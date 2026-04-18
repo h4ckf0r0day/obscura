@@ -218,7 +218,7 @@ async fn run_multi_worker_serve(
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
-                let worker_addr = format!("127.0.0.1:{}", port + 1);
+                let worker_addr = format!("127.0.0.1:{}", worker_port);
                 if let Ok(mut worker_stream) = tokio::net::TcpStream::connect(&worker_addr).await {
                     tokio::spawn(async move {
                         let _ = tokio::io::copy_bidirectional(&mut tokio::net::TcpStream::from_std(client_stream.into_std().unwrap()).unwrap(), &mut worker_stream).await;
