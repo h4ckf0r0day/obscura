@@ -218,10 +218,18 @@ async fn run_multi_worker_serve(
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
-                let worker_addr = format!("127.0.0.1:{}", port + 1);
+                let worker_addr = format!("127.0.0.1:{}", worker_port);
                 if let Ok(mut worker_stream) = tokio::net::TcpStream::connect(&worker_addr).await {
                     tokio::spawn(async move {
-                        let _ = tokio::io::copy_bidirectional(&mut tokio::net::TcpStream::from_std(client_stream.into_std().unwrap()).unwrap(), &mut worker_stream).await;
+                        let std_stream = match client_stream.into_std() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to convert client stream to std: {}", e);
+                                return;
+                            }
+                        };
+                        let mut client = tokio::net::TcpStream::from_std(std_stream);
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                     });
                 }
                 continue;
@@ -230,9 +238,17 @@ async fn run_multi_worker_serve(
 
         let worker_addr = format!("127.0.0.1:{}", worker_port);
         tokio::spawn(async move {
-            if let Ok(mut worker_stream) = tokio::net::TcpStream::connect(&worker_addr).await {
-                let mut client = client_stream;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
+            match tokio::net::TcpStream::connect(&worker_addr).await {
+                Ok(mut worker_stream) => {
+                    let mut client = client_stream;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Worker {} unreachable: {}", worker_addr, e);
+                    let response = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
+                    let _ = client_stream.write_all(response).await;
+                    let _ = client_stream.shutdown().await;
+                }
             }
         });
     }
