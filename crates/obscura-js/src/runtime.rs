@@ -92,6 +92,43 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().pending_navigation.take()
     }
 
+    /// Drains and returns all `<script src="…">` elements that JavaScript has
+    /// dynamically appended to the DOM since the last call.  The page runner
+    /// fetches these URLs, executes them, and then fires a `load` event via
+    /// [`Self::fire_script_load`] so that webpack-style Promise resolvers
+    /// continue.
+    pub fn take_pending_scripts(&self) -> Vec<(String, u32)> {
+        let state = self.state.borrow();
+        // Bind RefMut explicitly so it's dropped before `state` goes out of scope.
+        let mut guard = state.pending_scripts.borrow_mut();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Fires a synthetic `load` event on the `<script>` DOM element identified
+    /// by `nid`.  This unblocks webpack chunk-loading Promises that wait for
+    /// the script's `onload` callback (webpack 4, some third-party loaders).
+    pub fn fire_script_load(&mut self, nid: u32) {
+        let code = format!(
+            r#"(function(nid) {{
+                try {{
+                    var scripts = document.querySelectorAll('script');
+                    for (var i = 0; i < scripts.length; i++) {{
+                        if (typeof scripts[i]._nid === 'number' && scripts[i]._nid === nid) {{
+                            var evt = new Event('load');
+                            scripts[i].dispatchEvent(evt);
+                            if (typeof scripts[i].onload === 'function') {{
+                                try {{ scripts[i].onload.call(scripts[i], evt); }} catch(e) {{}}
+                            }}
+                            return;
+                        }}
+                    }}
+                }} catch(e) {{}}
+            }})({nid})"#,
+            nid = nid
+        );
+        let _ = self.runtime.execute_script("<fire-script-load>", code);
+    }
+
     pub fn set_intercept_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
