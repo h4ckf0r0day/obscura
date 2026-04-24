@@ -551,11 +551,15 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
-            "Forbidden URL scheme '{}' - only http and https are allowed",
+            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
             scheme
         ));
+    }
+
+    if scheme == "file" {
+        return Ok(());
     }
 
     if let Some(host) = url.host() {
