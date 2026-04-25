@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
@@ -24,18 +25,19 @@ enum ServerMessage {
 }
 
 pub async fn start(port: u16) -> anyhow::Result<()> {
-    start_with_options(port, None).await
+    start_with_options(port, IpAddr::from([127, 0, 0, 1]), None).await
 }
 
-pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+pub async fn start_with_options(
+    port: u16,
+    host: IpAddr,
+    proxy: Option<String>,
+) -> anyhow::Result<()> {
+    let addr = SocketAddr::new(host, port);
     let listener = TcpListener::bind(&addr).await?;
 
-    info!("Obscura CDP server listening on ws://127.0.0.1:{}", port);
-    info!(
-        "DevTools endpoint: ws://127.0.0.1:{}/devtools/browser",
-        port
-    );
+    info!("Obscura CDP server listening on ws://{}:{}", host, port);
+    info!("DevTools endpoint: ws://{}:{}/devtools/browser", host, port);
 
     let local = tokio::task::LocalSet::new();
     local

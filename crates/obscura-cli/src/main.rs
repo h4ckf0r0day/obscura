@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,9 @@ struct Args {
     #[arg(short, long, default_value_t = 9222)]
     port: u16,
 
+    #[arg(long, global = true, default_value = "127.0.0.1")]
+    host: IpAddr,
+
     #[arg(long)]
     proxy: Option<String>,
 
@@ -33,6 +37,9 @@ enum Command {
     Serve {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
+
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
 
         #[arg(long)]
         proxy: Option<String>,
@@ -98,7 +105,7 @@ enum DumpFormat {
     Links,
 }
 
-fn print_banner(port: u16) {
+fn print_banner(host: IpAddr, port: u16) {
     println!(r#"
    ____  _                              
   / __ \| |                             
@@ -108,8 +115,8 @@ fn print_banner(port: u16) {
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
   Headless Browser v0.1.0
-  CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+  CDP server: ws://{}:{}/devtools/browser
+"#, host, port);
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -126,8 +133,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
-            print_banner(port);
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers }) => {
+            print_banner(host, port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
@@ -141,9 +148,9 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, workers, proxy, stealth).await?;
+                run_multi_worker_serve(host, port, workers, proxy, stealth).await?;
             } else {
-                obscura_cdp::start_with_options(port, proxy).await?;
+                obscura_cdp::start_with_options(port, host, proxy).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
@@ -153,11 +160,11 @@ async fn main() -> anyhow::Result<()> {
             run_parallel_scrape(urls, eval, concurrency, &format).await?;
         }
         None => {
-            print_banner(args.port);
+            print_banner(args.host, args.port);
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy).await?;
+            obscura_cdp::start_with_options(args.port, args.host, args.proxy).await?;
         }
     }
 
@@ -165,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_multi_worker_serve(
+    host: IpAddr,
     port: u16,
     workers: u16,
     proxy: Option<String>,
@@ -196,7 +204,7 @@ async fn run_multi_worker_serve(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = std::net::SocketAddr::new(host, port);
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("Load balancer on port {}, {} workers", port, workers);
 

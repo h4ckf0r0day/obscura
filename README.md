@@ -91,7 +91,18 @@ obscura serve --port 9222
 
 # With stealth mode (anti-detection + tracker blocking)
 obscura serve --port 9222 --stealth
+
+# Bind on all interfaces (useful for Docker)
+obscura serve --host 0.0.0.0 --port 9222
 ```
+
+### Run in Docker
+
+```bash
+docker compose up --build
+```
+
+The CDP endpoint will be available at `ws://127.0.0.1:9222/devtools/browser`.
 
 ### Scrape in parallel
 
@@ -212,6 +223,7 @@ Start a CDP WebSocket server.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--host` | `127.0.0.1` | Interface to bind the CDP server to |
 | `--port` | `9222` | WebSocket port |
 | `--proxy` | — | HTTP/SOCKS5 proxy URL |
 | `--stealth` | off | Enable anti-detection + tracker blocking |

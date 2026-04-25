@@ -1,0 +1,8 @@
+services:
+  obscura:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9222:9222"
+    command: ["serve", "--host", "0.0.0.0", "--port", "9222"]
