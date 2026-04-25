@@ -39,10 +39,23 @@ impl CdpContext {
     }
 
     pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
-        let default_context = Arc::new(BrowserContext::with_options(
+        Self::new_with_runtime_options(
+            proxy,
+            stealth,
+            obscura_net::env_allows_private_network(),
+        )
+    }
+
+    pub fn new_with_runtime_options(
+        proxy: Option<String>,
+        stealth: bool,
+        allow_private_network: bool,
+    ) -> Self {
+        let default_context = Arc::new(BrowserContext::with_runtime_options(
             "default".to_string(),
             proxy,
             stealth,
+            allow_private_network,
         ));
         CdpContext {
             pages: Vec::new(),
