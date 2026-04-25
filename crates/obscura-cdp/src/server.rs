@@ -401,14 +401,25 @@ async fn process_cdp_message(
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
     let response = dispatch::dispatch(&req, ctx).await;
+    let emit_events_before_response = matches!(req.method.as_str(), "Target.createTarget" | "Target.attachToTarget");
+
+    if emit_events_before_response {
+        for event in ctx.pending_events.drain(..) {
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = reply_tx.send(json);
+            }
+        }
+    }
 
     if let Ok(json) = serde_json::to_string(&response) {
         let _ = reply_tx.send(json);
     }
 
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
+    if !emit_events_before_response {
+        for event in ctx.pending_events.drain(..) {
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = reply_tx.send(json);
+            }
         }
     }
 

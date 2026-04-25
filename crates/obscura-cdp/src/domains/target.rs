@@ -102,6 +102,120 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                 ));
             }
 
+            if let Some(page) = ctx.get_page(&page_id) {
+                let frame_id = page.frame_id.clone();
+                let page_url = page.url_string();
+                let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "init",
+                        "timestamp": ts
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Runtime.executionContextsCleared",
+                    json!({}),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.frameNavigated",
+                    json!({
+                        "frame": {
+                            "id": frame_id,
+                            "loaderId": loader_id,
+                            "url": page_url,
+                            "domainAndRegistry": "",
+                            "securityOrigin": page_url,
+                            "mimeType": "text/html",
+                            "adFrameStatus": { "adFrameType": "none" }
+                        },
+                        "type": "Navigation"
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Runtime.executionContextCreated",
+                    json!({
+                        "context": {
+                            "id": 2,
+                            "origin": page_url,
+                            "name": "",
+                            "uniqueId": format!("ctx-nav-{}", page_id),
+                            "auxData": {
+                                "isDefault": true,
+                                "type": "default",
+                                "frameId": frame_id
+                            }
+                        }
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "commit",
+                        "timestamp": ts
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "DOMContentLoaded",
+                        "timestamp": ts
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.domContentEventFired",
+                    json!({ "timestamp": ts }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "load",
+                        "timestamp": ts
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.loadEventFired",
+                    json!({ "timestamp": ts }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.lifecycleEvent",
+                    json!({
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "networkIdle",
+                        "timestamp": ts
+                    }),
+                    session_id.clone(),
+                ));
+                ctx.pending_events.push(CdpEvent::with_session(
+                    "Page.frameStoppedLoading",
+                    json!({ "frameId": frame_id }),
+                    session_id.clone(),
+                ));
+            }
+
             Ok(json!({ "targetId": page_id }))
         }
         "attachToTarget" => {
