@@ -304,8 +304,18 @@ async fn op_fetch_url(
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
 
+    let allow_private_network = {
+        let state_borrow = state.borrow();
+        let gs = state_borrow.borrow::<SharedState>().clone();
+        let gs = gs.borrow();
+        gs.http_client
+            .as_ref()
+            .map(|client| client.allow_private_network)
+            .unwrap_or_else(obscura_net::env_allows_private_network)
+    };
+
     if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url) {
+        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -558,7 +568,7 @@ fn glob_match(pattern: &str, url: &str) -> bool {
     url == pattern
 }
 
-fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
+fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
@@ -568,6 +578,10 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     }
 
     if scheme == "file" {
+        return Ok(());
+    }
+
+    if allow_private_network {
         return Ok(());
     }
 

@@ -90,6 +90,9 @@ obscura fetch https://example.com --wait-until networkidle0
 
 # Bound navigation time for slow or broken pages
 obscura fetch https://example.com --timeout 10
+
+# Trusted local development targets
+obscura fetch http://localhost:3000/app/ --allow-private-network --dump text
 ```
 
 ### Start the CDP server
@@ -99,6 +102,9 @@ obscura serve --port 9222
 
 # With stealth mode (anti-detection + tracker blocking)
 obscura serve --port 9222 --stealth
+
+# Allow CDP clients to load localhost/private network URLs
+obscura serve --port 9222 --allow-private-network
 ```
 
 ### Scrape in parallel
@@ -108,6 +114,17 @@ obscura scrape url1 url2 url3 ... \
   --concurrency 25 \
   --eval "document.querySelector('h1').textContent" \
   --format json
+```
+
+### Localhost and private networks
+
+Obscura blocks localhost and private network targets by default as an SSRF guard.
+For trusted local development, pass `--allow-private-network` or set
+`OBSCURA_ALLOW_PRIVATE_NETWORK=1`.
+
+```bash
+OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura serve --port 9222
+obscura fetch http://localhost:3000/app/settings --allow-private-network --dump text
 ```
 
 ## Puppeteer / Playwright
@@ -225,6 +242,7 @@ Start a CDP WebSocket server.
 | `--stealth` | off | Enable anti-detection + tracker blocking |
 | `--workers` | `1` | Number of parallel worker processes |
 | `--obey-robots` | off | Respect robots.txt |
+| `--allow-private-network` | off | Allow localhost/private network targets for trusted local development |
 
 ### `obscura fetch <URL>`
 
@@ -239,6 +257,7 @@ Fetch and render a single page.
 | `--selector` | — | Wait for CSS selector |
 | `--stealth` | off | Anti-detection mode |
 | `--quiet` | off | Suppress banner |
+| `--allow-private-network` | off | Allow localhost/private network targets for trusted local development |
 
 ### `obscura scrape <URL...>`
 
@@ -249,6 +268,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--concurrency` | `10` | Parallel workers |
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
+| `--allow-private-network` | off | Allow localhost/private network targets for trusted local development |
 
 ## License
 
