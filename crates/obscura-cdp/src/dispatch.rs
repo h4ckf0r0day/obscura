@@ -32,21 +32,26 @@ pub struct CdpContext {
 
 impl CdpContext {
     pub fn new() -> Self {
-        Self::new_with_proxy(None)
+        Self::new_with_options(None, false)
     }
 
     pub fn new_with_proxy(proxy: Option<String>) -> Self {
-        Self::new_with_proxy_and_file_url_policy(proxy, FileUrlPolicy::Deny)
+        Self::new_with_options(proxy, false)
     }
 
-    pub fn new_with_proxy_and_file_url_policy(
+    pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
+        Self::new_with_options_and_file_url_policy(proxy, stealth, FileUrlPolicy::Deny)
+    }
+
+    pub fn new_with_options_and_file_url_policy(
         proxy: Option<String>,
+        stealth: bool,
         file_url_policy: FileUrlPolicy,
     ) -> Self {
         let default_context = Arc::new(BrowserContext::with_options_and_file_url_policy(
             "default".to_string(),
             proxy,
-            false,
+            stealth,
             file_url_policy,
         ));
         CdpContext {

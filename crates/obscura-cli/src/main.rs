@@ -154,9 +154,13 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("User-Agent: {}", ua);
             }
             if stealth {
-                tracing::info!("Stealth mode enabled (TLS fingerprint spoofing)");
+                #[cfg(feature = "stealth")]
+                tracing::info!(
+                    "Stealth mode enabled (TLS fingerprint impersonation + tracker blocking)"
+                );
+                #[cfg(not(feature = "stealth"))]
+                tracing::info!("Stealth mode enabled (tracker blocking)");
             }
-            let _ = stealth;
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
@@ -166,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                     port,
                     host,
                     proxy,
+                    stealth,
                     file_url_policy,
                 )
                 .await?;
@@ -198,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 args.port,
                 host,
                 args.proxy,
+                false,
                 file_url_policy,
             )
             .await?;
@@ -273,7 +279,7 @@ async fn run_multi_worker_serve(
     file_url_policy: FileUrlPolicy,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
 
     let exe = std::env::current_exe()?;
     let mut children = Vec::new();
@@ -321,11 +327,49 @@ async fn run_multi_worker_serve(
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
-                let worker_addr = format!("127.0.0.1:{}", port + 1);
-                if let Ok(mut worker_stream) = tokio::net::TcpStream::connect(&worker_addr).await {
-                    tokio::spawn(async move {
-                        let _ = tokio::io::copy_bidirectional(&mut tokio::net::TcpStream::from_std(client_stream.into_std().unwrap()).unwrap(), &mut worker_stream).await;
-                    });
+                let worker_addr = format!("127.0.0.1:{}", worker_port);
+                match tokio::net::TcpStream::connect(&worker_addr).await {
+                    Ok(mut worker_stream) => {
+                        tokio::spawn(async move {
+                            let std_stream = match client_stream.into_std() {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "/json: failed to convert client to std stream: {}",
+                                        e
+                                    );
+                                    return;
+                                }
+                            };
+                            let mut client = match tokio::net::TcpStream::from_std(std_stream) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "/json: failed to recreate tokio TcpStream: {}",
+                                        e
+                                    );
+                                    return;
+                                }
+                            };
+                            let _ = tokio::io::copy_bidirectional(
+                                &mut client,
+                                &mut worker_stream,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("/json worker {} unreachable: {}", worker_addr, e);
+                        tokio::spawn(async move {
+                            let mut s = client_stream;
+                            let _ = s
+                                .write_all(
+                                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                            let _ = s.shutdown().await;
+                        });
+                    }
                 }
                 continue;
             }
@@ -333,9 +377,20 @@ async fn run_multi_worker_serve(
 
         let worker_addr = format!("127.0.0.1:{}", worker_port);
         tokio::spawn(async move {
-            if let Ok(mut worker_stream) = tokio::net::TcpStream::connect(&worker_addr).await {
-                let mut client = client_stream;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
+            match tokio::net::TcpStream::connect(&worker_addr).await {
+                Ok(mut worker_stream) => {
+                    let mut client = client_stream;
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
+                }
+                Err(e) => {
+                    tracing::warn!("worker {} unreachable: {}", worker_addr, e);
+                    let mut s = client_stream;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = s.shutdown().await;
+                }
             }
         });
     }

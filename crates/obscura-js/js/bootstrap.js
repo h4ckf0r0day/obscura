@@ -2382,17 +2382,33 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     get lastChild() { return children[children.length - 1] || null; },
     get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
     get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) { if (c) { children.push(c); c.parentNode = shadow; } return c; },
+    appendChild(c) {
+      if (c) {
+        children.push(c);
+        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
+      }
+      return c;
+    },
     insertBefore(n, ref) {
       if (!n) return n;
       if (!ref) { shadow.appendChild(n); return n; }
       const idx = children.indexOf(ref);
-      if (idx >= 0) { children.splice(idx, 0, n); n.parentNode = shadow; }
+      if (idx >= 0) {
+        children.splice(idx, 0, n);
+        try { n.parentNode = shadow; } catch (_) {}
+      }
       else shadow.appendChild(n);
       return n;
     },
     removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
-    replaceChild(n, o) { const idx = children.indexOf(o); if (idx >= 0) { children[idx] = n; n.parentNode = shadow; } return o; },
+    replaceChild(n, o) {
+      const idx = children.indexOf(o);
+      if (idx >= 0) {
+        children[idx] = n;
+        try { n.parentNode = shadow; } catch (_) {}
+      }
+      return o;
+    },
     querySelector(s) {
       for (const c of children) {
         if (c.matches && c.matches(s)) return c;

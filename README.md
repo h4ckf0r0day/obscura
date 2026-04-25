@@ -43,6 +43,10 @@ tar xzf obscura-x86_64-linux.tar.gz
 curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 
+# macOS Intel
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+tar xzf obscura-x86_64-macos.tar.gz
+
 # Windows
 Download the `.zip` from the releases page and extract it manually.
 ```

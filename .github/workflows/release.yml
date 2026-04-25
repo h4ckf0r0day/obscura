@@ -20,6 +20,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: obscura-aarch64-macos
+          - target: x86_64-apple-darwin
+            os: macos-13
+            name: obscura-x86_64-macos
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: obscura-x86_64-windows
