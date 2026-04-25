@@ -228,12 +228,18 @@ async fn process_with_interception(
     let url_owned = url.to_string();
 
     tokio::task::spawn_local(async move {
+        // Issue #19: serialize V8 work across pages. The interception path
+        // spawns navigation here while the parent task continues to pump
+        // CDP messages via `dispatch` (which also acquires this lock); both
+        // sides must coordinate or V8 aborts the process at concurrency >= 5.
+        let _v8_guard = obscura_js::v8_lock::global().lock().await;
         let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
         for source in &preload_scripts {
             if let Err(e) = page.execute_preload_script(source) {
                 tracing::debug!("Preload script error: {}", e);
             }
         }
+        drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
 

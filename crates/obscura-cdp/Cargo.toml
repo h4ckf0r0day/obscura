@@ -18,3 +18,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 futures-util = "0.3"
 obscura-net = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
