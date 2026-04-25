@@ -62,6 +62,36 @@ cargo build --release --features stealth
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
 
+### Run in a container
+
+Obscura denies `file://` URLs by default, and can also run behind Podman or Docker so any explicitly allowed file access is limited to the container filesystem:
+
+```bash
+podman build -t obscura:dev -f Containerfile .
+podman run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+  --cap-drop=all \
+  --security-opt=no-new-privileges \
+  -p 127.0.0.1:9222:9222 \
+  obscura:dev
+```
+
+Docker uses the same image definition:
+
+```bash
+docker build -t obscura:dev -f Containerfile .
+docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  -p 127.0.0.1:9222:9222 \
+  obscura:dev
+```
+
+See [docs/container.md](docs/container.md) for why `file://` is restricted, how to allow only specific fixture directories, Artix Linux Rust setup, and Podman/Docker hardening flags.
+
 ## Quick Start
 
 ### Fetch a page
@@ -87,6 +117,12 @@ obscura serve --port 9222
 
 # With stealth mode (anti-detection + tracker blocking)
 obscura serve --port 9222 --stealth
+
+# Bind all interfaces, useful inside a container only
+obscura serve --host 0.0.0.0 --port 9222
+
+# Allow file:// access only under one local directory
+obscura serve --allow-file-access "$PWD/fixtures" --port 9222
 ```
 
 ### Scrape in parallel
@@ -202,13 +238,18 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
 ## CLI Reference
 
+`file://` URLs are denied by default. `--allow-file-access <DIR>` and `--allow-all-file-urls` are global flags and can be used with `serve`, `fetch`, or `scrape`.
+
 ### `obscura serve`
 
 Start a CDP WebSocket server.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--host` | `127.0.0.1` | Address to bind the CDP server |
 | `--port` | `9222` | WebSocket port |
+| `--allow-file-access <DIR>` | — | Allow `file://` reads under a canonicalized directory; can be repeated |
+| `--allow-all-file-urls` | off | Allow unrestricted `file://` reads; unsafe legacy mode |
 | `--proxy` | — | HTTP/SOCKS5 proxy URL |
 | `--stealth` | off | Enable anti-detection + tracker blocking |
 | `--workers` | `1` | Number of parallel worker processes |
@@ -221,6 +262,8 @@ Fetch and render a single page.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dump` | `html` | Output: `html`, `text`, or `links` |
+| `--allow-file-access <DIR>` | — | Allow `file://` reads under a canonicalized directory; can be repeated |
+| `--allow-all-file-urls` | off | Allow unrestricted `file://` reads; unsafe legacy mode |
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
 | `--selector` | — | Wait for CSS selector |

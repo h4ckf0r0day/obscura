@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use futures_util::{SinkExt, StreamExt};
+use obscura_net::FileUrlPolicy;
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -28,10 +29,27 @@ pub async fn start(port: u16) -> anyhow::Result<()> {
 }
 
 pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    start_with_bind(port, IpAddr::V4(Ipv4Addr::LOCALHOST), proxy).await
+}
+
+pub async fn start_with_bind(
+    port: u16,
+    host: IpAddr,
+    proxy: Option<String>,
+) -> anyhow::Result<()> {
+    start_with_bind_and_file_url_policy(port, host, proxy, FileUrlPolicy::Deny).await
+}
+
+pub async fn start_with_bind_and_file_url_policy(
+    port: u16,
+    host: IpAddr,
+    proxy: Option<String>,
+    file_url_policy: FileUrlPolicy,
+) -> anyhow::Result<()> {
+    let addr = SocketAddr::new(host, port);
     let listener = TcpListener::bind(&addr).await?;
 
-    info!("Obscura CDP server listening on ws://127.0.0.1:{}", port);
+    info!("Obscura CDP server listening on {}:{}", host, port);
     info!(
         "DevTools endpoint: ws://127.0.0.1:{}/devtools/browser",
         port
@@ -42,7 +60,8 @@ pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Res
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy));
+            let _processor_handle =
+                tokio::task::spawn_local(cdp_processor(msg_rx, proxy, file_url_policy));
 
             loop {
                 match listener.accept().await {
@@ -67,8 +86,9 @@ pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Res
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
+    file_url_policy: FileUrlPolicy,
 ) {
-    let mut ctx = CdpContext::new_with_proxy(proxy);
+    let mut ctx = CdpContext::new_with_proxy_and_file_url_policy(proxy, file_url_policy);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
