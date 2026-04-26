@@ -346,6 +346,36 @@ class Node {
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
 
+class CharacterData extends Node {
+  get data() { return this.nodeValue; }
+  set data(v) { this.nodeValue = v; }
+  get length() { return (this.data || "").length; }
+  substringData(offset, count) { return (this.data || "").substring(offset, offset + count); }
+  appendData(arg) { this.data += arg; }
+  insertData(offset, arg) { const d = this.data || ""; this.data = d.substring(0, offset) + arg + d.substring(offset); }
+  deleteData(offset, count) { const d = this.data || ""; this.data = d.substring(0, offset) + d.substring(offset + count); }
+  replaceData(offset, count, arg) { const d = this.data || ""; this.data = d.substring(0, offset) + arg + d.substring(offset + count); }
+}
+
+class Text extends CharacterData {
+  get nodeType() { return 3; }
+  get nodeName() { return "#text"; }
+  splitText(offset) {
+    const d = this.data || "";
+    const head = d.substring(0, offset);
+    const tail = d.substring(offset);
+    this.data = head;
+    const newNode = document.createTextNode(tail);
+    if (this.parentNode) this.parentNode.insertBefore(newNode, this.nextSibling);
+    return newNode;
+  }
+}
+
+class Comment extends CharacterData {
+  get nodeType() { return 8; }
+  get nodeName() { return "#comment"; }
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -749,16 +779,7 @@ class Document extends Node {
     return el;
   }
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
-  createComment(t) {
-    const nid = +_dom("create_text_node", "");
-    const n = new Node(nid);
-    n._isComment = true;
-    n.nodeType = 8; // Override nodeType
-    Object.defineProperty(n, "nodeType", { value: 8, writable: false });
-    Object.defineProperty(n, "nodeName", { value: "#comment", writable: false });
-    _cache.set(nid, n);
-    return n;
-  }
+  createComment(t) { return _wrap(+_dom("create_comment", String(t))); }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
@@ -943,6 +964,8 @@ function _wrap(nid) {
   let n;
   if (t === 1) n = new Element(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 3) n = new Text(nid);
+  else if (t === 8) n = new Comment(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -1894,8 +1917,9 @@ globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
-globalThis.Text = Node;
-globalThis.Comment = Node;
+globalThis.CharacterData = CharacterData;
+globalThis.Text = Text;
+globalThis.Comment = Comment;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;

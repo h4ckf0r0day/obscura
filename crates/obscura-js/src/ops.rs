@@ -245,6 +245,9 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "create_text_node" => {
             dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
         }
+        "create_comment" => {
+            dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
+        }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter()

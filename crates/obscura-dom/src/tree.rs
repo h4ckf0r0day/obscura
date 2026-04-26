@@ -535,7 +535,7 @@ impl DomTree {
 fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
     if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
         match &node.data {
-            NodeData::Text { contents } => buf.push_str(contents),
+            NodeData::Text { contents } | NodeData::Comment { contents } => buf.push_str(contents),
             _ => {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
