@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,7 +63,17 @@ pub enum ResourceType {
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
-fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
+pub fn env_allows_private_network() -> bool {
+    matches!(
+        std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") | Ok("on") | Ok("ON")
+    )
+}
+
+pub(crate) fn validate_url(
+    url: &Url,
+    allow_private_network: bool,
+) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
@@ -74,6 +83,10 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     }
 
     if scheme == "file" {
+        return Ok(());
+    }
+
+    if allow_private_network {
         return Ok(());
     }
 
@@ -166,6 +179,7 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    pub allow_private_network: bool,
 }
 
 impl ObscuraHttpClient {
@@ -192,7 +206,12 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            allow_private_network: env_allows_private_network(),
         }
+    }
+
+    pub fn set_allow_private_network(&mut self, allow_private_network: bool) {
+        self.allow_private_network = allow_private_network;
     }
 
     async fn get_client(&self) -> &Client {
@@ -227,7 +246,7 @@ impl ObscuraHttpClient {
         url: &Url,
         initial_body: Option<Vec<u8>>,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url)?;
+        validate_url(url, self.allow_private_network)?;
 
         if url.scheme() == "file" {
             return fetch_file_url(url).await;
@@ -386,7 +405,7 @@ impl ObscuraHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url)?;
+                    validate_url(&next_url, self.allow_private_network)?;
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY

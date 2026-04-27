@@ -15,7 +15,7 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
-use crate::client::{Response, ObscuraNetError};
+use crate::client::{env_allows_private_network, validate_url, ObscuraNetError, Response};
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
@@ -27,6 +27,7 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    pub allow_private_network: bool,
 }
 
 #[cfg(feature = "stealth")]
@@ -36,6 +37,14 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_options(cookie_jar, proxy_url, env_allows_private_network())
+    }
+
+    pub fn with_options(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+    ) -> Self {
         let cert_store = wreq::tls::CertStore::builder()
             .set_default_paths()
             .build()
@@ -65,10 +74,13 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_private_network,
         }
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        validate_url(url, self.allow_private_network)?;
+
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
 
@@ -113,6 +125,7 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
+                    validate_url(&next_url, self.allow_private_network)?;
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;

@@ -11,12 +11,15 @@ pub struct BrowserContext {
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
     pub stealth: bool,
+    pub allow_private_network: bool,
 }
 
 impl BrowserContext {
     pub fn new(id: String) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
-        let http_client = Arc::new(ObscuraHttpClient::with_cookie_jar(cookie_jar.clone()));
+        let client = ObscuraHttpClient::with_cookie_jar(cookie_jar.clone());
+        let allow_private_network = client.allow_private_network;
+        let http_client = Arc::new(client);
         BrowserContext {
             id,
             cookie_jar,
@@ -26,15 +29,31 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth: false,
+            allow_private_network,
         }
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
+        Self::with_runtime_options(
+            id,
+            proxy_url,
+            stealth,
+            obscura_net::env_allows_private_network(),
+        )
+    }
+
+    pub fn with_runtime_options(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        allow_private_network: bool,
+    ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         let mut client = ObscuraHttpClient::with_options(
             cookie_jar.clone(),
             proxy_url.as_deref(),
         );
+        client.set_allow_private_network(allow_private_network);
         if stealth {
             client.block_trackers = true;
         }
@@ -48,6 +67,7 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth,
+            allow_private_network,
         }
     }
 

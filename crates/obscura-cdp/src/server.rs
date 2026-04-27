@@ -32,6 +32,20 @@ pub async fn start_with_options(
     proxy: Option<String>,
     stealth: bool,
 ) -> anyhow::Result<()> {
+    start_with_runtime_options(
+        port,
+        proxy,
+        stealth,
+        obscura_net::env_allows_private_network(),
+    ).await
+}
+
+pub async fn start_with_runtime_options(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+    allow_private_network: bool,
+) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(&addr).await?;
 
@@ -46,7 +60,12 @@ pub async fn start_with_options(
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth));
+            let processor_handle = tokio::task::spawn_local(cdp_processor(
+                msg_rx,
+                proxy,
+                stealth,
+                allow_private_network,
+            ));
 
             loop {
                 match listener.accept().await {
@@ -72,8 +91,9 @@ async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
     stealth: bool,
+    allow_private_network: bool,
 ) {
-    let mut ctx = CdpContext::new_with_options(proxy, stealth);
+    let mut ctx = CdpContext::new_with_runtime_options(proxy, stealth, allow_private_network);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
