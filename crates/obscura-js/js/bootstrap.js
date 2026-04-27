@@ -346,6 +346,20 @@ class Node {
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
 
+class CharacterData extends Node {
+  get data() { return _domParse("text_content", this._nid) ?? ""; }
+  set data(v) { _dom("set_text_content", this._nid, String(v ?? "")); }
+  get length() { return this.data.length; }
+  substringData(offset, count) { return this.data.substring(offset, offset + count); }
+  appendData(s) { this.data = this.data + s; }
+  insertData(offset, s) { this.data = this.data.slice(0, offset) + s + this.data.slice(offset); }
+  deleteData(offset, count) { this.data = this.data.slice(0, offset) + this.data.slice(offset + count); }
+  replaceData(offset, count, s) { this.data = this.data.slice(0, offset) + s + this.data.slice(offset + count); }
+}
+
+class Text extends CharacterData {}
+class Comment extends CharacterData {}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -943,7 +957,9 @@ function _wrap(nid) {
   let n;
   if (t === 1) n = new Element(nid);
   else if (t === 9) n = new Document(nid);
-  else n = new Node(nid);
+  else if (t === 3) n = new Text(nid);
+  else if (t === 8) n = new Comment(nid);
+  else n = new CharacterData(nid);
   _cache.set(nid, n);
   return n;
 }
@@ -1894,11 +1910,12 @@ globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
-globalThis.Text = Node;
-globalThis.Comment = Node;
+globalThis.Text = Text;
+globalThis.Comment = Comment;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
+globalThis.CharacterData = CharacterData;
 globalThis.Element = Element;
 globalThis.Document = Document;
 globalThis.EventTarget = Node;
