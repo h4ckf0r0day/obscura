@@ -1,8 +1,11 @@
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use obscura_browser::{BrowserContext, Page};
+use obscura_net::FileUrlPolicy;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
@@ -18,6 +21,15 @@ struct Args {
 
     #[arg(short, long, default_value_t = 9222)]
     port: u16,
+
+    #[arg(long, global = true, default_value = "127.0.0.1")]
+    host: IpAddr,
+
+    #[arg(long, global = true, value_name = "DIR")]
+    allow_file_access: Vec<PathBuf>,
+
+    #[arg(long, global = true)]
+    allow_all_file_urls: bool,
 
     #[arg(long)]
     proxy: Option<String>,
@@ -102,7 +114,7 @@ enum DumpFormat {
     Links,
 }
 
-fn print_banner(port: u16) {
+fn print_banner(host: IpAddr, port: u16) {
     println!(r#"
    ____  _                              
   / __ \| |                             
@@ -112,13 +124,16 @@ fn print_banner(port: u16) {
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
   Headless Browser v0.1.0
-  CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+  CDP bind address: {}:{}
+"#, host, port);
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let host = args.host;
+    let file_url_policy =
+        build_file_url_policy(args.allow_all_file_urls, &args.allow_file_access)?;
 
     let filter = if args.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
@@ -131,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
-            print_banner(port);
+            print_banner(host, port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
@@ -149,37 +164,122 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, workers, proxy, stealth).await?;
+                run_multi_worker_serve(host, port, workers, proxy, stealth, file_url_policy).await?;
             } else {
-                obscura_cdp::start_with_options(port, proxy, stealth).await?;
+                obscura_cdp::start_with_bind_and_file_url_policy(
+                    port,
+                    host,
+                    proxy,
+                    stealth,
+                    file_url_policy,
+                )
+                .await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, &wait_until, user_agent, stealth, eval, quiet).await?;
+            run_fetch(
+                &url,
+                dump,
+                selector,
+                wait,
+                &wait_until,
+                user_agent,
+                stealth,
+                eval,
+                quiet,
+                file_url_policy,
+            )
+            .await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
-            run_parallel_scrape(urls, eval, concurrency, &format, timeout).await?;
+            run_parallel_scrape(urls, eval, concurrency, &format, timeout, file_url_policy).await?;
         }
         None => {
-            print_banner(args.port);
+            print_banner(host, args.port);
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
+            obscura_cdp::start_with_bind_and_file_url_policy(
+                args.port,
+                host,
+                args.proxy,
+                false,
+                file_url_policy,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
+fn build_file_url_policy(
+    allow_all_file_urls: bool,
+    allow_file_access: &[PathBuf],
+) -> anyhow::Result<FileUrlPolicy> {
+    if allow_all_file_urls && !allow_file_access.is_empty() {
+        anyhow::bail!(
+            "--allow-all-file-urls cannot be combined with --allow-file-access <DIR>"
+        );
+    }
+
+    if allow_all_file_urls {
+        Ok(FileUrlPolicy::AllowAll)
+    } else {
+        Ok(FileUrlPolicy::allow_roots(allow_file_access.iter())?)
+    }
+}
+
+fn add_file_policy_args(cmd: &mut std::process::Command, file_url_policy: &FileUrlPolicy) {
+    match file_url_policy {
+        FileUrlPolicy::Deny => {}
+        FileUrlPolicy::AllowAll => {
+            cmd.arg("--allow-all-file-urls");
+        }
+        FileUrlPolicy::AllowRoots(roots) => {
+            for root in roots {
+                cmd.arg("--allow-file-access").arg(root);
+            }
+        }
+    }
+}
+
+fn add_file_policy_env(cmd: &mut TokioCommand, file_url_policy: &FileUrlPolicy) {
+    const ALLOW_ALL_ENV: &str = "OBSCURA_ALLOW_ALL_FILE_URLS";
+    const ROOTS_ENV: &str = "OBSCURA_FILE_ACCESS_ROOTS_JSON";
+
+    match file_url_policy {
+        FileUrlPolicy::Deny => {
+            cmd.env_remove(ALLOW_ALL_ENV);
+            cmd.env_remove(ROOTS_ENV);
+        }
+        FileUrlPolicy::AllowAll => {
+            cmd.env(ALLOW_ALL_ENV, "1");
+            cmd.env_remove(ROOTS_ENV);
+        }
+        FileUrlPolicy::AllowRoots(roots) => {
+            let roots: Vec<String> = roots
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect();
+            if let Ok(roots_json) = serde_json::to_string(&roots) {
+                cmd.env(ALLOW_ALL_ENV, "0");
+                cmd.env(ROOTS_ENV, roots_json);
+            }
+        }
+    }
+}
+
 async fn run_multi_worker_serve(
+    host: IpAddr,
     port: u16,
     workers: u16,
     proxy: Option<String>,
     stealth: bool,
+    file_url_policy: FileUrlPolicy,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
 
     let exe = std::env::current_exe()?;
     let mut children = Vec::new();
@@ -187,6 +287,7 @@ async fn run_multi_worker_serve(
     for i in 0..workers {
         let worker_port = port + 1 + i;
         let mut cmd = std::process::Command::new(&exe);
+        add_file_policy_args(&mut cmd, &file_url_policy);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
         if let Some(ref p) = proxy {
             cmd.arg("--proxy").arg(p);
@@ -204,7 +305,7 @@ async fn run_multi_worker_serve(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = std::net::SocketAddr::new(host, port);
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("Load balancer on port {}, {} workers", port, workers);
 
@@ -305,8 +406,14 @@ async fn run_fetch(
     stealth: bool,
     eval: Option<String>,
     quiet: bool,
+    file_url_policy: FileUrlPolicy,
 ) -> anyhow::Result<()> {
-    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth));
+    let context = Arc::new(BrowserContext::with_options_and_file_url_policy(
+        "fetch".to_string(),
+        None,
+        stealth,
+        file_url_policy,
+    ));
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {
@@ -461,6 +568,7 @@ async fn run_parallel_scrape(
     concurrency: usize,
     format: &str,
     timeout_secs: u64,
+    file_url_policy: FileUrlPolicy,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -485,6 +593,7 @@ async fn run_parallel_scrape(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let eval = Arc::new(eval);
     let worker_path = Arc::new(worker_path);
+    let file_url_policy = Arc::new(file_url_policy);
     let worker_timeout = Duration::from_secs(timeout_secs);
     let read_timeout = Duration::from_secs(timeout_secs.min(30));
     let shutdown_timeout = Duration::from_secs(5);
@@ -495,12 +604,15 @@ async fn run_parallel_scrape(
         let sem = semaphore.clone();
         let eval = eval.clone();
         let worker_path = worker_path.clone();
+        let file_url_policy = file_url_policy.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let task_start = Instant::now();
 
-            let mut child = match TokioCommand::new(worker_path.as_ref())
+            let mut worker_cmd = TokioCommand::new(worker_path.as_ref());
+            add_file_policy_env(&mut worker_cmd, &file_url_policy);
+            let mut child = match worker_cmd
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())

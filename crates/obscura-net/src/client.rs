@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +64,64 @@ pub enum ResourceType {
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
+#[derive(Debug, Clone, Default)]
+pub enum FileUrlPolicy {
+    #[default]
+    Deny,
+    AllowAll,
+    AllowRoots(Vec<PathBuf>),
+}
+
+impl FileUrlPolicy {
+    pub fn allow_roots<I, P>(roots: I) -> Result<Self, ObscuraNetError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut canonical_roots = Vec::new();
+        for root in roots {
+            let root = root.as_ref();
+            let canonical = std::fs::canonicalize(root).map_err(|e| {
+                ObscuraNetError::Network(format!(
+                    "Invalid file access root '{}': {}",
+                    root.display(),
+                    e
+                ))
+            })?;
+            canonical_roots.push(canonical);
+        }
+
+        if canonical_roots.is_empty() {
+            Ok(Self::Deny)
+        } else {
+            Ok(Self::AllowRoots(canonical_roots))
+        }
+    }
+
+    async fn authorize(&self, path: &Path) -> Result<PathBuf, ObscuraNetError> {
+        match self {
+            Self::Deny => Err(ObscuraNetError::Network(
+                "file:// URLs are disabled. Use --allow-file-access <DIR> to allow a sandboxed directory, or --allow-all-file-urls for legacy behavior.".to_string(),
+            )),
+            Self::AllowAll => Ok(path.to_path_buf()),
+            Self::AllowRoots(roots) => {
+                let canonical_path = tokio::fs::canonicalize(path).await.map_err(|e| {
+                    ObscuraNetError::Network(format!("Failed to resolve file path: {}", e))
+                })?;
+
+                if roots.iter().any(|root| canonical_path.starts_with(root)) {
+                    Ok(canonical_path)
+                } else {
+                    Err(ObscuraNetError::Network(format!(
+                        "file:// path '{}' is outside the allowed file access roots",
+                        canonical_path.display()
+                    )))
+                }
+            }
+        }
+    }
+}
+
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -74,6 +132,11 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     }
 
     if scheme == "file" {
+        if url.host_str().is_some() {
+            return Err(ObscuraNetError::Network(
+                "file:// URLs with hosts are not supported".to_string(),
+            ));
+        }
         return Ok(());
     }
 
@@ -119,10 +182,11 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     Ok(())
 }
 
-async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
+async fn fetch_file_url(url: &Url, policy: &FileUrlPolicy) -> Result<Response, ObscuraNetError> {
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
+    let path = policy.authorize(&path).await?;
     let body = tokio::fs::read(&path)
         .await
         .map_err(|e| ObscuraNetError::Network(format!("Failed to read file: {}", e)))?;
@@ -166,6 +230,7 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    pub file_url_policy: FileUrlPolicy,
 }
 
 impl ObscuraHttpClient {
@@ -178,6 +243,14 @@ impl ObscuraHttpClient {
     }
 
     pub fn with_options(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_options_and_file_url_policy(cookie_jar, proxy_url, FileUrlPolicy::Deny)
+    }
+
+    pub fn with_options_and_file_url_policy(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        file_url_policy: FileUrlPolicy,
+    ) -> Self {
         ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
@@ -192,6 +265,7 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            file_url_policy,
         }
     }
 
@@ -230,7 +304,7 @@ impl ObscuraHttpClient {
         validate_url(url)?;
 
         if url.scheme() == "file" {
-            return fetch_file_url(url).await;
+            return fetch_file_url(url, &self.file_url_policy).await;
         }
 
         let mut method = initial_method;
@@ -255,6 +329,12 @@ impl ObscuraHttpClient {
         let max_redirects = 20;
 
         for _redirect_count in 0..max_redirects {
+            if current_url.scheme() == "file" {
+                let mut response = fetch_file_url(&current_url, &self.file_url_policy).await?;
+                response.redirected_from = redirects;
+                return Ok(response);
+            }
+
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
@@ -455,4 +535,142 @@ pub enum ObscuraNetError {
 
     #[error("Request blocked: {0}")]
     Blocked(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "obscura-file-policy-{}-{}",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn client_for_root(root: &Path) -> ObscuraHttpClient {
+        ObscuraHttpClient::with_options_and_file_url_policy(
+            Arc::new(CookieJar::new()),
+            None,
+            FileUrlPolicy::allow_roots([root]).unwrap(),
+        )
+    }
+
+    fn error_text(result: Result<Response, ObscuraNetError>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    #[tokio::test]
+    async fn file_url_policy_denies_by_default() {
+        let root = test_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("secret.txt");
+        std::fs::write(&path, "secret").unwrap();
+
+        let url = Url::from_file_path(&path).unwrap();
+        let err = error_text(ObscuraHttpClient::new().fetch(&url).await);
+
+        assert!(err.contains("file:// URLs are disabled"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_url_policy_allows_canonical_root() {
+        let root = test_dir();
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let path = allowed.join("page.txt");
+        std::fs::write(&path, "inside").unwrap();
+
+        let url = Url::from_file_path(&path).unwrap();
+        let resp = client_for_root(&allowed).fetch(&url).await.unwrap();
+
+        assert_eq!(resp.body, b"inside");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_url_policy_blocks_relative_traversal_outside_root() {
+        let root = test_dir();
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        let url = Url::from_file_path(allowed.join("../outside/secret.txt")).unwrap();
+        let err = error_text(client_for_root(&allowed).fetch(&url).await);
+
+        assert!(err.contains("outside the allowed file access roots"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_url_policy_blocks_percent_encoded_traversal_outside_root() {
+        let root = test_dir();
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        let base = Url::from_directory_path(&allowed).unwrap();
+        let url = Url::parse(&format!("{}%2e%2e/outside/secret.txt", base)).unwrap();
+        let err = error_text(client_for_root(&allowed).fetch(&url).await);
+
+        assert!(err.contains("outside the allowed file access roots"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_url_policy_allows_relative_paths_inside_root() {
+        let root = test_dir();
+        let allowed = root.join("allowed");
+        let nested = allowed.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(allowed.join("style.css"), "body{}").unwrap();
+        let page = nested.join("page.html");
+        std::fs::write(&page, "<link rel=\"stylesheet\" href=\"../style.css\">").unwrap();
+
+        let base = Url::from_file_path(&page).unwrap();
+        let url = base.join("../style.css").unwrap();
+        let resp = client_for_root(&allowed).fetch(&url).await.unwrap();
+
+        assert_eq!(resp.body, b"body{}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_url_policy_rejects_file_urls_with_hosts() {
+        let root = test_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let url = Url::parse("file://example.com/etc/passwd").unwrap();
+        let err = error_text(client_for_root(&root).fetch(&url).await);
+
+        assert!(err.contains("file:// URLs with hosts are not supported"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_url_policy_blocks_symlink_escape_outside_root() {
+        let root = test_dir();
+        let allowed = root.join("allowed");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
+
+        let url = Url::from_file_path(allowed.join("link/secret.txt")).unwrap();
+        let err = error_text(client_for_root(&allowed).fetch(&url).await);
+
+        assert!(err.contains("outside the allowed file access roots"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -99,6 +99,10 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        if url.scheme() == "file" {
+            return self.http_client.fetch(url).await;
+        }
+
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
             return stealth.fetch(url).await;

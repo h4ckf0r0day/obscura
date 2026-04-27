@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
+use obscura_net::FileUrlPolicy;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -47,7 +48,10 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let context = Arc::new(BrowserContext::new("worker".to_string()));
+    let context = Arc::new(BrowserContext::new_with_file_url_policy(
+        "worker".to_string(),
+        file_url_policy_from_env(),
+    ));
     let mut page = Page::new("page-1".to_string(), context);
 
     let stdin = tokio::io::stdin();
@@ -134,5 +138,34 @@ async fn main() {
         out.push('\n');
         let _ = stdout.write_all(out.as_bytes()).await;
         let _ = stdout.flush().await;
+    }
+}
+
+fn file_url_policy_from_env() -> FileUrlPolicy {
+    const ALLOW_ALL_ENV: &str = "OBSCURA_ALLOW_ALL_FILE_URLS";
+    const ROOTS_ENV: &str = "OBSCURA_FILE_ACCESS_ROOTS_JSON";
+
+    if std::env::var(ALLOW_ALL_ENV).ok().as_deref() == Some("1") {
+        return FileUrlPolicy::AllowAll;
+    }
+
+    let Ok(roots_json) = std::env::var(ROOTS_ENV) else {
+        return FileUrlPolicy::Deny;
+    };
+
+    let roots = match serde_json::from_str::<Vec<String>>(&roots_json) {
+        Ok(roots) => roots,
+        Err(e) => {
+            eprintln!("Invalid {}: {}", ROOTS_ENV, e);
+            return FileUrlPolicy::Deny;
+        }
+    };
+
+    match FileUrlPolicy::allow_roots(roots.iter()) {
+        Ok(policy) => policy,
+        Err(e) => {
+            eprintln!("Invalid file access roots: {}", e);
+            FileUrlPolicy::Deny
+        }
     }
 }

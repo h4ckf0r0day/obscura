@@ -1,0 +1,7 @@
+.git
+.codex
+target
+**/target
+
+*.log
+*.tmp

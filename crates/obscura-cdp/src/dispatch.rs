@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
 use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+use obscura_net::FileUrlPolicy;
 use serde_json::json;
 
 use crate::domains;
@@ -39,10 +40,19 @@ impl CdpContext {
     }
 
     pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
-        let default_context = Arc::new(BrowserContext::with_options(
+        Self::new_with_options_and_file_url_policy(proxy, stealth, FileUrlPolicy::Deny)
+    }
+
+    pub fn new_with_options_and_file_url_policy(
+        proxy: Option<String>,
+        stealth: bool,
+        file_url_policy: FileUrlPolicy,
+    ) -> Self {
+        let default_context = Arc::new(BrowserContext::with_options_and_file_url_policy(
             "default".to_string(),
             proxy,
             stealth,
+            file_url_policy,
         ));
         CdpContext {
             pages: Vec::new(),
