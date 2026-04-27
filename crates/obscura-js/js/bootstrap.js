@@ -1201,7 +1201,11 @@ function _installWasmStreamingFallback() {
 _installWasmStreamingFallback();
 
 globalThis.fetch = async (input, init = {}) => {
-  let url = typeof input === "string" ? input : (input instanceof Request ? input.url : input?.url || "");
+  let url = typeof input === "string"
+    ? input
+    : (input instanceof Request
+      ? input.url
+      : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
     try {
       const base = _domParse("document_url") || "about:blank";
@@ -1505,7 +1509,8 @@ if (typeof Request === 'undefined') {
     constructor(input, init = {}) {
       if (typeof input === 'string') { this.url = input; }
       else if (input instanceof Request) { this.url = input.url; init = { ...input, ...init }; }
-      else { this.url = String(input); }
+      else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
+      else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(init.headers);
       this.body = init.body || null;
