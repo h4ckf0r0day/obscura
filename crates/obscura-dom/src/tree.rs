@@ -429,8 +429,20 @@ impl DomTree {
 
     pub fn text_content(&self, node_id: NodeId) -> String {
         let inner = self.inner.borrow();
+        if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+            match &node.data {
+                NodeData::Text { contents } | NodeData::Comment { contents } => {
+                    return contents.clone();
+                }
+                NodeData::ProcessingInstruction { data, .. } => {
+                    return data.clone();
+                }
+                _ => {}
+            }
+        }
+
         let mut result = String::new();
-        collect_text_inner(&inner, node_id, &mut result);
+        collect_text_descendants(&inner, node_id, &mut result);
         result
     }
 
@@ -532,19 +544,20 @@ impl DomTree {
     }
 }
 
-fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
+fn collect_text_descendants(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
     if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
-        match &node.data {
-            NodeData::Text { contents } | NodeData::Comment { contents } => buf.push_str(contents),
-            _ => {
-                let mut child = node.first_child;
-                while let Some(child_id) = child {
-                    collect_text_inner(inner, child_id, buf);
-                    child = inner.nodes.get(child_id.index())
-                        .and_then(|n| n.as_ref())
-                        .and_then(|n| n.next_sibling);
+        let mut child = node.first_child;
+        while let Some(child_id) = child {
+            if let Some(Some(child_node)) = inner.nodes.get(child_id.index()) {
+                match &child_node.data {
+                    NodeData::Text { contents } => buf.push_str(contents),
+                    NodeData::Comment { .. } | NodeData::ProcessingInstruction { .. } | NodeData::Doctype { .. } => {}
+                    _ => collect_text_descendants(inner, child_id, buf),
                 }
             }
+            child = inner.nodes.get(child_id.index())
+                .and_then(|n| n.as_ref())
+                .and_then(|n| n.next_sibling);
         }
     }
 }
