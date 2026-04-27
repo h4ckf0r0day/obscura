@@ -243,8 +243,7 @@ impl Page {
             .chain(async_scripts.into_iter())
             .collect();
 
-        let mut resolved: Vec<(usize, String)> = Vec::new();
-        let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
+        let client = self.http_client.clone();
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if let Some(src_url) = &script.src {
@@ -260,47 +259,21 @@ impl Page {
                     tracing::info!("Blocked script by interception: {}", full_url);
                     continue;
                 }
-                resolved.push((i, full_url.clone()));
-                fetch_tasks.push((i, full_url));
-            }
-        }
 
-        let client = self.http_client.clone();
-        let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
-            let url = url.clone();
-            let idx = *idx;
-            async move {
-                let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                let parsed = Url::parse(&full_url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
                 match client.fetch(&parsed).await {
-                    Ok(resp) => Some((idx, url, resp)),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch script {}: {}", url, e);
-                        None
-                    }
-                }
-            }
-        }).collect();
-
-        let fetch_results = futures::future::join_all(fetch_futures).await;
-
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
-        for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
-                let code = String::from_utf8_lossy(&resp.body).to_string();
-                fetched.insert(idx, (url, code, resp));
-            }
-        }
-
-        for (i, script) in all_to_execute.iter().enumerate() {
-            if script.src.is_some() {
-                if let Some((url, code, resp)) = fetched.remove(&i) {
-                    tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
-                    if let Some(js) = &mut self.js {
-                        if let Err(e) = js.execute_script_guarded(&url, &code) {
-                            tracing::warn!("Script error ({}): {}", url, e);
+                    Ok(resp) => {
+                        let code = String::from_utf8_lossy(&resp.body).to_string();
+                        tracing::info!("Executing script ({} bytes): {}", code.len(), full_url);
+                        self.record_network_event(&full_url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                        if let Some(js) = &mut self.js {
+                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
+                                tracing::warn!("Script error ({}): {}", full_url, e);
+                            }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch script {}: {}", full_url, e);
                     }
                 }
             } else if !script.inline.is_empty() {
