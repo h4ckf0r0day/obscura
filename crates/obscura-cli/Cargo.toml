@@ -17,6 +17,7 @@ stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 
 [dependencies]
 obscura-browser = { workspace = true }
+obscura-mcp = { workspace = true }
 obscura-cdp = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }

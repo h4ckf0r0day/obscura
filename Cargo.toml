@@ -6,6 +6,7 @@ members = [
     "crates/obscura-browser",
     "crates/obscura-cdp",
     "crates/obscura-js",
+    "crates/obscura-mcp",
     "crates/obscura-cli",
 ]
 
@@ -21,6 +22,7 @@ obscura-net = { path = "crates/obscura-net" }
 obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
+obscura-mcp = { path = "crates/obscura-mcp" }
 
 html5ever = "0.29"
 markup5ever = "0.14"
