@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
 use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+use obscura_net::CookieJar;
 use serde_json::json;
 
 use crate::domains;
@@ -39,10 +40,18 @@ impl CdpContext {
     }
 
     pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
-        let default_context = Arc::new(BrowserContext::with_options(
+        Self::new_with_jar(proxy, stealth, Arc::new(CookieJar::new()))
+    }
+
+    /// Build a context with a caller-supplied cookie jar so the server can
+    /// pre-load persisted cookies and keep a handle for graceful save on
+    /// shutdown.
+    pub fn new_with_jar(proxy: Option<String>, stealth: bool, cookie_jar: Arc<CookieJar>) -> Self {
+        let default_context = Arc::new(BrowserContext::with_options_and_jar(
             "default".to_string(),
             proxy,
             stealth,
+            cookie_jar,
         ));
         CdpContext {
             pages: Vec::new(),

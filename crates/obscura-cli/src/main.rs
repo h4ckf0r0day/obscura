@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,6 +47,11 @@ enum Command {
 
         #[arg(long, default_value_t = 1)]
         workers: u16,
+
+        /// Path to a JSON file used to persist cookies across runs. Loaded
+        /// on startup if present and saved on graceful shutdown (Ctrl+C).
+        #[arg(long, value_name = "PATH")]
+        cookie_store: Option<PathBuf>,
     },
 
     Fetch {
@@ -130,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
+        Some(Command::Serve { port, proxy, user_agent, stealth, workers, cookie_store }) => {
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -146,12 +152,20 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(not(feature = "stealth"))]
                 tracing::info!("Stealth mode enabled (tracker blocking)");
             }
+            if let Some(ref path) = cookie_store {
+                tracing::info!("Cookie store: {}", path.display());
+            }
 
             if workers > 1 {
+                if cookie_store.is_some() {
+                    tracing::warn!(
+                        "--cookie-store is ignored when --workers > 1; each worker would race the file"
+                    );
+                }
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth).await?;
             } else {
-                obscura_cdp::start_with_options(port, proxy, stealth).await?;
+                obscura_cdp::start_with_full_options(port, proxy, stealth, cookie_store).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
