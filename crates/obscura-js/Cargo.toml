@@ -20,3 +20,4 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 html5ever = { workspace = true }
 deno_error = "0.6"
+base64 = { workspace = true }

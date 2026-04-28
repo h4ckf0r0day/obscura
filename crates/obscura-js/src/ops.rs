@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 use deno_core::op2;
 use deno_core::OpState;
 use deno_core::Extension;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_net::{CookieJar, ObscuraHttpClient};
 use tokio::sync::Mutex;
@@ -517,16 +518,19 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_body = response
-        .text()
+    let resp_bytes = response
+        .bytes()
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+    let resp_body_base64 = BASE64.encode(&resp_bytes);
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
+        "bodyBase64": resp_body_base64,
         "url": url,
         "headers": resp_headers,
     })
@@ -551,11 +555,15 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
-            "Forbidden URL scheme '{}' - only http and https are allowed",
+            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
             scheme
         ));
+    }
+
+    if scheme == "file" {
+        return Ok(());
     }
 
     if let Some(host) = url.host() {

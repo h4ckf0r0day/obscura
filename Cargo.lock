@@ -1663,6 +1663,7 @@ name = "obscura-js"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "deno_core",
  "deno_error",
  "html5ever",

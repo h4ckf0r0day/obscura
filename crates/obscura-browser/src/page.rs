@@ -46,7 +46,12 @@ pub struct Page {
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
         let http_client = context.http_client.clone();
-        let frame_id = format!("{}.1", id);
+        // Chromium convention: the main frame's frameId == the targetId.
+        // Playwright's frame manager looks up the main frame by targetId
+        // (via target._targetInfo.targetId), so any divergence here makes
+        // Page.getFrameTree return a frame the client cannot match,
+        // triggering a Target.closeTarget and "Frame has been detached".
+        let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
             Some(Arc::new(StealthHttpClient::new(context.cookie_jar.clone())))
