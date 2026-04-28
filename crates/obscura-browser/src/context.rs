@@ -30,7 +30,18 @@ impl BrowserContext {
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
-        let cookie_jar = Arc::new(CookieJar::new());
+        Self::with_options_and_jar(id, proxy_url, stealth, Arc::new(CookieJar::new()))
+    }
+
+    /// Build a context using a caller-supplied cookie jar. Used to share a
+    /// pre-populated jar (e.g. loaded from disk) across the CDP server and
+    /// any shutdown hooks that need to persist it.
+    pub fn with_options_and_jar(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        cookie_jar: Arc<CookieJar>,
+    ) -> Self {
         let mut client = ObscuraHttpClient::with_options(
             cookie_jar.clone(),
             proxy_url.as_deref(),

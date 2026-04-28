@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use obscura_net::CookieJar;
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -32,6 +35,19 @@ pub async fn start_with_options(
     proxy: Option<String>,
     stealth: bool,
 ) -> anyhow::Result<()> {
+    start_with_full_options(port, proxy, stealth, None).await
+}
+
+/// Start the CDP server with all configurable options.
+///
+/// If `cookie_store` is `Some(path)`, cookies are loaded from that path on
+/// startup (missing file is fine) and saved back on Ctrl+C / SIGTERM.
+pub async fn start_with_full_options(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+    cookie_store: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(&addr).await?;
 
@@ -41,39 +57,72 @@ pub async fn start_with_options(
         port
     );
 
+    let cookie_jar = Arc::new(CookieJar::new());
+    if let Some(ref path) = cookie_store {
+        match cookie_jar.load_from_path(path) {
+            Ok(0) => info!("Cookie store {} not present yet", path.display()),
+            Ok(n) => info!("Loaded {} cookies from {}", n, path.display()),
+            Err(e) => warn!("Failed to load cookie store {}: {}", path.display(), e),
+        }
+    }
+
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth));
+            let _processor_handle = tokio::task::spawn_local(cdp_processor(
+                msg_rx,
+                proxy,
+                stealth,
+                cookie_jar.clone(),
+            ));
 
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer_addr)) => {
-                        info!("New connection from {}", peer_addr);
-                        let tx = msg_tx.clone();
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(stream, port, tx).await {
-                                if !format!("{}", e).contains("close") {
-                                    error!("Connection error from {}: {}", peer_addr, e);
+            let accept_loop = async {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, peer_addr)) => {
+                            info!("New connection from {}", peer_addr);
+                            let tx = msg_tx.clone();
+                            tokio::task::spawn_local(async move {
+                                if let Err(e) = handle_connection(stream, port, tx).await {
+                                    if !format!("{}", e).contains("close") {
+                                        error!("Connection error from {}: {}", peer_addr, e);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
+                        Err(e) => error!("Accept error: {}", e),
                     }
-                    Err(e) => error!("Accept error: {}", e),
+                }
+            };
+
+            tokio::select! {
+                _ = accept_loop => {}
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Ctrl+C received, shutting down");
+                }
+            }
+
+            if let Some(ref path) = cookie_store {
+                match cookie_jar.save_to_path(path) {
+                    Ok(()) => info!("Saved cookies to {}", path.display()),
+                    Err(e) => error!("Failed to save cookie store {}: {}", path.display(), e),
                 }
             }
         })
-        .await
+        .await;
+
+    Ok(())
 }
 
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
     stealth: bool,
+    cookie_jar: Arc<CookieJar>,
 ) {
-    let mut ctx = CdpContext::new_with_options(proxy, stealth);
+    let mut ctx = CdpContext::new_with_jar(proxy, stealth, cookie_jar);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
