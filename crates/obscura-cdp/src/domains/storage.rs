@@ -45,7 +45,11 @@ pub async fn handle(
                         Some(n) => n.to_string(),
                         None => continue,
                     };
-                    let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let value = c
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
 
                     let domain = c
                         .get("domain")
@@ -72,10 +76,8 @@ pub async fn handle(
                         .and_then(|v| v.as_str())
                         .unwrap_or("/")
                         .to_string();
-                    let secure =
-                        c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let http_only =
-                        c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let secure = c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let http_only = c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false);
 
                     ctx.default_context.cookie_jar.set_cookies_from_cdp(vec![
                         obscura_net::CookieInfo {
@@ -106,9 +108,7 @@ pub async fn handle(
                 .unwrap_or_default();
 
             if !name.is_empty() {
-                ctx.default_context
-                    .cookie_jar
-                    .delete_cookie(name, &domain);
+                ctx.default_context.cookie_jar.delete_cookie(name, &domain);
             }
             Ok(json!({}))
         }

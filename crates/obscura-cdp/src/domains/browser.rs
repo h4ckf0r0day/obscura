@@ -9,9 +9,7 @@ pub async fn handle(method: &str, _params: &Value) -> Result<Value, String> {
             "userAgent": "Obscura/0.1.0 (Headless Browser)",
             "jsVersion": "N/A",
         })),
-        "close" => {
-            Ok(json!({}))
-        }
+        "close" => Ok(json!({})),
         "getWindowForTarget" => Ok(json!({
             "windowId": 1,
             "bounds": {

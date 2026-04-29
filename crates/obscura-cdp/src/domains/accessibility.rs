@@ -22,12 +22,8 @@ pub async fn handle(
     match method {
         "enable" => Ok(json!({})),
         "getFullAXTree" => {
-            let page = ctx
-                .get_session_page(session_id)
-                .ok_or("No page")?;
-            let nodes = page
-                .with_dom(|dom| build_ax_nodes(dom))
-                .unwrap_or_default();
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let nodes = page.with_dom(|dom| build_ax_nodes(dom)).unwrap_or_default();
             Ok(json!({ "nodes": nodes }))
         }
         _ => Ok(json!({})),
@@ -182,8 +178,7 @@ fn map_role(data: &NodeData) -> &'static str {
                 "textarea" => "textbox",
                 "select" => {
                     if attrs.iter().any(|a| {
-                        a.name.local.as_ref() == "multiple"
-                            || a.name.local.as_ref() == "size"
+                        a.name.local.as_ref() == "multiple" || a.name.local.as_ref() == "size"
                     }) {
                         "listbox"
                     } else {
@@ -210,17 +205,16 @@ fn map_role(data: &NodeData) -> &'static str {
                 "section" => "region",
                 "figure" => "figure",
                 "figcaption" => "StaticText",
-                "p" | "div" | "span" | "pre" | "blockquote" | "code"
-                | "em" | "strong" | "b" | "i" | "u" | "s" | "small"
-                | "sub" | "sup" | "mark" | "del" | "ins" => "generic",
+                "p" | "div" | "span" | "pre" | "blockquote" | "code" | "em" | "strong" | "b"
+                | "i" | "u" | "s" | "small" | "sub" | "sup" | "mark" | "del" | "ins" => "generic",
                 "iframe" => "Iframe",
                 _ => "generic",
             }
         }
         NodeData::Text { .. } => "StaticText",
-        NodeData::Doctype { .. } | NodeData::Comment { .. } | NodeData::ProcessingInstruction { .. } => {
-            ""
-        }
+        NodeData::Doctype { .. }
+        | NodeData::Comment { .. }
+        | NodeData::ProcessingInstruction { .. } => "",
     }
 }
 
@@ -337,7 +331,8 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         }
 
         // editable
-        if tag == "input" || tag == "textarea"
+        if tag == "input"
+            || tag == "textarea"
             || attrs
                 .iter()
                 .any(|a| a.name.local.as_ref() == "contenteditable" && a.value != "false")
@@ -346,18 +341,12 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         }
 
         // checked for checkboxes/radios
-        if attrs
-            .iter()
-            .any(|a| a.name.local.as_ref() == "checked")
-        {
+        if attrs.iter().any(|a| a.name.local.as_ref() == "checked") {
             props.push(json!({"name": "checked", "value": {"type": "boolean", "value": true}}));
         }
 
         // disabled
-        if attrs
-            .iter()
-            .any(|a| a.name.local.as_ref() == "disabled")
-        {
+        if attrs.iter().any(|a| a.name.local.as_ref() == "disabled") {
             props.push(json!({"name": "disabled", "value": {"type": "boolean", "value": true}}));
         }
 
@@ -369,10 +358,9 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         }
 
         // required
-        if attrs
-            .iter()
-            .any(|a| a.name.local.as_ref() == "required" || a.name.local.as_ref() == "aria-required")
-        {
+        if attrs.iter().any(|a| {
+            a.name.local.as_ref() == "required" || a.name.local.as_ref() == "aria-required"
+        }) {
             props.push(json!({"name": "required", "value": {"type": "boolean", "value": true}}));
         }
 

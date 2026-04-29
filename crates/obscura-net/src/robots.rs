@@ -20,7 +20,10 @@ impl RobotsCache {
 
     pub fn parse_and_store(&self, domain: &str, body: &str, our_agent: &str) {
         let rules = parse_robots_txt(body, our_agent);
-        self.cache.write().unwrap().insert(domain.to_string(), rules);
+        self.cache
+            .write()
+            .unwrap()
+            .insert(domain.to_string(), rules);
     }
 
     pub fn is_allowed(&self, domain: &str, path: &str) -> bool {
@@ -97,7 +100,9 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
 
         for line in body.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             if let Some((key, value)) = line.split_once(':') {
                 let key = key.trim().to_lowercase();
                 let value = value.trim();
@@ -117,7 +122,10 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
         }
     }
 
-    RobotsRules { disallowed, allowed }
+    RobotsRules {
+        disallowed,
+        allowed,
+    }
 }
 
 fn path_matches(path: &str, pattern: &str) -> bool {

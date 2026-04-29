@@ -9,8 +9,8 @@ use selectors::matching::{
     NeedsSelectorFlags,
 };
 use selectors::parser::{self, ParseRelative, SelectorParseErrorKind};
-use selectors::{Element, OpaqueElement, SelectorList};
 use selectors::visitor::SelectorVisitor;
+use selectors::{Element, OpaqueElement, SelectorList};
 
 use crate::tree::{DomTree, NodeData, NodeId};
 
@@ -311,20 +311,26 @@ impl<'a> Element for DomElement<'a> {
     fn has_namespace(&self, ns: &CssNamespace) -> bool {
         self.tree
             .with_node(self.node_id, |n| {
-                n.as_element()
-                    .map(|name| name.ns == ns.0)
-                    .unwrap_or(false)
+                n.as_element().map(|name| name.ns == ns.0).unwrap_or(false)
             })
             .unwrap_or(false)
     }
 
     fn is_same_type(&self, other: &Self) -> bool {
-        let self_name = self.tree.with_node(self.node_id, |n| {
-            n.as_element().map(|name| (name.local.clone(), name.ns.clone()))
-        }).flatten();
-        let other_name = self.tree.with_node(other.node_id, |n| {
-            n.as_element().map(|name| (name.local.clone(), name.ns.clone()))
-        }).flatten();
+        let self_name = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element()
+                    .map(|name| (name.local.clone(), name.ns.clone()))
+            })
+            .flatten();
+        let other_name = self
+            .tree
+            .with_node(other.node_id, |n| {
+                n.as_element()
+                    .map(|name| (name.local.clone(), name.ns.clone()))
+            })
+            .flatten();
         match (self_name, other_name) {
             (Some((al, ans)), Some((bl, bns))) => al == bl && ans == bns,
             _ => false,
@@ -362,10 +368,9 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 node.attrs()
                     .map(|attrs| {
-                        attrs.iter().any(|a| {
-                            a.name.ns == html5ever::ns!()
-                                && a.name.local == local_name.0
-                        })
+                        attrs
+                            .iter()
+                            .any(|a| a.name.ns == html5ever::ns!() && a.name.local == local_name.0)
                     })
                     .unwrap_or(false)
             })
@@ -574,8 +579,7 @@ mod tests {
 
     #[test]
     fn test_query_selector_class() {
-        let tree =
-            parse_html(r#"<div class="foo bar">Content</div><div class="baz">Other</div>"#);
+        let tree = parse_html(r#"<div class="foo bar">Content</div><div class="baz">Other</div>"#);
         let result = tree.query_selector(".foo").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -598,8 +602,7 @@ mod tests {
 
     #[test]
     fn test_query_selector_descendant() {
-        let tree =
-            parse_html(r#"<div id="outer"><div id="inner"><span>Target</span></div></div>"#);
+        let tree = parse_html(r#"<div id="outer"><div id="inner"><span>Target</span></div></div>"#);
         let result = tree.query_selector("#outer span").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -608,9 +611,8 @@ mod tests {
 
     #[test]
     fn test_query_selector_attribute() {
-        let tree = parse_html(
-            r#"<input type="text" name="user"><input type="password" name="pass">"#,
-        );
+        let tree =
+            parse_html(r#"<input type="text" name="user"><input type="password" name="pass">"#);
         let result = tree.query_selector(r#"input[type="password"]"#).unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();

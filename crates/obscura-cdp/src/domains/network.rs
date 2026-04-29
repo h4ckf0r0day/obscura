@@ -24,7 +24,10 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
+            let ua = params
+                .get("userAgent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some(page) = ctx.get_session_page(session_id) {
                 page.http_client.set_user_agent(ua).await;
             }
@@ -33,37 +36,51 @@ pub async fn handle(
         "getCookies" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let cookies = page.context.cookie_jar.get_all_cookies();
-            let cdp_cookies: Vec<Value> = cookies.iter().map(|c| {
-                json!({
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain,
-                    "path": c.path,
-                    "expires": -1,
-                    "size": c.name.len() + c.value.len(),
-                    "httpOnly": c.http_only,
-                    "secure": c.secure,
-                    "session": true,
-                    "sameParty": false,
-                    "sourceScheme": "Secure",
-                    "sourcePort": 443,
+            let cdp_cookies: Vec<Value> = cookies
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name,
+                        "value": c.value,
+                        "domain": c.domain,
+                        "path": c.path,
+                        "expires": -1,
+                        "size": c.name.len() + c.value.len(),
+                        "httpOnly": c.http_only,
+                        "secure": c.secure,
+                        "session": true,
+                        "sameParty": false,
+                        "sourceScheme": "Secure",
+                        "sourcePort": 443,
+                    })
                 })
-            }).collect();
+                .collect();
             Ok(json!({ "cookies": cdp_cookies }))
         }
         "setCookies" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
-                let cookie_infos: Vec<obscura_net::CookieInfo> = cookies.iter().filter_map(|c| {
-                    Some(obscura_net::CookieInfo {
-                        name: c.get("name")?.as_str()?.to_string(),
-                        value: c.get("value")?.as_str()?.to_string(),
-                        domain: c.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        path: c.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string(),
-                        secure: c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false),
-                        http_only: c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+                let cookie_infos: Vec<obscura_net::CookieInfo> = cookies
+                    .iter()
+                    .filter_map(|c| {
+                        Some(obscura_net::CookieInfo {
+                            name: c.get("name")?.as_str()?.to_string(),
+                            value: c.get("value")?.as_str()?.to_string(),
+                            domain: c
+                                .get("domain")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            path: c
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("/")
+                                .to_string(),
+                            secure: c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false),
+                            http_only: c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+                        })
                     })
-                }).collect();
+                    .collect();
                 page.context.cookie_jar.set_cookies_from_cdp(cookie_infos);
             }
             Ok(json!({}))

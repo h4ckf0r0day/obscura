@@ -54,7 +54,8 @@ impl DomTree {
                 }
             }
             NodeData::Text { contents } => {
-                let parent_is_raw = node.parent
+                let parent_is_raw = node
+                    .parent
                     .and_then(|pid| {
                         self.with_node(pid, |p| {
                             p.as_element()
@@ -116,8 +117,20 @@ fn escape_attr(s: &str, buf: &mut String) {
 fn is_void_element(tag: &str) -> bool {
     matches!(
         tag,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
-            | "param" | "source" | "track" | "wbr"
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
     )
 }
 

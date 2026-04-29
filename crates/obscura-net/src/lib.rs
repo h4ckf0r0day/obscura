@@ -1,17 +1,17 @@
+pub mod blocklist;
 pub mod client;
 pub mod cookies;
 pub mod interceptor;
 pub mod robots;
-pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod stealth_client;
 
+pub use blocklist::is_blocked as is_tracker_blocked;
 pub use client::{ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType, Response};
 pub use cookies::{CookieInfo, CookieJar};
 pub use robots::RobotsCache;
-pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
-pub use stealth_client::{StealthHttpClient, STEALTH_USER_AGENT, Ja3Fingerprint, Ja4Fingerprint};
+pub use stealth_client::{Ja3Fingerprint, Ja4Fingerprint, StealthHttpClient, STEALTH_USER_AGENT};
 
 /// Helper to create a reqwest::ClientBuilder with the correct TLS provider (BoringSSL if enabled)
 pub fn create_client_builder() -> reqwest::ClientBuilder {
@@ -19,8 +19,8 @@ pub fn create_client_builder() -> reqwest::ClientBuilder {
 
     #[cfg(feature = "stealth")]
     {
-        use std::sync::Arc;
         use bssl_rustls_adapters::CryptoProviderBuilder;
+        use std::sync::Arc;
         use webpki_roots;
 
         let provider = CryptoProviderBuilder::full();

@@ -45,10 +45,7 @@ impl BrowserContext {
         ja4: Option<String>,
     ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
-        let mut client = ObscuraHttpClient::with_options(
-            cookie_jar.clone(),
-            proxy_url.as_deref(),
-        );
+        let mut client = ObscuraHttpClient::with_options(cookie_jar.clone(), proxy_url.as_deref());
         if stealth {
             client.block_trackers = true;
         }

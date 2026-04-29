@@ -17,41 +17,61 @@ pub async fn handle(
             page.with_dom(|dom| {
                 let node = serialize_node(dom, dom.document(), depth as u32, 0);
                 json!({ "root": node })
-            }).ok_or_else(|| "No DOM loaded".to_string())
+            })
+            .ok_or_else(|| "No DOM loaded".to_string())
         }
         "querySelector" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
-            let result = page.with_dom(|dom| {
-                dom.query_selector(selector).ok().flatten().map(|id| id.index()).unwrap_or(0)
-            }).unwrap_or(0);
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or("selector required")?;
+            let result = page
+                .with_dom(|dom| {
+                    dom.query_selector(selector)
+                        .ok()
+                        .flatten()
+                        .map(|id| id.index())
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
             Ok(json!({ "nodeId": result }))
         }
         "querySelectorAll" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
-            let ids = page.with_dom(|dom| {
-                dom.query_selector_all(selector).ok()
-                    .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            }).unwrap_or_default();
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or("selector required")?;
+            let ids = page
+                .with_dom(|dom| {
+                    dom.query_selector_all(selector)
+                        .ok()
+                        .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
             Ok(json!({ "nodeIds": ids }))
         }
         "getOuterHTML" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
+            let node_id = params
+                .get("nodeId")
+                .and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
                 .ok_or("nodeId required")?;
-            let html = page.with_dom(|dom| {
-                dom.outer_html(NodeId::new(node_id as u32))
-            }).unwrap_or_default();
+            let html = page
+                .with_dom(|dom| dom.outer_html(NodeId::new(node_id as u32)))
+                .unwrap_or_default();
             Ok(json!({ "outerHTML": html }))
         }
         "describeNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
 
-            let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
+            let node_id = if let Some(nid) = params
+                .get("nodeId")
+                .and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
             {
                 nid
@@ -67,14 +87,16 @@ pub async fn handle(
                 return Err("nodeId or objectId required".to_string());
             };
 
-            let node = page.with_dom(|dom| {
-                serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0)
-            }).unwrap_or(json!(null));
+            let node = page
+                .with_dom(|dom| serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0))
+                .unwrap_or(json!(null));
             Ok(json!({ "node": node }))
         }
         "resolveNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
+            let node_id = if let Some(nid) = params
+                .get("nodeId")
+                .and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
             {
                 nid
@@ -137,17 +159,15 @@ pub async fn handle(
         }
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
-        "getBoxModel" => {
-            Ok(json!({
-                "model": {
-                    "content": [8,8, 108,8, 108,28, 8,28],
-                    "padding": [8,8, 108,8, 108,28, 8,28],
-                    "border": [8,8, 108,8, 108,28, 8,28],
-                    "margin": [0,0, 116,0, 116,36, 0,36],
-                    "width": 100, "height": 20,
-                }
-            }))
-        }
+        "getBoxModel" => Ok(json!({
+            "model": {
+                "content": [8,8, 108,8, 108,28, 8,28],
+                "padding": [8,8, 108,8, 108,28, 8,28],
+                "border": [8,8, 108,8, 108,28, 8,28],
+                "margin": [0,0, 116,0, 116,36, 0,36],
+                "width": 100, "height": 20,
+            }
+        })),
         _ => Err(format!("Unknown DOM method: {}", method)),
     }
 }
@@ -163,41 +183,62 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
 
     match &node.data {
         NodeData::Document => {
-            result["nodeType"] = json!(9); result["nodeName"] = json!("#document");
-            result["localName"] = json!(""); result["nodeValue"] = json!("");
-            result["documentURL"] = json!(""); result["baseURL"] = json!(""); result["xmlVersion"] = json!("");
+            result["nodeType"] = json!(9);
+            result["nodeName"] = json!("#document");
+            result["localName"] = json!("");
+            result["nodeValue"] = json!("");
+            result["documentURL"] = json!("");
+            result["baseURL"] = json!("");
+            result["xmlVersion"] = json!("");
         }
-        NodeData::Doctype { name, public_id, system_id } => {
-            result["nodeType"] = json!(10); result["nodeName"] = json!(name);
-            result["localName"] = json!(""); result["nodeValue"] = json!("");
-            result["publicId"] = json!(public_id); result["systemId"] = json!(system_id);
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => {
+            result["nodeType"] = json!(10);
+            result["nodeName"] = json!(name);
+            result["localName"] = json!("");
+            result["nodeValue"] = json!("");
+            result["publicId"] = json!(public_id);
+            result["systemId"] = json!(system_id);
         }
         NodeData::Element { name, attrs, .. } => {
             result["nodeType"] = json!(1);
             result["nodeName"] = json!(name.local.as_ref().to_ascii_uppercase());
             result["localName"] = json!(name.local.as_ref());
             result["nodeValue"] = json!("");
-            let cdp_attrs: Vec<String> = attrs.iter()
-                .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()]).collect();
+            let cdp_attrs: Vec<String> = attrs
+                .iter()
+                .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()])
+                .collect();
             result["attributes"] = json!(cdp_attrs);
         }
         NodeData::Text { contents } => {
-            result["nodeType"] = json!(3); result["nodeName"] = json!("#text");
-            result["localName"] = json!(""); result["nodeValue"] = json!(contents);
+            result["nodeType"] = json!(3);
+            result["nodeName"] = json!("#text");
+            result["localName"] = json!("");
+            result["nodeValue"] = json!(contents);
         }
         NodeData::Comment { contents } => {
-            result["nodeType"] = json!(8); result["nodeName"] = json!("#comment");
-            result["localName"] = json!(""); result["nodeValue"] = json!(contents);
+            result["nodeType"] = json!(8);
+            result["nodeName"] = json!("#comment");
+            result["localName"] = json!("");
+            result["nodeValue"] = json!(contents);
         }
         NodeData::ProcessingInstruction { target, data } => {
-            result["nodeType"] = json!(7); result["nodeName"] = json!(target);
-            result["localName"] = json!(""); result["nodeValue"] = json!(data);
+            result["nodeType"] = json!(7);
+            result["nodeName"] = json!(target);
+            result["localName"] = json!("");
+            result["nodeValue"] = json!(data);
         }
     }
 
     if current_depth < max_depth && !children_ids.is_empty() {
-        let children: Vec<Value> = children_ids.iter()
-            .map(|&cid| serialize_node(dom, cid, max_depth, current_depth + 1)).collect();
+        let children: Vec<Value> = children_ids
+            .iter()
+            .map(|&cid| serialize_node(dom, cid, max_depth, current_depth + 1))
+            .collect();
         result["children"] = json!(children);
     }
     result

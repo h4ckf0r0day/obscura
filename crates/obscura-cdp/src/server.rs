@@ -48,7 +48,8 @@ pub async fn start_with_options(
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, ja3, ja4));
+            let processor_handle =
+                tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, ja3, ja4));
 
             loop {
                 match listener.accept().await {
@@ -80,16 +81,17 @@ async fn cdp_processor(
     let mut ctx = CdpContext::new_with_options(proxy, stealth, ja3, ja4);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
-    let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> =
+        Some(irx);
+    let mut intercepted_paused: HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    > = HashMap::new();
 
     while let Some(msg) = rx.recv().await {
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
-                let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
-                );
+                let _ = reply_tx.send(json!({"__init": true}).to_string());
             }
             ServerMessage::Cdp(cdp_msg) => {
                 let is_navigation = cdp_msg.text.contains("Page.navigate");
@@ -97,18 +99,27 @@ async fn cdp_processor(
 
                 if is_navigation && has_interception {
                     process_with_interception(
-                        &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused,
-                    ).await;
+                        &cdp_msg.text,
+                        &mut ctx,
+                        &cdp_msg.reply_tx,
+                        &mut rx,
+                        &mut intercept_rx,
+                        &mut intercepted_paused,
+                    )
+                    .await;
                 } else {
                     if cdp_msg.text.contains("Fetch.") {
-                        handle_fetch_resolution(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut intercepted_paused);
+                        handle_fetch_resolution(
+                            &cdp_msg.text,
+                            &mut ctx,
+                            &cdp_msg.reply_tx,
+                            &mut intercepted_paused,
+                        );
                     }
                     process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
                 }
             }
         }
-
     }
 }
 
@@ -116,33 +127,74 @@ fn handle_fetch_resolution(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    >,
 ) {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
-        let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
+        let request_id = req
+            .params
+            .get("requestId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        tracing::info!(
+            "INTERCEPTION resolution: {} for {}, paused_count={}",
+            method,
+            request_id,
+            intercepted_paused.len()
+        );
 
         if let Some(resolver) = intercepted_paused.remove(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
                 "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
-                    url: None, method: None, headers: None, body: None,
+                    url: None,
+                    method: None,
+                    headers: None,
+                    body: None,
                 },
                 "Fetch.fulfillRequest" => {
-                    let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-                    let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = req
+                        .params
+                        .get("responseCode")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(200) as u16;
+                    let raw_body = req
+                        .params
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let body = decode_base64(raw_body);
-                    let headers = req.params.get("responseHeaders")
+                    let headers = req
+                        .params
+                        .get("responseHeaders")
                         .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|h| {
+                                    Some((
+                                        h.get("name")?.as_str()?.to_string(),
+                                        h.get("value")?.as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    obscura_js::ops::InterceptResolution::Fulfill {
+                        status,
+                        headers,
+                        body,
+                    }
                 }
                 "Fetch.failRequest" => {
-                    let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
+                    let reason = req
+                        .params
+                        .get("errorReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Failed")
+                        .to_string();
                     obscura_js::ops::InterceptResolution::Fail { reason }
                 }
                 _ => return,
@@ -162,7 +214,10 @@ async fn process_with_interception(
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<
+        String,
+        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    >,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -198,7 +253,9 @@ async fn process_with_interception(
     };
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let wait_until = req.params.get("waitUntil")
+    let wait_until = req
+        .params
+        .get("waitUntil")
         .and_then(|v| {
             if let Some(s) = v.as_str() {
                 Some(obscura_browser::WaitUntil::from_str(s))
@@ -228,11 +285,15 @@ async fn process_with_interception(
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
+    let (nav_done_tx, mut nav_done_rx) =
+        mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
     let url_owned = url.to_string();
 
     tokio::task::spawn_local(async move {
-        let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
+        let result = page
+            .navigate_with_wait(&url_owned, wait_until)
+            .await
+            .map_err(|e| e.to_string());
         for source in &preload_scripts {
             if let Err(e) = page.execute_preload_script(source) {
                 tracing::debug!("Preload script error: {}", e);
@@ -353,43 +414,112 @@ async fn process_with_interception(
         let _ = reply_tx.send(json);
     }
 
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     let es = session_for_events;
 
     for event in [
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id_for_events), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
+        crate::types::CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Runtime.executionContextsCleared".into(),
+            params: json!({}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id_for_events), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}),
+            session_id: es.clone(),
+        },
     ] {
-        if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
     }
 
     for net_event in &network_events {
         for event in [
-            crate::types::CdpEvent { method: "Network.requestWillBeSent".into(), params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}), session_id: es.clone() },
-            crate::types::CdpEvent { method: "Network.responseReceived".into(), params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": ""}, "frameId": frame_id}), session_id: es.clone() },
-            crate::types::CdpEvent { method: "Network.loadingFinished".into(), params: json!({"requestId": net_event.request_id, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}), session_id: es.clone() },
+            crate::types::CdpEvent {
+                method: "Network.requestWillBeSent".into(),
+                params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                session_id: es.clone(),
+            },
+            crate::types::CdpEvent {
+                method: "Network.responseReceived".into(),
+                params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": ""}, "frameId": frame_id}),
+                session_id: es.clone(),
+            },
+            crate::types::CdpEvent {
+                method: "Network.loadingFinished".into(),
+                params: json!({"requestId": net_event.request_id, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
+                session_id: es.clone(),
+            },
         ] {
-            if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = reply_tx.send(json);
+            }
         }
     }
 
     for event in [
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+        crate::types::CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Page.domContentEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        crate::types::CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: es.clone(),
+        },
     ] {
-        if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
     }
     if reached_network_idle {
-        let idle_event = crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() };
-        if let Ok(json) = serde_json::to_string(&idle_event) { let _ = reply_tx.send(json); }
+        let idle_event = crate::types::CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}),
+            session_id: es.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&idle_event) {
+            let _ = reply_tx.send(json);
+        }
     }
-    let stop_event = crate::types::CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es };
-    if let Ok(json) = serde_json::to_string(&stop_event) { let _ = reply_tx.send(json); }
+    let stop_event = crate::types::CdpEvent {
+        method: "Page.frameStoppedLoading".into(),
+        params: json!({"frameId": frame_id}),
+        session_id: es,
+    };
+    if let Ok(json) = serde_json::to_string(&stop_event) {
+        let _ = reply_tx.send(json);
+    }
 }
 
 async fn process_cdp_message(
@@ -405,7 +535,12 @@ async fn process_cdp_message(
         }
     };
 
-    tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
+    tracing::debug!(
+        "CDP: {} (id={}, s={:?})",
+        req.method,
+        req.id,
+        req.session_id
+    );
 
     let response = dispatch::dispatch(&req, ctx).await;
 
@@ -426,7 +561,12 @@ async fn process_cdp_message(
     }
 
     if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
-        tracing::info!("JS-triggered nav: {} {} (body: {} bytes)", nav_method, nav_url, nav_body.len());
+        tracing::info!(
+            "JS-triggered nav: {} {} (body: {} bytes)",
+            nav_method,
+            nav_url,
+            nav_body.len()
+        );
         let nav_req = CdpRequest {
             id: 0,
             method: "Page.navigate".to_string(),
@@ -463,8 +603,12 @@ fn decode_base64(input: &str) -> String {
             chunk.get(3).copied().unwrap_or(0),
         ];
         out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
+        if chunk.len() > 2 {
+            out.push((b[1] << 4) | (b[2] >> 2));
+        }
+        if chunk.len() > 3 {
+            out.push((b[2] << 6) | b[3]);
+        }
     }
     String::from_utf8_lossy(&out).to_string()
 }
@@ -473,29 +617,37 @@ fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     let result = match req.method.as_str() {
-        "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
-        "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
-        "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled" |
-        "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
-        "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
-        "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
-        "Target.setAutoAttach" => {
-            Some(json!({}))
-        }
-        "Browser.getVersion" => {
-            Some(json!({
-                "protocolVersion": "1.3",
-                "product": "Obscura/0.1.0",
-                "revision": "0",
-                "userAgent": "Obscura/0.1.0",
-                "jsVersion": "V8",
-            }))
-        }
-        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
-            Some(json!({}))
-        }
+        "Network.enable"
+        | "Network.setCacheDisabled"
+        | "Network.setRequestInterception"
+        | "Page.enable"
+        | "Page.setLifecycleEventsEnabled"
+        | "Page.setInterceptFileChooserDialog"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Runtime.discardConsoleEntries"
+        | "Performance.enable"
+        | "Log.enable"
+        | "Security.enable"
+        | "Emulation.setDeviceMetricsOverride"
+        | "Emulation.setTouchEmulationEnabled"
+        | "CSS.enable"
+        | "Accessibility.enable"
+        | "ServiceWorker.enable"
+        | "Inspector.enable"
+        | "Debugger.enable"
+        | "Profiler.enable"
+        | "HeapProfiler.enable"
+        | "Overlay.enable"
+        | "Storage.enable"
+        | "Target.setAutoAttach" => Some(json!({})),
+        "Browser.getVersion" => Some(json!({
+            "protocolVersion": "1.3",
+            "product": "Obscura/0.1.0",
+            "revision": "0",
+            "userAgent": "Obscura/0.1.0",
+            "jsVersion": "V8",
+        })),
+        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => Some(json!({})),
         _ => None,
     };
 
@@ -507,10 +659,11 @@ fn fast_path_response(text: &str) -> Option<String> {
     }
 }
 
-fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
-    let page_id = session_id
-        .as_ref()
-        .and_then(|sid| ctx.sessions.get(sid))?;
+fn check_pending_navigation(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+) -> Option<(String, String, String)> {
+    let page_id = session_id.as_ref().and_then(|sid| ctx.sessions.get(sid))?;
     let page = ctx.pages.iter().find(|p| &p.id == page_id)?;
     page.take_pending_navigation()
 }
@@ -530,7 +683,10 @@ async fn handle_connection(
 
         if line.contains("/json/version") {
             return handle_http_json(stream, port, "version").await;
-        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
+        } else if line.contains("/json/list")
+            || line.contains("/json\r\n")
+            || line.contains("/json HTTP")
+        {
             return handle_http_json(stream, port, "list").await;
         } else if line.contains("/json/protocol") {
             return handle_http_json(stream, port, "protocol").await;

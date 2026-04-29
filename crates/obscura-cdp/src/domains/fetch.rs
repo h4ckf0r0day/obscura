@@ -118,10 +118,19 @@ pub async fn handle(
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
-                    url: params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    url: params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    method: params
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     headers: None,
-                    post_data: params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    post_data: params
+                        .get("postData")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 });
             }
             Ok(json!({}))
@@ -181,9 +190,7 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "getResponseBody" => {
-            Ok(json!({ "body": "", "base64Encoded": false }))
-        }
+        "getResponseBody" => Ok(json!({ "body": "", "base64Encoded": false })),
         _ => Err(format!("Unknown Fetch method: {}", method)),
     }
 }
