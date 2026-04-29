@@ -3,10 +3,6 @@ name = "obscura-net"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-stealth = ["wreq", "wreq-util"]
-
 [dependencies]
 reqwest = { workspace = true }
 tokio = { workspace = true }
@@ -16,5 +12,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
-wreq = { version = "6.0.0-rc.28", optional = true, features = ["prefix-symbols"] }
-wreq-util = { version = "3.0.0-rc.10", optional = true }
+bssl-rustls-adapters = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+bssl-crypto = { workspace = true, optional = true }
+
+[features]
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls"]
+stealth = ["bssl-rustls-adapters", "rustls", "webpki-roots", "bssl-crypto"]

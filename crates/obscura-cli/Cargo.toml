@@ -12,7 +12,6 @@ name = "obscura-worker"
 path = "src/worker.rs"
 
 [features]
-default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 
 [dependencies]
@@ -29,3 +28,5 @@ anyhow = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rustls = { workspace = true, default-features = false }
+bssl-rustls-adapters = { workspace = true }

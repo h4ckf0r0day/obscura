@@ -27,6 +27,12 @@ struct Args {
 
     #[arg(long)]
     user_agent: Option<String>,
+
+    #[arg(long)]
+    ja3: Option<String>,
+
+    #[arg(long)]
+    ja4: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +49,12 @@ enum Command {
 
         #[arg(long)]
         stealth: bool,
+
+        #[arg(long)]
+        ja3: Option<String>,
+
+        #[arg(long)]
+        ja4: Option<String>,
 
         #[arg(long, default_value_t = 1)]
         workers: u16,
@@ -68,6 +80,12 @@ enum Command {
 
         #[arg(long)]
         stealth: bool,
+
+        #[arg(long)]
+        ja3: Option<String>,
+
+        #[arg(long)]
+        ja4: Option<String>,
 
         #[arg(long, short)]
         eval: Option<String>,
@@ -129,8 +147,14 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    #[cfg(feature = "stealth")]
+    {
+        let provider = bssl_rustls_adapters::CryptoProviderBuilder::full();
+        let _ = rustls::crypto::CryptoProvider::install_default(provider);
+    }
+
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
+        Some(Command::Serve { port, proxy, user_agent, stealth, ja3, ja4, workers }) => {
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -149,13 +173,13 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, workers, proxy, stealth).await?;
+                run_multi_worker_serve(port, workers, proxy, stealth, ja3, ja4).await?;
             } else {
-                obscura_cdp::start_with_options(port, proxy, stealth).await?;
+                obscura_cdp::start_with_options(port, proxy, stealth, ja3, ja4).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, &wait_until, user_agent, stealth, eval, quiet).await?;
+        Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, ja3, ja4, eval, quiet }) => {
+            run_fetch(&url, dump, selector, wait, &wait_until, user_agent, stealth, ja3, ja4, eval, quiet).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
             run_parallel_scrape(urls, eval, concurrency, &format, timeout).await?;
@@ -165,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
+            obscura_cdp::start_with_options(args.port, args.proxy, false, args.ja3, args.ja4).await?;
         }
     }
 
@@ -177,6 +201,8 @@ async fn run_multi_worker_serve(
     workers: u16,
     proxy: Option<String>,
     stealth: bool,
+    ja3: Option<String>,
+    ja4: Option<String>,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -193,6 +219,12 @@ async fn run_multi_worker_serve(
         }
         if stealth {
             cmd.arg("--stealth");
+        }
+        if let Some(ref j3) = ja3 {
+            cmd.arg("--ja3").arg(j3);
+        }
+        if let Some(ref j4) = ja4 {
+            cmd.arg("--ja4").arg(j4);
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -303,10 +335,18 @@ async fn run_fetch(
     wait_until: &str,
     user_agent: Option<String>,
     stealth: bool,
+    ja3: Option<String>,
+    ja4: Option<String>,
     eval: Option<String>,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth));
+    let context = Arc::new(BrowserContext::with_full_options(
+        "fetch".to_string(),
+        None,
+        stealth,
+        ja3,
+        ja4,
+    ));
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {

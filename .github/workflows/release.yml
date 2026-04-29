@@ -36,12 +36,48 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libclang-dev
 
-      - name: Build stealth
-        run: cargo build --release --target ${{ matrix.target }} --features stealth
-        continue-on-error: true
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja llvm
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install cmake --installargs 'InstallDir="C:\\cmake"'
+          choco install ninja llvm
+
+      - name: Install bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bindgen-cli
+
+      - name: Build BoringSSL
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          git clone --depth=1 https://github.com/google/boringssl.git boringssl
+          cd boringssl
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRUST_BINDINGS=${{ matrix.target }}
+          ninja -C build
+          set BORINGSSL_BUILD_DIR=boringssl/build
+          cargo build --release --target ${{ matrix.target }} --features stealth
+
+      - name: Install BoringSSL (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          git clone --depth=1 https://github.com/google/boringssl.git boringssl
+          cd boringssl
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRUST_BINDINGS=${{ matrix.target }}
+          ninja -C build
+          export BORINGSSL_BUILD_DIR=$(pwd)/boringssl/build
+          cargo build --release --target ${{ matrix.target }} --features stealth
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

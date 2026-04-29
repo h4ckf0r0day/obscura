@@ -11,6 +11,8 @@ pub struct BrowserContext {
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
     pub stealth: bool,
+    pub ja3: Option<String>,
+    pub ja4: Option<String>,
 }
 
 impl BrowserContext {
@@ -26,10 +28,22 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth: false,
+            ja3: None,
+            ja4: None,
         }
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
+        Self::with_full_options(id, proxy_url, stealth, None, None)
+    }
+
+    pub fn with_full_options(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        ja3: Option<String>,
+        ja4: Option<String>,
+    ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         let mut client = ObscuraHttpClient::with_options(
             cookie_jar.clone(),
@@ -48,6 +62,8 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth,
+            ja3,
+            ja4,
         }
     }
 

@@ -29,7 +29,9 @@ servo_arc = "0.4"
 cssparser = "0.34"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
-reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "native-tls-vendored"], default-features = false }
+reqwest = { version = "0.13", features = ["cookies", "gzip", "brotli", "deflate", "rustls-no-provider"], default-features = false }
+bssl-rustls-adapters = { git = "https://github.com/google/boringssl", rev = "04aa32f96f3094994a2971d703f7489b75b94f84" }
+bssl-crypto = { git = "https://github.com/google/boringssl", rev = "04aa32f96f3094994a2971d703f7489b75b94f84" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
@@ -40,3 +42,5 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
+rustls = { version = "0.23", features = ["std"], default-features = false }
+webpki-roots = "0.26"

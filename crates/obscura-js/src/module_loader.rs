@@ -54,7 +54,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         let url = module_specifier.to_string();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            let client = reqwest::Client::builder()
+            let client = obscura_net::create_client_builder()
                 .build()
                 .map_err(|e| io_err(format!("HTTP client error: {}", e)))?;
 

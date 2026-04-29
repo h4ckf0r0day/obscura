@@ -280,7 +280,7 @@ static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_shared_client() -> &'static reqwest::Client {
     SHARED_HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        obscura_net::create_client_builder()
             .build()
             .expect("failed to build shared reqwest::Client")
     })

@@ -54,7 +54,12 @@ impl Page {
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
-            Some(Arc::new(StealthHttpClient::new(context.cookie_jar.clone())))
+            let ja3 = context.ja3.as_deref().and_then(obscura_net::Ja3Fingerprint::parse);
+            Some(Arc::new(StealthHttpClient::with_proxy(
+                context.cookie_jar.clone(),
+                context.proxy_url.as_deref(),
+                ja3,
+            )))
         } else {
             None
         };

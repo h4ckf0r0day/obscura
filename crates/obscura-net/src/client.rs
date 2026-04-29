@@ -197,11 +197,10 @@ impl ObscuraHttpClient {
 
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
+            let mut builder = crate::create_client_builder()
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(30))
-                .danger_accept_invalid_certs(false)
-;
+                .tls_danger_accept_invalid_certs(false);
 
             if let Some(ref proxy) = self.proxy_url {
                 if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
