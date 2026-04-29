@@ -363,13 +363,24 @@ class Element extends Node {
     return "http://www.w3.org/1999/xhtml";
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
-  set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
+  set innerHTML(v) {
+    if (this.localName === 'template') {
+      this.content.innerHTML = v;
+      return;
+    }
+    _dom("set_inner_html", this._nid, String(v ?? ""));
+  }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
     return ids.map(_wrapEl).filter(Boolean);
+  }
+  get content() {
+    if (this.localName !== 'template') return undefined;
+    if (!this._templateContent) this._templateContent = document.createDocumentFragment();
+    return this._templateContent;
   }
   get childElementCount() { return this.children.length; }
   get firstElementChild() { return this.children[0] || null; }
@@ -741,6 +752,9 @@ class Document extends Node {
   getElementsByClassName(c) { return this.querySelectorAll("." + c); }
   createElement(t) {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
+    if (el && t.toLowerCase() === 'template') {
+      el._templateContent = this.createDocumentFragment();
+    }
     return el;
   }
   createElementNS(ns, t) {
@@ -753,9 +767,8 @@ class Document extends Node {
     const nid = +_dom("create_text_node", "");
     const n = new Node(nid);
     n._isComment = true;
-    n.nodeType = 8; // Override nodeType
-    Object.defineProperty(n, "nodeType", { value: 8, writable: false });
-    Object.defineProperty(n, "nodeName", { value: "#comment", writable: false });
+    Object.defineProperty(n, "nodeType", { value: 8, writable: false, configurable: true });
+    Object.defineProperty(n, "nodeName", { value: "#comment", writable: false, configurable: true });
     _cache.set(nid, n);
     return n;
   }
@@ -913,11 +926,27 @@ class Document extends Node {
 class DocumentFragment extends Node {
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
-  querySelector(s) { return null; }
-  querySelectorAll(s) { return []; }
-  get children() { return []; }
-  get firstElementChild() { return null; }
+  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelectorAll(s) {
+    const ids = _domParse("query_selector_all", s) || [];
+    const list = ids.map(_wrapEl).filter(Boolean);
+    list.item = (i) => list[i] || null;
+    return list;
+  }
+  get children() {
+    const ids = _domParse("element_children", this._nid) || [];
+    return ids.map(_wrapEl).filter(Boolean);
+  }
+  get firstElementChild() { return this.children[0] || null; }
+  get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
   getElementById(id) { return null; }
+  cloneNode(deep) {
+    const frag = document.createDocumentFragment();
+    if (deep) frag.innerHTML = this.innerHTML;
+    return frag;
+  }
 }
 
 class DocumentType extends Node {
@@ -992,6 +1021,13 @@ globalThis.parent = globalThis;
 globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
+
+globalThis.Window = globalThis.Window || function Window() {};
+Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
+  value(obj) { return obj === globalThis || (obj && obj.window === obj); },
+  configurable: true,
+});
+
 
 const _iframeRegistry = [];
 function _registerIframe(iframeEl) {
@@ -1113,8 +1149,63 @@ globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.__fetchInterceptEnabled = false;
 globalThis.__fetchInterceptCallback = null; // Set by CDP to handle paused requests
 
+function _base64ToUint8Array(b64) {
+  const clean = String(b64 || '').replace(/[\r\n\s]/g, '');
+  if (!clean) return new Uint8Array();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const padding = clean.endsWith('==') ? 2 : (clean.endsWith('=') ? 1 : 0);
+  const bytes = new Uint8Array((clean.length * 3 >> 2) - padding);
+  let out = 0;
+  for (let i = 0; i < clean.length; i += 4) {
+    const a = alphabet.indexOf(clean[i]);
+    const b = alphabet.indexOf(clean[i + 1]);
+    const c = clean[i + 2] === '=' ? 0 : alphabet.indexOf(clean[i + 2]);
+    const d = clean[i + 3] === '=' ? 0 : alphabet.indexOf(clean[i + 3]);
+    const n = (a << 18) | (b << 12) | (c << 6) | d;
+    if (out < bytes.length) bytes[out++] = (n >> 16) & 0xff;
+    if (out < bytes.length) bytes[out++] = (n >> 8) & 0xff;
+    if (out < bytes.length) bytes[out++] = n & 0xff;
+  }
+  return bytes;
+}
+
+function _bodyToUint8Array(body) {
+  if (body == null) return new Uint8Array();
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  return new TextEncoder().encode(String(body));
+}
+
+function _arrayBufferFromBytes(bytes) {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+function _installWasmStreamingFallback() {
+  if (typeof WebAssembly === 'undefined') return;
+  if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
+  const nativeInstantiateStreaming = WebAssembly.instantiateStreaming;
+  const fallback = async function instantiateStreaming(source, imports) {
+    const response = await source;
+    if (response && typeof response.arrayBuffer === 'function') {
+      return WebAssembly.instantiate(await response.arrayBuffer(), imports);
+    }
+    if (typeof nativeInstantiateStreaming === 'function') {
+      return nativeInstantiateStreaming.call(WebAssembly, response, imports);
+    }
+    return WebAssembly.instantiate(response, imports);
+  };
+  fallback.__obscuraFallback = true;
+  WebAssembly.instantiateStreaming = fallback;
+}
+_installWasmStreamingFallback();
+
 globalThis.fetch = async (input, init = {}) => {
-  let url = typeof input === "string" ? input : (input instanceof Request ? input.url : input?.url || "");
+  let url = typeof input === "string"
+    ? input
+    : (input instanceof Request
+      ? input.url
+      : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
     try {
       const base = _domParse("document_url") || "about:blank";
@@ -1138,16 +1229,15 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
   const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
-  return {
-    ok: parsed.status >= 200 && parsed.status < 300, status: parsed.status, statusText: "",
-    type: respType, redirected: false, url: parsed.url || url,
-    headers: new Headers(parsed.headers || {}),
-    async text() { return parsed.body || ""; },
-    async json() { return JSON.parse(parsed.body || "null"); },
-    async arrayBuffer() { return new TextEncoder().encode(parsed.body || "").buffer; },
-    async blob() { return new Blob([parsed.body || ""]); },
-    clone() { return this; },
-  };
+  const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
+  return new Response(responseBody, {
+    status: parsed.status,
+    statusText: "",
+    headers: parsed.headers || {},
+    type: respType,
+    url: parsed.url || url,
+    redirected: false,
+  });
 };
 
 if (typeof Headers === "undefined") {
@@ -1419,7 +1509,8 @@ if (typeof Request === 'undefined') {
     constructor(input, init = {}) {
       if (typeof input === 'string') { this.url = input; }
       else if (input instanceof Request) { this.url = input.url; init = { ...input, ...init }; }
-      else { this.url = String(input); }
+      else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
+      else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(init.headers);
       this.body = init.body || null;
@@ -1440,16 +1531,16 @@ if (typeof Request === 'undefined') {
 if (typeof Response === 'undefined') {
   globalThis.Response = class Response {
     constructor(body, init = {}) {
-      this._body = body; this.status = init.status || 200; this.statusText = init.statusText || '';
+      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status || 200; this.statusText = init.statusText || '';
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
-      this.type = 'basic'; this.url = '';
+      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
     }
-    async text() { return this._body ? String(this._body) : ''; }
+    async text() { return new TextDecoder().decode(this._bodyBytes); }
     async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
-    async blob() { return new Blob([await this.text()]); }
-    clone() { return new Response(this._body, { status: this.status, headers: this.headers }); }
+    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { return new Blob([this._bodyBytes]); }
+    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
     static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
@@ -1544,7 +1635,9 @@ if (typeof TextDecoder === 'undefined') {
     constructor(label) { this.encoding = label || 'utf-8'; }
     decode(buf) {
       if (!buf) return '';
-      const bytes = new Uint8Array(buf.buffer || buf);
+      const bytes = ArrayBuffer.isView(buf)
+        ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+        : new Uint8Array(buf);
       let str = '', i = 0;
       while (i < bytes.length) {
         let c = bytes[i++];
@@ -2382,17 +2475,33 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     get lastChild() { return children[children.length - 1] || null; },
     get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
     get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) { if (c) { children.push(c); c.parentNode = shadow; } return c; },
+    appendChild(c) {
+      if (c) {
+        children.push(c);
+        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
+      }
+      return c;
+    },
     insertBefore(n, ref) {
       if (!n) return n;
       if (!ref) { shadow.appendChild(n); return n; }
       const idx = children.indexOf(ref);
-      if (idx >= 0) { children.splice(idx, 0, n); n.parentNode = shadow; }
+      if (idx >= 0) {
+        children.splice(idx, 0, n);
+        try { n.parentNode = shadow; } catch (_) {}
+      }
       else shadow.appendChild(n);
       return n;
     },
     removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
-    replaceChild(n, o) { const idx = children.indexOf(o); if (idx >= 0) { children[idx] = n; n.parentNode = shadow; } return o; },
+    replaceChild(n, o) {
+      const idx = children.indexOf(o);
+      if (idx >= 0) {
+        children[idx] = n;
+        try { n.parentNode = shadow; } catch (_) {}
+      }
+      return o;
+    },
     querySelector(s) {
       for (const c of children) {
         if (c.matches && c.matches(s)) return c;
@@ -2892,6 +3001,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
+  _installWasmStreamingFallback();
 
   globalThis.document = new Document(+_dom("document_node_id"));
 

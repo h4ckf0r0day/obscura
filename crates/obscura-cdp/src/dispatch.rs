@@ -17,17 +17,33 @@ pub struct CdpContext {
     page_counter: u32,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
+    // World names registered via Page.createIsolatedWorld. After every
+    // navigation Obscura clears execution contexts (via
+    // Runtime.executionContextsCleared) and must re-emit a
+    // Runtime.executionContextCreated for each registered world, otherwise
+    // Playwright/Puppeteer hang waiting for their utility world to come
+    // back. Stored as plain Strings (not by-page) — for now we only model
+    // a single page in CdpContext anyway.
+    pub isolated_worlds: Vec<String>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
 }
 
 impl CdpContext {
     pub fn new() -> Self {
-        Self::new_with_proxy(None)
+        Self::new_with_options(None, false)
     }
 
     pub fn new_with_proxy(proxy: Option<String>) -> Self {
-        let default_context = Arc::new(BrowserContext::with_proxy("default".to_string(), proxy));
+        Self::new_with_options(proxy, false)
+    }
+
+    pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
+        let default_context = Arc::new(BrowserContext::with_options(
+            "default".to_string(),
+            proxy,
+            stealth,
+        ));
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
@@ -38,6 +54,7 @@ impl CdpContext {
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
+            isolated_worlds: Vec::new(),
         }
     }
 
@@ -118,8 +135,9 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
+        "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
         "Emulation" | "Log" | "Performance" | "Security" | "CSS"
-        | "Accessibility" | "ServiceWorker" | "Inspector"
+        | "ServiceWorker" | "Inspector"
         | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay" => {
             Ok(json!({}))
         }

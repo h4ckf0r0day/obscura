@@ -66,11 +66,15 @@ pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
-            "Forbidden URL scheme '{}' - only http and https are allowed",
+            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
             scheme
         )));
+    }
+
+    if scheme == "file" {
+        return Ok(());
     }
 
     if let Some(host) = url.host() {
@@ -113,6 +117,41 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     }
 
     Ok(())
+}
+
+async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
+    let path = url
+        .to_file_path()
+        .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
+    let body = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ObscuraNetError::Network(format!("Failed to read file: {}", e)))?;
+
+    let mut headers = HashMap::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ct = match ext.to_lowercase().as_str() {
+            "html" | "htm" => "text/html",
+            "css" => "text/css",
+            "js" | "mjs" => "application/javascript",
+            "json" => "application/json",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "webp" => "image/webp",
+            "ico" => "image/x-icon",
+            _ => "application/octet-stream",
+        };
+        headers.insert("content-type".to_string(), ct.to_string());
+    }
+
+    Ok(Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    })
 }
 
 pub struct ObscuraHttpClient {
@@ -189,6 +228,10 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url)?;
+
+        if url.scheme() == "file" {
+            return fetch_file_url(url).await;
+        }
 
         let mut method = initial_method;
         let mut body = initial_body;

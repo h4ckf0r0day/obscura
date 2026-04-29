@@ -24,10 +24,14 @@ enum ServerMessage {
 }
 
 pub async fn start(port: u16) -> anyhow::Result<()> {
-    start_with_options(port, None).await
+    start_with_options(port, None, false).await
 }
 
-pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Result<()> {
+pub async fn start_with_options(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(&addr).await?;
 
@@ -42,7 +46,7 @@ pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Res
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy));
+            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth));
 
             loop {
                 match listener.accept().await {
@@ -67,8 +71,9 @@ pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Res
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
+    stealth: bool,
 ) {
-    let mut ctx = CdpContext::new_with_proxy(proxy);
+    let mut ctx = CdpContext::new_with_options(proxy, stealth);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
@@ -400,14 +405,20 @@ async fn process_cdp_message(
 
     let response = dispatch::dispatch(&req, ctx).await;
 
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
-    }
-
+    // Chromium CDP semantics: events emitted as a side-effect of a command
+    // (e.g. Target.targetCreated + Target.attachedToTarget from
+    // Target.createTarget) MUST arrive BEFORE the command's response.
+    // Playwright awaits the response and immediately reads state wired up
+    // by those events; if the response lands first, accessing
+    // Target._page errors with "Cannot read properties of undefined".
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);
         }
+    }
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = reply_tx.send(json);
     }
 
     if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {

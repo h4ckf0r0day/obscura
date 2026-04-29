@@ -67,14 +67,33 @@ pub async fn handle(
             let es = session_id.clone();
             let ts = timestamp();
 
-            let phase1 = vec![
+            let mut phase1 = vec![
                 CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
                 CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
                 CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
                 CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
-                CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 100, "origin": page_url, "name": "__puppeteer_utility_world__24.40.0", "uniqueId": format!("ctx-isolated-nav-{}", page_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}), session_id: es.clone() },
-                CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
             ];
+            // Re-emit each isolated world the client previously registered
+            // via Page.createIsolatedWorld. Without this, Playwright's
+            // utility-world handle becomes stale after navigation and
+            // every subsequent evaluate() (including page.title()) hangs.
+            // Fallback to the legacy hardcoded Puppeteer name so older
+            // Puppeteer clients that don't call createIsolatedWorld
+            // continue to work.
+            let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
+                vec!["__puppeteer_utility_world__24.40.0".to_string()]
+            } else {
+                ctx.isolated_worlds.clone()
+            };
+            for (idx, world_name) in world_names.iter().enumerate() {
+                let world_ctx_id = 100 + idx as u32;
+                phase1.push(CdpEvent {
+                    method: "Runtime.executionContextCreated".into(),
+                    params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, idx), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
+                    session_id: es.clone(),
+                });
+            }
+            phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
             ctx.pending_events.extend(phase1);
 
             if ctx.fetch_intercept.enabled {
@@ -159,6 +178,14 @@ pub async fn handle(
             let page_url = page.url_string();
             let page_id = page.id.clone();
             let context_id = 100;
+            // Track this world so Page.navigate can re-emit a context for it
+            // post-navigation. Without this, Playwright (and Puppeteer)
+            // hang in any operation that uses the utility world — including
+            // page.title() — because their utility world is gone after
+            // Runtime.executionContextsCleared and never re-created.
+            if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
+                ctx.isolated_worlds.push(world_name.clone());
+            }
 
             ctx.pending_events.push(CdpEvent {
                 method: "Runtime.executionContextCreated".to_string(),

@@ -7,4 +7,5 @@ pub mod network;
 pub mod fetch;
 pub mod input;
 pub mod storage;
+pub mod accessibility;
 pub mod lp;
