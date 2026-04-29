@@ -838,6 +838,21 @@ impl Page {
         }
     }
 
+    pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
+        if let Some((url, method, body)) = self.take_pending_navigation() {
+            self.navigate_with_wait_post(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                &method,
+                &body,
+            )
+            .await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
