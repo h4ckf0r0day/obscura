@@ -9,6 +9,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+
+// PR #36 comment 4341743194: the deferral queue in `process_with_interception`
+// must be bounded so a stalled navigation cannot OOM the process. When the cap
+// is reached we return an explicit error response rather than silently dropping.
+const MAX_DEFERRED_MESSAGES: usize = 256;
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -398,8 +403,23 @@ async fn process_with_interception(
                             // pushed to the outer `cdp_processor` queue so
                             // it's processed sequentially with no nav task
                             // in flight.
-                            tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
-                            deferred.push_back(ServerMessage::Cdp(msg));
+                            if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                                tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
+                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
+                                    let resp = crate::types::CdpResponse::error(
+                                        req.id,
+                                        -32000,
+                                        "Server busy: navigation in progress, try again later".to_string(),
+                                        req.session_id,
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let _ = msg.reply_tx.send(json);
+                                    }
+                                }
+                            } else {
+                                tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
+                                deferred.push_back(ServerMessage::Cdp(msg));
+                            }
                         }
                     }
                 }
