@@ -20,10 +20,21 @@ async fn serve_once() -> String {
                     (
                         "200 OK",
                         r#"<html><body>
-<form id="f"><input name="q" value="abc"><button id="submit" type="submit">Go</button></form>
+<form id="f" action="/submitted">
+  <input type="hidden" name="vacancy_id" value="123">
+  <textarea name="message">hello</textarea>
+  <input type="checkbox" name="agree" value="yes" checked>
+  <button id="submit" type="submit">Go</button>
+</form>
 <script>
 function submitCompat() {
-  location.href = '/submitted';
+  const form = document.getElementById('f');
+  const params = new URLSearchParams();
+  form.querySelectorAll('input, textarea').forEach(function(field) {
+    if (field.type === 'checkbox' && !field.checked) return;
+    params.append(field.name, field.value);
+  });
+  location.href = form.action + '?' + params.toString();
 }
 document.querySelector('button').addEventListener('click', function(e) {
   e.preventDefault();
@@ -118,6 +129,10 @@ async fn runtime_click_submit_prevent_default_navigation_updates_page() {
 
     let page = ctx.get_page_mut(&page_id).unwrap();
     assert_eq!(page.url.as_ref().unwrap().path(), "/submitted");
+    assert_eq!(
+        page.url.as_ref().unwrap().query(),
+        Some("vacancy_id=123&message=hello&agree=yes")
+    );
     assert!(page
         .evaluate("document.body.textContent")
         .as_str()
