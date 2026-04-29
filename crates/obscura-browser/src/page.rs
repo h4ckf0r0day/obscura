@@ -683,13 +683,14 @@ impl Page {
         }
     }
 
-    pub fn evaluate_for_cdp(
+    pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
         return_by_value: bool,
+        await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.evaluate_for_cdp(expression, return_by_value) {
+            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);

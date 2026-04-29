@@ -42,10 +42,15 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let await_promise = params
+                .get("awaitPromise")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = page.evaluate_for_cdp(expression, return_by_value);
+            let info = page.evaluate_for_cdp(expression, return_by_value, await_promise).await;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
