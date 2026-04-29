@@ -22,9 +22,12 @@ async fn serve_once() -> String {
                         r#"<html><body>
 <form id="f"><input name="q" value="abc"><button id="submit" type="submit">Go</button></form>
 <script>
-document.getElementById('f').addEventListener('submit', function(e) {
-  e.preventDefault();
+function submitCompat() {
   location.href = '/submitted';
+}
+document.querySelector('button').addEventListener('click', function(e) {
+  e.preventDefault();
+  submitCompat();
 });
 </script>
 </body></html>"#,
@@ -83,9 +86,20 @@ async fn runtime_click_submit_prevent_default_navigation_updates_page() {
         session_id,
     )
     .await;
-    let button = cdp(
+
+    let submit_compat_type = cdp(
         &mut ctx,
         2,
+        "Runtime.evaluate",
+        json!({"expression": "typeof submitCompat", "returnByValue": true}),
+        session_id,
+    )
+    .await;
+    assert_eq!(submit_compat_type["result"]["value"], "function");
+
+    let button = cdp(
+        &mut ctx,
+        3,
         "Runtime.evaluate",
         json!({"expression": "document.getElementById('submit')"}),
         session_id,
@@ -95,7 +109,7 @@ async fn runtime_click_submit_prevent_default_navigation_updates_page() {
 
     cdp(
         &mut ctx,
-        3,
+        4,
         "Runtime.callFunctionOn",
         json!({"objectId": object_id, "functionDeclaration": "function() { this.click(); }"}),
         session_id,
