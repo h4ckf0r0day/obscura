@@ -943,6 +943,61 @@ mod tests {
     }
 
     #[test]
+    fn test_button_click_dispatches_listener() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt.evaluate(r#"
+            const button = document.getElementById('go');
+            button.addEventListener('click', () => { button.dataset.clicked = 'yes'; });
+            button.click();
+            return button.dataset.clicked;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!("yes"));
+    }
+
+    #[test]
+    fn test_dispatch_mouse_event_runs_listener() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt.evaluate(r#"
+            const button = document.getElementById('go');
+            let count = 0;
+            button.addEventListener('click', () => { count += 1; });
+            button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return count;
+        "#).unwrap();
+        assert_eq!(result.as_f64().unwrap() as i64, 1);
+    }
+
+    #[test]
+    fn test_location_href_assignment_updates_navigation_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let href = rt.evaluate("const next = '/next'; location.href = next; return location.href;").unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/next"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/next".to_string(), "GET".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
+        let mut rt = setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
+        let href = rt.evaluate(r#"
+            const form = document.querySelector('form');
+            form.addEventListener('submit', (event) => {
+                event.preventDefault();
+                location.href = '/submitted';
+            });
+            document.getElementById('submit').click();
+            return location.href;
+        "#).unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/submitted"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/submitted".to_string(), "GET".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ua = rt.evaluate("navigator.userAgent").unwrap();

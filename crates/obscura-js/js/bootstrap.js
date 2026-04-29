@@ -472,12 +472,14 @@ class Element extends Node {
   }
   dispatchEvent(event) {
     if (!event) return true;
-    event.target = this;
+    if (!event.target) event.target = this;
     event.currentTarget = this;
     const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error(e); } }
-    if (event.bubbles && !event.defaultPrevented && this.parentNode) {
-      event.currentTarget = this.parentNode;
+    for (const h of handlers) {
+      try { h.call(this, event); } catch(e) { console.error(e); }
+      if (event._immediatePropagationStopped) break;
+    }
+    if (event.bubbles && !event._propagationStopped && this.parentNode) {
       this.parentNode.dispatchEvent(event);
     }
     return !event.defaultPrevented;
@@ -1836,10 +1838,10 @@ globalThis.IntersectionObserver = class {
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
 globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now(); }
+  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
-  preventDefault() { this.defaultPrevented=true; } stopPropagation(){} stopImmediatePropagation(){}
-  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable; }
+  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
+  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
 };
 globalThis.CustomEvent = class extends Event { constructor(t,o={}) { super(t,o);this.detail=o.detail; } };
 globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
