@@ -100,6 +100,7 @@ enum DumpFormat {
     Html,
     Text,
     Links,
+    Markdown,
 }
 
 fn print_banner(port: u16) {
@@ -354,6 +355,9 @@ async fn run_fetch(
         DumpFormat::Links => {
             dump_links(&page);
         }
+        DumpFormat::Markdown => {
+            dump_markdown(&mut page);
+        }
     }
 
     Ok(())
@@ -399,6 +403,13 @@ fn dump_text(page: &mut Page) {
             println!("{}", text.trim());
         }
     });
+}
+
+fn dump_markdown(page: &mut Page) {
+    let result = page.evaluate(obscura_browser::HTML_TO_MARKDOWN_JS);
+    if let Some(md) = result.as_str() {
+        println!("{}", md);
+    }
 }
 
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
