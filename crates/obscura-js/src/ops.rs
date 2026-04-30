@@ -228,8 +228,10 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| {
-                if let NodeData::Text { contents } = &mut n.data {
-                    *contents = arg2.clone();
+                match &mut n.data {
+                    NodeData::Text { contents } => { *contents = arg2.clone(); }
+                    NodeData::Comment { contents } => { *contents = arg2.clone(); }
+                    _ => {}
                 }
             });
             "true".into()
@@ -245,6 +247,9 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "create_text_node" => {
             dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
+        }
+        "create_comment_node" => {
+            dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
         }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
