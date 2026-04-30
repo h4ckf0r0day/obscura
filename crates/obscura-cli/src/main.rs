@@ -126,11 +126,15 @@ fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
     }
 }
 
+fn is_quiet_command(cmd: &Option<Command>) -> bool {
+    matches!(cmd, Some(Command::Fetch { quiet: true, .. }))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let quiet = matches!(&args.command, Some(Command::Fetch { quiet: true, .. }));
+    let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -721,7 +725,8 @@ fn dump_links(page: &Page) {
 }
 #[cfg(test)]
 mod tests {
-    use super::select_log_filter;
+    use super::{is_quiet_command, select_log_filter, Args, Command};
+    use clap::Parser;
 
     #[test]
     fn default_filter_is_warn() {
@@ -741,5 +746,65 @@ mod tests {
     #[test]
     fn verbose_wins_over_quiet() {
         assert_eq!(select_log_filter(true, true), "debug");
+    }
+
+    #[test]
+    fn parsed_fetch_with_quiet_flag_is_detected() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--quiet",
+            "https://example.com",
+        ])
+        .expect("clap should accept --quiet on fetch");
+        assert!(is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_fetch_without_quiet_is_not_detected() {
+        let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
+            .expect("clap should accept fetch without --quiet");
+        assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_serve_command_is_not_quiet() {
+        let args = Args::try_parse_from(["obscura", "serve"])
+            .expect("clap should accept serve");
+        assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn no_subcommand_is_not_quiet() {
+        assert!(!is_quiet_command(&None));
+    }
+
+    #[test]
+    fn parsed_fetch_quiet_resolves_to_off_filter() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--quiet",
+            "https://example.com",
+        ])
+        .unwrap();
+        let filter = select_log_filter(args.verbose, is_quiet_command(&args.command));
+        assert_eq!(filter, "off");
+    }
+
+    #[test]
+    fn matcher_still_uses_fetch_variant() {
+        let cmd = Some(Command::Fetch {
+            url: "https://x".to_string(),
+            dump: super::DumpFormat::Html,
+            selector: None,
+            wait: 5,
+            wait_until: "load".to_string(),
+            user_agent: None,
+            stealth: false,
+            eval: None,
+            quiet: true,
+        });
+        assert!(is_quiet_command(&cmd));
     }
 }
