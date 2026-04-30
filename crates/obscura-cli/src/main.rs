@@ -116,11 +116,22 @@ fn print_banner(port: u16) {
 "#, port);
 }
 
+fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
+    if verbose {
+        "debug"
+    } else if quiet {
+        "off"
+    } else {
+        "warn"
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let filter = if args.verbose { "debug" } else { "warn" };
+    let quiet = matches!(&args.command, Some(Command::Fetch { quiet: true, .. }));
+    let filter = select_log_filter(args.verbose, quiet);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -707,4 +718,28 @@ fn dump_links(page: &Page) {
             }
         }
     });
+}
+#[cfg(test)]
+mod tests {
+    use super::select_log_filter;
+
+    #[test]
+    fn default_filter_is_warn() {
+        assert_eq!(select_log_filter(false, false), "warn");
+    }
+
+    #[test]
+    fn verbose_filter_is_debug() {
+        assert_eq!(select_log_filter(true, false), "debug");
+    }
+
+    #[test]
+    fn quiet_filter_is_off() {
+        assert_eq!(select_log_filter(false, true), "off");
+    }
+
+    #[test]
+    fn verbose_wins_over_quiet() {
+        assert_eq!(select_log_filter(true, true), "debug");
+    }
 }
