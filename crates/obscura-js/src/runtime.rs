@@ -1467,6 +1467,72 @@ mod tests {
     }
 
     #[test]
+    fn test_html_to_markdown_headings() {
+        let mut rt = setup_runtime("<html><body><h1>Title</h1><h2>Sub</h2><p>Body</p></body></html>");
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("# Title"), "missing H1: {}", md);
+        assert!(md.contains("## Sub"), "missing H2: {}", md);
+        assert!(md.contains("Body"), "missing paragraph text: {}", md);
+    }
+
+    #[test]
+    fn test_html_to_markdown_links_and_inline() {
+        let mut rt = setup_runtime(
+            r#"<html><body><p>Hello <strong>world</strong> <a href="https://x.test/">link</a> <em>em</em></p></body></html>"#,
+        );
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("**world**"), "missing strong: {}", md);
+        assert!(md.contains("*em*"), "missing em: {}", md);
+        assert!(
+            md.contains("[link](https://x.test/)"),
+            "missing link: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_html_to_markdown_lists() {
+        let mut rt = setup_runtime(
+            "<html><body><ul><li>A</li><li>B</li></ul><ol><li>X</li><li>Y</li></ol></body></html>",
+        );
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("- A"), "missing unordered A: {}", md);
+        assert!(md.contains("- B"), "missing unordered B: {}", md);
+        assert!(md.contains("1. X"), "missing ordered X: {}", md);
+    }
+
+    #[test]
+    fn test_html_to_markdown_skips_script_and_style() {
+        let mut rt = setup_runtime(
+            "<html><body><p>Text</p><script>alert(1)</script><style>body{color:red}</style></body></html>",
+        );
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("Text"), "missing visible text: {}", md);
+        assert!(!md.contains("alert"), "leaked script content: {}", md);
+        assert!(!md.contains("color:red"), "leaked style content: {}", md);
+    }
+
+    #[test]
     fn test_page_content_puppeteer_pattern() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><head></head><body><p>Test</p></body></html>");
         let result = rt.evaluate(
