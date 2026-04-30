@@ -149,9 +149,9 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, workers, proxy, stealth).await?;
+                run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_options(port, proxy, stealth).await?;
+                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
@@ -177,6 +177,7 @@ async fn run_multi_worker_serve(
     workers: u16,
     proxy: Option<String>,
     stealth: bool,
+    user_agent: Option<String>,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -190,6 +191,9 @@ async fn run_multi_worker_serve(
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
         if let Some(ref p) = proxy {
             cmd.arg("--proxy").arg(p);
+        }
+        if let Some(ref ua) = user_agent {
+            cmd.arg("--user-agent").arg(ua);
         }
         if stealth {
             cmd.arg("--stealth");

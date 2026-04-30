@@ -39,10 +39,19 @@ impl CdpContext {
     }
 
     pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
-        let default_context = Arc::new(BrowserContext::with_options(
+        Self::new_with_full_options(proxy, stealth, None)
+    }
+
+    pub fn new_with_full_options(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+    ) -> Self {
+        let default_context = Arc::new(BrowserContext::with_full_options(
             "default".to_string(),
             proxy,
             stealth,
+            user_agent,
         ));
         CdpContext {
             pages: Vec::new(),
