@@ -2998,6 +2998,36 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
 }
 
+// Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
+// in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
+// Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
+// (see issue #63).
+if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
+  Document.prototype.elementFromPoint = function(x, y) {
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return null;
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 0;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
+    if (x < 0 || y < 0 || x > w || y > h) {
+      return null;
+    }
+    return this.body || this.documentElement || null;
+  };
+  Document.prototype.elementsFromPoint = function(x, y) {
+    var el = this.elementFromPoint(x, y);
+    return el ? [el] : [];
+  };
+}
+if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
+  ShadowRoot.prototype.elementFromPoint = function(x, y) {
+    return Document.prototype.elementFromPoint.call(globalThis.document || this, x, y);
+  };
+  ShadowRoot.prototype.elementsFromPoint = function(x, y) {
+    return Document.prototype.elementsFromPoint.call(globalThis.document || this, x, y);
+  };
+}
+
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;

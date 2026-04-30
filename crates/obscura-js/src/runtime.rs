@@ -1420,4 +1420,49 @@ mod tests {
         assert!(html.contains("<p>Test</p>"));
     }
 
+    #[test]
+    fn test_element_from_point_is_function() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let kind = rt.evaluate("typeof document.elementFromPoint").unwrap();
+        assert_eq!(kind, serde_json::json!("function"));
+        let kind2 = rt.evaluate("typeof document.elementsFromPoint").unwrap();
+        assert_eq!(kind2, serde_json::json!("function"));
+    }
+
+    #[test]
+    fn test_element_from_point_in_viewport_returns_body() {
+        let mut rt = setup_runtime("<html><body><h1>Hi</h1></body></html>");
+        let tag = rt.evaluate("document.elementFromPoint(10, 10)?.tagName").unwrap();
+        assert_eq!(tag, serde_json::json!("BODY"));
+    }
+
+    #[test]
+    fn test_element_from_point_out_of_viewport_returns_null() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let neg_x = rt.evaluate("document.elementFromPoint(-1, 10)").unwrap();
+        assert_eq!(neg_x, serde_json::Value::Null);
+        let neg_y = rt.evaluate("document.elementFromPoint(10, -1)").unwrap();
+        assert_eq!(neg_y, serde_json::Value::Null);
+        let huge = rt.evaluate("document.elementFromPoint(99999, 99999)").unwrap();
+        assert_eq!(huge, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_elements_from_point_returns_array() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let len_in = rt.evaluate("document.elementsFromPoint(10, 10).length").unwrap();
+        assert_eq!(len_in.as_f64().unwrap() as i64, 1);
+        let len_out = rt.evaluate("document.elementsFromPoint(-1, -1).length").unwrap();
+        assert_eq!(len_out.as_f64().unwrap() as i64, 0);
+    }
+
+    #[test]
+    fn test_element_from_point_non_numeric_returns_null() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let nan = rt.evaluate("document.elementFromPoint(NaN, 10)").unwrap();
+        assert_eq!(nan, serde_json::Value::Null);
+        let inf = rt.evaluate("document.elementFromPoint(Infinity, 10)").unwrap();
+        assert_eq!(inf, serde_json::Value::Null);
+    }
+
 }
