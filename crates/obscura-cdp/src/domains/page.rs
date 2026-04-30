@@ -223,6 +223,43 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
+        "getLayoutMetrics" => {
+            // Obscura has no visual layout engine, so we return a fixed
+            // 1280x720 viewport (Chrome's default) and try to derive the
+            // content height from document.documentElement.scrollHeight.
+            // Playwright calls this before every page.screenshot() and
+            // would otherwise fail with "Unknown Page method".
+            let width = 1280.0_f64;
+            let height = 720.0_f64;
+            let content_height = ctx
+                .get_session_page_mut(session_id)
+                .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
+                .and_then(|v| v.as_f64())
+                .filter(|n| *n > 0.0)
+                .unwrap_or(height);
+            let layout_viewport = json!({
+                "pageX": 0, "pageY": 0,
+                "clientWidth": width, "clientHeight": height,
+            });
+            let visual_viewport = json!({
+                "offsetX": 0.0, "offsetY": 0.0,
+                "pageX": 0.0, "pageY": 0.0,
+                "clientWidth": width, "clientHeight": height,
+                "scale": 1.0, "zoom": 1.0,
+            });
+            let content_size = json!({
+                "x": 0.0, "y": 0.0,
+                "width": width, "height": content_height,
+            });
+            Ok(json!({
+                "layoutViewport": layout_viewport,
+                "visualViewport": visual_viewport,
+                "contentSize": content_size,
+                "cssLayoutViewport": layout_viewport,
+                "cssVisualViewport": visual_viewport,
+                "cssContentSize": content_size,
+            }))
+        }
         "getNavigationHistory" => {
             let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
             Ok(json!({
@@ -245,4 +282,55 @@ fn timestamp() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::CdpContext;
+
+    #[tokio::test]
+    async fn get_layout_metrics_returns_chrome_default_viewport() {
+        let mut ctx = CdpContext::new();
+        let result = handle("getLayoutMetrics", &json!({}), &mut ctx, &None)
+            .await
+            .expect("getLayoutMetrics should succeed without a session");
+
+        // CDP spec requires three top-level shapes; Playwright's screenshot
+        // path reads contentSize.width/height to size the capture. Without
+        // them the screenshot call panics with "cannot read property of
+        // undefined".
+        for key in [
+            "layoutViewport",
+            "visualViewport",
+            "contentSize",
+            "cssLayoutViewport",
+            "cssVisualViewport",
+            "cssContentSize",
+        ] {
+            assert!(result.get(key).is_some(), "missing key: {key}");
+        }
+
+        let layout = &result["layoutViewport"];
+        assert_eq!(layout["clientWidth"].as_f64(), Some(1280.0));
+        assert_eq!(layout["clientHeight"].as_f64(), Some(720.0));
+
+        let visual = &result["visualViewport"];
+        assert_eq!(visual["scale"].as_f64(), Some(1.0));
+        assert_eq!(visual["clientWidth"].as_f64(), Some(1280.0));
+
+        let content = &result["contentSize"];
+        assert_eq!(content["width"].as_f64(), Some(1280.0));
+        // Without a live page the content height falls back to the viewport.
+        assert_eq!(content["height"].as_f64(), Some(720.0));
+    }
+
+    #[tokio::test]
+    async fn unknown_page_method_still_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle("notARealMethod", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("unknown methods must surface as errors");
+        assert!(err.contains("Unknown Page method"));
+    }
 }
