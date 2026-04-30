@@ -429,7 +429,13 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
                     | "ul" | "ol"
             );
 
-            if tag == "script" || tag == "style" {
+            // Boilerplate elements rarely contain content the user wants to
+            // scrape — strip them so `--dump text` returns the article body
+            // instead of menus, footers, and cookie banners.
+            if matches!(
+                tag,
+                "script" | "style" | "nav" | "header" | "footer" | "aside"
+            ) {
                 return result;
             }
 
@@ -707,4 +713,55 @@ fn dump_links(page: &Page) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_readable_text;
+    use obscura_dom::parse_html;
+
+    fn body_text(html: &str) -> String {
+        let dom = parse_html(html);
+        let body = dom
+            .query_selector("body")
+            .ok()
+            .flatten()
+            .expect("body must exist");
+        extract_readable_text(&dom, body).split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn skips_nav_header_footer_aside() {
+        let text = body_text(
+            r#"<html><body>
+                <header>SITE HEADER</header>
+                <nav>NAV LINKS</nav>
+                <aside>SIDEBAR</aside>
+                <main><p>Article body.</p></main>
+                <footer>FOOTER</footer>
+            </body></html>"#,
+        );
+        assert!(text.contains("Article body."), "main content kept: {text}");
+        for boilerplate in ["SITE HEADER", "NAV LINKS", "SIDEBAR", "FOOTER"] {
+            assert!(
+                !text.contains(boilerplate),
+                "boilerplate '{boilerplate}' leaked through: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_skips_script_and_style() {
+        // Regression guard for the original skip list.
+        let text = body_text(
+            r#"<html><body>
+                <p>Hello.</p>
+                <script>console.log("nope")</script>
+                <style>.x { color: red }</style>
+            </body></html>"#,
+        );
+        assert!(text.contains("Hello."));
+        assert!(!text.contains("console.log"));
+        assert!(!text.contains("color: red"));
+    }
 }
