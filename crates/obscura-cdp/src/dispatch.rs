@@ -136,9 +136,13 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
         "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        // Accepted but no-op. Puppeteer's FrameManager.initialize calls
+        // Audits.enable on connect — refusing it breaks puppeteer.connect()
+        // before any user code runs.
         "Emulation" | "Log" | "Performance" | "Security" | "CSS"
         | "ServiceWorker" | "Inspector"
-        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay" => {
+        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
+        | "Audits" => {
             Ok(json!({}))
         }
         _ => Err(format!("Unknown domain: {}", domain)),
@@ -150,5 +154,37 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             tracing::warn!("CDP error for {}: {}", req.method, msg);
             CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::CdpRequest;
+
+    fn req(method: &str) -> CdpRequest {
+        CdpRequest {
+            id: 1,
+            method: method.into(),
+            params: json!({}),
+            session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn audits_enable_returns_empty_success() {
+        let mut ctx = CdpContext::new();
+        let resp = dispatch(&req("Audits.enable"), &mut ctx).await;
+        assert!(resp.error.is_none(), "Audits.enable should not error: {:?}", resp.error);
+        assert_eq!(resp.result, Some(json!({})));
+    }
+
+    #[tokio::test]
+    async fn unknown_domain_still_errors() {
+        let mut ctx = CdpContext::new();
+        let resp = dispatch(&req("DefinitelyNotADomain.enable"), &mut ctx).await;
+        let err = resp.error.expect("unknown domain must surface as error");
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("Unknown domain"));
     }
 }
