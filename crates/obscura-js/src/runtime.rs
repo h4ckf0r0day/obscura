@@ -1409,6 +1409,66 @@ mod tests {
     }
 
     #[test]
+    fn test_create_event_custom_event_has_init_method() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let kind = rt
+            .evaluate("typeof document.createEvent('CustomEvent').initCustomEvent")
+            .unwrap();
+        assert_eq!(kind, serde_json::json!("function"));
+    }
+
+    #[test]
+    fn test_init_custom_event_sets_fields() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "test",
+            r#"
+            globalThis.__e = document.createEvent('CustomEvent');
+            globalThis.__e.initCustomEvent('myevent', true, false, {hello: 'world'});
+        "#,
+        )
+        .unwrap();
+        let t = rt.evaluate("globalThis.__e.type").unwrap();
+        assert_eq!(t, serde_json::json!("myevent"));
+        let b = rt.evaluate("globalThis.__e.bubbles").unwrap();
+        assert_eq!(b, serde_json::json!(true));
+        let c = rt.evaluate("globalThis.__e.cancelable").unwrap();
+        assert_eq!(c, serde_json::json!(false));
+        let d = rt.evaluate("globalThis.__e.detail.hello").unwrap();
+        assert_eq!(d, serde_json::json!("world"));
+    }
+
+    #[test]
+    fn test_create_event_returns_correct_class() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let cust = rt
+            .evaluate("document.createEvent('CustomEvent') instanceof CustomEvent")
+            .unwrap();
+        assert_eq!(cust, serde_json::json!(true));
+        let mouse = rt
+            .evaluate("document.createEvent('MouseEvent') instanceof MouseEvent")
+            .unwrap();
+        assert_eq!(mouse, serde_json::json!(true));
+        let mouses = rt
+            .evaluate("document.createEvent('MouseEvents') instanceof MouseEvent")
+            .unwrap();
+        assert_eq!(mouses, serde_json::json!(true));
+        let kb = rt
+            .evaluate("document.createEvent('KeyboardEvent') instanceof KeyboardEvent")
+            .unwrap();
+        assert_eq!(kb, serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_create_event_unknown_type_returns_event() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let kind = rt
+            .evaluate("document.createEvent('NotARealType') instanceof Event")
+            .unwrap();
+        assert_eq!(kind, serde_json::json!(true));
+    }
+
+    #[test]
     fn test_page_content_puppeteer_pattern() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><head></head><body><p>Test</p></body></html>");
         let result = rt.evaluate(

@@ -778,7 +778,28 @@ class Document extends Node {
     _cache.set(nid, frag);
     return frag;
   }
-  createEvent(type) { return new Event(type); }
+  // Legacy DOM Level 2 event factory. Spec returns an event of the requested
+  // class with an empty type until init*Event() is called. We previously
+  // returned a generic Event for every type, which broke libraries that call
+  // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
+  createEvent(type) {
+    const map = {
+      'customevent': CustomEvent, 'customevents': CustomEvent,
+      'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
+      'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
+      'focusevent': FocusEvent,
+      'inputevent': InputEvent,
+      'uievent': UIEvent, 'uievents': UIEvent,
+      'wheelevent': WheelEvent,
+      'pointerevent': PointerEvent,
+      'errorevent': ErrorEvent,
+      'popstateevent': PopStateEvent,
+      'animationevent': AnimationEvent,
+      'transitionevent': TransitionEvent,
+    };
+    const Cls = map[String(type || '').toLowerCase()] || Event;
+    return new Cls('');
+  }
   createRange() { return { setStart(){}, setEnd(){}, collapse(){}, selectNodeContents(){}, cloneContents(){ return document.createDocumentFragment(); } }; }
   addEventListener(type, fn, opts) {} removeEventListener() {} dispatchEvent() { return true; }
   createTreeWalker(root, whatToShow, filter) {
@@ -1841,7 +1862,18 @@ globalThis.Event = class Event {
   preventDefault() { this.defaultPrevented=true; } stopPropagation(){} stopImmediatePropagation(){}
   initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable; }
 };
-globalThis.CustomEvent = class extends Event { constructor(t,o={}) { super(t,o);this.detail=o.detail; } };
+globalThis.CustomEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.detail=o.detail; }
+  // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
+  // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
+  // instead of new CustomEvent(...). See issue #41.
+  initCustomEvent(type,bubbles,cancelable,detail) {
+    this.type = type;
+    this.bubbles = !!bubbles;
+    this.cancelable = !!cancelable;
+    this.detail = detail;
+  }
+};
 globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
 globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
 globalThis.FocusEvent = class extends Event {};
@@ -2104,7 +2136,7 @@ class _IframeDocument {
   createTextNode(text) { return document.createTextNode(text); }
   createComment(text) { return document.createComment(text); }
   createDocumentFragment() { return document.createDocumentFragment(); }
-  createEvent(type) { return new Event(type); }
+  createEvent(type) { return document.createEvent(type); }
   hasFocus() { return false; }
 
   get cookie() { return ''; }
