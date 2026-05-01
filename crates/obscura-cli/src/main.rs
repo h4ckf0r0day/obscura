@@ -465,6 +465,10 @@ async fn run_parallel_scrape(
     let total = urls.len();
     let start = Instant::now();
 
+    if total == 0 {
+        anyhow::bail!("No URLs provided. Pass at least one URL to scrape.");
+    }
+
     eprintln!(
         "Scraping {} URLs with {} concurrent workers (per-worker timeout: {}s)...",
         total, concurrency, timeout_secs
