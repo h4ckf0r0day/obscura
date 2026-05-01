@@ -51,7 +51,9 @@ tar xzf obscura-x86_64-macos.tar.gz
 Download the `.zip` from the releases page and extract it manually.
 ```
 
-Single binary. No Chrome, no Node.js, no dependencies.
+No Chrome, no Node.js, no dependencies. Release archives include both
+`obscura` and `obscura-worker`; keep them in the same directory for the
+parallel `scrape` command.
 
 ### Build from source
 

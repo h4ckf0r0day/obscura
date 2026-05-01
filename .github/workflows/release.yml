@@ -47,14 +47,14 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz obscura
+          tar czf ../../../${{ matrix.name }}.tar.gz obscura obscura-worker
           cd ../../..
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip obscura.exe
+          7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
           cd ../../..
 
       - name: Upload
