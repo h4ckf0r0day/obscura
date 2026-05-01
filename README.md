@@ -96,6 +96,9 @@ obscura fetch https://news.ycombinator.com --dump html
 # Write dump or eval output to a file
 obscura fetch https://example.com --dump text --output page.txt
 
+# Fetch through an HTTP or SOCKS proxy
+obscura --proxy socks5://127.0.0.1:1080 fetch https://example.com --dump text
+
 # Wait for dynamic content
 obscura fetch https://example.com --wait-until networkidle0
 
@@ -122,6 +125,9 @@ obscura scrape url1 url2 url3 ... \
 
 # Suppress scrape progress on stderr for script-friendly output
 obscura scrape https://example.com --quiet --format json
+
+# Scrape workers inherit the global proxy
+obscura --proxy http://127.0.0.1:8080 scrape https://example.com https://news.ycombinator.com
 ```
 
 ## Puppeteer / Playwright
@@ -254,6 +260,7 @@ Fetch and render a single page.
 | `--stealth` | off | Anti-detection mode |
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |
+| `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL |
 
 ### `obscura scrape <URL...>`
 
@@ -265,6 +272,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
 | `--quiet` | off | Suppress scrape progress on stderr |
+| `--proxy` | — | Inherited global HTTP/SOCKS5 proxy URL for all workers |
 
 ## License
 
