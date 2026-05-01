@@ -82,6 +82,9 @@ obscura fetch https://news.ycombinator.com --dump html
 
 # Wait for dynamic content
 obscura fetch https://example.com --wait-until networkidle0
+
+# Bound navigation time for slow or broken pages
+obscura fetch https://example.com --timeout 10
 ```
 
 ### Start the CDP server
@@ -227,6 +230,7 @@ Fetch and render a single page.
 | `--dump` | `html` | Output: `html`, `text`, or `links` |
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
+| `--timeout` | `30` | Maximum navigation time in seconds |
 | `--selector` | — | Wait for CSS selector |
 | `--stealth` | off | Anti-detection mode |
 | `--quiet` | off | Suppress banner |

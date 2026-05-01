@@ -60,6 +60,9 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         wait: u64,
 
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+
         #[arg(long, default_value = "load")]
         wait_until: String,
 
@@ -154,8 +157,8 @@ async fn main() -> anyhow::Result<()> {
                 obscura_cdp::start_with_options(port, proxy, stealth).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, &wait_until, user_agent, stealth, eval, quiet).await?;
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet }) => {
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
             run_parallel_scrape(urls, eval, concurrency, &format, timeout).await?;
@@ -300,6 +303,7 @@ async fn run_fetch(
     dump: DumpFormat,
     selector: Option<String>,
     wait_secs: u64,
+    timeout_secs: u64,
     wait_until: &str,
     user_agent: Option<String>,
     stealth: bool,
@@ -319,9 +323,14 @@ async fn run_fetch(
         eprintln!("Fetching {}...", url_str);
     }
 
-    page.navigate_with_wait(url_str, wait_condition).await.map_err(|e| {
-        anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e)
-    })?;
+    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
+        Err(_) => anyhow::bail!(
+            "Timed out navigating to {} after {}s",
+            url_str,
+            timeout_secs
+        ),
+    }
 
     if !quiet {
         eprintln!("Page loaded: {} - \"{}\"", page.url_string(), page.title);
