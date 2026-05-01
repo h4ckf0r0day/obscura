@@ -53,6 +53,9 @@ Download the `.zip` from the releases page and extract it manually.
 
 Single binary. No Chrome, no Node.js, no dependencies.
 
+Linux release builds target Ubuntu 22.04 so the downloaded binary remains
+usable on common LTS servers with glibc 2.35+.
+
 ### Build from source
 
 ```bash
