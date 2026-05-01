@@ -122,6 +122,9 @@ obscura scrape url1 url2 url3 ... \
 
 # Suppress scrape progress on stderr for script-friendly output
 obscura scrape https://example.com --quiet --format json
+
+# Read URL lists from a file. Blank lines and # comments are ignored.
+obscura scrape --input-file urls.txt --concurrency 25
 ```
 
 ## Puppeteer / Playwright
@@ -265,6 +268,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
 | `--quiet` | off | Suppress scrape progress on stderr |
+| `--input-file` | — | Read additional URLs from a file, or `-` for stdin |
 
 ## License
 

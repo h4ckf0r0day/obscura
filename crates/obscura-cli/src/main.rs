@@ -83,6 +83,9 @@ enum Command {
     },
 
     Scrape {
+        #[arg(long)]
+        input_file: Option<std::path::PathBuf>,
+
         urls: Vec<String>,
 
         #[arg(long, short)]
@@ -181,7 +184,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
             run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet).await?;
         }
-        Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
+        Some(Command::Scrape { input_file, urls, eval, concurrency, format, timeout, quiet }) => {
+            let urls = collect_scrape_urls(urls, input_file)?;
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet).await?;
         }
         None => {
@@ -190,6 +194,43 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Using proxy: {}", proxy);
             }
             obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_scrape_urls(
+    mut urls: Vec<String>,
+    input_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<Vec<String>> {
+    if let Some(path) = input_file {
+        if path == std::path::Path::new("-") {
+            let stdin = std::io::stdin();
+            append_scrape_urls_from_reader(stdin.lock(), &mut urls)?;
+        } else {
+            let file = std::fs::File::open(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+            append_scrape_urls_from_reader(std::io::BufReader::new(file), &mut urls)?;
+        }
+    }
+
+    if urls.is_empty() {
+        anyhow::bail!("No URLs provided. Pass URLs as arguments or use --input-file.");
+    }
+
+    Ok(urls)
+}
+
+fn append_scrape_urls_from_reader<R: std::io::BufRead>(
+    reader: R,
+    urls: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            urls.push(trimmed.to_string());
         }
     }
 
@@ -771,7 +812,8 @@ fn dump_links(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_readable_text, is_quiet_command, select_log_filter, write_or_print, Args, Command,
+        collect_scrape_urls, extract_readable_text, is_quiet_command, select_log_filter,
+        write_or_print, Args, Command,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -921,5 +963,31 @@ mod tests {
         assert!(text.contains("Hello."));
         assert!(!text.contains("console.log"));
         assert!(!text.contains("color: red"));
+    }
+
+    #[test]
+    fn collect_scrape_urls_merges_args_and_input_file_ignoring_blanks_and_comments() {
+        let path = std::env::temp_dir().join(format!(
+            "obscura-scrape-input-file-test-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "\n# skip this\nhttps://example.com/from-file\n  https://example.com/trimmed  \n",
+        )
+        .expect("write input file");
+
+        let urls = collect_scrape_urls(vec!["https://example.com/arg".to_string()], Some(path.clone()))
+            .expect("collect scrape urls");
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/arg",
+                "https://example.com/from-file",
+                "https://example.com/trimmed",
+            ]
+        );
     }
 }
