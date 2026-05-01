@@ -179,7 +179,7 @@ async fn run_multi_worker_serve(
     stealth: bool,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
 
     let exe = std::env::current_exe()?;
     let mut children = Vec::new();
