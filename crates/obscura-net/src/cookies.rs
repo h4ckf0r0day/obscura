@@ -391,7 +391,7 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
 
 fn domain_matches(host: &str, domain: &str) -> bool {
     let host = host.to_lowercase();
-    let domain = domain.to_lowercase();
+    let domain = domain.trim_start_matches('.').to_lowercase();
     host == domain || host.ends_with(&format!(".{}", domain))
 }
 
@@ -425,6 +425,31 @@ mod tests {
         let other_url = Url::parse("https://other.com/").unwrap();
         let header3 = jar.get_cookie_header(&other_url);
         assert!(header3.is_empty());
+    }
+
+    #[test]
+    fn test_cdp_cookie_with_leading_dot_domain_matches_requests() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "token".to_string(),
+            value: "xyz".to_string(),
+            domain: ".example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+        }]);
+
+        let apex_url = Url::parse("https://example.com/").unwrap();
+        let apex_header = jar.get_cookie_header(&apex_url);
+        assert!(apex_header.contains("token=xyz"));
+
+        let subdomain_url = Url::parse("https://api.example.com/").unwrap();
+        let subdomain_header = jar.get_cookie_header(&subdomain_url);
+        assert!(subdomain_header.contains("token=xyz"));
+
+        let other_url = Url::parse("https://other.com/").unwrap();
+        let other_header = jar.get_cookie_header(&other_url);
+        assert!(other_header.is_empty());
     }
 
     #[test]
