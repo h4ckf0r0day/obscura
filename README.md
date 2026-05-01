@@ -108,6 +108,9 @@ obscura scrape url1 url2 url3 ... \
   --concurrency 25 \
   --eval "document.querySelector('h1').textContent" \
   --format json
+
+# Read URL lists from a file. Blank lines and # comments are ignored.
+obscura scrape --input-file urls.txt --concurrency 25
 ```
 
 ## Puppeteer / Playwright
@@ -249,6 +252,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--concurrency` | `10` | Parallel workers |
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
+| `--input-file` | — | Read additional URLs from a file, or `-` for stdin |
 
 ## License
 
