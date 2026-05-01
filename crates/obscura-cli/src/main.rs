@@ -82,8 +82,8 @@ enum Command {
         #[arg(long, short)]
         eval: Option<String>,
 
-        #[arg(long, default_value_t = 10)]
-        concurrency: usize,
+        #[arg(long, default_value_t = std::num::NonZeroUsize::new(10).unwrap())]
+        concurrency: std::num::NonZeroUsize,
 
         #[arg(long, default_value = "json")]
         format: String,
@@ -158,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
             run_fetch(&url, dump, selector, wait, &wait_until, user_agent, stealth, eval, quiet).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
-            run_parallel_scrape(urls, eval, concurrency, &format, timeout).await?;
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
         }
         None => {
             print_banner(args.port);
