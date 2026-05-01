@@ -75,6 +75,9 @@ enum Command {
         #[arg(long, short)]
         eval: Option<String>,
 
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+
         #[arg(long, short)]
         quiet: bool,
     },
@@ -157,8 +160,8 @@ async fn main() -> anyhow::Result<()> {
                 obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet).await?;
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
@@ -312,6 +315,7 @@ async fn run_fetch(
     user_agent: Option<String>,
     stealth: bool,
     eval: Option<String>,
+    output: Option<std::path::PathBuf>,
     quiet: bool,
 ) -> anyhow::Result<()> {
     let context = Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth));
@@ -349,26 +353,33 @@ async fn run_fetch(
 
     if let Some(ref expr) = eval {
         let result = page.evaluate(expr);
-        match result {
-            serde_json::Value::String(s) => println!("{}", s),
-            serde_json::Value::Null => println!("null"),
-            other => println!("{}", other),
-        }
+        let rendered = match result {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Null => "null".to_string(),
+            other => other.to_string(),
+        };
+        write_or_print(rendered, output.as_ref()).await?;
         return Ok(());
     }
 
-    match dump {
-        DumpFormat::Html => {
-            dump_html(&page);
-        }
-        DumpFormat::Text => {
-            dump_text(&mut page);
-        }
-        DumpFormat::Links => {
-            dump_links(&page);
-        }
-    }
+    let rendered = match dump {
+        DumpFormat::Html => dump_html(&page),
+        DumpFormat::Text => dump_text(&mut page),
+        DumpFormat::Links => dump_links(&page),
+    };
+    write_or_print(rendered, output.as_ref()).await?;
 
+    Ok(())
+}
+
+async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    if let Some(path) = output {
+        tokio::fs::write(path, content)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    } else {
+        println!("{}", content);
+    }
     Ok(())
 }
 
@@ -391,27 +402,27 @@ async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -
     }
 }
 
-fn dump_html(page: &Page) {
+fn dump_html(page: &Page) -> String {
     page.with_dom(|dom| {
         if let Ok(Some(html_node)) = dom.query_selector("html") {
             let html = dom.outer_html(html_node);
-            println!("<!DOCTYPE html>");
-            println!("{}", html);
+            format!("<!DOCTYPE html>\n{}", html)
         } else {
             let doc = dom.document();
-            let html = dom.inner_html(doc);
-            println!("{}", html);
+            dom.inner_html(doc)
         }
-    });
+    }).unwrap_or_default()
 }
 
-fn dump_text(page: &mut Page) {
+fn dump_text(page: &mut Page) -> String {
     page.with_dom(|dom| {
         if let Ok(Some(body)) = dom.query_selector("body") {
             let text = extract_readable_text(dom, body);
-            println!("{}", text.trim());
+            text.trim().to_string()
+        } else {
+            String::new()
         }
-    });
+    }).unwrap_or_default()
 }
 
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
@@ -696,9 +707,10 @@ async fn run_parallel_scrape(
     Ok(())
 }
 
-fn dump_links(page: &Page) {
+fn dump_links(page: &Page) -> String {
     let base_url = page.url.clone();
     page.with_dom(|dom| {
+        let mut rendered = Vec::new();
         let links = dom.query_selector_all("a").unwrap_or_default();
         for link_id in links {
             if let Some(node) = dom.get_node(link_id) {
@@ -716,12 +728,38 @@ fn dump_links(page: &Page) {
 
                 if !full_url.is_empty() {
                     if text.is_empty() {
-                        println!("{}", full_url);
+                        rendered.push(full_url);
                     } else {
-                        println!("{}\t{}", full_url, text);
+                        rendered.push(format!("{}\t{}", full_url, text));
                     }
                 }
             }
         }
-    });
+        rendered.join("\n")
+    }).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_or_print;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_or_print_writes_output_file_with_tokio_fs() {
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-output-test-{}.txt",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        write_or_print("rendered output".to_string(), Some(&path))
+            .await
+            .expect("write output file");
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read output file");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(content, "rendered output");
+    }
 }
