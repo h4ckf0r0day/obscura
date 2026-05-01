@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
 </p>
 
-<h2 align="center">Obscura</h1>
+<h2 align="center">Obscura</h2>
 
 <p align="center">
   <strong>The open-source headless browser for AI agents and web scraping.</strong><br>
