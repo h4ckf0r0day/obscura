@@ -93,6 +93,9 @@ enum Command {
 
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
+
+        #[arg(long, short)]
+        quiet: bool,
     },
 
 }
@@ -160,8 +163,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet }) => {
             run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet).await?;
         }
-        Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
+        Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet).await?;
         }
         None => {
             print_banner(args.port);
@@ -474,6 +477,7 @@ async fn run_parallel_scrape(
     concurrency: usize,
     format: &str,
     timeout_secs: u64,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -482,10 +486,12 @@ async fn run_parallel_scrape(
         anyhow::bail!("No URLs provided. Pass at least one URL to scrape.");
     }
 
-    eprintln!(
-        "Scraping {} URLs with {} concurrent workers (per-worker timeout: {}s)...",
-        total, concurrency, timeout_secs
-    );
+    if !quiet {
+        eprintln!(
+            "Scraping {} URLs with {} concurrent workers (per-worker timeout: {}s)...",
+            total, concurrency, timeout_secs
+        );
+    }
 
     let worker_path = std::env::current_exe()
         .ok()
@@ -685,12 +691,14 @@ async fn run_parallel_scrape(
                 println!("{}ms\t{}\t{}", time, url, eval);
             }
         }
-        eprintln!(
-            "\nTotal: {}ms for {} URLs ({} concurrent)",
-            total_time.as_millis(),
-            total,
-            concurrency
-        );
+        if !quiet {
+            eprintln!(
+                "\nTotal: {}ms for {} URLs ({} concurrent)",
+                total_time.as_millis(),
+                total,
+                concurrency
+            );
+        }
     }
 
     Ok(())

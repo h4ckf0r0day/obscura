@@ -108,6 +108,9 @@ obscura scrape url1 url2 url3 ... \
   --concurrency 25 \
   --eval "document.querySelector('h1').textContent" \
   --format json
+
+# Suppress scrape progress on stderr for script-friendly output
+obscura scrape https://example.com --quiet --format json
 ```
 
 ## Puppeteer / Playwright
@@ -249,6 +252,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--concurrency` | `10` | Parallel workers |
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
+| `--quiet` | off | Suppress scrape progress on stderr |
 
 ## License
 
