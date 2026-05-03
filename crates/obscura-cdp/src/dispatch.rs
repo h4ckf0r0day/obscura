@@ -121,6 +121,27 @@ impl CdpContext {
 }
 
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    // Issue #19: V8 fatal abort under concurrent CDP work.
+    //
+    // Every CDP handler below may end up calling into a per-Page `JsRuntime`
+    // (each owning its own V8 Isolate). All of them run on a single OS
+    // thread (current_thread tokio + LocalSet). When two pages' V8-touching
+    // futures interleave across an `.await` (which `process_with_interception`
+    // can trigger by handling new CDP messages while a navigation task is in
+    // flight on `spawn_local`), V8 trips the
+    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts the
+    // process via `V8_Fatal` — no Rust panic, just `abort(3)`.
+    //
+    // Holding the process-wide V8 lock around the entire dispatch keeps each
+    // handler contiguous on the thread: V8 fully exits one Isolate before
+    // the next page is allowed in. This converts the abort into latency.
+    // It overshoots — non-V8 handlers (Browser.*, Storage.*, Emulation.*)
+    // also serialize — but those are cheap and the safety win dominates.
+    //
+    // The properly concurrent fix is to pin each `JsRuntime` to its own OS
+    // thread and message-pass; that's tracked as the larger #19 follow-up.
+    let _v8_guard = obscura_js::v8_lock::global().lock().await;
+
     let (domain, method) = match req.method.split_once('.') {
         Some((d, m)) => (d, m),
         None => {
