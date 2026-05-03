@@ -32,7 +32,16 @@ pub async fn start_with_options(
     proxy: Option<String>,
     stealth: bool,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    start_with_host(port, proxy, stealth, [0, 0, 0, 0]).await
+}
+
+pub async fn start_with_host(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+    host: [u8; 4],
+) -> anyhow::Result<()> {
+    let addr = SocketAddr::from((host, port));
     let listener = TcpListener::bind(&addr).await?;
 
     info!("Obscura CDP server listening on ws://127.0.0.1:{}", port);
