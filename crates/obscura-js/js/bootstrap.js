@@ -345,6 +345,56 @@ class Node {
   isSameNode(other) { return other && this._nid === other._nid; }
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
+class CharacterData extends Node {
+  get data() {
+    return _domParse("text_content", this._nid) ?? "";
+  }
+  set data(v) {
+    _dom("set_text_content", this._nid, String(v ?? ""));
+  }
+  get length() { return this.data.length; }
+  substringData(offset, count) {
+    return this.data.substring(offset, offset + count);
+  }
+  appendData(s) { this.data += s; }
+  insertData(offset, s) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + s + d.slice(offset);
+  }
+  deleteData(offset, count) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + d.slice(offset + count);
+  }
+  replaceData(offset, count, s) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+  }
+}
+
+class Text extends CharacterData {
+  get nodeName() { return "#text"; }
+  get nodeType() { return 3; }
+  get wholeText() { return this.data; }
+  splitText(offset) {
+    const d = this.data;
+    const tail = d.substring(offset);
+    this.data = d.substring(0, offset);
+    const newNid = +_dom("create_text_node", tail);
+    const parent = this.parentNode;
+    if (parent) {
+      const ref = this.nextSibling;
+      parent.insertBefore(_wrap(newNid), ref);
+    }
+    return _wrap(newNid);
+  }
+  cloneNode() { return document.createTextNode(this.data); }
+}
+
+class Comment extends CharacterData {
+  get nodeName() { return "#comment"; }
+  get nodeType() { return 8; }
+  cloneNode() { return document.createComment(this.data); }
+}
 
 class Element extends Node {
   constructor(nid) {
@@ -764,11 +814,8 @@ class Document extends Node {
   }
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
   createComment(t) {
-    const nid = +_dom("create_text_node", "");
-    const n = new Node(nid);
-    n._isComment = true;
-    Object.defineProperty(n, "nodeType", { value: 8, writable: false, configurable: true });
-    Object.defineProperty(n, "nodeName", { value: "#comment", writable: false, configurable: true });
+    const nid = +_dom("create_comment_node", String(t ?? ""));
+    const n = new Comment(nid);
     _cache.set(nid, n);
     return n;
   }
@@ -971,6 +1018,8 @@ function _wrap(nid) {
   const t = +_dom("node_type", nid);
   let n;
   if (t === 1) n = new Element(nid);
+  else if (t === 3) n = new Text(nid);
+  else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
@@ -1987,8 +2036,9 @@ globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
-globalThis.Text = Node;
-globalThis.Comment = Node;
+globalThis.CharacterData = CharacterData;
+globalThis.Text = Text;
+globalThis.Comment = Comment;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
