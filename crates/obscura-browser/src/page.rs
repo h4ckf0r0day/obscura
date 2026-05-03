@@ -168,6 +168,9 @@ impl Page {
             is_defer: bool,
             is_async: bool,
             is_module: bool,
+            /// DOM node id of the `<script>` element — used to set
+            /// `document.currentScript` for the duration of execution.
+            node_id: u32,
         }
 
         let all_scripts = match &self.js {
@@ -205,6 +208,7 @@ impl Page {
                                     is_defer,
                                     is_async,
                                     is_module,
+                                    node_id: sid.raw(),
                                 });
                             }
                         }
@@ -305,9 +309,19 @@ impl Page {
                 }
             } else if !script.inline.is_empty() {
                 if let Some(js) = &mut self.js {
+                    // Set document.currentScript to this <script> node for the
+                    // duration of execution, then clear it — matches browser spec.
+                    let _ = js.execute_script(
+                        "<set-current-script>",
+                        &format!("globalThis.__obscura_currentScript_nid = {};", script.node_id),
+                    );
                     if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
                         tracing::warn!("Inline script error: {}", e);
                     }
+                    let _ = js.execute_script(
+                        "<clear-current-script>",
+                        "globalThis.__obscura_currentScript_nid = null;",
+                    );
                 }
             }
         }
@@ -344,6 +358,87 @@ impl Page {
             }
         }
 
+        // Dynamic script processing loop — handles webpack / turbopack / React
+        // lazy-loading where the initial bundle injects additional <script src>
+        // elements at runtime.  We iterate until the queue is empty (or we hit
+        // the safety cap) because each chunk may itself inject more chunks.
+        let max_dynamic_rounds = 20;
+        for round in 0..max_dynamic_rounds {
+            // Let Promise micro-tasks flush first (e.g. webpack's
+            // `Promise.all([__webpack_require__.e(...)])` which resolves when
+            // the chunk script runs and calls webpackChunkCallback).
+            if let Some(js) = &mut self.js {
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(100),
+                    js.run_event_loop(),
+                ).await;
+            }
+
+            let pending = self.js.as_ref().map(|js| js.take_pending_scripts()).unwrap_or_default();
+            if pending.is_empty() {
+                break;
+            }
+
+            // Deduplicate URLs to avoid executing the same chunk twice.
+            let mut seen_urls = std::collections::HashSet::new();
+            let pending: Vec<(String, u32)> = pending
+                .into_iter()
+                .filter(|(url, _)| seen_urls.insert(url.clone()))
+                .collect();
+
+            tracing::info!("Dynamic script round {}: {} chunk(s) to fetch", round + 1, pending.len());
+
+            // Fetch all pending scripts concurrently.
+            let client = self.http_client.clone();
+            let fetch_futures: Vec<_> = pending.iter().map(|(url, _nid)| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    match Url::parse(&url) {
+                        Ok(parsed) => match client.fetch(&parsed).await {
+                            Ok(resp) => Some((url, resp)),
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch dynamic script {}: {}", url, e);
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("Invalid dynamic script URL {}: {}", url, e);
+                            None
+                        }
+                    }
+                }
+            }).collect();
+
+            let fetch_results = futures::future::join_all(fetch_futures).await;
+
+            let mut fetched: std::collections::HashMap<String, (String, obscura_net::Response)> =
+                std::collections::HashMap::new();
+            for result in fetch_results {
+                if let Some((url, resp)) = result {
+                    let code = String::from_utf8_lossy(&resp.body).to_string();
+                    fetched.insert(url, (code, resp));
+                }
+            }
+
+            for (url, nid) in &pending {
+                if let Some((code, resp)) = fetched.remove(url) {
+                    tracing::info!("Executing dynamic script ({} bytes): {}", code.len(), url);
+                    self.record_network_event(url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                    if let Some(js) = &mut self.js {
+                        if let Err(e) = js.execute_script_guarded(url, &code) {
+                            tracing::warn!("Dynamic script error ({}): {}", url, e);
+                        }
+                        // Fire the `load` event so webpack-4-style onload resolvers proceed.
+                        js.fire_script_load(*nid);
+                    }
+                }
+            }
+        }
+
+        // DOMContentLoaded + load events are fired AFTER all dynamic chunks
+        // are executed so that React / Vue / Angular can find their mount points
+        // with a fully-hydrated module graph.
         if let Some(js) = &mut self.js {
             let _ = js.execute_script("<load-events>",
                 "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\

@@ -49,6 +49,11 @@ pub struct ObscuraState {
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
+    /// Dynamically injected `<script src="…">` elements queued by `op_dom`
+    /// `append_child` / `set_attribute` so the async page runner can fetch and
+    /// execute them (webpack / turbopack chunk loading, React lazy loading, etc.).
+    /// Each entry is `(resolved_url, node_id)`.
+    pub pending_scripts: std::cell::RefCell<Vec<(String, u32)>>,
 }
 
 impl ObscuraState {
@@ -64,6 +69,7 @@ impl ObscuraState {
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
+            pending_scripts: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -174,6 +180,30 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 } else {
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                 }
+                // Detect the reverse pattern: <script> appended first, src set afterward.
+                // Only queue if the element is already in the DOM (has a parent).
+                if name == "src" {
+                    let pending_entry: Option<(String, u32)> = dom.get_node(node_id).and_then(|node| {
+                        if !node.as_element().map(|n| n.local.as_ref() == "script").unwrap_or(false) {
+                            return None;
+                        }
+                        if node.parent.is_none() {
+                            return None; // not in the DOM yet — will be caught by append_child
+                        }
+                        let script_type = node.get_attribute("type").unwrap_or("");
+                        if !script_type.is_empty()
+                            && script_type != "text/javascript"
+                            && script_type != "application/javascript"
+                        {
+                            return None;
+                        }
+                        // `value` is the src that was just set
+                        Some((resolve_script_url(value, &gs.url), nid))
+                    });
+                    if let Some(entry) = pending_entry {
+                        gs.pending_scripts.borrow_mut().push(entry);
+                    }
+                }
             }
             "true".into()
         }
@@ -189,6 +219,28 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let parent = arg1.parse::<u32>().unwrap_or(0);
             let child = arg2.parse::<u32>().unwrap_or(0);
             dom.append_child(NodeId::new(parent), NodeId::new(child));
+            // Detect dynamically injected <script src="…"> elements so the async
+            // page runner can fetch + execute them (webpack / turbopack chunk loading).
+            // Pattern: script.src set BEFORE appendChild (most common in webpack 5).
+            let pending_entry: Option<(String, u32)> = dom.get_node(NodeId::new(child)).and_then(|node| {
+                if !node.as_element().map(|n| n.local.as_ref() == "script").unwrap_or(false) {
+                    return None;
+                }
+                let script_type = node.get_attribute("type").unwrap_or("");
+                if !script_type.is_empty()
+                    && script_type != "text/javascript"
+                    && script_type != "application/javascript"
+                {
+                    return None;
+                }
+                node.get_attribute("src").map(|src| {
+                    let full_url = resolve_script_url(src, &gs.url);
+                    (full_url, child)
+                })
+            });
+            if let Some(entry) = pending_entry {
+                gs.pending_scripts.borrow_mut().push(entry);
+            }
             "true".into()
         }
         "remove_child" => {
@@ -540,6 +592,26 @@ async fn op_fetch_url(
         "headers": resp_headers,
     })
     .to_string())
+}
+
+/// Resolve a script `src` value against the current page URL.
+/// Handles absolute URLs, protocol-relative URLs, and relative paths.
+fn resolve_script_url(src: &str, page_url: &str) -> String {
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return src.to_string();
+    }
+    if src.starts_with("//") {
+        let scheme = page_url.split(':').next().unwrap_or("https");
+        return format!("{}:{}", scheme, src);
+    }
+    if let Ok(base) = url::Url::parse(page_url) {
+        if base.scheme() != "about" && base.scheme() != "data" {
+            if let Ok(resolved) = base.join(src) {
+                return resolved.to_string();
+            }
+        }
+    }
+    src.to_string()
 }
 
 fn glob_match(pattern: &str, url: &str) -> bool {
