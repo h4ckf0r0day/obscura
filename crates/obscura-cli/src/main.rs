@@ -35,6 +35,9 @@ enum Command {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
 
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
         #[arg(long)]
         proxy: Option<String>,
 
@@ -130,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers }) => {
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -147,11 +150,13 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Stealth mode enabled (tracker blocking)");
             }
 
+            let host_octets = parse_host(&host)?;
+
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth).await?;
             } else {
-                obscura_cdp::start_with_options(port, proxy, stealth).await?;
+                obscura_cdp::start_with_host(port, proxy, stealth, host_octets).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, wait_until, user_agent, stealth, eval, quiet }) => {
@@ -677,6 +682,12 @@ async fn run_parallel_scrape(
     }
 
     Ok(())
+}
+
+fn parse_host(host: &str) -> anyhow::Result<[u8; 4]> {
+    let addr: std::net::Ipv4Addr = host.parse()
+        .map_err(|_| anyhow::anyhow!("Invalid host address '{}'. Use an IPv4 address like 0.0.0.0 or 127.0.0.1", host))?;
+    Ok(addr.octets())
 }
 
 fn dump_links(page: &Page) {
