@@ -40,6 +40,7 @@ pub async fn handle(
                         x = x, y = y,
                     );
                     page.evaluate(&code);
+                    page.process_pending_navigation().await.map_err(|e| e.to_string())?;
                 }
             } else if event_type == "mouseReleased" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {

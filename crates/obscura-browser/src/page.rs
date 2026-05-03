@@ -683,13 +683,14 @@ impl Page {
         }
     }
 
-    pub fn evaluate_for_cdp(
+    pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
         return_by_value: bool,
+        await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.evaluate_for_cdp(expression, return_by_value) {
+            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -834,6 +835,21 @@ impl Page {
             js.take_pending_navigation()
         } else {
             None
+        }
+    }
+
+    pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
+        if let Some((url, method, body)) = self.take_pending_navigation() {
+            self.navigate_with_wait_post(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                &method,
+                &body,
+            )
+            .await?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 

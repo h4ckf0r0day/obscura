@@ -64,6 +64,7 @@ pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
+    let allow_private_network = std::env::var_os("OBSCURA_ALLOW_PRIVATE_NETWORK").is_some();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
@@ -72,7 +73,7 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
         )));
     }
 
-    if scheme == "file" {
+    if scheme == "file" || allow_private_network {
         return Ok(());
     }
 

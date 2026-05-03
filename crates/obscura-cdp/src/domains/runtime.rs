@@ -42,10 +42,16 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let await_promise = params
+                .get("awaitPromise")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = page.evaluate_for_cdp(expression, return_by_value);
+            let info = page.evaluate_for_cdp(expression, return_by_value, await_promise).await;
+            page.process_pending_navigation().await.map_err(|e| e.to_string())?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
@@ -74,6 +80,7 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info =
                 page.call_function_on_for_cdp(function_declaration, object_id, &arguments, return_by_value, await_promise).await;
+            page.process_pending_navigation().await.map_err(|e| e.to_string())?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
