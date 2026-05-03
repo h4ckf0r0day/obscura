@@ -19,7 +19,7 @@ struct Args {
     #[arg(short, long, default_value_t = 9222)]
     port: u16,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     proxy: Option<String>,
 
     #[arg(long)]
@@ -119,6 +119,10 @@ fn print_banner(port: u16) {
 "#, port);
 }
 
+fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
+    command_proxy.or(global_proxy)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -132,8 +136,11 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let global_proxy = args.proxy.clone();
+
     match args.command {
         Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
+            let proxy = merge_proxy(global_proxy.clone(), proxy);
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -158,10 +165,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet, global_proxy).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, global_proxy).await?;
         }
         None => {
             print_banner(args.port);
@@ -313,8 +320,9 @@ async fn run_fetch(
     stealth: bool,
     eval: Option<String>,
     quiet: bool,
+    proxy: Option<String>,
 ) -> anyhow::Result<()> {
-    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth));
+    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth));
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {
@@ -474,6 +482,7 @@ async fn run_parallel_scrape(
     concurrency: usize,
     format: &str,
     timeout_secs: u64,
+    proxy: Option<String>,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -512,6 +521,7 @@ async fn run_parallel_scrape(
         let sem = semaphore.clone();
         let eval = eval.clone();
         let worker_path = worker_path.clone();
+        let proxy = proxy.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -521,6 +531,7 @@ async fn run_parallel_scrape(
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
+                .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .spawn()
             {
                 Ok(c) => c,
@@ -724,4 +735,26 @@ fn dump_links(page: &Page) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_proxy;
+
+    #[test]
+    fn command_proxy_overrides_global_proxy() {
+        let proxy = merge_proxy(
+            Some("http://global.example:8080".to_string()),
+            Some("socks5://127.0.0.1:1080".to_string()),
+        );
+
+        assert_eq!(proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn global_proxy_is_used_when_command_proxy_is_absent() {
+        let proxy = merge_proxy(Some("http://global.example:8080".to_string()), None);
+
+        assert_eq!(proxy.as_deref(), Some("http://global.example:8080"));
+    }
 }
