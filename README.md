@@ -241,6 +241,63 @@ Scrape multiple URLs in parallel with worker processes.
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
 
+## MCP (Model Context Protocol)
+
+Obscura ships an MCP server that exposes browser automation tools to AI agents (Claude Desktop, Cursor, etc.).
+
+### Start
+
+**stdio** (default) — for Claude Desktop and MCP clients that launch a subprocess:
+
+```bash
+obscura mcp
+```
+
+**HTTP** — for clients that connect over the network:
+
+```bash
+obscura mcp --http --port 8080
+# endpoint: http://127.0.0.1:8080/mcp
+```
+
+Optional flags (both transports):
+
+| Flag | Description |
+|------|-------------|
+| `--proxy <URL>` | HTTP/SOCKS5 proxy |
+| `--user-agent <UA>` | Custom User-Agent string |
+| `--stealth` | Enable anti-detection mode |
+
+### Claude Desktop config
+
+```json
+{
+  "mcpServers": {
+    "obscura": {
+      "command": "obscura",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `browser_navigate` | Navigate to a URL (`url`, optional `waitUntil`: `load` / `domcontentloaded` / `networkidle0`) |
+| `browser_snapshot` | Return the current page URL, title, and body text |
+| `browser_click` | Click an element by CSS selector |
+| `browser_fill` | Set an input value (triggers `input` + `change` events) |
+| `browser_type` | Append text to an input |
+| `browser_press_key` | Dispatch a keyboard event (`key`, optional `selector`) |
+| `browser_select_option` | Select an `<option>` by value or text |
+| `browser_evaluate` | Evaluate a JavaScript expression and return the result |
+| `browser_wait_for` | Wait for a CSS selector to appear (`selector`, optional `timeout` in seconds) |
+| `browser_network_requests` | List network requests made by the current page |
+| `browser_console_messages` | Return console messages logged by the page |
+| `browser_close` | Close the page and reset browser state |
+
 ## License
 
 Apache 2.0

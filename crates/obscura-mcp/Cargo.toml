@@ -1,0 +1,18 @@
+[package]
+name = "obscura-mcp"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
+
+[dependencies]
+obscura-browser = { workspace = true }
+obscura-dom = { workspace = true }
+obscura-net = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
