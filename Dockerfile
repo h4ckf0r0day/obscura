@@ -3,6 +3,7 @@ FROM rust:1.95-slim AS builder
 
 # Step 2: Install system dependencies
 RUN apt-get update && apt-get install -y \
+    git \
     python3 \
     build-essential \
     cmake \
