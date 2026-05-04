@@ -111,18 +111,53 @@ enum DumpFormat {
     Links,
 }
 
-fn print_banner(port: u16) {
-    println!(r#"
-   ____  _                              
-  / __ \| |                             
- | |  | | |__  ___  ___ _   _ _ __ __ _ 
+fn banner_text(port: u16) -> String {
+    format!(r#"
+   ____  _
+  / __ \| |
+ | |  | | |__  ___  ___ _   _ _ __ __ _
  | |  | | '_ \/ __|/ __| | | | '__/ _` |
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
-                   
-  Headless Browser v0.1.2
+
+  Headless Browser v{}
   CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+"#, env!("CARGO_PKG_VERSION"), port)
+}
+
+fn print_banner(port: u16) {
+    println!("{}", banner_text(port));
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::banner_text;
+
+    #[test]
+    fn banner_includes_compiled_pkg_version() {
+        let pkg = env!("CARGO_PKG_VERSION");
+        let out = banner_text(9222);
+        assert!(
+            out.contains(&format!("Headless Browser v{}", pkg)),
+            "banner missing compiled CARGO_PKG_VERSION ({}): {}",
+            pkg,
+            out
+        );
+        assert!(out.contains("ws://127.0.0.1:9222/devtools/browser"));
+    }
+
+    #[test]
+    fn banner_version_is_not_hardcoded_zero() {
+        let out = banner_text(9222);
+        let pkg = env!("CARGO_PKG_VERSION");
+        if pkg != "0.1.0" {
+            assert!(
+                !out.contains("Headless Browser v0.1.0"),
+                "banner still prints stale v0.1.0 while pkg version is {}",
+                pkg
+            );
+        }
+    }
 }
 
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
