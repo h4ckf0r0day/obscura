@@ -112,6 +112,18 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
+        "getUsageAndQuota" => {
+            Ok(json!({
+                "usage": 0.0,
+                "quota": 1073741824.0,
+                "overrideActive": false,
+                "usageBreakdown": []
+            }))
+        }
+        "clearDataForOrigin" => {
+            ctx.default_context.cookie_jar.clear();
+            Ok(json!({}))
+        }
         _ => Ok(json!({})),
     }
 }

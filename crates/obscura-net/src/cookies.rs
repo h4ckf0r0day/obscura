@@ -6,7 +6,7 @@ pub struct CookieJar {
     cookies: RwLock<HashMap<String, HashMap<String, CookieEntry>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CookieEntry {
     name: String,
     value: String,
@@ -338,6 +338,67 @@ impl CookieJar {
     pub fn clear(&self) {
         self.cookies.write().unwrap().clear();
     }
+
+    /// Serialize all non-expired cookies to a JSON file.
+    /// Writes atomically via tempfile then rename.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+        use std::io::Write;
+
+        let cookies = self.cookies.read().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut all: Vec<CookieInfo> = Vec::new();
+        for domain_cookies in cookies.values() {
+            for entry in domain_cookies.values() {
+                if let Some(exp) = entry.expires {
+                    if exp < now {
+                        continue;
+                    }
+                }
+                all.push(CookieInfo {
+                    name: entry.name.clone(),
+                    value: entry.value.clone(),
+                    domain: entry.domain.clone(),
+                    path: entry.path.clone(),
+                    secure: entry.secure,
+                    http_only: entry.http_only,
+                });
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&all).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut tmp = tempfile::NamedTempFile::new_in(
+            path.parent().unwrap_or(std::path::Path::new(".")),
+        )?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    }
+
+    /// Load cookies from a JSON file into the jar.
+    /// Merges with existing cookies (does not clear).
+    /// Returns the number of cookies loaded.
+    pub fn load_from_file(&self, path: &std::path::Path) -> Result<usize, std::io::Error> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let data = std::fs::read_to_string(path)?;
+        let cookies: Vec<CookieInfo> =
+            serde_json::from_str(&data).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+        let count = cookies.len();
+        self.set_cookies_from_cdp(cookies);
+        Ok(count)
+    }
 }
 
 impl Default for CookieJar {
@@ -507,5 +568,36 @@ mod tests {
 
         jar.clear();
         assert!(jar.get_cookie_header(&url).is_empty());
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("session=abc123; Domain=example.com; Path=/", &url);
+        jar.set_cookie("token=xyz; Secure; HttpOnly", &url);
+
+        jar.save_to_file(&path).unwrap();
+        assert!(path.exists());
+
+        let jar2 = CookieJar::new();
+        let count = jar2.load_from_file(&path).unwrap();
+        assert_eq!(count, 2);
+
+        let header = jar2.get_cookie_header(&url);
+        assert!(header.contains("session=abc123"));
+        assert!(header.contains("token=xyz"));
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_returns_zero() {
+        let jar = CookieJar::new();
+        let count = jar
+            .load_from_file(std::path::Path::new("/nonexistent/cookies.json"))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

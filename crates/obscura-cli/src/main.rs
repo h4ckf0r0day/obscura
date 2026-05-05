@@ -27,6 +27,9 @@ struct Args {
 
     #[arg(long)]
     user_agent: Option<String>,
+
+    #[arg(long)]
+    storage_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -158,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet, args.storage_dir).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
@@ -313,8 +316,13 @@ async fn run_fetch(
     stealth: bool,
     eval: Option<String>,
     quiet: bool,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth));
+    let context = if let Some(ref dir) = storage_dir {
+        Arc::new(BrowserContext::with_storage("fetch".to_string(), Some(dir.clone())))
+    } else {
+        Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth))
+    };
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {
@@ -368,6 +376,9 @@ async fn run_fetch(
             dump_links(&page);
         }
     }
+
+    // Save cookies to disk if storage_dir is configured
+    context.save_cookies();
 
     Ok(())
 }
