@@ -49,6 +49,9 @@ enum Command {
 
         #[arg(long, default_value_t = 1)]
         workers: u16,
+
+        #[arg(long)]
+        storage_dir: Option<std::path::PathBuf>,
     },
 
     Fetch {
@@ -139,7 +142,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers }) => {
+        Some(Command::Serve { port, proxy, user_agent, stealth, workers, storage_dir }) => {
+            if let Some(ref dir) = storage_dir {
+                tracing::info!("Storage dir: {}", dir.display());
+            }
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
