@@ -47,12 +47,34 @@ impl CdpContext {
         stealth: bool,
         user_agent: Option<String>,
     ) -> Self {
-        let default_context = Arc::new(BrowserContext::with_full_options(
-            "default".to_string(),
-            proxy,
-            stealth,
-            user_agent,
-        ));
+        Self::_new_inner(proxy, stealth, user_agent, None)
+    }
+
+    pub fn new_with_storage(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::_new_inner(proxy, stealth, user_agent, storage_dir)
+    }
+
+    fn _new_inner(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        let default_context = if let Some(ref dir) = storage_dir {
+            Arc::new(BrowserContext::with_storage("default".to_string(), Some(dir.clone())))
+        } else {
+            Arc::new(BrowserContext::with_full_options(
+                "default".to_string(),
+                proxy,
+                stealth,
+                user_agent,
+            ))
+        };
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),

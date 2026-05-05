@@ -166,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent).await?;
+                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent, storage_dir).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet, storage_dir }) => {
