@@ -80,6 +80,9 @@ enum Command {
 
         #[arg(long, short)]
         quiet: bool,
+
+        #[arg(long)]
+        storage_dir: Option<std::path::PathBuf>,
     },
 
     Scrape {
@@ -160,8 +163,8 @@ async fn main() -> anyhow::Result<()> {
                 obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet, args.storage_dir).await?;
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet, storage_dir }) => {
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet, storage_dir).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
@@ -323,6 +326,8 @@ async fn run_fetch(
     } else {
         Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth))
     };
+    // Clone for post-fetch save (context is moved into Page::new below)
+    let ctx_for_save = context.clone();
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {
@@ -378,7 +383,7 @@ async fn run_fetch(
     }
 
     // Save cookies to disk if storage_dir is configured
-    context.save_cookies();
+    ctx_for_save.save_cookies();
 
     Ok(())
 }
