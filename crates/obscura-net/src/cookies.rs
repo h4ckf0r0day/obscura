@@ -601,3 +601,43 @@ mod tests {
         assert_eq!(count, 0);
     }
 }
+
+    #[test]
+    fn test_domain_matches_subdomain_without_leading_dot() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "session".to_string(),
+            value: "abc".to_string(),
+            domain: "xiaohongshu.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: true,
+        }]);
+        let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
+        let header = jar.get_cookie_header(&url);
+        assert!(header.contains("session=abc"), "Cookie header was: '{}'", header);
+    }
+
+    #[test]
+    fn test_cookie_from_file_load_then_send_in_request() {
+        // Simulate what happens: load cookies from file → navigate → cookie should be in request
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        
+        // Write cookies like we exported from Chrome
+        let cookies = serde_json::json!([
+            {"name": "a1", "value": "testval", "domain": "xiaohongshu.com", "path": "/", "secure": false, "httpOnly": false},
+            {"name": "web_session", "value": "sess123", "domain": "xiaohongshu.com", "path": "/", "secure": false, "httpOnly": true},
+        ]);
+        std::fs::write(&path, serde_json::to_string(&cookies).unwrap()).unwrap();
+        
+        let jar = CookieJar::new();
+        let count = jar.load_from_file(&path).unwrap();
+        assert_eq!(count, 2, "Should load 2 cookies");
+        
+        let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
+        let header = jar.get_cookie_header(&url);
+        assert!(header.contains("a1=testval"), "Missing a1 in: '{}'", header);
+        assert!(header.contains("web_session=sess123"), "Missing web_session in: '{}'", header);
+    }

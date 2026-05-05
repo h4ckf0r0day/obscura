@@ -328,9 +328,33 @@ impl ObscuraHttpClient {
             );
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            tracing::debug!(
+                "Cookie header for {}: {} cookies ({} bytes)",
+                current_url.host_str().unwrap_or("?"),
+                cookie_header.split("; ").filter(|s| !s.is_empty()).count(),
+                cookie_header.len(),
+            );
             if !cookie_header.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(&cookie_header) {
-                    headers.insert(reqwest::header::COOKIE, val);
+                match HeaderValue::from_str(&cookie_header) {
+                    Ok(val) => {
+                        headers.insert(reqwest::header::COOKIE, val);
+                    }
+                    Err(_) => {
+                        let filtered: String = cookie_header
+                            .split("; ")
+                            .filter(|pair| HeaderValue::from_str(pair).is_ok())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        if !filtered.is_empty() {
+                            if let Ok(val) = HeaderValue::from_str(&filtered) {
+                                headers.insert(reqwest::header::COOKIE, val);
+                            }
+                        }
+                        tracing::debug!(
+                            "Cookie header invalid chars, filtered {} -> {} bytes",
+                            cookie_header.len(), filtered.len(),
+                        );
+                    }
                 }
             }
 
