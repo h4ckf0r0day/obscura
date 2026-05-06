@@ -502,6 +502,15 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))
         }
+        // Critical: Puppeteer calls this as the *first* CDP command on connect
+        // (`BrowserConnector._connectToCdpBrowser`). If another client or a long
+        // `Page.navigate` / interception holds the single `cdp_processor` task,
+        // queued Target commands starve and Puppeteer hits protocolTimeout on
+        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same payload
+        // as `domains::target::handle` when default context id is `"default"`.
+        "Target.getBrowserContexts" => {
+            Some(json!({ "browserContextIds": ["default"] }))
+        }
         _ => None,
     };
 
