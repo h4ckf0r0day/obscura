@@ -105,6 +105,41 @@ impl ObscuraJsRuntime {
             format!("globalThis.__obscura_ua = '{}';", escaped),
         );
     }
+
+    pub fn set_viewport_metrics(&mut self, width: u32, height: u32, device_scale_factor: f64) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let device_scale_factor = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+            device_scale_factor
+        } else {
+            2.0
+        };
+        let _ = self.runtime.execute_script(
+            "<set-viewport>",
+            format!(
+                "globalThis.__obscura_apply_viewport?.({}, {}, {});",
+                width, height, device_scale_factor
+            ),
+        );
+    }
+
+    pub fn set_current_script(&mut self, node_id: u32) {
+        let _ = self.runtime.execute_script(
+            "<set-current-script>",
+            format!(
+                "globalThis.__obscura_set_current_script?.({});",
+                node_id
+            ),
+        );
+    }
+
+    pub fn clear_current_script(&mut self) {
+        let _ = self.runtime.execute_script(
+            "<clear-current-script>",
+            "globalThis.__obscura_set_current_script?.(0);".to_string(),
+        );
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         let wrapped = Self::wrap_expression(expression);
         let result = self
@@ -440,16 +475,17 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
-    pub fn execute_script_guarded(&mut self, _name: &str, source: &str) -> Result<(), String> {
+    pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
         if source.len() < 10_000 {
-            self.execute_script(_name, source)
+            self.execute_script(name, source)
         } else {
-            self.execute_script_with_timeout(source, std::time::Duration::from_secs(5))
+            self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(20))
         }
     }
 
     pub fn execute_script_with_timeout(
         &mut self,
+        name: &str,
         source: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
@@ -505,7 +541,7 @@ impl ObscuraJsRuntime {
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("Uncaught Error: execution terminated") {
-                    tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
+                    tracing::warn!("Script killed after {}s timeout: {}", timeout.as_secs(), name);
                     self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
                     Ok(())
                 } else {
@@ -520,6 +556,57 @@ impl ObscuraJsRuntime {
             .run_event_loop(deno_core::PollEventLoopOptions::default())
             .await
             .map_err(|e| format!("Event loop error: {}", e))
+    }
+
+    pub async fn run_event_loop_slice(
+        &mut self,
+        poll_timeout: tokio::time::Duration,
+        cpu_timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let pair = std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
+        let pair_clone = pair.clone();
+
+        let watchdog = std::thread::spawn(move || {
+            let (lock, cvar) = &*pair_clone;
+            let mut cancelled = lock.lock().unwrap();
+            let result = cvar.wait_timeout(cancelled, cpu_timeout).unwrap();
+            cancelled = result.0;
+            if !*cancelled && result.1.timed_out() {
+                isolate_handle.terminate_execution();
+            }
+        });
+
+        let result = tokio::time::timeout(
+            poll_timeout,
+            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
+        ).await;
+
+        {
+            let (lock, cvar) = &*pair;
+            let mut cancelled = lock.lock().unwrap();
+            *cancelled = true;
+            cvar.notify_one();
+        }
+        let _ = watchdog.join();
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("Uncaught Error: execution terminated") {
+                    tracing::warn!("Event loop task killed after {}ms timeout", cpu_timeout.as_millis());
+                    self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
+                    Ok(())
+                } else {
+                    Err(format!("Event loop error: {}", msg))
+                }
+            }
+            Err(_) => Ok(()),
+        }
     }
 
     pub async fn resolve_promises(&mut self) {

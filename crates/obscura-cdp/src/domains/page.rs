@@ -224,19 +224,24 @@ pub async fn handle(
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
         "getLayoutMetrics" => {
-            // Obscura has no visual layout engine, so we return a fixed
-            // 1280x720 viewport (Chrome's default) and try to derive the
+            // Obscura has no visual layout engine, so we return the page's
+            // emulated viewport and try to derive the
             // content height from document.documentElement.scrollHeight.
             // Playwright calls this before every page.screenshot() and
             // would otherwise fail with "Unknown Page method".
-            let width = 1280.0_f64;
-            let height = 720.0_f64;
-            let content_height = ctx
+            let (width, height, content_height) = ctx
                 .get_session_page_mut(session_id)
-                .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
-                .and_then(|v| v.as_f64())
-                .filter(|n| *n > 0.0)
-                .unwrap_or(height);
+                .map(|p| {
+                    let width = p.viewport_width as f64;
+                    let height = p.viewport_height as f64;
+                    let content_height = p
+                        .evaluate("document.documentElement && document.documentElement.scrollHeight")
+                        .as_f64()
+                        .filter(|n| *n > 0.0)
+                        .unwrap_or(height);
+                    (width, height, content_height)
+                })
+                .unwrap_or((1920.0, 1000.0, 1000.0));
             let layout_viewport = json!({
                 "pageX": 0, "pageY": 0,
                 "clientWidth": width, "clientHeight": height,
@@ -312,17 +317,17 @@ mod tests {
         }
 
         let layout = &result["layoutViewport"];
-        assert_eq!(layout["clientWidth"].as_f64(), Some(1280.0));
-        assert_eq!(layout["clientHeight"].as_f64(), Some(720.0));
+        assert_eq!(layout["clientWidth"].as_f64(), Some(1920.0));
+        assert_eq!(layout["clientHeight"].as_f64(), Some(1000.0));
 
         let visual = &result["visualViewport"];
         assert_eq!(visual["scale"].as_f64(), Some(1.0));
-        assert_eq!(visual["clientWidth"].as_f64(), Some(1280.0));
+        assert_eq!(visual["clientWidth"].as_f64(), Some(1920.0));
 
         let content = &result["contentSize"];
-        assert_eq!(content["width"].as_f64(), Some(1280.0));
+        assert_eq!(content["width"].as_f64(), Some(1920.0));
         // Without a live page the content height falls back to the viewport.
-        assert_eq!(content["height"].as_f64(), Some(720.0));
+        assert_eq!(content["height"].as_f64(), Some(1000.0));
     }
 
     #[tokio::test]

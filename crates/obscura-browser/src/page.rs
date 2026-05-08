@@ -37,6 +37,9 @@ pub struct Page {
     pub title: String,
     pub network_events: Vec<NetworkEvent>,
     network_event_counter: u32,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub device_scale_factor: f64,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
@@ -72,6 +75,9 @@ impl Page {
             title: String::new(),
             network_events: Vec::new(),
             network_event_counter: 0,
+            viewport_width: 1920,
+            viewport_height: 1000,
+            device_scale_factor: 2.0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
@@ -115,6 +121,14 @@ impl Page {
             let js = self.js.as_mut().unwrap();
             js.set_url(&url_str);
             js.set_title(&title);
+            if let Ok(ua) = self.http_client.user_agent.try_read() {
+                js.set_user_agent(&ua);
+            }
+            js.set_viewport_metrics(
+                self.viewport_width,
+                self.viewport_height,
+                self.device_scale_factor,
+            );
 
             if let Some(d) = dom {
                 js.set_dom(d);
@@ -145,6 +159,11 @@ impl Page {
             rt.set_user_agent(&ua);
         }
 
+        rt.set_viewport_metrics(
+            self.viewport_width,
+            self.viewport_height,
+            self.device_scale_factor,
+        );
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
 
@@ -164,6 +183,7 @@ impl Page {
 
         #[derive(Debug)]
         struct ScriptInfo {
+            node_id: u32,
             src: Option<String>,
             inline: String,
             is_defer: bool,
@@ -201,6 +221,7 @@ impl Page {
 
                             if src.is_some() || !inline_code.trim().is_empty() {
                                 scripts.push(ScriptInfo {
+                                    node_id: sid.raw(),
                                     src,
                                     inline: inline_code,
                                     is_defer,
@@ -300,29 +321,56 @@ impl Page {
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
+            let mut pump_after_script = false;
+
             if script.src.is_some() {
                 if let Some((url, code)) = data_scripts.remove(&i) {
                     tracing::info!("Executing data script ({} bytes)", code.len());
                     if let Some(js) = &mut self.js {
+                        js.set_current_script(script.node_id);
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Data script error: {}", e);
                         }
+                        let _ = js.execute_script(
+                            "<resource-load>",
+                            &format!("globalThis.__obscura_finish_resource_node({}, false, '')", script.node_id),
+                        );
+                        js.clear_current_script();
                     }
                 } else if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                     self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
                     if let Some(js) = &mut self.js {
+                        js.set_current_script(script.node_id);
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
                         }
+                        let _ = js.execute_script(
+                            "<resource-load>",
+                            &format!("globalThis.__obscura_finish_resource_node({}, false, '')", script.node_id),
+                        );
+                        js.clear_current_script();
+                        pump_after_script = true;
                     }
                 }
             } else if !script.inline.is_empty() {
+                let inline_len = script.inline.len();
                 if let Some(js) = &mut self.js {
+                    js.set_current_script(script.node_id);
                     if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
                         tracing::warn!("Inline script error: {}", e);
                     }
+                    let _ = js.execute_script(
+                        "<resource-load>",
+                        &format!("globalThis.__obscura_finish_resource_node({}, false, '')", script.node_id),
+                    );
+                    js.clear_current_script();
+                    pump_after_script = inline_len >= 10_000;
                 }
+            }
+
+            if pump_after_script {
+                self.pump_event_loop_for(tokio::time::Duration::from_millis(300)).await;
             }
         }
 
@@ -337,64 +385,91 @@ impl Page {
                 };
 
                 tracing::info!("Loading ES module: {}", full_url);
+                let mut module_loaded = false;
                 if let Some(js) = &mut self.js {
+                    js.set_current_script(module_script.node_id);
                     match js.load_module(&full_url).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
-                            self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
+                            module_loaded = true;
+                            let _ = js.execute_script(
+                                "<resource-load>",
+                                &format!("globalThis.__obscura_finish_resource_node({}, false, '')", module_script.node_id),
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("ES module error ({}): {}", full_url, e);
                         }
                     }
+                    js.clear_current_script();
                 }
+                if module_loaded {
+                    self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
+                }
+                self.pump_event_loop_for(tokio::time::Duration::from_millis(300)).await;
             } else if !module_script.inline.is_empty() {
                 let base = self.url_string();
                 if let Some(js) = &mut self.js {
+                    js.set_current_script(module_script.node_id);
                     if let Err(e) = js.load_inline_module(&module_script.inline, &base).await {
                         tracing::warn!("Inline ES module error: {}", e);
                     }
+                    let _ = js.execute_script(
+                        "<resource-load>",
+                        &format!("globalThis.__obscura_finish_resource_node({}, false, '')", module_script.node_id),
+                    );
+                    js.clear_current_script();
                 }
+                self.pump_event_loop_for(tokio::time::Duration::from_millis(300)).await;
             }
         }
 
         if let Some(js) = &mut self.js {
             let _ = js.execute_script("<load-events>",
                 "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 try { document._readyState = 'interactive'; } catch(e) {}\n\
                  try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}\n\
+                 try { document._readyState = 'complete'; } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('load')); } catch(e) {}");
         }
 
-        if let Some(js) = &mut self.js {
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
-            let mut idle_count = 0u32;
-            loop {
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(10),
-                    js.run_event_loop(),
-                ).await;
+        self.pump_event_loop_for(tokio::time::Duration::from_secs(3)).await;
+    }
 
-                match result {
-                    Ok(Ok(())) => {
-                        if self.http_client.active_requests() == 0 {
-                            idle_count += 1;
-                            if idle_count >= 2 {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        } else {
-                            idle_count = 0;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                        }
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        idle_count = 0;
-                        if tokio::time::Instant::now() >= deadline {
-                            break;
-                        }
-                    }
+    pub async fn pump_event_loop_for(&mut self, duration: tokio::time::Duration) {
+        let http_client = self.http_client.clone();
+        let Some(js) = &mut self.js else {
+            return;
+        };
+
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut idle_count = 0u32;
+
+        loop {
+            let result = js.run_event_loop_slice(
+                tokio::time::Duration::from_millis(25),
+                std::time::Duration::from_millis(250),
+            ).await;
+
+            if let Err(e) = result {
+                tracing::debug!("JS event loop pump error: {}", e);
+                break;
+            }
+
+            let active = http_client.active_requests();
+            if active == 0 {
+                idle_count += 1;
+                if idle_count >= 6 {
+                    break;
                 }
+                tokio::task::yield_now().await;
+            } else {
+                idle_count = 0;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
         }
     }
@@ -636,9 +711,9 @@ impl Page {
                 }
 
                 if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
+                    let _ = js.run_event_loop_slice(
                         tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
+                        std::time::Duration::from_millis(250),
                     ).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -657,6 +732,25 @@ impl Page {
         self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
+    }
+
+    pub fn set_viewport_metrics(&mut self, width: u32, height: u32, device_scale_factor: f64) {
+        self.viewport_width = width.max(1);
+        self.viewport_height = height.max(1);
+        self.device_scale_factor =
+            if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
+                device_scale_factor
+            } else {
+                2.0
+            };
+
+        if let Some(js) = &mut self.js {
+            js.set_viewport_metrics(
+                self.viewport_width,
+                self.viewport_height,
+                self.device_scale_factor,
+            );
+        }
     }
 
     pub fn url_string(&self) -> String {

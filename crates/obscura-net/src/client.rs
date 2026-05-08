@@ -11,6 +11,12 @@ use url::Url;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+pub const DEFAULT_SEC_CH_UA: &str = "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"";
+pub const DEFAULT_SEC_CH_UA_FULL_VERSION_LIST: &str = "\"Google Chrome\";v=\"147.0.0.0\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"147.0.0.0\"";
+pub const DEFAULT_SEC_CH_UA_PLATFORM: &str = "\"macOS\"";
+pub const DEFAULT_SEC_CH_UA_PLATFORM_VERSION: &str = "\"26.4.0\"";
+
 #[derive(Debug, Clone)]
 pub struct Response {
     pub url: Url,
@@ -181,9 +187,7 @@ impl ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
+            user_agent: RwLock::new(DEFAULT_USER_AGENT.to_string()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             on_request: RwLock::new(Vec::new()),
@@ -284,7 +288,7 @@ impl ObscuraHttpClient {
             let ua = self.user_agent.read().await.clone();
             let mut headers = HeaderMap::new();
             headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+                HeaderValue::from_static(DEFAULT_USER_AGENT)
             }));
             headers.insert(
                 reqwest::header::ACCEPT,
@@ -296,7 +300,11 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_static("\"Chromium\";v=\"145\", \"Not;A=Brand\";v=\"24\", \"Google Chrome\";v=\"145\""),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA),
+            );
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-full-version-list"),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA_FULL_VERSION_LIST),
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-mobile"),
@@ -304,7 +312,11 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_static("\"Linux\""),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA_PLATFORM),
+            );
+            headers.insert(
+                HeaderName::from_static("sec-ch-ua-platform-version"),
+                HeaderValue::from_static(DEFAULT_SEC_CH_UA_PLATFORM_VERSION),
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-dest"),

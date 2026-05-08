@@ -34,6 +34,7 @@ pub struct InterceptedRequest {
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
+    pub body: String,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
@@ -317,7 +318,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx) = {
+    let (cookie_jar, in_flight, intercept_tx, http_client, page_url) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -334,6 +335,8 @@ async fn op_fetch_url(
         }
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
+        let http_client = gs.http_client.clone();
+        let page_url = gs.url.clone();
         tracing::debug!("op_fetch_url: intercept_enabled={}, has_tx={}", gs.intercept_enabled, gs.intercept_tx.is_some());
         let itx = if gs.intercept_enabled {
             gs.intercept_counter += 1;
@@ -341,23 +344,26 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx)
+        (jar, in_flight, itx, http_client, page_url)
     };
 
+    let mut custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
+    apply_browser_fetch_headers(&mut custom_headers, &url, &page_url, http_client.as_ref()).await;
+
     if let Some((tx, request_id)) = intercept_tx {
-        let custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
-        let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
+        let (resolve_tx, mut resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
+            body: body.clone(),
             resource_type: "Fetch".to_string(),
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            match tokio::time::timeout(tokio::time::Duration::from_millis(250), resolve_rx).await {
-                Ok(Ok(InterceptResolution::Fulfill { status, headers: h, body: b })) => {
+            match resolve_rx.try_recv() {
+                Ok(InterceptResolution::Fulfill { status, headers: h, body: b }) => {
                     let resp_headers: HashMap<String, String> = h;
                     return Ok(serde_json::json!({
                         "status": status,
@@ -366,7 +372,7 @@ async fn op_fetch_url(
                         "headers": resp_headers,
                     }).to_string());
                 }
-                Ok(Ok(InterceptResolution::Fail { reason })) => {
+                Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
                         "status": 0,
                         "body": "",
@@ -376,13 +382,13 @@ async fn op_fetch_url(
                         "error": reason,
                     }).to_string());
                 }
-                Ok(Ok(InterceptResolution::Continue { url: new_url, method: new_method, headers: new_headers, body: new_body })) => {
+                Ok(InterceptResolution::Continue { .. }) => {
                     tracing::debug!("Interception: continue request {}", url);
                 }
-                Ok(Err(_)) => {
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    tracing::debug!("Interception event emitted; continuing request without blocking {}", url);
                 }
-                Err(_) => {
-                    tracing::debug!("Interception continuation timed out; continuing request {}", url);
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 }
             }
         }
@@ -405,18 +411,13 @@ async fn op_fetch_url(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
-    let custom_headers: std::collections::HashMap<String, String> =
-        serde_json::from_str(&headers_json).unwrap_or_default();
-
     let needs_preflight = is_cross_origin
         && mode == "cors"
         && (req_method != reqwest::Method::GET
             && req_method != reqwest::Method::HEAD
             && req_method != reqwest::Method::POST
             || custom_headers.keys().any(|k| {
-                let kl = k.to_lowercase();
-                kl != "accept" && kl != "accept-language" && kl != "content-language"
-                    && kl != "content-type"
+                !is_cors_safelisted_or_browser_header(k)
             }));
 
     if needs_preflight {
@@ -545,6 +546,62 @@ async fn op_fetch_url(
     .to_string())
 }
 
+async fn apply_browser_fetch_headers(
+    headers: &mut HashMap<String, String>,
+    request_url: &str,
+    page_url: &str,
+    http_client: Option<&Arc<ObscuraHttpClient>>,
+) {
+    let ua = if let Some(client) = http_client {
+        client.user_agent.read().await.clone()
+    } else {
+        obscura_net::DEFAULT_USER_AGENT.to_string()
+    };
+
+    insert_header_if_absent(headers, "user-agent", ua);
+    insert_header_if_absent(headers, "accept", "*/*");
+    insert_header_if_absent(headers, "accept-language", "en-US,en;q=0.9");
+    insert_header_if_absent(headers, "sec-ch-ua", obscura_net::DEFAULT_SEC_CH_UA);
+    insert_header_if_absent(headers, "sec-ch-ua-full-version-list", obscura_net::DEFAULT_SEC_CH_UA_FULL_VERSION_LIST);
+    insert_header_if_absent(headers, "sec-ch-ua-model", "\"\"");
+    insert_header_if_absent(headers, "sec-ch-ua-mobile", "?0");
+    insert_header_if_absent(headers, "sec-ch-ua-platform", obscura_net::DEFAULT_SEC_CH_UA_PLATFORM);
+    insert_header_if_absent(headers, "sec-ch-ua-platform-version", obscura_net::DEFAULT_SEC_CH_UA_PLATFORM_VERSION);
+    insert_header_if_absent(headers, "sec-ch-prefers-color-scheme", "dark");
+    insert_header_if_absent(headers, "sec-fetch-dest", "empty");
+    insert_header_if_absent(headers, "sec-fetch-mode", "cors");
+
+    if page_url.starts_with("http://") || page_url.starts_with("https://") {
+        insert_header_if_absent(headers, "referer", page_url);
+        let fetch_site = match (url::Url::parse(request_url), url::Url::parse(page_url)) {
+            (Ok(request), Ok(page)) if request.origin() == page.origin() => "same-origin",
+            (Ok(request), Ok(page)) if request.domain() == page.domain() => "same-site",
+            (Ok(_), Ok(_)) => "cross-site",
+            _ => "none",
+        };
+        insert_header_if_absent(headers, "sec-fetch-site", fetch_site);
+    }
+}
+
+fn insert_header_if_absent(headers: &mut HashMap<String, String>, key: &str, value: impl Into<String>) {
+    if !headers.keys().any(|existing| existing.eq_ignore_ascii_case(key)) {
+        headers.insert(key.to_string(), value.into());
+    }
+}
+
+fn is_cors_safelisted_or_browser_header(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower == "accept"
+        || lower == "accept-language"
+        || lower == "content-language"
+        || lower == "content-type"
+        || lower == "user-agent"
+        || lower == "referer"
+        || lower == "origin"
+        || lower.starts_with("sec-fetch-")
+        || lower.starts_with("sec-ch-")
+}
+
 fn glob_match(pattern: &str, url: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -654,6 +711,13 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
+#[op2(async)]
+async fn op_sleep(#[smi] delay_ms: i32) -> Result<(), deno_error::JsErrorBox> {
+    let delay_ms = delay_ms.clamp(0, 60_000) as u64;
+    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+    Ok(())
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -664,6 +728,7 @@ pub fn build_extension() -> Extension {
             op_get_cookies(),
             op_set_cookie(),
             op_navigate(),
+            op_sleep(),
         ]),
         ..Default::default()
     }

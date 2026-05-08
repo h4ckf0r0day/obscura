@@ -89,11 +89,16 @@ async fn cdp_processor(
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
     let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
     let mut event_sinks: Vec<mpsc::UnboundedSender<String>> = Vec::new();
+    let mut page_tick = tokio::time::interval(tokio::time::Duration::from_millis(50));
+    page_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
+            _ = page_tick.tick() => {
+                pump_loaded_pages(&mut ctx).await;
+            }
             Some(intercepted) = async {
                 if let Some(ref mut irx) = intercept_rx {
                     irx.recv().await
@@ -133,6 +138,12 @@ async fn cdp_processor(
             }
             else => break,
         }
+    }
+}
+
+async fn pump_loaded_pages(ctx: &mut CdpContext) {
+    for page in ctx.pages.iter_mut() {
+        page.pump_event_loop_for(tokio::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -200,13 +211,7 @@ fn emit_intercepted_request(
 
     let request_id = intercepted.request_id.clone();
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-    let request = json!({
-        "url": intercepted.url,
-        "method": intercepted.method,
-        "headers": intercepted.headers,
-        "initialPriority": "High",
-        "referrerPolicy": "strict-origin-when-cross-origin",
-    });
+    let request = intercepted_request_payload(&intercepted);
 
     let network_event = json!({
         "method": "Network.requestWillBeSent",
@@ -248,6 +253,20 @@ fn emit_intercepted_request(
             url: None, method: None, headers: None, body: None,
         });
     }
+}
+
+fn intercepted_request_payload(intercepted: &obscura_js::ops::InterceptedRequest) -> serde_json::Value {
+    let mut request = json!({
+        "url": intercepted.url,
+        "method": intercepted.method,
+        "headers": intercepted.headers,
+        "initialPriority": "High",
+        "referrerPolicy": "strict-origin-when-cross-origin",
+    });
+    if !intercepted.body.is_empty() {
+        request["postData"] = json!(intercepted.body);
+    }
+    request
 }
 
 fn current_intercept_target(ctx: &CdpContext) -> Option<(String, String, String)> {
@@ -372,19 +391,14 @@ async fn process_with_interception(
                 }
             }, if has_irx => {
                 tracing::info!("INTERCEPTION: requestPaused for {} {} (sending to client)", intercepted.method, intercepted.url);
+                let request_payload = intercepted_request_payload(&intercepted);
                 let rws_event = json!({
                     "method": "Network.requestWillBeSent",
                     "params": {
                         "requestId": intercepted.request_id,
                         "loaderId": "",
                         "documentURL": "",
-                        "request": {
-                            "url": intercepted.url,
-                            "method": intercepted.method,
-                            "headers": intercepted.headers,
-                            "initialPriority": "High",
-                            "referrerPolicy": "strict-origin-when-cross-origin",
-                        },
+                        "request": request_payload.clone(),
                         "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
                         "wallTime": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
                         "initiator": {"type": "script"},
@@ -399,13 +413,7 @@ async fn process_with_interception(
                     "method": "Fetch.requestPaused",
                     "params": {
                         "requestId": intercepted.request_id,
-                        "request": {
-                            "url": intercepted.url,
-                            "method": intercepted.method,
-                            "headers": intercepted.headers,
-                            "initialPriority": "High",
-                            "referrerPolicy": "strict-origin-when-cross-origin",
-                        },
+                        "request": request_payload,
                         "frameId": frame_id,
                         "resourceType": intercepted.resource_type,
                         "networkId": intercepted.request_id,
@@ -588,7 +596,6 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled" |
         "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
         "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
         "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
@@ -600,7 +607,7 @@ fn fast_path_response(text: &str) -> Option<String> {
                 "protocolVersion": "1.3",
                 "product": "Obscura/0.1.0",
                 "revision": "0",
-                "userAgent": "Obscura/0.1.0",
+                "userAgent": obscura_net::DEFAULT_USER_AGENT,
                 "jsVersion": "V8",
             }))
         }
@@ -725,7 +732,7 @@ async fn handle_http_json(stream: TcpStream, port: u16, endpoint: &str) -> anyho
         "version" => serde_json::to_string_pretty(&json!({
             "Browser": "Obscura/0.1.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
+            "User-Agent": obscura_net::DEFAULT_USER_AGENT,
             "V8-Version": "N/A",
             "WebKit-Version": "N/A",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),

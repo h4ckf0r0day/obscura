@@ -142,14 +142,14 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
+        "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
         "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Emulation" | "Log" | "Performance" | "Security" | "CSS"
-        | "ServiceWorker" | "Inspector"
+        "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector"
         | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
         | "Audits" => {
             Ok(json!({}))

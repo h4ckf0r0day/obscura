@@ -21,7 +21,7 @@ impl BrowserContext {
             id,
             cookie_jar,
             http_client,
-            user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+            user_agent: obscura_net::DEFAULT_USER_AGENT.to_string(),
             proxy_url: None,
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
@@ -48,7 +48,7 @@ impl BrowserContext {
             client.block_trackers = true;
         }
         let resolved_ua = user_agent.unwrap_or_else(|| {
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string()
+            obscura_net::DEFAULT_USER_AGENT.to_string()
         });
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so

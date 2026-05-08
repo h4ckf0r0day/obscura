@@ -6,6 +6,7 @@ pub mod runtime;
 pub mod network;
 pub mod fetch;
 pub mod input;
+pub mod emulation;
 pub mod storage;
 pub mod accessibility;
 pub mod lp;
