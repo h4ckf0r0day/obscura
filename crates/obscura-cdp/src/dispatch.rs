@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
-use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
 
 use crate::domains;
