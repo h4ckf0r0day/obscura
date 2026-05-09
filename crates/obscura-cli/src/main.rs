@@ -188,6 +188,18 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+/// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
+/// Returns `None` when the user didn't pass the flag, passed an empty string,
+/// or passed only whitespace; in those cases V8 is left untouched.
+fn normalize_v8_flags(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -202,12 +214,9 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    if let Some(flags) = args.v8_flags.as_deref() {
-        let trimmed = flags.trim();
-        if !trimmed.is_empty() {
-            tracing::info!("Applying V8 flags: {}", trimmed);
-            obscura_js::set_v8_flags(trimmed);
-        }
+    if let Some(flags) = normalize_v8_flags(args.v8_flags.as_deref()) {
+        tracing::info!("Applying V8 flags: {}", flags);
+        obscura_js::set_v8_flags(&flags);
     }
 
     let global_proxy = args.proxy.clone();
@@ -920,7 +929,8 @@ fn dump_links(page: &Page) -> String {
 mod tests {
     use super::{
         extract_readable_text, fetch_original_bytes, is_quiet_command, merge_proxy,
-        select_log_filter, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
+        normalize_v8_flags, select_log_filter, write_or_print, write_or_print_bytes, Args,
+        Command, DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -1100,6 +1110,73 @@ mod tests {
         let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
             .expect("clap should accept fetch without --v8-flags");
         assert!(args.v8_flags.is_none());
+    }
+
+    #[test]
+    fn parsed_v8_flags_with_serve_subcommand() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "--max-old-space-size=2048",
+            "serve",
+            "--port",
+            "9333",
+        ])
+        .expect("clap should accept --v8-flags with serve");
+        assert_eq!(args.v8_flags.as_deref(), Some("--max-old-space-size=2048"));
+    }
+
+    #[test]
+    fn parsed_v8_flags_with_scrape_subcommand() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "--expose-gc",
+            "scrape",
+            "https://a.com",
+            "https://b.com",
+        ])
+        .expect("clap should accept --v8-flags with scrape");
+        assert_eq!(args.v8_flags.as_deref(), Some("--expose-gc"));
+    }
+
+    #[test]
+    fn parsed_v8_flags_empty_string_is_accepted() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept empty --v8-flags value");
+        assert_eq!(args.v8_flags.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn normalize_v8_flags_returns_none_when_unset() {
+        assert_eq!(normalize_v8_flags(None), None);
+    }
+
+    #[test]
+    fn normalize_v8_flags_returns_none_for_empty_or_whitespace() {
+        assert_eq!(normalize_v8_flags(Some("")), None);
+        assert_eq!(normalize_v8_flags(Some("   ")), None);
+        assert_eq!(normalize_v8_flags(Some("\t\n")), None);
+    }
+
+    #[test]
+    fn normalize_v8_flags_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_v8_flags(Some("  --max-old-space-size=4096  ")).as_deref(),
+            Some("--max-old-space-size=4096"),
+        );
+    }
+
+    #[test]
+    fn normalize_v8_flags_preserves_multi_flag_string() {
+        let input = "--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc";
+        assert_eq!(normalize_v8_flags(Some(input)).as_deref(), Some(input));
     }
 
     #[test]
