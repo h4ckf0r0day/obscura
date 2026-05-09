@@ -1,6 +1,6 @@
 ---
 name: obscura
-description: Use Obscura — a Rust headless browser with a Chrome DevTools Protocol server — for fast page fetches, JS execution, scraping, and CDP automation. Drop-in CDP replacement for Chrome with Puppeteer or Playwright. Trigger on requests to "open a page", "fetch a URL with JS", "scrape a site", "render this page", "screenshot", "automate browser via CDP", or any task where Chrome would be too heavy. Also use when the user mentions stealth fingerprinting, tracker blocking, `navigator.webdriver` masking, or evading basic bot detection.
+description: Use Obscura — a Rust headless browser with a Chrome DevTools Protocol server — for fast page fetches, JS execution, scraping, and CDP automation. Drop-in CDP replacement for Chrome with Puppeteer or Playwright. Trigger on requests to "open a page", "fetch a URL with JS", "scrape a site", "render this page", "automate browser via CDP", or any task where Chrome would be too heavy. Also use when the user mentions stealth fingerprinting, tracker blocking, `navigator.webdriver` masking, or evading basic bot detection.
 ---
 
 # Obscura
@@ -95,24 +95,6 @@ console.log(await page.title());
 await browser.disconnect();
 ```
 
-## Localhost / private network
-
-Obscura's SSRF guard blocks `localhost`, `127.0.0.1`, `::1`, and RFC 1918 ranges by default. For trusted local development, opt in:
-
-```bash
-/tmp/obscura-target/debug/obscura fetch http://localhost:3000/ --allow-private-network --dump text --quiet
-# or
-OBSCURA_ALLOW_PRIVATE_NETWORK=1 /tmp/obscura-target/debug/obscura fetch http://localhost:3000/
-```
-
-For the CDP server:
-
-```bash
-/tmp/obscura-target/debug/obscura serve --port 9222 --allow-private-network
-```
-
-Without the flag/env var, localhost requests fail with the SSRF guard's private-host error. Do not enable this against arbitrary external URLs.
-
 ## Scaling profile
 
 - ✅ **High concurrency, low resource:** static + lightly-dynamic pages — hundreds of parallel fetches per box.
@@ -122,7 +104,7 @@ Without the flag/env var, localhost requests fail with the SSRF guard's private-
 ## Known limits
 
 - Not full Chrome — some browser APIs and CDP methods are incomplete relative to upstream Chromium.
-- Screenshot fidelity is not guaranteed across all CSS/canvas paths.
+- Screenshot capture is not implemented (no layout/rendering engine).
 - Authenticated pages need cookie or session injection via CDP; Obscura won't run interactive logins.
 - Hard CAPTCHAs (Turnstile interactive, hCaptcha) require a human or a third-party solver.
 
