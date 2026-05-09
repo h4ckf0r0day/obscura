@@ -10,8 +10,6 @@ use crate::ops::{build_extension, ObscuraState};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
-const BOOTSTRAP_JS: &str = include_str!("../js/bootstrap.js");
-
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,

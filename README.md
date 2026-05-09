@@ -27,6 +27,14 @@ Designed for automation at scale, not desktop browsing.
 | Puppeteer    | **Yes**      | Yes              |
 | Playwright   | **Yes**      | Yes              |
 
+## 🎉 10,000 stars and what's next
+
+I'm working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
+
+The open-source engine stays Apache-2.0, fully featured. No feature gating, ever.
+
+**[Get on the waitlist →](https://tally.so/r/gDWzdD)**
+
 ## Install
 
 ### Download
@@ -85,6 +93,9 @@ obscura fetch https://example.com --dump links
 # Render JavaScript and dump HTML
 obscura fetch https://news.ycombinator.com --dump html
 
+# Write dump or eval output to a file
+obscura fetch https://example.com --dump text --output page.txt
+
 # Wait for dynamic content
 obscura fetch https://example.com --wait-until networkidle0
 
@@ -114,6 +125,9 @@ obscura scrape url1 url2 url3 ... \
   --concurrency 25 \
   --eval "document.querySelector('h1').textContent" \
   --format json
+
+# Suppress scrape progress on stderr for script-friendly output
+obscura scrape https://example.com --quiet --format json
 ```
 
 ### Localhost and private networks
@@ -256,6 +270,7 @@ Fetch and render a single page.
 | `--timeout` | `30` | Maximum navigation time in seconds |
 | `--selector` | — | Wait for CSS selector |
 | `--stealth` | off | Anti-detection mode |
+| `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |
 | `--allow-private-network` | off | Allow localhost/private network targets for trusted local development |
 
@@ -268,6 +283,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--concurrency` | `10` | Parallel workers |
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
+| `--quiet` | off | Suppress scrape progress on stderr |
 | `--allow-private-network` | off | Allow localhost/private network targets for trusted local development |
 
 ## License

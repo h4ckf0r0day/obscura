@@ -16,5 +16,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
-wreq = { version = "6.0.0-rc.28", optional = true, features = ["prefix-symbols"] }
 wreq-util = { version = "3.0.0-rc.10", optional = true }
+
+# `prefix-symbols` renames BoringSSL exports to avoid clashes with system OpenSSL,
+# but the renaming is only correct on Linux and Android (per wreq's README).
+# Enabling it on other platforms produces unresolved `build_script_main_*`
+# symbols at link time (see issue #39).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+wreq = { version = "6.0.0-rc.28", optional = true, features = ["prefix-symbols"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
+wreq = { version = "6.0.0-rc.28", optional = true }

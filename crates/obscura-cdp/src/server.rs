@@ -72,7 +72,7 @@ pub async fn start_with_runtime_options(
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(
+            let _processor_handle = tokio::task::spawn_local(cdp_processor(
                 msg_rx,
                 proxy,
                 stealth,
@@ -144,7 +144,7 @@ async fn cdp_processor(
 
 fn handle_fetch_resolution(
     text: &str,
-    ctx: &mut CdpContext,
+    _ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
 ) {
@@ -271,8 +271,8 @@ async fn process_with_interception(
         let _ = nav_done_tx.send((page, result)).await;
     });
 
-    let mut navigate_result: Result<(), String> = Ok(());
-    let mut page_back: Option<obscura_browser::Page> = None;
+    let navigate_result: Result<(), String>;
+    let page_back: Option<obscura_browser::Page>;
 
     loop {
         let has_irx = intercept_rx.is_some();
@@ -525,6 +525,15 @@ fn fast_path_response(text: &str) -> Option<String> {
         }
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))
+        }
+        // Critical: Puppeteer calls this as the *first* CDP command on connect
+        // (`BrowserConnector._connectToCdpBrowser`). If another client or a long
+        // `Page.navigate` / interception holds the single `cdp_processor` task,
+        // queued Target commands starve and Puppeteer hits protocolTimeout on
+        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same payload
+        // as `domains::target::handle` when default context id is `"default"`.
+        "Target.getBrowserContexts" => {
+            Some(json!({ "browserContextIds": ["default"] }))
         }
         _ => None,
     };

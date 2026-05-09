@@ -15,6 +15,7 @@ struct CookieEntry {
     secure: bool,
     http_only: bool,
     expires: Option<u64>,
+    #[allow(dead_code)]
     same_site: String,
 }
 
