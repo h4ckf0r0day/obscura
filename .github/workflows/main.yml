@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            # Build on Ubuntu 22.04 so the Linux release binary works on
+            # common LTS servers with glibc 2.35 instead of requiring the
+            # newer glibc shipped by ubuntu-latest.
+            os: ubuntu-22.04
+            name: obscura-x86_64-linux
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: obscura-aarch64-macos
+          - target: x86_64-apple-darwin
+            os: macos-13
+            name: obscura-x86_64-macos
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: obscura-x86_64-windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build stealth
+        run: cargo build --release --target ${{ matrix.target }} --features stealth
+        continue-on-error: true
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.name }}.tar.gz obscura obscura-worker
+          cd ../../..
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+          cd ../../..
+
+      - name: Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.zip
