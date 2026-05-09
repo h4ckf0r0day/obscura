@@ -44,8 +44,6 @@ pub async fn handle(
 
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let info = page.evaluate_for_cdp(expression, return_by_value);
-            page.pump_event_loop_for(tokio::time::Duration::from_millis(500))
-                .await;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
@@ -78,8 +76,6 @@ pub async fn handle(
                     return_by_value,
                     await_promise,
                 )
-                .await;
-            page.pump_event_loop_for(tokio::time::Duration::from_millis(500))
                 .await;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))

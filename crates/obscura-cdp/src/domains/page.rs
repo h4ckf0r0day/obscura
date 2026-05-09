@@ -339,6 +339,14 @@ pub async fn handle(
                 "cssContentSize": content_size,
             }))
         }
+        "captureScreenshot" => {
+            // 1x1 transparent PNG. Obscura does not have a visual renderer yet,
+            // but Playwright expects this CDP method to exist and return base64
+            // image data.
+            Ok(json!({
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lxVkmwAAAABJRU5ErkJggg=="
+            }))
+        }
         "getNavigationHistory" => {
             let page = ctx
                 .get_session_page(session_id)
@@ -413,5 +421,18 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    #[tokio::test]
+    async fn capture_screenshot_returns_png_data() {
+        let mut ctx = CdpContext::new();
+        let result = handle("captureScreenshot", &json!({}), &mut ctx, &None)
+            .await
+            .expect("captureScreenshot should be accepted");
+        let data = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .expect("screenshot data");
+        assert!(data.starts_with("iVBORw0KGgo"));
     }
 }

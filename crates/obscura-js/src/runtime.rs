@@ -105,11 +105,22 @@ impl ObscuraJsRuntime {
         state.intercept_enabled = true;
     }
 
+    pub fn set_network_event_tx(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.intercept_tx = Some(tx);
+    }
+
     pub fn set_user_agent(&mut self, ua: &str) {
         let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
         let _ = self.runtime.execute_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            format!(
+                "globalThis.__obscura_apply_user_agent_string?.('{}');",
+                escaped
+            ),
         );
     }
 
@@ -168,6 +179,22 @@ impl ObscuraJsRuntime {
         expression: &str,
         return_by_value: bool,
     ) -> Result<RemoteObjectInfo, String> {
+        if !return_by_value
+            && expression.contains("packages/injected/src/injectedScript.ts")
+            && expression.contains("module.exports.InjectedScript")
+        {
+            return self
+                .store_object_with_meta("globalThis.__obscura_make_playwright_injected_script()");
+        }
+
+        if !return_by_value
+            && expression.contains("packages/injected/src/utilityScript.ts")
+            && expression.contains("module.exports.UtilityScript")
+        {
+            return self
+                .store_object_with_meta("globalThis.__obscura_make_playwright_utility_script()");
+        }
+
         if return_by_value {
             let val = self.evaluate(expression)?;
             return Ok(Self::info_from_json(&val));
@@ -998,6 +1025,15 @@ mod tests {
     }
 
     #[test]
+    fn test_inner_text_skips_script_and_style_content() {
+        let mut rt = setup_runtime(
+            r#"<body>Hello<script>{"login":true}</script><style>.x{}</style><p>World</p></body>"#,
+        );
+        let text = rt.evaluate("document.body.innerText").unwrap();
+        assert_eq!(text, serde_json::json!("HelloWorld"));
+    }
+
+    #[test]
     fn test_script_execution() {
         let mut rt = setup_runtime("<ul><li>A</li><li>B</li></ul>");
         rt.execute_script(
@@ -1147,6 +1183,31 @@ mod tests {
         let result = rt.evaluate_for_cdp("document", false).unwrap();
         assert_eq!(result.subtype.as_deref(), Some("node"));
         assert_eq!(result.class_name, "HTMLDocument");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_utility_script_fast_path_evaluates_functions() {
+        let mut rt = setup_runtime("<html><body><h1>Hello</h1></body></html>");
+        let utility = rt
+            .evaluate_for_cdp(
+                "/* packages/injected/src/utilityScript.ts */ module.exports.UtilityScript",
+                false,
+            )
+            .unwrap();
+        let utility_oid = utility.object_id.unwrap();
+
+        let result = rt
+            .call_function_on_for_cdp(
+                "function() { return this.evaluate(true, true, '(x) => x + 1', 1, 41); }",
+                Some(&utility_oid),
+                &[],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap().as_f64().unwrap() as i64, 42);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -9,7 +9,13 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            let tx_clone = ctx.intercept_tx.clone();
+            if let (Some(tx), Some(page)) = (tx_clone, ctx.get_session_page_mut(session_id)) {
+                page.set_network_event_tx(tx);
+            }
+            Ok(json!({}))
+        }
         "setExtraHTTPHeaders" => {
             let headers = params.get("headers").and_then(|v| v.as_object());
             if let Some(page) = ctx.get_session_page(session_id) {
@@ -27,7 +33,12 @@ pub async fn handle(
             let ua = params
                 .get("userAgent")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or(obscura_net::DEFAULT_USER_AGENT);
+            let ua = if ua.trim().is_empty() {
+                obscura_net::DEFAULT_USER_AGENT
+            } else {
+                ua
+            };
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.http_client.set_user_agent(ua).await;
                 if let Some(js) = &mut page.js {
@@ -183,6 +194,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enable_attaches_network_events_without_fetch_pause() {
+        let mut ctx = CdpContext::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.intercept_tx = Some(tx);
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert("session-1".to_string(), page_id);
+
+        handle("enable", &json!({}), &mut ctx, &session_id)
+            .await
+            .expect("Network.enable should succeed");
+
+        let page = ctx.get_session_page(&session_id).unwrap();
+        assert!(
+            !page.intercept_enabled,
+            "Network.enable should surface Network events without turning on Fetch.requestPaused"
+        );
+    }
+
+    #[tokio::test]
     async fn get_response_body_returns_cached_body_by_request_id() {
         let mut ctx = CdpContext::new();
         ctx.network_response_bodies.lock().await.insert(
@@ -208,6 +239,29 @@ mod tests {
                 "body": "{\"ok\":true}",
                 "base64Encoded": false,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_user_agent_override_uses_default_for_blank_value() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert("session-1".to_string(), page_id);
+
+        handle(
+            "setUserAgentOverride",
+            &json!({"userAgent": ""}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("Network.setUserAgentOverride should accept blank UA");
+
+        let page = ctx.get_session_page(&session_id).unwrap();
+        assert_eq!(
+            page.http_client.user_agent.read().await.as_str(),
+            obscura_net::DEFAULT_USER_AGENT
         );
     }
 }

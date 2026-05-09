@@ -11,12 +11,12 @@ use url::Url;
 use crate::cookies::CookieJar;
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
-pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 pub const DEFAULT_SEC_CH_UA: &str =
-    "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"";
-pub const DEFAULT_SEC_CH_UA_FULL_VERSION_LIST: &str = "\"Google Chrome\";v=\"147.0.0.0\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"147.0.0.0\"";
+    "\"Google Chrome\";v=\"124\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"124\"";
+pub const DEFAULT_SEC_CH_UA_FULL_VERSION_LIST: &str = "\"Google Chrome\";v=\"124.0.0.0\", \"Not.A/Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"124.0.0.0\"";
 pub const DEFAULT_SEC_CH_UA_PLATFORM: &str = "\"macOS\"";
-pub const DEFAULT_SEC_CH_UA_PLATFORM_VERSION: &str = "\"26.4.0\"";
+pub const DEFAULT_SEC_CH_UA_PLATFORM_VERSION: &str = "\"14.4.1\"";
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -288,7 +288,12 @@ impl ObscuraHttpClient {
                 cb(&request_info);
             }
 
-            let ua = self.user_agent.read().await.clone();
+            let configured_ua = self.user_agent.read().await.clone();
+            let ua = if configured_ua.trim().is_empty() {
+                DEFAULT_USER_AGENT.to_string()
+            } else {
+                configured_ua
+            };
             let mut headers = HeaderMap::new();
             headers.insert(
                 USER_AGENT,
@@ -350,8 +355,10 @@ impl ObscuraHttpClient {
                     headers.insert(reqwest::header::COOKIE, val);
                 }
             }
-
             for (k, v) in self.extra_headers.read().await.iter() {
+                if k.eq_ignore_ascii_case("user-agent") && v.trim().is_empty() {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -452,7 +459,11 @@ impl ObscuraHttpClient {
     }
 
     pub async fn set_user_agent(&self, ua: &str) {
-        *self.user_agent.write().await = ua.to_string();
+        *self.user_agent.write().await = if ua.trim().is_empty() {
+            DEFAULT_USER_AGENT.to_string()
+        } else {
+            ua.to_string()
+        };
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
@@ -471,6 +482,22 @@ impl ObscuraHttpClient {
 impl Default for ObscuraHttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_user_agent_uses_default_for_blank_value() {
+        let client = ObscuraHttpClient::new();
+        client.set_user_agent("").await;
+        assert_eq!(
+            client.user_agent.read().await.as_str(),
+            DEFAULT_USER_AGENT,
+            "blank UA overrides must not produce empty User-Agent headers"
+        );
     }
 }
 

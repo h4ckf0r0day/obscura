@@ -188,7 +188,11 @@ impl Page {
         rt.set_http_client(self.http_client.clone());
 
         if let Some(tx) = &self.intercept_tx {
-            rt.set_intercept_tx(tx.clone());
+            if self.intercept_enabled {
+                rt.set_intercept_tx(tx.clone());
+            } else {
+                rt.set_network_event_tx(tx.clone());
+            }
         }
 
         if let Some(dom) = self.dom.take() {
@@ -1075,8 +1079,19 @@ impl Page {
         tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
     ) {
         self.intercept_tx = Some(tx.clone());
+        self.intercept_enabled = true;
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
+        }
+    }
+
+    pub fn set_network_event_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    ) {
+        self.intercept_tx = Some(tx.clone());
+        if let Some(js) = &self.js {
+            js.set_network_event_tx(tx);
         }
     }
 }

@@ -10,6 +10,8 @@ use deno_core::RequestedModuleType;
 
 use crate::ops::SharedState;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
 pub struct ObscuraModuleLoader {
     pub base_url: String,
     state: SharedState,
@@ -60,6 +62,17 @@ impl ModuleLoader for ObscuraModuleLoader {
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
             tracing::debug!("Loading ES module: {}", url);
+
+            if let Some(code) = decode_data_module(&url) {
+                let specifier = ModuleSpecifier::parse(&url)
+                    .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                return Ok(ModuleSource::new(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    &specifier,
+                    None,
+                ));
+            }
 
             let http_client = {
                 let gs = state.borrow();
@@ -117,5 +130,52 @@ impl ModuleLoader for ObscuraModuleLoader {
                 None,
             ))
         })))
+    }
+}
+
+fn decode_data_module(url: &str) -> Option<String> {
+    if !url.starts_with("data:") {
+        return None;
+    }
+
+    let comma = url.find(',')?;
+    let (metadata, data) = url.split_at(comma);
+    let data = &data[1..];
+    let bytes = if metadata.to_ascii_lowercase().contains(";base64") {
+        BASE64.decode(data).ok()?
+    } else {
+        percent_decode(data)
+    };
+
+    String::from_utf8(bytes).ok()
+}
+
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }

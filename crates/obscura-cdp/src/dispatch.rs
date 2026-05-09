@@ -80,6 +80,9 @@ impl CdpContext {
         self.page_counter += 1;
         let page_id = format!("page-{}", self.page_counter);
         let mut page = Page::new(page_id.clone(), self.default_context.clone());
+        if let Some(tx) = &self.intercept_tx {
+            page.set_network_event_tx(tx.clone());
+        }
         page.navigate_blank();
         self.pages.push(page);
         page_id

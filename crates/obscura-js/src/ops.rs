@@ -44,6 +44,7 @@ pub struct InterceptedRequest {
     pub headers: HashMap<String, String>,
     pub body: String,
     pub resource_type: String,
+    pub pause: bool,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
     pub response_rx: tokio::sync::oneshot::Receiver<InterceptedResponse>,
 }
@@ -404,6 +405,20 @@ async fn op_fetch_url(
         url
     );
 
+    if let Some((body, content_type)) = decode_data_url(&url) {
+        let body_text = String::from_utf8_lossy(&body).to_string();
+        return Ok(serde_json::json!({
+            "status": 200,
+            "body": body_text,
+            "bodyBase64": BASE64.encode(&body),
+            "url": url,
+            "headers": {
+                "content-type": content_type,
+            },
+        })
+        .to_string());
+    }
+
     if let Ok(parsed_url) = url::Url::parse(&url) {
         if let Err(e) = validate_fetch_url(&parsed_url) {
             return Ok(serde_json::json!({
@@ -444,7 +459,8 @@ async fn op_fetch_url(
             gs.intercept_enabled,
             gs.intercept_tx.is_some()
         );
-        let itx = if gs.intercept_enabled {
+        let should_pause = gs.intercept_enabled;
+        let itx = if gs.intercept_tx.is_some() {
             gs.intercept_counter += 1;
             let request_prefix = page_id
                 .as_deref()
@@ -454,6 +470,7 @@ async fn op_fetch_url(
                 (
                     tx,
                     format!("{}-intercept-{}", request_prefix, gs.intercept_counter),
+                    should_pause,
                 )
             })
         } else {
@@ -467,7 +484,7 @@ async fn op_fetch_url(
     apply_browser_fetch_headers(&mut custom_headers, &url, &page_url, http_client.as_ref()).await;
 
     let mut response_tx = None;
-    if let Some((tx, request_id)) = intercept_tx {
+    if let Some((tx, request_id, should_pause)) = intercept_tx {
         let (resolve_tx, mut resolve_rx) = tokio::sync::oneshot::channel();
         let (completion_tx, response_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
@@ -479,6 +496,7 @@ async fn op_fetch_url(
             headers: custom_headers.clone(),
             body: body.clone(),
             resource_type: "Fetch".to_string(),
+            pause: should_pause,
             resolver: resolve_tx,
             response_rx,
         };
@@ -771,6 +789,64 @@ fn insert_header_if_absent(
         .any(|existing| existing.eq_ignore_ascii_case(key))
     {
         headers.insert(key.to_string(), value.into());
+    }
+}
+
+fn decode_data_url(url: &str) -> Option<(Vec<u8>, String)> {
+    if !url.starts_with("data:") {
+        return None;
+    }
+
+    let comma = url.find(',')?;
+    let (metadata, data) = url.split_at(comma);
+    let data = &data[1..];
+    let metadata_lower = metadata.to_ascii_lowercase();
+    let content_type = metadata
+        .strip_prefix("data:")
+        .and_then(|m| m.split(';').next())
+        .filter(|m| !m.is_empty())
+        .unwrap_or("text/plain;charset=US-ASCII")
+        .to_string();
+    let bytes = if metadata_lower.contains(";base64") {
+        BASE64.decode(data).ok()?
+    } else {
+        percent_decode(data)
+    };
+
+    Some((bytes, content_type))
+}
+
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            decoded.push(b' ');
+            i += 1;
+            continue;
+        }
+
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

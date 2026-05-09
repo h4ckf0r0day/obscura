@@ -3,6 +3,10 @@ name = "obscura-cdp"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
+
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-browser = { workspace = true }

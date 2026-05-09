@@ -293,23 +293,26 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    let paused_event = json!({
-        "method": "Fetch.requestPaused",
-        "params": {
-            "requestId": request_id,
-            "request": request,
-            "frameId": frame_id,
-            "resourceType": intercepted.resource_type,
-            "networkId": request_id,
-            "responseErrorReason": null,
-            "responseStatusCode": null,
-            "responseHeaders": null,
-        },
-        "sessionId": session_id,
-    });
-
     let network_sent = broadcast_json(event_sinks, network_event.to_string());
-    let paused_sent = broadcast_json(event_sinks, paused_event.to_string());
+    let paused_sent = if intercepted.pause && ctx.fetch_intercept.enabled {
+        let paused_event = json!({
+            "method": "Fetch.requestPaused",
+            "params": {
+                "requestId": request_id,
+                "request": request,
+                "frameId": frame_id,
+                "resourceType": intercepted.resource_type,
+                "networkId": request_id,
+                "responseErrorReason": null,
+                "responseStatusCode": null,
+                "responseHeaders": null,
+            },
+            "sessionId": session_id,
+        });
+        broadcast_json(event_sinks, paused_event.to_string())
+    } else {
+        false
+    };
     let sent = network_sent || paused_sent;
     if sent {
         spawn_intercepted_response_events(
@@ -322,7 +325,18 @@ fn emit_intercepted_request(
             resource_type,
             response_rx,
         );
-        intercepted_paused.insert(request_id, intercepted.resolver);
+        if paused_sent {
+            intercepted_paused.insert(request_id, intercepted.resolver);
+        } else {
+            let _ = intercepted
+                .resolver
+                .send(obscura_js::ops::InterceptResolution::Continue {
+                    url: None,
+                    method: None,
+                    headers: None,
+                    body: None,
+                });
+        }
     } else {
         let _ = intercepted
             .resolver

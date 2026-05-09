@@ -44,7 +44,9 @@ impl BrowserContext {
         if stealth {
             client.block_trackers = true;
         }
-        let resolved_ua = user_agent.unwrap_or_else(|| obscura_net::DEFAULT_USER_AGENT.to_string());
+        let resolved_ua = user_agent
+            .filter(|ua| !ua.trim().is_empty())
+            .unwrap_or_else(|| obscura_net::DEFAULT_USER_AGENT.to_string());
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so
         // try_write always succeeds; we fall back silently if it ever fails.
@@ -99,5 +101,18 @@ mod tests {
     async fn with_options_keeps_default_user_agent() {
         let ctx = BrowserContext::with_options("test".to_string(), None, false);
         assert!(ctx.user_agent.contains("Chrome"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_full_options_uses_default_for_blank_user_agent() {
+        let ctx = BrowserContext::with_full_options(
+            "test".to_string(),
+            None,
+            false,
+            Some("".to_string()),
+        );
+        assert_eq!(ctx.user_agent, obscura_net::DEFAULT_USER_AGENT);
+        let client_ua = ctx.http_client.user_agent.read().await.clone();
+        assert_eq!(client_ua, obscura_net::DEFAULT_USER_AGENT);
     }
 }

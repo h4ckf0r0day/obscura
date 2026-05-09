@@ -339,15 +339,6 @@ function _notifyBootloaderResourceDone(el) {
     const loaded = globalThis._btldr || (globalThis._btldr = {});
     loaded[hash] = 1;
   } catch(e) {}
-
-  if (el._obscuraBootloaderDone === hash) return;
-  try {
-    const bootloader = typeof require === "function" ? require("Bootloader") : null;
-    if (bootloader && typeof bootloader.done === "function") {
-      bootloader.done(hash);
-      el._obscuraBootloaderDone = hash;
-    }
-  } catch(e) {}
 }
 
 function _fireElementLoad(el) {
@@ -727,7 +718,17 @@ class Element extends Node {
     _dom("set_inner_html", this._nid, String(v ?? ""));
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  get innerText() {
+    const tag = this.localName;
+    if (tag === "script" || tag === "style" || tag === "template" || tag === "noscript") return "";
+    let text = "";
+    for (const child of this.childNodes || []) {
+      if (!child) continue;
+      if (child.nodeType === 3) text += child.textContent || "";
+      else if (child.nodeType === 1) text += child.innerText || "";
+    }
+    return text;
+  }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -1704,16 +1705,16 @@ function _finishIframeLoad(iframeEl, url) {
     }, 0);
   }
 }
-const _OBSCURA_DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+const _OBSCURA_DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const _OBSCURA_CH_BRANDS = [
-  {brand: "Google Chrome", version: "147"},
+  {brand: "Google Chrome", version: "124"},
   {brand: "Not.A/Brand", version: "8"},
-  {brand: "Chromium", version: "147"},
+  {brand: "Chromium", version: "124"},
 ];
 const _OBSCURA_CH_FULL_VERSION_LIST = [
-  {brand: "Google Chrome", version: "147.0.0.0"},
+  {brand: "Google Chrome", version: "124.0.0.0"},
   {brand: "Not.A/Brand", version: "8.0.0.0"},
-  {brand: "Chromium", version: "147.0.0.0"},
+  {brand: "Chromium", version: "124.0.0.0"},
 ];
 globalThis.__obscura_language = globalThis.__obscura_language || "en-US";
 globalThis.__obscura_languages = globalThis.__obscura_languages || ["en-US","en"];
@@ -1726,9 +1727,44 @@ function _obscuraLangList(value) {
 function _obscuraUAMetadata() {
   return globalThis.__obscura_user_agent_metadata || {};
 }
+function _obscuraMetadataFromUA(ua) {
+  ua = String(ua || _OBSCURA_DEFAULT_UA);
+  const fullVersion = (ua.match(/(?:Chrome|Chromium)\/([0-9.]+)/) || [])[1] || "124.0.0.0";
+  const major = fullVersion.split(".")[0] || "124";
+  const isLinux = /Linux/i.test(ua);
+  const isMac = /Mac OS X|Macintosh/i.test(ua);
+  return {
+    architecture: "x86",
+    bitness: "64",
+    brands: [
+      {brand: "Google Chrome", version: major},
+      {brand: "Not.A/Brand", version: "8"},
+      {brand: "Chromium", version: major},
+    ],
+    fullVersionList: [
+      {brand: "Google Chrome", version: fullVersion},
+      {brand: "Not.A/Brand", version: "8.0.0.0"},
+      {brand: "Chromium", version: fullVersion},
+    ],
+    mobile: /Mobile/i.test(ua),
+    model: "",
+    platform: isLinux ? "Linux" : (isMac ? "macOS" : "Windows"),
+    platformVersion: isLinux ? "" : (isMac ? "14.4.1" : "10.0.0"),
+    uaFullVersion: fullVersion,
+  };
+}
+globalThis.__obscura_apply_user_agent_string = function(ua) {
+  if (typeof ua !== "string") return;
+  if (!ua.trim()) ua = _OBSCURA_DEFAULT_UA;
+  globalThis.__obscura_ua = ua;
+  globalThis.__obscura_user_agent_metadata = _obscuraMetadataFromUA(ua);
+  if (/Linux/i.test(ua)) globalThis.__obscura_platform = "Linux x86_64";
+  else if (/Mac OS X|Macintosh/i.test(ua)) globalThis.__obscura_platform = "MacIntel";
+  else if (/Windows/i.test(ua)) globalThis.__obscura_platform = "Win32";
+};
 globalThis.__obscura_apply_user_agent_override = function(params) {
   params = params || {};
-  if (typeof params.userAgent === "string") globalThis.__obscura_ua = params.userAgent;
+  if (typeof params.userAgent === "string") globalThis.__obscura_apply_user_agent_string(params.userAgent);
   if (typeof params.acceptLanguage === "string") {
     globalThis.__obscura_language = params.acceptLanguage.split(",")[0].split(";")[0].trim() || "en-US";
     globalThis.__obscura_languages = _obscuraLangList(params.acceptLanguage);
@@ -1737,6 +1773,174 @@ globalThis.__obscura_apply_user_agent_override = function(params) {
   if (params.userAgentMetadata && typeof params.userAgentMetadata === "object") {
     globalThis.__obscura_user_agent_metadata = params.userAgentMetadata;
   }
+};
+function __obscura_pw_parse_arg(value, handles, refs) {
+  handles = handles || [];
+  refs = refs || new Map();
+  if (value && typeof value === "object") {
+    if ("ref" in value) return refs.get(value.ref);
+    if ("h" in value) return handles[value.h];
+    if ("v" in value) {
+      if (value.v === "undefined") return undefined;
+      if (value.v === "null") return null;
+      if (value.v === "NaN") return NaN;
+      if (value.v === "Infinity") return Infinity;
+      if (value.v === "-Infinity") return -Infinity;
+      if (value.v === "-0") return -0;
+    }
+    if ("bi" in value) return BigInt(value.bi);
+    if ("a" in value) {
+      const result = [];
+      refs.set(value.id, result);
+      for (const item of value.a) result.push(__obscura_pw_parse_arg(item, handles, refs));
+      return result;
+    }
+    if ("o" in value) {
+      const result = {};
+      refs.set(value.id, result);
+      for (const item of value.o) {
+        if (item.k !== "__proto__") result[item.k] = __obscura_pw_parse_arg(item.v, handles, refs);
+      }
+      return result;
+    }
+  }
+  return value;
+}
+function __obscura_pw_serialize(value, refs) {
+  refs = refs || new Map();
+  if (value === undefined) return {v: "undefined"};
+  if (value === null) return {v: "null"};
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return {v: "NaN"};
+    if (value === Infinity) return {v: "Infinity"};
+    if (value === -Infinity) return {v: "-Infinity"};
+    if (Object.is(value, -0)) return {v: "-0"};
+    return value;
+  }
+  if (typeof value === "boolean" || typeof value === "string") return value;
+  if (typeof value === "bigint") return {bi: String(value)};
+  if (typeof value === "object") {
+    if (refs.has(value)) return {ref: refs.get(value)};
+    const id = refs.size + 1;
+    refs.set(value, id);
+    if (Array.isArray(value)) return {a: value.map(v => __obscura_pw_serialize(v, refs)), id};
+    const entries = [];
+    for (const key of Object.keys(value)) {
+      if (key !== "__proto__") entries.push({k: key, v: __obscura_pw_serialize(value[key], refs)});
+    }
+    return {o: entries, id};
+  }
+  return {v: "undefined"};
+}
+function __obscura_pw_selector_from_parsed(parsed) {
+  try {
+    const parts = parsed && parsed.parts;
+    if (!Array.isArray(parts) || parts.length !== 1) return null;
+    const part = parts[0];
+    if (!part || part.name !== "css") return null;
+    const body = part.body;
+    if (!Array.isArray(body) || body.length !== 1) return null;
+    const simples = body[0] && body[0].simples;
+    if (!Array.isArray(simples) || simples.length !== 1) return null;
+    const simple = simples[0];
+    if (!simple || simple.combinator !== "") return null;
+    const selector = simple.selector;
+    if (!selector || !Array.isArray(selector.functions) || selector.functions.length !== 0) return null;
+    return typeof selector.css === "string" ? selector.css : null;
+  } catch (_) {
+    return null;
+  }
+}
+function __obscura_pw_selector_from_info(info) {
+  return __obscura_pw_selector_from_parsed(info && info.parsed);
+}
+globalThis.__obscura_make_playwright_injected_script = function() {
+  function queryAll(parsed, root) {
+    const selector = __obscura_pw_selector_from_parsed(parsed);
+    if (!selector) return [];
+    const scope = root || document;
+    return Array.from(scope.querySelectorAll(selector));
+  }
+  return {
+    eval: globalThis.eval.bind(globalThis),
+    querySelectorAll(parsed, root) {
+      return queryAll(parsed, root);
+    },
+    querySelector(parsed, root, strict) {
+      const elements = queryAll(parsed, root);
+      if (strict && elements.length > 1) {
+        throw new Error("strict mode violation: selector resolved to " + elements.length + " elements");
+      }
+      return elements[0] || null;
+    },
+    checkDeprecatedSelectorUsage() {},
+    markTargetElements() {},
+    previewNode(node) {
+      if (!node) return "<null>";
+      const name = (node.nodeName || node.tagName || "node").toLowerCase();
+      const id = node.id ? "#" + node.id : "";
+      return "<" + name + id + ">";
+    }
+  };
+};
+globalThis.__obscura_make_playwright_utility_script = function() {
+  class UtilityScript {
+    evaluate(isFunction, returnByValue, expression, argCount, ...argsAndHandles) {
+      const args = argsAndHandles.slice(0, argCount);
+      const handles = argsAndHandles.slice(argCount);
+      const parsedArgs = args.map(arg => __obscura_pw_parse_arg(arg, handles));
+      const fastResult = this._fastLocatorResult(returnByValue, expression, parsedArgs);
+      if (fastResult !== undefined) return fastResult;
+      let result = globalThis.eval(expression);
+      if (isFunction === true) result = result(...parsedArgs);
+      else if (isFunction !== false && typeof result === "function") result = result(...parsedArgs);
+      if (!returnByValue) return result;
+      if (result && typeof result.then === "function") {
+        return result.then(value => __obscura_pw_serialize(value)).catch(() => undefined);
+      }
+      return __obscura_pw_serialize(result);
+    }
+    jsonValue(_returnByValue, value) {
+      return __obscura_pw_serialize(value);
+    }
+    _fastLocatorResult(returnByValue, expression, parsedArgs) {
+      if (!returnByValue || typeof expression !== "string") return undefined;
+
+      if (expression.indexOf("injected.querySelectorAll") !== -1 && expression.indexOf("elements.length") !== -1) {
+        const payload = parsedArgs[1] || {};
+        const selector = __obscura_pw_selector_from_info(payload.info);
+        if (!selector) return undefined;
+        return __obscura_pw_serialize(document.querySelectorAll(selector).length);
+      }
+
+      if (expression.indexOf("callbackText") === -1 || expression.indexOf("injected.querySelector") === -1) {
+        return undefined;
+      }
+
+      const payload = parsedArgs[1] || {};
+      const selector = __obscura_pw_selector_from_info(payload.info);
+      if (!selector || typeof payload.callbackText !== "string") return undefined;
+
+      const element = document.querySelector(selector);
+      if (!element) return __obscura_pw_serialize({ success: false });
+
+      let value;
+      if (payload.callbackText.indexOf("element.innerText") !== -1) {
+        value = element.innerText;
+      } else if (payload.callbackText.indexOf("element.textContent") !== -1) {
+        value = element.textContent;
+      } else {
+        return undefined;
+      }
+
+      return __obscura_pw_serialize({
+        log: "  locator resolved to " + selector,
+        success: true,
+        value
+      });
+    }
+  }
+  return new UtilityScript();
 };
 class _ObscuraServiceWorker {
   constructor(scriptURL = "") {
@@ -1855,8 +2059,8 @@ globalThis.navigator = {
         mobile: Boolean(metadata.mobile),
         model: metadata.model || "",
         platform: metadata.platform || "macOS",
-        platformVersion: metadata.platformVersion || "26.4.0",
-        uaFullVersion: metadata.uaFullVersion || "147.0.0.0",
+        platformVersion: metadata.platformVersion || "14.4.1",
+        uaFullVersion: metadata.uaFullVersion || "124.0.0.0",
       });
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
