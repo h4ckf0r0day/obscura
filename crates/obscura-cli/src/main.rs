@@ -27,6 +27,12 @@ struct Args {
 
     #[arg(long)]
     user_agent: Option<String>,
+
+    /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
+    /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
+    /// Applied once at startup before any isolate is created.
+    #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
+    v8_flags: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -195,6 +201,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if let Some(flags) = args.v8_flags.as_deref() {
+        let trimmed = flags.trim();
+        if !trimmed.is_empty() {
+            tracing::info!("Applying V8 flags: {}", trimmed);
+            obscura_js::set_v8_flags(trimmed);
+        }
+    }
 
     let global_proxy = args.proxy.clone();
 
@@ -1063,6 +1077,29 @@ mod tests {
     #[test]
     fn no_subcommand_is_not_quiet() {
         assert!(!is_quiet_command(&None));
+    }
+
+    #[test]
+    fn parsed_v8_flags_global_arg() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "--max-old-space-size=4096 --max-semi-space-size=64",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept --v8-flags as a global arg");
+        assert_eq!(
+            args.v8_flags.as_deref(),
+            Some("--max-old-space-size=4096 --max-semi-space-size=64"),
+        );
+    }
+
+    #[test]
+    fn v8_flags_default_is_none() {
+        let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
+            .expect("clap should accept fetch without --v8-flags");
+        assert!(args.v8_flags.is_none());
     }
 
     #[test]
