@@ -66,6 +66,12 @@ parallel `scrape` command.
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
 
+### Arch Linux (AUR)
+
+```bash
+yay -S obscura-browser
+```
+
 ### Build from source
 
 ```bash
