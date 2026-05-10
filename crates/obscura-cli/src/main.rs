@@ -13,6 +13,13 @@ struct Args {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Allow localhost/private network targets for trusted local development"
+    )]
+    allow_private_network: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -142,6 +149,7 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let allow_private_network = args.allow_private_network;
 
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
@@ -173,23 +181,23 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(port, workers, proxy, stealth, user_agent, allow_private_network).await?;
             } else {
-                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent).await?;
+                obscura_cdp::start_with_runtime_options(port, proxy, stealth, allow_private_network, user_agent).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, allow_private_network).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet).await?;
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, allow_private_network).await?;
         }
         None => {
             print_banner(args.port);
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
+            obscura_cdp::start_with_runtime_options(args.port, args.proxy, false, allow_private_network, args.user_agent).await?;
         }
     }
 
@@ -202,6 +210,7 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    allow_private_network: bool,
 ) -> anyhow::Result<()> {
     use tokio::net::TcpListener;
     use tokio::io::AsyncWriteExt as _;
@@ -221,6 +230,9 @@ async fn run_multi_worker_serve(
         }
         if stealth {
             cmd.arg("--stealth");
+        }
+        if allow_private_network {
+            cmd.arg("--allow-private-network");
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -335,8 +347,15 @@ async fn run_fetch(
     eval: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
+    allow_private_network: bool,
 ) -> anyhow::Result<()> {
-    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth));
+    let context = Arc::new(BrowserContext::with_runtime_options(
+        "fetch".to_string(),
+        None,
+        stealth,
+        allow_private_network,
+        user_agent.clone(),
+    ));
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {
@@ -510,6 +529,7 @@ async fn run_parallel_scrape(
     format: &str,
     timeout_secs: u64,
     quiet: bool,
+    allow_private_network: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -555,12 +575,16 @@ async fn run_parallel_scrape(
             let _permit = sem.acquire().await.unwrap();
             let task_start = Instant::now();
 
-            let mut child = match TokioCommand::new(worker_path.as_ref())
+            let mut command = TokioCommand::new(worker_path.as_ref());
+            command
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
+                .stderr(std::process::Stdio::null());
+            if allow_private_network {
+                command.env("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+            }
+
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(e) => {
                     return serde_json::json!({
