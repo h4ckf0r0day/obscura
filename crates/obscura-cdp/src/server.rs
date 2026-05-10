@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -185,10 +185,22 @@ fn handle_fetch_resolution(
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
                 "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
-                    url: None,
-                    method: None,
-                    headers: None,
-                    body: None,
+                    url: req
+                        .params
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    method: req
+                        .params
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    headers: parse_cdp_headers(req.params.get("headers")),
+                    body: req
+                        .params
+                        .get("postData")
+                        .and_then(|v| v.as_str())
+                        .map(decode_cdp_post_data),
                 },
                 "Fetch.fulfillRequest" => {
                     let status = req
@@ -244,6 +256,32 @@ fn handle_fetch_resolution(
     }
 
     false
+}
+
+fn parse_cdp_headers(value: Option<&Value>) -> Option<HashMap<String, String>> {
+    let value = value?;
+    if let Some(entries) = value.as_array() {
+        let headers = entries
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("name")?.as_str()?.to_string(),
+                    entry.get("value")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        return Some(headers);
+    }
+
+    value.as_object().map(|map| {
+        map.iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|value| (name.clone(), value.to_string()))
+            })
+            .collect()
+    })
 }
 
 fn emit_intercepted_request(
@@ -887,6 +925,30 @@ fn decode_base64(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn decode_cdp_post_data(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let looks_base64 = input.len() % 4 == 0
+        && input
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    if !looks_base64 {
+        return input.to_string();
+    }
+
+    let decoded = decode_base64(input);
+    let printable = decoded
+        .bytes()
+        .all(|b| matches!(b, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(&b));
+    if printable {
+        decoded
+    } else {
+        input.to_string()
+    }
+}
+
 fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
@@ -1124,5 +1186,70 @@ mod tests {
 
         assert_eq!(session_id, "second-session");
         assert_eq!(frame_id, second_page);
+    }
+
+    #[test]
+    fn handle_fetch_resolution_applies_continue_request_overrides() {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::new();
+        paused.insert("req-1".to_string(), resolution_tx);
+
+        let handled = handle_fetch_resolution(
+            &json!({
+                "id": 9,
+                "method": "Fetch.continueRequest",
+                "params": {
+                    "requestId": "req-1",
+                    "url": "https://www.instagram.com/graphql/query/?cursor=injected",
+                    "method": "POST",
+                    "headers": [
+                        {"name": "content-type", "value": "application/json"},
+                        {"name": "x-injected", "value": "1"}
+                    ],
+                    "postData": "eyJjdXJzb3IiOiJpbmplY3RlZCJ9"
+                },
+                "sessionId": "session-1"
+            })
+            .to_string(),
+            &reply_tx,
+            &mut paused,
+        );
+
+        assert!(handled);
+        assert!(paused.is_empty());
+        match resolution_rx.try_recv().expect("resolution should be sent") {
+            obscura_js::ops::InterceptResolution::Continue {
+                url,
+                method,
+                headers,
+                body,
+            } => {
+                assert_eq!(
+                    url.as_deref(),
+                    Some("https://www.instagram.com/graphql/query/?cursor=injected")
+                );
+                assert_eq!(method.as_deref(), Some("POST"));
+                let headers = headers.expect("headers should be forwarded");
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("application/json")
+                );
+                assert_eq!(headers.get("x-injected").map(String::as_str), Some("1"));
+                assert_eq!(body.as_deref(), Some("{\"cursor\":\"injected\"}"));
+            }
+            other => panic!("expected Continue resolution, got {other:?}"),
+        }
+
+        let response = reply_rx.try_recv().expect("CDP response should be sent");
+        assert!(response.contains("\"id\":9"));
+    }
+
+    #[test]
+    fn decode_cdp_post_data_preserves_non_base64_bodies() {
+        assert_eq!(
+            decode_cdp_post_data("{\"cursor\":\"already-plain\"}"),
+            "{\"cursor\":\"already-plain\"}"
+        );
     }
 }

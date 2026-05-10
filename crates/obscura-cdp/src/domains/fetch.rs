@@ -122,11 +122,11 @@ pub async fn handle(
                         .get("method")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
-                    headers: None,
+                    headers: parse_cdp_headers(params.get("headers")),
                     post_data: params
                         .get("postData")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                        .map(decode_cdp_post_data),
                 });
             }
             Ok(json!({}))
@@ -201,5 +201,83 @@ pub async fn handle(
             }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
+    }
+}
+
+fn parse_cdp_headers(value: Option<&Value>) -> Option<HashMap<String, String>> {
+    let value = value?;
+    if let Some(entries) = value.as_array() {
+        let headers = entries
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("name")?.as_str()?.to_string(),
+                    entry.get("value")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        return Some(headers);
+    }
+
+    value.as_object().map(|map| {
+        map.iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|value| (name.clone(), value.to_string()))
+            })
+            .collect()
+    })
+}
+
+fn decode_cdp_post_data(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let looks_base64 = input.len() % 4 == 0
+        && input
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    if !looks_base64 {
+        return input.to_string();
+    }
+
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter_map(|c| match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let b = [
+            chunk.first().copied().unwrap_or(0),
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+            chunk.get(3).copied().unwrap_or(0),
+        ];
+        out.push((b[0] << 2) | (b[1] >> 4));
+        if chunk.len() > 2 {
+            out.push((b[1] << 4) | (b[2] >> 2));
+        }
+        if chunk.len() > 3 {
+            out.push((b[2] << 6) | b[3]);
+        }
+    }
+
+    let decoded = String::from_utf8_lossy(&out).to_string();
+    let printable = decoded
+        .bytes()
+        .all(|b| matches!(b, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(&b));
+    if printable {
+        decoded
+    } else {
+        input.to_string()
     }
 }

@@ -479,9 +479,18 @@ async fn op_fetch_url(
         (jar, in_flight, itx, http_client, page_url, page_id)
     };
 
+    let mut request_url = url;
+    let mut request_method = method;
+    let mut request_body = body;
     let mut custom_headers: HashMap<String, String> =
         serde_json::from_str(&headers_json).unwrap_or_default();
-    apply_browser_fetch_headers(&mut custom_headers, &url, &page_url, http_client.as_ref()).await;
+    apply_browser_fetch_headers(
+        &mut custom_headers,
+        &request_url,
+        &page_url,
+        http_client.as_ref(),
+    )
+    .await;
 
     let mut response_tx = None;
     if let Some((tx, request_id, should_pause)) = intercept_tx {
@@ -491,10 +500,10 @@ async fn op_fetch_url(
             page_id: page_id.clone(),
             page_url: page_url.clone(),
             request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
+            url: request_url.clone(),
+            method: request_method.clone(),
             headers: custom_headers.clone(),
-            body: body.clone(),
+            body: request_body.clone(),
             resource_type: "Fetch".to_string(),
             pause: should_pause,
             resolver: resolve_tx,
@@ -502,8 +511,65 @@ async fn op_fetch_url(
         };
         if tx.send(intercepted).is_ok() {
             response_tx = Some(completion_tx);
-            match resolve_rx.try_recv() {
-                Ok(InterceptResolution::Fulfill {
+            let resolution = if should_pause {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), resolve_rx).await {
+                    Ok(Ok(resolution)) => Some(resolution),
+                    Ok(Err(_)) => None,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Interception timed out waiting for Fetch resolution {}; continuing original request",
+                            request_url
+                        );
+                        None
+                    }
+                }
+            } else {
+                match resolve_rx.try_recv() {
+                    Ok(resolution) => Some(resolution),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        tracing::debug!(
+                            "Interception event emitted; continuing request without blocking {}",
+                            request_url
+                        );
+                        None
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+                }
+            };
+
+            match resolution {
+                Some(InterceptResolution::Continue {
+                    url,
+                    method,
+                    headers,
+                    body,
+                }) => {
+                    if let Some(url) = url {
+                        request_url = url;
+                    }
+                    if let Some(method) = method {
+                        request_method = method;
+                    }
+                    if let Some(headers) = headers {
+                        custom_headers = headers;
+                    }
+                    if let Some(body) = body {
+                        request_body = body;
+                    }
+                    tracing::debug!("Interception: continue request {}", request_url);
+                }
+                Some(InterceptResolution::Fail { reason }) => {
+                    return Ok(serde_json::json!({
+                        "status": 0,
+                        "body": "",
+                        "url": request_url,
+                        "headers": {},
+                        "blocked": true,
+                        "error": reason,
+                    })
+                    .to_string());
+                }
+                Some(InterceptResolution::Fulfill {
                     status,
                     headers: h,
                     body: b,
@@ -512,39 +578,19 @@ async fn op_fetch_url(
                     return Ok(serde_json::json!({
                         "status": status,
                         "body": b,
-                        "url": url,
+                        "url": request_url,
                         "headers": resp_headers,
                     })
                     .to_string());
                 }
-                Ok(InterceptResolution::Fail { reason }) => {
-                    return Ok(serde_json::json!({
-                        "status": 0,
-                        "body": "",
-                        "url": url,
-                        "headers": {},
-                        "blocked": true,
-                        "error": reason,
-                    })
-                    .to_string());
-                }
-                Ok(InterceptResolution::Continue { .. }) => {
-                    tracing::debug!("Interception: continue request {}", url);
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    tracing::debug!(
-                        "Interception event emitted; continuing request without blocking {}",
-                        url
-                    );
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+                None => {}
             }
         }
     }
 
     let client = get_shared_client();
 
-    let request_origin = url::Url::parse(&url)
+    let request_origin = url::Url::parse(&request_url)
         .ok()
         .map(|u| {
             let host = u.host_str().unwrap_or("");
@@ -561,7 +607,7 @@ async fn op_fetch_url(
     };
     let is_cross_origin = !page_origin.is_empty() && request_origin != page_origin;
 
-    let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
+    let req_method: reqwest::Method = request_method.parse().unwrap_or(reqwest::Method::GET);
 
     let needs_preflight = is_cross_origin
         && mode == "cors"
@@ -574,9 +620,9 @@ async fn op_fetch_url(
 
     if needs_preflight {
         let preflight = client
-            .request(reqwest::Method::OPTIONS, &url)
+            .request(reqwest::Method::OPTIONS, &request_url)
             .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str())
+            .header("Access-Control-Request-Method", request_method.as_str())
             .header(
                 "Access-Control-Request-Headers",
                 custom_headers
@@ -605,7 +651,7 @@ async fn op_fetch_url(
         }
     }
 
-    let mut req = client.request(req_method, &url);
+    let mut req = client.request(req_method, &request_url);
 
     if is_cross_origin {
         req = req.header("Origin", &page_origin);
@@ -613,7 +659,7 @@ async fn op_fetch_url(
 
     if !is_cross_origin {
         if let Some(ref jar) = cookie_jar {
-            if let Ok(parsed_url) = url::Url::parse(&url) {
+            if let Ok(parsed_url) = url::Url::parse(&request_url) {
                 let cookie_header = jar.get_cookie_header(&parsed_url);
                 if !cookie_header.is_empty() {
                     req = req.header("Cookie", &cookie_header);
@@ -626,8 +672,8 @@ async fn op_fetch_url(
         req = req.header(k.as_str(), v.as_str());
     }
 
-    if !body.is_empty() {
-        req = req.body(body);
+    if !request_body.is_empty() {
+        req = req.body(request_body.clone());
     }
 
     if let Some(ref counter) = in_flight {
@@ -648,7 +694,7 @@ async fn op_fetch_url(
     let status = response.status().as_u16();
 
     if let Some(ref jar) = cookie_jar {
-        if let Ok(parsed_url) = url::Url::parse(&url) {
+        if let Ok(parsed_url) = url::Url::parse(&request_url) {
             for val in response.headers().get_all(reqwest::header::SET_COOKIE) {
                 if let Ok(s) = val.to_str() {
                     jar.set_cookie(s, &parsed_url);
@@ -673,7 +719,7 @@ async fn op_fetch_url(
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
-                "url": url,
+                "url": request_url,
                 "headers": {},
                 "corsBlocked": true,
                 "corsError": format!("CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'", page_origin, allowed),
@@ -691,7 +737,7 @@ async fn op_fetch_url(
 
     if let Some(tx) = response_tx {
         let _ = tx.send(InterceptedResponse {
-            url: url.clone(),
+            url: request_url.clone(),
             status,
             headers: resp_headers.clone(),
             body: resp_body.clone(),
@@ -702,8 +748,8 @@ async fn op_fetch_url(
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
-        method,
-        url,
+        request_method,
+        request_url,
         resp_body.len()
     );
 
@@ -711,7 +757,7 @@ async fn op_fetch_url(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": request_url,
         "headers": resp_headers,
     })
     .to_string())
