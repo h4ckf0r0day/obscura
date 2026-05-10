@@ -800,6 +800,7 @@ class Document extends Node {
   }
   getElementsByTagName(t) { return this.querySelectorAll(t); }
   getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByName(n) { return this.querySelectorAll('[name="' + String(n).replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
     if (el && t.toLowerCase() === 'template') {
@@ -2180,6 +2181,9 @@ class _IframeDocument {
   }
   getElementsByClassName(cls) {
     return this._root.querySelectorAll('.' + cls);
+  }
+  getElementsByName(name) {
+    return this._root.querySelectorAll('[name="' + String(name).replace(/"/g, '\\"') + '"]');
   }
   createElement(tag) { return document.createElement(tag); }
   createElementNS(ns, tag) { return document.createElementNS(ns, tag); }

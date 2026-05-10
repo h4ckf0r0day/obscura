@@ -124,6 +124,19 @@ obscura scrape url1 url2 url3 ... \
 obscura scrape https://example.com --quiet --format json
 ```
 
+### Scrape public X timelines
+
+```bash
+# Read latest public posts through a Nitter-compatible timeline endpoint
+obscura x elonmusk sama --limit 3 --concurrency 25 --format json
+
+# Use direct X logged-out web data explicitly (experimental; X may return highlights)
+obscura x elonmusk --source x-web --base-url https://x.com --format text
+
+# Point at a self-hosted Nitter-compatible endpoint for high-volume polling
+obscura x elonmusk sama --nitter-base-url https://nitter.example.com --source nitter
+```
+
 ## Puppeteer / Playwright
 
 ### Puppeteer
@@ -265,6 +278,38 @@ Scrape multiple URLs in parallel with worker processes.
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
 | `--quiet` | off | Suppress scrape progress on stderr |
+
+### `obscura x <HANDLE...>`
+
+Scrape public X timeline posts and return canonical `x.com` status URLs.
+
+The default source is a Nitter-compatible timeline endpoint because X's logged-out web GraphQL can return ranked highlights instead of the latest profile posts. `--source x-web` keeps the direct logged-out X path available for experimentation and can include tweet/profile metrics when X returns them. The command does not depend on XCancel.
+
+JSON rows include the stable timeline fields `handle`, `status_id`, `url`, `text`, `published_at`, and `source`. When available, rows also include tweet metrics (`reply_count`, `repost_count`, `quote_count`, `like_count`, `view_count`) and profile metrics (`profile_name`, `profile_description`, `profile_followers_count`, `profile_following_count`, `profile_statuses_count`, `profile_listed_count`, `profile_verified`). Nitter-compatible RSS usually exposes timeline text and dates, while `x-web` is the richer but less stable source.
+
+This is useful for high-frequency monitoring jobs where a generic RSS aggregation layer can lag behind the source timeline. For large watchlists, point `--nitter-base-url` at an endpoint you control.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base-url` | `https://x.com` | X-compatible web base URL |
+| `--nitter-base-url` | `https://nitter.net` | Nitter-compatible timeline base URL |
+| `--source` | `nitter` | Source: `nitter`, `x-web`, or `auto` |
+| `--limit` | `3` | Maximum statuses per handle |
+| `--concurrency` | `25` | Parallel profile fetches |
+| `--timeout` | `20` | Per-profile timeout in seconds |
+| `--format` | `json` | Output: `json` or `text` |
+| `--quiet` | off | Suppress per-profile errors on stderr |
+
+#### 78-handle watchlist benchmark
+
+Measured with `/usr/bin/time -v` on x86_64 Linux using `--source nitter --limit 1 --concurrency 78 --quiet`.
+The machine was a 12-vCPU KVM VM reporting `QEMU Virtual CPU version 2.5+` with 31 GiB RAM.
+
+| Handles requested | Handles returned | Wall time | User CPU | System CPU | CPU share | Max resident memory |
+|-------------------|------------------|-----------|----------|------------|-----------|---------------------|
+| 78 | 74 | 1.87s | 0.64s | 0.10s | 39% | 36,092 KB |
+
+The four misses in this run were HTTP 404 responses from the public timeline endpoint. Network behavior depends on the endpoint; high-volume users should run their own Nitter-compatible service.
 
 ## License
 
