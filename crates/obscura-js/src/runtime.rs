@@ -1,6 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::Poll;
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
@@ -552,9 +556,11 @@ impl ObscuraJsRuntime {
         }
 
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let termination_requested = Arc::new(AtomicBool::new(false));
 
         let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let pair_clone = pair.clone();
+        let termination_requested_for_thread = termination_requested.clone();
 
         let watchdog = std::thread::spawn(move || {
             let (lock, cvar) = &*pair_clone;
@@ -564,6 +570,7 @@ impl ObscuraJsRuntime {
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
+                    termination_requested_for_thread.store(true, Ordering::SeqCst);
                     isolate_handle.terminate_execution();
                     return;
                 }
@@ -585,6 +592,11 @@ impl ObscuraJsRuntime {
             cvar.notify_one();
         }
         let _ = watchdog.join();
+
+        let termination_requested = termination_requested.load(Ordering::SeqCst);
+        if termination_requested {
+            self.runtime.v8_isolate().cancel_terminate_execution();
+        }
 
         match result {
             Ok(_) => Ok(()),
@@ -617,65 +629,52 @@ impl ObscuraJsRuntime {
     pub async fn run_event_loop_slice(
         &mut self,
         poll_timeout: tokio::time::Duration,
-        cpu_timeout: std::time::Duration,
+        _cpu_timeout: std::time::Duration,
     ) -> Result<(), String> {
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let pair_clone = pair.clone();
+        // Poll the Deno/V8 event loop directly instead of wrapping
+        // `run_event_loop()` in a timeout. Dropping that future mid-poll can
+        // leave pending V8 work in a fragile state under heavy fetch/CDP load.
+        // Event-loop callbacks are also not terminated from a watchdog thread;
+        // watchdog termination is kept for top-level script execution only.
+        let deadline = tokio::time::Instant::now() + poll_timeout;
 
-        let watchdog = std::thread::spawn(move || {
-            let (lock, cvar) = &*pair_clone;
-            let mut cancelled = lock.lock().unwrap();
-            let result = cvar.wait_timeout(cancelled, cpu_timeout).unwrap();
-            cancelled = result.0;
-            if !*cancelled && result.1.timed_out() {
-                isolate_handle.terminate_execution();
+        loop {
+            match self.poll_event_loop_once().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => return Err(e),
             }
-        });
 
-        let result = tokio::time::timeout(
-            poll_timeout,
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
-
-        {
-            let (lock, cvar) = &*pair;
-            let mut cancelled = lock.lock().unwrap();
-            *cancelled = true;
-            cvar.notify_one();
-        }
-        let _ = watchdog.join();
-
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("Uncaught Error: execution terminated") {
-                    tracing::warn!(
-                        "Event loop task killed after {}ms timeout",
-                        cpu_timeout.as_millis()
-                    );
-                    self.runtime
-                        .execute_script("<reset>", "undefined".to_string())
-                        .ok();
-                    Ok(())
-                } else {
-                    Err(format!("Event loop error: {}", msg))
-                }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(());
             }
-            Err(_) => Ok(()),
+
+            tokio::task::yield_now().await;
         }
     }
 
     pub async fn resolve_promises(&mut self) {
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
+        let _ = self
+            .run_event_loop_slice(
+                tokio::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+    }
+
+    async fn poll_event_loop_once(&mut self) -> Result<bool, String> {
+        poll_fn(|cx| {
+            let result = match self
+                .runtime
+                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
+            {
+                Poll::Ready(Ok(())) => Ok(true),
+                Poll::Ready(Err(e)) => Err(format!("Event loop error: {}", e)),
+                Poll::Pending => Ok(false),
+            };
+            Poll::Ready(result)
+        })
+        .await
     }
     pub fn take_dom(&self) -> Option<DomTree> {
         self.state.borrow_mut().dom.take()
@@ -1048,6 +1047,20 @@ mod tests {
         .unwrap();
         let result = rt.evaluate("globalThis.__result").unwrap();
         assert_eq!(result, serde_json::json!(["A", "B"]));
+    }
+
+    #[test]
+    fn test_runtime_usable_after_terminated_script() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script_with_timeout(
+            "infinite-loop",
+            "while (true) {}",
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let result = rt.evaluate("1 + 1").unwrap();
+        assert_eq!(result, serde_json::json!(2.0));
     }
 
     #[test]
