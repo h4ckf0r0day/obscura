@@ -1,11 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
 
 use crate::dispatch::CdpContext;
-use crate::types::CdpEvent;
 
 pub struct PausedRequest {
     pub request_id: String,

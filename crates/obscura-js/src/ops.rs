@@ -376,7 +376,7 @@ async fn op_fetch_url(
                         "error": reason,
                     }).to_string());
                 }
-                Ok(InterceptResolution::Continue { url: new_url, method: new_method, headers: new_headers, body: new_body }) => {
+                Ok(InterceptResolution::Continue { url: _new_url, method: _new_method, headers: _new_headers, body: _new_body }) => {
                     tracing::debug!("Interception: continue request {}", url);
                 }
                 Err(_) => {

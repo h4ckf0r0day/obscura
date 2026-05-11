@@ -273,6 +273,20 @@ pub async fn handle(
                 }]
             }))
         }
+        "printToPDF" => {
+            // Obscura has no layout/rendering engine, so PDF generation is
+            // intentionally not implemented. Returning a distinct, descriptive
+            // error (rather than the generic "Unknown Page method" fallback)
+            // tells Playwright/Puppeteer/headless_chrome clients exactly why
+            // the call failed and what to do instead.
+            Err(
+                "Page.printToPDF is not supported by Obscura: no layout engine. \
+                 Use Runtime.evaluate (e.g. page.evaluate) to extract the rendered \
+                 HTML, then render to PDF in your client (wkhtmltopdf, weasyprint, \
+                 a separate headless Chromium pipeline, etc.)."
+                    .to_string(),
+            )
+        }
         _ => Err(format!("Unknown Page method: {}", method)),
     }
 }
@@ -332,5 +346,30 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    #[tokio::test]
+    async fn print_to_pdf_returns_descriptive_unsupported_error() {
+        // Regression for #53: Page.printToPDF must be handled explicitly so
+        // Playwright clients receive a descriptive error rather than the
+        // generic "Unknown Page method" fallback.
+        let mut ctx = CdpContext::new();
+        let err = handle("printToPDF", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("printToPDF must error until a real renderer exists");
+        assert!(
+            !err.contains("Unknown Page method"),
+            "printToPDF must NOT fall through to the catch-all: {err}"
+        );
+        assert!(
+            err.contains("not supported by Obscura"),
+            "error must clearly state PDF is unsupported: {err}"
+        );
+        // Direct user to a workaround so the message is actionable.
+        assert!(
+            err.to_lowercase().contains("evaluate")
+                || err.to_lowercase().contains("html"),
+            "error must point to a workaround: {err}"
+        );
     }
 }

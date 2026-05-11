@@ -81,6 +81,9 @@ enum Command {
         #[arg(long, short)]
         eval: Option<String>,
 
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+
         #[arg(long, short)]
         quiet: bool,
 
@@ -102,6 +105,9 @@ enum Command {
 
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
+
+        #[arg(long, short)]
+        quiet: bool,
     },
 
 }
@@ -123,16 +129,31 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.0
+  Headless Browser v0.1.2
   CDP server: ws://127.0.0.1:{}/devtools/browser
 "#, port);
+}
+
+fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
+    if verbose {
+        "debug"
+    } else if quiet {
+        "off"
+    } else {
+        "warn"
+    }
+}
+
+fn is_quiet_command(cmd: &Option<Command>) -> bool {
+    matches!(cmd, Some(Command::Fetch { quiet: true, .. }))
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let filter = if args.verbose { "debug" } else { "warn" };
+    let quiet = is_quiet_command(&args.command);
+    let filter = select_log_filter(args.verbose, quiet);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -169,11 +190,11 @@ async fn main() -> anyhow::Result<()> {
                 obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent, storage_dir).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, quiet, storage_dir }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, quiet, storage_dir).await?;
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, storage_dir).await?;
         }
-        Some(Command::Scrape { urls, eval, concurrency, format, timeout }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout).await?;
+        Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet).await?;
         }
         None => {
             print_banner(args.port);
@@ -324,6 +345,7 @@ async fn run_fetch(
     user_agent: Option<String>,
     stealth: bool,
     eval: Option<String>,
+    output: Option<std::path::PathBuf>,
     quiet: bool,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
@@ -368,29 +390,36 @@ async fn run_fetch(
 
     if let Some(ref expr) = eval {
         let result = page.evaluate(expr);
-        match result {
-            serde_json::Value::String(s) => println!("{}", s),
-            serde_json::Value::Null => println!("null"),
-            other => println!("{}", other),
-        }
+        let rendered = match result {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Null => "null".to_string(),
+            other => other.to_string(),
+        };
+        write_or_print(rendered, output.as_ref()).await?;
         return Ok(());
     }
 
-    match dump {
-        DumpFormat::Html => {
-            dump_html(&page);
-        }
-        DumpFormat::Text => {
-            dump_text(&mut page);
-        }
-        DumpFormat::Links => {
-            dump_links(&page);
-        }
-    }
+    let rendered = match dump {
+        DumpFormat::Html => dump_html(&page),
+        DumpFormat::Text => dump_text(&mut page),
+        DumpFormat::Links => dump_links(&page),
+    };
+    write_or_print(rendered, output.as_ref()).await?;
 
     // Save cookies to disk if storage_dir is configured
     ctx_for_save.save_cookies();
 
+    Ok(())
+}
+
+async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    if let Some(path) = output {
+        tokio::fs::write(path, content)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    } else {
+        println!("{}", content);
+    }
     Ok(())
 }
 
@@ -413,27 +442,27 @@ async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -
     }
 }
 
-fn dump_html(page: &Page) {
+fn dump_html(page: &Page) -> String {
     page.with_dom(|dom| {
         if let Ok(Some(html_node)) = dom.query_selector("html") {
             let html = dom.outer_html(html_node);
-            println!("<!DOCTYPE html>");
-            println!("{}", html);
+            format!("<!DOCTYPE html>\n{}", html)
         } else {
             let doc = dom.document();
-            let html = dom.inner_html(doc);
-            println!("{}", html);
+            dom.inner_html(doc)
         }
-    });
+    }).unwrap_or_default()
 }
 
-fn dump_text(page: &mut Page) {
+fn dump_text(page: &mut Page) -> String {
     page.with_dom(|dom| {
         if let Ok(Some(body)) = dom.query_selector("body") {
             let text = extract_readable_text(dom, body);
-            println!("{}", text.trim());
+            text.trim().to_string()
+        } else {
+            String::new()
         }
-    });
+    }).unwrap_or_default()
 }
 
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
@@ -464,7 +493,13 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
                     | "ul" | "ol"
             );
 
-            if tag == "script" || tag == "style" {
+            // Boilerplate elements rarely contain content the user wants to
+            // scrape — strip them so `--dump text` returns the article body
+            // instead of menus, footers, and cookie banners.
+            if matches!(
+                tag,
+                "script" | "style" | "nav" | "header" | "footer" | "aside"
+            ) {
                 return result;
             }
 
@@ -496,6 +531,7 @@ async fn run_parallel_scrape(
     concurrency: usize,
     format: &str,
     timeout_secs: u64,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -504,10 +540,12 @@ async fn run_parallel_scrape(
         anyhow::bail!("No URLs provided. Pass at least one URL to scrape.");
     }
 
-    eprintln!(
-        "Scraping {} URLs with {} concurrent workers (per-worker timeout: {}s)...",
-        total, concurrency, timeout_secs
-    );
+    if !quiet {
+        eprintln!(
+            "Scraping {} URLs with {} concurrent workers (per-worker timeout: {}s)...",
+            total, concurrency, timeout_secs
+        );
+    }
 
     let worker_path = std::env::current_exe()
         .ok()
@@ -707,20 +745,23 @@ async fn run_parallel_scrape(
                 println!("{}ms\t{}\t{}", time, url, eval);
             }
         }
-        eprintln!(
-            "\nTotal: {}ms for {} URLs ({} concurrent)",
-            total_time.as_millis(),
-            total,
-            concurrency
-        );
+        if !quiet {
+            eprintln!(
+                "\nTotal: {}ms for {} URLs ({} concurrent)",
+                total_time.as_millis(),
+                total,
+                concurrency
+            );
+        }
     }
 
     Ok(())
 }
 
-fn dump_links(page: &Page) {
+fn dump_links(page: &Page) -> String {
     let base_url = page.url.clone();
     page.with_dom(|dom| {
+        let mut rendered = Vec::new();
         let links = dom.query_selector_all("a").unwrap_or_default();
         for link_id in links {
             if let Some(node) = dom.get_node(link_id) {
@@ -738,12 +779,169 @@ fn dump_links(page: &Page) {
 
                 if !full_url.is_empty() {
                     if text.is_empty() {
-                        println!("{}", full_url);
+                        rendered.push(full_url);
                     } else {
-                        println!("{}\t{}", full_url, text);
+                        rendered.push(format!("{}\t{}", full_url, text));
                     }
                 }
             }
         }
-    });
+        rendered.join("\n")
+    }).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_readable_text, is_quiet_command, select_log_filter, write_or_print, Args, Command,
+    };
+    use clap::Parser;
+    use obscura_dom::parse_html;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_or_print_writes_output_file_with_tokio_fs() {
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-output-test-{}.txt",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        write_or_print("rendered output".to_string(), Some(&path))
+            .await
+            .expect("write output file");
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read output file");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(content, "rendered output");
+    }
+
+    #[test]
+    fn default_filter_is_warn() {
+        assert_eq!(select_log_filter(false, false), "warn");
+    }
+
+    #[test]
+    fn verbose_filter_is_debug() {
+        assert_eq!(select_log_filter(true, false), "debug");
+    }
+
+    #[test]
+    fn quiet_filter_is_off() {
+        assert_eq!(select_log_filter(false, true), "off");
+    }
+
+    #[test]
+    fn verbose_wins_over_quiet() {
+        assert_eq!(select_log_filter(true, true), "debug");
+    }
+
+    #[test]
+    fn parsed_fetch_with_quiet_flag_is_detected() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--quiet",
+            "https://example.com",
+        ])
+        .expect("clap should accept --quiet on fetch");
+        assert!(is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_fetch_without_quiet_is_not_detected() {
+        let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
+            .expect("clap should accept fetch without --quiet");
+        assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_serve_command_is_not_quiet() {
+        let args = Args::try_parse_from(["obscura", "serve"])
+            .expect("clap should accept serve");
+        assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn no_subcommand_is_not_quiet() {
+        assert!(!is_quiet_command(&None));
+    }
+
+    #[test]
+    fn parsed_fetch_quiet_resolves_to_off_filter() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--quiet",
+            "https://example.com",
+        ])
+        .unwrap();
+        let filter = select_log_filter(args.verbose, is_quiet_command(&args.command));
+        assert_eq!(filter, "off");
+    }
+
+    #[test]
+    fn matcher_still_uses_fetch_variant() {
+        let cmd = Some(Command::Fetch {
+            url: "https://x".to_string(),
+            dump: super::DumpFormat::Html,
+            selector: None,
+            wait: 5,
+            timeout: 30,
+            wait_until: "load".to_string(),
+            user_agent: None,
+            stealth: false,
+            eval: None,
+            quiet: true,
+            output: None,
+        });
+        assert!(is_quiet_command(&cmd));
+    }
+
+    fn body_text(html: &str) -> String {
+        let dom = parse_html(html);
+        let body = dom
+            .query_selector("body")
+            .ok()
+            .flatten()
+            .expect("body must exist");
+        extract_readable_text(&dom, body).split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn skips_nav_header_footer_aside() {
+        let text = body_text(
+            r#"<html><body>
+                <header>SITE HEADER</header>
+                <nav>NAV LINKS</nav>
+                <aside>SIDEBAR</aside>
+                <main><p>Article body.</p></main>
+                <footer>FOOTER</footer>
+            </body></html>"#,
+        );
+        assert!(text.contains("Article body."), "main content kept: {text}");
+        for boilerplate in ["SITE HEADER", "NAV LINKS", "SIDEBAR", "FOOTER"] {
+            assert!(
+                !text.contains(boilerplate),
+                "boilerplate '{boilerplate}' leaked through: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_skips_script_and_style() {
+        // Regression guard for the original skip list.
+        let text = body_text(
+            r#"<html><body>
+                <p>Hello.</p>
+                <script>console.log("nope")</script>
+                <style>.x { color: red }</style>
+            </body></html>"#,
+        );
+        assert!(text.contains("Hello."));
+        assert!(!text.contains("console.log"));
+        assert!(!text.contains("color: red"));
+    }
 }

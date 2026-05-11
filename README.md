@@ -47,6 +47,9 @@ curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
+# Arch Linux (AUR)
+yay -S obscura-browser
+
 # macOS Apple Silicon
 curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
@@ -93,6 +96,9 @@ obscura fetch https://example.com --dump links
 # Render JavaScript and dump HTML
 obscura fetch https://news.ycombinator.com --dump html
 
+# Write dump or eval output to a file
+obscura fetch https://example.com --dump text --output page.txt
+
 # Wait for dynamic content
 obscura fetch https://example.com --wait-until networkidle0
 
@@ -116,6 +122,9 @@ obscura scrape url1 url2 url3 ... \
   --concurrency 25 \
   --eval "document.querySelector('h1').textContent" \
   --format json
+
+# Suppress scrape progress on stderr for script-friendly output
+obscura scrape https://example.com --quiet --format json
 ```
 
 ## Puppeteer / Playwright
@@ -246,6 +255,7 @@ Fetch and render a single page.
 | `--timeout` | `30` | Maximum navigation time in seconds |
 | `--selector` | — | Wait for CSS selector |
 | `--stealth` | off | Anti-detection mode |
+| `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |
 
 ### `obscura scrape <URL...>`
@@ -257,6 +267,7 @@ Scrape multiple URLs in parallel with worker processes.
 | `--concurrency` | `10` | Parallel workers |
 | `--eval` | — | JS expression per page |
 | `--format` | `json` | Output: `json` or `text` |
+| `--quiet` | off | Suppress scrape progress on stderr |
 
 ## License
 
