@@ -1,0 +1,22 @@
+[package]
+name = "obscura-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP server for Obscura headless browser — web scraping and browser automation for AI agents"
+keywords = ["mcp", "web-scraping", "headless-browser", "ai-agent"]
+
+[[bin]]
+name = "obscura-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "obscura_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+regex = { workspace = true }
+crossterm = { workspace = true }

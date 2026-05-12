@@ -1,0 +1,19 @@
+{
+  "name": "obscura-mcp",
+  "version": "1.2.0",
+  "description": "MCP server for Obscura headless browser — web scraping and content extraction for AI agents.",
+  "author": {
+    "name": "epicsagas",
+    "url": "https://github.com/epicsagas"
+  },
+  "homepage": "https://github.com/epicsagas/obscura",
+  "repository": "https://github.com/epicsagas/obscura-mcp",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "web-scraping",
+    "headless-browser",
+    "ai-agent",
+    "obscura"
+  ]
+}
