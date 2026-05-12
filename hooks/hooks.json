@@ -11,7 +11,7 @@
             "async": false
           }
         ],
-        "description": "Install obscura + obscura-mcp binaries if missing, register MCP server and skill"
+        "description": "Install obscura-mcp binary if missing, register MCP server and seed skills/agents"
       }
     ]
   }

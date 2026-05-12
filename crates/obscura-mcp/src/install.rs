@@ -88,7 +88,7 @@ fn tool_config(id: &str) -> Option<ToolConfig> {
         "codex" => Some(ToolConfig {
             name: "Codex CLI",
             skills_dir: Box::new(|s| home().join(format!(".codex/skills/{s}/SKILL.md"))),
-            agents_dir: Box::new(|a| home().join(format!(".codex/agents/{a}.md"))),
+            agents_dir: Box::new(|a| home().join(format!(".codex/skills/{a}/agents/openai.yaml"))),
             mcp_file: home().join(".codex/config.toml"),
             mcp_key: "mcp_servers",
             mcp_format: "toml",
@@ -139,15 +139,11 @@ fn ensure_parent(path: &std::path::Path) {
     }
 }
 
-fn write_or_sync(path: &PathBuf, content: &str) -> bool {
+fn upsert_file(path: &PathBuf, content: &str) -> bool {
     ensure_parent(path);
     if path.exists() {
-        if let Ok(existing) = fs::read_to_string(path) {
-            if existing == content {
-                println!("  skip (unchanged): {}", path.display());
-                return false;
-            }
-        }
+        println!("  skip (exists): {}", path.display());
+        return false;
     }
     match fs::write(path, content) {
         Ok(()) => {
@@ -213,35 +209,35 @@ fn inject_mcp(cfg: &ToolConfig) {
 
     let key = cfg.mcp_key;
 
-    if cfg.mcp_format == "opencode" {
-        let mcp = data
-            .as_object_mut()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| json!({}));
-        mcp.as_object_mut().unwrap().insert(
-            "obscura".into(),
-            json!({
-                "type": "local",
-                "command": [exe, "serve"],
-                "environment": { "OBSCURA_BIN": "obscura" }
-            }),
-        );
+    // Build the new entry
+    let new_entry = if cfg.mcp_format == "opencode" {
+        json!({
+            "type": "local",
+            "command": [exe, "serve"],
+            "environment": { "OBSCURA_BIN": "obscura" }
+        })
     } else {
-        let servers = data
-            .as_object_mut()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| json!({}));
-        servers.as_object_mut().unwrap().insert(
-            "obscura".into(),
-            json!({
-                "command": exe,
-                "args": ["serve"],
-                "env": { "OBSCURA_BIN": "obscura" }
-            }),
-        );
+        json!({
+            "command": exe,
+            "args": ["serve"],
+            "env": { "OBSCURA_BIN": "obscura" }
+        })
+    };
+
+    // upsert: skip if identical entry already exists
+    if let Some(servers) = data.get(key).and_then(|v| v.get("obscura")) {
+        if servers == &new_entry {
+            println!("  skip (unchanged): {}", cfg.mcp_file.display());
+            return;
+        }
     }
+
+    let servers = data
+        .as_object_mut()
+        .unwrap()
+        .entry(key)
+        .or_insert_with(|| json!({}));
+    servers.as_object_mut().unwrap().insert("obscura".into(), new_entry);
 
     write_json(&cfg.mcp_file, &data);
     println!("  mcp injected: {}", cfg.mcp_file.display());
@@ -305,13 +301,21 @@ fn inject_mcp_toml(path: &PathBuf, exe: &str) {
         String::new()
     };
 
+    let new_entry = format!(
+        "[mcp_servers.obscura]\ncommand = \"{exe}\"\nargs = [\"serve\"]\nenabled = true\n\n[mcp_servers.obscura.env]\nOBSCURA_BIN = \"obscura\"\n"
+    );
+
+    // upsert: skip if identical entry already exists
+    if content.contains("mcp_servers.obscura") && content.contains(&format!("command = \"{exe}\"")) {
+        println!("  skip (unchanged): {}", path.display());
+        return;
+    }
+
     let mut cleaned = remove_toml_sections(&content, "mcp_servers.obscura");
     if !cleaned.ends_with('\n') && !cleaned.is_empty() {
         cleaned.push('\n');
     }
-    cleaned.push_str(&format!(
-        "[mcp_servers.obscura]\ncommand = \"{exe}\"\nargs = [\"serve\"]\nenabled = true\n\n[mcp_servers.obscura.env]\nOBSCURA_BIN = \"obscura\"\n"
-    ));
+    cleaned.push_str(&new_entry);
 
     ensure_parent(path);
     let _ = fs::write(path, &cleaned);
@@ -364,9 +368,18 @@ pub fn transform_agent(content: &str, tool: &str) -> String {
                 .replace("  - Grep", "  - grep_search")
                 .replace("  - Glob", "  - glob")
         }
-        "codex" => format!(
-            "{content}\n## Codex Sub-agent\n\nThis agent can be invoked as a Codex sub-agent for parallel execution.\n"
-        ),
+        "codex" => {
+            // Extract frontmatter description for the yaml interface
+            let desc = content
+                .lines()
+                .find(|l| l.starts_with("description:"))
+                .and_then(|l| l.strip_prefix("description:"))
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| "Obscura browser agent".to_string());
+            format!(
+                "interface:\n  display_name: \"Obscura Browser\"\n  short_description: \"{desc}\"\n  default_prompt: \"Use $obscura-browser for read-only Obscura-based web fetch, extraction, and scrape workflows.\"\n"
+            )
+        }
         "opencode" => {
             let re = regex::Regex::new(r"(?m)^(\s*-\s+)(\w+)$").unwrap();
             let result = re.replace_all(content, "  $2: true");
@@ -419,12 +432,12 @@ pub fn install_tool(tool_id: &str, components: Option<&[String]>) {
                 combined.push_str(&format!("## {name}\n\n{transformed}\n\n---\n\n"));
             }
             let dest = (cfg.skills_dir)("");
-            write_or_sync(&dest, &combined);
+            upsert_file(&dest, &combined);
         } else {
             for (name, content) in CANONICAL_SKILLS {
                 let transformed = transform_skill(content, tool_id);
                 let dest = (cfg.skills_dir)(name);
-                write_or_sync(&dest, &transformed);
+                upsert_file(&dest, &transformed);
             }
         }
     }
@@ -434,7 +447,13 @@ pub fn install_tool(tool_id: &str, components: Option<&[String]>) {
         for (name, content) in CANONICAL_AGENTS {
             let transformed = transform_agent(content, tool_id);
             let dest = (cfg.agents_dir)(name);
-            write_or_sync(&dest, &transformed);
+            upsert_file(&dest, &transformed);
+            // For tools that nest agents inside skill dirs (e.g. Codex),
+            // also seed the agent SKILL.md alongside the yaml.
+            if tool_id == "codex" {
+                let skill_dest = home().join(format!(".codex/skills/{name}/SKILL.md"));
+                upsert_file(&skill_dest, content);
+            }
         }
     }
 
