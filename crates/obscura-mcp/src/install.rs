@@ -98,23 +98,28 @@ fn tool_config(id: &str) -> Option<ToolConfig> {
         }),
         "opencode" => Some(ToolConfig {
             name: "OpenCode",
-            skills_dir: Box::new(|_| PathBuf::new()),
+            skills_dir: Box::new(|s| home().join(format!(".opencode/skills/{s}/SKILL.md"))),
             agents_dir: Box::new(|a| home().join(format!(".config/opencode/agents/{a}.md"))),
             mcp_file: home().join(".config/opencode/opencode.json"),
             mcp_key: "mcp",
             mcp_format: "opencode",
-            supports_skills: false,
+            supports_skills: true,
             supports_agents: true,
             supports_mcp: true,
         }),
         "cline" => Some(ToolConfig {
             name: "Cline",
-            skills_dir: Box::new(|_| PathBuf::new()),
+            skills_dir: Box::new(|s| home().join(format!(".cline/skills/{s}/SKILL.md"))),
             agents_dir: Box::new(|_| PathBuf::new()),
-            mcp_file: home().join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
+            mcp_file: {
+                #[cfg(target_os = "macos")]
+                { home().join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json") }
+                #[cfg(not(target_os = "macos"))]
+                { home().join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json") }
+            },
             mcp_key: "mcpServers",
             mcp_format: "standard",
-            supports_skills: false,
+            supports_skills: true,
             supports_agents: false,
             supports_mcp: true,
         }),
