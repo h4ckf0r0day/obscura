@@ -5,14 +5,10 @@ use serde_json::{json, Value};
 
 // ── Canonical sources ─────────────────────────────────────────────────────
 
-static SKILL_FETCH: &str = include_str!("../../../registry/skills/obscura-fetch.md");
-static SKILL_SCRAPE: &str = include_str!("../../../registry/skills/obscura-scrape.md");
-static SKILL_PIPELINE: &str = include_str!("../../../registry/skills/obscura-pipeline.md");
+static SKILL_FETCH: &str = include_str!("../../../registry/skills/obscura-fetch/SKILL.md");
+static SKILL_SCRAPE: &str = include_str!("../../../registry/skills/obscura-scrape/SKILL.md");
+static SKILL_PIPELINE: &str = include_str!("../../../registry/skills/obscura-pipeline/SKILL.md");
 static AGENT_BROWSER: &str = include_str!("../../../registry/agents/obscura-browser.md");
-
-/// Single unified skill deployed via the Claude Code plugin mechanism.
-/// Installed to ~/.claude/skills/obscura/SKILL.md
-static PLUGIN_SKILL: &str = include_str!("../../../registry/skill/SKILL.md");
 
 static CANONICAL_SKILLS: &[(&str, &str)] = &[
     ("obscura-fetch", SKILL_FETCH),
@@ -58,7 +54,7 @@ fn tool_config(id: &str) -> Option<ToolConfig> {
     match id {
         "claude" => Some(ToolConfig {
             name: "Claude Code",
-            skills_dir: Box::new(|s| home().join(format!(".claude/commands/{s}.md"))),
+            skills_dir: Box::new(|s| home().join(format!(".claude/skills/{s}/SKILL.md"))),
             agents_dir: Box::new(|a| home().join(format!(".claude/agents/{a}.md"))),
             mcp_file: home().join(".claude.json"),
             mcp_key: "mcpServers",
@@ -384,13 +380,6 @@ pub fn install_tool(tool_id: &str, components: Option<&[String]>) {
         inject_mcp(&cfg);
     }
 
-    // Claude Code plugin skill: deploy unified SKILL.md to ~/.claude/skills/obscura/
-    if tool_id == "claude" && (components.is_none() || components.unwrap().iter().any(|c| c == "skills")) {
-        println!("\n[Plugin Skill]");
-        let dest = home().join(".claude/skills/obscura/SKILL.md");
-        write_or_sync(&dest, PLUGIN_SKILL);
-    }
-
     if want_skills && cfg.supports_skills {
         println!("\n[Skills]");
         if tool_id == "cursor" {
@@ -438,20 +427,6 @@ pub fn uninstall_tool(tool_id: &str) {
     if cfg.supports_mcp {
         println!("[MCP Server]");
         remove_mcp(&cfg);
-    }
-
-    // Claude Code plugin skill
-    if tool_id == "claude" {
-        println!("\n[Plugin Skill]");
-        let dest = home().join(".claude/skills/obscura/SKILL.md");
-        if dest.exists() {
-            let _ = fs::remove_file(&dest);
-            println!("  removed: {}", dest.display());
-            // remove dir if empty
-            if let Some(parent) = dest.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-        }
     }
 
     if cfg.supports_skills {
