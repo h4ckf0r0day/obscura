@@ -269,6 +269,78 @@ Scrape multiple URLs in parallel with worker processes.
 | `--format` | `json` | Output: `json` or `text` |
 | `--quiet` | off | Suppress scrape progress on stderr |
 
+## AI Agent Integration
+
+Obscura ships an MCP server (`obscura-mcp`) that connects it to AI coding agents — Claude Code, Cursor, Gemini CLI, Codex CLI, OpenCode, and Cline.
+
+### Install
+
+```bash
+cargo install obscura-mcp
+```
+
+Or grab the binary from [Releases](https://github.com/h4ckf0r0day/obscura/releases).
+
+### Register with your AI tools
+
+```bash
+# Interactive — pick which tools to install to
+obscura-mcp install
+
+# One specific tool
+obscura-mcp install claude
+obscura-mcp install cursor
+
+# All supported tools at once
+obscura-mcp install all
+
+# Remove
+obscura-mcp uninstall claude
+```
+
+This injects the MCP server entry into each tool's config and seeds skills and agents into their respective directories.
+
+### What gets installed
+
+| Tool | MCP | Skills | Agent |
+|------|:---:|:------:|:-----:|
+| Claude Code | ✅ | ✅ `~/.claude/skills/` | ✅ `~/.claude/agents/` |
+| Cursor | ✅ | ✅ `~/.cursor/rules/` | ✅ `~/.cursor/agents/` |
+| Gemini CLI | ✅ | ✅ `~/.gemini/skills/` | ✅ `~/.gemini/agents/` |
+| Codex CLI | ✅ | ✅ `~/.codex/skills/` | ✅ `~/.codex/agents/` |
+| OpenCode | ✅ | ✅ `~/.opencode/skills/` | ✅ `~/.config/opencode/agents/` |
+| Cline | ✅ | ✅ `~/.cline/skills/` | — |
+
+### MCP tools exposed
+
+| Tool | Description |
+|------|-------------|
+| `obscura_fetch` | Fetch a URL, return HTML / text / links |
+| `obscura_scrape` | Parallel scrape multiple URLs |
+| `obscura_serve` | Start CDP server (Puppeteer / Playwright) |
+| `obscura_screenshot` | Fetch + evaluate a JS expression |
+| `obscura_extract_markdown` | URL → clean markdown |
+
+### Skills installed
+
+Once registered, trigger these slash commands inside your agent:
+
+```
+/obscura-fetch <url> [--dump text|html|links] [--eval <js>] [--stealth]
+/obscura-scrape <url1> <url2> ... [--concurrency <N>] [--format json|text]
+/obscura-pipeline <index-url>   # discover → scrape multi-step workflow
+```
+
+### Claude Code plugin
+
+Install the plugin directly from the Claude Code marketplace:
+
+```
+@h4ckf0r0day/obscura
+```
+
+The plugin auto-installs `obscura` and `obscura-mcp` on session start and registers the MCP server automatically — no manual setup needed.
+
 ## License
 
 Apache 2.0
