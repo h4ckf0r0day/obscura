@@ -271,34 +271,65 @@ Scrape multiple URLs in parallel with worker processes.
 
 ## AI Agent Integration
 
-Obscura ships an MCP server (`obscura-mcp`) that connects it to AI coding agents — Claude Code, Cursor, Gemini CLI, Codex CLI, OpenCode, and Cline.
+Obscura ships `obscura-mcp` — an MCP server that gives AI coding agents direct access to the headless browser. Install once, use from any supported tool.
 
-### Install
+### Claude Code (recommended)
 
-```bash
-cargo install obscura-mcp
+```
+/plugin marketplace add h4ckf0r0day/plugins
+/plugin install obscura@h4ckf0r0day
 ```
 
-Or grab the binary from [Releases](https://github.com/h4ckf0r0day/obscura/releases).
+Auto-installs `obscura` and `obscura-mcp`, registers the MCP server, and seeds skills and the browser agent — all in one step. On subsequent sessions, the plugin checks for updates automatically.
+
+### macOS / Linux
+
+```bash
+# Install the MCP server binary
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-mcp-installer.sh | sh
+```
+
+Or via Cargo:
+
+```bash
+cargo binstall obscura-mcp   # pre-built binary (fast)
+cargo install obscura-mcp    # build from source
+```
+
+### Windows
+
+```powershell
+irm https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-mcp-installer.ps1 | iex
+```
 
 ### Register with your AI tools
 
+After installing the binary, run `obscura-mcp install` to connect it to your tools:
+
 ```bash
-# Interactive — pick which tools to install to
-obscura-mcp install
-
-# One specific tool
-obscura-mcp install claude
-obscura-mcp install cursor
-
-# All supported tools at once
-obscura-mcp install all
-
-# Remove
-obscura-mcp uninstall claude
+obscura-mcp install              # interactive — pick which tools
+obscura-mcp install claude       # Claude Code
+obscura-mcp install cursor       # Cursor
+obscura-mcp install gemini       # Gemini CLI
+obscura-mcp install codex        # Codex CLI
+obscura-mcp install opencode     # OpenCode
+obscura-mcp install cline        # Cline
+obscura-mcp install all          # all at once
 ```
 
 This injects the MCP server entry into each tool's config and seeds skills and agents into their respective directories.
+
+```bash
+obscura-mcp uninstall claude     # remove from a specific tool
+obscura-mcp list                 # show supported tools and status
+```
+
+### `obscura-mcp install` — what it does
+
+1. Injects the MCP server entry into the tool's config file
+2. Seeds skills into the tool's skill directory
+3. Seeds the `obscura-browser` agent into the tool's agent directory
 
 ### What gets installed
 
@@ -311,35 +342,42 @@ This injects the MCP server entry into each tool's config and seeds skills and a
 | OpenCode | ✅ | ✅ `~/.opencode/skills/` | ✅ `~/.config/opencode/agents/` |
 | Cline | ✅ | ✅ `~/.cline/skills/` | — |
 
-### MCP tools exposed
+### MCP tools
 
 | Tool | Description |
 |------|-------------|
-| `obscura_fetch` | Fetch a URL, return HTML / text / links |
-| `obscura_scrape` | Parallel scrape multiple URLs |
-| `obscura_serve` | Start CDP server (Puppeteer / Playwright) |
-| `obscura_screenshot` | Fetch + evaluate a JS expression |
-| `obscura_extract_markdown` | URL → clean markdown |
+| `obscura_fetch` | Fetch a URL — returns HTML, text, links, or JS eval result |
+| `obscura_scrape` | Parallel scrape multiple URLs with configurable concurrency |
+| `obscura_serve` | Start a CDP server for Puppeteer / Playwright |
+| `obscura_screenshot` | Fetch a page and evaluate a JS expression |
+| `obscura_extract_markdown` | Convert a URL to clean markdown |
 
-### Skills installed
+### Skills
 
-Once registered, trigger these slash commands inside your agent:
+Registered skills are available as slash commands inside your agent:
 
 ```
 /obscura-fetch <url> [--dump text|html|links] [--eval <js>] [--stealth]
-/obscura-scrape <url1> <url2> ... [--concurrency <N>] [--format json|text]
-/obscura-pipeline <index-url>   # discover → scrape multi-step workflow
+/obscura-scrape <url1> <url2> ... [--concurrency <N>] [--format json]
+/obscura-pipeline <index-url>   # discover links → scrape in one pipeline
 ```
 
-### Claude Code plugin
+### The `obscura-browser` agent
 
-Install the plugin directly from the Claude Code marketplace:
+The `obscura-browser` agent is a self-directed web data collection specialist. Invoke it for tasks like:
 
+> "Collect all product titles and prices from these 30 URLs"  
+> "Fetch the docs at example.com/api and summarize the endpoints"  
+> "Scrape the HN front page and return structured JSON"
+
+The agent knows Obscura's limits — it stops and escalates to Playwright when login or interaction is required.
+
+### Verify
+
+```bash
+obscura-mcp --version        # binary installed
+obscura-mcp list             # registered tools
 ```
-@h4ckf0r0day/obscura
-```
-
-The plugin auto-installs `obscura` and `obscura-mcp` on session start and registers the MCP server automatically — no manual setup needed.
 
 ## License
 
