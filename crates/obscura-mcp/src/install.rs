@@ -172,10 +172,10 @@ fn write_json(path: &PathBuf, data: &Value) {
 
 // ── MCP injection ────────────────────────────────────────────────────────
 
-fn current_exe_name() -> String {
+fn current_exe_path() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "obscura-mcp".into())
 }
 
@@ -184,7 +184,7 @@ fn inject_mcp(cfg: &ToolConfig) {
         return;
     }
 
-    let exe = current_exe_name();
+    let exe = current_exe_path();
 
     if cfg.mcp_format == "toml" {
         inject_mcp_toml(&cfg.mcp_file, &exe);
@@ -443,6 +443,10 @@ pub fn uninstall_tool(tool_id: &str) {
                 if dest.exists() {
                     let _ = fs::remove_file(&dest);
                     println!("  removed: {}", dest.display());
+                    // remove parent dir if empty (e.g. ~/.claude/skills/obscura-fetch/)
+                    if let Some(parent) = dest.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
                 }
             }
         }
