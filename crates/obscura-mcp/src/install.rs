@@ -193,12 +193,33 @@ fn current_exe_path() -> String {
         .unwrap_or_else(|| "obscura-mcp".into())
 }
 
+/// Resolve the obscura binary path.
+/// Priority: OBSCURA_BIN env → sibling of this exe → "obscura" (PATH fallback).
+fn obscura_bin_path() -> String {
+    if let Ok(v) = std::env::var("OBSCURA_BIN") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    // Look for `obscura` next to the running `obscura-mcp` binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("obscura");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "obscura".into()
+}
+
 fn inject_mcp(cfg: &ToolConfig) {
     if !cfg.supports_mcp || cfg.mcp_file.as_os_str().is_empty() {
         return;
     }
 
     let exe = current_exe_path();
+    let obscura = obscura_bin_path();
 
     if cfg.mcp_format == "toml" {
         inject_mcp_toml(&cfg.mcp_file, &exe);
@@ -214,13 +235,13 @@ fn inject_mcp(cfg: &ToolConfig) {
         json!({
             "type": "local",
             "command": [exe, "serve"],
-            "environment": { "OBSCURA_BIN": "obscura" }
+            "environment": { "OBSCURA_BIN": obscura }
         })
     } else {
         json!({
             "command": exe,
             "args": ["serve"],
-            "env": { "OBSCURA_BIN": "obscura" }
+            "env": { "OBSCURA_BIN": obscura }
         })
     };
 
@@ -301,8 +322,9 @@ fn inject_mcp_toml(path: &PathBuf, exe: &str) {
         String::new()
     };
 
+    let obscura = obscura_bin_path();
     let new_entry = format!(
-        "[mcp_servers.obscura]\ncommand = \"{exe}\"\nargs = [\"serve\"]\nenabled = true\n\n[mcp_servers.obscura.env]\nOBSCURA_BIN = \"obscura\"\n"
+        "[mcp_servers.obscura]\ncommand = \"{exe}\"\nargs = [\"serve\"]\nenabled = true\n\n[mcp_servers.obscura.env]\nOBSCURA_BIN = \"{obscura}\"\n"
     );
 
     // upsert: skip if identical entry already exists
