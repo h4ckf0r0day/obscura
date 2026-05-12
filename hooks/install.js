@@ -11,8 +11,8 @@ const { join } = require("path");
 const https = require("https");
 const os = require("os");
 
-const REPO = "epicsagas/obscura-mcp";
-const OBSCURA_REPO = "epicsagas/obscura";
+const REPO = "h4ckf0r0day/obscura-mcp";
+const OBSCURA_REPO = "h4ckf0r0day/obscura";
 const MCP_BINARY = "obscura-mcp";
 const OBSCURA_BINARY = "obscura";
 const INSTALLER_SH = `https://github.com/${REPO}/releases/latest/download/obscura-mcp-installer.sh`;

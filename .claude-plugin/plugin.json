@@ -3,11 +3,11 @@
   "version": "0.1.0",
   "description": "Headless browser MCP server for AI agents — fetch, scrape, extract markdown, and CDP automation.",
   "author": {
-    "name": "epicsagas",
-    "url": "https://github.com/epicsagas"
+    "name": "h4ckf0r0day",
+    "url": "https://github.com/h4ckf0r0day"
   },
   "homepage": "https://epiccounty.com",
-  "repository": "https://github.com/epicsagas/obscura",
+  "repository": "https://github.com/h4ckf0r0day/obscura",
   "license": "Apache-2.0",
   "keywords": [
     "headless-browser",

@@ -1,9 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "name": "epicsagas",
+  "name": "h4ckf0r0day",
   "owner": {
-    "name": "epicsagas",
-    "url": "https://github.com/epicsagas"
+    "name": "h4ckf0r0day",
+    "url": "https://github.com/h4ckf0r0day"
   },
   "metadata": {
     "description": "Headless browser MCP server for AI agents — fetch, scrape, extract markdown, and CDP automation."
