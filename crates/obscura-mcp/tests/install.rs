@@ -90,11 +90,12 @@ fn agent_no_transform_for_claude() {
 }
 
 #[test]
-fn agent_no_transform_for_gemini() {
-    assert_eq!(
-        install::transform_agent(SAMPLE_AGENT, "gemini"),
-        SAMPLE_AGENT
-    );
+fn agent_gemini_remaps_tools() {
+    let result = install::transform_agent(SAMPLE_AGENT, "gemini");
+    assert!(result.contains("run_shell_command"));
+    assert!(result.contains("read_file"));
+    assert!(!result.contains("  - Bash"));
+    assert!(!result.contains("  - Read"));
 }
 
 #[test]

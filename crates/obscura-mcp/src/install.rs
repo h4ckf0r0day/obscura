@@ -164,10 +164,19 @@ fn read_json(path: &PathBuf) -> Value {
 
 fn write_json(path: &PathBuf, data: &Value) {
     ensure_parent(path);
-    let _ = fs::write(
-        path,
-        format!("{}\n", serde_json::to_string_pretty(data).unwrap()),
-    );
+    let content = format!("{}\n", serde_json::to_string_pretty(data).unwrap());
+    // Atomic write: tmp → rename to avoid partial-write corruption
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    if fs::write(&tmp, &content).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    } else {
+        // fallback: direct write
+        let _ = fs::write(path, &content);
+    }
 }
 
 // ── MCP injection ────────────────────────────────────────────────────────
@@ -335,6 +344,16 @@ pub fn transform_agent(content: &str, tool: &str) -> String {
             } else {
                 content.replacen("---\n", "---\nmodel: inherit\n", 1)
             }
+        }
+        "gemini" => {
+            // Gemini CLI uses different tool names
+            content
+                .replace("  - Bash", "  - run_shell_command")
+                .replace("  - Read", "  - read_file")
+                .replace("  - Write", "  - write_file")
+                .replace("  - Edit", "  - replace_in_file")
+                .replace("  - Grep", "  - grep_search")
+                .replace("  - Glob", "  - glob")
         }
         "codex" => format!(
             "{content}\n## Codex Sub-agent\n\nThis agent can be invoked as a Codex sub-agent for parallel execution.\n"
