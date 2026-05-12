@@ -258,7 +258,10 @@ fn inject_mcp(cfg: &ToolConfig) {
         .unwrap()
         .entry(key)
         .or_insert_with(|| json!({}));
-    servers.as_object_mut().unwrap().insert("obscura".into(), new_entry);
+    servers
+        .as_object_mut()
+        .unwrap()
+        .insert("obscura".into(), new_entry);
 
     write_json(&cfg.mcp_file, &data);
     println!("  mcp injected: {}", cfg.mcp_file.display());
@@ -328,7 +331,8 @@ fn inject_mcp_toml(path: &PathBuf, exe: &str) {
     );
 
     // upsert: skip if identical entry already exists
-    if content.contains("mcp_servers.obscura") && content.contains(&format!("command = \"{exe}\"")) {
+    if content.contains("mcp_servers.obscura") && content.contains(&format!("command = \"{exe}\""))
+    {
         println!("  skip (unchanged): {}", path.display());
         return;
     }
@@ -391,7 +395,13 @@ pub fn transform_agent(content: &str, tool: &str) -> String {
                 .replace("  - Glob", "  - glob")
         }
         "codex" => {
-            // Extract frontmatter description for the yaml interface
+            // Extract frontmatter fields for openai.yaml (Codex Agent Skills spec)
+            let name = content
+                .lines()
+                .find(|l| l.starts_with("name:"))
+                .and_then(|l| l.strip_prefix("name:"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "obscura-browser".to_string());
             let desc = content
                 .lines()
                 .find(|l| l.starts_with("description:"))
@@ -399,7 +409,7 @@ pub fn transform_agent(content: &str, tool: &str) -> String {
                 .map(|s| s.trim().trim_matches('"').to_string())
                 .unwrap_or_else(|| "Obscura browser agent".to_string());
             format!(
-                "interface:\n  display_name: \"Obscura Browser\"\n  short_description: \"{desc}\"\n  default_prompt: \"Use $obscura-browser for read-only Obscura-based web fetch, extraction, and scrape workflows.\"\n"
+                "name: {name}\ndisplay_name: \"Obscura Browser\"\ndescription: \"{desc}\"\nversion: \"0.1.0\"\ntags:\n  - web-scraping\n  - headless-browser\n  - ai-agent\n\n## Codex Sub-agent\n\nThis agent can be invoked as a Codex sub-agent.\n"
             )
         }
         "opencode" => {
