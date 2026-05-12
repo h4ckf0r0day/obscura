@@ -266,6 +266,7 @@ fn scrape_has_required_urls() {
 // ── Integration: full stdio round-trip ─────────────────────────────────────
 
 #[test]
+#[ignore = "requires `cargo build --release` first; run with --ignored"]
 fn stdio_roundtrip() {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};

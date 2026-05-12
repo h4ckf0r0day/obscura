@@ -113,9 +113,13 @@ fn tool_config(id: &str) -> Option<ToolConfig> {
             agents_dir: Box::new(|_| PathBuf::new()),
             mcp_file: {
                 #[cfg(target_os = "macos")]
-                { home().join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json") }
+                {
+                    home().join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json")
+                }
                 #[cfg(not(target_os = "macos"))]
-                { home().join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json") }
+                {
+                    home().join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json")
+                }
             },
             mcp_key: "mcpServers",
             mcp_format: "standard",
