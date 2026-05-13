@@ -128,12 +128,16 @@ enum Command {
 }
 
 
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
     Html,
     Text,
     Links,
     Markdown,
+    /// Stream the raw HTTP response body verbatim (binary-safe).
+    /// Bypasses the browser/JS layer — useful for fetching images,
+    /// JSON, JS, CSS, or any non-HTML resource (cf. issue #117).
+    Original,
 }
 
 fn print_banner(port: u16) {
@@ -379,6 +383,22 @@ async fn run_fetch(
     quiet: bool,
     proxy: Option<String>,
 ) -> anyhow::Result<()> {
+    // --dump original short-circuits the browser stack entirely: fetch the raw
+    // response body via HTTP and stream the bytes verbatim. Useful for binary
+    // payloads (images, fonts, …) and any non-HTML resource where parsing the
+    // body through the DOM/JS layer would corrupt or discard data.
+    if dump == DumpFormat::Original {
+        let bytes = fetch_original_bytes(
+            url_str,
+            proxy,
+            user_agent.clone(),
+            timeout_secs,
+        )
+        .await?;
+        write_or_print_bytes(&bytes, output.as_ref()).await?;
+        return Ok(());
+    }
+
     let context = Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth));
     let mut page = Page::new("fetch-page".to_string(), context);
 
@@ -428,10 +448,38 @@ async fn run_fetch(
         DumpFormat::Text => dump_text(&mut page),
         DumpFormat::Links => dump_links(&page),
         DumpFormat::Markdown => dump_markdown(&mut page),
+        // Handled above via the short-circuit branch; unreachable here.
+        DumpFormat::Original => unreachable!("Original dump handled before page navigation"),
     };
     write_or_print(rendered, output.as_ref()).await?;
 
     Ok(())
+}
+
+async fn fetch_original_bytes(
+    url_str: &str,
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    timeout_secs: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let url = url::Url::parse(url_str)
+        .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
+
+    let client = obscura_net::ObscuraHttpClient::with_options(
+        Arc::new(obscura_net::CookieJar::new()),
+        proxy.as_deref(),
+    );
+    if let Some(ua) = user_agent {
+        client.set_user_agent(&ua).await;
+    }
+
+    let response = match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+    };
+
+    Ok(response.body)
 }
 
 async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
@@ -441,6 +489,30 @@ async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) ->
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
     } else {
         println!("{}", content);
+    }
+    Ok(())
+}
+
+async fn write_or_print_bytes(
+    bytes: &[u8],
+    output: Option<&std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if let Some(path) = output {
+        tokio::fs::write(path, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    } else {
+        // Write raw bytes to stdout — never println! (would append a newline
+        // and break binary payloads like JPEG/PNG).
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write to stdout: {}", e))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {}", e))?;
     }
     Ok(())
 }
@@ -824,11 +896,94 @@ fn dump_links(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_readable_text, is_quiet_command, merge_proxy, select_log_filter, write_or_print,
-        Args, Command,
+        extract_readable_text, fetch_original_bytes, is_quiet_command, merge_proxy,
+        select_log_filter, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    // Issue #117 — `--dump original` short-circuits the browser stack and
+    // streams the raw response body verbatim, including for binary payloads.
+    //
+    // Two tests below pin the behaviour:
+    //   1. clap accepts `--dump original` as a valid DumpFormat variant.
+    //   2. `fetch_original_bytes` returns the exact bytes a `file://` URL
+    //      points at (binary-safe round-trip — no UTF-8 decode, no trailing
+    //      newline, no DOM mutation).
+    //   3. `write_or_print_bytes` writes raw bytes to a file without the
+    //      trailing newline that `println!` would add.
+    #[test]
+    fn parsed_fetch_dump_original_is_accepted_by_clap() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--dump",
+            "original",
+            "https://example.com/image.jpg",
+        ])
+        .expect("clap should accept --dump original");
+        match args.command {
+            Some(Command::Fetch { dump, .. }) => {
+                assert_eq!(dump, DumpFormat::Original);
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_original_bytes_returns_file_contents_verbatim() {
+        // A real binary payload: a 1×1 transparent PNG (89 50 4E 47 …) —
+        // exactly the kind of resource #117 wants to stream without HTML/
+        // JS rendering.
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-original-test-{}.png",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        tokio::fs::write(&path, PNG_BYTES)
+            .await
+            .expect("seed temp PNG fixture");
+
+        let file_url = format!("file://{}", path.display());
+        let bytes = fetch_original_bytes(&file_url, None, None, 5)
+            .await
+            .expect("fetch_original_bytes should round-trip the file body");
+
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(bytes, PNG_BYTES, "raw response body must match the file byte-for-byte");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_or_print_bytes_writes_without_trailing_newline() {
+        // Regression guard for #117: stdout must receive raw bytes. The file
+        // path used here exercises the file-output branch — println!-style
+        // output (used by write_or_print) would append a 0x0A byte and
+        // corrupt binary payloads. write_or_print_bytes must not.
+        let payload: &[u8] = &[0x00, 0xFF, b'h', b'i', 0x00];
+        let path = std::env::temp_dir().join(format!(
+            "obscura-write-bytes-test-{}.bin",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        write_or_print_bytes(payload, Some(&path))
+            .await
+            .expect("write_or_print_bytes should write the file");
+
+        let read_back = tokio::fs::read(&path).await.expect("read back");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(read_back, payload, "file bytes must match the payload exactly");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn write_or_print_writes_output_file_with_tokio_fs() {

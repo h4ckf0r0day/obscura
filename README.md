@@ -99,6 +99,10 @@ obscura fetch https://news.ycombinator.com --dump html
 # Write dump or eval output to a file
 obscura fetch https://example.com --dump text --output page.txt
 
+# Stream the raw response body verbatim (binary-safe; bypasses the JS/DOM layer).
+# Use this for images, JSON, JS, CSS, or any non-HTML resource.
+obscura fetch https://picsum.photos/200/300 --dump original > photo.jpg
+
 # Fetch through an HTTP or SOCKS proxy
 obscura --proxy socks5://127.0.0.1:1080 fetch https://example.com --dump text
 
@@ -255,7 +259,7 @@ Fetch and render a single page.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dump` | `html` | Output: `html`, `text`, or `links` |
+| `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, or `original` (raw response body) |
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
 | `--timeout` | `30` | Maximum navigation time in seconds |
