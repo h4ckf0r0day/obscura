@@ -245,6 +245,14 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
 ## CLI Reference
 
+### Tuning V8
+
+Obscura embeds V8 directly. Use `--v8-flags` to pass raw flags through to V8 — same syntax as Chromium's `--js-flags` and Node's command-line flags. Most common use is raising the heap cap to fix `JavaScript heap out of memory` on JS-heavy pages:
+
+```bash
+obscura --v8-flags "--max-old-space-size=4096" fetch <url>
+```
+
 ### `obscura serve`
 
 Start a CDP WebSocket server.
