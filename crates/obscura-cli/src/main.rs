@@ -109,6 +109,7 @@ enum DumpFormat {
     Html,
     Text,
     Links,
+    Assets,
 }
 
 fn print_banner(port: u16) {
@@ -384,6 +385,7 @@ async fn run_fetch(
         DumpFormat::Html => dump_html(&page),
         DumpFormat::Text => dump_text(&mut page),
         DumpFormat::Links => dump_links(&page),
+        DumpFormat::Assets => dump_assets(&page),
     };
     write_or_print(rendered, output.as_ref()).await?;
 
@@ -736,6 +738,30 @@ async fn run_parallel_scrape(
     Ok(())
 }
 
+fn dump_assets(page: &Page) -> String {
+    render_assets_json(&page.network_events)
+}
+
+fn render_assets_json(events: &[obscura_browser::NetworkEvent]) -> String {
+    let items: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "request_id": e.request_id,
+                "url": e.url,
+                "method": e.method,
+                "resource_type": e.resource_type,
+                "status": e.status,
+                "request_headers": e.headers,
+                "response_headers": &*e.response_headers,
+                "body_size": e.body_size,
+                "timestamp": e.timestamp,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn dump_links(page: &Page) -> String {
     let base_url = page.url.clone();
     page.with_dom(|dom| {
@@ -886,6 +912,78 @@ mod tests {
             .flatten()
             .expect("body must exist");
         extract_readable_text(&dom, body).split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn parsed_fetch_with_dump_assets_is_accepted() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--dump",
+            "assets",
+            "https://example.com",
+        ])
+        .expect("clap should accept --dump assets on fetch");
+        match args.command {
+            Some(Command::Fetch { dump, .. }) => {
+                assert!(matches!(dump, super::DumpFormat::Assets));
+            }
+            other => panic!("expected Fetch command, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn render_assets_json_serializes_events_for_replay() {
+        use obscura_browser::NetworkEvent;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut req_headers = HashMap::new();
+        req_headers.insert("user-agent".to_string(), "obscura/test".to_string());
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "image/jpeg".to_string());
+        resp_headers.insert("content-length".to_string(), "1024".to_string());
+
+        let events = vec![NetworkEvent {
+            request_id: "req-1".to_string(),
+            url: "https://example.com/photo.jpg".to_string(),
+            method: "GET".to_string(),
+            resource_type: "Image".to_string(),
+            status: 200,
+            headers: req_headers,
+            response_headers: Arc::new(resp_headers),
+            body_size: 1024,
+            timestamp: 1.5,
+        }];
+
+        let rendered = super::render_assets_json(&events);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("output must parse as JSON");
+
+        let arr = parsed.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 1);
+
+        let entry = &arr[0];
+        assert_eq!(entry["request_id"], "req-1");
+        assert_eq!(entry["url"], "https://example.com/photo.jpg");
+        assert_eq!(entry["method"], "GET");
+        assert_eq!(entry["resource_type"], "Image");
+        assert_eq!(entry["status"], 200);
+        assert_eq!(entry["body_size"], 1024);
+        // Both request and response header maps must be present so consumers
+        // can replay each fetch with the original headers Obscura sent.
+        assert_eq!(entry["request_headers"]["user-agent"], "obscura/test");
+        assert_eq!(entry["response_headers"]["content-type"], "image/jpeg");
+        assert_eq!(entry["response_headers"]["content-length"], "1024");
+    }
+
+    #[test]
+    fn render_assets_json_returns_empty_array_when_no_events() {
+        let rendered = super::render_assets_json(&[]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("output must parse as JSON");
+        assert_eq!(parsed, serde_json::json!([]));
     }
 
     #[test]
