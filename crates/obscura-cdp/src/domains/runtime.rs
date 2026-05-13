@@ -42,6 +42,15 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            // Spec-compliant contextId handling (#51): when the client
+            // targets a specific execution context, reject the call if that
+            // context has not been advertised via Runtime.executionContextCreated
+            // (or Page.createIsolatedWorld). Obscura routes every evaluate
+            // against the page's single V8 isolate, so accepting a foreign
+            // id silently would mis-attribute UtilityScript state and break
+            // Playwright's locator path.
+            validate_context_id(params, "contextId", ctx, "evaluate")?;
+
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
@@ -68,6 +77,13 @@ pub async fn handle(
                 .and_then(|v| v.as_array())
                 .map(|a| a.to_vec())
                 .unwrap_or_default();
+
+            // #51: validate executionContextId the same way Runtime.evaluate
+            // does. CDP names this field `executionContextId` on
+            // callFunctionOn (not `contextId`); a request may omit it when
+            // `objectId` is supplied — in that case validate_context_id is a
+            // no-op and the default context is used.
+            validate_context_id(params, "executionContextId", ctx, "callFunctionOn")?;
 
             let page = ctx
                 .get_session_page_mut(session_id)
@@ -186,6 +202,35 @@ pub async fn handle(
     }
 }
 
+/// Reject `Runtime.{evaluate,callFunctionOn}` calls that target an execution
+/// context Obscura has not advertised. Returns `Ok(())` when the parameter is
+/// absent (defaulting to the page's default context) or when the id matches
+/// one of `ctx.valid_context_ids`. Logs a debug trace on accept for #51.
+fn validate_context_id(
+    params: &Value,
+    field: &str,
+    ctx: &crate::dispatch::CdpContext,
+    method: &str,
+) -> Result<(), String> {
+    let Some(id) = params.get(field).and_then(|v| v.as_i64()) else {
+        return Ok(());
+    };
+    if !ctx.valid_context_ids.contains(&id) {
+        return Err(format!(
+            "Cannot find context with specified id: {}",
+            id
+        ));
+    }
+    tracing::debug!(
+        target: "obscura_cdp::runtime",
+        "Runtime.{}: {}={} (single-isolate routing)",
+        method,
+        field,
+        id
+    );
+    Ok(())
+}
+
 fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
     let mut obj = json!({ "type": info.js_type });
 
@@ -210,4 +255,107 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
     }
 
     obj
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::CdpContext;
+
+    // Issue #51 — Runtime.evaluate / callFunctionOn must read and validate
+    // contextId. Pre-fix the parameter was silently dropped, so Playwright's
+    // locator (which targets the utility world created by
+    // Page.createIsolatedWorld) ran in the wrong context and timed out.
+    //
+    // Phase 5.5 (RED-then-GREEN) verification:
+    //   - Without the prod fix, `valid_context_ids` does not exist on
+    //     CdpContext → these tests fail to compile.
+    //   - With the prod fix, all four tests pass.
+
+    #[tokio::test]
+    async fn evaluate_rejects_unknown_context_id() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "evaluate",
+            &json!({ "expression": "1 + 1", "contextId": 9999 }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("unknown contextId must error per CDP spec");
+        assert!(
+            err.contains("Cannot find context with specified id"),
+            "error must match real Chrome's wording: {err}"
+        );
+        assert!(err.contains("9999"), "error must include the bad id: {err}");
+    }
+
+    #[tokio::test]
+    async fn call_function_on_rejects_unknown_execution_context_id() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "callFunctionOn",
+            &json!({
+                "functionDeclaration": "() => 42",
+                "executionContextId": 9999,
+            }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("unknown executionContextId must error per CDP spec");
+        assert!(
+            err.contains("Cannot find context with specified id"),
+            "error must match Chrome wording: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_accepts_default_context_id_one() {
+        // Runtime.enable advertises contextId=1 — that must be accepted as
+        // valid input to evaluate, regardless of whether a page is attached.
+        // (Without a page we get an Err("No page") AFTER the contextId check,
+        // which proves validation passed for id=1.)
+        let mut ctx = CdpContext::new();
+        let result = handle(
+            "evaluate",
+            &json!({ "expression": "1 + 1", "contextId": 1 }),
+            &mut ctx,
+            &None,
+        )
+        .await;
+        match result {
+            Ok(_) => {} // accepted + executed (would happen if a page is attached)
+            Err(e) => assert!(
+                !e.contains("Cannot find context"),
+                "contextId=1 must be accepted, got: {e}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_isolated_world_registers_id_for_evaluate() {
+        // Round-trip: Page.createIsolatedWorld returns contextId N, and a
+        // subsequent Runtime.evaluate targeting that contextId must NOT be
+        // rejected.
+        let mut ctx = CdpContext::new();
+        // Bypass the page-attached path of createIsolatedWorld by direct
+        // insert — mirrors the same effect as calling the page handler with
+        // a real session.
+        ctx.valid_context_ids.insert(100);
+
+        let result = handle(
+            "evaluate",
+            &json!({ "expression": "1 + 1", "contextId": 100 }),
+            &mut ctx,
+            &None,
+        )
+        .await;
+        if let Err(e) = result {
+            assert!(
+                !e.contains("Cannot find context"),
+                "registered isolated-world contextId=100 must be accepted, got: {e}"
+            );
+        }
+    }
 }

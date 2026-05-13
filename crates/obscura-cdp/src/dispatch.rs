@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
@@ -25,6 +25,16 @@ pub struct CdpContext {
     // back. Stored as plain Strings (not by-page) — for now we only model
     // a single page in CdpContext anyway.
     pub isolated_worlds: Vec<String>,
+    // Set of executionContextIds Obscura has emitted via
+    // Runtime.executionContextCreated. Pre-populated with the default-frame
+    // contexts (`1`, `2`) that Runtime.enable / Page.navigate emit, then
+    // extended each time Page.createIsolatedWorld assigns a fresh id.
+    //
+    // Runtime.evaluate / Runtime.callFunctionOn consult this set to reject
+    // requests targeting an unknown context — matching real Chrome's
+    // "Cannot find context with specified id" CDP error and unblocking the
+    // Playwright locator path described in issue #51.
+    pub valid_context_ids: HashSet<i64>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
 }
@@ -53,6 +63,15 @@ impl CdpContext {
             stealth,
             user_agent,
         ));
+        // Pre-seed with the default-frame execution context ids that
+        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
+        // via Runtime.executionContextCreated. Anything else has to be
+        // registered explicitly (Page.createIsolatedWorld), otherwise
+        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
+        let mut valid_context_ids = HashSet::new();
+        valid_context_ids.insert(1);
+        valid_context_ids.insert(2);
+
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
@@ -64,6 +83,7 @@ impl CdpContext {
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             isolated_worlds: Vec::new(),
+            valid_context_ids,
         }
     }
 

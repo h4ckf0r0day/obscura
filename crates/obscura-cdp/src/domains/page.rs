@@ -177,7 +177,7 @@ pub async fn handle(
                 .unwrap_or("").to_string();
             let page_url = page.url_string();
             let page_id = page.id.clone();
-            let context_id = 100;
+            let context_id: i64 = 100;
             // Track this world so Page.navigate can re-emit a context for it
             // post-navigation. Without this, Playwright (and Puppeteer)
             // hang in any operation that uses the utility world — including
@@ -186,6 +186,9 @@ pub async fn handle(
             if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
                 ctx.isolated_worlds.push(world_name.clone());
             }
+            // Register the isolated world's id so Runtime.evaluate /
+            // Runtime.callFunctionOn accept it as a valid contextId (#51).
+            ctx.valid_context_ids.insert(context_id);
 
             ctx.pending_events.push(CdpEvent {
                 method: "Runtime.executionContextCreated".to_string(),
