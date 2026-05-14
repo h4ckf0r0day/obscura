@@ -27,6 +27,45 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Sub-resource fetch policy. A page may only pull a `<script src>` /
+/// `<link rel=stylesheet href>` / etc. when the URL scheme is safe for
+/// the page's origin. http(s) pages cannot reach into file: or data:
+/// to fabricate scripts, and pages with no origin only get http/https.
+fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
+    let Ok(target) = Url::parse(resource) else { return false };
+    let scheme = target.scheme().to_ascii_lowercase();
+    match scheme.as_str() {
+        "http" | "https" => true,
+        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Escape a value for safe inclusion inside a JavaScript template
+/// literal. The previous implementation only escaped `\`, `` ` `` and
+/// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
+/// and other control characters as breakout vectors. Done at the
+/// callsite means future tweaks come back to one function.
+fn escape_for_js_template_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            '\u{0000}' => out.push_str("\\0"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub request_id: String,
@@ -274,6 +313,19 @@ impl Page {
                     src_url.clone()
                 };
 
+                if !subresource_allowed(self.url.as_ref(), &full_url) {
+                    // Block file://, data:, javascript:, and other
+                    // off-origin schemes from being injected as a
+                    // <script src>. Without this an http page can
+                    // include <script src="file:///etc/passwd"> and
+                    // see the body parsed as JS source.
+                    tracing::warn!(
+                        "blocking cross-scheme <script src>: page={} src={}",
+                        self.url_string(),
+                        full_url,
+                    );
+                    continue;
+                }
                 if self.should_block_url(&full_url) {
                     tracing::info!("Blocked script by interception: {}", full_url);
                     continue;
@@ -425,7 +477,8 @@ impl Page {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
-        for _chain in 0..10 {
+        const REDIRECT_LIMIT: usize = 10;
+        for chain in 0..REDIRECT_LIMIT {
             self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
                 if cross_scheme_to_file(&current_url, &next_url) {
@@ -446,6 +499,13 @@ impl Page {
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
+                if chain + 1 == REDIRECT_LIMIT {
+                    // Hit the cap and the page still wants to keep
+                    // chaining. Surface that as an error instead of
+                    // returning Ok(()) so callers can distinguish a
+                    // successful load from a redirect storm.
+                    return Err(PageError::TooManyRedirects(REDIRECT_LIMIT));
+                }
                 continue;
             }
             break;
@@ -549,6 +609,14 @@ impl Page {
             } else {
                 href.clone()
             };
+            if !subresource_allowed(self.url.as_ref(), &full_url) {
+                tracing::warn!(
+                    "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
+                    self.url_string(),
+                    full_url,
+                );
+                continue;
+            }
             if self.should_block_url(&full_url) {
                 tracing::info!("Blocked stylesheet by interception: {}", full_url);
                 continue;
@@ -595,10 +663,13 @@ impl Page {
         if !css_sources.is_empty() {
             if let Some(js) = &mut self.js {
                 let combined_css = css_sources.join("\n");
-                let escaped = combined_css
-                    .replace('\\', "\\\\")
-                    .replace('`', "\\`")
-                    .replace("${", "\\${");
+                // Use the thorough template-literal escape that
+                // covers U+2028 / U+2029 and other control chars.
+                // The previous escaper only handled `, \, and ${,
+                // letting attacker-controlled CSS containing a raw
+                // U+2028 break out of the template literal and run
+                // arbitrary JS in the page's V8 realm.
+                let escaped = escape_for_js_template_literal(&combined_css);
                 let code = format!("globalThis.__obscura_css = `{}`;", escaped);
                 let _ = js.execute_script("<css>", &code);
             }
@@ -887,6 +958,9 @@ pub enum PageError {
 
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    #[error("Too many redirects (limit {0})")]
+    TooManyRedirects(usize),
 }
 
 impl From<ObscuraNetError> for PageError {
