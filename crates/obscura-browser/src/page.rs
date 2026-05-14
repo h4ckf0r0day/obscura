@@ -11,6 +11,22 @@ use crate::lifecycle::LifecycleState;
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 
+/// Returns true when a JS-initiated navigation would step from a
+/// non-file scheme into a file: URL. We treat that move as an SOP
+/// violation because the existing realm survives the navigation and
+/// can read the new document's body.
+fn cross_scheme_to_file(from: &str, to: &str) -> bool {
+    let to_is_file = Url::parse(to)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or(false);
+    if !to_is_file {
+        return false;
+    }
+    Url::parse(from)
+        .map(|u| !u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or(true)
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub request_id: String,
@@ -113,27 +129,15 @@ impl Page {
         self.http_client.fetch(url).await
     }
     fn init_js(&mut self) {
+        // Drop any existing runtime so the JS realm starts clean on
+        // every navigation. The old code reused the V8 isolate and
+        // only re-bound `globalThis.document`, leaving window.onload,
+        // custom window properties and event handlers from the prior
+        // page in place. That made it possible for a page to set
+        // attacker-controlled state, trigger a navigation, and then
+        // run code in the next document's context.
         if self.js.is_some() {
-            let url_str = self.url_string();
-            let title = self.title.clone();
-            let dom = self.dom.take();
-
-            let js = self.js.as_mut().unwrap();
-            js.set_url(&url_str);
-            js.set_title(&title);
-
-            if let Some(d) = dom {
-                js.set_dom(d);
-            }
-
-            let _ = js.execute_script("<reset>",
-                "_cache.clear(); globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; \
-                 _iframeRegistry.length = 0; globalThis.length = 0; \
-                 globalThis._formValues = {}; globalThis._formChecked = {}; \
-                 globalThis._eventRegistry = {}; \
-                 globalThis.document = new Document(+_dom('document_node_id'));");
-
-            return;
+            let _ = self.js.take();
         }
 
         // Thread the BrowserContext's proxy through to the ES-module loader
@@ -424,6 +428,20 @@ impl Page {
         for _chain in 0..10 {
             self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
+                if cross_scheme_to_file(&current_url, &next_url) {
+                    // SOP gate. A web page must not be able to drive
+                    // a navigation to file:// and then read the loaded
+                    // document. Without this an http(s) page sets
+                    // window.onload, calls location.href = "file:..."
+                    // and harvests document.body from a local file
+                    // once the new document loads.
+                    tracing::warn!(
+                        "blocking JS-initiated cross-scheme navigation to file: {} -> {}",
+                        current_url,
+                        next_url,
+                    );
+                    break;
+                }
                 tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
                 current_url = next_url;
                 current_method = next_method;
