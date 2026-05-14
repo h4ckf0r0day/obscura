@@ -54,7 +54,14 @@ impl Page {
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
-            Some(Arc::new(StealthHttpClient::new(context.cookie_jar.clone())))
+            // wreq doesn't support SOCKS5; Clash mixed port handles both.
+            let stealth_proxy = context.proxy_url.as_ref().map(|u| {
+                u.replacen("socks5://", "http://", 1)
+            });
+            Some(Arc::new(StealthHttpClient::with_proxy(
+                context.cookie_jar.clone(),
+                stealth_proxy.as_deref(),
+            )))
         } else {
             None
         };

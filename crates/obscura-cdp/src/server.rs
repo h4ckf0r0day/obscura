@@ -47,13 +47,27 @@ pub async fn start_with_full_options(
     user_agent: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent, storage_dir).await
+}
+
+pub async fn start_with_host(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    storage_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
+    let addr = SocketAddr::new(ip, port);
     let listener = TcpListener::bind(&addr).await?;
 
-    info!("Obscura CDP server listening on ws://127.0.0.1:{}", port);
+    info!("Obscura CDP server listening on ws://{}:{}", host, port);
     info!(
-        "DevTools endpoint: ws://127.0.0.1:{}/devtools/browser",
-        port
+        "DevTools endpoint: ws://{}:{}/devtools/browser",
+        host, port
     );
 
     let local = tokio::task::LocalSet::new();

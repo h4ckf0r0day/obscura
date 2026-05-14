@@ -19,7 +19,7 @@ struct Args {
     #[arg(short, long, default_value_t = 9222)]
     port: u16,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     proxy: Option<String>,
 
     #[arg(long)]
@@ -37,6 +37,13 @@ enum Command {
     Serve {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
+
+        // Bind address. Defaults to 127.0.0.1 (loopback only) for safety.
+        // Set to 0.0.0.0 to listen on all interfaces (e.g. inside a Docker
+        // container where you want the port to be reachable from the host
+        // via -p mapping).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
 
         #[arg(long)]
         proxy: Option<String>,
@@ -110,6 +117,23 @@ enum Command {
         quiet: bool,
     },
 
+    Mcp {
+        #[arg(long)]
+        http: bool,
+
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+
+        #[arg(long)]
+        proxy: Option<String>,
+
+        #[arg(long)]
+        user_agent: Option<String>,
+
+        #[arg(long)]
+        stealth: bool,
+    },
+
 }
 
 
@@ -118,6 +142,7 @@ enum DumpFormat {
     Html,
     Text,
     Links,
+    Markdown,
 }
 
 fn print_banner(port: u16) {
@@ -129,7 +154,7 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.2
+  Headless Browser v0.1.4
   CDP server: ws://127.0.0.1:{}/devtools/browser
 "#, port);
 }
@@ -145,7 +170,14 @@ fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
 }
 
 fn is_quiet_command(cmd: &Option<Command>) -> bool {
-    matches!(cmd, Some(Command::Fetch { quiet: true, .. }))
+    matches!(
+        cmd,
+        Some(Command::Fetch { quiet: true, .. }) | Some(Command::Scrape { quiet: true, .. })
+    )
+}
+
+fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
+    command_proxy.or(global_proxy)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -162,8 +194,11 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let global_proxy = args.proxy.clone();
+
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers, storage_dir }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, storage_dir }) => {
+            let proxy = merge_proxy(global_proxy.clone(), proxy);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -187,14 +222,21 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent, storage_dir).await?;
+                obscura_cdp::start_with_host(port, &host, proxy, stealth, user_agent, storage_dir).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, storage_dir).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet).await?;
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
+        }
+        Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+            if http {
+                obscura_mcp::http::run(port, proxy, user_agent, stealth).await?;
+            } else {
+                obscura_mcp::run(proxy, user_agent, stealth).await?;
+            }
         }
         None => {
             print_banner(args.port);
@@ -347,14 +389,14 @@ async fn run_fetch(
     eval: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
+    proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let context = if let Some(ref dir) = storage_dir {
         Arc::new(BrowserContext::with_storage("fetch".to_string(), Some(dir.clone())))
     } else {
-        Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth))
+        Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth))
     };
-    // Clone for post-fetch save (context is moved into Page::new below)
     let ctx_for_save = context.clone();
     let mut page = Page::new("fetch-page".to_string(), context);
 
@@ -403,6 +445,7 @@ async fn run_fetch(
         DumpFormat::Html => dump_html(&page),
         DumpFormat::Text => dump_text(&mut page),
         DumpFormat::Links => dump_links(&page),
+        DumpFormat::Markdown => dump_markdown(&mut page),
     };
     write_or_print(rendered, output.as_ref()).await?;
 
@@ -463,6 +506,11 @@ fn dump_text(page: &mut Page) -> String {
             String::new()
         }
     }).unwrap_or_default()
+}
+
+fn dump_markdown(page: &mut Page) -> String {
+    let result = page.evaluate(obscura_browser::HTML_TO_MARKDOWN_JS);
+    result.as_str().unwrap_or_default().to_string()
 }
 
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
@@ -532,6 +580,7 @@ async fn run_parallel_scrape(
     format: &str,
     timeout_secs: u64,
     quiet: bool,
+    proxy: Option<String>,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -547,10 +596,11 @@ async fn run_parallel_scrape(
         );
     }
 
+    let worker_name = if cfg!(windows) { "obscura-worker.exe" } else { "obscura-worker" };
     let worker_path = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("obscura-worker")))
-        .unwrap_or_else(|| std::path::PathBuf::from("obscura-worker"));
+        .and_then(|p| p.parent().map(|d| d.join(worker_name)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worker_name));
 
     if !worker_path.exists() {
         anyhow::bail!(
@@ -572,6 +622,7 @@ async fn run_parallel_scrape(
         let sem = semaphore.clone();
         let eval = eval.clone();
         let worker_path = worker_path.clone();
+        let proxy = proxy.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -581,6 +632,7 @@ async fn run_parallel_scrape(
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
+                .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .spawn()
             {
                 Ok(c) => c,
@@ -793,7 +845,8 @@ fn dump_links(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_readable_text, is_quiet_command, select_log_filter, write_or_print, Args, Command,
+        extract_readable_text, is_quiet_command, merge_proxy, select_log_filter, write_or_print,
+        Args, Command,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -943,5 +996,22 @@ mod tests {
         assert!(text.contains("Hello."));
         assert!(!text.contains("console.log"));
         assert!(!text.contains("color: red"));
+    }
+
+    #[test]
+    fn command_proxy_overrides_global_proxy() {
+        let proxy = merge_proxy(
+            Some("http://global.example:8080".to_string()),
+            Some("socks5://127.0.0.1:1080".to_string()),
+        );
+
+        assert_eq!(proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn global_proxy_is_used_when_command_proxy_is_absent() {
+        let proxy = merge_proxy(Some("http://global.example:8080".to_string()), None);
+
+        assert_eq!(proxy.as_deref(), Some("http://global.example:8080"));
     }
 }

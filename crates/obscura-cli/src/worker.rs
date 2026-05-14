@@ -47,7 +47,11 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let context = Arc::new(BrowserContext::new("worker".to_string()));
+    let proxy = std::env::var("OBSCURA_PROXY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let context = Arc::new(BrowserContext::with_options("worker".to_string(), proxy, false));
     let mut page = Page::new("page-1".to_string(), context);
 
     let stdin = tokio::io::stdin();
