@@ -11,6 +11,14 @@ pub struct BrowserContext {
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
     pub stealth: bool,
+    /// When true, CDP-driven navigation to file:// URLs is permitted.
+    /// Default is false: a remote CDP client cannot point the browser
+    /// at /etc/shadow even if Obscura is running as a privileged user.
+    /// Flip on via `obscura serve --allow-file-access` for legitimate
+    /// local-HTML testing workflows. The CLI's own `obscura fetch
+    /// file://...` path is unaffected because it does not go through
+    /// the CDP server.
+    pub allow_file_access: bool,
 }
 
 impl BrowserContext {
@@ -26,6 +34,7 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth: false,
+            allow_file_access: false,
         }
     }
 
@@ -66,6 +75,7 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth,
+            allow_file_access: false,
         }
     }
 

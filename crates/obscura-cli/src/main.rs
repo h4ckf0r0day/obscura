@@ -53,6 +53,13 @@ enum Command {
 
         #[arg(long, default_value_t = 1)]
         workers: u16,
+
+        /// Allow CDP clients to navigate to file:// URLs. Off by
+        /// default so a CDP connection cannot read arbitrary local
+        /// files. Enable only when serving local HTML for testing
+        /// and the port is on a trusted network.
+        #[arg(long)]
+        allow_file_access: bool,
     },
 
     Fetch {
@@ -192,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
     let global_proxy = args.proxy.clone();
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
             print_banner(port);
             if let Some(ref proxy) = proxy {
@@ -214,7 +221,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_host(port, &host, proxy, stealth, user_agent).await?;
+                obscura_cdp::start_with_host_and_security(
+                    port, &host, proxy, stealth, user_agent, allow_file_access,
+                ).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {

@@ -4,6 +4,14 @@ use serde_json::{json, Value};
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 
+fn url_is_file_scheme(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or_else(|_| {
+            raw.trim_start().to_ascii_lowercase().starts_with("file:")
+        })
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -15,6 +23,18 @@ pub async fn handle(
         "navigate" => {
             let url = params.get("url").and_then(|v| v.as_str())
                 .ok_or("url required")?;
+
+            // Block CDP-initiated file:// navigation by default.
+            // Anyone who can reach the CDP port (default localhost,
+            // but Docker images bind 0.0.0.0) could otherwise read
+            // any file the obscura process can read. Opt in via
+            // `obscura serve --allow-file-access` when local-HTML
+            // testing is the intended workflow.
+            if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+                return Err(
+                    "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+                );
+            }
 
             let wait_until = params.get("waitUntil")
                 .and_then(|v| {

@@ -57,12 +57,23 @@ impl CdpContext {
         stealth: bool,
         user_agent: Option<String>,
     ) -> Self {
-        let default_context = Arc::new(BrowserContext::with_full_options(
+        Self::new_with_security(proxy, stealth, user_agent, false)
+    }
+
+    pub fn new_with_security(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        allow_file_access: bool,
+    ) -> Self {
+        let mut ctx = BrowserContext::with_full_options(
             "default".to_string(),
             proxy,
             stealth,
             user_agent,
-        ));
+        );
+        ctx.allow_file_access = allow_file_access;
+        let default_context = Arc::new(ctx);
         // Pre-seed with the default-frame execution context ids that
         // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
         // via Runtime.executionContextCreated. Anything else has to be
