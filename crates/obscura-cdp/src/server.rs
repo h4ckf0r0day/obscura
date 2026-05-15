@@ -58,18 +58,6 @@ pub async fn start_with_host(
     user_agent: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host_and_security(port, host, proxy, stealth, user_agent, storage_dir, false).await
-}
-
-pub async fn start_with_host_and_security(
-    port: u16,
-    host: &str,
-    proxy: Option<String>,
-    stealth: bool,
-    user_agent: Option<String>,
-    storage_dir: Option<std::path::PathBuf>,
-    allow_file_access: bool,
-) -> anyhow::Result<()> {
     let ip: std::net::IpAddr = host
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
@@ -81,16 +69,13 @@ pub async fn start_with_host_and_security(
         "DevTools endpoint: ws://{}:{}/devtools/browser",
         host, port
     );
-    if allow_file_access {
-        info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
-    }
 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let _processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, user_agent, storage_dir, allow_file_access));
+            let _processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, user_agent, storage_dir));
 
             loop {
                 match listener.accept().await {
@@ -118,9 +103,8 @@ async fn cdp_processor(
     stealth: bool,
     user_agent: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
-    allow_file_access: bool,
 ) {
-    let mut ctx = CdpContext::_new_inner(proxy, stealth, user_agent, storage_dir, allow_file_access);
+    let mut ctx = CdpContext::new_with_storage(proxy, stealth, user_agent, storage_dir);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
