@@ -345,6 +345,56 @@ class Node {
   isSameNode(other) { return other && this._nid === other._nid; }
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
+class CharacterData extends Node {
+  get data() {
+    return _domParse("text_content", this._nid) ?? "";
+  }
+  set data(v) {
+    _dom("set_text_content", this._nid, String(v ?? ""));
+  }
+  get length() { return this.data.length; }
+  substringData(offset, count) {
+    return this.data.substring(offset, offset + count);
+  }
+  appendData(s) { this.data += s; }
+  insertData(offset, s) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + s + d.slice(offset);
+  }
+  deleteData(offset, count) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + d.slice(offset + count);
+  }
+  replaceData(offset, count, s) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+  }
+}
+
+class Text extends CharacterData {
+  get nodeName() { return "#text"; }
+  get nodeType() { return 3; }
+  get wholeText() { return this.data; }
+  splitText(offset) {
+    const d = this.data;
+    const tail = d.substring(offset);
+    this.data = d.substring(0, offset);
+    const newNid = +_dom("create_text_node", tail);
+    const parent = this.parentNode;
+    if (parent) {
+      const ref = this.nextSibling;
+      parent.insertBefore(_wrap(newNid), ref);
+    }
+    return _wrap(newNid);
+  }
+  cloneNode() { return document.createTextNode(this.data); }
+}
+
+class Comment extends CharacterData {
+  get nodeName() { return "#comment"; }
+  get nodeType() { return 8; }
+  cloneNode() { return document.createComment(this.data); }
+}
 
 class Element extends Node {
   constructor(nid) {
@@ -769,11 +819,8 @@ class Document extends Node {
   }
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
   createComment(t) {
-    const nid = +_dom("create_text_node", "");
-    const n = new Node(nid);
-    n._isComment = true;
-    Object.defineProperty(n, "nodeType", { value: 8, writable: false, configurable: true });
-    Object.defineProperty(n, "nodeName", { value: "#comment", writable: false, configurable: true });
+    const nid = +_dom("create_comment_node", String(t ?? ""));
+    const n = new Comment(nid);
     _cache.set(nid, n);
     return n;
   }
@@ -783,7 +830,28 @@ class Document extends Node {
     _cache.set(nid, frag);
     return frag;
   }
-  createEvent(type) { return new Event(type); }
+  // Legacy DOM Level 2 event factory. Spec returns an event of the requested
+  // class with an empty type until init*Event() is called. We previously
+  // returned a generic Event for every type, which broke libraries that call
+  // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
+  createEvent(type) {
+    const map = {
+      'customevent': CustomEvent, 'customevents': CustomEvent,
+      'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
+      'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
+      'focusevent': FocusEvent,
+      'inputevent': InputEvent,
+      'uievent': UIEvent, 'uievents': UIEvent,
+      'wheelevent': WheelEvent,
+      'pointerevent': PointerEvent,
+      'errorevent': ErrorEvent,
+      'popstateevent': PopStateEvent,
+      'animationevent': AnimationEvent,
+      'transitionevent': TransitionEvent,
+    };
+    const Cls = map[String(type || '').toLowerCase()] || Event;
+    return new Cls('');
+  }
   createRange() { return { setStart(){}, setEnd(){}, collapse(){}, selectNodeContents(){}, cloneContents(){ return document.createDocumentFragment(); } }; }
   addEventListener(type, fn, opts) {} removeEventListener() {} dispatchEvent() { return true; }
   createTreeWalker(root, whatToShow, filter) {
@@ -976,6 +1044,8 @@ function _wrap(nid) {
   const t = +_dom("node_type", nid);
   let n;
   if (t === 1) n = new Element(nid);
+  else if (t === 3) n = new Text(nid);
+  else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
@@ -1846,7 +1916,18 @@ globalThis.Event = class Event {
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
 };
-globalThis.CustomEvent = class extends Event { constructor(t,o={}) { super(t,o);this.detail=o.detail; } };
+globalThis.CustomEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.detail=o.detail; }
+  // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
+  // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
+  // instead of new CustomEvent(...). See issue #41.
+  initCustomEvent(type,bubbles,cancelable,detail) {
+    this.type = type;
+    this.bubbles = !!bubbles;
+    this.cancelable = !!cancelable;
+    this.detail = detail;
+  }
+};
 globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
 globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
 globalThis.FocusEvent = class extends Event {};
@@ -2010,8 +2091,9 @@ globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
-globalThis.Text = Node;
-globalThis.Comment = Node;
+globalThis.CharacterData = CharacterData;
+globalThis.Text = Text;
+globalThis.Comment = Comment;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
@@ -2127,7 +2209,7 @@ class _IframeDocument {
   createTextNode(text) { return document.createTextNode(text); }
   createComment(text) { return document.createComment(text); }
   createDocumentFragment() { return document.createDocumentFragment(); }
-  createEvent(type) { return new Event(type); }
+  createEvent(type) { return document.createEvent(type); }
   hasFocus() { return false; }
 
   get cookie() { return ''; }
@@ -3019,6 +3101,36 @@ if (typeof URLPattern === 'undefined') {
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
+}
+
+// Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
+// in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
+// Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
+// (see issue #63).
+if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
+  Document.prototype.elementFromPoint = function(x, y) {
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return null;
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 0;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
+    if (x < 0 || y < 0 || x > w || y > h) {
+      return null;
+    }
+    return this.body || this.documentElement || null;
+  };
+  Document.prototype.elementsFromPoint = function(x, y) {
+    var el = this.elementFromPoint(x, y);
+    return el ? [el] : [];
+  };
+}
+if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
+  ShadowRoot.prototype.elementFromPoint = function(x, y) {
+    return Document.prototype.elementFromPoint.call(globalThis.document || this, x, y);
+  };
+  ShadowRoot.prototype.elementsFromPoint = function(x, y) {
+    return Document.prototype.elementsFromPoint.call(globalThis.document || this, x, y);
+  };
 }
 
 globalThis.__obscura_init = function() {

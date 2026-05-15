@@ -15,13 +15,16 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # Build on Ubuntu 22.04 so the Linux release binary works on
+            # common LTS servers with glibc 2.35 instead of requiring the
+            # newer glibc shipped by ubuntu-latest.
+            os: ubuntu-22.04
             name: obscura-x86_64-linux
           - target: aarch64-apple-darwin
             os: macos-latest
             name: obscura-aarch64-macos
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             name: obscura-x86_64-macos
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -47,14 +50,14 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz obscura
+          tar czf ../../../${{ matrix.name }}.tar.gz obscura obscura-worker
           cd ../../..
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip obscura.exe
+          7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
           cd ../../..
 
       - name: Upload

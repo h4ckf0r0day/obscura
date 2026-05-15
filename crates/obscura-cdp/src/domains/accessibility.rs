@@ -13,6 +13,16 @@ fn ax_value_string(s: &str) -> Value {
     json!({"type": "string", "value": s})
 }
 
+/// Build a CDP AXValue for a boolean type.
+fn ax_value_boolean(b: bool) -> Value {
+    json!({"type": "boolean", "value": b})
+}
+
+/// Build a CDP AXValue for an integer type.
+fn ax_value_integer(i: u32) -> Value {
+    json!({"type": "integer", "value": i})
+}
+
 pub async fn handle(
     method: &str,
     _params: &Value,
@@ -95,16 +105,51 @@ fn build_ax_node(
         .filter_map(|child_id| dom_to_ax.get(&child_id.raw()).cloned())
         .collect();
 
-    Some(json!({
+    // Resolve parentId — walk DOM ancestors until we find one in the AX tree
+    let parent_id: Option<String> = {
+        let mut current = node_id;
+        let mut result = None;
+        loop {
+            let next_parent = dom.with_node(current, |n| n.parent).flatten();
+            match next_parent {
+                Some(pid) => {
+                    if let Some(ax_pid) = dom_to_ax.get(&pid.raw()) {
+                        result = Some(ax_pid.clone());
+                        break;
+                    }
+                    current = pid;
+                }
+                None => break,
+            }
+        }
+        result
+    };
+
+    // Build node with only non-empty optional fields (per CDP spec, optional fields should be omitted when empty)
+    let mut ax_node = json!({
         "nodeId": ax_id,
         "ignored": false,
         "role": ax_value_role(role),
-        "name": name.as_deref().map(ax_value_string),
-        "value": value.as_deref().map(ax_value_string),
-        "properties": properties,
-        "childIds": child_ids,
-        "backendDOMNodeId": node_id.raw(),
-    }))
+    });
+
+    if let Some(ref pid) = parent_id {
+        ax_node.as_object_mut().unwrap().insert("parentId".into(), json!(pid));
+    }
+    if let Some(ref n) = name {
+        ax_node.as_object_mut().unwrap().insert("name".into(), json!(ax_value_string(n)));
+    }
+    if let Some(ref v) = value {
+        ax_node.as_object_mut().unwrap().insert("value".into(), json!(ax_value_string(v)));
+    }
+    if !properties.is_empty() {
+        ax_node.as_object_mut().unwrap().insert("properties".into(), json!(properties));
+    }
+    if !child_ids.is_empty() {
+        ax_node.as_object_mut().unwrap().insert("childIds".into(), json!(child_ids));
+    }
+    ax_node.as_object_mut().unwrap().insert("backendDOMNodeId".into(), json!(node_id.raw()));
+
+    Some(ax_node)
 }
 
 /// Map HTML element tag to ARIA role value.
@@ -333,7 +378,7 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
             an == "tabindex" || an == "contenteditable"
         });
         if focusable {
-            props.push(json!({"name": "focusable", "value": {"type": "boolean", "value": true}}));
+            props.push(json!({"name": "focusable", "value": ax_value_boolean(true)}));
         }
 
         // editable
@@ -342,7 +387,7 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
                 .iter()
                 .any(|a| a.name.local.as_ref() == "contenteditable" && a.value != "false")
         {
-            props.push(json!({"name": "editable", "value": {"type": "boolean", "value": true}}));
+            props.push(json!({"name": "editable", "value": ax_value_boolean(true)}));
         }
 
         // checked for checkboxes/radios
@@ -350,7 +395,7 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
             .iter()
             .any(|a| a.name.local.as_ref() == "checked")
         {
-            props.push(json!({"name": "checked", "value": {"type": "boolean", "value": true}}));
+            props.push(json!({"name": "checked", "value": ax_value_boolean(true)}));
         }
 
         // disabled
@@ -358,13 +403,13 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
             .iter()
             .any(|a| a.name.local.as_ref() == "disabled")
         {
-            props.push(json!({"name": "disabled", "value": {"type": "boolean", "value": true}}));
+            props.push(json!({"name": "disabled", "value": ax_value_boolean(true)}));
         }
 
         // level for headings
         if let Some(level) = tag.strip_prefix('h').and_then(|s| s.parse::<u32>().ok()) {
             if level >= 1 && level <= 6 {
-                props.push(json!({"name": "level", "value": {"type": "integer", "value": level}}));
+                props.push(json!({"name": "level", "value": ax_value_integer(level)}));
             }
         }
 
@@ -373,12 +418,12 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
             .iter()
             .any(|a| a.name.local.as_ref() == "required" || a.name.local.as_ref() == "aria-required")
         {
-            props.push(json!({"name": "required", "value": {"type": "boolean", "value": true}}));
+            props.push(json!({"name": "required", "value": ax_value_boolean(true)}));
         }
 
         // multiline for textarea
         if tag == "textarea" {
-            props.push(json!({"name": "multiline", "value": {"type": "boolean", "value": true}}));
+            props.push(json!({"name": "multiline", "value": ax_value_boolean(true)}));
         }
 
         props

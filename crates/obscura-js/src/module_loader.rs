@@ -10,12 +10,21 @@ use deno_core::RequestedModuleType;
 
 pub struct ObscuraModuleLoader {
     pub base_url: String,
+    /// Proxy URL threaded through to every dynamic ES-module fetch (#139).
+    /// `None` keeps the pre-#139 direct-connection behaviour for callers
+    /// that haven't been updated.
+    pub proxy_url: Option<String>,
 }
 
 impl ObscuraModuleLoader {
     pub fn new(base_url: &str) -> Self {
+        Self::with_proxy(base_url, None)
+    }
+
+    pub fn with_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
+            proxy_url,
         }
     }
 }
@@ -52,13 +61,32 @@ impl ModuleLoader for ObscuraModuleLoader {
         _requested_module_type: RequestedModuleType,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        // Capture the loader's proxy here so the async closure below owns a
+        // plain Option<String> rather than borrowing &self across an `await`.
+        let proxy_url = self.proxy_url.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            let client = reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder();
+            if let Some(ref proxy) = proxy_url {
+                match reqwest::Proxy::all(proxy) {
+                    Ok(p) => builder = builder.proxy(p),
+                    Err(e) => {
+                        return Err(io_err(format!(
+                            "Invalid module proxy '{}': {}",
+                            proxy, e
+                        )));
+                    }
+                }
+            }
+            let client = builder
                 .build()
                 .map_err(|e| io_err(format!("HTTP client error: {}", e)))?;
 
-            tracing::debug!("Loading ES module: {}", url);
+            tracing::debug!(
+                "Loading ES module: {} (proxy: {})",
+                url,
+                proxy_url.as_deref().unwrap_or("direct")
+            );
 
             let resp = client
                 .get(&url)

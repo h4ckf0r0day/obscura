@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -212,6 +211,14 @@ impl ObscuraHttpClient {
 
             builder.build().expect("failed to build HTTP client")
         }).await
+    }
+
+    /// Read-only accessor for the proxy URL the client was configured with
+    /// (if any). Exposed so callers outside the `obscura-net` crate — notably
+    /// `op_fetch_url` in `obscura-js` (#139) — can route their own reqwest
+    /// requests through the same upstream proxy.
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {

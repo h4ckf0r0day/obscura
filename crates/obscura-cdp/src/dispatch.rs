@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
-use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
 
 use crate::domains;
@@ -25,6 +25,16 @@ pub struct CdpContext {
     // back. Stored as plain Strings (not by-page) — for now we only model
     // a single page in CdpContext anyway.
     pub isolated_worlds: Vec<String>,
+    // Set of executionContextIds Obscura has emitted via
+    // Runtime.executionContextCreated. Pre-populated with the default-frame
+    // contexts (`1`, `2`) that Runtime.enable / Page.navigate emit, then
+    // extended each time Page.createIsolatedWorld assigns a fresh id.
+    //
+    // Runtime.evaluate / Runtime.callFunctionOn consult this set to reject
+    // requests targeting an unknown context — matching real Chrome's
+    // "Cannot find context with specified id" CDP error and unblocking the
+    // Playwright locator path described in issue #51.
+    pub valid_context_ids: HashSet<i64>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
 }
@@ -39,11 +49,40 @@ impl CdpContext {
     }
 
     pub fn new_with_options(proxy: Option<String>, stealth: bool) -> Self {
-        let default_context = Arc::new(BrowserContext::with_options(
+        Self::new_with_full_options(proxy, stealth, None)
+    }
+
+    pub fn new_with_full_options(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+    ) -> Self {
+        Self::new_with_security(proxy, stealth, user_agent, false)
+    }
+
+    pub fn new_with_security(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        allow_file_access: bool,
+    ) -> Self {
+        let mut ctx = BrowserContext::with_full_options(
             "default".to_string(),
             proxy,
             stealth,
-        ));
+            user_agent,
+        );
+        ctx.allow_file_access = allow_file_access;
+        let default_context = Arc::new(ctx);
+        // Pre-seed with the default-frame execution context ids that
+        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
+        // via Runtime.executionContextCreated. Anything else has to be
+        // registered explicitly (Page.createIsolatedWorld), otherwise
+        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
+        let mut valid_context_ids = HashSet::new();
+        valid_context_ids.insert(1);
+        valid_context_ids.insert(2);
+
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
@@ -55,6 +94,7 @@ impl CdpContext {
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             isolated_worlds: Vec::new(),
+            valid_context_ids,
         }
     }
 
@@ -112,6 +152,35 @@ impl CdpContext {
 }
 
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    // headless_chrome (and older Puppeteer) wrap every CDP call inside
+    // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
+    // V8 lock — the recursive dispatch will acquire it for the inner call,
+    // and tokio Mutex is not reentrant.
+    if req.method == "Target.sendMessageToTarget" {
+        return dispatch_send_message_to_target(req, ctx).await;
+    }
+
+    // Issue #19: V8 fatal abort under concurrent CDP work.
+    //
+    // Every CDP handler below may end up calling into a per-Page `JsRuntime`
+    // (each owning its own V8 Isolate). All of them run on a single OS
+    // thread (current_thread tokio + LocalSet). When two pages' V8-touching
+    // futures interleave across an `.await` (which `process_with_interception`
+    // can trigger by handling new CDP messages while a navigation task is in
+    // flight on `spawn_local`), V8 trips the
+    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts the
+    // process via `V8_Fatal` — no Rust panic, just `abort(3)`.
+    //
+    // Holding the process-wide V8 lock around the entire dispatch keeps each
+    // handler contiguous on the thread: V8 fully exits one Isolate before
+    // the next page is allowed in. This converts the abort into latency.
+    // It overshoots — non-V8 handlers (Browser.*, Storage.*, Emulation.*)
+    // also serialize — but those are cheap and the safety win dominates.
+    //
+    // The properly concurrent fix is to pin each `JsRuntime` to its own OS
+    // thread and message-pass; that's tracked as the larger #19 follow-up.
+    let _v8_guard = obscura_js::v8_lock::global().lock().await;
+
     let (domain, method) = match req.method.split_once('.') {
         Some((d, m)) => (d, m),
         None => {
@@ -136,9 +205,13 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
         "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        // Accepted but no-op. Puppeteer's FrameManager.initialize calls
+        // Audits.enable on connect — refusing it breaks puppeteer.connect()
+        // before any user code runs.
         "Emulation" | "Log" | "Performance" | "Security" | "CSS"
         | "ServiceWorker" | "Inspector"
-        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay" => {
+        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
+        | "Audits" => {
             Ok(json!({}))
         }
         _ => Err(format!("Unknown domain: {}", domain)),
@@ -150,5 +223,150 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             tracing::warn!("CDP error for {}: {}", req.method, msg);
             CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
         }
+    }
+}
+
+async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    let session_id = req
+        .params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let message = match req.params.get("message").and_then(|v| v.as_str()) {
+        Some(m) => m,
+        None => {
+            return CdpResponse::error(
+                req.id,
+                -32602,
+                "sendMessageToTarget requires a message string".into(),
+                req.session_id.clone(),
+            );
+        }
+    };
+
+    let inner: CdpRequest = match serde_json::from_str(message) {
+        Ok(r) => r,
+        Err(e) => {
+            return CdpResponse::error(
+                req.id,
+                -32700,
+                format!("sendMessageToTarget message is not a valid CDP request: {e}"),
+                req.session_id.clone(),
+            );
+        }
+    };
+
+    // Override the inner session with the one supplied by the wrapper so
+    // the inner dispatch routes against the right page. Boxing the future
+    // sidesteps the async-fn recursion limit.
+    let inner_with_session = CdpRequest {
+        id: inner.id,
+        method: inner.method.clone(),
+        params: inner.params,
+        session_id: session_id.clone().or(inner.session_id),
+    };
+    let inner_response = Box::pin(dispatch(&inner_with_session, ctx)).await;
+
+    // Re-emit the inner response as the legacy event headless_chrome (and
+    // older Puppeteer) listen for instead of correlating responses by id.
+    let inner_serialized = serde_json::to_string(&inner_response).unwrap_or_else(|_| "{}".into());
+    ctx.pending_events.push(CdpEvent {
+        method: "Target.receivedMessageFromTarget".to_string(),
+        params: json!({
+            "sessionId": session_id.clone().unwrap_or_default(),
+            "message": inner_serialized,
+            "targetId": session_id.clone().unwrap_or_default(),
+        }),
+        session_id: req.session_id.clone(),
+    });
+
+    CdpResponse::success(req.id, json!({}), req.session_id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::CdpRequest;
+
+    fn req(method: &str) -> CdpRequest {
+        CdpRequest {
+            id: 1,
+            method: method.into(),
+            params: json!({}),
+            session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn audits_enable_returns_empty_success() {
+        let mut ctx = CdpContext::new();
+        let resp = dispatch(&req("Audits.enable"), &mut ctx).await;
+        assert!(resp.error.is_none(), "Audits.enable should not error: {:?}", resp.error);
+        assert_eq!(resp.result, Some(json!({})));
+    }
+
+    #[tokio::test]
+    async fn unknown_domain_still_errors() {
+        let mut ctx = CdpContext::new();
+        let resp = dispatch(&req("DefinitelyNotADomain.enable"), &mut ctx).await;
+        let err = resp.error.expect("unknown domain must surface as error");
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("Unknown domain"));
+    }
+
+    #[tokio::test]
+    async fn send_message_to_target_unwraps_inner_call() {
+        let mut ctx = CdpContext::new();
+        let inner = json!({
+            "id": 42,
+            "method": "Browser.getVersion",
+            "params": {},
+        });
+        let outer = CdpRequest {
+            id: 99,
+            method: "Target.sendMessageToTarget".into(),
+            params: json!({
+                "sessionId": "sess-1",
+                "message": inner.to_string(),
+            }),
+            session_id: None,
+        };
+
+        let resp = dispatch(&outer, &mut ctx).await;
+        assert!(resp.error.is_none(), "wrapper must succeed: {:?}", resp.error);
+        assert_eq!(resp.id, 99);
+        assert_eq!(resp.result, Some(json!({})));
+
+        // headless_chrome reads the inner response from the
+        // receivedMessageFromTarget event, not from the wrapper response.
+        let evt = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.receivedMessageFromTarget")
+            .expect("receivedMessageFromTarget event must be emitted");
+        assert_eq!(evt.params["sessionId"], "sess-1");
+        let inner_msg = evt.params["message"].as_str().expect("message is a string");
+        let parsed: serde_json::Value = serde_json::from_str(inner_msg).unwrap();
+        assert_eq!(parsed["id"], 42);
+        // Browser.getVersion returns a populated result object, not an error.
+        assert!(parsed.get("result").is_some(), "inner response carries result");
+        assert!(parsed.get("error").is_none(), "inner response is not an error");
+    }
+
+    #[tokio::test]
+    async fn send_message_to_target_rejects_invalid_message() {
+        let mut ctx = CdpContext::new();
+        let outer = CdpRequest {
+            id: 5,
+            method: "Target.sendMessageToTarget".into(),
+            params: json!({
+                "sessionId": "sess-1",
+                "message": "{not valid json",
+            }),
+            session_id: None,
+        };
+        let resp = dispatch(&outer, &mut ctx).await;
+        let err = resp.error.expect("malformed inner messages must error");
+        assert_eq!(err.code, -32700);
     }
 }

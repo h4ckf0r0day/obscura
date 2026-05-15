@@ -1,2 +1,12 @@
 [env]
 RUST_TEST_THREADS = "1"
+
+# macOS 26 (Tahoe) moved libc++ headers inside the SDK; Apple clang 17 no longer
+# finds them at the old search path. This causes boring-sys's cmake step to fail
+# when building with --features stealth. Setting CXXFLAGS and SDKROOT here makes
+# them visible to all build scripts (including boring-sys's) so cmake can locate
+# the headers. force=false lets CI or developers override via their shell env.
+# Non-macOS platforms ignore SDKROOT; the -isystem path is silently skipped if
+# it doesn't exist. See: https://github.com/h4ckf0r0day/obscura/issues/136
+CXXFLAGS = { value = "-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1", force = false }
+SDKROOT  = { value = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }

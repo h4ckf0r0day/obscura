@@ -104,6 +104,31 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
 
             Ok(json!({ "targetId": page_id }))
         }
+        "attachToBrowserTarget" => {
+            // Playwright calls this on connect to obtain a session for the
+            // implicit "browser" target. Returning Unknown method aborts
+            // the connect handshake before any user code runs.
+            let session_id = "browser-session".to_string();
+            ctx.sessions.insert(session_id.clone(), "browser".to_string());
+
+            ctx.pending_events.push(CdpEvent::new(
+                "Target.attachedToTarget",
+                json!({
+                    "sessionId": session_id,
+                    "targetInfo": {
+                        "targetId": "browser",
+                        "type": "browser",
+                        "title": "",
+                        "url": "",
+                        "attached": true,
+                        "browserContextId": "",
+                    },
+                    "waitingForDebugger": false,
+                }),
+            ));
+
+            Ok(json!({ "sessionId": session_id }))
+        }
         "attachToTarget" => {
             let target_id = params.get("targetId").and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
@@ -192,5 +217,44 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
             }
         }
         _ => Err(format!("Unknown Target method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn attach_to_browser_target_returns_session_id() {
+        let mut ctx = CdpContext::new();
+        let result = handle("attachToBrowserTarget", &json!({}), &mut ctx)
+            .await
+            .expect("attachToBrowserTarget should succeed");
+
+        assert_eq!(result["sessionId"], "browser-session");
+        assert_eq!(
+            ctx.sessions.get("browser-session").map(String::as_str),
+            Some("browser")
+        );
+
+        // Playwright/Puppeteer expect a Target.attachedToTarget event before
+        // they finish wiring up the session — without it the connect promise
+        // hangs.
+        let attached_evt = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.attachedToTarget")
+            .expect("attachedToTarget event must be emitted");
+        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+    }
+
+    #[tokio::test]
+    async fn unknown_target_method_still_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle("notARealMethod", &json!({}), &mut ctx)
+            .await
+            .expect_err("unknown methods must surface as errors");
+        assert!(err.contains("Unknown Target method"));
     }
 }

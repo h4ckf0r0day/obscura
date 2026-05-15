@@ -9,6 +9,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+
+// PR #36 comment 4341743194: the deferral queue in `process_with_interception`
+// must be bounded so a stalled navigation cannot OOM the process. When the cap
+// is reached we return an explicit error response rather than silently dropping.
+const MAX_DEFERRED_MESSAGES: usize = 256;
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -32,21 +37,57 @@ pub async fn start_with_options(
     proxy: Option<String>,
     stealth: bool,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    start_with_full_options(port, proxy, stealth, None).await
+}
+
+pub async fn start_with_full_options(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+) -> anyhow::Result<()> {
+    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent).await
+}
+
+pub async fn start_with_host(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+) -> anyhow::Result<()> {
+    start_with_host_and_security(port, host, proxy, stealth, user_agent, false).await
+}
+
+pub async fn start_with_host_and_security(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+) -> anyhow::Result<()> {
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
+    let addr = SocketAddr::new(ip, port);
     let listener = TcpListener::bind(&addr).await?;
 
-    info!("Obscura CDP server listening on ws://127.0.0.1:{}", port);
+    info!("Obscura CDP server listening on ws://{}:{}", host, port);
     info!(
-        "DevTools endpoint: ws://127.0.0.1:{}/devtools/browser",
-        port
+        "DevTools endpoint: ws://{}:{}/devtools/browser",
+        host, port
     );
+    if allow_file_access {
+        info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
+    }
 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth));
+            let _processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy, stealth, user_agent, allow_file_access));
 
             loop {
                 match listener.accept().await {
@@ -72,14 +113,38 @@ async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
     stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
 ) {
-    let mut ctx = CdpContext::new_with_options(proxy, stealth);
+    let mut ctx = CdpContext::new_with_security(proxy, stealth, user_agent, allow_file_access);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
     let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
 
-    while let Some(msg) = rx.recv().await {
+    // Issue #19 follow-up: messages deferred from inside
+    // `process_with_interception` because routing them through
+    // `process_cdp_message → dispatch` while a nav was in flight would have
+    // tripped V8's TryGetCurrent invariant. Drained at the top of each
+    // outer iteration so they get processed sequentially with no other nav
+    // in flight.
+    let mut deferred: std::collections::VecDeque<ServerMessage> =
+        std::collections::VecDeque::new();
+
+    loop {
+        // Drain any deferred messages from the previous interception window
+        // before pulling new ones off the wire. Each is processed with no
+        // nav-task spawn_local in flight, so dispatch's v8_lock can claim
+        // the only Isolate cleanly.
+        let msg = if let Some(d) = deferred.pop_front() {
+            d
+        } else {
+            match rx.recv().await {
+                Some(m) => m,
+                None => break,
+            }
+        };
+
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 let _ = reply_tx.send(
@@ -95,6 +160,7 @@ async fn cdp_processor(
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                         &mut intercept_rx, &mut intercepted_paused,
+                        &mut deferred,
                     ).await;
                 } else {
                     if cdp_msg.text.contains("Fetch.") {
@@ -110,7 +176,7 @@ async fn cdp_processor(
 
 fn handle_fetch_resolution(
     text: &str,
-    ctx: &mut CdpContext,
+    _ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
 ) {
@@ -159,6 +225,7 @@ async fn process_with_interception(
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -192,6 +259,21 @@ async fn process_with_interception(
             return;
         }
     };
+
+    // Issue #19 follow-up: V8 only allows ONE entered Isolate per OS thread.
+    // The regular dispatch path enforces this via `get_session_page_mut`
+    // (which `suspend_js`'es every other page before letting the target
+    // page run JS). The interception path here bypasses that — it removes
+    // the target page and spawns a nav task — so we have to enforce the
+    // same invariant explicitly. Otherwise nav-2's `init_js` constructs
+    // Isolate-2 while page-1's Isolate-1 is still alive in ctx.pages, and
+    // the next V8 scope unwind aborts the process via `Context::Exit`'s
+    // `heap->isolate() == Isolate::TryGetCurrent()` check.
+    for other in ctx.pages.iter_mut() {
+        if other.has_js() {
+            other.suspend_js();
+        }
+    }
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let wait_until = req.params.get("waitUntil")
@@ -228,18 +310,44 @@ async fn process_with_interception(
     let url_owned = url.to_string();
 
     tokio::task::spawn_local(async move {
+        // Issue #19: serialize V8 work across pages. The interception path
+        // spawns navigation here while the parent task continues to pump
+        // CDP messages via `dispatch` (which also acquires this lock); both
+        // sides must coordinate or V8 aborts the process at concurrency >= 5.
+        let _v8_guard = obscura_js::v8_lock::global().lock().await;
         let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
         for source in &preload_scripts {
             if let Err(e) = page.execute_preload_script(source) {
                 tracing::debug!("Preload script error: {}", e);
             }
         }
+        drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
 
-    let mut navigate_result: Result<(), String> = Ok(());
-    let mut page_back: Option<obscura_browser::Page> = None;
+    let navigate_result: Result<(), String>;
+    let page_back: Option<obscura_browser::Page>;
 
+    // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
+    // While the spawned nav task is executing V8 (potentially parked on
+    // `op_fetch_url`'s `resolve_rx.await` *with Isolate-N still entered*),
+    // we must NOT let the parent's `select!` route foreign Cdp messages
+    // through `process_cdp_message → dispatch → page handlers`, because
+    // those handlers call `get_session_page_mut` which `suspend_js`'es
+    // OTHER pages (drops their `JsRuntime`, which calls
+    // `JsRealmInner::destroy`). That trips V8's
+    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts
+    // the process via `V8_Fatal`.
+    //
+    // The `obscura_js::v8_lock` mutex doesn't save us here: it's a
+    // `tokio::sync::Mutex` that is released around `.await`s inside V8
+    // ops, so it doesn't actually keep the V8 enter/exit pair contiguous
+    // on the thread.
+    //
+    // Park foreign Cdp messages into the outer deferred queue so the
+    // outer `cdp_processor` loop processes them after this nav fully
+    // completes (and its JsRuntime is no longer in flight on the
+    // LocalSet).
     loop {
         let has_irx = intercept_rx.is_some();
 
@@ -310,22 +418,55 @@ async fn process_with_interception(
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
+                        // Safe: no V8 enter, just bookkeeping.
                         let pid = ctx.create_page();
                         let sid = format!("{}-session", pid);
                         ctx.sessions.insert(sid.clone(), pid.clone());
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.") {
+                        if msg.text.contains("Fetch.continueRequest")
+                            || msg.text.contains("Fetch.fulfillRequest")
+                            || msg.text.contains("Fetch.failRequest")
+                        {
+                            // Safe: only flips a oneshot to resume the parked
+                            // op inside the spawned nav task. No V8 enter on
+                            // this side; the actual V8 work happens back on
+                            // the nav task's thread.
                             handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
                         } else {
-                            process_cdp_message(&msg.text, ctx, &msg.reply_tx).await;
+                            // UNSAFE during nav: would route through dispatch,
+                            // which can `suspend_js` other pages and trip the
+                            // V8 invariant. Defer until nav completes —
+                            // pushed to the outer `cdp_processor` queue so
+                            // it's processed sequentially with no nav task
+                            // in flight.
+                            if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                                tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
+                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
+                                    let resp = crate::types::CdpResponse::error(
+                                        req.id,
+                                        -32000,
+                                        "Server busy: navigation in progress, try again later".to_string(),
+                                        req.session_id,
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let _ = msg.reply_tx.send(json);
+                                    }
+                                }
+                            } else {
+                                tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
+                                deferred.push_back(ServerMessage::Cdp(msg));
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    // Deferred messages are handled by the outer `cdp_processor` loop
+    // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
 
@@ -491,6 +632,15 @@ fn fast_path_response(text: &str) -> Option<String> {
         }
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))
+        }
+        // Critical: Puppeteer calls this as the *first* CDP command on connect
+        // (`BrowserConnector._connectToCdpBrowser`). If another client or a long
+        // `Page.navigate` / interception holds the single `cdp_processor` task,
+        // queued Target commands starve and Puppeteer hits protocolTimeout on
+        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same payload
+        // as `domains::target::handle` when default context id is `"default"`.
+        "Target.getBrowserContexts" => {
+            Some(json!({ "browserContextIds": ["default"] }))
         }
         _ => None,
     };

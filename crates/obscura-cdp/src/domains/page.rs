@@ -4,6 +4,14 @@ use serde_json::{json, Value};
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 
+fn url_is_file_scheme(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or_else(|_| {
+            raw.trim_start().to_ascii_lowercase().starts_with("file:")
+        })
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -15,6 +23,18 @@ pub async fn handle(
         "navigate" => {
             let url = params.get("url").and_then(|v| v.as_str())
                 .ok_or("url required")?;
+
+            // Block CDP-initiated file:// navigation by default.
+            // Anyone who can reach the CDP port (default localhost,
+            // but Docker images bind 0.0.0.0) could otherwise read
+            // any file the obscura process can read. Opt in via
+            // `obscura serve --allow-file-access` when local-HTML
+            // testing is the intended workflow.
+            if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+                return Err(
+                    "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+                );
+            }
 
             let wait_until = params.get("waitUntil")
                 .and_then(|v| {
@@ -177,7 +197,7 @@ pub async fn handle(
                 .unwrap_or("").to_string();
             let page_url = page.url_string();
             let page_id = page.id.clone();
-            let context_id = 100;
+            let context_id: i64 = 100;
             // Track this world so Page.navigate can re-emit a context for it
             // post-navigation. Without this, Playwright (and Puppeteer)
             // hang in any operation that uses the utility world — including
@@ -186,6 +206,9 @@ pub async fn handle(
             if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
                 ctx.isolated_worlds.push(world_name.clone());
             }
+            // Register the isolated world's id so Runtime.evaluate /
+            // Runtime.callFunctionOn accept it as a valid contextId (#51).
+            ctx.valid_context_ids.insert(context_id);
 
             ctx.pending_events.push(CdpEvent {
                 method: "Runtime.executionContextCreated".to_string(),
@@ -223,6 +246,43 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
+        "getLayoutMetrics" => {
+            // Obscura has no visual layout engine, so we return a fixed
+            // 1280x720 viewport (Chrome's default) and try to derive the
+            // content height from document.documentElement.scrollHeight.
+            // Playwright calls this before every page.screenshot() and
+            // would otherwise fail with "Unknown Page method".
+            let width = 1280.0_f64;
+            let height = 720.0_f64;
+            let content_height = ctx
+                .get_session_page_mut(session_id)
+                .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
+                .and_then(|v| v.as_f64())
+                .filter(|n| *n > 0.0)
+                .unwrap_or(height);
+            let layout_viewport = json!({
+                "pageX": 0, "pageY": 0,
+                "clientWidth": width, "clientHeight": height,
+            });
+            let visual_viewport = json!({
+                "offsetX": 0.0, "offsetY": 0.0,
+                "pageX": 0.0, "pageY": 0.0,
+                "clientWidth": width, "clientHeight": height,
+                "scale": 1.0, "zoom": 1.0,
+            });
+            let content_size = json!({
+                "x": 0.0, "y": 0.0,
+                "width": width, "height": content_height,
+            });
+            Ok(json!({
+                "layoutViewport": layout_viewport,
+                "visualViewport": visual_viewport,
+                "contentSize": content_size,
+                "cssLayoutViewport": layout_viewport,
+                "cssVisualViewport": visual_viewport,
+                "cssContentSize": content_size,
+            }))
+        }
         "getNavigationHistory" => {
             let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
             Ok(json!({
@@ -236,6 +296,20 @@ pub async fn handle(
                 }]
             }))
         }
+        "printToPDF" => {
+            // Obscura has no layout/rendering engine, so PDF generation is
+            // intentionally not implemented. Returning a distinct, descriptive
+            // error (rather than the generic "Unknown Page method" fallback)
+            // tells Playwright/Puppeteer/headless_chrome clients exactly why
+            // the call failed and what to do instead.
+            Err(
+                "Page.printToPDF is not supported by Obscura: no layout engine. \
+                 Use Runtime.evaluate (e.g. page.evaluate) to extract the rendered \
+                 HTML, then render to PDF in your client (wkhtmltopdf, weasyprint, \
+                 a separate headless Chromium pipeline, etc.)."
+                    .to_string(),
+            )
+        }
         _ => Err(format!("Unknown Page method: {}", method)),
     }
 }
@@ -245,4 +319,80 @@ fn timestamp() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::CdpContext;
+
+    #[tokio::test]
+    async fn get_layout_metrics_returns_chrome_default_viewport() {
+        let mut ctx = CdpContext::new();
+        let result = handle("getLayoutMetrics", &json!({}), &mut ctx, &None)
+            .await
+            .expect("getLayoutMetrics should succeed without a session");
+
+        // CDP spec requires three top-level shapes; Playwright's screenshot
+        // path reads contentSize.width/height to size the capture. Without
+        // them the screenshot call panics with "cannot read property of
+        // undefined".
+        for key in [
+            "layoutViewport",
+            "visualViewport",
+            "contentSize",
+            "cssLayoutViewport",
+            "cssVisualViewport",
+            "cssContentSize",
+        ] {
+            assert!(result.get(key).is_some(), "missing key: {key}");
+        }
+
+        let layout = &result["layoutViewport"];
+        assert_eq!(layout["clientWidth"].as_f64(), Some(1280.0));
+        assert_eq!(layout["clientHeight"].as_f64(), Some(720.0));
+
+        let visual = &result["visualViewport"];
+        assert_eq!(visual["scale"].as_f64(), Some(1.0));
+        assert_eq!(visual["clientWidth"].as_f64(), Some(1280.0));
+
+        let content = &result["contentSize"];
+        assert_eq!(content["width"].as_f64(), Some(1280.0));
+        // Without a live page the content height falls back to the viewport.
+        assert_eq!(content["height"].as_f64(), Some(720.0));
+    }
+
+    #[tokio::test]
+    async fn unknown_page_method_still_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle("notARealMethod", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("unknown methods must surface as errors");
+        assert!(err.contains("Unknown Page method"));
+    }
+
+    #[tokio::test]
+    async fn print_to_pdf_returns_descriptive_unsupported_error() {
+        // Regression for #53: Page.printToPDF must be handled explicitly so
+        // Playwright clients receive a descriptive error rather than the
+        // generic "Unknown Page method" fallback.
+        let mut ctx = CdpContext::new();
+        let err = handle("printToPDF", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("printToPDF must error until a real renderer exists");
+        assert!(
+            !err.contains("Unknown Page method"),
+            "printToPDF must NOT fall through to the catch-all: {err}"
+        );
+        assert!(
+            err.contains("not supported by Obscura"),
+            "error must clearly state PDF is unsupported: {err}"
+        );
+        // Direct user to a workaround so the message is actionable.
+        assert!(
+            err.to_lowercase().contains("evaluate")
+                || err.to_lowercase().contains("html"),
+            "error must point to a workaround: {err}"
+        );
+    }
 }
