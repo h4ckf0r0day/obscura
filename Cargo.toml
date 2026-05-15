@@ -6,6 +6,7 @@ members = [
     "crates/obscura-browser",
     "crates/obscura-cdp",
     "crates/obscura-js",
+    "crates/obscura-mcp",
     "crates/obscura-cli",
 ]
 
@@ -21,6 +22,7 @@ obscura-net = { path = "crates/obscura-net" }
 obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
+obscura-mcp = { path = "crates/obscura-mcp" }
 
 html5ever = "0.29"
 markup5ever = "0.14"
@@ -29,7 +31,7 @@ servo_arc = "0.4"
 cssparser = "0.34"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
-reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "native-tls-vendored"], default-features = false }
+reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "native-tls-vendored", "socks"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"

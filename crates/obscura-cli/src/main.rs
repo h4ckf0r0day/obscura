@@ -19,7 +19,7 @@ struct Args {
     #[arg(short, long, default_value_t = 9222)]
     port: u16,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     proxy: Option<String>,
 
     #[arg(long)]
@@ -38,6 +38,13 @@ enum Command {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
 
+        // Bind address. Defaults to 127.0.0.1 (loopback only) for safety.
+        // Set to 0.0.0.0 to listen on all interfaces (e.g. inside a Docker
+        // container where you want the port to be reachable from the host
+        // via -p mapping).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
         #[arg(long)]
         proxy: Option<String>,
 
@@ -52,6 +59,13 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Allow CDP clients to navigate to file:// URLs. Off by
+        /// default so a CDP connection cannot read arbitrary local
+        /// files. Enable only when serving local HTML for testing
+        /// and the port is on a trusted network.
+        #[arg(long)]
+        allow_file_access: bool,
     },
 
     Fetch {
@@ -110,14 +124,36 @@ enum Command {
         quiet: bool,
     },
 
+    Mcp {
+        #[arg(long)]
+        http: bool,
+
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+
+        #[arg(long)]
+        proxy: Option<String>,
+
+        #[arg(long)]
+        user_agent: Option<String>,
+
+        #[arg(long)]
+        stealth: bool,
+    },
+
 }
 
 
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
     Html,
     Text,
     Links,
+    Markdown,
+    /// Stream the raw HTTP response body verbatim (binary-safe).
+    /// Bypasses the browser/JS layer — useful for fetching images,
+    /// JSON, JS, CSS, or any non-HTML resource (cf. issue #117).
+    Original,
 }
 
 fn print_banner(port: u16) {
@@ -129,7 +165,7 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.2
+  Headless Browser v0.1.5
   CDP server: ws://127.0.0.1:{}/devtools/browser
 "#, port);
 }
@@ -145,7 +181,14 @@ fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
 }
 
 fn is_quiet_command(cmd: &Option<Command>) -> bool {
-    matches!(cmd, Some(Command::Fetch { quiet: true, .. }))
+    matches!(
+        cmd,
+        Some(Command::Fetch { quiet: true, .. }) | Some(Command::Scrape { quiet: true, .. })
+    )
+}
+
+fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
+    command_proxy.or(global_proxy)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -162,11 +205,14 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let global_proxy = args.proxy.clone();
+
     match args.command {
-        Some(Command::Serve { port, proxy, user_agent, stealth, workers, storage_dir }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, storage_dir, allow_file_access }) => {
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
+            let proxy = merge_proxy(global_proxy.clone(), proxy);
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -187,14 +233,23 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_full_options(port, proxy, stealth, user_agent, storage_dir).await?;
+                obscura_cdp::start_with_host_and_security(
+                    port, &host, proxy, stealth, user_agent, storage_dir, allow_file_access,
+                ).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, storage_dir).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, storage_dir, global_proxy).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet).await?;
+            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
+        }
+        Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+            if http {
+                obscura_mcp::http::run(port, proxy, user_agent, stealth).await?;
+            } else {
+                obscura_mcp::run(proxy, user_agent, stealth).await?;
+            }
         }
         None => {
             print_banner(args.port);
@@ -348,11 +403,25 @@ async fn run_fetch(
     output: Option<std::path::PathBuf>,
     quiet: bool,
     storage_dir: Option<std::path::PathBuf>,
+    proxy: Option<String>,
 ) -> anyhow::Result<()> {
+    // --dump original short-circuits the browser stack entirely
+    if dump == DumpFormat::Original {
+        let bytes = fetch_original_bytes(
+            url_str,
+            proxy,
+            user_agent.clone(),
+            timeout_secs,
+        )
+        .await?;
+        write_or_print_bytes(&bytes, output.as_ref()).await?;
+        return Ok(());
+    }
+
     let context = if let Some(ref dir) = storage_dir {
         Arc::new(BrowserContext::with_storage("fetch".to_string(), Some(dir.clone())))
     } else {
-        Arc::new(BrowserContext::with_options("fetch".to_string(), None, stealth))
+        Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth))
     };
     // Clone for post-fetch save (context is moved into Page::new below)
     let ctx_for_save = context.clone();
@@ -403,6 +472,9 @@ async fn run_fetch(
         DumpFormat::Html => dump_html(&page),
         DumpFormat::Text => dump_text(&mut page),
         DumpFormat::Links => dump_links(&page),
+        DumpFormat::Markdown => dump_markdown(&mut page),
+        // Handled above via the short-circuit branch; unreachable here.
+        DumpFormat::Original => unreachable!("Original dump handled before page navigation"),
     };
     write_or_print(rendered, output.as_ref()).await?;
 
@@ -412,6 +484,32 @@ async fn run_fetch(
     Ok(())
 }
 
+async fn fetch_original_bytes(
+    url_str: &str,
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    timeout_secs: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let url = url::Url::parse(url_str)
+        .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
+
+    let client = obscura_net::ObscuraHttpClient::with_options(
+        Arc::new(obscura_net::CookieJar::new()),
+        proxy.as_deref(),
+    );
+    if let Some(ua) = user_agent {
+        client.set_user_agent(&ua).await;
+    }
+
+    let response = match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+    };
+
+    Ok(response.body)
+}
+
 async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     if let Some(path) = output {
         tokio::fs::write(path, content)
@@ -419,6 +517,30 @@ async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) ->
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
     } else {
         println!("{}", content);
+    }
+    Ok(())
+}
+
+async fn write_or_print_bytes(
+    bytes: &[u8],
+    output: Option<&std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if let Some(path) = output {
+        tokio::fs::write(path, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    } else {
+        // Write raw bytes to stdout — never println! (would append a newline
+        // and break binary payloads like JPEG/PNG).
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write to stdout: {}", e))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {}", e))?;
     }
     Ok(())
 }
@@ -463,6 +585,11 @@ fn dump_text(page: &mut Page) -> String {
             String::new()
         }
     }).unwrap_or_default()
+}
+
+fn dump_markdown(page: &mut Page) -> String {
+    let result = page.evaluate(obscura_browser::HTML_TO_MARKDOWN_JS);
+    result.as_str().unwrap_or_default().to_string()
 }
 
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
@@ -532,6 +659,7 @@ async fn run_parallel_scrape(
     format: &str,
     timeout_secs: u64,
     quiet: bool,
+    proxy: Option<String>,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -547,10 +675,11 @@ async fn run_parallel_scrape(
         );
     }
 
+    let worker_name = if cfg!(windows) { "obscura-worker.exe" } else { "obscura-worker" };
     let worker_path = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("obscura-worker")))
-        .unwrap_or_else(|| std::path::PathBuf::from("obscura-worker"));
+        .and_then(|p| p.parent().map(|d| d.join(worker_name)))
+        .unwrap_or_else(|| std::path::PathBuf::from(worker_name));
 
     if !worker_path.exists() {
         anyhow::bail!(
@@ -572,6 +701,7 @@ async fn run_parallel_scrape(
         let sem = semaphore.clone();
         let eval = eval.clone();
         let worker_path = worker_path.clone();
+        let proxy = proxy.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -581,6 +711,7 @@ async fn run_parallel_scrape(
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
+                .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .spawn()
             {
                 Ok(c) => c,
@@ -793,10 +924,94 @@ fn dump_links(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_readable_text, is_quiet_command, select_log_filter, write_or_print, Args, Command,
+        extract_readable_text, fetch_original_bytes, is_quiet_command, merge_proxy,
+        select_log_filter, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    // Issue #117 — `--dump original` short-circuits the browser stack and
+    // streams the raw response body verbatim, including for binary payloads.
+    //
+    // Two tests below pin the behaviour:
+    //   1. clap accepts `--dump original` as a valid DumpFormat variant.
+    //   2. `fetch_original_bytes` returns the exact bytes a `file://` URL
+    //      points at (binary-safe round-trip — no UTF-8 decode, no trailing
+    //      newline, no DOM mutation).
+    //   3. `write_or_print_bytes` writes raw bytes to a file without the
+    //      trailing newline that `println!` would add.
+    #[test]
+    fn parsed_fetch_dump_original_is_accepted_by_clap() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--dump",
+            "original",
+            "https://example.com/image.jpg",
+        ])
+        .expect("clap should accept --dump original");
+        match args.command {
+            Some(Command::Fetch { dump, .. }) => {
+                assert_eq!(dump, DumpFormat::Original);
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_original_bytes_returns_file_contents_verbatim() {
+        // A real binary payload: a 1×1 transparent PNG (89 50 4E 47 …) —
+        // exactly the kind of resource #117 wants to stream without HTML/
+        // JS rendering.
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-original-test-{}.png",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        tokio::fs::write(&path, PNG_BYTES)
+            .await
+            .expect("seed temp PNG fixture");
+
+        let file_url = format!("file://{}", path.display());
+        let bytes = fetch_original_bytes(&file_url, None, None, 5)
+            .await
+            .expect("fetch_original_bytes should round-trip the file body");
+
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(bytes, PNG_BYTES, "raw response body must match the file byte-for-byte");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_or_print_bytes_writes_without_trailing_newline() {
+        // Regression guard for #117: stdout must receive raw bytes. The file
+        // path used here exercises the file-output branch — println!-style
+        // output (used by write_or_print) would append a 0x0A byte and
+        // corrupt binary payloads. write_or_print_bytes must not.
+        let payload: &[u8] = &[0x00, 0xFF, b'h', b'i', 0x00];
+        let path = std::env::temp_dir().join(format!(
+            "obscura-write-bytes-test-{}.bin",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        write_or_print_bytes(payload, Some(&path))
+            .await
+            .expect("write_or_print_bytes should write the file");
+
+        let read_back = tokio::fs::read(&path).await.expect("read back");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(read_back, payload, "file bytes must match the payload exactly");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn write_or_print_writes_output_file_with_tokio_fs() {
@@ -943,5 +1158,22 @@ mod tests {
         assert!(text.contains("Hello."));
         assert!(!text.contains("console.log"));
         assert!(!text.contains("color: red"));
+    }
+
+    #[test]
+    fn command_proxy_overrides_global_proxy() {
+        let proxy = merge_proxy(
+            Some("http://global.example:8080".to_string()),
+            Some("socks5://127.0.0.1:1080".to_string()),
+        );
+
+        assert_eq!(proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn global_proxy_is_used_when_command_proxy_is_absent() {
+        let proxy = merge_proxy(Some("http://global.example:8080".to_string()), None);
+
+        assert_eq!(proxy.as_deref(), Some("http://global.example:8080"));
     }
 }

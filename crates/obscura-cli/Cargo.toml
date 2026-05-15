@@ -13,10 +13,11 @@ path = "src/worker.rs"
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
+stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
 
 [dependencies]
 obscura-browser = { workspace = true }
+obscura-mcp = { workspace = true }
 obscura-cdp = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }

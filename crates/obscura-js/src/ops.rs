@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use deno_core::op2;
 use deno_core::OpState;
@@ -281,14 +281,25 @@ fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     }
 }
 
-static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn get_shared_client() -> &'static reqwest::Client {
-    SHARED_HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .build()
-            .expect("failed to build shared reqwest::Client")
-    })
+// op_fetch_url backs JS-level `fetch()` and XHR. Pre-#139 it used a
+// process-wide `OnceLock<reqwest::Client>` initialised with no proxy, so
+// every JS network call bypassed the configured upstream proxy. We now
+// build a client per request, threading whatever `proxy_url` the page's
+// ObscuraHttpClient was configured with.
+//
+// The per-request build cost is negligible (≪1ms) compared with the actual
+// network round-trip; the simplification is worth not having to invalidate
+// a cache when the proxy is reconfigured between fetches.
+fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy) = proxy_url {
+        let p = reqwest::Proxy::all(proxy)
+            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
+        builder = builder.proxy(p);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build reqwest::Client: {}", e))
 }
 
 #[op2(async)]
@@ -317,7 +328,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -334,6 +345,10 @@ async fn op_fetch_url(
         }
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
+        // #139: thread the configured proxy through to the per-request
+        // reqwest::Client. Without this, op_fetch_url silently bypasses
+        // BrowserContext.proxy_url for every JS fetch() / XHR call.
+        let proxy_url = gs.http_client.as_ref().and_then(|c| c.proxy_url().map(|s| s.to_string()));
         tracing::debug!("op_fetch_url: intercept_enabled={}, has_tx={}", gs.intercept_enabled, gs.intercept_tx.is_some());
         let itx = if gs.intercept_enabled {
             gs.intercept_counter += 1;
@@ -341,7 +356,7 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx)
+        (jar, in_flight, itx, proxy_url)
     };
 
     if let Some((tx, request_id)) = intercept_tx {
@@ -385,7 +400,8 @@ async fn op_fetch_url(
         }
     }
 
-    let client = get_shared_client();
+    let client = build_request_client(proxy_url.as_deref())
+        .map_err(deno_error::JsErrorBox::generic)?;
 
     let request_origin = url::Url::parse(&url)
         .ok()

@@ -33,10 +33,17 @@ impl ObscuraJsRuntime {
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
+        Self::with_base_url_and_proxy(base_url, None)
+    }
+
+    /// Construct a runtime whose ES-module loader routes dynamic imports
+    /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
+    /// (direct connection).
+    pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
 
-        let module_loader = Rc::new(ObscuraModuleLoader::new(base_url));
+        let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
 
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![build_extension()],
@@ -1467,6 +1474,72 @@ mod tests {
     }
 
     #[test]
+    fn test_html_to_markdown_headings() {
+        let mut rt = setup_runtime("<html><body><h1>Title</h1><h2>Sub</h2><p>Body</p></body></html>");
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("# Title"), "missing H1: {}", md);
+        assert!(md.contains("## Sub"), "missing H2: {}", md);
+        assert!(md.contains("Body"), "missing paragraph text: {}", md);
+    }
+
+    #[test]
+    fn test_html_to_markdown_links_and_inline() {
+        let mut rt = setup_runtime(
+            r#"<html><body><p>Hello <strong>world</strong> <a href="https://x.test/">link</a> <em>em</em></p></body></html>"#,
+        );
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("**world**"), "missing strong: {}", md);
+        assert!(md.contains("*em*"), "missing em: {}", md);
+        assert!(
+            md.contains("[link](https://x.test/)"),
+            "missing link: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_html_to_markdown_lists() {
+        let mut rt = setup_runtime(
+            "<html><body><ul><li>A</li><li>B</li></ul><ol><li>X</li><li>Y</li></ol></body></html>",
+        );
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("- A"), "missing unordered A: {}", md);
+        assert!(md.contains("- B"), "missing unordered B: {}", md);
+        assert!(md.contains("1. X"), "missing ordered X: {}", md);
+    }
+
+    #[test]
+    fn test_html_to_markdown_skips_script_and_style() {
+        let mut rt = setup_runtime(
+            "<html><body><p>Text</p><script>alert(1)</script><style>body{color:red}</style></body></html>",
+        );
+        let md = rt
+            .evaluate(crate::HTML_TO_MARKDOWN_JS)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(md.contains("Text"), "missing visible text: {}", md);
+        assert!(!md.contains("alert"), "leaked script content: {}", md);
+        assert!(!md.contains("color:red"), "leaked style content: {}", md);
+    }
+
+    #[test]
     fn test_page_content_puppeteer_pattern() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><head></head><body><p>Test</p></body></html>");
         let result = rt.evaluate(
@@ -1521,6 +1594,63 @@ mod tests {
         assert_eq!(nan, serde_json::Value::Null);
         let inf = rt.evaluate("document.elementFromPoint(Infinity, 10)").unwrap();
         assert_eq!(inf, serde_json::Value::Null);
+    }
+
+    // Issue #139 — proxy_url must thread through to both the ES-module
+    // loader (module_loader.rs) and op_fetch_url's reqwest client
+    // (ops.rs::build_request_client). Pre-fix both built clients with
+    // `Client::builder().build()` — no proxy — so JS fetch/XHR and
+    // dynamic imports silently bypassed BrowserContext.proxy_url.
+    //
+    // Phase 5.5 RED check: each test references a symbol that does NOT
+    // exist on main (proxy_url() accessor, with_proxy ctor,
+    // with_base_url_and_proxy ctor), so the tests fail to compile without
+    // the prod fix.
+    #[test]
+    fn http_client_round_trips_proxy_url() {
+        use obscura_net::{CookieJar, ObscuraHttpClient};
+        let jar = std::sync::Arc::new(CookieJar::new());
+        let configured =
+            ObscuraHttpClient::with_options(jar.clone(), Some("http://proxy.test:8080"));
+        assert_eq!(
+            configured.proxy_url(),
+            Some("http://proxy.test:8080"),
+            "proxy_url() must expose the value passed to with_options"
+        );
+
+        let direct = ObscuraHttpClient::with_options(jar, None);
+        assert_eq!(
+            direct.proxy_url(),
+            None,
+            "proxy_url() must return None when no proxy was configured"
+        );
+    }
+
+    #[test]
+    fn module_loader_stores_proxy_for_dynamic_imports() {
+        use crate::module_loader::ObscuraModuleLoader;
+        let loader = ObscuraModuleLoader::with_proxy(
+            "https://example.com/",
+            Some("http://proxy.test:8080".to_string()),
+        );
+        assert_eq!(loader.proxy_url.as_deref(), Some("http://proxy.test:8080"));
+        assert_eq!(loader.base_url, "https://example.com/");
+
+        // Default constructor must keep the historical "no proxy" behaviour.
+        let direct = ObscuraModuleLoader::new("https://example.com/");
+        assert_eq!(direct.proxy_url, None);
+    }
+
+    #[test]
+    fn runtime_with_base_url_and_proxy_constructs_successfully() {
+        // Sanity-check the public ctor that page.rs uses to thread proxy
+        // through to the module loader. Direct (None) and proxied paths
+        // must both initialise the JS environment.
+        let _direct = ObscuraJsRuntime::with_base_url_and_proxy("https://example.com/", None);
+        let _proxied = ObscuraJsRuntime::with_base_url_and_proxy(
+            "https://example.com/",
+            Some("http://proxy.test:8080".to_string()),
+        );
     }
 
 }

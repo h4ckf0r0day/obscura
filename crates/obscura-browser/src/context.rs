@@ -13,11 +13,32 @@ pub struct BrowserContext {
     pub obey_robots: bool,
     pub stealth: bool,
     pub storage_dir: Option<PathBuf>,
+    /// When true, CDP-driven navigation to file:// URLs is permitted.
+    /// Default is false: a remote CDP client cannot point the browser
+    /// at /etc/shadow even if Obscura is running as a privileged user.
+    /// Flip on via `obscura serve --allow-file-access` for legitimate
+    /// local-HTML testing workflows. The CLI's own `obscura fetch
+    /// file://...` path is unaffected because it does not go through
+    /// the CDP server.
+    pub allow_file_access: bool,
 }
 
 impl BrowserContext {
     pub fn new(id: String) -> Self {
-        Self::_new_inner(id, None, false, None, None)
+        let cookie_jar = Arc::new(CookieJar::new());
+        let http_client = Arc::new(ObscuraHttpClient::with_cookie_jar(cookie_jar.clone()));
+        BrowserContext {
+            id,
+            cookie_jar,
+            http_client,
+            user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
+            proxy_url: None,
+            robots_cache: Arc::new(RobotsCache::new()),
+            obey_robots: false,
+            stealth: false,
+            storage_dir: None,
+            allow_file_access: false,
+        }
     }
 
     /// Create a BrowserContext with an optional storage directory.
@@ -79,6 +100,7 @@ impl BrowserContext {
             obey_robots: false,
             stealth,
             storage_dir,
+            allow_file_access: false,
         }
     }
 

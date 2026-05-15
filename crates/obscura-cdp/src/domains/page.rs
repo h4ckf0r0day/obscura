@@ -4,6 +4,14 @@ use serde_json::{json, Value};
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 
+fn url_is_file_scheme(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or_else(|_| {
+            raw.trim_start().to_ascii_lowercase().starts_with("file:")
+        })
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -15,6 +23,18 @@ pub async fn handle(
         "navigate" => {
             let url = params.get("url").and_then(|v| v.as_str())
                 .ok_or("url required")?;
+
+            // Block CDP-initiated file:// navigation by default.
+            // Anyone who can reach the CDP port (default localhost,
+            // but Docker images bind 0.0.0.0) could otherwise read
+            // any file the obscura process can read. Opt in via
+            // `obscura serve --allow-file-access` when local-HTML
+            // testing is the intended workflow.
+            if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+                return Err(
+                    "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+                );
+            }
 
             let wait_until = params.get("waitUntil")
                 .and_then(|v| {
@@ -177,7 +197,7 @@ pub async fn handle(
                 .unwrap_or("").to_string();
             let page_url = page.url_string();
             let page_id = page.id.clone();
-            let context_id = 100;
+            let context_id: i64 = 100;
             // Track this world so Page.navigate can re-emit a context for it
             // post-navigation. Without this, Playwright (and Puppeteer)
             // hang in any operation that uses the utility world — including
@@ -186,6 +206,9 @@ pub async fn handle(
             if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
                 ctx.isolated_worlds.push(world_name.clone());
             }
+            // Register the isolated world's id so Runtime.evaluate /
+            // Runtime.callFunctionOn accept it as a valid contextId (#51).
+            ctx.valid_context_ids.insert(context_id);
 
             ctx.pending_events.push(CdpEvent {
                 method: "Runtime.executionContextCreated".to_string(),
