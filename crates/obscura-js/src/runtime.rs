@@ -119,12 +119,13 @@ impl ObscuraJsRuntime {
         self.v8_to_json(result)
     }
 
-    pub fn evaluate_for_cdp(
+    pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
         return_by_value: bool,
+        await_promise: bool,
     ) -> Result<RemoteObjectInfo, String> {
-        if return_by_value {
+        if !await_promise && return_by_value {
             let val = self.evaluate(expression)?;
             return Ok(Self::info_from_json(&val));
         }
@@ -139,24 +140,59 @@ impl ObscuraJsRuntime {
             .trim()
             .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
 
-        let meta_code = format!(
-            "(function() {{\n\
-                var __result;\n\
-                try {{ __result = ({expr}); }} catch(e) {{ __result = undefined; }}\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
-                return {meta_fn};\n\
-            }})()",
-            expr = cleaned_expr,
-            oid = oid,
-            meta_fn = Self::meta_extract_js("__result"),
-        );
+        let meta_code = if await_promise {
+            format!(
+                "(async function() {{\n\
+                    try {{\n\
+                        var __result = await ({expr});\n\
+                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        globalThis.__obscura_await_meta = {meta_fn};\n\
+                        globalThis.__obscura_await_rejected = false;\n\
+                    }} catch(e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
+                    }}\n\
+                }})()",
+                expr = cleaned_expr,
+                oid = oid,
+                meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = Self::meta_extract_js("e"),
+            )
+        } else {
+            format!(
+                "(function() {{\n\
+                    var __result;\n\
+                    try {{ __result = ({expr}); }} catch(e) {{ __result = undefined; }}\n\
+                    globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    return {meta_fn};\n\
+                }})()",
+                expr = cleaned_expr,
+                oid = oid,
+                meta_fn = Self::meta_extract_js("__result"),
+            )
+        };
 
         let result = self
             .runtime
             .execute_script("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
-        let meta_str = self.v8_to_json(result)?;
+        let meta_str = if await_promise {
+            self.resolve_promises().await;
+            let rejected = self.runtime.execute_script("<readRejected>", "globalThis.__obscura_await_rejected".to_string())
+                .map_err(|e| format!("JS error: {}", e))?;
+            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+                let err = self.runtime.execute_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
+                    .map_err(|e| format!("JS error: {}", e))?;
+                return Err(format!("Promise rejected: {}", self.v8_to_json(err)?.as_str().unwrap_or("")));
+            }
+            self.runtime.execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .map_err(|e| format!("JS error: {}", e))?
+        } else {
+            result
+        };
+        let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
         } else {
@@ -166,6 +202,13 @@ impl ObscuraJsRuntime {
             oid.clone(),
             format!("globalThis.__obscura_objects['{}']", oid),
         );
+
+        if await_promise && return_by_value {
+            let read = self.runtime.execute_script("<readResult>", format!("globalThis.__obscura_objects['{}']", oid))
+                .map_err(|e| format!("JS error: {}", e))?;
+            let json_val = self.v8_to_json(read)?;
+            return Ok(Self::info_from_json(&json_val));
+        }
 
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -529,7 +572,7 @@ impl ObscuraJsRuntime {
 
     pub async fn resolve_promises(&mut self) {
         let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(100),
+            tokio::time::Duration::from_secs(5),
             self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
         ).await;
     }
@@ -905,6 +948,61 @@ mod tests {
     }
 
     #[test]
+    fn test_button_click_dispatches_listener() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt.evaluate(r#"
+            const button = document.getElementById('go');
+            button.addEventListener('click', () => { button.dataset.clicked = 'yes'; });
+            button.click();
+            return button.dataset.clicked;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!("yes"));
+    }
+
+    #[test]
+    fn test_dispatch_mouse_event_runs_listener() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt.evaluate(r#"
+            const button = document.getElementById('go');
+            let count = 0;
+            button.addEventListener('click', () => { count += 1; });
+            button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return count;
+        "#).unwrap();
+        assert_eq!(result.as_f64().unwrap() as i64, 1);
+    }
+
+    #[test]
+    fn test_location_href_assignment_updates_navigation_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let href = rt.evaluate("const next = '/next'; location.href = next; return location.href;").unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/next"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/next".to_string(), "GET".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
+        let mut rt = setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
+        let href = rt.evaluate(r#"
+            const form = document.querySelector('form');
+            form.addEventListener('submit', (event) => {
+                event.preventDefault();
+                location.href = '/submitted';
+            });
+            document.getElementById('submit').click();
+            return location.href;
+        "#).unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/submitted"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/submitted".to_string(), "GET".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ua = rt.evaluate("navigator.userAgent").unwrap();
@@ -986,23 +1084,52 @@ mod tests {
         assert_eq!(result2.value.unwrap().as_f64().unwrap() as i64, 3);
     }
 
-    #[test]
-    fn test_evaluate_for_cdp_detects_node() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_detects_node() {
         let mut rt = setup_runtime("<html><body><h1>Hello</h1></body></html>");
         let result = rt
-            .evaluate_for_cdp("document.querySelector('h1')", false)
-            .unwrap();
+            .evaluate_for_cdp("document.querySelector('h1')", false, false)
+            .await.unwrap();
         assert_eq!(result.subtype.as_deref(), Some("node"));
         assert_eq!(result.js_type, "object");
         assert!(result.object_id.is_some());
     }
 
-    #[test]
-    fn test_evaluate_for_cdp_detects_document() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_detects_document() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate_for_cdp("document", false).unwrap();
+        let result = rt.evaluate_for_cdp("document", false, false).await.unwrap();
         assert_eq!(result.subtype.as_deref(), Some("node"));
         assert_eq!(result.class_name, "HTMLDocument");
+    }
+
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_awaits_resolved_promise() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp("Promise.resolve(42)", true, true).await.unwrap();
+        assert_eq!(result.value.unwrap().as_f64().unwrap() as i64, 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_awaits_timer_promise() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp("new Promise(resolve => setTimeout(() => resolve('done'), 1))", true, true).await.unwrap();
+        assert_eq!(result.value.unwrap().as_str().unwrap(), "done");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_awaits_async_function() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp("(async () => 'async-ok')()", true, true).await.unwrap();
+        assert_eq!(result.value.unwrap().as_str().unwrap(), "async-ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_evaluate_for_cdp_reports_promise_rejection() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let err = rt.evaluate_for_cdp("Promise.reject(new Error('boom'))", true, true).await.unwrap_err();
+        assert!(err.contains("boom"));
     }
 
     #[tokio::test(flavor = "current_thread")]

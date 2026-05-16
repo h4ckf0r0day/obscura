@@ -41,20 +41,19 @@ pub async fn handle(
                 .get("returnByValue")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-
-            // Spec-compliant contextId handling (#51): when the client
-            // targets a specific execution context, reject the call if that
-            // context has not been advertised via Runtime.executionContextCreated
-            // (or Page.createIsolatedWorld). Obscura routes every evaluate
-            // against the page's single V8 isolate, so accepting a foreign
-            // id silently would mis-attribute UtilityScript state and break
-            // Playwright's locator path.
+          
             validate_context_id(params, "contextId", ctx, "evaluate")?;
+
+            let await_promise = params
+                .get("awaitPromise")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = page.evaluate_for_cdp(expression, return_by_value);
+            let info = page.evaluate_for_cdp(expression, return_by_value, await_promise).await;
+            page.process_pending_navigation().await.map_err(|e| e.to_string())?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
@@ -90,6 +89,7 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info =
                 page.call_function_on_for_cdp(function_declaration, object_id, &arguments, return_by_value, await_promise).await;
+            page.process_pending_navigation().await.map_err(|e| e.to_string())?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }

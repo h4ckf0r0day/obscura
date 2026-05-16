@@ -47,6 +47,10 @@ curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura
 tar xzf obscura-x86_64-linux.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
+# Linux ARM64 (aarch64)
+curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+tar xzf obscura-aarch64-linux.tar.gz
+
 # Arch Linux (AUR)
 yay -S obscura-browser
 
@@ -248,6 +252,14 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | **Input** | dispatchMouseEvent, dispatchKeyEvent |
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
 ## CLI Reference
+
+### Tuning V8
+
+Obscura embeds V8 directly. Use `--v8-flags` to pass raw flags through to V8, same syntax as Chromium's `--js-flags` and Node's command-line flags. Most common use is raising the heap cap to fix `JavaScript heap out of memory` on JS-heavy pages:
+
+```bash
+obscura --v8-flags "--max-old-space-size=4096" fetch <url>
+```
 
 ### `obscura serve`
 

@@ -64,6 +64,7 @@ pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
+    let allow_private_network = std::env::var_os("OBSCURA_ALLOW_PRIVATE_NETWORK").is_some();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
@@ -72,7 +73,7 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
         )));
     }
 
-    if scheme == "file" {
+    if scheme == "file" || allow_private_network {
         return Ok(());
     }
 
@@ -336,33 +337,9 @@ impl ObscuraHttpClient {
             );
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
-            tracing::debug!(
-                "Cookie header for {}: {} cookies ({} bytes)",
-                current_url.host_str().unwrap_or("?"),
-                cookie_header.split("; ").filter(|s| !s.is_empty()).count(),
-                cookie_header.len(),
-            );
             if !cookie_header.is_empty() {
-                match HeaderValue::from_str(&cookie_header) {
-                    Ok(val) => {
-                        headers.insert(reqwest::header::COOKIE, val);
-                    }
-                    Err(_) => {
-                        let filtered: String = cookie_header
-                            .split("; ")
-                            .filter(|pair| HeaderValue::from_str(pair).is_ok())
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        if !filtered.is_empty() {
-                            if let Ok(val) = HeaderValue::from_str(&filtered) {
-                                headers.insert(reqwest::header::COOKIE, val);
-                            }
-                        }
-                        tracing::debug!(
-                            "Cookie header invalid chars, filtered {} -> {} bytes",
-                            cookie_header.len(), filtered.len(),
-                        );
-                    }
+                if let Ok(val) = HeaderValue::from_str(&cookie_header) {
+                    headers.insert(reqwest::header::COOKIE, val);
                 }
             }
 

@@ -109,13 +109,15 @@ impl Page {
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
-            // wreq doesn't support SOCKS5; Clash mixed port handles both.
-            let stealth_proxy = context.proxy_url.as_ref().map(|u| {
-                u.replacen("socks5://", "http://", 1)
-            });
+            // The wreq client backing StealthHttpClient does not speak SOCKS5.
+            // Callers must validate the proxy scheme up front and fail loudly
+            // (see obscura-cli) rather than silently rewriting socks5:// to
+            // http://, which only works when the upstream happens to be a
+            // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
+            // like `ssh -ND` (#160).
             Some(Arc::new(StealthHttpClient::with_proxy(
                 context.cookie_jar.clone(),
-                stealth_proxy.as_deref(),
+                context.proxy_url.as_deref(),
             )))
         } else {
             None
@@ -786,13 +788,14 @@ impl Page {
         }
     }
 
-    pub fn evaluate_for_cdp(
+    pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
         return_by_value: bool,
+        await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.evaluate_for_cdp(expression, return_by_value) {
+            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -937,6 +940,21 @@ impl Page {
             js.take_pending_navigation()
         } else {
             None
+        }
+    }
+
+    pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
+        if let Some((url, method, body)) = self.take_pending_navigation() {
+            self.navigate_with_wait_post(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                &method,
+                &body,
+            )
+            .await?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 

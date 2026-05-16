@@ -522,12 +522,14 @@ class Element extends Node {
   }
   dispatchEvent(event) {
     if (!event) return true;
-    event.target = this;
+    if (!event.target) event.target = this;
     event.currentTarget = this;
     const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error(e); } }
-    if (event.bubbles && !event.defaultPrevented && this.parentNode) {
-      event.currentTarget = this.parentNode;
+    for (const h of handlers) {
+      try { h.call(this, event); } catch(e) { console.error(e); }
+      if (event._immediatePropagationStopped) break;
+    }
+    if (event.bubbles && !event._propagationStopped && this.parentNode) {
       this.parentNode.dispatchEvent(event);
     }
     return !event.defaultPrevented;
@@ -646,7 +648,10 @@ class Element extends Node {
     }
     return this._iframeWin;
   }
-  get action() { return this.getAttribute("action") || ""; }
+  get action() {
+    const action = this.getAttribute("action") || _domParse("document_url") || "";
+    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+  }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
@@ -1906,10 +1911,10 @@ globalThis.IntersectionObserver = class {
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
 globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now(); }
+  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
-  preventDefault() { this.defaultPrevented=true; } stopPropagation(){} stopImmediatePropagation(){}
-  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable; }
+  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
+  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
 };
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.detail=o.detail; }
@@ -1944,7 +1949,25 @@ globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class { constructor(init=""){this._p=new Map();if(typeof init==="string"){init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this._p.set(decodeURIComponent(k),decodeURIComponent(v.join("=")));});}} get(k){return this._p.get(k)??null;} set(k,v){this._p.set(k,String(v));} has(k){return this._p.has(k);} toString(){return[...this._p].map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");} forEach(cb){this._p.forEach((v,k)=>cb(v,k));} };
+if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
+  constructor(init=""){
+    this._p=[];
+    if(typeof init==="string"){
+      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(decodeURIComponent(k),decodeURIComponent(v.join("=")));});
+    } else if (init && typeof init[Symbol.iterator] === 'function') {
+      for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
+    } else if (init && typeof init === 'object') {
+      Object.keys(init).forEach(k => this.append(k, init[k]));
+    }
+  }
+  append(k,v){this._p.push([String(k),String(v)]);}
+  get(k){const p=this._p.find(([key])=>key===String(k)); return p?p[1]:null;}
+  set(k,v){this.delete(k); this.append(k,v);}
+  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k);}
+  has(k){k=String(k); return this._p.some(([key])=>key===k);}
+  toString(){return this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");}
+  forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
+};
 
 globalThis.DOMParser = class { parseFromString(s,t) { return globalThis.document; } };
 globalThis.XMLSerializer = class XMLSerializer {

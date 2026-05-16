@@ -28,8 +28,11 @@ struct Args {
     #[arg(long)]
     user_agent: Option<String>,
 
-    #[arg(long)]
-    storage_dir: Option<std::path::PathBuf>,
+    /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
+    /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
+    /// Applied once at startup before any isolate is created.
+    #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
+    v8_flags: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -57,8 +60,12 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         workers: u16,
 
+        /// Allow CDP clients to navigate to file:// URLs. Off by
+        /// default so a CDP connection cannot read arbitrary local
+        /// files. Enable only when serving local HTML for testing
+        /// and the port is on a trusted network.
         #[arg(long)]
-        storage_dir: Option<std::path::PathBuf>,
+        allow_file_access: bool,
     },
 
     Fetch {
@@ -93,9 +100,6 @@ enum Command {
 
         #[arg(long, short)]
         quiet: bool,
-
-        #[arg(long)]
-        storage_dir: Option<std::path::PathBuf>,
     },
 
     Scrape {
@@ -137,12 +141,16 @@ enum Command {
 }
 
 
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
     Html,
     Text,
     Links,
     Markdown,
+    /// Stream the raw HTTP response body verbatim (binary-safe).
+    /// Bypasses the browser/JS layer — useful for fetching images,
+    /// JSON, JS, CSS, or any non-HTML resource (cf. issue #117).
+    Original,
 }
 
 fn print_banner(port: u16) {
@@ -154,7 +162,7 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.4
+  Headless Browser v0.1.5
   CDP server: ws://127.0.0.1:{}/devtools/browser
 "#, port);
 }
@@ -180,6 +188,38 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+/// `--stealth` routes outbound traffic through `wreq`, which doesn't speak
+/// SOCKS5. A previous workaround silently rewrote `socks5://` to `http://`,
+/// which broke plain SOCKS5 servers (#160). Refuse the combination at
+/// startup so the user gets a clear message instead of `TunnelUnexpectedEof`.
+fn reject_stealth_with_socks5(proxy: Option<&str>, stealth: bool) -> anyhow::Result<()> {
+    if !stealth {
+        return Ok(());
+    }
+    let Some(p) = proxy else { return Ok(()) };
+    let scheme = p.split("://").next().unwrap_or("").to_ascii_lowercase();
+    if scheme == "socks5" || scheme == "socks5h" {
+        anyhow::bail!(
+            "--stealth does not support SOCKS5 proxies (the stealth HTTP \
+             client cannot reach the upstream). Use --proxy http://... \
+             or drop --stealth."
+        );
+    }
+    Ok(())
+}
+
+/// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
+/// Returns `None` when the user didn't pass the flag, passed an empty string,
+/// or passed only whitespace; in those cases V8 is left untouched.
+fn normalize_v8_flags(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -194,14 +234,17 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    if let Some(flags) = normalize_v8_flags(args.v8_flags.as_deref()) {
+        tracing::info!("Applying V8 flags: {}", flags);
+        obscura_js::set_v8_flags(&flags);
+    }
+
     let global_proxy = args.proxy.clone();
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, storage_dir }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
-            if let Some(ref dir) = storage_dir {
-                tracing::info!("Storage dir: {}", dir.display());
-            }
+            reject_stealth_with_socks5(proxy.as_deref(), stealth)?;
             print_banner(port);
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
@@ -222,16 +265,21 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_host(port, &host, proxy, stealth, user_agent, storage_dir).await?;
+                obscura_cdp::start_with_host_and_security(
+                    port, &host, proxy, stealth, user_agent, allow_file_access,
+                ).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir).await?;
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
+            reject_stealth_with_socks5(global_proxy.as_deref(), stealth)?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
         }
         Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+            let mcp_proxy = merge_proxy(global_proxy.clone(), proxy.clone());
+            reject_stealth_with_socks5(mcp_proxy.as_deref(), stealth)?;
             if http {
                 obscura_mcp::http::run(port, proxy, user_agent, stealth).await?;
             } else {
@@ -390,14 +438,24 @@ async fn run_fetch(
     output: Option<std::path::PathBuf>,
     quiet: bool,
     proxy: Option<String>,
-    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let context = if let Some(ref dir) = storage_dir {
-        Arc::new(BrowserContext::with_storage("fetch".to_string(), Some(dir.clone())))
-    } else {
-        Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth))
-    };
-    let ctx_for_save = context.clone();
+    // --dump original short-circuits the browser stack entirely: fetch the raw
+    // response body via HTTP and stream the bytes verbatim. Useful for binary
+    // payloads (images, fonts, …) and any non-HTML resource where parsing the
+    // body through the DOM/JS layer would corrupt or discard data.
+    if dump == DumpFormat::Original {
+        let bytes = fetch_original_bytes(
+            url_str,
+            proxy,
+            user_agent.clone(),
+            timeout_secs,
+        )
+        .await?;
+        write_or_print_bytes(&bytes, output.as_ref()).await?;
+        return Ok(());
+    }
+
+    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth));
     let mut page = Page::new("fetch-page".to_string(), context);
 
     if let Some(ref ua) = user_agent {
@@ -446,13 +504,38 @@ async fn run_fetch(
         DumpFormat::Text => dump_text(&mut page),
         DumpFormat::Links => dump_links(&page),
         DumpFormat::Markdown => dump_markdown(&mut page),
+        // Handled above via the short-circuit branch; unreachable here.
+        DumpFormat::Original => unreachable!("Original dump handled before page navigation"),
     };
     write_or_print(rendered, output.as_ref()).await?;
 
-    // Save cookies to disk if storage_dir is configured
-    ctx_for_save.save_cookies();
-
     Ok(())
+}
+
+async fn fetch_original_bytes(
+    url_str: &str,
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    timeout_secs: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let url = url::Url::parse(url_str)
+        .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
+
+    let client = obscura_net::ObscuraHttpClient::with_options(
+        Arc::new(obscura_net::CookieJar::new()),
+        proxy.as_deref(),
+    );
+    if let Some(ua) = user_agent {
+        client.set_user_agent(&ua).await;
+    }
+
+    let response = match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+    };
+
+    Ok(response.body)
 }
 
 async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
@@ -462,6 +545,30 @@ async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) ->
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
     } else {
         println!("{}", content);
+    }
+    Ok(())
+}
+
+async fn write_or_print_bytes(
+    bytes: &[u8],
+    output: Option<&std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if let Some(path) = output {
+        tokio::fs::write(path, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    } else {
+        // Write raw bytes to stdout — never println! (would append a newline
+        // and break binary payloads like JPEG/PNG).
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write to stdout: {}", e))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {}", e))?;
     }
     Ok(())
 }
@@ -845,11 +952,95 @@ fn dump_links(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_readable_text, is_quiet_command, merge_proxy, select_log_filter, write_or_print,
-        Args, Command,
+        extract_readable_text, fetch_original_bytes, is_quiet_command, merge_proxy,
+        normalize_v8_flags, reject_stealth_with_socks5, select_log_filter, write_or_print,
+        write_or_print_bytes, Args, Command, DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    // Issue #117 — `--dump original` short-circuits the browser stack and
+    // streams the raw response body verbatim, including for binary payloads.
+    //
+    // Two tests below pin the behaviour:
+    //   1. clap accepts `--dump original` as a valid DumpFormat variant.
+    //   2. `fetch_original_bytes` returns the exact bytes a `file://` URL
+    //      points at (binary-safe round-trip — no UTF-8 decode, no trailing
+    //      newline, no DOM mutation).
+    //   3. `write_or_print_bytes` writes raw bytes to a file without the
+    //      trailing newline that `println!` would add.
+    #[test]
+    fn parsed_fetch_dump_original_is_accepted_by_clap() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--dump",
+            "original",
+            "https://example.com/image.jpg",
+        ])
+        .expect("clap should accept --dump original");
+        match args.command {
+            Some(Command::Fetch { dump, .. }) => {
+                assert_eq!(dump, DumpFormat::Original);
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_original_bytes_returns_file_contents_verbatim() {
+        // A real binary payload: a 1×1 transparent PNG (89 50 4E 47 …) —
+        // exactly the kind of resource #117 wants to stream without HTML/
+        // JS rendering.
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-original-test-{}.png",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        tokio::fs::write(&path, PNG_BYTES)
+            .await
+            .expect("seed temp PNG fixture");
+
+        let file_url = format!("file://{}", path.display());
+        let bytes = fetch_original_bytes(&file_url, None, None, 5)
+            .await
+            .expect("fetch_original_bytes should round-trip the file body");
+
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(bytes, PNG_BYTES, "raw response body must match the file byte-for-byte");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_or_print_bytes_writes_without_trailing_newline() {
+        // Regression guard for #117: stdout must receive raw bytes. The file
+        // path used here exercises the file-output branch — println!-style
+        // output (used by write_or_print) would append a 0x0A byte and
+        // corrupt binary payloads. write_or_print_bytes must not.
+        let payload: &[u8] = &[0x00, 0xFF, b'h', b'i', 0x00];
+        let path = std::env::temp_dir().join(format!(
+            "obscura-write-bytes-test-{}.bin",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+
+        write_or_print_bytes(payload, Some(&path))
+            .await
+            .expect("write_or_print_bytes should write the file");
+
+        let read_back = tokio::fs::read(&path).await.expect("read back");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(read_back, payload, "file bytes must match the payload exactly");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn write_or_print_writes_output_file_with_tokio_fs() {
@@ -920,6 +1111,131 @@ mod tests {
     #[test]
     fn no_subcommand_is_not_quiet() {
         assert!(!is_quiet_command(&None));
+    }
+
+    #[test]
+    fn parsed_v8_flags_global_arg() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "--max-old-space-size=4096 --max-semi-space-size=64",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept --v8-flags as a global arg");
+        assert_eq!(
+            args.v8_flags.as_deref(),
+            Some("--max-old-space-size=4096 --max-semi-space-size=64"),
+        );
+    }
+
+    #[test]
+    fn v8_flags_default_is_none() {
+        let args = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
+            .expect("clap should accept fetch without --v8-flags");
+        assert!(args.v8_flags.is_none());
+    }
+
+    #[test]
+    fn parsed_v8_flags_with_serve_subcommand() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "--max-old-space-size=2048",
+            "serve",
+            "--port",
+            "9333",
+        ])
+        .expect("clap should accept --v8-flags with serve");
+        assert_eq!(args.v8_flags.as_deref(), Some("--max-old-space-size=2048"));
+    }
+
+    #[test]
+    fn parsed_v8_flags_with_scrape_subcommand() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "--expose-gc",
+            "scrape",
+            "https://a.com",
+            "https://b.com",
+        ])
+        .expect("clap should accept --v8-flags with scrape");
+        assert_eq!(args.v8_flags.as_deref(), Some("--expose-gc"));
+    }
+
+    #[test]
+    fn parsed_v8_flags_empty_string_is_accepted() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--v8-flags",
+            "",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept empty --v8-flags value");
+        assert_eq!(args.v8_flags.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn normalize_v8_flags_returns_none_when_unset() {
+        assert_eq!(normalize_v8_flags(None), None);
+    }
+
+    #[test]
+    fn normalize_v8_flags_returns_none_for_empty_or_whitespace() {
+        assert_eq!(normalize_v8_flags(Some("")), None);
+        assert_eq!(normalize_v8_flags(Some("   ")), None);
+        assert_eq!(normalize_v8_flags(Some("\t\n")), None);
+    }
+
+    #[test]
+    fn normalize_v8_flags_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_v8_flags(Some("  --max-old-space-size=4096  ")).as_deref(),
+            Some("--max-old-space-size=4096"),
+        );
+    }
+
+    #[test]
+    fn normalize_v8_flags_preserves_multi_flag_string() {
+        let input = "--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc";
+        assert_eq!(normalize_v8_flags(Some(input)).as_deref(), Some(input));
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_passes_when_no_stealth() {
+        assert!(reject_stealth_with_socks5(Some("socks5://127.0.0.1:1080"), false).is_ok());
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_passes_when_no_proxy() {
+        assert!(reject_stealth_with_socks5(None, true).is_ok());
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_passes_for_http_proxy() {
+        assert!(reject_stealth_with_socks5(Some("http://127.0.0.1:8080"), true).is_ok());
+        assert!(reject_stealth_with_socks5(Some("https://proxy.example:443"), true).is_ok());
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_fails_for_socks5() {
+        let err = reject_stealth_with_socks5(Some("socks5://127.0.0.1:9999"), true).unwrap_err();
+        assert!(err.to_string().contains("SOCKS5"));
+        assert!(err.to_string().contains("--stealth"));
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_fails_for_socks5h() {
+        let err = reject_stealth_with_socks5(Some("socks5h://127.0.0.1:9999"), true).unwrap_err();
+        assert!(err.to_string().contains("SOCKS5"));
+    }
+
+    #[test]
+    fn reject_stealth_with_socks5_is_case_insensitive() {
+        let err = reject_stealth_with_socks5(Some("SOCKS5://127.0.0.1:9999"), true).unwrap_err();
+        assert!(err.to_string().contains("SOCKS5"));
     }
 
     #[test]
