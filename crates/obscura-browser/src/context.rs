@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
@@ -11,6 +12,7 @@ pub struct BrowserContext {
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
     pub stealth: bool,
+    pub storage_dir: Option<PathBuf>,
     /// When true, CDP-driven navigation to file:// URLs is permitted.
     /// Default is false: a remote CDP client cannot point the browser
     /// at /etc/shadow even if Obscura is running as a privileged user.
@@ -34,6 +36,70 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth: false,
+            storage_dir: None,
+            allow_file_access: false,
+        }
+    }
+
+    /// Create a BrowserContext with an optional storage directory.
+    /// When `storage_dir` is set, cookies are automatically loaded from
+    /// `{storage_dir}/cookies.json` on creation.
+    pub fn with_storage(
+        id: String,
+        storage_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::_new_inner(id, None, false, None, storage_dir)
+    }
+
+    fn _new_inner(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<PathBuf>,
+    ) -> Self {
+        let cookie_jar = Arc::new(CookieJar::new());
+
+        // Restore cookies from disk if storage_dir is configured
+        if let Some(ref dir) = storage_dir {
+            let cookie_path = dir.join("cookies.json");
+            if cookie_path.exists() {
+                match cookie_jar.load_from_file(&cookie_path) {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Loaded {} cookies from {}", n, cookie_path.display());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to load cookies from {}: {}", cookie_path.display(), e);
+                    }
+                }
+            }
+        }
+
+        let mut client = ObscuraHttpClient::with_options(
+            cookie_jar.clone(),
+            proxy_url.as_deref(),
+        );
+        if stealth {
+            client.block_trackers = true;
+        }
+        let resolved_ua = user_agent.unwrap_or_else(|| {
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string()
+        });
+        if let Ok(mut guard) = client.user_agent.try_write() {
+            *guard = resolved_ua.clone();
+        }
+        let http_client = Arc::new(client);
+        BrowserContext {
+            id,
+            cookie_jar,
+            http_client,
+            user_agent: resolved_ua,
+            proxy_url,
+            robots_cache: Arc::new(RobotsCache::new()),
+            obey_robots: false,
+            stealth,
+            storage_dir,
             allow_file_access: false,
         }
     }
@@ -48,39 +114,25 @@ impl BrowserContext {
         stealth: bool,
         user_agent: Option<String>,
     ) -> Self {
-        let cookie_jar = Arc::new(CookieJar::new());
-        let mut client = ObscuraHttpClient::with_options(
-            cookie_jar.clone(),
-            proxy_url.as_deref(),
-        );
-        if stealth {
-            client.block_trackers = true;
-        }
-        let resolved_ua = user_agent.unwrap_or_else(|| {
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string()
-        });
-        // Sync the http client's UA at construction so navigation requests pick it
-        // up before any async setup runs. The lock has no other holders here, so
-        // try_write always succeeds; we fall back silently if it ever fails.
-        if let Ok(mut guard) = client.user_agent.try_write() {
-            *guard = resolved_ua.clone();
-        }
-        let http_client = Arc::new(client);
-        BrowserContext {
-            id,
-            cookie_jar,
-            http_client,
-            user_agent: resolved_ua,
-            proxy_url,
-            robots_cache: Arc::new(RobotsCache::new()),
-            obey_robots: false,
-            stealth,
-            allow_file_access: false,
-        }
+        Self::_new_inner(id, proxy_url, stealth, user_agent, None)
     }
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {
         Self::with_options(id, proxy_url, false)
+    }
+
+    /// Persist cookies to disk if storage_dir is configured.
+    /// Called during graceful shutdown.
+    pub fn save_cookies(&self) {
+        if let Some(ref dir) = self.storage_dir {
+            let _ = std::fs::create_dir_all(dir);
+            let cookie_path = dir.join("cookies.json");
+            if let Err(e) = self.cookie_jar.save_to_file(&cookie_path) {
+                tracing::warn!("Failed to save cookies to {}: {}", cookie_path.display(), e);
+            } else {
+                tracing::info!("Saved cookies to {}", cookie_path.display());
+            }
+        }
     }
 }
 

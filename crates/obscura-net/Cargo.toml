@@ -17,6 +17,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
 wreq-util = { version = "3.0.0-rc.10", optional = true }
+tempfile = "3"
 
 # `prefix-symbols` renames BoringSSL exports to avoid clashes with system OpenSSL,
 # but the renaming is only correct on Linux and Android (per wreq's README).

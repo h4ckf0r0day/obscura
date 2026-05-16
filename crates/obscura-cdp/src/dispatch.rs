@@ -60,20 +60,45 @@ impl CdpContext {
         Self::new_with_security(proxy, stealth, user_agent, false)
     }
 
+    pub fn new_with_storage(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::_new_inner(proxy, stealth, user_agent, storage_dir, false)
+    }
+
     pub fn new_with_security(
         proxy: Option<String>,
         stealth: bool,
         user_agent: Option<String>,
         allow_file_access: bool,
     ) -> Self {
-        let mut ctx = BrowserContext::with_full_options(
-            "default".to_string(),
-            proxy,
-            stealth,
-            user_agent,
-        );
-        ctx.allow_file_access = allow_file_access;
-        let default_context = Arc::new(ctx);
+        Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access)
+    }
+
+    pub(crate) fn _new_inner(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<std::path::PathBuf>,
+        allow_file_access: bool,
+    ) -> Self {
+        let default_context = if let Some(ref dir) = storage_dir {
+            let mut ctx = BrowserContext::with_storage("default".to_string(), Some(dir.clone()));
+            ctx.allow_file_access = allow_file_access;
+            Arc::new(ctx)
+        } else {
+            let mut ctx = BrowserContext::with_full_options(
+                "default".to_string(),
+                proxy,
+                stealth,
+                user_agent,
+            );
+            ctx.allow_file_access = allow_file_access;
+            Arc::new(ctx)
+        };
         // Pre-seed with the default-frame execution context ids that
         // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
         // via Runtime.executionContextCreated. Anything else has to be
