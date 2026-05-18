@@ -791,7 +791,7 @@ class Document extends Node {
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get contentType() { return "text/html"; }
-  get readyState() { return "complete"; }
+  get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
@@ -805,6 +805,7 @@ class Document extends Node {
   }
   getElementsByTagName(t) { return this.querySelectorAll(t); }
   getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
     if (el && t.toLowerCase() === 'template') {
@@ -853,7 +854,23 @@ class Document extends Node {
     return new Cls('');
   }
   createRange() { return { setStart(){}, setEnd(){}, collapse(){}, selectNodeContents(){}, cloneContents(){ return document.createDocumentFragment(); } }; }
-  addEventListener(type, fn, opts) {} removeEventListener() {} dispatchEvent() { return true; }
+  addEventListener(type, fn, opts) {
+    if (typeof fn !== 'function') return;
+    if (!this._listeners) this._listeners = {};
+    if (!this._listeners[type]) this._listeners[type] = [];
+    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+  }
+  removeEventListener(type, fn) {
+    if (this._listeners?.[type]) {
+      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+    }
+  }
+  dispatchEvent(event) {
+    if (!event) return true;
+    const handlers = (this._listeners?.[event.type] || []).slice();
+    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
+    return !event.defaultPrevented;
+  }
   createTreeWalker(root, whatToShow, filter) {
     whatToShow = whatToShow || 0xFFFFFFFF; // NodeFilter.SHOW_ALL
     const walker = {

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{ObscuraHttpClient, ObscuraNetError, Response};
@@ -7,6 +8,48 @@ use url::Url;
 
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
+
+fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    if meta.split(';').any(|t| t.eq_ignore_ascii_case("base64")) {
+        let cleaned: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+        BASE64.decode(cleaned).ok()
+    } else {
+        Some(percent_decode(payload))
+    }
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = hex_val(b[i + 1]);
+            let lo = hex_val(b[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
 
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
@@ -364,6 +407,13 @@ impl Page {
             }
         }
 
+        // Spec: readyState is "loading" while parser-discovered scripts execute.
+        // Scripts that check readyState === 'loading' will register DOMContentLoaded
+        // listeners instead of calling their callback immediately.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script("<ready-state>", "globalThis.__documentReadyState__ = 'loading';");
+        }
+
         for (i, script) in all_to_execute.iter().enumerate() {
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
@@ -417,10 +467,15 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
+            // Spec order: readyState -> interactive, fire DOMContentLoaded on both
+            // document and window, then readyState -> complete, fire load.
             let _ = js.execute_script("<load-events>",
-                "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('load')); } catch(e) {}");
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 globalThis.__documentReadyState__ = 'complete';\n\
+                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
         }
 
         if let Some(js) = &mut self.js {
@@ -556,7 +611,18 @@ impl Page {
             }
         }
 
-        let response = if method == "POST" {
+        let response = if url.scheme() == "data" {
+            let content_type = url_str.strip_prefix("data:")
+                .and_then(|s| s.split(',').next())
+                .unwrap_or("text/html")
+                .split(';').next()
+                .unwrap_or("text/html")
+                .to_string();
+            let body_bytes = decode_data_uri(url_str).unwrap_or_default();
+            let mut headers = std::collections::HashMap::new();
+            headers.insert("content-type".to_string(), content_type);
+            Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
+        } else if method == "POST" {
             self.http_client.post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
