@@ -371,6 +371,38 @@ class CharacterData extends Node {
   }
 }
 
+// ChildNode mixin for CharacterData (Text, Comment) — spec requires
+// before(), after(), replaceWith(), remove() on Text and Comment nodes.
+CharacterData.prototype.remove = function() {
+  if (this.parentNode) this.parentNode.removeChild(this);
+};
+CharacterData.prototype.before = function(...nodes) {
+  const parent = this.parentNode;
+  if (!parent) return;
+  for (const n of nodes) {
+    if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
+    else parent.insertBefore(n, this);
+  }
+};
+CharacterData.prototype.after = function(...nodes) {
+  const parent = this.parentNode;
+  if (!parent) return;
+  const ref = this.nextSibling;
+  for (const n of nodes) {
+    if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), ref);
+    else parent.insertBefore(n, ref);
+  }
+};
+CharacterData.prototype.replaceWith = function(...nodes) {
+  const parent = this.parentNode;
+  if (!parent) return;
+  for (const n of nodes) {
+    if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
+    else parent.insertBefore(n, this);
+  }
+  parent.removeChild(this);
+};
+
 class Text extends CharacterData {
   get nodeName() { return "#text"; }
   get nodeType() { return 3; }
@@ -758,7 +790,9 @@ class Element extends Node {
     };
   }
   getAnimations() { return []; }
-  get isConnected() { return true; }
+  // isConnected is defined correctly on Node.prototype (walking the parent chain).
+  // Defining it here as always-true shadows that correct implementation, causing
+  // detached Elements to report isConnected === true after remove().
   after() {} before() {} remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
   prepend() {}
@@ -2054,9 +2088,21 @@ globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<
 globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
-const _mkStore = () => { const s={}; return { getItem:k=>s[k]??null, setItem:(k,v)=>{s[k]=String(v);}, removeItem:k=>{delete s[k];}, clear:()=>{for(const k in s)delete s[k];}, get length(){return Object.keys(s).length;}, key:i=>Object.keys(s)[i]??null }; };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+class Storage {
+  constructor() {
+    const s = {};
+    this._s = s;
+  }
+  getItem(k) { return this._s[k] ?? null; }
+  setItem(k, v) { this._s[k] = String(v); }
+  removeItem(k) { delete this._s[k]; }
+  clear() { for (const k in this._s) delete this._s[k]; }
+  get length() { return Object.keys(this._s).length; }
+  key(i) { return Object.keys(this._s)[i] ?? null; }
+}
+globalThis.Storage = Storage;
+globalThis.localStorage = new Storage();
+globalThis.sessionStorage = new Storage();
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
@@ -2150,6 +2196,10 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
   Node.prototype.contains, Node.prototype.hasChildNodes, Node.prototype.cloneNode,
+  CharacterData.prototype.before, CharacterData.prototype.after,
+  CharacterData.prototype.replaceWith, CharacterData.prototype.remove,
+  Storage, Storage.prototype.getItem, Storage.prototype.setItem,
+  Storage.prototype.removeItem, Storage.prototype.clear,
   Document.prototype.getElementById, Document.prototype.querySelector,
   Document.prototype.querySelectorAll, Document.prototype.getElementsByTagName,
   Document.prototype.createElement, Document.prototype.createElementNS,

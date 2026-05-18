@@ -288,6 +288,56 @@ impl DomTree {
     }
 
     pub fn detach(&self, node_id: NodeId) {
+        // Collect IDs to clean from the index before taking the mutable borrow.
+        // Only clean IDs when the node is actually attached to a parent —
+        // append_child calls detach() defensively on newly-created nodes, and
+        // we must not strip their IDs from the index before they're ever used.
+        let ids_to_clean: Vec<String> = {
+            let inner = self.inner.borrow();
+            let node_has_parent = inner.nodes.get(node_id.index())
+                .and_then(|n| n.as_ref())
+                .map(|n| n.parent.is_some())
+                .unwrap_or(false);
+            if !node_has_parent {
+                Vec::new()
+            } else {
+            let mut ids = Vec::new();
+            // Check the node itself
+            if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+                if let Some(id_val) = node.get_attribute("id") {
+                    ids.push(id_val.to_string());
+                }
+            }
+            // Walk descendants
+            let mut stack: Vec<NodeId> = Vec::new();
+            if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+                let mut child = node.first_child;
+                while let Some(cid) = child {
+                    stack.push(cid);
+                    child = inner.nodes.get(cid.index())
+                        .and_then(|n| n.as_ref())
+                        .and_then(|n| n.next_sibling);
+                }
+            }
+            while let Some(current) = stack.pop() {
+                if let Some(Some(node)) = inner.nodes.get(current.index()) {
+                    if let Some(id_val) = node.get_attribute("id") {
+                        ids.push(id_val.to_string());
+                    }
+                    let mut child = node.first_child;
+                    while let Some(cid) = child {
+                        stack.push(cid);
+                        child = inner.nodes.get(cid.index())
+                            .and_then(|n| n.as_ref())
+                            .and_then(|n| n.next_sibling);
+                    }
+                }
+            }
+            ids
+            }
+        };
+
+        // Now take the mutable borrow for the structural changes.
         let mut inner = self.inner.borrow_mut();
 
         let (parent_id, prev_id, next_id) = match inner.nodes.get(node_id.index()).and_then(|n| n.as_ref()) {
@@ -319,6 +369,11 @@ impl DomTree {
             node.parent = None;
             node.prev_sibling = None;
             node.next_sibling = None;
+        }
+
+        // Clean the ID index for the detached subtree.
+        for id_str in &ids_to_clean {
+            inner.id_index.remove(id_str);
         }
     }
 
