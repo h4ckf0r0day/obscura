@@ -49,6 +49,10 @@ pub struct ObscuraState {
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
+    // Queue of (binding_name, payload) calls made by page JS via the
+    // `op_binding_called` op. Drained by the CDP layer after each dispatch
+    // and emitted as `Runtime.bindingCalled` events.
+    pub pending_binding_calls: Vec<(String, String)>,
 }
 
 impl ObscuraState {
@@ -64,6 +68,7 @@ impl ObscuraState {
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
+            pending_binding_calls: Vec::new(),
         }
     }
 }
@@ -742,6 +747,16 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
+// Records a binding call from page JS. The CDP layer drains this queue
+// after every dispatch and emits one `Runtime.bindingCalled` event per
+// entry — that's how puppeteer's `page.exposeFunction` callbacks fire.
+#[op2(fast)]
+fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.pending_binding_calls.push((name.to_string(), payload.to_string()));
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -752,6 +767,7 @@ pub fn build_extension() -> Extension {
             op_get_cookies(),
             op_set_cookie(),
             op_navigate(),
+            op_binding_called(),
         ]),
         ..Default::default()
     }

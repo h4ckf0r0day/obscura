@@ -217,6 +217,8 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 
+    drain_binding_calls(ctx);
+
     match result {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
         Err(msg) => {
@@ -224,6 +226,50 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
         }
     }
+}
+
+// Drain every page's binding-call queue (filled by op_binding_called when
+// page JS invokes a `Runtime.addBinding` shim) and turn each entry into a
+// Runtime.bindingCalled CDP event that the writer task forwards to the
+// connected client. Called after every dispatch — binding calls only land
+// in the queue while V8 is running inside a CDP handler, so there is no
+// window in which they could pile up without a draining opportunity.
+fn drain_binding_calls(ctx: &mut CdpContext) {
+    // page_id -> session_id (any one session that holds this page).
+    let page_to_session: HashMap<String, String> = ctx
+        .sessions
+        .iter()
+        .map(|(sid, pid)| (pid.clone(), sid.clone()))
+        .collect();
+
+    let mut events: Vec<CdpEvent> = Vec::new();
+    for page in &mut ctx.pages {
+        let calls = page.take_pending_binding_calls();
+        if calls.is_empty() {
+            continue;
+        }
+        let Some(session_id) = page_to_session.get(&page.id).cloned() else {
+            // No session attached — drop the calls; there is no client to
+            // deliver them to.
+            continue;
+        };
+        for (name, payload) in calls {
+            events.push(CdpEvent {
+                method: "Runtime.bindingCalled".into(),
+                // Use executionContextId=2: the default main-frame context
+                // emitted post-navigation (see domains/page.rs phase1).
+                // Puppeteer matches on session_id + binding name and
+                // tolerates any registered context id.
+                params: json!({
+                    "name": name,
+                    "payload": payload,
+                    "executionContextId": 2,
+                }),
+                session_id: Some(session_id.clone()),
+            });
+        }
+    }
+    ctx.pending_events.extend(events);
 }
 
 async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {

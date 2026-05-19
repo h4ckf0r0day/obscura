@@ -1035,6 +1035,14 @@ impl Page {
         }
     }
 
+    pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
+        if let Some(js) = &self.js {
+            js.take_pending_binding_calls()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
         self.preload_scripts = scripts;
     }
