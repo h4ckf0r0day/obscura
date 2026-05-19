@@ -16,6 +16,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                         "title": "",
                         "url": "",
                         "attached": true,
+                        "canAccessOpener": false,
                         "browserContextId": "",
                     }
                 }),
@@ -30,6 +31,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": false,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         }
                     }),
@@ -48,6 +50,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                         "title": page.title,
                         "url": page.url_string(),
                         "attached": true,
+                        "canAccessOpener": false,
                         "browserContextId": page.context.id,
                     })
                 })
@@ -90,6 +93,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": false,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         }
                     }),
@@ -107,6 +111,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": true,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         },
                         "waitingForDebugger": false,
@@ -133,6 +138,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                         "title": "",
                         "url": "",
                         "attached": true,
+                        "canAccessOpener": false,
                         "browserContextId": "",
                     },
                     "waitingForDebugger": false,
@@ -158,6 +164,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": true,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         },
                         "waitingForDebugger": false,
@@ -211,6 +218,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": true,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         }
                     }))
@@ -223,6 +231,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": "",
                             "url": "",
                             "attached": true,
+                            "canAccessOpener": false,
                         }
                     }))
                 }
