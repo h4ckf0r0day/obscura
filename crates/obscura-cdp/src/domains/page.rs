@@ -50,18 +50,17 @@ async fn do_navigate(
         let frame_id = page.frame_id.clone();
         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
+        // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
+        // must run BEFORE the page's own scripts (CDP contract). Hand them to
+        // the page so navigate_single can inject them at the right point.
+        page.set_preload_scripts(preload_scripts);
+
         let nav_method = params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
         if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await.map_err(|e| e.to_string())?;
         } else {
             page.navigate_with_wait(url, wait_until).await.map_err(|e| e.to_string())?;
-        }
-
-        for source in &preload_scripts {
-            if let Err(e) = page.execute_preload_script(source) {
-                tracing::debug!("Preload script error: {}", e);
-            }
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
