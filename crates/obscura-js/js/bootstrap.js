@@ -1873,52 +1873,6 @@ _markNative(XMLHttpRequest.prototype.setRequestHeader);
 _markNative(XMLHttpRequest.prototype.getResponseHeader);
 _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 
-if (typeof URL === 'undefined' || !URL.prototype) {
-  globalThis.URL = class URL {
-    constructor(url, base) {
-      // Per WHATWG URL spec, both arguments are stringified — callers
-      // routinely pass `window.location` (Location object) or a URL
-      // instance as `base`. Coerce explicitly so the regex .match() calls
-      // below don't blow up on non-strings.
-      url = String(url);
-      if (base !== undefined && base !== null) base = String(base);
-      let full = url;
-      if (base && !url.includes('://')) {
-        var bm = base.match(/^(https?:\/\/[^\/\?#]+)(\/[^?#]*)?/);
-        if (bm) {
-          var bOrigin = bm[1];
-          var bPath = bm[2] || '/';
-          if (url.startsWith('/')) {
-            full = bOrigin + url;
-          } else if (url.startsWith('?') || url.startsWith('#')) {
-            full = bOrigin + bPath + url;
-          } else {
-            var dir = bPath.substring(0, bPath.lastIndexOf('/') + 1);
-            full = bOrigin + dir + url;
-          }
-        }
-      }
-      const m = full.match(/^(https?):\/\/([^\/\?#]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-      if (m) {
-        this.protocol = m[1] + ':';
-        this.host = m[2]; this.hostname = m[2].split(':')[0];
-        this.port = m[2].includes(':') ? m[2].split(':')[1] : '';
-        this.pathname = m[3] || '/';
-        this.search = m[4] || ''; this.hash = m[5] || '';
-      } else {
-        this.protocol = ''; this.host = ''; this.hostname = '';
-        this.port = ''; this.pathname = full; this.search = ''; this.hash = '';
-      }
-      this.href = full; this.origin = this.protocol + '//' + this.host;
-      this.searchParams = new URLSearchParams(this.search);
-    }
-    toString() { return this.href; }
-    toJSON() { return this.href; }
-    static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
-    static revokeObjectURL() {}
-  };
-}
-
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function requestIdleCallback(cb, opts) {
   const start = Date.now();
   return setTimeout(() => {
@@ -2560,25 +2514,6 @@ globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
-  constructor(init=""){
-    this._p=[];
-    if(typeof init==="string"){
-      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(decodeURIComponent(k),decodeURIComponent(v.join("=")));});
-    } else if (init && typeof init[Symbol.iterator] === 'function') {
-      for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
-    } else if (init && typeof init === 'object') {
-      Object.keys(init).forEach(k => this.append(k, init[k]));
-    }
-  }
-  append(k,v){this._p.push([String(k),String(v)]);}
-  get(k){const p=this._p.find(([key])=>key===String(k)); return p?p[1]:null;}
-  set(k,v){this.delete(k); this.append(k,v);}
-  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k);}
-  has(k){k=String(k); return this._p.some(([key])=>key===k);}
-  toString(){return this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");}
-  forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
-};
 
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
@@ -4058,12 +3993,6 @@ if (typeof SharedWorker === 'undefined') {
 }
 if (typeof ServiceWorkerContainer === 'undefined') {
   globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
-}
-
-if (typeof URLPattern === 'undefined') {
-  globalThis.URLPattern = class URLPattern {
-    constructor(pattern){this._pattern=pattern||{};} test(){return false;} exec(){return null;}
-  };
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {

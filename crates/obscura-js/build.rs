@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
+#[path = "src/deno_extensions.rs"]
+mod deno_extensions;
+
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=src/deno_extensions.rs");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -14,7 +18,7 @@ fn main() {
             cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
             startup_snapshot: None,
             skip_op_registration: true,
-            extensions: vec![],
+            extensions: deno_extensions::build(),
             extension_transpiler: None,
             with_runtime_cb: Some(Box::new(move |runtime| {
                 runtime

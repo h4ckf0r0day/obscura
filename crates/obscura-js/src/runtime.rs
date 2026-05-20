@@ -5,6 +5,7 @@ use std::rc::Rc;
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
 
+use crate::deno_extensions;
 use crate::module_loader::ObscuraModuleLoader;
 use crate::ops::{build_extension, ObscuraState};
 
@@ -45,8 +46,11 @@ impl ObscuraJsRuntime {
 
         let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
 
+        let mut extensions = deno_extensions::build();
+        extensions.push(build_extension());
+
         let mut runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![build_extension()],
+            extensions,
             module_loader: Some(module_loader),
             startup_snapshot: Some(SNAPSHOT),
             ..Default::default()
