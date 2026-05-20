@@ -186,21 +186,6 @@ globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
-class MessageChannel {
-  constructor() {
-    this.port1 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port2 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port1.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port2.onmessage) this.port2.onmessage({ data }); });
-    };
-    this.port2.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port1.onmessage) this.port1.onmessage({ data }); });
-    };
-  }
-}
-globalThis.MessageChannel = MessageChannel;
-globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
-
 class CSSStyleDeclaration {
   constructor() { this._props = {}; }
   setProperty(name, value) { this._props[name] = String(value); }
@@ -648,8 +633,13 @@ class Element extends Node {
   }
   dispatchEvent(event) {
     if (!event) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
+    // deno_web's Event has getter-only `target` and `currentTarget`; use
+    // defineProperty so our DOM-side dispatch (which doesn't go through the
+    // native EventTarget machinery) can still set them.
+    if (!event.target) {
+      Object.defineProperty(event, 'target', { value: this, writable: true, configurable: true });
+    }
+    Object.defineProperty(event, 'currentTarget', { value: this, writable: true, configurable: true });
     // Spec: inline `onclick="..."` content attributes are event handlers
     // for the matching event type. Fire them alongside any
     // addEventListener handlers. Also honor the IDL property
@@ -2026,45 +2016,6 @@ globalThis.ResizeObserver = class ResizeObserver {
   disconnect() { this._connected = false; this._targets.clear(); }
 };
 
-if (typeof TextEncoder === 'undefined') {
-  globalThis.TextEncoder = class TextEncoder {
-    get encoding() { return 'utf-8'; }
-    encode(str) {
-      str = String(str);
-      const buf = [];
-      for (let i = 0; i < str.length; i++) {
-        let c = str.charCodeAt(i);
-        if (c < 0x80) buf.push(c);
-        else if (c < 0x800) { buf.push(0xC0|(c>>6), 0x80|(c&0x3F)); }
-        else if (c < 0xD800 || c >= 0xE000) { buf.push(0xE0|(c>>12), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); }
-        else { c = 0x10000 + (((c & 0x3FF) << 10) | (str.charCodeAt(++i) & 0x3FF)); buf.push(0xF0|(c>>18), 0x80|((c>>12)&0x3F), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); }
-      }
-      return new Uint8Array(buf);
-    }
-    encodeInto(str, dest) { const enc = this.encode(str); dest.set(enc.slice(0, dest.length)); return { read: str.length, written: Math.min(enc.length, dest.length) }; }
-  };
-}
-if (typeof TextDecoder === 'undefined') {
-  globalThis.TextDecoder = class TextDecoder {
-    constructor(label) { this.encoding = label || 'utf-8'; }
-    decode(buf) {
-      if (!buf) return '';
-      const bytes = ArrayBuffer.isView(buf)
-        ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
-        : new Uint8Array(buf);
-      let str = '', i = 0;
-      while (i < bytes.length) {
-        let c = bytes[i++];
-        if (c < 0x80) str += String.fromCharCode(c);
-        else if (c < 0xE0) str += String.fromCharCode(((c&0x1F)<<6)|(bytes[i++]&0x3F));
-        else if (c < 0xF0) { const b1=bytes[i++], b2=bytes[i++]; str += String.fromCharCode(((c&0x0F)<<12)|((b1&0x3F)<<6)|(b2&0x3F)); }
-        else { const b1=bytes[i++], b2=bytes[i++], b3=bytes[i++]; const cp=((c&0x07)<<18)|((b1&0x3F)<<12)|((b2&0x3F)<<6)|(b3&0x3F); if(cp>0xFFFF){const s=cp-0x10000;str+=String.fromCharCode(0xD800+(s>>10),0xDC00+(s&0x3FF));}else str+=String.fromCharCode(cp); }
-      }
-      return str;
-    }
-  };
-}
-
 globalThis.matchMedia = _markNative(function matchMedia(q) { return { matches: false, media: q, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} }; });
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
@@ -2466,29 +2417,29 @@ globalThis.IntersectionObserver = class IntersectionObserver {
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
-globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return true; }
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
-};
-globalThis.CustomEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.detail=o.detail; }
-  // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
-  // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
-  // instead of new CustomEvent(...). See issue #41.
-  initCustomEvent(type,bubbles,cancelable,detail) {
-    this.type = type;
-    this.bubbles = !!bubbles;
-    this.cancelable = !!cancelable;
-    this.detail = detail;
-  }
-};
+// Event, CustomEvent, ErrorEvent, MessageEvent, ProgressEvent, CloseEvent,
+// PromiseRejectionEvent, EventTarget, AbortController, AbortSignal,
+// Blob, File, and FileReader are provided by `deno_web` (V8/ICU-native).
+// The DOM-specific Event subclasses below extend the native Event.
+
+// Legacy DOM Level 2 method some pages still rely on (see issue #41:
+// Starbucks China bundle, older analytics shims call createEvent +
+// initCustomEvent instead of `new CustomEvent`). deno_web only ships the
+// modern API, so we re-attach this on the prototype. Uses defineProperty
+// because deno_web's `type`/`bubbles`/`cancelable` are getter-only.
+if (!CustomEvent.prototype.initCustomEvent) {
+  CustomEvent.prototype.initCustomEvent = function(type, bubbles, cancelable, detail) {
+    Object.defineProperty(this, 'type', { value: type, writable: true, configurable: true });
+    Object.defineProperty(this, 'bubbles', { value: !!bubbles, writable: true, configurable: true });
+    Object.defineProperty(this, 'cancelable', { value: !!cancelable, writable: true, configurable: true });
+    Object.defineProperty(this, 'detail', { value: detail, writable: true, configurable: true });
+  };
+}
+
 globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
 globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
 globalThis.FocusEvent = class extends Event {};
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
-globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
@@ -2505,14 +2456,12 @@ globalThis.PopStateEvent = class extends Event {
   }
 };
 globalThis.HashChangeEvent = class extends Event {};
-globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
-globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
-globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
-if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
-if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
+// FormData is not in deno_web (it ships in deno_fetch, which we deliberately
+// avoid to keep our SSRF-policed fetch implementation). Keep a minimal stub
+// that now stores real Blobs since the native Blob is available.
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
 
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
@@ -2618,21 +2567,30 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
-globalThis.performance = globalThis.performance || {
-  now: () => Date.now(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
-  setResourceTimingBufferSize(){},
-  timeOrigin: 0,
-  timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
-  navigation: { type: 0, redirectCount: 0 },
-  memory: {
+// `performance` (with sub-ms resolution and proper `mark`/`measure`) comes
+// from deno_web. We patch on the two non-standard properties that real Chrome
+// exposes (`performance.timing` legacy + `performance.memory`) for pages that
+// fingerprint or sniff them — `Performance.prototype` is shared, so this
+// assigns directly on the singleton.
+Object.defineProperty(performance, 'timing', {
+  value: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(performance, 'navigation', {
+  value: { type: 0, redirectCount: 0 },
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(performance, 'memory', {
+  value: {
     jsHeapSizeLimit: 2172649472,
     totalJSHeapSize: 19321856,
     usedJSHeapSize: 16781520,
   },
-};
+  writable: true,
+  configurable: true,
+});
 
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
@@ -2653,9 +2611,9 @@ Object.defineProperty(Document.prototype, 'fonts', {
   },
   configurable: true,
 });
-globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<arr.length;i++) arr[i]=Math.floor(Math.random()*256); return arr; }, randomUUID(){ return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==="x"?r:(r&3|8)).toString(16);}); } };
-globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
-globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
+// `crypto` (Web Crypto API, including secure `crypto.getRandomValues`,
+// `crypto.randomUUID`, and `crypto.subtle`) comes from deno_crypto.
+// `structuredClone` and `reportError` come from deno_web.
 
 globalThis.Storage = function Storage() {};
 Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
@@ -2669,8 +2627,7 @@ const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {};
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
-globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
-globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
+// atob / btoa come from deno_web.
 
 // Functional History API. The earlier stub returned constant state and was a
 // no-op on push/replace, so any SPA that tried to update its URL (Next.js
@@ -2809,7 +2766,10 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
-globalThis.EventTarget = Node;
+// Note: real `EventTarget` comes from deno_web. The DOM `Node` here does not
+// extend it (DOM-side event dispatch is handled in Rust via `_listeners`),
+// so `nodeInstance instanceof EventTarget` is false — matching no real
+// browser, but no observed pages rely on this check.
 globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
 
 [
@@ -3666,97 +3626,11 @@ globalThis.stop = function() {};
 globalThis.postMessage = function() {};
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
-if (typeof ReadableStream === 'undefined') {
-  globalThis.ReadableStream = class ReadableStream {
-    constructor(source = {}, strategy = {}) {
-      this._source = source; this._queue = []; this._closed = false;
-      this.locked = false;
-      if (source.start) source.start({ enqueue: (chunk) => this._queue.push(chunk), close: () => { this._closed = true; }, error: () => {} });
-    }
-    getReader() {
-      this.locked = true;
-      const stream = this;
-      return {
-        read() {
-          if (stream._queue.length > 0) return Promise.resolve({ value: stream._queue.shift(), done: false });
-          if (stream._closed) return Promise.resolve({ value: undefined, done: true });
-          return Promise.resolve({ value: undefined, done: true });
-        },
-        releaseLock() { stream.locked = false; },
-        cancel() { stream._closed = true; return Promise.resolve(); },
-        get closed() { return stream._closed ? Promise.resolve() : new Promise(() => {}); },
-      };
-    }
-    cancel() { this._closed = true; return Promise.resolve(); }
-    pipeTo(dest) { return Promise.resolve(); }
-    pipeThrough(transform) { return transform.readable || new ReadableStream(); }
-    tee() { return [new ReadableStream(), new ReadableStream()]; }
-    [Symbol.asyncIterator]() {
-      const reader = this.getReader();
-      return { next: () => reader.read(), return: () => { reader.releaseLock(); return Promise.resolve({done:true}); } };
-    }
-  };
-}
-if (typeof WritableStream === 'undefined') {
-  globalThis.WritableStream = class WritableStream {
-    constructor(sink = {}) { this._sink = sink; this.locked = false; }
-    getWriter() {
-      this.locked = true;
-      const stream = this;
-      return {
-        write(chunk) { if (stream._sink.write) stream._sink.write(chunk); return Promise.resolve(); },
-        close() { if (stream._sink.close) stream._sink.close(); return Promise.resolve(); },
-        abort() { return Promise.resolve(); },
-        releaseLock() { stream.locked = false; },
-        get ready() { return Promise.resolve(); },
-        get closed() { return Promise.resolve(); },
-        get desiredSize() { return 1; },
-      };
-    }
-    close() { return Promise.resolve(); }
-    abort() { return Promise.resolve(); }
-  };
-}
-if (typeof TransformStream === 'undefined') {
-  globalThis.TransformStream = class TransformStream {
-    constructor(transformer = {}) {
-      this.readable = new ReadableStream();
-      this.writable = new WritableStream();
-    }
-  };
-}
-
-if (!globalThis.crypto) globalThis.crypto = {};
-if (!globalThis.crypto.subtle) {
-  globalThis.crypto.subtle = {
-    async digest(algorithm, data) {
-      // Real WebCrypto digest. Delegates to `op_subtle_digest` which runs
-      // the actual SHA-1/256/384/512 via Rust's `sha1` and `sha2` crates.
-      // The previous JS implementation was a custom FNV variant that
-      // produced bytes shaped like the hash but with wrong contents, so
-      // SRI checks, JWS signature verification, and OAuth PKCE silently
-      // accepted invalid input.
-      const name = (typeof algorithm === 'string' ? algorithm : algorithm?.name) || 'SHA-256';
-      let bytes;
-      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
-      else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      else bytes = new Uint8Array(data || []);
-      const out = Deno.core.ops.op_subtle_digest(name, bytes);
-      return new Uint8Array(out).buffer;
-    },
-    async encrypt() { throw new DOMException('NotSupportedError'); },
-    async decrypt() { throw new DOMException('NotSupportedError'); },
-    async sign() { return new ArrayBuffer(32); },
-    async verify() { return true; },
-    async generateKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-    async importKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-    async exportKey() { return new ArrayBuffer(32); },
-    async deriveBits() { return new ArrayBuffer(32); },
-    async deriveKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-    async wrapKey() { return new ArrayBuffer(32); },
-    async unwrapKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-  };
-}
+// ReadableStream, WritableStream, TransformStream (plus controllers, readers,
+// writers, and queuing strategies) come from deno_web.
+// Web Crypto API (crypto.getRandomValues, randomUUID, crypto.subtle) comes
+// from deno_crypto — real implementations, not the previous Math.random()-
+// backed stubs that were a glaring stealth tell.
 
 if (typeof DOMRect === 'undefined') {
   globalThis.DOMRect = class DOMRect {
@@ -4065,8 +3939,11 @@ globalThis.__obscura_init = function() {
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh;
 
+  // performance.timeOrigin is a getter-only accessor on deno_web's real
+  // Performance, populated from StartTime when the runtime initialises — no
+  // need to (and we can't) reassign it. We still patch `timing` because some
+  // pages read it through the legacy DOM Level 1 surface.
   const t0 = Date.now();
-  globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
 
   const hide = (obj, props) => {

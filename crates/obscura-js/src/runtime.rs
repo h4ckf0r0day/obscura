@@ -2123,4 +2123,193 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!(["menu", "true"]));
     }
+
+    // ---------------------------------------------------------------
+    // deno_web / deno_crypto regression tests.
+    //
+    // These pin the behavioral contract that the hand-rolled polyfills
+    // in bootstrap.js previously *broke* (see ISSUE_deno_web.md). If any
+    // of these start failing after a dep bump, the deno extension wiring
+    // in `deno_extensions.rs` has regressed.
+    // ---------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_blob_preserves_binary_data() {
+        // The old hand-rolled Blob `join("")`-ed its parts as strings, so
+        // `new Blob([Uint8Array]).text()` returned "[object Object]". The
+        // real Blob from deno_web must round-trip bytes intact.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const bytes = new Uint8Array([0xE2, 0x9C, 0x93]); // UTF-8 for U+2713 ✓
+                    const blob = new Blob([bytes]);
+                    return {
+                        size: blob.size,
+                        text: await blob.text(),
+                        buffer: Array.from(new Uint8Array(await blob.arrayBuffer())),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let v = result.value.unwrap();
+        assert_eq!(v["size"].as_u64().unwrap(), 3);
+        assert_eq!(v["text"].as_str().unwrap(), "\u{2713}");
+        assert_eq!(v["buffer"], serde_json::json!([0xE2, 0x9C, 0x93]));
+    }
+
+    #[test]
+    fn test_text_encoder_handles_surrogate_pair() {
+        // A code point above U+FFFF requires a UTF-16 surrogate pair on input
+        // and four UTF-8 bytes on output. The old hand-rolled TextEncoder
+        // mishandled lone-surrogate edge cases; deno_web's ICU-backed
+        // encoder matches V8/Chrome exactly.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                // U+1F600 GRINNING FACE — UTF-8: F0 9F 98 80
+                "Array.from(new TextEncoder().encode('\\uD83D\\uDE00'))",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([0xF0, 0x9F, 0x98, 0x80]));
+    }
+
+    #[test]
+    fn test_structured_clone_preserves_date_and_typed_array() {
+        // Old polyfill was `JSON.parse(JSON.stringify(v))` — silently
+        // turned Date into a string, Uint8Array into an object with
+        // numeric keys, lost circular refs entirely.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const src = { d: new Date(1700000000000), bytes: new Uint8Array([1, 2, 3]) };
+                    const cloned = structuredClone(src);
+                    return {
+                        dateIsDate: cloned.d instanceof Date,
+                        dateMs: cloned.d.getTime(),
+                        bytesIsUint8: cloned.bytes instanceof Uint8Array,
+                        bytesLen: cloned.bytes.length,
+                        firstByte: cloned.bytes[0],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["dateIsDate"], serde_json::json!(true));
+        assert_eq!(result["dateMs"].as_i64().unwrap(), 1700000000000);
+        assert_eq!(result["bytesIsUint8"], serde_json::json!(true));
+        assert_eq!(result["bytesLen"].as_u64().unwrap(), 3);
+        assert_eq!(result["firstByte"].as_u64().unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_abort_controller_fires_abort_event() {
+        // Old stub set `.aborted = true` on `abort()` but never invoked
+        // the listener. Real AbortSignal must actually fire `'abort'`.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const ctrl = new AbortController();
+                    let fired = 0;
+                    ctrl.signal.addEventListener('abort', () => { fired++; });
+                    ctrl.abort();
+                    // Allow microtask draining.
+                    await Promise.resolve();
+                    return { fired, aborted: ctrl.signal.aborted };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let v = result.value.unwrap();
+        assert_eq!(v["fired"].as_u64().unwrap(), 1);
+        assert_eq!(v["aborted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_crypto_get_random_values_has_entropy() {
+        // Old crypto.getRandomValues used Math.random() — a fingerprinting
+        // tell and not actually random across calls in some patterns. The
+        // real CSPRNG from deno_crypto must produce different outputs on
+        // sequential calls (probability of collision over 32 bytes is
+        // negligible).
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const a = new Uint8Array(32); crypto.getRandomValues(a);
+                    const b = new Uint8Array(32); crypto.getRandomValues(b);
+                    let equal = true;
+                    for (let i = 0; i < 32; i++) if (a[i] !== b[i]) { equal = false; break; }
+                    return { equal, allZeroA: a.every(x => x === 0) };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result["equal"],
+            serde_json::json!(false),
+            "two 32-byte CSPRNG draws were identical"
+        );
+        assert_eq!(
+            result["allZeroA"],
+            serde_json::json!(false),
+            "CSPRNG returned all-zero buffer"
+        );
+    }
+
+    #[test]
+    fn test_crypto_random_uuid_is_v4_format() {
+        // Old stub used Math.random() with a `4xxx`/`yxxx` template — looked
+        // right but wasn't CSPRNG-backed. Real `randomUUID` must match the
+        // RFC 4122 v4 shape: xxxxxxxx-xxxx-4xxx-Yxxx-xxxxxxxxxxxxx where
+        // Y is one of 8/9/a/b.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate("crypto.randomUUID()").unwrap();
+        let uuid = result.as_str().unwrap();
+        assert_eq!(uuid.len(), 36, "uuid wrong length: {}", uuid);
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        assert!(
+            parts[2].starts_with('4'),
+            "v4 UUID must start its 3rd group with '4': {}",
+            uuid
+        );
+        let variant = parts[3].chars().next().unwrap();
+        assert!(
+            matches!(variant, '8' | '9' | 'a' | 'b'),
+            "RFC 4122 variant bits wrong (got {}): {}",
+            variant,
+            uuid
+        );
+    }
+
+    #[test]
+    fn test_btoa_handles_non_ascii_via_textencoder() {
+        // The old hand-rolled btoa depended on the broken hand-rolled
+        // TextEncoder, so multi-byte input produced wrong output. With
+        // both backed by deno_web/V8 ICU, base64 of UTF-8 is correct.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // btoa expects a binary string (latin-1). For UTF-8, pages typically
+        // do `btoa(String.fromCharCode(...new TextEncoder().encode(s)))`.
+        let result = rt
+            .evaluate(
+                "btoa(String.fromCharCode(...new TextEncoder().encode('\u{2713}')))",
+            )
+            .unwrap();
+        assert_eq!(result.as_str().unwrap(), "4pyT");
+    }
 }
