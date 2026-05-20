@@ -149,6 +149,12 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// Hard wall-clock deadline for the *current* navigation. Threaded
+    /// into the synchronous JS execution path so a single page-supplied
+    /// script can no longer hold the tokio executor past `--timeout` —
+    /// `tokio::time::timeout` only fires at await points, and inline
+    /// `<script>` evaluation has none.
+    navigation_deadline: Option<std::time::Instant>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -196,9 +202,27 @@ impl Page {
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            navigation_deadline: None,
             #[cfg(feature = "stealth")]
             stealth_client,
         }
+    }
+
+    /// Set a wall-clock deadline that bounds the next navigation. Pass
+    /// `None` to clear. The deadline is checked between scripts and is
+    /// also handed to the per-script V8 watchdog so synchronous JS work
+    /// is terminated when it overruns.
+    pub fn set_navigation_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.navigation_deadline = deadline;
+    }
+
+    fn navigation_remaining(&self) -> Option<std::time::Duration> {
+        self.navigation_deadline
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    fn navigation_expired(&self) -> bool {
+        matches!(self.navigation_remaining(), Some(r) if r.is_zero())
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -408,6 +432,7 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        let nav_deadline = self.navigation_deadline;
         let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
             let client = client.clone();
             let url = url.clone();
@@ -438,10 +463,18 @@ impl Page {
                     };
                     return Some((idx, url, resp));
                 }
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((idx, url, resp)),
-                    Err(e) => {
+                let fetch_budget = nav_deadline
+                    .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+                    .filter(|d| !d.is_zero())
+                    .unwrap_or_else(|| std::time::Duration::from_secs(30));
+                match tokio::time::timeout(fetch_budget, client.fetch(&parsed)).await {
+                    Ok(Ok(resp)) => Some((idx, url, resp)),
+                    Ok(Err(e)) => {
                         tracing::warn!("Failed to fetch script {}: {}", url, e);
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!("Script fetch deadline exceeded: {}", url);
                         None
                     }
                 }
@@ -500,13 +533,26 @@ impl Page {
                 );
                 break;
             }
+            // Hard cut-off when the caller's deadline has elapsed. Without
+            // this, `--timeout=1` on a script-heavy page would still run
+            // every remaining `<script>` to completion because the
+            // synchronous V8 calls below never yield to the tokio
+            // executor.
+            if self.navigation_expired() {
+                break;
+            }
+            let script_budget = self
+                .navigation_remaining()
+                .unwrap_or_else(|| std::time::Duration::from_secs(5));
+
+
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                     self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
                     if let Some(js) = &mut self.js {
                         let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
-                        if let Err(e) = js.execute_script_guarded(&url, &code) {
+                        if let Err(e) = js.execute_script_with_timeout(&code, script_budget) {
                             tracing::warn!("Script error ({}): {}", url, e);
                         }
                         let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
@@ -515,7 +561,7 @@ impl Page {
             } else if !script.inline.is_empty() {
                 if let Some(js) = &mut self.js {
                     let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
+                    if let Err(e) = js.execute_script_with_timeout(&script.inline, script_budget) {
                         tracing::warn!("Inline script error: {}", e);
                     }
                     let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
@@ -523,9 +569,29 @@ impl Page {
             }
         }
 
-        for module_script in &module_scripts {
+        for module_script in module_scripts.iter() {
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached, skipping remaining module scripts");
+                break;
+            }
+            if self.navigation_expired() {
+                break;
+            }
+            let module_budget = self
+                .navigation_remaining()
+                .unwrap_or_else(|| std::time::Duration::from_secs(10));
+
+            // V8 module evaluation cannot be reliably interrupted: JS try-catch
+            // absorbs terminate_execution(), so the module runs to natural
+            // completion regardless of the watchdog. Only start a module when
+            // there is enough budget to absorb its worst-case run time.
+            const MIN_MODULE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+            if self.navigation_deadline.is_some() && module_budget < MIN_MODULE_BUDGET {
+                tracing::info!(
+                    "skipping ES module: only {:.1}s remaining (need {}s min)",
+                    module_budget.as_secs_f64(),
+                    MIN_MODULE_BUDGET.as_secs()
+                );
                 break;
             }
             if let Some(ref src) = module_script.src {
@@ -539,7 +605,7 @@ impl Page {
 
                 tracing::info!("Loading ES module: {}", full_url);
                 if let Some(js) = &mut self.js {
-                    match js.load_module(&full_url).await {
+                    match js.load_module(&full_url, module_budget).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
                             self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
@@ -552,38 +618,57 @@ impl Page {
             } else if !module_script.inline.is_empty() {
                 let base = self.url_string();
                 if let Some(js) = &mut self.js {
-                    if let Err(e) = js.load_inline_module(&module_script.inline, &base).await {
+                    if let Err(e) = js.load_inline_module(&module_script.inline, &base, module_budget).await {
                         tracing::warn!("Inline ES module error: {}", e);
                     }
                 }
             }
         }
 
+        // Compute budgets before mutably borrowing self.js.
+        let events_budget = self
+            .navigation_remaining()
+            .unwrap_or_else(|| std::time::Duration::from_secs(5))
+            .max(std::time::Duration::from_millis(50));
+        let event_loop_cap = std::time::Duration::from_millis(500);
+        let event_loop_budget = self
+            .navigation_remaining()
+            .map(|r| r.min(event_loop_cap))
+            .unwrap_or(event_loop_cap);
+
         if let Some(js) = &mut self.js {
             // Spec order: readyState -> interactive, fire DOMContentLoaded on both
             // document and window, then readyState -> complete, fire load.
-            let _ = js.execute_script("<load-events>",
+            // Allow at least 50 ms so basic event dispatch always completes, but cap
+            // at the remaining navigation budget so heavy onload handlers don't escape.
+            let _ = js.execute_script_with_timeout(
                 "globalThis.__documentReadyState__ = 'interactive';\n\
                  try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
                  globalThis.__documentReadyState__ = 'complete';\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
+                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                events_budget,
+            );
         }
 
         if let Some(js) = &mut self.js {
-            // Bound the post-script settle loop by wall clock, not just by the
-            // 10ms-tick branch. The old code only consulted `deadline` inside
-            // the `Err(_)` arm (when the inner tick timed out), so a steady
+            // Bound the post-script settle loop. `event_loop_budget` caps at
+            // 500ms (or the remaining navigation budget, whichever is
+            // smaller). The old code only consulted `deadline` inside the
+            // `Err(_)` arm (when the inner tick timed out), so a steady
             // stream of inflight XHR/fetch (active_requests() > 0) kept the
             // loop running indefinitely because it took the `Ok(Ok(()))` arm
             // and slept 1ms each iteration without ever checking the clock.
             // On busy sites this could keep the V8 lock held for tens of
-            // seconds, wedging the entire CDP dispatcher (see triage for
-            // issue series around the 40-site compat sweep).
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+            // seconds, wedging the entire CDP dispatcher.
+            let deadline = tokio::time::Instant::now() + event_loop_budget;
             let mut idle_count = 0u32;
             loop {
+                // Check the deadline on every iteration, not only in the
+                // timeout branch — otherwise a page that keeps the event
+                // loop "busy" (microtask spirals, stuck XHRs) can loop here
+                // indefinitely because the deadline check is unreachable.
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
@@ -942,6 +1027,16 @@ impl Page {
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
 
+        // execute_scripts honours the deadline internally and breaks
+        // early, but `Ok(())` from there is ambiguous: the caller still
+        // sees "navigation succeeded". Surface the timeout so the CLI
+        // produces the expected "Timed out navigating" error instead of
+        // silently returning a partially-rendered page.
+        if self.navigation_expired() {
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NavigationTimedOut);
+        }
+
         self.lifecycle = LifecycleState::DomContentLoaded;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
@@ -1263,6 +1358,9 @@ pub enum PageError {
 
     #[error("Too many redirects (limit {0})")]
     TooManyRedirects(usize),
+
+    #[error("Navigation deadline exceeded")]
+    NavigationTimedOut,
 }
 
 impl From<ObscuraNetError> for PageError {

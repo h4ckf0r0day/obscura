@@ -57,6 +57,7 @@ impl ObscuraJsRuntime {
         });
 
         runtime.op_state().borrow_mut().put(state_clone);
+        runtime.op_state().borrow_mut().put(deno_extensions::ObscuraTimersPermission);
 
         runtime
             .execute_script(
@@ -484,7 +485,7 @@ impl ObscuraJsRuntime {
         );
         self.object_store.clear();
     }
-    pub async fn load_module(&mut self, url: &str) -> Result<(), String> {
+    pub async fn load_module(&mut self, url: &str, timeout: std::time::Duration) -> Result<(), String> {
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
 
@@ -512,32 +513,10 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Module load error: {}", e))?;
 
-        let result = self.runtime.mod_evaluate(module_id);
-
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
-
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
-                tracing::warn!("Module evaluation timed out after 10s: {}", url);
-                return Ok(());
-            }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Module eval error: {}", e);
-                Ok(())
-            }
-        }
+        self.eval_module_with_timeout(module_id, timeout, url).await
     }
 
-    pub async fn load_inline_module(&mut self, code: &str, base_url: &str) -> Result<(), String> {
+    pub async fn load_inline_module(&mut self, code: &str, base_url: &str, timeout: std::time::Duration) -> Result<(), String> {
         let specifier = deno_core::ModuleSpecifier::parse(
             &format!("{}#inline-module-{}", base_url, self.object_counter),
         )
@@ -554,26 +533,51 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Inline module load error: {}", e))?;
 
-        let result = self.runtime.mod_evaluate(module_id);
+        self.eval_module_with_timeout(module_id, timeout, base_url).await
+    }
 
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
+    // Drive module evaluation with a deadline-aware tokio timeout.
+    // The tokio timeout fires when V8 yields (between ticks), bounding the
+    // overshoot to the module's natural completion time. A V8 watchdog thread
+    // (like execute_script_with_timeout) is intentionally NOT used here:
+    // terminate_execution is catchable by JS try-catch, and a single
+    // termination call on heavy module code with error-recovery paths ends up
+    // running the module LONGER than letting it complete naturally.
+    async fn eval_module_with_timeout(
+        &mut self,
+        module_id: deno_core::ModuleId,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<(), String> {
+        let effective = if timeout.is_zero() {
+            std::time::Duration::from_secs(10)
+        } else {
+            timeout
+        };
+
+        let mod_eval = self.runtime.mod_evaluate(module_id);
+
+        // Drive the event loop concurrently with mod_evaluate, returning as
+        // soon as the module's top-level evaluation completes. Plain
+        // run_event_loop only resolves once ALL pending work in the runtime
+        // drains, so a page with a persistent setInterval would block here
+        // indefinitely.
+        let result = tokio::time::timeout(
+            effective,
+            self.runtime.with_event_loop_promise(
+                Box::pin(mod_eval),
+                deno_core::PollEventLoopOptions::default(),
+            ),
         ).await;
 
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
-                tracing::warn!("Inline module timed out after 10s");
-                return Ok(());
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!("Module eval error ({}): {}", label, e);
+                Ok(())
             }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Inline module eval error: {}", e);
+            Err(_) => {
+                tracing::warn!("Module eval timed out ({}s): {}", effective.as_secs_f64(), label);
                 Ok(())
             }
         }
@@ -600,9 +604,6 @@ impl ObscuraJsRuntime {
         timeout: std::time::Duration,
     ) -> Result<(), String> {
         if timeout.is_zero() {
-            self.runtime
-                .execute_script("<script>", source.to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
             return Ok(());
         }
 
@@ -622,8 +623,20 @@ impl ObscuraJsRuntime {
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    isolate_handle.terminate_execution();
-                    return;
+                    // Repeated firing: a single terminate_execution can be
+                    // swallowed by JS try-catch. Re-fire every 10 ms so that
+                    // scripts with catch-all handlers are eventually forced to
+                    // terminate.
+                    loop {
+                        isolate_handle.terminate_execution();
+                        let (c2, _) = cvar
+                            .wait_timeout(cancelled, std::time::Duration::from_millis(10))
+                            .unwrap();
+                        cancelled = c2;
+                        if *cancelled {
+                            return;
+                        }
+                    }
                 }
 
                 let result = cvar.wait_timeout(cancelled, remaining).unwrap();

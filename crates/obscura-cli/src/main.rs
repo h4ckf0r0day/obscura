@@ -525,8 +525,25 @@ async fn run_fetch(
         eprintln!("Fetching {}...", url_str);
     }
 
+    // tokio::time::timeout can only fire at await points, so synchronous
+    // V8 work (page-supplied `<script>` evaluation) used to hold the
+    // executor for the entire duration of every script regardless of
+    // `--timeout`. Plumb the deadline into the page itself so each
+    // script runs under a V8 watchdog with the remaining budget, and
+    // the navigation aborts cleanly between scripts once the deadline
+    // is past. The outer `timeout(...)` wrapper still guards async-only
+    // hangs (slow network, idle wait).
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    page.set_navigation_deadline(Some(deadline));
+
     match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
+        Ok(Ok(())) => {}
+        Ok(Err(obscura_browser::page::PageError::NavigationTimedOut)) => anyhow::bail!(
+            "Timed out navigating to {} after {}s",
+            url_str,
+            timeout_secs
+        ),
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e)),
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
             url_str,

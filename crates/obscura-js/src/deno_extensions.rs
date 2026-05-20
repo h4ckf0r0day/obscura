@@ -51,10 +51,8 @@ Object.defineProperty(globalThis, "URLPattern", { value: URLPattern, writable: t
 /// globals separately. We do the same here via a synthetic entry that
 /// imports every public class and exposes it on `globalThis`.
 fn deno_web_with_globals() -> Extension {
-    let ext = deno_web::deno_web::init::<ObscuraTimersPermission>(
-        Arc::new(BlobStore::default()),
-        None,
-    );
+    let ext =
+        deno_web::deno_web::init::<ObscuraTimersPermission>(Arc::new(BlobStore::default()), None);
     add_synthetic_entry(
         ext,
         "ext:obscura/deno_web_entry.js",
@@ -70,15 +68,17 @@ import {
   ProgressEvent,
   PromiseRejectionEvent,
   reportError,
+  saveGlobalThisReference,
 } from "ext:deno_web/02_event.js";
+saveGlobalThisReference(globalThis);
 import { AbortController, AbortSignal } from "ext:deno_web/03_abort_signal.js";
 import { structuredClone } from "ext:deno_web/02_structured_clone.js";
-// 02_timers.js is loaded transitively (deno_web internals - AbortSignal.timeout,
-// performance.now, FileReader event scheduling - depend on it). We deliberately
-// do NOT expose its setTimeout / setInterval / clearTimeout / clearInterval
-// here: bootstrap.js installs fast-fake versions that dispatch via microtask
-// regardless of delay, and that behavior is load-bearing for the scraper's
-// throughput target (the README's 51-85 ms page-load numbers).
+import {
+  setTimeout,
+  setInterval,
+  clearTimeout,
+  clearInterval,
+} from "ext:deno_web/02_timers.js";
 import { atob, btoa } from "ext:deno_web/05_base64.js";
 import {
   ByteLengthQueuingStrategy,
@@ -146,6 +146,10 @@ expose("reportError", reportError);
 expose("AbortController", AbortController);
 expose("AbortSignal", AbortSignal);
 expose("structuredClone", structuredClone);
+expose("setTimeout", setTimeout);
+expose("setInterval", setInterval);
+expose("clearTimeout", clearTimeout);
+expose("clearInterval", clearInterval);
 expose("atob", atob);
 expose("btoa", btoa);
 expose("ReadableStream", ReadableStream);
@@ -228,8 +232,14 @@ fn add_synthetic_entry(
 /// - `deno_crypto` (Web Crypto API + secure CSPRNG)
 pub fn build() -> Vec<Extension> {
     vec![
-        with_esm_entry(deno_webidl::deno_webidl::init(), "ext:deno_webidl/00_webidl.js"),
-        with_esm_entry(deno_console::deno_console::init(), "ext:deno_console/01_console.js"),
+        with_esm_entry(
+            deno_webidl::deno_webidl::init(),
+            "ext:deno_webidl/00_webidl.js",
+        ),
+        with_esm_entry(
+            deno_console::deno_console::init(),
+            "ext:deno_console/01_console.js",
+        ),
         deno_url_with_globals(),
         deno_web_with_globals(),
         deno_crypto_with_globals(),

@@ -145,45 +145,12 @@ globalThis.console = {
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
 
-let _tid = 0;
-const _clearedTimers = new Set();
-const _intervals = new Set();
-
-const _scheduleAfter = (delay, fn) => {
-  const d = Math.max(0, Number(delay) || 0);
-  if (d === 0) Promise.resolve().then(fn);
-  else Deno.core.ops.op_sleep(d).then(fn);
-};
-
-globalThis.setTimeout = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
-  const id = ++_tid;
-  _scheduleAfter(delay, () => {
-    if (_clearedTimers.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Timer error:", e); }
-  });
-  return id;
-};
-
-globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
-
-globalThis.setInterval = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
-  const id = ++_tid;
-  _intervals.add(id);
-  const tick = () => {
-    if (!_intervals.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Interval error:", e); }
-    if (!_intervals.has(id)) return;
-    _scheduleAfter(delay, tick);
-  };
-  _scheduleAfter(delay, tick);
-  return id;
-};
-
-globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
+// setTimeout / setInterval / clearTimeout / clearInterval are provided by
+// deno_web (see deno_extensions.rs). requestAnimationFrame is not in
+// deno_web; we wire it to setTimeout(0) — close enough for a headless
+// scraping browser with no rendering pipeline.
 globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
-globalThis.cancelAnimationFrame = globalThis.clearTimeout;
+globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
 class CSSStyleDeclaration {
@@ -547,6 +514,71 @@ class Element extends Node {
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
   removeAttribute(n) { _dom("remove_attribute", this._nid, n); }
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
+  // <slot> element API. Obscura has no slot-distribution pipeline; return
+  // empty so libraries (e.g. Swiper, Lit, lit-html) keep mounting.
+  assignedNodes() { return []; }
+  assignedElements() { return []; }
+  // HTMLMediaElement no-ops. Obscura doesn't run a video/audio pipeline,
+  // but bundles probe `<video>` capability with `el.play()` (e.g. WaPo's
+  // zeus/main.js iOS-Safari sniff plays a tiny MP4 to feature-detect
+  // playsinline support) and React components call play/pause on refs.
+  play() { return Promise.resolve(); }
+  pause() {}
+  load() {}
+  canPlayType() { return ""; }
+  // <style>.sheet and <link rel=stylesheet>.sheet. CSS-in-JS runtimes
+  // (Stitches, Emotion, styled-components, Goober) read `el.sheet.cssRules`
+  // to detect already-injected rules during hydration. We don't apply CSS,
+  // but giving them a CSSStyleSheet backed by the element's textContent
+  // lets them keep working.
+  get sheet() {
+    const tag = this.localName;
+    if (tag !== "style" && tag !== "link") return null;
+    if (!this._sheet) {
+      this._sheet = new CSSStyleSheet();
+      if (tag === "style") {
+        const text = this.textContent || "";
+        if (text) this._sheet.replaceSync(text);
+      }
+    }
+    return this._sheet;
+  }
+  removeAttributeNode(attr) {
+    if (attr && typeof attr.name === "string") this.removeAttribute(attr.name);
+    return attr;
+  }
+  getAttributeNode(n) {
+    const v = this.getAttribute(n);
+    return v === null ? null : { name: n, value: v, namespaceURI: null, ownerElement: this, specified: true };
+  }
+  setAttributeNode(attr) {
+    if (attr && typeof attr.name === "string") this.setAttribute(attr.name, attr.value ?? "");
+    return attr;
+  }
+  get attributes() {
+    const el = this;
+    return new Proxy({}, {
+      get(_t, p) {
+        const pairs = _domParse("element_attributes", el._nid) || [];
+        if (p === "length") return pairs.length;
+        if (p === Symbol.iterator) {
+          return function*() {
+            for (const [name, value] of pairs) yield { name, value, namespaceURI: null, ownerElement: el, specified: true };
+          };
+        }
+        if (p === "item") return (i) => {
+          const e = pairs[i];
+          return e ? { name: e[0], value: e[1], namespaceURI: null, ownerElement: el, specified: true } : null;
+        };
+        if (p === "getNamedItem") return (name) => el.getAttributeNode(name);
+        if (typeof p === "string" && /^\d+$/.test(p)) {
+          const e = pairs[+p];
+          return e ? { name: e[0], value: e[1], namespaceURI: null, ownerElement: el, specified: true } : undefined;
+        }
+        return undefined;
+      },
+    });
+  }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   get attributes() {
@@ -761,8 +793,48 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
-  get href() { return this.getAttribute("href") || ""; }
+  get dir() { return this.getAttribute("dir") || ""; }
+  set dir(v) { this.setAttribute("dir", v); }
+  get lang() { return this.getAttribute("lang") || ""; }
+  set lang(v) { this.setAttribute("lang", v); }
+  get title() { return this.getAttribute("title") || ""; }
+  set title(v) { this.setAttribute("title", v); }
+  get hidden() { return this.hasAttribute("hidden"); }
+  set hidden(v) { if (v) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
+  get tabIndex() { const v = this.getAttribute("tabindex"); return v === null ? -1 : parseInt(v, 10) || 0; }
+  set tabIndex(v) { this.setAttribute("tabindex", String(v|0)); }
+  get isContentEditable() { return this.getAttribute("contenteditable") === "true"; }
+  get contentEditable() { return this.getAttribute("contenteditable") || "inherit"; }
+  set contentEditable(v) { this.setAttribute("contenteditable", String(v)); }
+  get draggable() { return this.getAttribute("draggable") === "true"; }
+  set draggable(v) { this.setAttribute("draggable", v ? "true" : "false"); }
+  get spellcheck() { return this.getAttribute("spellcheck") !== "false"; }
+  set spellcheck(v) { this.setAttribute("spellcheck", v ? "true" : "false"); }
+  get href() {
+    const raw = this.getAttribute("href");
+    if (raw === null) return "";
+    const tag = this.localName;
+    if (tag === "a" || tag === "area") {
+      try { return new URL(raw, _domParse("document_url") || "about:blank").href; } catch { return raw; }
+    }
+    return raw;
+  }
   set href(v) { this.setAttribute("href", v); }
+  get _hyperlinkURL() {
+    const tag = this.localName;
+    if (tag !== "a" && tag !== "area") return null;
+    const raw = this.getAttribute("href");
+    if (raw === null) return null;
+    try { return new URL(raw, _domParse("document_url") || "about:blank"); } catch { return null; }
+  }
+  get origin()   { const u = this._hyperlinkURL; return u ? u.origin   : ""; }
+  get protocol() { const u = this._hyperlinkURL; return u ? u.protocol : ""; }
+  get host()     { const u = this._hyperlinkURL; return u ? u.host     : ""; }
+  get hostname() { const u = this._hyperlinkURL; return u ? u.hostname : ""; }
+  get port()     { const u = this._hyperlinkURL; return u ? u.port     : ""; }
+  get pathname() { const u = this._hyperlinkURL; return u ? u.pathname : ""; }
+  get search()   { const u = this._hyperlinkURL; return u ? u.search   : ""; }
+  get hash()     { const u = this._hyperlinkURL; return u ? u.hash     : ""; }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
@@ -1253,7 +1325,15 @@ class Document extends Node {
       hasFeature() { return true; },
     };
   }
-  get styleSheets() { return []; }
+  get styleSheets() {
+    const els = this.querySelectorAll("style, link[rel=stylesheet]");
+    const out = [];
+    for (let i = 0; i < els.length; i++) {
+      const s = els[i].sheet;
+      if (s) out.push(s);
+    }
+    return out;
+  }
   get forms() { return this.querySelectorAll("form"); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
@@ -1461,7 +1541,12 @@ globalThis.navigator = {
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
-  connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
+  connection: (() => {
+    const c = new EventTarget();
+    c.effectiveType = "4g"; c.rtt = 50; c.downlink = 10; c.saveData = false;
+    c.type = "wifi"; c.onchange = null;
+    return c;
+  })(),
   get webdriver() { return undefined; },
   pdfViewerEnabled: true,
   get plugins() {
@@ -2120,37 +2205,132 @@ globalThis.getSelection = _markNative(function getSelection() {
   };
 });
 
+// Parse one CSS rule into a CSSRule-shaped object. Handles plain style rules
+// (`sel { decls }`), @media wrappers, @keyframes, and bare @-rules. Stitches /
+// Emotion / styled-components iterate `cssRules` and read `.selectorText`,
+// `.style.cssText`, `.type`, `.conditionText` — give them enough that those
+// reads return something sensible.
+function _parseCSSRule(text, sheet) {
+  const t = String(text ?? "").trim();
+  if (!t) return { cssText: "", type: 1, selectorText: "", style: _makeCSSStyleDecl(""), parentStyleSheet: sheet, parentRule: null };
+  if (t.startsWith("@")) {
+    const m = t.match(/^@([a-z-]+)\s*([^{]*)\{/i);
+    const kind = m ? m[1].toLowerCase() : "";
+    // 1=STYLE, 4=MEDIA, 7=KEYFRAMES, 5=FONT_FACE, 8=KEYFRAME, 12=SUPPORTS
+    const TYPES = { media: 4, keyframes: 7, "font-face": 5, supports: 12, import: 3, charset: 2, page: 6 };
+    const type = TYPES[kind] ?? 0;
+    return {
+      cssText: t, type,
+      cssRules: [], conditionText: m ? m[2].trim() : "",
+      name: kind === "keyframes" && m ? m[2].trim() : "",
+      parentStyleSheet: sheet, parentRule: null,
+    };
+  }
+  const brace = t.indexOf("{");
+  if (brace < 0) return { cssText: t, type: 1, selectorText: t, style: _makeCSSStyleDecl(""), parentStyleSheet: sheet, parentRule: null };
+  const selector = t.slice(0, brace).trim();
+  const body = t.slice(brace + 1).replace(/\}\s*$/, "");
+  return {
+    cssText: t,
+    type: 1,
+    selectorText: selector,
+    style: _makeCSSStyleDecl(body),
+    parentStyleSheet: sheet,
+    parentRule: null,
+  };
+}
+
+function _makeCSSStyleDecl(cssText) {
+  const props = new Map();
+  const text = String(cssText ?? "").trim();
+  if (text) {
+    for (const decl of text.split(";")) {
+      const colon = decl.indexOf(":");
+      if (colon < 0) continue;
+      const name = decl.slice(0, colon).trim();
+      const value = decl.slice(colon + 1).trim();
+      if (name) props.set(name, value);
+    }
+  }
+  const obj = {
+    get cssText() {
+      return Array.from(props).map(([k, v]) => `${k}: ${v}`).join("; ");
+    },
+    set cssText(v) {
+      props.clear();
+      for (const decl of String(v ?? "").split(";")) {
+        const colon = decl.indexOf(":");
+        if (colon < 0) continue;
+        const n = decl.slice(0, colon).trim();
+        const vv = decl.slice(colon + 1).trim();
+        if (n) props.set(n, vv);
+      }
+    },
+    get length() { return props.size; },
+    item(i) { return Array.from(props.keys())[i] ?? ""; },
+    getPropertyValue(name) { return props.get(String(name).toLowerCase()) ?? ""; },
+    getPropertyPriority() { return ""; },
+    setProperty(name, value) { props.set(String(name).toLowerCase(), String(value)); },
+    removeProperty(name) { const k = String(name).toLowerCase(); const v = props.get(k) ?? ""; props.delete(k); return v; },
+  };
+  return obj;
+}
+
 globalThis.CSSStyleSheet = class CSSStyleSheet {
   constructor(options) {
-    this.cssRules = [];
     this.ownerRule = null;
     this.disabled = false;
     this._rules = [];
   }
+  get cssRules() { return this._rules; }
+  get rules() { return this._rules; }
+  get type() { return "text/css"; }
+  get href() { return null; }
+  get media() { return { mediaText: "", length: 0, item() { return null; } }; }
+  get title() { return null; }
+  get ownerNode() { return this._ownerNode || null; }
   insertRule(rule, index) {
     const idx = index ?? this._rules.length;
-    this._rules.splice(idx, 0, { cssText: rule, type: 1 });
-    this.cssRules = this._rules;
+    this._rules.splice(idx, 0, _parseCSSRule(rule, this));
     return idx;
   }
-  deleteRule(index) {
-    this._rules.splice(index, 1);
-    this.cssRules = this._rules;
-  }
-  addRule(selector, style, index) {
-    return this.insertRule(selector + '{' + style + '}', index);
-  }
+  deleteRule(index) { this._rules.splice(index, 1); }
+  addRule(selector, style, index) { return this.insertRule(selector + "{" + (style ?? "") + "}", index); }
   removeRule(index) { this.deleteRule(index); }
   replace(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
+    this._rules = _splitCSSRules(text).map((r) => _parseCSSRule(r, this));
     return Promise.resolve(this);
   }
   replaceSync(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
+    this._rules = _splitCSSRules(text).map((r) => _parseCSSRule(r, this));
   }
 };
+
+// Naive top-level rule splitter. Tracks brace depth and string state so a
+// `{` inside a value or a quoted url() doesn't confuse the split. Good
+// enough for CSS-in-JS output, which is well-formed.
+function _splitCSSRules(text) {
+  const out = [];
+  const s = String(text ?? "");
+  let depth = 0, start = 0, q = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === q && s[i-1] !== "\\") q = ""; continue; }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        const r = s.slice(start, i + 1).trim();
+        if (r) out.push(r);
+        start = i + 1;
+      }
+    }
+  }
+  const tail = s.slice(start).trim();
+  if (tail) out.push(tail);
+  return out;
+}
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
   get() { return this._adoptedStyleSheets || []; },
@@ -2711,28 +2891,51 @@ globalThis.scrollX = 0; globalThis.scrollY = 0;
 globalThis.CSS = { supports(){return false;}, escape(s){return s;} };
 
 globalThis.HTMLElement = Element;
-globalThis.HTMLDivElement = Element;
-globalThis.HTMLSpanElement = Element;
-globalThis.HTMLParagraphElement = Element;
-globalThis.HTMLAnchorElement = Element;
-globalThis.HTMLImageElement = Element;
-globalThis.HTMLInputElement = Element;
-globalThis.HTMLButtonElement = Element;
-globalThis.HTMLFormElement = class HTMLFormElement extends Element {
-  get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
-  get length() { return this.elements.length; }
-  // Inherit submit() from Element.prototype: it dispatches the cancelable
-  // 'submit' event and (if not prevented) builds form data and navigates.
-  reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
+function _tagElementClass(name, ...tags) {
+  const C = class extends Element {};
+  Object.defineProperty(C, 'name', { value: name });
+  Object.defineProperty(C, Symbol.hasInstance, {
+    value: function(inst) {
+      if (!(inst instanceof Element)) return false;
+      const t = (inst.localName || '').toLowerCase();
+      for (let i = 0; i < tags.length; i++) if (tags[i] === t) return true;
+      return false;
+    },
+  });
+  return C;
+}
+globalThis.HTMLDivElement       = _tagElementClass('HTMLDivElement', 'div');
+globalThis.HTMLSpanElement      = _tagElementClass('HTMLSpanElement', 'span');
+globalThis.HTMLParagraphElement = _tagElementClass('HTMLParagraphElement', 'p');
+globalThis.HTMLAnchorElement    = _tagElementClass('HTMLAnchorElement', 'a');
+globalThis.HTMLImageElement     = _tagElementClass('HTMLImageElement', 'img');
+globalThis.HTMLInputElement     = _tagElementClass('HTMLInputElement', 'input');
+globalThis.HTMLButtonElement    = _tagElementClass('HTMLButtonElement', 'button');
+globalThis.HTMLFormElement      = _tagElementClass('HTMLFormElement', 'form');
+globalThis.HTMLSelectElement    = _tagElementClass('HTMLSelectElement', 'select');
+globalThis.HTMLTextAreaElement  = _tagElementClass('HTMLTextAreaElement', 'textarea');
+globalThis.HTMLLabelElement     = _tagElementClass('HTMLLabelElement', 'label');
+globalThis.HTMLTableElement     = _tagElementClass('HTMLTableElement', 'table');
+globalThis.HTMLIFrameElement    = _tagElementClass('HTMLIFrameElement', 'iframe');
+globalThis.HTMLCanvasElement    = _tagElementClass('HTMLCanvasElement', 'canvas');
+globalThis.HTMLVideoElement     = _tagElementClass('HTMLVideoElement', 'video');
+globalThis.HTMLAudioElement     = _tagElementClass('HTMLAudioElement', 'audio');
+// HTMLFormElement's tag class above gates `instanceof`; the form-specific
+// methods (`.elements`, `.length`, `.reset()`) live on Element.prototype
+// gated by localName, so any `<form>` node — which is an Element instance,
+// not an HTMLFormElement instance — still gets them. submit() is inherited
+// from Element.prototype and dispatches the cancelable 'submit' event.
+Object.defineProperty(Element.prototype, 'elements', {
+  configurable: true,
+  get() {
+    if ((this.localName || '').toLowerCase() !== 'form') return undefined;
+    return this.querySelectorAll("input, select, textarea, button, fieldset, output, object");
+  },
+});
+Element.prototype.reset = function reset() {
+  if ((this.localName || '').toLowerCase() !== 'form') return;
+  for (const f of this.elements) { if ('value' in f) f.value = ''; }
 };
-globalThis.HTMLSelectElement = Element;
-globalThis.HTMLTextAreaElement = Element;
-globalThis.HTMLLabelElement = Element;
-globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
-globalThis.HTMLCanvasElement = Element;
-globalThis.HTMLVideoElement = Element;
-globalThis.HTMLAudioElement = Element;
 globalThis.HTMLScriptElement = Element;
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
