@@ -20,18 +20,32 @@ jobs:
             # newer glibc shipped by ubuntu-latest.
             os: ubuntu-22.04
             name: obscura-x86_64-linux
+            cross: false
           - target: aarch64-unknown-linux-gnu
+            # Native build on GitHub's ARM runner. Produces the fastest
+            # and most reliable binary for ARM64 Linux targets.
             os: ubuntu-22.04-arm
             name: obscura-aarch64-linux
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            # Cross-compile fallback from x86_64 Ubuntu 22.04. Same glibc
+            # 2.35 floor, useful when ARM runners are unavailable or
+            # when a reproducible cross-build is preferred.
+            os: ubuntu-22.04
+            name: obscura-aarch64-linux-cross
+            cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             name: obscura-aarch64-macos
+            cross: false
           - target: x86_64-apple-darwin
             os: macos-latest
             name: obscura-x86_64-macos
+            cross: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: obscura-x86_64-windows
+            cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -41,6 +55,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation toolchain (aarch64-linux)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'CARGO_EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          CARGO_EOF
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
