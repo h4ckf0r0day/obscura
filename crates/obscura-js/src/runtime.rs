@@ -1224,6 +1224,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_locator_count_accepts_grouped_css_selector() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <input>
+                <textarea></textarea>
+                <select></select>
+                <div role="combobox"></div>
+            </body></html>"#,
+        );
+        let injected = rt
+            .evaluate_for_cdp(
+                "/* packages/injected/src/injectedScript.ts */ module.exports.InjectedScript",
+                false,
+            )
+            .unwrap();
+        let injected_oid = injected.object_id.unwrap();
+        let utility = rt
+            .evaluate_for_cdp(
+                "/* packages/injected/src/utilityScript.ts */ module.exports.UtilityScript",
+                false,
+            )
+            .unwrap();
+        let utility_oid = utility.object_id.unwrap();
+
+        let result = rt
+            .call_function_on_for_cdp(
+                "(utilityScript, ...args) => utilityScript.evaluate(...args)",
+                Some(&utility_oid),
+                &[
+                    serde_json::json!({"objectId": utility_oid}),
+                    serde_json::json!({"value": true}),
+                    serde_json::json!({"value": true}),
+                    serde_json::json!({"value": "(injected, { info }) => { const elements = injected.querySelectorAll(info.parsed, document); return elements.length; }"}),
+                    serde_json::json!({"value": 2}),
+                    serde_json::json!({"value": {"h": 0}}),
+                    serde_json::json!({"value": {
+                        "o": [{
+                            "k": "info",
+                            "v": {
+                                "o": [
+                                    {"k": "source", "v": "input, textarea, select, [role=combobox]"},
+                                    {"k": "parsed", "v": {
+                                        "o": [{"k": "parts", "v": {"a": [], "id": 4}}],
+                                        "id": 3
+                                    }}
+                                ],
+                                "id": 2
+                            }
+                        }],
+                        "id": 1
+                    }}),
+                    serde_json::json!({"objectId": injected_oid}),
+                ],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap().as_f64().unwrap() as i64, 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_call_function_on_dom_interaction() {
         let mut rt = setup_runtime(r#"<div id="items"><span>A</span><span>B</span></div>"#);
         let args = vec![serde_json::json!({"value": "span"})];

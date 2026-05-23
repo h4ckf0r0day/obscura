@@ -1839,19 +1839,25 @@ function __obscura_pw_selector_from_parsed(parsed) {
     const part = parts[0];
     if (!part || part.name !== "css") return null;
     const body = part.body;
-    if (!Array.isArray(body) || body.length !== 1) return null;
-    const simples = body[0] && body[0].simples;
-    if (!Array.isArray(simples) || simples.length !== 1) return null;
-    const simple = simples[0];
-    if (!simple || simple.combinator !== "") return null;
-    const selector = simple.selector;
-    if (!selector || !Array.isArray(selector.functions) || selector.functions.length !== 0) return null;
-    return typeof selector.css === "string" ? selector.css : null;
+    if (!Array.isArray(body) || body.length < 1) return null;
+    const groups = [];
+    for (const group of body) {
+      const simples = group && group.simples;
+      if (!Array.isArray(simples) || simples.length !== 1) return null;
+      const simple = simples[0];
+      if (!simple || simple.combinator !== "") return null;
+      const selector = simple.selector;
+      if (!selector || !Array.isArray(selector.functions) || selector.functions.length !== 0) return null;
+      if (typeof selector.css !== "string") return null;
+      groups.push(selector.css);
+    }
+    return groups.join(", ");
   } catch (_) {
     return null;
   }
 }
 function __obscura_pw_selector_from_info(info) {
+  if (info && typeof info.source === "string") return info.source;
   return __obscura_pw_selector_from_parsed(info && info.parsed);
 }
 globalThis.__obscura_make_playwright_injected_script = function() {
