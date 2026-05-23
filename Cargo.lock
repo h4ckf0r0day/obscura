@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "obscura-browser"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "base64",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "obscura-cdp"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "base64",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "obscura-cli"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "obscura-dom"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "cssparser",
  "html5ever",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "obscura-js"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "base64",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "obscura-net"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "reqwest",
