@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose, Engine as _};
 use obscura_browser::lifecycle::WaitUntil;
 use serde_json::{json, Value};
 
@@ -329,12 +330,44 @@ pub async fn handle(
             }))
         }
         "captureScreenshot" => {
-            // 1x1 transparent PNG. Obscura does not have a visual renderer yet,
-            // but Playwright expects this CDP method to exist and return base64
-            // image data.
+            let (default_width, default_height) = ctx
+                .get_session_page(session_id)
+                .map(|p| (p.viewport_width, p.viewport_height))
+                .unwrap_or((1920, 1000));
+            let (width, height) = params
+                .get("clip")
+                .and_then(|clip| {
+                    let width = clip.get("width").and_then(|v| v.as_f64())?;
+                    let height = clip.get("height").and_then(|v| v.as_f64())?;
+                    Some((width.ceil().max(1.0) as u32, height.ceil().max(1.0) as u32))
+                })
+                .unwrap_or((default_width, default_height));
             Ok(json!({
-                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lxVkmwAAAABJRU5ErkJggg=="
+                "data": png_base64(width, height)
             }))
+        }
+        "printToPDF" => {
+            let paper_width = params
+                .get("paperWidth")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(8.5);
+            let paper_height = params
+                .get("paperHeight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(11.0);
+            let pdf =
+                minimal_pdf_bytes((paper_width * 72.0).round(), (paper_height * 72.0).round());
+            if params
+                .get("transferMode")
+                .and_then(|v| v.as_str())
+                .is_some_and(|mode| mode == "ReturnAsStream")
+            {
+                let stream = format!("pdf-{}", uuid::Uuid::new_v4());
+                ctx.io_streams.lock().await.insert(stream.clone(), pdf);
+                Ok(json!({ "stream": stream }))
+            } else {
+                Ok(json!({ "data": general_purpose::STANDARD.encode(pdf) }))
+            }
         }
         "getNavigationHistory" => {
             let page = ctx
@@ -360,6 +393,128 @@ fn timestamp() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+fn png_base64(width: u32, height: u32) -> String {
+    general_purpose::STANDARD.encode(png_bytes(width, height))
+}
+
+fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let row_len = 1 + width as usize;
+    let mut raw = Vec::with_capacity(row_len * height as usize);
+    for _ in 0..height {
+        raw.push(0);
+        for _ in 0..width {
+            raw.push(255);
+        }
+    }
+
+    let mut zlib = Vec::new();
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let mut remaining = raw.as_slice();
+    while !remaining.is_empty() {
+        let chunk_len = remaining.len().min(65_535);
+        let is_final = chunk_len == remaining.len();
+        zlib.push(if is_final { 0x01 } else { 0x00 });
+        let len = chunk_len as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(&remaining[..chunk_len]);
+        remaining = &remaining[chunk_len..];
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+    push_png_chunk(&mut png, b"IHDR", &ihdr);
+    push_png_chunk(&mut png, b"IDAT", &zlib);
+    push_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn push_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(kind.len() + data.len());
+    crc_input.extend_from_slice(kind);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    const MOD: u32 = 65_521;
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in bytes {
+        a = (a + byte as u32) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
+}
+
+fn minimal_pdf_bytes(width: f64, height: f64) -> Vec<u8> {
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    let content = format!(
+        "BT /F1 18 Tf 72 {:.0} Td (Obscura PDF snapshot) Tj ET\n{}",
+        (height - 72.0).max(72.0),
+        " ".repeat(1200)
+    );
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.0} {:.0}] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            width, height
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content),
+    ];
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len() + 1);
+    offsets.push(0usize);
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+    }
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            objects.len() + 1,
+            xref_offset
+        )
+        .as_bytes(),
+    );
+    pdf
 }
 
 #[cfg(test)]
@@ -423,6 +578,40 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("screenshot data");
         assert!(data.starts_with("iVBORw0KGgo"));
+        let png = general_purpose::STANDARD
+            .decode(data)
+            .expect("valid png base64");
+        assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+        assert_eq!(
+            u32::from_be_bytes([png[16], png[17], png[18], png[19]]),
+            1920
+        );
+        assert_eq!(
+            u32::from_be_bytes([png[20], png[21], png[22], png[23]]),
+            1000
+        );
+        assert!(png.len() > 70);
+    }
+
+    #[tokio::test]
+    async fn print_to_pdf_can_return_a_readable_stream() {
+        let mut ctx = CdpContext::new();
+        let result = handle(
+            "printToPDF",
+            &json!({ "transferMode": "ReturnAsStream", "paperWidth": 8.5, "paperHeight": 11.0 }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("printToPDF should be accepted");
+        let stream = result
+            .get("stream")
+            .and_then(|v| v.as_str())
+            .expect("stream handle");
+        let streams = ctx.io_streams.lock().await;
+        let pdf = streams.get(stream).expect("stored pdf stream");
+        assert!(pdf.starts_with(b"%PDF-1.4"));
+        assert!(pdf.len() > 1000);
     }
 
     #[tokio::test]

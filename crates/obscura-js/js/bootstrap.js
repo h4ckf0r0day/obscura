@@ -161,15 +161,31 @@ function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
+globalThis._formFiles = globalThis._formFiles || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
+const _formFiles = globalThis._formFiles;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 function _asNodeList(items) {
   const list = Array.from(items || []).filter(Boolean);
   list.item = (i) => list[i] || null;
   list.forEach = Array.prototype.forEach.bind(list);
   return list;
+}
+function _makeFileList(items) {
+  const list = Array.from(items || []).filter(Boolean);
+  Object.defineProperty(list, "item", {
+    value: (i) => list[i] || null,
+    configurable: true,
+  });
+  return list;
+}
+function _base64ByteLength(value) {
+  const data = String(value || "").replace(/\s/g, "");
+  if (!data) return 0;
+  const padding = data.endsWith("==") ? 2 : (data.endsWith("=") ? 1 : 0);
+  return Math.max(0, Math.floor(data.length * 3 / 4) - padding);
 }
 function _scopedQuerySelectorAll(root, selector) {
   if (!root || !globalThis.document) return _asNodeList([]);
@@ -880,15 +896,32 @@ class Element extends Node {
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
   get value() {
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (this.localName === 'input' && (this.type || '').toLowerCase() === 'file') return "";
     const tag = this.localName;
     if (tag === 'textarea') return this.textContent;
     return this.getAttribute("value") || "";
   }
   set value(v) {
+    if (this.localName === 'input' && (this.type || '').toLowerCase() === 'file') {
+      if (String(v || "") === "") {
+        _formFiles[this._nid] = _makeFileList([]);
+        _formValues[this._nid] = "";
+      }
+      return;
+    }
     _formValues[this._nid] = String(v);
     const tag = this.localName;
     if (tag === 'textarea') {
       this.textContent = String(v);
+    }
+  }
+  get files() {
+    if (this.localName !== 'input' || (this.type || '').toLowerCase() !== 'file') return null;
+    return _formFiles[this._nid] || _makeFileList([]);
+  }
+  set files(v) {
+    if (this.localName === 'input' && (this.type || '').toLowerCase() === 'file') {
+      _formFiles[this._nid] = _makeFileList(v || []);
     }
   }
   get checked() {
@@ -1843,37 +1876,54 @@ function __obscura_pw_serialize(value, refs) {
   }
   return {v: "undefined"};
 }
-function __obscura_pw_selector_from_parsed(parsed) {
+function __obscura_pw_css_selector_from_part(part) {
+  if (!part || part.name !== "css") return null;
+  const body = part.body;
+  if (!Array.isArray(body) || body.length < 1) return null;
+  const groups = [];
+  for (const group of body) {
+    const simples = group && group.simples;
+    if (!Array.isArray(simples) || simples.length !== 1) return null;
+    const simple = simples[0];
+    if (!simple || simple.combinator !== "") return null;
+    const selector = simple.selector;
+    if (!selector || !Array.isArray(selector.functions)) return null;
+    if (typeof selector.css === "string") {
+      if (selector.functions.length !== 0) return null;
+      groups.push(selector.css);
+      continue;
+    }
+    if (selector.functions.length === 1 && selector.functions[0]?.name === "scope") {
+      groups.push(":scope");
+      continue;
+    }
+    return null;
+  }
+  return groups.join(", ");
+}
+function __obscura_pw_selector_plan_from_parsed(parsed) {
   try {
     const parts = parsed && parsed.parts;
-    if (!Array.isArray(parts) || parts.length !== 1) return null;
-    const part = parts[0];
-    if (!part || part.name !== "css") return null;
-    const body = part.body;
-    if (!Array.isArray(body) || body.length < 1) return null;
-    const groups = [];
-    for (const group of body) {
-      const simples = group && group.simples;
-      if (!Array.isArray(simples) || simples.length !== 1) return null;
-      const simple = simples[0];
-      if (!simple || simple.combinator !== "") return null;
-      const selector = simple.selector;
-      if (!selector || !Array.isArray(selector.functions)) return null;
-      if (typeof selector.css === "string") {
-        if (selector.functions.length !== 0) return null;
-        groups.push(selector.css);
-        continue;
-      }
-      if (selector.functions.length === 1 && selector.functions[0]?.name === "scope") {
-        groups.push(":scope");
+    if (!Array.isArray(parts) || parts.length < 1) return null;
+    const selector = __obscura_pw_css_selector_from_part(parts[0]);
+    if (!selector) return null;
+    let nth = null;
+    for (let i = 1; i < parts.length; i++) {
+      const part = parts[i];
+      if (part && part.name === "nth" && /^-?\d+$/.test(String(part.body))) {
+        nth = Number(part.body);
         continue;
       }
       return null;
     }
-    return groups.join(", ");
+    return { selector, nth };
   } catch (_) {
     return null;
   }
+}
+function __obscura_pw_selector_from_parsed(parsed) {
+  const plan = __obscura_pw_selector_plan_from_parsed(parsed);
+  return plan && plan.selector;
 }
 function __obscura_pw_selector_from_info(info) {
   if (info && typeof info.source === "string") return info.source;
@@ -1881,11 +1931,18 @@ function __obscura_pw_selector_from_info(info) {
 }
 globalThis.__obscura_make_playwright_injected_script = function() {
   function queryAll(parsed, root) {
-    const selector = __obscura_pw_selector_from_parsed(parsed);
+    const plan = __obscura_pw_selector_plan_from_parsed(parsed);
+    const selector = plan && plan.selector;
     if (!selector) return [];
     const scope = root || document;
-    if (selector === ":scope" && scope && scope.nodeType === 1) return [scope];
-    return Array.from(scope.querySelectorAll(selector));
+    let elements = selector === ":scope" && scope && scope.nodeType === 1
+      ? [scope]
+      : Array.from(scope.querySelectorAll(selector));
+    if (plan.nth !== null) {
+      const index = plan.nth < 0 ? elements.length + plan.nth : plan.nth;
+      elements = index >= 0 && index < elements.length ? [elements[index]] : [];
+    }
+    return elements;
   }
   function associatedControl(node) {
     if (!node || node.localName !== "label") return node || null;
@@ -1994,6 +2051,15 @@ globalThis.__obscura_make_playwright_injected_script = function() {
       }
       return "error:notfillable";
     },
+    setInputFiles(node, files) {
+      const element = associatedControl(node);
+      if (!element || !element.isConnected) return "error:notconnected";
+      if (element.localName !== "input" || (element.type || "").toLowerCase() !== "file") {
+        return "error:notfileinput";
+      }
+      globalThis.__obscura_set_input_files?.(element._nid, Array.from(files || []));
+      return "done";
+    },
     createStacklessError(message) {
       const error = new Error(message);
       try { error.stack = ""; } catch (_) {}
@@ -2011,6 +2077,24 @@ globalThis.__obscura_make_playwright_injected_script = function() {
       return "<" + name + id + ">";
     }
   };
+};
+globalThis.__obscura_set_input_files = function(nodeId, files) {
+  const node = _wrap(Number(nodeId));
+  if (!node || node.localName !== "input" || (node.type || "").toLowerCase() !== "file") return false;
+  const normalized = Array.from(files || []).map((info) => {
+    const name = String(info && info.name || "");
+    const size = Math.max(0, Number(info && info.size) || _base64ByteLength(info && info.buffer) || 0);
+    const type = String(info && (info.type || info.mimeType) || "");
+    const lastModified = Number(info && (info.lastModified || info.lastModifiedMs)) || Date.now();
+    const file = new File([""], name, { type, lastModified });
+    try { Object.defineProperty(file, "size", { value: size, configurable: true }); } catch (_) {}
+    return file;
+  });
+  _formFiles[node._nid] = _makeFileList(normalized);
+  _formValues[node._nid] = normalized.length ? "C:\\fakepath\\" + normalized[0].name : "";
+  try { node.dispatchEvent(new Event("input", { bubbles: true, composed: true })); } catch (_) {}
+  try { node.dispatchEvent(new Event("change", { bubbles: true })); } catch (_) {}
+  return true;
 };
 globalThis.__obscura_make_playwright_utility_script = function() {
   class UtilityScript {
@@ -2037,9 +2121,15 @@ globalThis.__obscura_make_playwright_utility_script = function() {
 
       if (expression.indexOf("injected.querySelectorAll") !== -1 && expression.indexOf("return elements.length") !== -1) {
         const payload = parsedArgs[1] || {};
-        const selector = __obscura_pw_selector_from_info(payload.info);
+        const plan = __obscura_pw_selector_plan_from_parsed(payload.info && payload.info.parsed);
+        const selector = plan ? plan.selector : __obscura_pw_selector_from_info(payload.info);
         if (!selector) return undefined;
-        return __obscura_pw_serialize(document.querySelectorAll(selector).length);
+        let elements = Array.from(document.querySelectorAll(selector));
+        if (plan && plan.nth !== null) {
+          const index = plan.nth < 0 ? elements.length + plan.nth : plan.nth;
+          elements = index >= 0 && index < elements.length ? [elements[index]] : [];
+        }
+        return __obscura_pw_serialize(elements.length);
       }
 
       if (expression.indexOf("callbackText") === -1 || expression.indexOf("injected.querySelector") === -1) {
@@ -2047,10 +2137,16 @@ globalThis.__obscura_make_playwright_utility_script = function() {
       }
 
       const payload = parsedArgs[1] || {};
-      const selector = __obscura_pw_selector_from_info(payload.info);
+      const plan = __obscura_pw_selector_plan_from_parsed(payload.info && payload.info.parsed);
+      const selector = plan ? plan.selector : __obscura_pw_selector_from_info(payload.info);
       if (!selector || typeof payload.callbackText !== "string") return undefined;
 
-      const element = document.querySelector(selector);
+      let elements = Array.from(document.querySelectorAll(selector));
+      if (plan && plan.nth !== null) {
+        const index = plan.nth < 0 ? elements.length + plan.nth : plan.nth;
+        elements = index >= 0 && index < elements.length ? [elements[index]] : [];
+      }
+      const element = elements[0] || null;
       if (!element) return __obscura_pw_serialize({ success: false });
 
       let value;
@@ -3204,7 +3300,7 @@ globalThis.AbortSignal = {
   },
 };
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
-if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
+if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts={}){super(parts,opts);this.name=name;this.lastModified=opts.lastModified||Date.now();} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
 if (typeof URLSearchParams === "undefined" || typeof URLSearchParams.prototype?.[Symbol.iterator] !== "function") {
   globalThis.URLSearchParams = class URLSearchParams {

@@ -1406,6 +1406,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_injected_nth_selector_filters_css_results() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <input class="candidate" id="first_name">
+                <input class="candidate" id="last_name">
+            </body></html>"#,
+        );
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r##"() => {
+                    const injected = globalThis.__obscura_make_playwright_injected_script();
+                    const css = { name: 'css', body: [{ simples: [{ selector: { css: '.candidate', functions: [] }, combinator: '' }] }] };
+                    const first = injected.querySelectorAll({ parts: [css, { name: 'nth', body: '0' }] }, document);
+                    const second = injected.querySelectorAll({ parts: [css, { name: 'nth', body: '1' }] }, document);
+                    const last = injected.querySelectorAll({ parts: [css, { name: 'nth', body: '-1' }] }, document);
+                    return [first.length, first[0]?.id, second.length, second[0]?.id, last.length, last[0]?.id].join(':');
+                }"##,
+                None,
+                &[],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            "1:first_name:1:last_name:1:last_name"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_injected_set_input_files_uses_payload_metadata() {
+        let mut rt = setup_runtime(r#"<html><body><input id="resume" type="file"></body></html>"#);
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r##"() => {
+                    const input = document.querySelector("#resume");
+                    globalThis.__obscura_set_input_files(input._nid, [{
+                        name: "resume.txt",
+                        mimeType: "text/plain",
+                        buffer: "YWJjZA=="
+                    }]);
+                    const file = input.files[0];
+                    return [input.files.length, file.name, file.size, file.type, input.value].join(":");
+                }"##,
+                None,
+                &[],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            r#"1:resume.txt:4:text/plain:C:\fakepath\resume.txt"#
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_call_function_on_dom_interaction() {
         let mut rt = setup_runtime(r#"<div id="items"><span>A</span><span>B</span></div>"#);
         let args = vec![serde_json::json!({"value": "span"})];

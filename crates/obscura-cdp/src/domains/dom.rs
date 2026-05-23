@@ -1,3 +1,4 @@
+use obscura_browser::Page;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use serde_json::{json, Value};
 
@@ -157,18 +158,186 @@ pub async fn handle(
                 }
             }))
         }
+        "setFileInputFiles" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = node_id_from_params(params, page)?;
+            let files: Vec<Value> = params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(file_metadata)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let payload = serde_json::to_string(&files).map_err(|e| e.to_string())?;
+            let code = format!(
+                "globalThis.__obscura_set_input_files && globalThis.__obscura_set_input_files({}, {});",
+                node_id, payload
+            );
+            page.evaluate(&code);
+            Ok(json!({}))
+        }
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
-        "getBoxModel" => Ok(json!({
-            "model": {
-                "content": [8,8, 108,8, 108,28, 8,28],
-                "padding": [8,8, 108,8, 108,28, 8,28],
-                "border": [8,8, 108,8, 108,28, 8,28],
-                "margin": [0,0, 116,0, 116,36, 0,36],
-                "width": 100, "height": 20,
+        "scrollIntoViewIfNeeded" => Ok(json!({})),
+        "getContentQuads" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = node_id_from_params(params, page)?;
+            let rect = element_rect(page, node_id);
+            if rect.width <= 0.0 || rect.height <= 0.0 {
+                return Ok(json!({ "quads": [] }));
             }
-        })),
+            Ok(json!({
+                "quads": [[
+                    rect.x, rect.y,
+                    rect.x + rect.width, rect.y,
+                    rect.x + rect.width, rect.y + rect.height,
+                    rect.x, rect.y + rect.height,
+                ]]
+            }))
+        }
+        "getBoxModel" => {
+            let rect = if let Some(page) = ctx.get_session_page_mut(session_id) {
+                match node_id_from_params(params, page) {
+                    Ok(node_id) => element_rect(page, node_id),
+                    Err(_) => Rect::default_box(),
+                }
+            } else {
+                Rect::default_box()
+            };
+            let x = rect.x;
+            let y = rect.y;
+            let w = rect.width.max(1.0);
+            let h = rect.height.max(1.0);
+            Ok(json!({
+                "model": {
+                    "content": [x,y, x+w,y, x+w,y+h, x,y+h],
+                    "padding": [x,y, x+w,y, x+w,y+h, x,y+h],
+                    "border": [x,y, x+w,y, x+w,y+h, x,y+h],
+                    "margin": [x,y, x+w,y, x+w,y+h, x,y+h],
+                    "width": w, "height": h,
+                }
+            }))
+        }
         _ => Err(format!("Unknown DOM method: {}", method)),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Rect {
+    fn default_box() -> Self {
+        Self {
+            x: 8.0,
+            y: 8.0,
+            width: 100.0,
+            height: 20.0,
+        }
+    }
+}
+
+fn node_id_from_params(params: &Value, page: &mut Page) -> Result<u64, String> {
+    if let Some(nid) = params
+        .get("nodeId")
+        .and_then(|v| v.as_u64())
+        .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
+    {
+        return Ok(nid);
+    }
+    if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
+        return Ok(node_id_from_object_id(page, oid));
+    }
+    Err("nodeId or objectId required".to_string())
+}
+
+fn node_id_from_object_id(page: &mut Page, object_id: &str) -> u64 {
+    let object_id_json = serde_json::to_string(object_id).unwrap_or_else(|_| "\"\"".to_string());
+    let code = format!(
+        "(function() {{ var o = globalThis.__obscura_objects[{}]; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+        object_id_json
+    );
+    let result = page.evaluate(&code);
+    result.as_f64().map(|n| n as u64).unwrap_or(0)
+}
+
+fn element_rect(page: &mut Page, node_id: u64) -> Rect {
+    let code = format!(
+        r#"(function() {{
+            var node = typeof _wrap === 'function' ? _wrap({}) : null;
+            if (!node || !node.getBoundingClientRect) return null;
+            var r = node.getBoundingClientRect();
+            return {{
+                x: Number(r.x || r.left) || 0,
+                y: Number(r.y || r.top) || 0,
+                width: Number(r.width) || 0,
+                height: Number(r.height) || 0
+            }};
+        }})()"#,
+        node_id
+    );
+    let result = page.evaluate(&code);
+    Rect {
+        x: result.get("x").and_then(|v| v.as_f64()).unwrap_or(8.0),
+        y: result.get("y").and_then(|v| v.as_f64()).unwrap_or(8.0),
+        width: result
+            .get("width")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(100.0),
+        height: result
+            .get("height")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(20.0),
+    }
+}
+
+fn file_metadata(path: &str) -> Value {
+    let path_ref = std::path::Path::new(path);
+    let name = path_ref
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or(path)
+        .to_string();
+    let metadata = std::fs::metadata(path_ref).ok();
+    let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let last_modified = metadata
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    json!({
+        "name": name,
+        "size": size,
+        "type": mime_type_for_path(path_ref),
+        "lastModified": last_modified,
+    })
+}
+
+fn mime_type_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "txt" => "text/plain",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        _ => "",
     }
 }
 

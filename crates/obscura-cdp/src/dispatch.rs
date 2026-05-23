@@ -35,6 +35,7 @@ pub struct CdpContext {
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub network_response_bodies: Arc<Mutex<HashMap<String, NetworkResponseBody>>>,
+    pub io_streams: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl CdpContext {
@@ -73,6 +74,7 @@ impl CdpContext {
             intercept_tx: None,
             isolated_worlds: Vec::new(),
             network_response_bodies: Arc::new(Mutex::new(HashMap::new())),
+            io_streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -151,6 +153,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
+        "IO" => domains::io::handle(method, &req.params, ctx).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
         "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
