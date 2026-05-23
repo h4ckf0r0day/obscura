@@ -115,6 +115,9 @@ obscura fetch https://example.com --dump text --output page.txt
 # Use this for images, JSON, JS, CSS, or any non-HTML resource.
 obscura fetch https://picsum.photos/200/300 --dump original > photo.jpg
 
+# List every sub-resource URL the page would fetch (NDJSON; one record per asset)
+obscura fetch https://example.com --dump assets
+
 # Fetch through an HTTP or SOCKS proxy
 obscura --proxy socks5://127.0.0.1:1080 fetch https://example.com --dump text
 
@@ -279,7 +282,7 @@ Fetch and render a single page.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, or `original` (raw response body) |
+| `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, `assets` (NDJSON of every sub-resource URL the page references), or `original` (raw response body) |
 | `--eval` | — | JavaScript expression to evaluate |
 | `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
 | `--timeout` | `30` | Maximum navigation time in seconds |

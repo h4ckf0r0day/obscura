@@ -155,6 +155,12 @@ enum DumpFormat {
     /// Bypasses the browser/JS layer — useful for fetching images,
     /// JSON, JS, CSS, or any non-HTML resource (cf. issue #117).
     Original,
+    /// One JSON object per line listing every sub-resource URL the
+    /// rendered page references (script src, link href, img src,
+    /// iframe src, media sources, embed/object data). Lets callers
+    /// replay the asset graph with their own HTTP client when they
+    /// need the originals alongside the page (cf. issue 124).
+    Assets,
 }
 
 fn print_banner(port: u16) {
@@ -508,6 +514,7 @@ async fn run_fetch(
         DumpFormat::Text => dump_text(&mut page),
         DumpFormat::Links => dump_links(&page),
         DumpFormat::Markdown => dump_markdown(&mut page),
+        DumpFormat::Assets => dump_assets(&page),
         // Handled above via the short-circuit branch; unreachable here.
         DumpFormat::Original => unreachable!("Original dump handled before page navigation"),
     };
@@ -953,12 +960,100 @@ fn dump_links(page: &Page) -> String {
     }).unwrap_or_default()
 }
 
+/// Selectors paired with the attribute whose URL we extract and the
+/// asset kind we surface. Order is stable so the output of
+/// `--dump assets` is deterministic across runs.
+const ASSET_SELECTORS: &[(&str, &str, &str)] = &[
+    ("script[src]", "src", "script"),
+    ("link[href]", "href", "link"),
+    ("img[src]", "src", "image"),
+    ("iframe[src]", "src", "iframe"),
+    ("source[src]", "src", "media"),
+    ("video[src]", "src", "video"),
+    ("audio[src]", "src", "audio"),
+    ("embed[src]", "src", "embed"),
+    ("object[data]", "data", "object"),
+];
+
+/// Map a `<link>` element's `rel` token to a more specific asset
+/// kind so consumers can filter (e.g. just stylesheets, just icons).
+/// Unknown / missing `rel` falls back to a generic "link" so the
+/// caller still sees the URL.
+fn link_kind_from_rel(rel: &str) -> &'static str {
+    match rel.split_ascii_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "stylesheet" => "stylesheet",
+        "icon" | "shortcut" => "icon",
+        "manifest" => "manifest",
+        "preload" => "preload",
+        "prefetch" => "prefetch",
+        "modulepreload" => "modulepreload",
+        "dns-prefetch" => "dns-prefetch",
+        "preconnect" => "preconnect",
+        "alternate" => "alternate",
+        _ => "link",
+    }
+}
+
+/// Resolve a raw `src`/`href`/`data` attribute against the page's
+/// base URL. Mirrors `dump_links`'s logic so `--dump assets` and
+/// `--dump links` agree on absolute-URL semantics.
+fn resolve_asset_url(raw: &str, base_url: Option<&url::Url>) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_string());
+    }
+    if let Some(base) = base_url {
+        if let Ok(joined) = base.join(trimmed) {
+            return Some(joined.to_string());
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+/// Walk the rendered DOM and emit one NDJSON line per discoverable
+/// sub-resource. Pure over `DomTree`/`Url` so unit tests can drive
+/// it from a fixture HTML without standing up a browser.
+fn extract_assets(dom: &obscura_dom::DomTree, base_url: Option<&url::Url>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (selector, attr, default_kind) in ASSET_SELECTORS {
+        let nodes = dom.query_selector_all(selector).unwrap_or_default();
+        for node_id in nodes {
+            let Some(node) = dom.get_node(node_id) else { continue };
+            let raw = node.get_attribute(attr).unwrap_or_default().to_string();
+            let Some(url) = resolve_asset_url(&raw, base_url) else { continue };
+
+            let kind = if *default_kind == "link" {
+                let rel = node.get_attribute("rel").unwrap_or_default().to_string();
+                link_kind_from_rel(&rel)
+            } else {
+                *default_kind
+            };
+
+            let record = serde_json::json!({
+                "url": url,
+                "type": kind,
+            });
+            out.push(record.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+fn dump_assets(page: &Page) -> String {
+    let base_url = page.url.clone();
+    page.with_dom(|dom| extract_assets(dom, base_url.as_ref())).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_readable_text, fetch_original_bytes, is_quiet_command, merge_proxy,
-        normalize_v8_flags, reject_stealth_with_socks5, select_log_filter, write_or_print,
-        write_or_print_bytes, Args, Command, DumpFormat,
+        extract_assets, extract_readable_text, fetch_original_bytes, is_quiet_command,
+        link_kind_from_rel, merge_proxy, normalize_v8_flags, reject_stealth_with_socks5,
+        resolve_asset_url, select_log_filter, write_or_print, write_or_print_bytes, Args,
+        Command, DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -1334,4 +1429,178 @@ mod tests {
 
         assert_eq!(proxy.as_deref(), Some("http://global.example:8080"));
     }
+
+    #[test]
+    fn parsed_fetch_dump_assets_is_accepted_by_clap() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--dump",
+            "assets",
+            "https://example.com",
+        ])
+        .expect("clap should accept --dump assets");
+        match args.command {
+            Some(Command::Fetch { dump, .. }) => {
+                assert_eq!(dump, DumpFormat::Assets);
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn resolve_asset_url_keeps_absolute_unchanged() {
+        let base = url::Url::parse("https://page.test/a/b").unwrap();
+        let abs = "https://cdn.test/x.js";
+        assert_eq!(resolve_asset_url(abs, Some(&base)).as_deref(), Some(abs));
+    }
+
+    #[test]
+    fn resolve_asset_url_joins_relative_against_base() {
+        let base = url::Url::parse("https://page.test/a/b").unwrap();
+        let rel = "/static/x.js";
+        assert_eq!(
+            resolve_asset_url(rel, Some(&base)).as_deref(),
+            Some("https://page.test/static/x.js"),
+        );
+    }
+
+    #[test]
+    fn resolve_asset_url_drops_empty() {
+        let base = url::Url::parse("https://page.test/").unwrap();
+        assert!(resolve_asset_url("", Some(&base)).is_none());
+        assert!(resolve_asset_url("   ", Some(&base)).is_none());
+    }
+
+    #[test]
+    fn link_kind_from_rel_handles_common_values() {
+        assert_eq!(link_kind_from_rel("stylesheet"), "stylesheet");
+        assert_eq!(link_kind_from_rel("icon"), "icon");
+        // First token wins for multi-token rel (e.g. "shortcut icon").
+        assert_eq!(link_kind_from_rel("shortcut icon"), "icon");
+        assert_eq!(link_kind_from_rel("manifest"), "manifest");
+        assert_eq!(link_kind_from_rel("preload"), "preload");
+        assert_eq!(link_kind_from_rel("prefetch"), "prefetch");
+        assert_eq!(link_kind_from_rel("modulepreload"), "modulepreload");
+        assert_eq!(link_kind_from_rel("dns-prefetch"), "dns-prefetch");
+        assert_eq!(link_kind_from_rel("preconnect"), "preconnect");
+        assert_eq!(link_kind_from_rel("alternate"), "alternate");
+        // Empty / unknown falls back to generic "link" so URL is still emitted.
+        assert_eq!(link_kind_from_rel(""), "link");
+        assert_eq!(link_kind_from_rel("noopener"), "link");
+    }
+
+    #[test]
+    fn extract_assets_covers_every_resource_tag() {
+        let html = r#"<html><head>
+            <link rel="stylesheet" href="/site.css">
+            <link rel="icon" href="/favicon.ico">
+            <link rel="preload" href="/font.woff2">
+            <link href="/no-rel.css">
+            <script src="/app.js"></script>
+        </head><body>
+            <img src="/logo.png">
+            <iframe src="/frame.html"></iframe>
+            <video src="/clip.mp4"><source src="/clip.webm"></video>
+            <audio src="/track.mp3"></audio>
+            <embed src="/widget.swf">
+            <object data="/doc.pdf"></object>
+        </body></html>"#;
+        let dom = obscura_dom::parse_html(html);
+        let base = url::Url::parse("https://example.test/page").unwrap();
+        let ndjson = extract_assets(&dom, Some(&base));
+        let records: Vec<serde_json::Value> = ndjson
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line must be valid JSON"))
+            .collect();
+
+        // Every emitted record must have an absolute URL on example.test
+        // and a non-empty type string. Pin specific entries so a regression
+        // in selectors or kind mapping fails loudly.
+        for r in &records {
+            let url = r["url"].as_str().unwrap();
+            assert!(
+                url.starts_with("https://example.test/"),
+                "url not absolute: {url}",
+            );
+            assert!(!r["type"].as_str().unwrap().is_empty());
+        }
+
+        let pairs: Vec<(String, String)> = records
+            .iter()
+            .map(|r| {
+                (
+                    r["url"].as_str().unwrap().to_string(),
+                    r["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+
+        assert!(pairs.contains(&(
+            "https://example.test/app.js".to_string(),
+            "script".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/site.css".to_string(),
+            "stylesheet".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/favicon.ico".to_string(),
+            "icon".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/font.woff2".to_string(),
+            "preload".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/no-rel.css".to_string(),
+            "link".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/logo.png".to_string(),
+            "image".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/frame.html".to_string(),
+            "iframe".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/clip.mp4".to_string(),
+            "video".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/clip.webm".to_string(),
+            "media".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/track.mp3".to_string(),
+            "audio".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/widget.swf".to_string(),
+            "embed".to_string(),
+        )));
+        assert!(pairs.contains(&(
+            "https://example.test/doc.pdf".to_string(),
+            "object".to_string(),
+        )));
+    }
+
+    #[test]
+    fn extract_assets_skips_empty_attributes() {
+        let html = r#"<html><body>
+            <script src=""></script>
+            <img src="   ">
+            <iframe src="/ok.html"></iframe>
+        </body></html>"#;
+        let dom = obscura_dom::parse_html(html);
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let ndjson = extract_assets(&dom, Some(&base));
+        let lines: Vec<&str> = ndjson.lines().collect();
+        // Only the iframe with a non-empty src survives.
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains("\"https://example.test/ok.html\""));
+        assert!(lines[0].contains("\"iframe\""));
+    }
+
 }
