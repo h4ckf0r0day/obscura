@@ -13,35 +13,38 @@ pub async fn handle(
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let button = params
+            let _button = params
                 .get("button")
                 .and_then(|v| v.as_str())
                 .unwrap_or("left");
-            let click_count = params
+            let _click_count = params
                 .get("clickCount")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1);
 
-            if event_type == "mousePressed" {
+            if event_type == "mouseMoved" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x}, {y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
+                            globalThis.__obscura_click_target = target;\
+                            var evt = new MouseEvent('mousemove', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
+                            target.dispatchEvent(evt);\
+                        }})()",
+                        x = x, y = y,
+                    );
+                    page.evaluate(&code);
+                }
+            } else if event_type == "mousePressed" {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let code = format!(
+                        "(function() {{\
+                            var target = globalThis.__obscura_click_target || (document.elementFromPoint && document.elementFromPoint({x}, {y})) || document.activeElement || document.body;\
+                            if (!target) return;\
+                            globalThis.__obscura_click_target = target;\
                             var evt = new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
                             target.dispatchEvent(evt);\
-                            var click = new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
-                            var cancelled = !target.dispatchEvent(click);\
-                            if (!cancelled) {{\
-                                var link = target.closest ? target.closest('a[href]') : null;\
-                                if (!link && target.tagName === 'A' && target.getAttribute('href')) link = target;\
-                                if (link) {{\
-                                    var href = link.getAttribute('href');\
-                                    if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {{\
-                                        location.assign(href);\
-                                    }}\
-                                }}\
-                            }}\
                         }})()",
                         x = x, y = y,
                     );
@@ -55,6 +58,18 @@ pub async fn handle(
                             if (!target) return;\
                             var evt = new MouseEvent('mouseup', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
                             target.dispatchEvent(evt);\
+                            var click = new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
+                            var cancelled = !target.dispatchEvent(click);\
+                            if (!cancelled) {{\
+                                var link = target.closest ? target.closest('a[href]') : null;\
+                                if (!link && target.tagName === 'A' && target.getAttribute('href')) link = target;\
+                                if (link) {{\
+                                    var href = link.getAttribute('href');\
+                                    if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {{\
+                                        location.assign(href);\
+                                    }}\
+                                }}\
+                            }}\
                         }})()",
                         x = x, y = y,
                     );

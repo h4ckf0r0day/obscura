@@ -187,6 +187,15 @@ function _base64ByteLength(value) {
   const padding = data.endsWith("==") ? 2 : (data.endsWith("=") ? 1 : 0);
   return Math.max(0, Math.floor(data.length * 3 / 4) - padding);
 }
+function _cssPixelValue(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text || text === "auto") return null;
+  const match = text.match(/^(-?\d+(?:\.\d+)?)(?:px)?$/i);
+  if (!match) return null;
+  const number = Number(match[1]);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
 function _scopedQuerySelectorAll(root, selector) {
   if (!root || !globalThis.document) return _asNodeList([]);
   const all = Document.prototype.querySelectorAll.call(globalThis.document, selector);
@@ -481,7 +490,14 @@ const _styleProxy = (decl) => new Proxy(decl, {
     return undefined;
   },
   set(t, p, v) {
-    if (typeof p === "string") { t._props[p] = String(v); return true; }
+    if (typeof p === "string") {
+      if (p in t) {
+        t[p] = v;
+        return true;
+      }
+      t._props[p] = String(v);
+      return true;
+    }
     t[p] = v; return true;
   }
 });
@@ -705,6 +721,7 @@ class Element extends Node {
   constructor(nid) {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
+    this._styleAttributeValue = undefined;
   }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
   get localName() { return (this.tagName || "").toLowerCase(); }
@@ -774,11 +791,31 @@ class Element extends Node {
     };
     return obj;
   }
-  get style() { return this._style; }
-  set style(v) { if (typeof v === "string") this._style.cssText = v; }
+  _syncInlineStyle() {
+    const attr = this.getAttribute("style") || "";
+    if (this._styleAttributeValue !== attr) {
+      this._style.cssText = attr;
+      this._styleAttributeValue = attr;
+    }
+  }
+  get style() {
+    this._syncInlineStyle();
+    return this._style;
+  }
+  set style(v) {
+    if (typeof v === "string") {
+      this._style.cssText = v;
+      this._styleAttributeValue = v;
+      _dom("set_attribute", this._nid, "style\0" + v);
+    }
+  }
   getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
   setAttribute(n, v) {
     _dom("set_attribute", this._nid, n + "\0" + String(v));
+    if (String(n || "").toLowerCase() === "style") {
+      this._style.cssText = String(v);
+      this._styleAttributeValue = String(v);
+    }
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
     const lowerName = String(n || "").toLowerCase();
     if (
@@ -1120,13 +1157,21 @@ class Element extends Node {
   }
   get offsetWidth() { return this.clientWidth; } get offsetHeight() { return this.clientHeight; }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
+  _explicitLayoutPixel(name) {
+    const style = this.style;
+    return _cssPixelValue(style.getPropertyValue(name) || style[name]);
+  }
   get clientWidth() {
     if (this === document.documentElement || this === document.body) return globalThis.innerWidth || 1920;
+    const width = this._explicitLayoutPixel("width");
+    if (width !== null) return width;
     if (this._isBlockLikeForLayout()) return Math.max(320, globalThis.innerWidth || 1920);
     return 100;
   }
   get clientHeight() {
     if (this === document.documentElement || this === document.body) return globalThis.innerHeight || 1000;
+    const height = this._explicitLayoutPixel("height");
+    if (height !== null) return height;
     if (this._isBlockLikeForLayout()) return Math.max(20, Math.min(globalThis.innerHeight || 1000, 1000));
     return 20;
   }
@@ -2059,6 +2104,13 @@ globalThis.__obscura_make_playwright_injected_script = function() {
       }
       globalThis.__obscura_set_input_files?.(element._nid, Array.from(files || []));
       return "done";
+    },
+    setupHitTargetInterceptor(node) {
+      if (!node || !node.isConnected) return "error:notconnected";
+      globalThis.__obscura_click_target = node;
+      return {
+        stop() { return "done"; }
+      };
     },
     createStacklessError(message) {
       const error = new Error(message);
@@ -4792,6 +4844,13 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
     if (x < 0 || y < 0 || x > w || y > h) {
       return null;
+    }
+    var target = globalThis.__obscura_click_target;
+    if (target && target.getBoundingClientRect) {
+      var rect = target.getBoundingClientRect();
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return target;
+      }
     }
     return this.body || this.documentElement || null;
   };

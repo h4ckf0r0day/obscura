@@ -1469,6 +1469,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_inline_style_dimensions_feed_bounding_client_rect() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div role="combobox" id="country" style="width: 160px; height: 36px"></div></body></html>"#,
+        );
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r##"() => {
+                    const rect = document.querySelector("#country").getBoundingClientRect();
+                    return rect.width + "x" + rect.height;
+                }"##,
+                None,
+                &[],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), "160x36");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_hit_target_interceptor_reports_done() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div role="combobox" id="country" style="width: 160px; height: 36px"></div></body></html>"#,
+        );
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r##"() => {
+                    const injected = globalThis.__obscura_make_playwright_injected_script();
+                    const node = document.querySelector("#country");
+                    const interceptor = injected.setupHitTargetInterceptor(node, "mouse", { x: 80, y: 18 }, false);
+                    return interceptor.stop();
+                }"##,
+                None,
+                &[],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), "done");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_call_function_on_dom_interaction() {
         let mut rt = setup_runtime(r#"<div id="items"><span>A</span><span>B</span></div>"#);
         let args = vec![serde_json::json!({"value": "span"})];

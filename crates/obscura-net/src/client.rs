@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method};
@@ -72,14 +73,14 @@ pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" && scheme != "file" {
+    if scheme != "http" && scheme != "https" && scheme != "file" && scheme != "data" {
         return Err(ObscuraNetError::Network(format!(
-            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
+            "Forbidden URL scheme '{}' - only http, https, file, and data are allowed",
             scheme
         )));
     }
 
-    if scheme == "file" {
+    if scheme == "file" || scheme == "data" {
         return Ok(());
     }
 
@@ -151,6 +152,43 @@ async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
         headers.insert("content-type".to_string(), ct.to_string());
     }
 
+    Ok(Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    })
+}
+
+fn fetch_data_url(url: &Url) -> Result<Response, ObscuraNetError> {
+    let raw = url.as_str();
+    let Some(rest) = raw.strip_prefix("data:") else {
+        return Err(ObscuraNetError::Network("Invalid data URL".to_string()));
+    };
+    let comma = rest
+        .find(',')
+        .ok_or_else(|| ObscuraNetError::Network("Invalid data URL".to_string()))?;
+    let metadata = &rest[..comma];
+    let data = &rest[comma + 1..];
+    let metadata_lower = metadata.to_ascii_lowercase();
+    let is_base64 = metadata_lower
+        .split(';')
+        .any(|part| part.trim() == "base64");
+    let content_type = metadata
+        .split(';')
+        .find(|part| part.contains('/'))
+        .filter(|part| !part.is_empty())
+        .unwrap_or("text/plain;charset=US-ASCII");
+    let body = if is_base64 {
+        general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| ObscuraNetError::Network(format!("Invalid data URL base64: {}", e)))?
+    } else {
+        percent_decode(data)
+    };
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
     Ok(Response {
         url: url.clone(),
         status: 200,
@@ -234,6 +272,10 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url)?;
+
+        if url.scheme() == "data" {
+            return fetch_data_url(url);
+        }
 
         if url.scheme() == "file" {
             return fetch_file_url(url).await;
@@ -485,6 +527,35 @@ impl Default for ObscuraHttpClient {
     }
 }
 
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +569,18 @@ mod tests {
             DEFAULT_USER_AGENT,
             "blank UA overrides must not produce empty User-Agent headers"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_supports_data_url_documents() {
+        let client = ObscuraHttpClient::new();
+        let url = Url::parse("data:text/html,%3Ctitle%3EData%3C/title%3E").unwrap();
+
+        let response = client.fetch(&url).await.expect("data URL should load");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type(), Some("text/html"));
+        assert_eq!(response.text().unwrap(), "<title>Data</title>");
     }
 }
 
