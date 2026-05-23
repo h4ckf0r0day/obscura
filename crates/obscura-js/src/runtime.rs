@@ -1287,6 +1287,125 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_locator_resolution_not_confused_with_count_fast_path() {
+        let mut rt = setup_runtime(r#"<html><body><input id="first_name"></body></html>"#);
+        let injected = rt
+            .evaluate_for_cdp(
+                "/* packages/injected/src/injectedScript.ts */ module.exports.InjectedScript",
+                false,
+            )
+            .unwrap();
+        let injected_oid = injected.object_id.unwrap();
+        let utility = rt
+            .evaluate_for_cdp(
+                "/* packages/injected/src/utilityScript.ts */ module.exports.UtilityScript",
+                false,
+            )
+            .unwrap();
+        let utility_oid = utility.object_id.unwrap();
+
+        let result = rt
+            .call_function_on_for_cdp(
+                "(utilityScript, ...args) => utilityScript.evaluate(...args)",
+                Some(&utility_oid),
+                &[
+                    serde_json::json!({"objectId": utility_oid}),
+                    serde_json::json!({"value": true}),
+                    serde_json::json!({"value": true}),
+                    serde_json::json!({"value": "(injected, { info, root }) => { const parsed = { parts: [{ name: 'css', body: [{ simples: [{ selector: { css: info.source, functions: [] }, combinator: '' }] }] }] }; const elements = injected.querySelectorAll(parsed, root || document); const element = elements[0]; const visible = element ? injected.utils.isElementVisible(element) : false; if (elements.length > 1 && info.strict) throw injected.strictModeViolationError(parsed, elements); return (element && element.id) + ':' + visible + ':' + !!element; }"}),
+                    serde_json::json!({"value": 2}),
+                    serde_json::json!({"value": {"h": 0}}),
+                    serde_json::json!({"value": {
+                        "o": [{
+                            "k": "info",
+                            "v": {
+                                "o": [
+                                    {"k": "source", "v": "#first_name"},
+                                    {"k": "strict", "v": true}
+                                ],
+                                "id": 2
+                            }
+                        }, {
+                            "k": "root",
+                            "v": {"v": "undefined"}
+                        }],
+                        "id": 1
+                    }}),
+                    serde_json::json!({"objectId": injected_oid}),
+                ],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), "first_name:true:true");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_injected_fill_sets_input_value() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+                <input id="first_name" name="first_name">
+            </body></html>"#,
+        );
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r##"async () => {
+                    const injected = globalThis.__obscura_make_playwright_injected_script();
+                    const input = document.querySelector("#first_name");
+                    const check = await injected.checkElementStates(input, ["visible", "enabled", "editable"]);
+                    const fillResult = injected.fill(input, "Alice");
+                    return {
+                        actionabilityPassed: check === undefined,
+                        editable: injected.elementState(input, "editable").matches,
+                        fillResult,
+                        retargetedValue: injected.retarget(input, "follow-label").value,
+                        value: input.value
+                    };
+                }"##,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert_eq!(value["actionabilityPassed"], true);
+        assert_eq!(value["editable"], true);
+        assert_eq!(value["fillResult"], "done");
+        assert_eq!(value["retargetedValue"], "Alice");
+        assert_eq!(value["value"], "Alice");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_playwright_injected_scope_selector_matches_handle_root() {
+        let mut rt = setup_runtime(r#"<html><body><input id="first_name"></body></html>"#);
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r##"() => {
+                    const injected = globalThis.__obscura_make_playwright_injected_script();
+                    const parsed = { parts: [{ name: 'css', body: [{ simples: [{ selector: { functions: [{ name: 'scope', args: [] }] }, combinator: '' }] }] }] };
+                    const root = document.querySelector("#first_name");
+                    const elements = injected.querySelectorAll(parsed, root);
+                    return elements.length + ":" + (elements[0] && elements[0].id);
+                }"##,
+                None,
+                &[],
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), "1:first_name");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_call_function_on_dom_interaction() {
         let mut rt = setup_runtime(r#"<div id="items"><span>A</span><span>B</span></div>"#);
         let args = vec![serde_json::json!({"value": "span"})];

@@ -903,6 +903,17 @@ class Element extends Node {
   set selected(v) { this._selected = !!v; }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
+  get readOnly() { return this.hasAttribute("readonly"); }
+  set readOnly(v) { if (v) this.setAttribute("readonly", ""); else this.removeAttribute("readonly"); }
+  get isContentEditable() {
+    let node = this;
+    while (node && node.nodeType === 1) {
+      const value = node.getAttribute("contenteditable");
+      if (value !== null) return value === "" || value.toLowerCase() === "true";
+      node = node.parentElement;
+    }
+    return false;
+  }
   get type() { return this.getAttribute("type") || (this.localName === "input" ? "text" : ""); }
   set type(v) { this.setAttribute("type", v); }
   get name() { return this.getAttribute("name") || ""; }
@@ -1847,9 +1858,17 @@ function __obscura_pw_selector_from_parsed(parsed) {
       const simple = simples[0];
       if (!simple || simple.combinator !== "") return null;
       const selector = simple.selector;
-      if (!selector || !Array.isArray(selector.functions) || selector.functions.length !== 0) return null;
-      if (typeof selector.css !== "string") return null;
-      groups.push(selector.css);
+      if (!selector || !Array.isArray(selector.functions)) return null;
+      if (typeof selector.css === "string") {
+        if (selector.functions.length !== 0) return null;
+        groups.push(selector.css);
+        continue;
+      }
+      if (selector.functions.length === 1 && selector.functions[0]?.name === "scope") {
+        groups.push(":scope");
+        continue;
+      }
+      return null;
     }
     return groups.join(", ");
   } catch (_) {
@@ -1865,7 +1884,63 @@ globalThis.__obscura_make_playwright_injected_script = function() {
     const selector = __obscura_pw_selector_from_parsed(parsed);
     if (!selector) return [];
     const scope = root || document;
+    if (selector === ":scope" && scope && scope.nodeType === 1) return [scope];
     return Array.from(scope.querySelectorAll(selector));
+  }
+  function associatedControl(node) {
+    if (!node || node.localName !== "label") return node || null;
+    const forId = node.getAttribute("for");
+    if (forId) {
+      const found = document.getElementById(forId);
+      if (found) return found;
+    }
+    return node.querySelector("button, input, textarea, select") || node;
+  }
+  function isVisible(node) {
+    if (!node || !node.isConnected) return false;
+    if (node.nodeType !== 1) return true;
+    if (node.hasAttribute("hidden")) return false;
+    const style = node.style || {};
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    return true;
+  }
+  function isEnabled(node) {
+    if (!node || !node.isConnected) return false;
+    let current = node;
+    while (current && current.nodeType === 1) {
+      if (current.disabled || current.hasAttribute("disabled")) return false;
+      current = current.parentElement;
+    }
+    return true;
+  }
+  function isEditable(node) {
+    const element = associatedControl(node);
+    if (!element || !isEnabled(element)) return false;
+    if (element.isContentEditable) return true;
+    const tag = element.localName;
+    if (tag === "textarea") return !element.readOnly;
+    if (tag === "select") return false;
+    if (tag !== "input") return false;
+    const type = (element.type || "text").toLowerCase();
+    const textTypes = new Set(["", "email", "number", "password", "search", "tel", "text", "url"]);
+    return textTypes.has(type) && !element.readOnly;
+  }
+  function stateResult(node, state) {
+    const element = associatedControl(node);
+    if (!element || !element.isConnected) {
+      return { matches: false, received: "error:notconnected" };
+    }
+    if (state === "attached") return { matches: true, received: "attached" };
+    if (state === "detached") return { matches: false, received: "attached" };
+    if (state === "visible") return { matches: isVisible(element), received: isVisible(element) ? "visible" : "hidden" };
+    if (state === "hidden") return { matches: !isVisible(element), received: isVisible(element) ? "visible" : "hidden" };
+    if (state === "enabled") return { matches: isEnabled(element), received: isEnabled(element) ? "enabled" : "disabled" };
+    if (state === "disabled") return { matches: !isEnabled(element), received: isEnabled(element) ? "enabled" : "disabled" };
+    if (state === "editable") return { matches: isEditable(element), received: isEditable(element) ? "editable" : "readOnly" };
+    if (state === "checked") return { matches: !!element.checked, received: element.checked ? "checked" : "unchecked" };
+    if (state === "unchecked") return { matches: !element.checked, received: element.checked ? "checked" : "unchecked" };
+    if (state === "stable") return { matches: true, received: "stable" };
+    return { matches: true, received: state };
   }
   return {
     eval: globalThis.eval.bind(globalThis),
@@ -1878,6 +1953,54 @@ globalThis.__obscura_make_playwright_injected_script = function() {
         throw new Error("strict mode violation: selector resolved to " + elements.length + " elements");
       }
       return elements[0] || null;
+    },
+    async checkElementStates(node, states) {
+      const element = associatedControl(node);
+      if (!element || !element.isConnected) return "error:notconnected";
+      for (const state of states || []) {
+        if (state === "stable") continue;
+        const result = stateResult(element, state);
+        if (!result.matches) return { missingState: state };
+      }
+      return undefined;
+    },
+    elementState(node, state) {
+      return stateResult(node, state);
+    },
+    retarget(node, behavior) {
+      if (behavior === "follow-label") return associatedControl(node);
+      return node || null;
+    },
+    utils: {
+      isElementVisible: isVisible,
+    },
+    fill(node, value) {
+      const element = associatedControl(node);
+      if (!element || !element.isConnected) return "error:notconnected";
+      const tag = element.localName;
+      const stringValue = String(value ?? "");
+      if (tag === "input" || tag === "textarea") {
+        element.focus?.();
+        element.value = stringValue;
+        try { element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: stringValue })); } catch (_) {}
+        try { element.dispatchEvent(new Event("change", { bubbles: true })); } catch (_) {}
+        return "done";
+      }
+      if (element.isContentEditable) {
+        element.focus?.();
+        element.textContent = stringValue;
+        try { element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: stringValue })); } catch (_) {}
+        return "done";
+      }
+      return "error:notfillable";
+    },
+    createStacklessError(message) {
+      const error = new Error(message);
+      try { error.stack = ""; } catch (_) {}
+      return error;
+    },
+    strictModeViolationError(parsed, elements) {
+      return new Error("strict mode violation: selector resolved to " + (elements ? elements.length : 0) + " elements");
     },
     checkDeprecatedSelectorUsage() {},
     markTargetElements() {},
@@ -1912,7 +2035,7 @@ globalThis.__obscura_make_playwright_utility_script = function() {
     _fastLocatorResult(returnByValue, expression, parsedArgs) {
       if (!returnByValue || typeof expression !== "string") return undefined;
 
-      if (expression.indexOf("injected.querySelectorAll") !== -1 && expression.indexOf("elements.length") !== -1) {
+      if (expression.indexOf("injected.querySelectorAll") !== -1 && expression.indexOf("return elements.length") !== -1) {
         const payload = parsedArgs[1] || {};
         const selector = __obscura_pw_selector_from_info(payload.info);
         if (!selector) return undefined;

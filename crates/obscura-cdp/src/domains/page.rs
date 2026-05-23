@@ -190,6 +190,15 @@ pub async fn handle(
                 "loaderId": loader_id,
             }))
         }
+        "reload" => {
+            let url = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?
+                .url_string();
+            let navigate_params = json!({ "url": url });
+            let _ = Box::pin(handle("navigate", &navigate_params, ctx, session_id)).await?;
+            Ok(json!({}))
+        }
         "getFrameTree" => {
             let page = ctx
                 .get_session_page(session_id)
@@ -414,5 +423,37 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("screenshot data");
         assert!(data.starts_with("iVBORw0KGgo"));
+    }
+
+    #[tokio::test]
+    async fn reload_reuses_current_page_url() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{}-session", page_id));
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
+        let path =
+            std::env::temp_dir().join(format!("obscura-cdp-reload-{}.html", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "<!doctype html><title>reload</title><input id=first_name>",
+        )
+        .expect("write reload fixture");
+        let url = format!("file://{}", path.display());
+        handle("navigate", &json!({ "url": url }), &mut ctx, &session_id)
+            .await
+            .expect("initial navigation should succeed");
+        ctx.pending_events.clear();
+
+        let result = handle("reload", &json!({}), &mut ctx, &session_id)
+            .await
+            .expect("Page.reload should be accepted");
+
+        assert_eq!(result, json!({}));
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.frameNavigated"));
+        let _ = std::fs::remove_file(path);
     }
 }
