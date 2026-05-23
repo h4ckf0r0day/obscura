@@ -14,6 +14,16 @@ use crate::dispatch::{self, CdpContext};
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
+
+// The WS-stream forwarding channel must also be bounded: if the LocalSet
+// (CDP processor + nav tasks) stalls, the accept thread keeps pushing
+// `std::net::TcpStream`s into the queue. An unbounded channel would let
+// that queue grow without limit and OOM the process. With a bounded
+// capacity, when the LocalSet is saturated the accept thread closes the
+// new connection on the spot instead of buffering it — the kernel TCP
+// backlog still absorbs short-term spikes, but a long-term stall now
+// fails loudly at accept time rather than silently piling up FDs.
+const MAX_PENDING_WS_HANDOFFS: usize = 128;
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -94,11 +104,25 @@ pub async fn start_with_host_and_security(
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<std::net::TcpStream>();
+    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
+    //
+    // Lifecycle note: this thread is spawned detached (no `join` handle).
+    // It is intended to run for the entire process lifetime — the same
+    // contract Chromium DevTools / Playwright clients expect from a CDP
+    // server. When `start_with_*` returns (whether by Ok or panic in the
+    // LocalSet), `ws_rx` drops; the next `ws_tx.blocking_send` then
+    // returns `SendError`, which `accept_dispatch` surfaces as
+    // "accept channel closed" and the loop logs+continues. The listener
+    // FD stays bound until the process exits. If we ever need to support
+    // graceful shutdown for embedded/library use, add an
+    // `Arc<AtomicBool>` shutdown flag checked between `accept()`s and
+    // switch to a non-blocking `set_nonblocking(true)` + poll loop.
+    // For the standalone `obscura serve` binary the detached lifetime is
+    // correct.
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -165,7 +189,7 @@ const WS_PEEK_BUF: usize = 4;
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
-    ws_tx: &mpsc::UnboundedSender<std::net::TcpStream>,
+    ws_tx: &mpsc::Sender<std::net::TcpStream>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
     let n = stream.peek(&mut buf)?;
@@ -193,9 +217,21 @@ fn accept_dispatch(
         // Upgrade: websocket).
     }
 
+    // Try to hand off the WS stream to the LocalSet. If the bounded channel
+    // is full the LocalSet is saturated — drop the connection cleanly
+    // rather than blocking the accept thread (which would freeze the HTTP
+    // control plane that this whole rework exists to keep alive). The
+    // dropped `stream` closes itself; the client will see ECONNRESET and
+    // can retry.
     ws_tx
-        .send(stream)
-        .map_err(|_| anyhow::anyhow!("accept channel closed"))
+        .try_send(stream)
+        .map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
+                anyhow::anyhow!("ws handoff channel full")
+            }
+            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
+        })
 }
 
 /// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.

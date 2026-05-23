@@ -20,6 +20,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const JS_DURATION_MS: u64 = 5000;
 
+// Pick a free port for the test server. There is a small TOCTOU window
+// between dropping the listener here and the server's own bind a few lines
+// later — under heavy CI parallelism another process could steal the port
+// in between. The test is `#[ignore]` and opt-in via `--ignored`, so it
+// runs serially in practice. If we ever flip it to a default-on integration
+// test, replace this with a SO_REUSEPORT-aware port lease or pass the
+// already-bound listener into the server.
 async fn pick_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
