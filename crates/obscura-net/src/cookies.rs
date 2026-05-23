@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use url::Url;
 
+const DEFAULT_SAME_SITE: &str = "Lax";
+
 pub struct CookieJar {
     cookies: RwLock<HashMap<String, HashMap<String, CookieEntry>>>,
 }
@@ -15,7 +17,6 @@ struct CookieEntry {
     secure: bool,
     http_only: bool,
     expires: Option<u64>,
-    #[allow(dead_code)]
     same_site: String,
 }
 
@@ -165,6 +166,8 @@ impl CookieJar {
                     path: entry.path.clone(),
                     secure: entry.secure,
                     http_only: entry.http_only,
+                    same_site: entry.same_site.clone(),
+                    expires: entry.expires.map(|e| e as i64),
                 });
             }
         }
@@ -174,6 +177,12 @@ impl CookieJar {
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
         let mut jar = self.cookies.write().unwrap();
         for cookie in cookies {
+            let same_site = if cookie.same_site.is_empty() {
+                DEFAULT_SAME_SITE.to_string()
+            } else {
+                cookie.same_site
+            };
+            let expires = cookie.expires.and_then(|e| if e > 0 { Some(e as u64) } else { None });
             let entry = CookieEntry {
                 name: cookie.name.clone(),
                 value: cookie.value,
@@ -181,8 +190,8 @@ impl CookieJar {
                 domain: cookie.domain.clone(),
                 secure: cookie.secure,
                 http_only: cookie.http_only,
-                expires: None,
-                same_site: "Lax".to_string(),
+                expires,
+                same_site,
             };
             jar.entry(cookie.domain).or_default().insert(cookie.name, entry);
         }
@@ -336,6 +345,30 @@ impl CookieJar {
         }
     }
 
+    pub fn delete_cookies_filtered(&self, name: &str, domain: &str, path: Option<&str>) {
+        let mut cookies = self.cookies.write().unwrap();
+        let matches_path = |entry_path: &str| match path {
+            Some(p) => entry_path == p,
+            None => true,
+        };
+        if domain.is_empty() {
+            for domain_cookies in cookies.values_mut() {
+                domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+            }
+        } else {
+            let domains_to_try = [
+                domain.to_string(),
+                format!(".{}", domain.trim_start_matches('.')),
+                domain.trim_start_matches('.').to_string(),
+            ];
+            for d in &domains_to_try {
+                if let Some(domain_cookies) = cookies.get_mut(d.as_str()) {
+                    domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+                }
+            }
+        }
+    }
+
     pub fn clear(&self) {
         self.cookies.write().unwrap().clear();
     }
@@ -356,6 +389,10 @@ pub struct CookieInfo {
     pub secure: bool,
     #[serde(rename = "httpOnly")]
     pub http_only: bool,
+    #[serde(default, rename = "sameSite")]
+    pub same_site: String,
+    #[serde(default)]
+    pub expires: Option<i64>,
 }
 
 fn parse_http_date(s: &str) -> Result<u64, ()> {
@@ -438,6 +475,8 @@ mod tests {
             path: "/".to_string(),
             secure: false,
             http_only: false,
+            same_site: String::new(),
+            expires: None,
         }]);
 
         let apex_url = Url::parse("https://example.com/").unwrap();
@@ -507,6 +546,107 @@ mod tests {
         assert!(!jar.get_cookie_header(&url).is_empty());
 
         jar.clear();
+        assert!(jar.get_cookie_header(&url).is_empty());
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_preserves_same_site_and_expires() {
+        let jar = CookieJar::new();
+        let future_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "abc".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            same_site: "Strict".to_string(),
+            expires: Some(future_expiry),
+        }]);
+
+        let cookies = jar.get_all_cookies();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].same_site, "Strict");
+        assert_eq!(cookies[0].expires, Some(future_expiry));
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_session_when_expires_none() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "n".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        let cookies = jar.get_all_cookies();
+        assert_eq!(cookies[0].expires, None);
+        assert_eq!(cookies[0].same_site, DEFAULT_SAME_SITE);
+    }
+
+    #[test]
+    fn test_delete_cookies_filtered_path_mismatch_preserves_cookie() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/admin".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        jar.delete_cookies_filtered("sid", "example.com", Some("/other"));
+        assert_eq!(jar.get_all_cookies().len(), 1);
+
+        jar.delete_cookies_filtered("sid", "example.com", Some("/admin"));
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
+    fn test_delete_cookies_filtered_no_path_deletes_regardless() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/admin".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        jar.delete_cookies_filtered("sid", "example.com", None);
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_expired_does_not_persist() {
+        let jar = CookieJar::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "old".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: Some(now - 1),
+        }]);
+        let url = Url::parse("https://example.com/").unwrap();
         assert!(jar.get_cookie_header(&url).is_empty());
     }
 }
