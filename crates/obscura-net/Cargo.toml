@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
+encoding_rs = "0.8"
 wreq-util = { version = "3.0.0-rc.10", optional = true }
 
 # `prefix-symbols` renames BoringSSL exports to avoid clashes with system OpenSSL,

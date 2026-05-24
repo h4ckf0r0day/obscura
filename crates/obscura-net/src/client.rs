@@ -21,8 +21,17 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn text(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.body.clone())
+    /// Decode the body as text, honoring the response charset.
+    ///
+    /// Uses the HTTP `Content-Type` header's `charset=` parameter, then for
+    /// HTML responses falls back to sniffing `<meta charset>` in the first
+    /// 1KB, then UTF-8. Mirrors browser behaviour per the HTML5 spec.
+    pub fn text(&self) -> String {
+        if self.is_html() {
+            crate::encoding::decode_response(&self.body, self.content_type())
+        } else {
+            crate::encoding::decode_non_html(&self.body, self.content_type())
+        }
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {

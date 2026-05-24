@@ -402,7 +402,9 @@ impl Page {
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
-                let code = String::from_utf8_lossy(&resp.body).to_string();
+                // Script bodies: only the HTTP Content-Type charset matters
+                // (no in-band meta-charset for JS).
+                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                 fetched.insert(idx, (url, code, resp));
             }
         }
@@ -650,7 +652,11 @@ impl Page {
             self.url = Some(response.url.clone());
         }
 
-        let body_text = String::from_utf8_lossy(&response.body).to_string();
+        // Honor the response charset: HTTP Content-Type → <meta charset> sniff
+        // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
+        // page (GBK, Big5, Shift-JIS, Windows-125x, EUC-KR, ISO-8859-x)
+        // came through as replacement characters.
+        let body_text = obscura_net::decode_response(&response.body, response.content_type());
         let dom = parse_html(&body_text);
 
         self.title = dom
@@ -718,7 +724,9 @@ impl Page {
         let mut css_sources = Vec::new();
         for result in css_results {
             if let Some((url_str, resp)) = result {
-                let css = String::from_utf8_lossy(&resp.body).to_string();
+                // CSS bodies: honor the Content-Type charset; CSS @charset is
+                // out of scope for the current scrape-focused pipeline.
+                let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
                 self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
                 css_sources.push(css);
             }
