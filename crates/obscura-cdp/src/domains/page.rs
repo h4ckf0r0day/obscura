@@ -313,6 +313,17 @@ pub async fn handle(
                     .to_string(),
             )
         }
+        "captureScreenshot" | "captureSnapshot" => {
+            // Same story as printToPDF: rasterising a page needs a layout and
+            // paint pipeline that Obscura intentionally does not have. Reply
+            // with a clear error so clients can fail fast instead of waiting
+            // on the generic "Unknown Page method" reply.
+            Err(format!(
+                "Page.{method} is not supported by Obscura: no layout or paint engine. \
+                 For visual snapshots, drive a real headless Chromium for the \
+                 screenshot leg of your pipeline and use Obscura for the scraping leg."
+            ))
+        }
         _ => Err(format!("Unknown Page method: {}", method)),
     }
 }
@@ -396,6 +407,34 @@ mod tests {
             err.to_lowercase().contains("evaluate")
                 || err.to_lowercase().contains("html"),
             "error must point to a workaround: {err}"
+        );
+    }
+
+    /// Regression for #45: same idea as printToPDF for captureScreenshot.
+    /// Playwright's `page.screenshot()` calls Page.captureScreenshot via CDP;
+    /// without an explicit arm, clients see "Unknown Page method" and have
+    /// no idea why their screenshot request failed.
+    #[tokio::test]
+    async fn capture_screenshot_returns_descriptive_unsupported_error() {
+        let mut ctx = CdpContext::new();
+        let err = handle("captureScreenshot", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("captureScreenshot must error until a real paint exists");
+        assert!(
+            !err.contains("Unknown Page method"),
+            "captureScreenshot must NOT fall through to the catch-all: {err}"
+        );
+        assert!(
+            err.contains("not supported by Obscura"),
+            "error must clearly state screenshot is unsupported: {err}"
+        );
+        // Same for the MHTML snapshot sibling method.
+        let err2 = handle("captureSnapshot", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("captureSnapshot must error until a real renderer exists");
+        assert!(
+            !err2.contains("Unknown Page method"),
+            "captureSnapshot must NOT fall through: {err2}"
         );
     }
 }

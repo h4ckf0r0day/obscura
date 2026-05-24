@@ -1,7 +1,35 @@
+use obscura_browser::Page;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
+
+/// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
+/// and `objectId` in that order. Playwright commonly passes only `objectId`
+/// (returned by a prior `DOM.resolveNode`); without this fallback those
+/// requests silently default to node 0 and click the wrong element.
+fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
+    if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64()) {
+        return Ok(nid);
+    }
+    if let Some(nid) = params.get("backendNodeId").and_then(|v| v.as_u64()) {
+        return Ok(nid);
+    }
+    if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
+        let code = format!(
+            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
+             return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+            oid.replace('\'', "\\'")
+        );
+        let result = page.evaluate(&code);
+        let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+        if nid < 0 {
+            return Err(format!("objectId {oid} could not be resolved to a node"));
+        }
+        return Ok(nid as u64);
+    }
+    Err("nodeId, backendNodeId, or objectId required".to_string())
+}
 
 pub async fn handle(
     method: &str,
@@ -138,10 +166,8 @@ pub async fn handle(
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
         "getBoxModel" => {
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
@@ -175,10 +201,8 @@ pub async fn handle(
             }))
         }
         "getContentQuads" => {
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\

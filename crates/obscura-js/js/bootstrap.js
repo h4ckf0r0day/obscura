@@ -746,6 +746,29 @@ class Element extends Node {
     return {x:8,y:8,width:100,height:20,top:8,right:108,bottom:28,left:8,toJSON(){return this;}};
   }
   getClientRects() { return [this.getBoundingClientRect()]; }
+  // No layout engine: a stub that always returns true unblocks Playwright's
+  // actionability polling. With a real layout we'd check display, visibility,
+  // opacity and rect dimensions per spec.
+  checkVisibility(opts) { return true; }
+  // ARIA reflection properties. Without an accessibility tree we expose the
+  // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
+  // at least find elements that author them explicitly.
+  get role() { return this.getAttribute('role'); }
+  set role(v) { if (v == null) this.removeAttribute('role'); else this.setAttribute('role', String(v)); }
+  get ariaLabel() { return this.getAttribute('aria-label'); }
+  set ariaLabel(v) { if (v == null) this.removeAttribute('aria-label'); else this.setAttribute('aria-label', String(v)); }
+  get ariaRoleDescription() { return this.getAttribute('aria-roledescription'); }
+  set ariaRoleDescription(v) { if (v == null) this.removeAttribute('aria-roledescription'); else this.setAttribute('aria-roledescription', String(v)); }
+  get ariaChecked() { return this.getAttribute('aria-checked'); }
+  set ariaChecked(v) { if (v == null) this.removeAttribute('aria-checked'); else this.setAttribute('aria-checked', String(v)); }
+  get ariaDisabled() { return this.getAttribute('aria-disabled'); }
+  set ariaDisabled(v) { if (v == null) this.removeAttribute('aria-disabled'); else this.setAttribute('aria-disabled', String(v)); }
+  get ariaExpanded() { return this.getAttribute('aria-expanded'); }
+  set ariaExpanded(v) { if (v == null) this.removeAttribute('aria-expanded'); else this.setAttribute('aria-expanded', String(v)); }
+  get ariaHidden() { return this.getAttribute('aria-hidden'); }
+  set ariaHidden(v) { if (v == null) this.removeAttribute('aria-hidden'); else this.setAttribute('aria-hidden', String(v)); }
+  get ariaSelected() { return this.getAttribute('aria-selected'); }
+  set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView() { globalThis.__obscura_click_target = this; }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
@@ -2164,6 +2187,7 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Element.prototype.getElementsByTagName, Element.prototype.getElementsByClassName,
   Element.prototype.matches, Element.prototype.closest,
   Element.prototype.getBoundingClientRect, Element.prototype.getClientRects,
+  Element.prototype.checkVisibility,
   Element.prototype.addEventListener, Element.prototype.removeEventListener,
   Element.prototype.dispatchEvent, Element.prototype.click,
   Element.prototype.focus, Element.prototype.blur,

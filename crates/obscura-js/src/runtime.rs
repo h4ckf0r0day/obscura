@@ -1811,4 +1811,66 @@ mod tests {
         );
     }
 
+    // ── Issue #45 (Playwright actionability) regression tests ────────────────
+    // Kept at the end of the module so they don't share textual context with
+    // unrelated test additions in other branches (avoids spurious merge
+    // conflicts when both this branch and an unrelated bootstrap.js change
+    // add tests near the start of `mod tests`).
+
+    /// Playwright >= 1.25 calls `element.checkVisibility(...)` before every
+    /// input event. If the method isn't defined Playwright retries until its
+    /// action timeout fires. Without a layout engine we can't compute it
+    /// properly, so the stub always returns true — still strictly better
+    /// than the undefined path.
+    #[test]
+    fn element_check_visibility_is_callable() {
+        let mut rt = setup_runtime(r#"<div id="x">x</div>"#);
+        let result = rt
+            .evaluate("document.getElementById('x').checkVisibility({checkOpacity: true})")
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+
+        let typeof_method = rt
+            .evaluate("typeof document.getElementById('x').checkVisibility")
+            .unwrap();
+        assert_eq!(typeof_method, serde_json::json!("function"));
+    }
+
+    /// Playwright's `getByRole` / `getByLabel` locators resolve via ARIA
+    /// reflection properties. Without the getters those locators always
+    /// fail. Reflect the underlying aria-* attributes.
+    #[test]
+    fn element_aria_reflection_properties_read_aria_attrs() {
+        let mut rt = setup_runtime(
+            r#"<button id="b" role="tab" aria-label="Settings" aria-selected="true">x</button>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const el = document.getElementById('b');
+                return [el.role, el.ariaLabel, el.ariaSelected];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["tab", "Settings", "true"]));
+    }
+
+    /// Setting an ARIA reflection property must write through to the
+    /// underlying attribute so frameworks that toggle state via
+    /// `el.ariaExpanded = 'true'` actually update the DOM.
+    #[test]
+    fn element_aria_reflection_setters_write_through() {
+        let mut rt = setup_runtime(r#"<div id="d"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const el = document.getElementById('d');
+                el.role = 'menu';
+                el.ariaExpanded = 'true';
+                return [el.getAttribute('role'), el.getAttribute('aria-expanded')];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["menu", "true"]));
+    }
 }
