@@ -86,7 +86,8 @@ async fn handle_connection(
                 let hdr = "HTTP/1.1 204 No Content\r\n\
                     Access-Control-Allow-Origin: *\r\n\
                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                    Access-Control-Allow-Headers: Content-Type\r\n\
+                    Access-Control-Allow-Headers: Content-Type, Accept, mcp-protocol-version\r\n\
+                    Access-Control-Max-Age: 86400\r\n\
                     \r\n";
                 writer.write_all(hdr.as_bytes()).await?;
             }
@@ -196,6 +197,7 @@ async fn respond(writer: &mut (impl AsyncWriteExt + Unpin), status: u16, body: &
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
          \r\n",
         body.len()
     );
