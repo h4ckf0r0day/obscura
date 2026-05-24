@@ -224,6 +224,9 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                     }))
                 }
                 None => {
+                    // canAccessOpener is required on every TargetInfo per the
+                    // CDP spec. Strict clients (chromiumoxide) panic if it's
+                    // missing. The browser target itself has no opener.
                     Ok(json!({
                         "targetInfo": {
                             "targetId": "browser",
@@ -231,6 +234,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": "",
                             "url": "",
                             "attached": true,
+                            "canAccessOpener": false,
                         }
                     }))
                 }
@@ -276,5 +280,26 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Target method"));
+    }
+
+    /// Regression for #122 item 5: every TargetInfo payload must carry the
+    /// `canAccessOpener` field. The browser-target branch of getTargetInfo
+    /// (no targetId passed → no page) used to omit it; strict CDP clients
+    /// like chromiumoxide panic when the field is missing.
+    #[tokio::test]
+    async fn get_target_info_browser_target_includes_can_access_opener() {
+        let mut ctx = CdpContext::new();
+        // No targetId → falls through to the browser-target branch.
+        let result = handle("getTargetInfo", &json!({}), &mut ctx)
+            .await
+            .expect("getTargetInfo with no targetId must return browser info");
+
+        let info = &result["targetInfo"];
+        assert_eq!(info["type"], "browser", "must be the browser target");
+        assert!(
+            info.get("canAccessOpener").is_some(),
+            "canAccessOpener must be present on every TargetInfo, got: {result}"
+        );
+        assert_eq!(info["canAccessOpener"], false);
     }
 }

@@ -11,25 +11,37 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let event = crate::types::CdpEvent {
-                method: "Runtime.executionContextCreated".to_string(),
-                params: json!({
-                    "context": {
-                        "id": 1,
-                        "origin": page.url_string(),
-                        "name": "",
-                        "uniqueId": format!("ctx-{}", page.id),
-                        "auxData": {
-                            "isDefault": true,
-                            "type": "default",
-                            "frameId": page.frame_id,
-                        }
-                    }
-                }),
-                session_id: session_id.clone(),
-            };
-            ctx.pending_events.push(event);
+            // puppeteer-extra's FrameManager.initialize calls Runtime.enable on
+            // the browser-level connection BEFORE any page target exists. Real
+            // Chrome replies with `{}` and emits executionContextCreated when
+            // a context appears. Returning "No page" here breaks the standard
+            // puppeteer connect/newPage flow. If there's no session, succeed
+            // silently — the next Target.attachToTarget will set things up.
+            match ctx.get_session_page(session_id) {
+                Some(page) => {
+                    let event = crate::types::CdpEvent {
+                        method: "Runtime.executionContextCreated".to_string(),
+                        params: json!({
+                            "context": {
+                                "id": 1,
+                                "origin": page.url_string(),
+                                "name": "",
+                                "uniqueId": format!("ctx-{}", page.id),
+                                "auxData": {
+                                    "isDefault": true,
+                                    "type": "default",
+                                    "frameId": page.frame_id,
+                                }
+                            }
+                        }),
+                        session_id: session_id.clone(),
+                    };
+                    ctx.pending_events.push(event);
+                }
+                None => {
+                    // No session attached yet — that's fine. Just ack.
+                }
+            }
             Ok(json!({}))
         }
         "evaluate" => {
@@ -41,7 +53,7 @@ pub async fn handle(
                 .get("returnByValue")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-          
+
             validate_context_id(params, "contextId", ctx, "evaluate")?;
 
             let await_promise = params
@@ -49,10 +61,31 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            // CDP `timeout` field (milliseconds). Default to Chrome's
+            // protocolTimeout (30s) so long evaluations don't pin the V8 lock
+            // indefinitely and starve every other CDP command on the same
+            // session.
+            let timeout_ms = params
+                .get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30_000);
+
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page")?;
-            let info = page.evaluate_for_cdp(expression, return_by_value, await_promise).await;
+            let info = match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                page.evaluate_for_cdp(expression, return_by_value, await_promise),
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(_) => {
+                    return Err(format!(
+                        "Runtime.evaluate exceeded {timeout_ms}ms timeout"
+                    ));
+                }
+            };
             page.process_pending_navigation().await.map_err(|e| e.to_string())?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
@@ -357,5 +390,19 @@ mod tests {
                 "registered isolated-world contextId=100 must be accepted, got: {e}"
             );
         }
+    }
+
+    /// Regression for #122 item 7: puppeteer-extra's FrameManager.initialize
+    /// fires Runtime.enable on the browser-level WebSocket BEFORE any page
+    /// target exists. Real Chrome replies with `{}`; before the fix Obscura
+    /// returned `{"error":{"code":-32601,"message":"No page"}}` and the
+    /// puppeteer connect flow died.
+    #[tokio::test]
+    async fn enable_succeeds_when_no_session_attached() {
+        let mut ctx = CdpContext::new();
+        let result = handle("enable", &json!({}), &mut ctx, &None)
+            .await
+            .expect("Runtime.enable must succeed even with no session");
+        assert_eq!(result, json!({}));
     }
 }
