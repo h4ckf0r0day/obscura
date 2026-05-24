@@ -1042,7 +1042,20 @@ class Document extends Node {
   get activeElement() { return globalThis.__obscura_focused || this.body; }
   get implementation() {
     return {
-      createHTMLDocument(title) { return globalThis.document; },
+      // Must return a NEW, DETACHED document. jQuery and others use this as a
+      // sandbox: `createHTMLDocument("").body.innerHTML = "<form></form>..."`
+      // for feature detection. Returning the live document made that wipe the
+      // real <body>, dropping all page content (see issue 147).
+      createHTMLDocument(title) {
+        const doc = new _IframeDocument('', 'about:blank', undefined);
+        if (title !== undefined) {
+          const titleEl = document.createElement('title');
+          titleEl.textContent = String(title);
+          doc._head.appendChild(titleEl);
+          doc._title = String(title);
+        }
+        return doc;
+      },
       createDocument() { return globalThis.document; },
       hasFeature() { return true; },
     };

@@ -965,6 +965,64 @@ mod tests {
         assert_eq!(text, serde_json::json!("BODY_TEXT"));
     }
 
+    /// Regression test for #147: `document.implementation.createHTMLDocument`
+    /// must return a NEW, detached document. jQuery 3.7.x uses it as a
+    /// sandbox — `createHTMLDocument("").body.innerHTML = "<form></form>..."`
+    /// during feature detection. The previous implementation returned the
+    /// live `globalThis.document`, so that write wiped the real <body> down
+    /// to two `<form>` stubs — every page that loaded jQuery (e.g. WordPress
+    /// + GeneratePress + offside.js) collapsed to a 1-byte text dump because
+    /// `.slideout-navigation` no longer matched any element, then offside.js
+    /// dereferenced `undefined.classList`.
+    #[test]
+    fn create_html_document_returns_detached_document() {
+        let mut rt = setup_runtime(
+            "<html><body><nav id=keep>NAV_CONTENT</nav><p>PARA</p></body></html>",
+        );
+
+        let before_children = rt
+            .evaluate("document.body.children.length")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert_eq!(before_children, 2.0, "baseline: <body> has nav + p");
+
+        // Reproduce the exact jQuery 3.7.1 feature-detect snippet that used
+        // to wipe the live body.
+        rt.execute_script(
+            "jquery-support-detect",
+            r#"
+            var sandbox = document.implementation.createHTMLDocument("");
+            sandbox.body.innerHTML = "<form></form><form></form>";
+            globalThis.__sandboxFormCount = sandbox.body.children.length;
+            globalThis.__sandboxIsLive = (sandbox === document);
+            "#,
+        )
+        .unwrap();
+
+        // The sandbox must be a distinct document, not the live one.
+        let is_live = rt.evaluate("globalThis.__sandboxIsLive").unwrap();
+        assert_eq!(is_live, serde_json::json!(false),
+                   "createHTMLDocument must NOT return the live document");
+
+        // The sandbox itself received the two forms.
+        let sandbox_forms = rt.evaluate("globalThis.__sandboxFormCount").unwrap();
+        assert_eq!(sandbox_forms, serde_json::json!(2.0));
+
+        // Critical assertion: the real <body> still has its original content.
+        let after_children = rt
+            .evaluate("document.body.children.length")
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert_eq!(after_children, 2.0,
+                   "live <body> must be untouched by sandbox writes");
+        let nav_text = rt
+            .evaluate("document.querySelector('#keep').textContent")
+            .unwrap();
+        assert_eq!(nav_text, serde_json::json!("NAV_CONTENT"));
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
