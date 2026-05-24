@@ -83,10 +83,15 @@ async fn handle_connection(
 
         match method {
             "OPTIONS" => {
+                // mcp-protocol-version is part of the MCP spec, Authorization /
+                // X-API-Key are common for hosted deployments. Without these
+                // listed the browser preflight check fails and blocks the actual
+                // request.
                 let hdr = "HTTP/1.1 204 No Content\r\n\
                     Access-Control-Allow-Origin: *\r\n\
                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                    Access-Control-Allow-Headers: Content-Type\r\n\
+                    Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key, mcp-protocol-version\r\n\
+                    Access-Control-Max-Age: 86400\r\n\
                     \r\n";
                 writer.write_all(hdr.as_bytes()).await?;
             }
