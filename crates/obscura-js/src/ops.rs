@@ -120,6 +120,17 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        "query_selector_scoped" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.query_selector_from(NodeId::new(root_nid), &arg2).ok().flatten()
+                .map(|id| id.index().to_string()).unwrap_or("-1".into())
+        }
+        "query_selector_all_scoped" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            let ids: Vec<i32> = dom.query_selector_all_from(NodeId::new(root_nid), &arg2).ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
@@ -742,6 +753,11 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
+#[op2(async)]
+async fn op_sleep(#[number] millis: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -752,6 +768,7 @@ pub fn build_extension() -> Extension {
             op_get_cookies(),
             op_set_cookie(),
             op_navigate(),
+            op_sleep(),
         ]),
         ..Default::default()
     }

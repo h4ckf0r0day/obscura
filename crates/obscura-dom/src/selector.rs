@@ -500,6 +500,14 @@ pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, S
 
 impl DomTree {
     pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, String> {
+        self.query_selector_from(self.document(), selector)
+    }
+
+    pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeId>, String> {
+        self.query_selector_all_from(self.document(), selector)
+    }
+
+    pub fn query_selector_from(&self, root: NodeId, selector: &str) -> Result<Option<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
@@ -511,8 +519,7 @@ impl DomTree {
             MatchingForInvalidation::No,
         );
 
-        let doc = self.document();
-        for desc_id in self.descendants(doc) {
+        for desc_id in self.descendants(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -528,7 +535,7 @@ impl DomTree {
         Ok(None)
     }
 
-    pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeId>, String> {
+    pub fn query_selector_all_from(&self, root: NodeId, selector: &str) -> Result<Vec<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
@@ -541,8 +548,7 @@ impl DomTree {
         );
         let mut results = Vec::new();
 
-        let doc = self.document();
-        for desc_id in self.descendants(doc) {
+        for desc_id in self.descendants(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -637,5 +643,48 @@ mod tests {
         );
         let results = tree.query_selector_all(".list .item.active").unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_query_selector_all_from_scopes_to_subtree() {
+        let tree = parse_html(
+            r#"<div id="a"><span class="x">in a</span></div><div id="b"><span class="x">in b</span></div>"#,
+        );
+        let a = tree.get_element_by_id("a").expect("div#a");
+        let b = tree.get_element_by_id("b").expect("div#b");
+
+        // Document-rooted: sees both spans.
+        assert_eq!(tree.query_selector_all(".x").unwrap().len(), 2);
+        // Scoped to #a: only its descendant span.
+        let in_a = tree.query_selector_all_from(a, ".x").unwrap();
+        assert_eq!(in_a.len(), 1);
+        let in_b = tree.query_selector_all_from(b, ".x").unwrap();
+        assert_eq!(in_b.len(), 1);
+        assert_ne!(in_a[0], in_b[0]);
+    }
+
+    #[test]
+    fn test_query_selector_from_returns_first_in_subtree_only() {
+        let tree = parse_html(
+            r#"<section id="s"><p>first</p><p>second</p></section><p>outside</p>"#,
+        );
+        let s = tree.get_element_by_id("s").expect("section#s");
+
+        // Scoped to #s: skip the outside paragraph; return the first inside.
+        let first_in_s = tree.query_selector_from(s, "p").unwrap().expect("a p inside");
+        assert_eq!(tree.text_content(first_in_s), "first");
+    }
+
+    #[test]
+    fn test_query_selector_from_excludes_self() {
+        // The root element itself must not match its own scoped query, per
+        // the spec: querySelector matches descendants only.
+        let tree = parse_html(r#"<div id="root" class="x"><span>child</span></div>"#);
+        let root = tree.get_element_by_id("root").expect("div#root");
+
+        // Only descendants are candidates: `.x` on root finds nothing.
+        assert!(tree.query_selector_from(root, ".x").unwrap().is_none());
+        // `span` finds the child.
+        assert!(tree.query_selector_from(root, "span").unwrap().is_some());
     }
 }

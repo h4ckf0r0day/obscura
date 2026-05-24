@@ -965,6 +965,117 @@ mod tests {
         assert_eq!(text, serde_json::json!("BODY_TEXT"));
     }
 
+    /// Regression for #105: `element.querySelector` and `querySelectorAll`
+    /// must scope to the receiver's subtree, not the whole document.
+    #[test]
+    fn element_query_selector_is_scoped_to_subtree() {
+        let mut rt = setup_runtime(
+            r#"<div id="a"><span class="x">in a</span></div><div id="b"><span class="x">in b</span></div>"#,
+        );
+        let text = rt
+            .evaluate("document.getElementById('a').querySelector('.x').textContent")
+            .unwrap();
+        assert_eq!(text, serde_json::json!("in a"));
+
+        let count_in_a = rt
+            .evaluate("document.getElementById('a').querySelectorAll('.x').length")
+            .unwrap();
+        assert_eq!(count_in_a.as_f64().unwrap() as i64, 1);
+
+        // Document-scoped query still sees both.
+        let count_doc = rt.evaluate("document.querySelectorAll('.x').length").unwrap();
+        assert_eq!(count_doc.as_f64().unwrap() as i64, 2);
+    }
+
+    /// Regression for #105: `document.forms` / `images` / `links` must be
+    /// live, not hardcoded `[]`. jQuery 1.x's submit-event setup iterates
+    /// `document.forms` and crashes when it's empty for pages that have forms.
+    #[test]
+    fn document_forms_images_links_are_live() {
+        let mut rt = setup_runtime(
+            r#"<form></form><form></form><img><a href="x">l</a><a>no-href</a>"#,
+        );
+        assert_eq!(rt.evaluate("document.forms.length").unwrap().as_f64().unwrap() as i64, 2);
+        assert_eq!(rt.evaluate("document.images.length").unwrap().as_f64().unwrap() as i64, 1);
+        assert_eq!(rt.evaluate("document.links.length").unwrap().as_f64().unwrap() as i64, 1);
+    }
+
+    /// Regression for #105: `HTMLFormElement` must expose `.elements` so
+    /// frameworks that probe form field collections work.
+    #[test]
+    fn html_form_element_exposes_elements_collection() {
+        let mut rt = setup_runtime(
+            r#"<form id="f"><input name=a><input name=b><textarea></textarea></form>"#,
+        );
+        let n = rt
+            .evaluate("document.getElementById('f').elements.length")
+            .unwrap();
+        assert_eq!(n.as_f64().unwrap() as i64, 3);
+        let is_form = rt
+            .evaluate("document.getElementById('f') instanceof HTMLFormElement")
+            .unwrap();
+        assert_eq!(is_form, serde_json::json!(true));
+    }
+
+    /// Regression for #105: `Element.prepend` must actually insert at the
+    /// start, not silently no-op.
+    #[test]
+    fn element_prepend_inserts_at_start() {
+        let mut rt = setup_runtime(r#"<div id="c"><span>existing</span></div>"#);
+        rt.evaluate(
+            r#"
+            const c = document.getElementById('c');
+            const n = document.createElement('span');
+            n.id = 'first';
+            c.prepend(n);
+            "#,
+        )
+        .unwrap();
+        let first_id = rt.evaluate("document.getElementById('c').firstChild.id").unwrap();
+        assert_eq!(first_id, serde_json::json!("first"));
+        let count = rt.evaluate("document.getElementById('c').childNodes.length").unwrap();
+        assert_eq!(count.as_f64().unwrap() as i64, 2);
+    }
+
+    /// Regression for #105: `isEqualNode` compares structure, not identity.
+    /// Framework diff algorithms rely on this.
+    #[test]
+    fn is_equal_node_does_structural_compare() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const a = document.createElement('div'); a.setAttribute('class', 'x'); a.innerHTML = '<span>hi</span>';
+                const b = document.createElement('div'); b.setAttribute('class', 'x'); b.innerHTML = '<span>hi</span>';
+                const c = document.createElement('div'); c.innerHTML = '<span>bye</span>';
+                return [a.isEqualNode(b), a.isEqualNode(c), a.isSameNode(b)];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, false, false]));
+    }
+
+    /// Regression for the long-standing insert_before arg-order bug noted
+    /// in CLAUDE.md: bootstrap.js was passing (parent, new, ref) but `_dom`
+    /// forwards only two args, silently dropping `ref`. With the fix,
+    /// `insertBefore` actually inserts.
+    #[test]
+    fn insert_before_inserts_node_at_correct_position() {
+        let mut rt = setup_runtime(r#"<div id="p"><span id="b">b</span><span id="c">c</span></div>"#);
+        let order = rt
+            .evaluate(
+                r#"
+                const p = document.getElementById('p');
+                const a = document.createElement('span');
+                a.id = 'a';
+                p.insertBefore(a, document.getElementById('b'));
+                return Array.from(p.children).map(e => e.id).join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(order, serde_json::json!("a,b,c"));
+    }
+
     #[test]
     fn test_console_log() {
         let mut rt = setup_runtime("<html><body></body></html>");

@@ -146,27 +146,42 @@ globalThis.console = {
 };
 
 let _tid = 0;
-const _pendingTimers = new Map();
 const _clearedTimers = new Set();
+const _intervals = new Set();
+
+const _scheduleAfter = (delay, fn) => {
+  const d = Math.max(0, Number(delay) || 0);
+  if (d === 0) Promise.resolve().then(fn);
+  else Deno.core.ops.op_sleep(d).then(fn);
+};
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   if (typeof fn !== "function") return ++_tid;
   const id = ++_tid;
-  _pendingTimers.set(id, { fn, args, delay });
-  Promise.resolve().then(() => {
-    if (!_clearedTimers.has(id) && _pendingTimers.has(id)) {
-      _pendingTimers.delete(id);
-      try { fn(...args); } catch(e) { console.error("Timer error:", e); }
-    }
+  _scheduleAfter(delay, () => {
+    if (_clearedTimers.has(id)) return;
+    try { fn(...args); } catch(e) { console.error("Timer error:", e); }
   });
   return id;
 };
 
-globalThis.clearTimeout = (id) => { _clearedTimers.add(id); _pendingTimers.delete(id); };
-globalThis.setInterval = (fn, delay, ...args) => {
-  return setTimeout(fn, delay, ...args);
+globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
+
+globalThis.setInterval = (fn, delay = 0, ...args) => {
+  if (typeof fn !== "function") return ++_tid;
+  const id = ++_tid;
+  _intervals.add(id);
+  const tick = () => {
+    if (!_intervals.has(id)) return;
+    try { fn(...args); } catch(e) { console.error("Interval error:", e); }
+    if (!_intervals.has(id)) return;
+    _scheduleAfter(delay, tick);
+  };
+  _scheduleAfter(delay, tick);
+  return id;
 };
-globalThis.clearInterval = globalThis.clearTimeout;
+
+globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
 globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
@@ -292,14 +307,14 @@ class Node {
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
-    _dom("insert_before", this._nid, newChild._nid, oldChild._nid);
+    _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
   }
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
-    _dom("insert_before", this._nid, n._nid, ref._nid);
+    _dom("insert_before", n._nid, ref._nid);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -341,7 +356,28 @@ class Node {
   }
   getRootNode() { return globalThis.document; }
   normalize() {} // no-op
-  isEqualNode(other) { return other && this._nid === other._nid; }
+  isEqualNode(other) {
+    if (!other) return false;
+    if (this._nid === other._nid) return true;
+    if (this.nodeType !== other.nodeType) return false;
+    if (this.nodeName !== other.nodeName) return false;
+    if (this.nodeValue !== other.nodeValue) return false;
+    const a = this.attributes ? this.attributes : null;
+    const b = other.attributes ? other.attributes : null;
+    if ((a && a.length) || (b && b.length)) {
+      if (!a || !b || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (other.getAttribute(a[i].name) !== a[i].value) return false;
+      }
+    }
+    const cA = this.childNodes || [];
+    const cB = other.childNodes || [];
+    if (cA.length !== cB.length) return false;
+    for (let i = 0; i < cA.length; i++) {
+      if (!cA[i].isEqualNode(cB[i])) return false;
+    }
+    return true;
+  }
   isSameNode(other) { return other && this._nid === other._nid; }
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
@@ -464,9 +500,9 @@ class Element extends Node {
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   getAttributeNS(ns, n) { return this.getAttribute(n); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
     list.forEach = Array.prototype.forEach.bind(list);
@@ -768,7 +804,14 @@ class Element extends Node {
   }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
-  prepend() {}
+  prepend(...nodes) {
+    const ref = this.firstChild;
+    for (const n of nodes) {
+      const node = (typeof n === "string") ? document.createTextNode(n) : n;
+      if (ref) this.insertBefore(node, ref);
+      else this.appendChild(node);
+    }
+  }
 }
 
 class Document extends Node {
@@ -982,9 +1025,9 @@ class Document extends Node {
     };
   }
   get styleSheets() { return []; }
-  get forms() { return []; }
-  get images() { return []; }
-  get links() { return []; }
+  get forms() { return this.querySelectorAll("form"); }
+  get images() { return this.querySelectorAll("img"); }
+  get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
     return Deno.core.ops.op_get_cookies();
@@ -1025,9 +1068,9 @@ class DocumentFragment extends Node {
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
     return list;
@@ -1062,12 +1105,17 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+function _elementClassFor(nid) {
+  const tag = _domParse("tag_name", nid);
+  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  return Element;
+}
 function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) n = new Element(nid);
+  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
@@ -1078,7 +1126,8 @@ function _wrap(nid) {
 function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
-  const n = new Element(nid);
+  const C = _elementClassFor(nid);
+  const n = new C(nid);
   _cache.set(nid, n);
   return n;
 }
@@ -2101,7 +2150,13 @@ globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = Element;
 globalThis.HTMLInputElement = Element;
 globalThis.HTMLButtonElement = Element;
-globalThis.HTMLFormElement = Element;
+globalThis.HTMLFormElement = class HTMLFormElement extends Element {
+  get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
+  get length() { return this.elements.length; }
+  // Inherit submit() from Element.prototype: it dispatches the cancelable
+  // 'submit' event and (if not prevented) builds form data and navigates.
+  reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
+};
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = Element;
 globalThis.HTMLLabelElement = Element;
@@ -2169,8 +2224,9 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Element.prototype.focus, Element.prototype.blur,
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.scrollIntoView,
-  Element.prototype.append, Element.prototype.remove,
+  Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
+  HTMLFormElement.prototype.reset,
   Element.prototype.getContext, Element.prototype.toDataURL, Element.prototype.toBlob,
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
