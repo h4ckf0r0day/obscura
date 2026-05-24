@@ -758,8 +758,15 @@ class Element extends Node {
     };
   }
   getAnimations() { return []; }
-  get isConnected() { return true; }
-  after() {} before() {} remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+  get isConnected() {
+    var node = this;
+    while (node) {
+      if (node.nodeType === 9) return true;
+      node = node.parentNode;
+    }
+    return false;
+  }
+  remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
   prepend() {}
 }
@@ -1678,6 +1685,15 @@ if (!Element.prototype.after) {
   _markNative(Element.prototype.after);
 }
 
+// ChildNode mixin: also mix before/after/replaceWith/remove into
+// CharacterData.prototype (covers Text, Comment, ProcessingInstruction).
+// These are the same implementations as Element.prototype — frameworks
+// (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
+if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
+if (!CharacterData.prototype.after) CharacterData.prototype.after = Element.prototype.after;
+if (!CharacterData.prototype.replaceWith) CharacterData.prototype.replaceWith = Element.prototype.replaceWith;
+if (!CharacterData.prototype.remove) CharacterData.prototype.remove = Element.prototype.remove;
+
 if (!('isConnected' in Node.prototype)) {
   Object.defineProperty(Node.prototype, 'isConnected', {
     get() {
@@ -2054,7 +2070,15 @@ globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<
 globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
-const _mkStore = () => { const s={}; return { getItem:k=>s[k]??null, setItem:(k,v)=>{s[k]=String(v);}, removeItem:k=>{delete s[k];}, clear:()=>{for(const k in s)delete s[k];}, get length(){return Object.keys(s).length;}, key:i=>Object.keys(s)[i]??null }; };
+globalThis.Storage = function Storage() {};
+Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
+Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
+Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
+Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
+Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
+
+const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {}; return s; };
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
@@ -2146,16 +2170,21 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.scrollIntoView,
   Element.prototype.append, Element.prototype.remove,
+  Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   Element.prototype.getContext, Element.prototype.toDataURL, Element.prototype.toBlob,
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
   Node.prototype.contains, Node.prototype.hasChildNodes, Node.prototype.cloneNode,
+  CharacterData.prototype.before, CharacterData.prototype.after,
+  CharacterData.prototype.replaceWith, CharacterData.prototype.remove,
   Document.prototype.getElementById, Document.prototype.querySelector,
   Document.prototype.querySelectorAll, Document.prototype.getElementsByTagName,
   Document.prototype.createElement, Document.prototype.createElementNS,
   Document.prototype.createTextNode, Document.prototype.createComment,
   Document.prototype.createDocumentFragment, Document.prototype.createEvent,
   Document.prototype.hasFocus,
+  Storage, Storage.prototype.getItem, Storage.prototype.setItem,
+  Storage.prototype.removeItem, Storage.prototype.clear, Storage.prototype.key,
   Notification, Notification.requestPermission,
   window.chrome?.csi, window.chrome?.loadTimes,
   MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver,

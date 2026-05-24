@@ -193,7 +193,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "remove_child" => {
             let child = arg1.parse::<u32>().unwrap_or(0);
-            dom.detach(NodeId::new(child));
+            dom.remove_child(NodeId::new(child));
             "true".into()
         }
         "insert_before" => {

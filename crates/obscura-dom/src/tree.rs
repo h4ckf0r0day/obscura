@@ -322,6 +322,40 @@ impl DomTree {
         }
     }
 
+    /// Detach a node from its parent AND remove it (and all descendants)
+    /// from the id-index so that `getElementById` no longer returns them.
+    /// Unlike `remove()`, this does NOT free the nodes — the JS side may
+    /// still hold references to the wrappers.
+    pub fn remove_child(&self, node_id: NodeId) {
+        // Collect all id attribute values in the subtree. We snapshot them
+        // before detaching so `get_attribute` can still see the tree.
+        let ids_to_remove: Vec<String> = {
+            let descendants = self.descendants(node_id);
+            let inner = self.inner.borrow();
+            let mut ids: Vec<String> = Vec::new();
+            if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+                if let Some(id_val) = node.get_attribute("id") {
+                    ids.push(id_val.to_string());
+                }
+            }
+            for desc_id in &descendants {
+                if let Some(Some(node)) = inner.nodes.get(desc_id.index()) {
+                    if let Some(id_val) = node.get_attribute("id") {
+                        ids.push(id_val.to_string());
+                    }
+                }
+            }
+            ids
+        };
+
+        self.detach(node_id);
+
+        let mut inner = self.inner.borrow_mut();
+        for id_str in &ids_to_remove {
+            inner.id_index.remove(id_str);
+        }
+    }
+
     pub fn remove(&self, node_id: NodeId) {
         self.detach(node_id);
         let descendants = self.descendants(node_id);
