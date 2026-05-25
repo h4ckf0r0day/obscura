@@ -499,6 +499,31 @@ class Element extends Node {
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
+  get attributes() {
+    const el = this;
+    const names = _domParse("attribute_names", el._nid) || [];
+    const list = names.map((name) => ({
+      name,
+      localName: name,
+      value: el.getAttribute(name) ?? "",
+      namespaceURI: null,
+      prefix: null,
+      specified: true,
+      ownerElement: el,
+      nodeName: name,
+      nodeValue: el.getAttribute(name) ?? "",
+      nodeType: 2,
+    }));
+    list.length = names.length;
+    list.getNamedItem = (n) => names.includes(n) ? list[names.indexOf(n)] : null;
+    list.setNamedItem = (a) => { if (a && a.name) el.setAttribute(a.name, a.value); return a; };
+    list.removeNamedItem = (n) => { const a = list.getNamedItem(n); if (a) el.removeAttribute(n); return a; };
+    list.item = (i) => list[i] || null;
+    for (let i = 0; i < names.length; i++) {
+      Object.defineProperty(list, names[i], { value: list[i], configurable: true, enumerable: false });
+    }
+    return list;
+  }
   getAttributeNS(ns, n) { return this.getAttribute(n); }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
@@ -779,7 +804,23 @@ class Element extends Node {
   get scrollLeft() { return 0; } set scrollLeft(v) {}
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
-    return {x:8,y:8,width:100,height:20,top:8,right:108,bottom:28,left:8,toJSON(){return this;}};
+    // No layout engine, but Playwright's actionability polling needs each
+    // element to occupy a stable, distinct rect so hit-testing can pick the
+    // right one (issue #45). Synthesize a deterministic position from the
+    // node id: every nid maps to a unique cell in a 12-column grid, sized
+    // to fit a 1280x720 viewport. Stable across reads, different per node.
+    const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
+    const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
+    const cell = this._nid | 0;
+    const col = ((cell * 7) | 0) % COLS;
+    const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
+    const x = 10 + col * GX;
+    const y = 10 + row * GY;
+    return {
+      x, y, width: CW, height: CH,
+      top: y, right: x + CW, bottom: y + CH, left: x,
+      toJSON() { return this; },
+    };
   }
   getClientRects() { return [this.getBoundingClientRect()]; }
   // No layout engine: a stub that always returns true unblocks Playwright's
@@ -1195,6 +1236,28 @@ globalThis.parent = globalThis;
 globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
+
+// HTML spec exposes on* event handler IDL attributes on Window. Libraries like
+// jQuery feature-detect bubbling via `("on" + ev) in window` and fall back to
+// a legacy IE path that crashes on missing DOM APIs when the check returns
+// false. Initialising them to null makes the check match real browsers.
+for (const _ev of [
+  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
+  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
+  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
+  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
+  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
+  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
+  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
+  "offline","online","pagehide","pageshow","paste","pause","play","playing",
+  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
+  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
+  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
+  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
+  "unload","volumechange","waiting","wheel",
+]) {
+  if (!(("on" + _ev) in globalThis)) globalThis["on" + _ev] = null;
+}
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
