@@ -478,11 +478,13 @@ async fn run_fetch(
         return Ok(());
     }
 
-    let context = if let Some(ref dir) = storage_dir {
-        Arc::new(BrowserContext::with_storage("fetch".to_string(), Some(dir.clone())))
-    } else {
-        Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth))
-    };
+    let context = Arc::new(BrowserContext::with_storage_full(
+        "fetch".to_string(),
+        proxy,
+        stealth,
+        user_agent.clone(),
+        storage_dir.clone(),
+    ));
     let mut page = Page::new("fetch-page".to_string(), context.clone());
 
     if let Some(ref ua) = user_agent {
@@ -523,6 +525,7 @@ async fn run_fetch(
             other => other.to_string(),
         };
         write_or_print(rendered, output.as_ref()).await?;
+        context.save_cookies();
         return Ok(());
     }
 
@@ -1384,6 +1387,7 @@ mod tests {
             eval: None,
             quiet: true,
             output: None,
+            storage_dir: None,
         });
         assert!(is_quiet_command(&cmd));
     }

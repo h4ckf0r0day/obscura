@@ -321,6 +321,12 @@ async fn cdp_processor(
     let mut deferred: std::collections::VecDeque<ServerMessage> =
         std::collections::VecDeque::new();
 
+    // Subscribe to Ctrl-C once. The future is single-shot, so we break out of
+    // the outer loop when it fires and never poll it again. Without this the
+    // accept loop just exits and any cookies set during the session are lost
+    // before `BrowserContext::save_cookies()` runs.
+    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+
     loop {
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
@@ -329,9 +335,15 @@ async fn cdp_processor(
         let msg = if let Some(d) = deferred.pop_front() {
             d
         } else {
-            match rx.recv().await {
-                Some(m) => m,
-                None => break,
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = &mut shutdown => {
+                    tracing::info!("Shutdown signal received");
+                    break;
+                }
             }
         };
 
@@ -362,6 +374,11 @@ async fn cdp_processor(
         }
 
     }
+
+    // Single exit point handles both Ctrl-C shutdown and the channel being
+    // closed by the accept thread. Without this any cookies set during the
+    // session are dropped on the floor.
+    ctx.default_context.save_cookies();
 }
 
 fn handle_fetch_resolution(

@@ -752,6 +752,8 @@ mod tests {
             path: "/".to_string(),
             secure: false,
             http_only: true,
+            same_site: String::new(),
+            expires: None,
         }]);
         let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
         let header = jar.get_cookie_header(&url);
