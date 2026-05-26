@@ -56,7 +56,7 @@ pub async fn start_with_full_options(
     stealth: bool,
     user_agent: Option<String>,
 ) -> anyhow::Result<()> {
-    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent).await
+    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent, None).await
 }
 
 pub async fn start_with_host(
@@ -66,7 +66,7 @@ pub async fn start_with_host(
     stealth: bool,
     user_agent: Option<String>,
 ) -> anyhow::Result<()> {
-    start_with_host_and_security(port, host, proxy, stealth, user_agent, false).await
+    start_with_host_and_security(port, host, proxy, stealth, user_agent, false, None).await
 }
 
 pub async fn start_with_host_and_security(
@@ -76,6 +76,18 @@ pub async fn start_with_host_and_security(
     stealth: bool,
     user_agent: Option<String>,
     allow_file_access: bool,
+) -> anyhow::Result<()> {
+    start_with_host_security_and_storage(port, host, proxy, stealth, user_agent, allow_file_access, None).await
+}
+
+pub async fn start_with_host_security_and_storage(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     let ip: std::net::IpAddr = host
         .parse()
@@ -146,7 +158,7 @@ pub async fn start_with_host_and_security(
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
             let _processor_handle = tokio::task::spawn_local(cdp_processor(
-                msg_rx, proxy, stealth, user_agent, allow_file_access,
+                msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
             ));
 
             while let Some(stream) = ws_rx.recv().await {
@@ -284,8 +296,14 @@ async fn cdp_processor(
     stealth: bool,
     user_agent: Option<String>,
     allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
 ) {
-    let mut ctx = CdpContext::new_with_security(proxy, stealth, user_agent, allow_file_access);
+    let mut ctx = if storage_dir.is_some() {
+        // Use storage-aware context creation with security settings
+        CdpContext::new_with_storage(proxy, stealth, user_agent, storage_dir)
+    } else {
+        CdpContext::new_with_security(proxy, stealth, user_agent, allow_file_access)
+    };
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);

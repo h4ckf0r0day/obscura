@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
@@ -19,36 +20,60 @@ pub struct BrowserContext {
     /// file://...` path is unaffected because it does not go through
     /// the CDP server.
     pub allow_file_access: bool,
+    pub storage_dir: Option<PathBuf>,
 }
 
 impl BrowserContext {
     pub fn new(id: String) -> Self {
-        let cookie_jar = Arc::new(CookieJar::new());
-        let http_client = Arc::new(ObscuraHttpClient::with_cookie_jar(cookie_jar.clone()));
-        BrowserContext {
-            id,
-            cookie_jar,
-            http_client,
-            user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            proxy_url: None,
-            robots_cache: Arc::new(RobotsCache::new()),
-            obey_robots: false,
-            stealth: false,
-            allow_file_access: false,
-        }
+        Self::_new_inner(id, None, false, None, None)
     }
 
-    pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
-        Self::with_full_options(id, proxy_url, stealth, None)
+    /// Create a BrowserContext with an optional storage directory.
+    /// When `storage_dir` is set, cookies are automatically loaded from
+    /// `{storage_dir}/cookies.json` on creation.
+    pub fn with_storage(
+        id: String,
+        storage_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::_new_inner(id, None, false, None, storage_dir)
     }
 
-    pub fn with_full_options(
+    /// Create a BrowserContext with full options including storage_dir.
+    pub fn with_storage_full(
         id: String,
         proxy_url: Option<String>,
         stealth: bool,
         user_agent: Option<String>,
+        storage_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir)
+    }
+
+    fn _new_inner(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<PathBuf>,
     ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
+
+        // Restore cookies from disk if storage_dir is configured
+        if let Some(ref dir) = storage_dir {
+            let cookie_path = dir.join("cookies.json");
+            if cookie_path.exists() {
+                match cookie_jar.load_from_file(&cookie_path) {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Loaded {} cookies from {}", n, cookie_path.display());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to load cookies from {}: {}", cookie_path.display(), e);
+                    }
+                }
+            }
+        }
+
         let mut client = ObscuraHttpClient::with_options(
             cookie_jar.clone(),
             proxy_url.as_deref(),
@@ -76,11 +101,39 @@ impl BrowserContext {
             obey_robots: false,
             stealth,
             allow_file_access: false,
+            storage_dir,
         }
+    }
+
+    pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
+        Self::with_full_options(id, proxy_url, stealth, None)
+    }
+
+    pub fn with_full_options(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+    ) -> Self {
+        Self::_new_inner(id, proxy_url, stealth, user_agent, None)
     }
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {
         Self::with_options(id, proxy_url, false)
+    }
+
+    /// Persist cookies to disk if storage_dir is configured.
+    /// Called during graceful shutdown.
+    pub fn save_cookies(&self) {
+        if let Some(ref dir) = self.storage_dir {
+            let _ = std::fs::create_dir_all(dir);
+            let cookie_path = dir.join("cookies.json");
+            if let Err(e) = self.cookie_jar.save_to_file(&cookie_path) {
+                tracing::warn!("Failed to save cookies to {}: {}", cookie_path.display(), e);
+            } else {
+                tracing::info!("Saved cookies to {}", cookie_path.display());
+            }
+        }
     }
 }
 

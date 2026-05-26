@@ -32,6 +32,9 @@ struct Args {
     #[arg(long)]
     user_agent: Option<String>,
 
+    #[arg(long)]
+    storage_dir: Option<std::path::PathBuf>,
+
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
     /// Applied once at startup before any isolate is created.
@@ -70,6 +73,9 @@ enum Command {
         /// and the port is on a trusted network.
         #[arg(long)]
         allow_file_access: bool,
+
+        #[arg(long)]
+        storage_dir: Option<std::path::PathBuf>,
     },
 
     Fetch {
@@ -104,6 +110,9 @@ enum Command {
 
         #[arg(long, short)]
         quiet: bool,
+
+        #[arg(long)]
+        storage_dir: Option<std::path::PathBuf>,
     },
 
     Scrape {
@@ -252,10 +261,13 @@ async fn main() -> anyhow::Result<()> {
     let global_proxy = args.proxy.clone();
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access, storage_dir }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
             reject_stealth_with_socks5(proxy.as_deref(), stealth)?;
             print_banner(port);
+            if let Some(ref dir) = storage_dir {
+                tracing::info!("Storage dir: {}", dir.display());
+            }
             if let Some(ref proxy) = proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
@@ -280,9 +292,9 @@ async fn main() -> anyhow::Result<()> {
                 ).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet }) => {
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
             reject_stealth_with_socks5(global_proxy.as_deref(), stealth)?;
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
@@ -448,6 +460,7 @@ async fn run_fetch(
     output: Option<std::path::PathBuf>,
     quiet: bool,
     proxy: Option<String>,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // --dump original short-circuits the browser stack entirely: fetch the raw
     // response body via HTTP and stream the bytes verbatim. Useful for binary
@@ -465,8 +478,12 @@ async fn run_fetch(
         return Ok(());
     }
 
-    let context = Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth));
-    let mut page = Page::new("fetch-page".to_string(), context);
+    let context = if let Some(ref dir) = storage_dir {
+        Arc::new(BrowserContext::with_storage("fetch".to_string(), Some(dir.clone())))
+    } else {
+        Arc::new(BrowserContext::with_options("fetch".to_string(), proxy, stealth))
+    };
+    let mut page = Page::new("fetch-page".to_string(), context.clone());
 
     if let Some(ref ua) = user_agent {
         page.http_client.set_user_agent(ua).await;
@@ -519,6 +536,9 @@ async fn run_fetch(
         DumpFormat::Original => unreachable!("Original dump handled before page navigation"),
     };
     write_or_print(rendered, output.as_ref()).await?;
+
+    // Save cookies to disk if storage_dir is configured
+    context.save_cookies();
 
     Ok(())
 }
