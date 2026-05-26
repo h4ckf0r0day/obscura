@@ -47,7 +47,7 @@ pub async fn start_with_options(
     proxy: Option<String>,
     stealth: bool,
 ) -> anyhow::Result<()> {
-    start_with_full_options(port, proxy, stealth, None).await
+    start_with_full_options(port, proxy, stealth, None, None).await
 }
 
 pub async fn start_with_full_options(
@@ -55,8 +55,9 @@ pub async fn start_with_full_options(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent, None).await
+    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent, storage_dir).await
 }
 
 pub async fn start_with_host(
@@ -65,8 +66,9 @@ pub async fn start_with_host(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host_and_security(port, host, proxy, stealth, user_agent, false, None).await
+    start_with_host_and_security(port, host, proxy, stealth, user_agent, false, storage_dir).await
 }
 
 pub async fn start_with_host_and_security(
@@ -76,8 +78,9 @@ pub async fn start_with_host_and_security(
     stealth: bool,
     user_agent: Option<String>,
     allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host_security_and_storage(port, host, proxy, stealth, user_agent, allow_file_access, None).await
+    start_with_host_security_and_storage(port, host, proxy, stealth, user_agent, allow_file_access, storage_dir).await
 }
 
 pub async fn start_with_host_security_and_storage(

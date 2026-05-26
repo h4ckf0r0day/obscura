@@ -288,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
                 obscura_cdp::start_with_host_and_security(
-                    port, &host, proxy, stealth, user_agent, allow_file_access,
+                    port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
                 ).await?;
             }
         }

@@ -399,6 +399,8 @@ impl CookieJar {
                     path: entry.path.clone(),
                     secure: entry.secure,
                     http_only: entry.http_only,
+                    same_site: entry.same_site.clone(),
+                    expires: entry.expires.map(|e| e as i64),
                 });
             }
         }
@@ -709,6 +711,7 @@ mod tests {
         }]);
         let url = Url::parse("https://example.com/").unwrap();
         assert!(jar.get_cookie_header(&url).is_empty());
+    }
     fn test_save_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
