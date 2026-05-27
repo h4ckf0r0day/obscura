@@ -74,6 +74,42 @@ async fn do_navigate(
     let es = session_id.clone();
     let ts = timestamp();
 
+    // Real Chrome uses the navigation's loaderId as the main document's
+    // request id, and Puppeteer/Playwright identify the navigation response
+    // via `requestId === loaderId && type === "Document"` (issue #189).
+    // Override the first Document event's request id with loaderId so
+    // `page.goto()` resolves to the navigation Response instead of null.
+    let nav_request_ids: Vec<String> = {
+        let mut nav_seen = false;
+        network_events.iter().map(|ev| {
+            if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
+                nav_seen = true;
+                loader_id.clone()
+            } else {
+                ev.request_id.clone()
+            }
+        }).collect()
+    };
+    let nav_idx: Option<usize> = network_events
+        .iter()
+        .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
+
+    // Playwright needs `Network.requestWillBeSent` for the main document to
+    // arrive BEFORE `Page.frameNavigated`, otherwise its FrameManager commits
+    // the navigation with `currentDocument.request = void 0` and never
+    // attaches the response. Mirrors real Chrome's event order. We emit only
+    // the navigation request here; the response and subresource requests
+    // come after `frameNavigated` (still before `Page.lifecycleEvent: load`).
+    if let Some(idx) = nav_idx {
+        let net_event = &network_events[idx];
+        let rid = &nav_request_ids[idx];
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            session_id: es.clone(),
+        });
+    }
+
     let mut phase1 = vec![
         CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
@@ -97,11 +133,12 @@ async fn do_navigate(
     ctx.pending_events.extend(phase1);
 
     if ctx.fetch_intercept.enabled {
-        for net_event in &network_events {
+        for (i, net_event) in network_events.iter().enumerate() {
+            let rid = &nav_request_ids[i];
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
-                    "requestId": net_event.request_id,
+                    "requestId": rid,
                     "request": {
                         "url": net_event.url,
                         "method": net_event.method,
@@ -109,27 +146,33 @@ async fn do_navigate(
                     },
                     "frameId": frame_id,
                     "resourceType": net_event.resource_type,
-                    "networkId": net_event.request_id,
+                    "networkId": rid,
                 }),
                 session_id: es.clone(),
             });
         }
     }
 
-    for net_event in &network_events {
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
+    for (i, net_event) in network_events.iter().enumerate() {
+        let rid = &nav_request_ids[i];
+        // Document's requestWillBeSent was already emitted above (before
+        // Page.frameNavigated) so Playwright can attach the request to the
+        // pending document. Skip re-emitting it here.
+        if Some(i) != nav_idx {
+            ctx.pending_events.push(CdpEvent {
+                method: "Network.requestWillBeSent".into(),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                session_id: es.clone(),
+            });
+        }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
-            params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
             session_id: es.clone(),
         });
         ctx.pending_events.push(CdpEvent {
             method: "Network.loadingFinished".into(),
-            params: json!({"requestId": net_event.request_id, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
+            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
             session_id: es.clone(),
         });
     }
