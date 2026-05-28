@@ -471,7 +471,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             // Spec order: readyState -> interactive, fire DOMContentLoaded on both
             // document and window, then readyState -> complete, fire load.
-            let _ = js.execute_script("<load-events>",
+            let _ = js.execute_script_guarded("<load-events>",
                 "globalThis.__documentReadyState__ = 'interactive';\n\
                  try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
@@ -484,13 +484,12 @@ impl Page {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
             let mut idle_count = 0u32;
             loop {
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(10),
-                    js.run_event_loop(),
-                ).await;
+                let result = js
+                    .run_event_loop_with_timeout(tokio::time::Duration::from_millis(10))
+                    .await;
 
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(()) => {
                         if self.http_client.active_requests() == 0 {
                             idle_count += 1;
                             if idle_count >= 2 {
@@ -502,10 +501,9 @@ impl Page {
                             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         }
                     }
-                    Ok(Err(_)) => break,
-                    Err(_) => {
+                    Err(e) => {
                         idle_count = 0;
-                        if tokio::time::Instant::now() >= deadline {
+                        if !e.contains("timed out") || tokio::time::Instant::now() >= deadline {
                             break;
                         }
                     }
@@ -807,10 +805,9 @@ impl Page {
                 }
 
                 if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    ).await;
+                    let _ = js
+                        .run_event_loop_with_timeout(tokio::time::Duration::from_millis(50))
+                        .await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }

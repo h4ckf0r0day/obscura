@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Sanitized HH login load reproducer</title>
+  <!--
+    Anonymous/minimized fixture for https://hh.ru/account/login?role=applicant&backurl=%2F.
+    It contains no credentials, cookies, HH HTML, or HH asset bytes. The shape
+    matches the observed failure class: parser scripts, deferred scripts, and
+    an async script are all discovered; one compact regular script can monopolize
+    V8, and a later script keeps the event loop non-idle with zero-delay work.
+  -->
+  <script>
+    window.__hhLoginFixtureInvoked = ['inline-init'];
+    window.__hhLoginFixtureTicks = 0;
+  </script>
+  <script src="/assets/regular-hangs.js"></script>
+  <script src="/assets/regular-after.js"></script>
+  <script defer src="/assets/deferred.js"></script>
+  <script async src="/assets/async.js"></script>
+</head>
+<body>
+  <form id="login" action="/account/login" method="post">
+    <input name="login" autocomplete="username">
+    <input name="password" type="password" autocomplete="current-password">
+    <button type="submit">Log in</button>
+  </form>
+</body>
+</html>
