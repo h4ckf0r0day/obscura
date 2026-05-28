@@ -38,12 +38,92 @@ impl Page {
         val.as_str().unwrap_or("").to_string()
     }
 
-    /// Wait for CSS selector to appear.
+    /// Query a single element by CSS selector.
+    pub fn query_selector(&mut self, selector: &str) -> Option<Element> {
+        let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+        let js = format!(
+            "(function() {{ var el = document.querySelector('{}'); return el ? el._nid : null; }})()",
+            escaped
+        );
+        let val = self.evaluate(&js);
+        val.as_u64().map(|nid| Element { node_id: nid, page: self as *const Page })
+    }
+
+    /// Wait for CSS selector to appear (polls every 100ms).
     pub async fn wait_for_selector(
         &mut self,
-        _selector: &str,
-        _timeout: Duration,
-    ) -> Result<(), Error> {
-        Err(Error::Timeout("wait_for_selector: not yet implemented".into()))
+        selector: &str,
+        timeout: Duration,
+    ) -> Result<Element, Error> {
+        let start = std::time::Instant::now();
+        let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+        loop {
+            let js = format!(
+                "(function() {{ var el = document.querySelector('{}'); return el ? el._nid : null; }})()",
+                escaped
+            );
+            let val = self.evaluate(&js);
+            if let Some(nid) = val.as_u64() {
+                return Ok(Element { node_id: nid, page: self as *const Page });
+            }
+            if start.elapsed() > timeout {
+                return Err(Error::Timeout(format!(
+                    "wait_for_selector({}) timed out after {}ms",
+                    selector,
+                    timeout.as_millis()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Handle to a DOM element.
+///
+/// Created via [`Page::query_selector`] or [`Page::wait_for_selector`].
+pub struct Element {
+    node_id: u64,
+    page: *const Page,
+}
+
+impl Element {
+    /// Get text content of this element.
+    pub fn text(&self) -> String {
+        let page = unsafe { &mut *(self.page as *mut Page) };
+        let val = page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return el ? el.textContent : ''; }})()",
+            self.node_id
+        ));
+        val.as_str().unwrap_or("").to_string()
+    }
+
+    /// Get an attribute value.
+    pub fn attribute(&self, name: &str) -> Option<String> {
+        let page = unsafe { &mut *(self.page as *mut Page) };
+        let val = page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return el ? el.getAttribute('{}') : null; }})()",
+            self.node_id, name
+        ));
+        if val.is_null() { None } else { Some(val.as_str().unwrap_or("").to_string()) }
+    }
+
+    /// Click this element.
+    pub fn click(&self) -> Result<(), Error> {
+        let page = unsafe { &mut *(self.page as *mut Page) };
+        // Scroll into view
+        page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); if (el) el.scrollIntoView({{block:'center'}}); }})()",
+            self.node_id
+        ));
+        // Click
+        let result = page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); if (el) {{ el.click(); return true; }} return false; }})()",
+            self.node_id
+        ));
+        if result.as_bool().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(Error::ElementNotFound("click failed".into()))
+        }
     }
 }

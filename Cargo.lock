@@ -1575,9 +1575,11 @@ dependencies = [
  "obscura-browser",
  "obscura-js",
  "obscura-net",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "url",
 ]
 
 [[package]]

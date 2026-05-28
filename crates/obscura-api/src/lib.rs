@@ -10,17 +10,19 @@
 //!         .build()?;
 //!     let mut page = browser.new_page().await?;
 //!     page.goto("https://example.com").await?;
-//!     println!("Title: {}", page.title().await?);
+//!     println!("Content: {} bytes", page.content().len());
 //!     Ok(())
 //! }
 //! ```
 
 mod browser;
 mod config;
+mod cookie;
 mod error;
 mod page;
 
 pub use browser::Browser;
 pub use config::BrowserConfig;
+pub use cookie::{Cookie, CookieStore};
 pub use error::Error;
 pub use page::Page;
