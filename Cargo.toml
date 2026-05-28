@@ -8,6 +8,7 @@ members = [
     "crates/obscura-js",
     "crates/obscura-mcp",
     "crates/obscura-cli",
+    "crates/obscura-api",
 ]
 
 [workspace.package]

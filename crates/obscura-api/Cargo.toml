@@ -1,0 +1,14 @@
+[package]
+name = "obscura-api"
+version = "0.1.0"
+edition = "2021"
+description = "Rust API for the Obscura headless browser"
+
+[dependencies]
+obscura-browser = { path = "../obscura-browser" }
+obscura-net = { path = "../obscura-net" }
+obscura-js = { path = "../obscura-js" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt"] }
+thiserror = "1"
+serde_json = "1"

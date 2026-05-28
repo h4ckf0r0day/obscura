@@ -167,7 +167,10 @@ pub async fn handle(
         "removeNode" => Ok(json!({})),
         "getBoxModel" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = resolve_node_id(page, params)?;
+            let node_id = match resolve_node_id(page, params) {
+                Ok(nid) => nid,
+                Err(_) => return Ok(json!(null)),
+            };
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
@@ -202,7 +205,10 @@ pub async fn handle(
         }
         "getContentQuads" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = resolve_node_id(page, params)?;
+            let node_id = match resolve_node_id(page, params) {
+                Ok(nid) => nid,
+                Err(_) => return Ok(json!(null)),
+            };
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
