@@ -1568,12 +1568,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "obscura-api"
+name = "obscura"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "obscura-browser",
- "obscura-js",
  "obscura-net",
  "serde",
  "serde_json",
