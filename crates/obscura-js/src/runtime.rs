@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
@@ -416,18 +417,13 @@ impl ObscuraJsRuntime {
 
         let result = self.runtime.mod_evaluate(module_id);
 
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
-
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
+        match self.run_event_loop_with_timeout(Duration::from_secs(10)).await {
+            Ok(()) => {}
+            Err(e) if e.contains("timed out") => {
                 tracing::warn!("Module evaluation timed out after 10s: {}", url);
                 return Ok(());
             }
+            Err(e) => return Err(format!("Module event loop error: {}", e)),
         }
 
         match result.await {
@@ -458,18 +454,13 @@ impl ObscuraJsRuntime {
 
         let result = self.runtime.mod_evaluate(module_id);
 
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
-
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
+        match self.run_event_loop_with_timeout(Duration::from_secs(10)).await {
+            Ok(()) => {}
+            Err(e) if e.contains("timed out") => {
                 tracing::warn!("Inline module timed out after 10s");
                 return Ok(());
             }
+            Err(e) => return Err(format!("Module event loop error: {}", e)),
         }
 
         match result.await {
@@ -489,17 +480,26 @@ impl ObscuraJsRuntime {
     }
 
     pub fn execute_script_guarded(&mut self, _name: &str, source: &str) -> Result<(), String> {
-        if source.len() < 10_000 {
-            self.execute_script(_name, source)
-        } else {
-            self.execute_script_with_timeout(source, std::time::Duration::from_secs(5))
-        }
+        // Every page script must be attempted, but no single script may pin the
+        // browser forever. Small scripts need the same watchdog as larger scripts
+        // because a compact busy loop can block full-load navigation before later
+        // defer/async scripts run.
+        self.execute_script_with_timeout(source, Self::script_execution_timeout())
+    }
+
+    fn script_execution_timeout() -> Duration {
+        std::env::var("OBSCURA_SCRIPT_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(1))
     }
 
     pub fn execute_script_with_timeout(
         &mut self,
         source: &str,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<(), String> {
         if timeout.is_zero() {
             self.runtime
@@ -553,12 +553,78 @@ impl ObscuraJsRuntime {
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("Uncaught Error: execution terminated") {
-                    tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
+                    tracing::warn!("Script killed after {}ms timeout", timeout.as_millis());
+                    let _ = self.runtime.v8_isolate().cancel_terminate_execution();
                     self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
                     Ok(())
                 } else {
                     Err(format!("JS error: {}", msg))
                 }
+            }
+        }
+    }
+
+    pub async fn run_event_loop_with_timeout(&mut self, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return self.run_event_loop().await;
+        }
+
+        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let pair = std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
+        let pair_clone = pair.clone();
+
+        let watchdog = std::thread::spawn(move || {
+            let (lock, cvar) = &*pair_clone;
+            let mut cancelled = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + timeout;
+
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    isolate_handle.terminate_execution();
+                    return;
+                }
+
+                let result = cvar.wait_timeout(cancelled, remaining).unwrap();
+                cancelled = result.0;
+                if *cancelled {
+                    return;
+                }
+            }
+        });
+
+        let result = tokio::select! {
+            result = self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()) => Some(result),
+            _ = tokio::time::sleep(timeout) => None,
+        };
+
+        {
+            let (lock, cvar) = &*pair;
+            let mut cancelled = lock.lock().unwrap();
+            *cancelled = true;
+            cvar.notify_one();
+        }
+        let _ = watchdog.join();
+
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("execution terminated") {
+                    tracing::warn!("Event loop killed after {}ms timeout", timeout.as_millis());
+                    let _ = self.runtime.v8_isolate().cancel_terminate_execution();
+                    self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
+                    Err(format!("Event loop timed out after {}ms", timeout.as_millis()))
+                } else {
+                    Err(format!("Event loop error: {}", msg))
+                }
+            }
+            None => {
+                let _ = self.runtime.v8_isolate().cancel_terminate_execution();
+                Err(format!("Event loop timed out after {}ms", timeout.as_millis()))
             }
         }
     }
@@ -932,6 +998,34 @@ mod tests {
         .unwrap();
         let result = rt.evaluate("globalThis.__result").unwrap();
         assert_eq!(result, serde_json::json!(["A", "B"]));
+    }
+
+    #[test]
+    fn guarded_small_busy_loop_times_out_and_runtime_recovers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let started = std::time::Instant::now();
+
+        rt.execute_script_guarded(
+            "busy",
+            "globalThis.__busyLoopStarted = true; while (true) {}",
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "guarded small script was not bounded"
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__busyLoopStarted").unwrap(),
+            serde_json::json!(true)
+        );
+
+        rt.execute_script("after", "globalThis.__afterBusyLoop = 'still alive';")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__afterBusyLoop").unwrap(),
+            serde_json::json!("still alive")
+        );
     }
 
     /// Regression test for #147: a TypeError in one script must not poison
