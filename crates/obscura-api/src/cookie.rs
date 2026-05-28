@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use obscura_net::CookieJar;
 use serde::{Deserialize, Serialize};
 
@@ -28,11 +29,11 @@ impl Cookie {
 
 /// Cookie management for a browser session.
 pub struct CookieStore {
-    jar: CookieJar,
+    jar: Arc<CookieJar>,
 }
 
 impl CookieStore {
-    pub(crate) fn new(jar: CookieJar) -> Self {
+    pub(crate) fn new(jar: Arc<CookieJar>) -> Self {
         Self { jar }
     }
 

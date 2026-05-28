@@ -5,6 +5,7 @@ use obscura_browser::BrowserContext;
 use obscura_net::CookieJar;
 
 use crate::config::BrowserConfig;
+use crate::cookie::CookieStore;
 use crate::error::Error;
 use crate::page::Page;
 
@@ -67,6 +68,11 @@ impl Browser {
             inner: page,
             context: self.context.clone(),
         })
+    }
+
+    /// Access the cookie store for this browser session.
+    pub fn cookies(&self) -> CookieStore {
+        CookieStore::new(self.cookie_jar.clone())
     }
 }
 
