@@ -35,6 +35,14 @@ pub struct CdpContext {
     // "Cannot find context with specified id" CDP error and unblocking the
     // Playwright locator path described in issue #51.
     pub valid_context_ids: HashSet<i64>,
+    // Monotonic counter for isolated-world execution context ids. Issue #192:
+    // both `Page.createIsolatedWorld` and `do_navigate` used to hardcode id
+    // 100, so re-creating a context (e.g. Playwright opening a second page or
+    // re-navigating) silently emitted the same id twice and the client's
+    // bookkeeping diverged from the server's. Each fresh isolated context now
+    // claims and increments from this counter so the ids real Chrome would
+    // emit (incrementing, never reused) are mirrored.
+    pub next_isolated_context_id: i64,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
 }
@@ -124,7 +132,17 @@ impl CdpContext {
             intercept_tx: None,
             isolated_worlds: Vec::new(),
             valid_context_ids,
+            next_isolated_context_id: 100,
         }
+    }
+
+    /// Claim the next isolated-world execution context id and register it as
+    /// valid for `Runtime.evaluate`/`callFunctionOn`. Issue #192.
+    pub fn next_isolated_context(&mut self) -> i64 {
+        let id = self.next_isolated_context_id;
+        self.next_isolated_context_id += 1;
+        self.valid_context_ids.insert(id);
+        id
     }
 
     pub fn create_page(&mut self) -> String {

@@ -121,11 +121,18 @@ async fn do_navigate(
     } else {
         ctx.isolated_worlds.clone()
     };
-    for (idx, world_name) in world_names.iter().enumerate() {
-        let world_ctx_id = 100 + idx as u32;
+    // Issue #192: real Chrome emits a fresh, monotonically increasing
+    // executionContextId on every re-creation. Reusing ids 100, 101, …
+    // across navigations made Playwright's client-side counter and our
+    // server-side `valid_context_ids` diverge after the first nav, so
+    // Runtime.evaluate failed with "Cannot find context with specified
+    // id: 101". Each post-nav isolated world now claims a fresh id from
+    // the same counter that backs Page.createIsolatedWorld.
+    for world_name in &world_names {
+        let world_ctx_id = ctx.next_isolated_context();
         phase1.push(CdpEvent {
             method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, idx), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
+            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
             session_id: es.clone(),
         });
     }
@@ -236,14 +243,17 @@ pub async fn handle(
             }))
         }
         "createIsolatedWorld" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-            let frame_id_param = params.get("frameId").and_then(|v| v.as_str())
-                .unwrap_or(&page.frame_id).to_string();
-            let world_name = params.get("worldName").and_then(|v| v.as_str())
-                .unwrap_or("").to_string();
-            let page_url = page.url_string();
-            let page_id = page.id.clone();
-            let context_id: i64 = 100;
+            let (frame_id_param, world_name, page_url, page_id) = {
+                let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+                (
+                    params.get("frameId").and_then(|v| v.as_str())
+                        .unwrap_or(&page.frame_id).to_string(),
+                    params.get("worldName").and_then(|v| v.as_str())
+                        .unwrap_or("").to_string(),
+                    page.url_string(),
+                    page.id.clone(),
+                )
+            };
             // Track this world so Page.navigate can re-emit a context for it
             // post-navigation. Without this, Playwright (and Puppeteer)
             // hang in any operation that uses the utility world — including
@@ -252,9 +262,12 @@ pub async fn handle(
             if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
                 ctx.isolated_worlds.push(world_name.clone());
             }
-            // Register the isolated world's id so Runtime.evaluate /
-            // Runtime.callFunctionOn accept it as a valid contextId (#51).
-            ctx.valid_context_ids.insert(context_id);
+            // Issue #192: every isolated world emission gets a fresh id from
+            // the monotonic counter and is registered as a valid contextId.
+            // Reusing id 100 across navigations made Playwright's bookkeeping
+            // diverge (it expected 101 on the second nav) and Runtime.evaluate
+            // failed with "Cannot find context with specified id: 101".
+            let context_id = ctx.next_isolated_context();
 
             ctx.pending_events.push(CdpEvent {
                 method: "Runtime.executionContextCreated".to_string(),
@@ -263,7 +276,7 @@ pub async fn handle(
                         "id": context_id,
                         "origin": page_url,
                         "name": world_name,
-                        "uniqueId": format!("ctx-isolated-{}", page_id),
+                        "uniqueId": format!("ctx-isolated-{}-{}", page_id, context_id),
                         "auxData": {
                             "isDefault": false,
                             "type": "isolated",
