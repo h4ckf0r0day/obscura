@@ -239,6 +239,24 @@ fn normalize_v8_flags(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// Default V8 flags applied at startup unless the user disabled them via
+/// `--v8-flags`. The default heap matches headless Chrome (~4 GB) so pages
+/// that ship heavy fingerprinting or analytics bundles
+/// (e.g. demo.fingerprint.com — issue #199) don't SIGTRAP out of the box.
+/// V8 parses flags left-to-right and later wins, so anything the user
+/// passes via `--v8-flags` overrides these.
+#[cfg(target_pointer_width = "64")]
+const DEFAULT_V8_FLAGS: &str = "--max-old-space-size=4096";
+#[cfg(not(target_pointer_width = "64"))]
+const DEFAULT_V8_FLAGS: &str = "--max-old-space-size=1024";
+
+fn effective_v8_flags(user: Option<&str>) -> String {
+    match normalize_v8_flags(user) {
+        Some(u) => format!("{} {}", DEFAULT_V8_FLAGS, u),
+        None => DEFAULT_V8_FLAGS.to_string(),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -253,10 +271,9 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    if let Some(flags) = normalize_v8_flags(args.v8_flags.as_deref()) {
-        tracing::info!("Applying V8 flags: {}", flags);
-        obscura_js::set_v8_flags(&flags);
-    }
+    let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
+    tracing::debug!("V8 flags: {}", v8_flags);
+    obscura_js::set_v8_flags(&v8_flags);
 
     let global_proxy = args.proxy.clone();
 
@@ -1073,10 +1090,10 @@ fn dump_assets(page: &Page) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_assets, extract_readable_text, fetch_original_bytes, is_quiet_command,
-        link_kind_from_rel, merge_proxy, normalize_v8_flags, reject_stealth_with_socks5,
-        resolve_asset_url, select_log_filter, write_or_print, write_or_print_bytes, Args,
-        Command, DumpFormat,
+        effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
+        is_quiet_command, link_kind_from_rel, merge_proxy, normalize_v8_flags,
+        reject_stealth_with_socks5, resolve_asset_url, select_log_filter, write_or_print,
+        write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -1323,6 +1340,30 @@ mod tests {
     fn normalize_v8_flags_preserves_multi_flag_string() {
         let input = "--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc";
         assert_eq!(normalize_v8_flags(Some(input)).as_deref(), Some(input));
+    }
+
+    #[test]
+    fn effective_v8_flags_returns_default_when_unset() {
+        assert_eq!(effective_v8_flags(None), DEFAULT_V8_FLAGS);
+        assert_eq!(effective_v8_flags(Some("")), DEFAULT_V8_FLAGS);
+        assert_eq!(effective_v8_flags(Some("   ")), DEFAULT_V8_FLAGS);
+    }
+
+    #[test]
+    fn effective_v8_flags_user_overrides_default() {
+        // V8 parses left-to-right and later wins, so the user value must
+        // come after the default in the merged string.
+        let user = "--max-old-space-size=8192";
+        let merged = effective_v8_flags(Some(user));
+        assert!(merged.starts_with(DEFAULT_V8_FLAGS));
+        assert!(merged.ends_with(user));
+    }
+
+    #[test]
+    fn effective_v8_flags_appends_user_extras() {
+        let merged = effective_v8_flags(Some("--expose-gc"));
+        assert!(merged.contains(DEFAULT_V8_FLAGS));
+        assert!(merged.contains("--expose-gc"));
     }
 
     #[test]
