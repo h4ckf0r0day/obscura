@@ -21,11 +21,17 @@ pub struct BrowserContext {
     /// the CDP server.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
+    /// When true, the http client allows fetching localhost / RFC1918 /
+    /// link-local addresses. Set via `--allow-private-network` (issue #33).
+    /// Independent of `allow_file_access` because they cover different threat
+    /// models: file:// is a local file-system read, while private-network is
+    /// the broader SSRF gate from issue #4.
+    pub allow_private_network: bool,
 }
 
 impl BrowserContext {
     pub fn new(id: String) -> Self {
-        Self::_new_inner(id, None, false, None, None)
+        Self::_new_inner(id, None, false, None, None, false)
     }
 
     /// Create a BrowserContext with an optional storage directory.
@@ -35,7 +41,7 @@ impl BrowserContext {
         id: String,
         storage_dir: Option<PathBuf>,
     ) -> Self {
-        Self::_new_inner(id, None, false, None, storage_dir)
+        Self::_new_inner(id, None, false, None, storage_dir, false)
     }
 
     /// Create a BrowserContext with full options including storage_dir.
@@ -46,7 +52,21 @@ impl BrowserContext {
         user_agent: Option<String>,
         storage_dir: Option<PathBuf>,
     ) -> Self {
-        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir)
+        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir, false)
+    }
+
+    /// Variant that also accepts the `allow_private_network` opt-in. All
+    /// pre-existing constructors default it to `false`; callers that want the
+    /// CLI's `--allow-private-network` (issue #33) behaviour go through here.
+    pub fn with_storage_and_network(
+        id: String,
+        proxy_url: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<PathBuf>,
+        allow_private_network: bool,
+    ) -> Self {
+        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir, allow_private_network)
     }
 
     fn _new_inner(
@@ -55,6 +75,7 @@ impl BrowserContext {
         stealth: bool,
         user_agent: Option<String>,
         storage_dir: Option<PathBuf>,
+        allow_private_network: bool,
     ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
 
@@ -74,9 +95,10 @@ impl BrowserContext {
             }
         }
 
-        let mut client = ObscuraHttpClient::with_options(
+        let mut client = ObscuraHttpClient::with_full_options(
             cookie_jar.clone(),
             proxy_url.as_deref(),
+            allow_private_network,
         );
         if stealth {
             client.block_trackers = true;
@@ -102,6 +124,7 @@ impl BrowserContext {
             stealth,
             allow_file_access: false,
             storage_dir,
+            allow_private_network,
         }
     }
 
@@ -115,7 +138,7 @@ impl BrowserContext {
         stealth: bool,
         user_agent: Option<String>,
     ) -> Self {
-        Self::_new_inner(id, proxy_url, stealth, user_agent, None)
+        Self::_new_inner(id, proxy_url, stealth, user_agent, None, false)
     }
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {

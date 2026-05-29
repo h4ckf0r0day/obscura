@@ -7,7 +7,10 @@ pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
-pub use client::{ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType, Response};
+pub use client::{
+    env_allows_private_network, ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType,
+    Response,
+};
 pub use cookies::{CookieInfo, CookieJar};
 pub use encoding::{decode_non_html, decode_response};
 pub use robots::RobotsCache;

@@ -74,7 +74,7 @@ impl CdpContext {
         user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        Self::_new_inner(proxy, stealth, user_agent, storage_dir, false)
+        Self::_new_inner(proxy, stealth, user_agent, storage_dir, false, false)
     }
 
     pub fn new_with_security(
@@ -83,7 +83,22 @@ impl CdpContext {
         user_agent: Option<String>,
         allow_file_access: bool,
     ) -> Self {
-        Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access)
+        Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access, false)
+    }
+
+    /// Kitchen-sink constructor that also threads `allow_private_network`
+    /// (issue #33). Older `new_with_*` builders stay as-is.
+    pub fn new_full(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        storage_dir: Option<std::path::PathBuf>,
+        allow_file_access: bool,
+        allow_private_network: bool,
+    ) -> Self {
+        Self::_new_inner(
+            proxy, stealth, user_agent, storage_dir, allow_file_access, allow_private_network,
+        )
     }
 
     fn _new_inner(
@@ -92,23 +107,16 @@ impl CdpContext {
         user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
         allow_file_access: bool,
+        allow_private_network: bool,
     ) -> Self {
-        let mut ctx = if let Some(ref dir) = storage_dir {
-            BrowserContext::with_storage_full(
-                "default".to_string(),
-                proxy,
-                stealth,
-                user_agent,
-                Some(dir.clone()),
-            )
-        } else {
-            BrowserContext::with_full_options(
-                "default".to_string(),
-                proxy,
-                stealth,
-                user_agent,
-            )
-        };
+        let mut ctx = BrowserContext::with_storage_and_network(
+            "default".to_string(),
+            proxy,
+            stealth,
+            user_agent,
+            storage_dir,
+            allow_private_network,
+        );
         ctx.allow_file_access = allow_file_access;
         let default_context = Arc::new(ctx);
         // Pre-seed with the default-frame execution context ids that

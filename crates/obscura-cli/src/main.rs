@@ -35,6 +35,14 @@ struct Args {
     #[arg(long)]
     storage_dir: Option<std::path::PathBuf>,
 
+    /// Permit fetches to loopback, RFC1918, and link-local addresses.
+    /// Default is to block them (SSRF fix from #4). Use this for local
+    /// development against http://localhost:N or http://192.168.x.y.
+    /// Equivalent to `OBSCURA_ALLOW_PRIVATE_NETWORK=1` but per-process
+    /// and survives in command pipelines.
+    #[arg(long, global = true)]
+    allow_private_network: bool,
+
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
     /// Applied once at startup before any isolate is created.
@@ -304,14 +312,15 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_host_and_security(
+                obscura_cdp::start_with_full_serve_options(
                     port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
+                    args.allow_private_network,
                 ).await?;
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
             reject_stealth_with_socks5(global_proxy.as_deref(), stealth)?;
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir).await?;
+            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
@@ -478,6 +487,7 @@ async fn run_fetch(
     quiet: bool,
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
 ) -> anyhow::Result<()> {
     // --dump original short-circuits the browser stack entirely: fetch the raw
     // response body via HTTP and stream the bytes verbatim. Useful for binary
@@ -495,12 +505,13 @@ async fn run_fetch(
         return Ok(());
     }
 
-    let context = Arc::new(BrowserContext::with_storage_full(
+    let context = Arc::new(BrowserContext::with_storage_and_network(
         "fetch".to_string(),
         proxy,
         stealth,
         user_agent.clone(),
         storage_dir.clone(),
+        allow_private_network,
     ));
     let mut page = Page::new("fetch-page".to_string(), context.clone());
 
