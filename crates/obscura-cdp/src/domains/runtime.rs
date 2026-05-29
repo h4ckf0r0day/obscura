@@ -212,18 +212,49 @@ pub async fn handle(
         }
         "addBinding" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                && !name.chars().next().unwrap_or('0').is_ascii_digit()
+            {
+                // The shim forwards every call back to Rust through
+                // op_binding_called; the CDP dispatcher then drains the
+                // queue and emits Runtime.bindingCalled events the same
+                // way Chromium does. Chromium's V8InspectorImpl rejects
+                // calls without exactly one argument and ToString-coerces
+                // that argument before emitting it as the payload — we
+                // match the coercion (`String(arg)`) and silently drop
+                // calls with wrong arity, which is what Chrome does.
+                let shim = format!(
+                    "globalThis['{name}'] = function (arg) {{\
+                        if (arguments.length !== 1) return;\
+                        try {{\
+                            const payload = typeof arg === 'string' ? arg : String(arg);\
+                            Deno.core.ops.op_binding_called('{name}', payload);\
+                        }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
+                    }};",
+                    name = name,
+                );
+                // Re-install on every navigation: globalThis is wiped on
+                // each new document, and puppeteer registers bindings
+                // once-per-page rather than once-per-document.
+                let key = format!("__obscura_binding__{}", name);
+                ctx.preload_scripts.retain(|(k, _)| k != &key);
+                ctx.preload_scripts.push((key, shim.clone()));
+                // Install on the current page so the binding is usable
+                // immediately, without waiting for the next navigation.
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    page.evaluate(&shim);
+                }
+            }
+            Ok(json!({}))
+        }
+        "removeBinding" => {
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if !name.is_empty() {
-                if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-                    && !name.chars().next().unwrap_or('0').is_ascii_digit() {
-                    if let Some(page) = ctx.get_session_page_mut(session_id) {
-                        let code = format!(
-                            "if (typeof globalThis.{name} === 'undefined') {{\
-                                globalThis.{name} = function() {{ return null; }};\
-                            }}",
-                            name = name,
-                        );
-                        page.evaluate(&code);
-                    }
+                let key = format!("__obscura_binding__{}", name);
+                ctx.preload_scripts.retain(|(k, _)| k != &key);
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    page.evaluate(&format!("delete globalThis['{}'];", name));
                 }
             }
             Ok(json!({}))

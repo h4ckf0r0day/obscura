@@ -97,6 +97,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().pending_navigation.take()
     }
 
+    pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
+    }
+
     pub fn set_intercept_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);

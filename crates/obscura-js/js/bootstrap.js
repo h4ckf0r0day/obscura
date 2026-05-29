@@ -1691,6 +1691,12 @@ _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 if (typeof URL === 'undefined' || !URL.prototype) {
   globalThis.URL = class URL {
     constructor(url, base) {
+      // Per WHATWG URL spec, both arguments are stringified — callers
+      // routinely pass `window.location` (Location object) or a URL
+      // instance as `base`. Coerce explicitly so the regex .match() calls
+      // below don't blow up on non-strings.
+      url = String(url);
+      if (base !== undefined && base !== null) base = String(base);
       let full = url;
       if (base && !url.includes('://')) {
         var bm = base.match(/^(https?:\/\/[^\/\?#]+)(\/[^?#]*)?/);

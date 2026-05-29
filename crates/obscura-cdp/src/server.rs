@@ -522,12 +522,11 @@ async fn process_with_interception(
         // CDP messages via `dispatch` (which also acquires this lock); both
         // sides must coordinate or V8 aborts the process at concurrency >= 5.
         let _v8_guard = obscura_js::v8_lock::global().lock().await;
+        // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
+        // must run BEFORE the page's own scripts (CDP contract). Hand them
+        // to the page so navigate_single can inject them at the right point.
+        page.set_preload_scripts(preload_scripts);
         let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
-        for source in &preload_scripts {
-            if let Err(e) = page.execute_preload_script(source) {
-                tracing::debug!("Preload script error: {}", e);
-            }
-        }
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });

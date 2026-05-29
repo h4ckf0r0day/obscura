@@ -137,6 +137,11 @@ pub struct Page {
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
+    // Scripts to execute in the page's JS context BEFORE any of the page's
+    // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
+    // contract. Includes `Runtime.addBinding` shims so puppeteer's
+    // `exposeFunction` bindings exist before inline `<script>` tags execute.
+    preload_scripts: Vec<String>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -181,6 +186,7 @@ impl Page {
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
+            preload_scripts: Vec::new(),
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -416,6 +422,20 @@ impl Page {
             let _ = js.execute_script("<ready-state>", "globalThis.__documentReadyState__ = 'loading';");
         }
 
+        // CDP `Page.addScriptToEvaluateOnNewDocument` contract: preload
+        // sources must run BEFORE any of the page's own scripts. This is
+        // also where puppeteer's `exposeFunction` wrapper installs itself —
+        // if preload runs after page scripts, every early binding call
+        // hits an undefined function and silently no-ops.
+        let preload_sources = self.preload_scripts.clone();
+        if let Some(js) = &mut self.js {
+            for source in &preload_sources {
+                if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
+                    tracing::debug!("Preload script error: {}", e);
+                }
+            }
+        }
+
         for (i, script) in all_to_execute.iter().enumerate() {
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
@@ -616,6 +636,18 @@ impl Page {
         if url.scheme() == "about" {
             self.navigate_blank();
             self.init_js();
+            // Preloads (Page.addScriptToEvaluateOnNewDocument, the
+            // Runtime.addBinding shim) must run on about:blank too —
+            // puppeteer's `browser.newPage()` lands on about:blank and
+            // a follow-up `exposeFunction` is unusable otherwise.
+            let preload_sources = self.preload_scripts.clone();
+            if let Some(js) = &mut self.js {
+                for source in &preload_sources {
+                    if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
+                        tracing::debug!("Preload script error on about:blank: {}", e);
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -1021,6 +1053,18 @@ impl Page {
         } else {
             None
         }
+    }
+
+    pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
+        if let Some(js) = &self.js {
+            js.take_pending_binding_calls()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
+        self.preload_scripts = scripts;
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
