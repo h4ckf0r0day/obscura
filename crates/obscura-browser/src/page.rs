@@ -634,6 +634,18 @@ impl Page {
         if url.scheme() == "about" {
             self.navigate_blank();
             self.init_js();
+            // Preloads (Page.addScriptToEvaluateOnNewDocument, the
+            // Runtime.addBinding shim) must run on about:blank too —
+            // puppeteer's `browser.newPage()` lands on about:blank and
+            // a follow-up `exposeFunction` is unusable otherwise.
+            let preload_sources = self.preload_scripts.clone();
+            if let Some(js) = &mut self.js {
+                for source in &preload_sources {
+                    if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
+                        tracing::debug!("Preload script error on about:blank: {}", e);
+                    }
+                }
+            }
             return Ok(());
         }
 

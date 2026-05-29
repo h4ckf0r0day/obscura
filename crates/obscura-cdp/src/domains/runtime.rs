@@ -186,11 +186,16 @@ pub async fn handle(
                 // The shim forwards every call back to Rust through
                 // op_binding_called; the CDP dispatcher then drains the
                 // queue and emits Runtime.bindingCalled events the same
-                // way Chromium does.
+                // way Chromium does. Chromium's V8InspectorImpl rejects
+                // calls without exactly one argument and ToString-coerces
+                // that argument before emitting it as the payload — we
+                // match the coercion (`String(arg)`) and silently drop
+                // calls with wrong arity, which is what Chrome does.
                 let shim = format!(
                     "globalThis['{name}'] = function (arg) {{\
+                        if (arguments.length !== 1) return;\
                         try {{\
-                            const payload = typeof arg === 'string' ? arg : JSON.stringify(arg);\
+                            const payload = typeof arg === 'string' ? arg : String(arg);\
                             Deno.core.ops.op_binding_called('{name}', payload);\
                         }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
                     }};",
