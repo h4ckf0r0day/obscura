@@ -4032,9 +4032,12 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // (see issue #63).
 if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // Real hit testing against the synthetic bboxes from getBoundingClientRect.
-  // Walks the tree depth-first and returns the deepest element whose rect
-  // contains (x, y). Used by Input.dispatchMouseEvent so .click() dispatches
-  // on the right element instead of a stale __obscura_click_target.
+  // Flat iteration over every element, NOT a tree walk: our synthetic rects
+  // don't form a proper containment hierarchy (a child's rect can lie far
+  // outside its parent's), so a tree walk that only descends into ancestors
+  // containing (x,y) would never reach a deep <input> inside <label><p>.
+  // Returns the deepest matching element (highest nid wins as a proxy for
+  // tree depth) so descendants beat ancestors.
   Document.prototype.elementFromPoint = function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
@@ -4042,21 +4045,23 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
-    var deepest = null;
-    var walk = function(el) {
-      if (!el || !el.getBoundingClientRect) return;
+    var all = this.querySelectorAll('*');
+    var best = null;
+    var bestNid = -1;
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!el || !el.getBoundingClientRect) continue;
+      // documentElement / body span the viewport; skip them so we pick a
+      // real descendant instead of falling back to <html>/<body>.
+      if (el === this.documentElement || el === this.body) continue;
       var r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        deepest = el;
-        var children = el.children;
-        if (children) {
-          for (var i = 0; i < children.length; i++) walk(children[i]);
-        }
+        var nid = el._nid | 0;
+        if (nid > bestNid) { best = el; bestNid = nid; }
       }
-    };
-    walk(this.documentElement);
-    if (!deepest) walk(this.body);
-    return deepest || this.body || this.documentElement || null;
+    }
+    return best || this.body || this.documentElement || null;
   };
   Document.prototype.elementsFromPoint = function(x, y) {
     var el = this.elementFromPoint(x, y);

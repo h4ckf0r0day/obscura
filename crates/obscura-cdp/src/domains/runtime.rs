@@ -1,7 +1,49 @@
+use obscura_browser::lifecycle::WaitUntil;
 use obscura_js::runtime::RemoteObjectInfo;
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
+
+/// Drain pending JS-initiated navigation (form.submit, location.assign, etc),
+/// then emit the same CDP nav-event sequence Page.navigate emits so
+/// Puppeteer's waitForNavigation / Playwright's wait_for_url resolves.
+/// Without this, in-page navigations look like Runtime.evaluate finishing
+/// to clients and they hang waiting for a frameNavigated that never fires.
+async fn emit_post_eval_nav(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) -> Result<(), String> {
+    let page = ctx
+        .get_session_page_mut(session_id)
+        .ok_or("No page")?;
+    let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+    if !did_navigate {
+        return Ok(());
+    }
+    let (frame_id, page_url, page_id, network_events, reached_idle) = {
+        let p = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+        (
+            p.frame_id.clone(),
+            p.url_string(),
+            p.id.clone(),
+            p.network_events.drain(..).collect::<Vec<_>>(),
+            p.lifecycle.is_network_idle(),
+        )
+    };
+    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    super::page::emit_navigation_events(
+        ctx,
+        session_id,
+        &frame_id,
+        &loader_id,
+        &page_url,
+        &page_id,
+        &network_events,
+        WaitUntil::Load,
+        reached_idle,
+    );
+    Ok(())
+}
 
 pub async fn handle(
     method: &str,
@@ -86,7 +128,7 @@ pub async fn handle(
                     ));
                 }
             };
-            page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+            emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
@@ -122,7 +164,7 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info =
                 page.call_function_on_for_cdp(function_declaration, object_id, &arguments, return_by_value, await_promise).await;
-            page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+            emit_post_eval_nav(ctx, session_id).await?;
 
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }

@@ -270,6 +270,16 @@ impl Page {
 
     async fn execute_scripts(&mut self) {
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        // Soft deadline on the entire script-execution phase. Heavy SPAs
+        // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
+        // fetch + execute loop can blow past a 25s Puppeteer goto timeout.
+        // Override via OBSCURA_SCRIPT_DEADLINE_MS for slow networks.
+        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        let script_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(script_deadline_ms);
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -431,7 +441,18 @@ impl Page {
             }
         }).collect();
 
-        let fetch_results = futures::future::join_all(fetch_futures).await;
+        let fetch_results = match tokio::time::timeout_at(
+            script_deadline,
+            futures::future::join_all(fetch_futures),
+        ).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::warn!(
+                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
+                );
+                Vec::new()
+            }
+        };
 
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
         for result in fetch_results {
@@ -465,6 +486,13 @@ impl Page {
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
+            if tokio::time::Instant::now() >= script_deadline {
+                tracing::warn!(
+                    "execute_scripts: deadline reached, skipping {} remaining scripts",
+                    all_to_execute.len() - i,
+                );
+                break;
+            }
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
@@ -489,6 +517,10 @@ impl Page {
         }
 
         for module_script in &module_scripts {
+            if tokio::time::Instant::now() >= script_deadline {
+                tracing::warn!("execute_scripts: deadline reached, skipping remaining module scripts");
+                break;
+            }
             if let Some(ref src) = module_script.src {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
@@ -843,15 +875,11 @@ impl Page {
         }
 
         self.dom = Some(dom);
-        self.lifecycle = LifecycleState::DomContentLoaded;
-
-        if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
-            self.init_js();
-            return Ok(());
-        }
-
         self.init_js();
 
+        // Inject CSS as a global so getComputedStyle and any CSS-aware shim
+        // can read it. Has to happen before scripts run, regardless of
+        // waitUntil, so handlers that read window.__obscura_css see it.
         if !css_sources.is_empty() {
             if let Some(js) = &mut self.js {
                 let combined_css = css_sources.join("\n");
@@ -871,7 +899,19 @@ impl Page {
                 "(function() { var iframes = document.querySelectorAll('iframe[src]'); for (var i = 0; i < iframes.length; i++) { var src = iframes[i].getAttribute('src'); if (src && src !== 'about:blank') iframes[i]._loadIframeSrc(src); } })()");
         }
 
+        // Spec: DOMContentLoaded fires AFTER parser-blocking scripts run,
+        // not before. Skipping execute_scripts() on the DCL path meant
+        // every inline <script> in the page was silently dropped: form
+        // listeners never registered, frameworks never bootstrapped,
+        // page.click() handlers were no-ops. Now scripts run regardless
+        // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+
+        self.lifecycle = LifecycleState::DomContentLoaded;
+
+        if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
+            return Ok(());
+        }
 
         if let Some(js) = &mut self.js {
             if let Ok(new_title) = js.evaluate("document.title") {
