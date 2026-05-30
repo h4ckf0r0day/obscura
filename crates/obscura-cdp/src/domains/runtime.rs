@@ -127,6 +127,24 @@ pub async fn handle(
             Ok(json!({ "result": remote_object_from_info(&info) }))
         }
         "getProperties" => {
+            // Puppeteer's $$() flow:
+            //   1. evaluate querySelectorAll → handle for the NodeList
+            //   2. getProperties on that handle → indexed items
+            //   3. For each item, JSHandle.asElement() checks subtype === 'node';
+            //      if true, wraps as ElementHandle (with click/type/etc).
+            //
+            // Older impl returned the raw value via JSON, dropping the node
+            // identity. Items came back as `{type:'object'}` with no objectId
+            // and no subtype, so asElement returned null and the caller got
+            // plain JSHandles back from page.$$ -- breaking checkboxes[0].click().
+            //
+            // We now:
+            //   1. Walk the underlying object in JS, allocating a stable child
+            //      oid per (parent_oid + index) and stashing each value in
+            //      __obscura_objects so later callFunctionOn can resolve it.
+            //   2. Annotate each item with subtype:'node' + className when the
+            //      value has a numeric nodeType, so Puppeteer wraps it as
+            //      ElementHandle.
             let object_id = params.get("objectId").and_then(|v| v.as_str());
             if let Some(oid) = object_id {
                 let page = ctx
@@ -137,9 +155,29 @@ pub async fn handle(
                     "(function() {{\
                         var obj = globalThis.__obscura_objects['{oid}'];\
                         if (!obj || typeof obj !== 'object') return [];\
-                        return Object.keys(obj).map(function(k) {{\
+                        var keys = Object.keys(obj);\
+                        return keys.map(function(k) {{\
                             var v = obj[k];\
-                            return {{ name: k, value: v, type: typeof v }};\
+                            var t = typeof v;\
+                            var item = {{ name: k, type: t }};\
+                            if (v === null) {{ item.value = null; return item; }}\
+                            if (t !== 'object' && t !== 'function') {{ item.value = v; return item; }}\
+                            var childOid = '{oid}::' + k;\
+                            globalThis.__obscura_objects[childOid] = v;\
+                            item.childOid = childOid;\
+                            if (typeof v.nodeType === 'number') {{\
+                                item.subtype = 'node';\
+                                item.className = v.constructor && v.constructor.name ? v.constructor.name : (v.tagName ? 'HTML' + v.tagName.charAt(0) + v.tagName.slice(1).toLowerCase() + 'Element' : 'Node');\
+                                item.description = v.tagName ? v.tagName.toLowerCase() : (v.nodeName || 'node');\
+                            }} else if (Array.isArray(v)) {{\
+                                item.subtype = 'array';\
+                                item.className = 'Array';\
+                                item.description = 'Array(' + v.length + ')';\
+                            }} else {{\
+                                item.className = (v.constructor && v.constructor.name) || 'Object';\
+                                item.description = item.className;\
+                            }}\
+                            return item;\
                         }});\
                     }})()",
                     oid = escaped_oid,
@@ -150,32 +188,43 @@ pub async fn handle(
                         .iter()
                         .map(|p| {
                             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let value = p.get("value").unwrap_or(&Value::Null);
                             let prop_type =
                                 p.get("type").and_then(|v| v.as_str()).unwrap_or("undefined");
-                            let mut remote = json!({
-                                "type": prop_type,
-                            });
-                            match value {
-                                Value::Null => {
-                                    remote["type"] = json!("object");
-                                    remote["subtype"] = json!("null");
-                                    remote["value"] = json!(null);
+                            let mut remote = json!({ "type": prop_type });
+                            if let Some(child_oid) = p.get("childOid").and_then(|v| v.as_str()) {
+                                remote["type"] = json!("object");
+                                if let Some(sub) = p.get("subtype").and_then(|v| v.as_str()) {
+                                    remote["subtype"] = json!(sub);
                                 }
-                                Value::String(s) => {
-                                    remote["type"] = json!("string");
-                                    remote["value"] = json!(s);
+                                if let Some(cls) = p.get("className").and_then(|v| v.as_str()) {
+                                    remote["className"] = json!(cls);
                                 }
-                                Value::Number(n) => {
-                                    remote["type"] = json!("number");
-                                    remote["value"] = json!(n);
+                                if let Some(desc) = p.get("description").and_then(|v| v.as_str()) {
+                                    remote["description"] = json!(desc);
                                 }
-                                Value::Bool(b) => {
-                                    remote["type"] = json!("boolean");
-                                    remote["value"] = json!(b);
-                                }
-                                _ => {
-                                    remote["value"] = value.clone();
+                                remote["objectId"] = json!(child_oid);
+                            } else if let Some(val) = p.get("value") {
+                                match val {
+                                    Value::Null => {
+                                        remote["type"] = json!("object");
+                                        remote["subtype"] = json!("null");
+                                        remote["value"] = json!(null);
+                                    }
+                                    Value::String(s) => {
+                                        remote["type"] = json!("string");
+                                        remote["value"] = json!(s);
+                                    }
+                                    Value::Number(n) => {
+                                        remote["type"] = json!("number");
+                                        remote["value"] = json!(n);
+                                    }
+                                    Value::Bool(b) => {
+                                        remote["type"] = json!("boolean");
+                                        remote["value"] = json!(b);
+                                    }
+                                    _ => {
+                                        remote["value"] = val.clone();
+                                    }
                                 }
                             }
                             json!({

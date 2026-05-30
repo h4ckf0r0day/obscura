@@ -636,6 +636,20 @@ class Element extends Node {
     if (!event) return true;
     if (!event.target) event.target = this;
     event.currentTarget = this;
+    // Spec: inline `onclick="..."` content attributes are event handlers
+    // for the matching event type. Fire them alongside any
+    // addEventListener handlers. Also honor the IDL property
+    // `el.onclick = fn` if set. Without this, b.click() never invokes
+    // the inline handler and forms with onsubmit / buttons with onclick
+    // are silently dead.
+    const handlerName = 'on' + event.type;
+    const inlineFn = this[handlerName] || this._resolveInlineHandler(handlerName);
+    if (typeof inlineFn === 'function') {
+      try {
+        const ret = inlineFn.call(this, event);
+        if (ret === false) event.preventDefault();
+      } catch(e) { console.error(e); }
+    }
     const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
     for (const h of handlers) {
       try { h.call(this, event); } catch(e) { console.error(e); }
@@ -645,6 +659,20 @@ class Element extends Node {
       this.parentNode.dispatchEvent(event);
     }
     return !event.defaultPrevented;
+  }
+  _resolveInlineHandler(name) {
+    // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
+    // as a function body on first read and cache it on the instance.
+    const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
+    if (Object.prototype.hasOwnProperty.call(cache, name)) return cache[name];
+    const src = this.getAttribute && this.getAttribute(name);
+    if (!src) { cache[name] = null; return null; }
+    try {
+      cache[name] = new Function('event', src);
+    } catch (e) {
+      cache[name] = null;
+    }
+    return cache[name];
   }
   click() {
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
@@ -847,14 +875,36 @@ class Element extends Node {
       set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
     });
   }
-  get offsetWidth() { return 100; } get offsetHeight() { return 20; }
+  get offsetWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
+  get offsetHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
-  get clientWidth() { return 100; } get clientHeight() { return 20; }
-  get scrollWidth() { return 100; } get scrollHeight() { return 20; }
+  // documentElement / body / window expose VIEWPORT geometry, not their own content box.
+  // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
+  // returning 100x20 there made every element appear off-screen and broke .click().
+  get clientWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
+  get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get scrollWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
+  get scrollHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  _isViewportRoot() {
+    const t = this.tagName;
+    return t === 'HTML' || t === 'BODY';
+  }
   get scrollTop() { return 0; } set scrollTop(v) {}
   get scrollLeft() { return 0; } set scrollLeft(v) {}
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
+    // documentElement and body span the full viewport. Without this every
+    // hit test against them clips down to a 100x20 synthetic cell and
+    // Document.elementFromPoint can never recurse into their children.
+    if (this._isViewportRoot()) {
+      const vw = globalThis.innerWidth || 1280;
+      const vh = globalThis.innerHeight || 720;
+      return {
+        x: 0, y: 0, width: vw, height: vh,
+        top: 0, right: vw, bottom: vh, left: 0,
+        toJSON() { return this; },
+      };
+    }
     // No layout engine, but Playwright's actionability polling needs each
     // element to occupy a stable, distinct rect so hit-testing can pick the
     // right one (issue #45). Synthesize a deterministic position from the
@@ -1469,8 +1519,8 @@ globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 globalThis.screen = { width:1920, height:1080, availWidth:1920, availHeight:1040, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
-globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
-globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
+globalThis.innerWidth = 1280; globalThis.innerHeight = 720;
+globalThis.outerWidth = 1280; globalThis.outerHeight = 720;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 
@@ -3981,16 +4031,32 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
 // (see issue #63).
 if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
+  // Real hit testing against the synthetic bboxes from getBoundingClientRect.
+  // Walks the tree depth-first and returns the deepest element whose rect
+  // contains (x, y). Used by Input.dispatchMouseEvent so .click() dispatches
+  // on the right element instead of a stale __obscura_click_target.
   Document.prototype.elementFromPoint = function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
-    var w = (typeof window !== 'undefined' && window.innerWidth) || 0;
-    var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
-    if (x < 0 || y < 0 || x > w || y > h) {
-      return null;
-    }
-    return this.body || this.documentElement || null;
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    if (x < 0 || y < 0 || x > w || y > h) return null;
+    var deepest = null;
+    var walk = function(el) {
+      if (!el || !el.getBoundingClientRect) return;
+      var r = el.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        deepest = el;
+        var children = el.children;
+        if (children) {
+          for (var i = 0; i < children.length; i++) walk(children[i]);
+        }
+      }
+    };
+    walk(this.documentElement);
+    if (!deepest) walk(this.body);
+    return deepest || this.body || this.documentElement || null;
   };
   Document.prototype.elementsFromPoint = function(x, y) {
     var el = this.elementFromPoint(x, y);

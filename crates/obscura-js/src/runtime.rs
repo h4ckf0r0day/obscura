@@ -144,11 +144,16 @@ impl ObscuraJsRuntime {
             .trim()
             .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
 
+        // Puppeteer / Playwright bundles end with a `//# sourceURL=...`
+        // line comment. If we put `{expr})` on a single line the comment
+        // swallows the closing paren and our wrapper breaks. A newline
+        // before the `)` terminates any trailing line comment so the
+        // parens close on their own line.
         let meta_code = if await_promise {
             format!(
                 "(async function() {{\n\
                     try {{\n\
-                        var __result = await ({expr});\n\
+                        var __result = await (\n{expr}\n);\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
                         globalThis.__obscura_await_rejected = false;\n\
@@ -167,7 +172,7 @@ impl ObscuraJsRuntime {
             format!(
                 "(function() {{\n\
                     var __result;\n\
-                    try {{ __result = ({expr}); }} catch(e) {{ __result = undefined; }}\n\
+                    try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
                     globalThis.__obscura_objects['{oid}'] = __result;\n\
                     return {meta_fn};\n\
                 }})()",
@@ -366,7 +371,7 @@ impl ObscuraJsRuntime {
         let oid = self.make_oid(self.object_counter);
         let code = format!(
             "(function() {{\n\
-                var __result = ({expr});\n\
+                var __result = (\n{expr}\n);\n\
                 globalThis.__obscura_objects['{oid}'] = __result;\n\
                 return {meta_fn};\n\
             }})()",
@@ -614,7 +619,7 @@ impl ObscuraJsRuntime {
 
         if is_multi_statement {
             format!(
-                "(function() {{ try {{ {} }} catch(e) {{ return null; }} }})()",
+                "(function() {{ try {{\n{}\n}} catch(e) {{ return null; }} }})()",
                 expression
             )
         } else {
@@ -625,9 +630,13 @@ impl ObscuraJsRuntime {
             // to parse, the catch never fires (parse errors are not
             // catchable), and the function silently returns `undefined`.
             // Stripping makes the wrapped expression syntactically valid.
+            //
+            // The newline before the trailing `)` also terminates any
+            // `//# sourceURL=...` line comment the caller may have appended
+            // (Puppeteer's evaluated bundles do).
             let cleaned = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
             format!(
-                "(function() {{ try {{ return ({}); }} catch(e) {{ return null; }} }})()",
+                "(function() {{ try {{ return (\n{}\n); }} catch(e) {{ return null; }} }})()",
                 cleaned
             )
         }

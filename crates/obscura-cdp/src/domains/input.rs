@@ -20,8 +20,9 @@ pub async fn handle(
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
+                            globalThis.__obscura_click_target = target;\
                             var evt = new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
                             target.dispatchEvent(evt);\
                             var click = new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
@@ -33,6 +34,19 @@ pub async fn handle(
                                     var href = link.getAttribute('href');\
                                     if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {{\
                                         location.assign(href);\
+                                    }}\
+                                }} else {{\
+                                    var tag = target.tagName;\
+                                    var type = (target.getAttribute && target.getAttribute('type') || '').toLowerCase();\
+                                    if (tag === 'BUTTON' && type !== 'button' && type !== 'reset') {{\
+                                        var form = target.closest ? target.closest('form') : null;\
+                                        if (form && typeof form.submit === 'function') {{ try {{ form.submit(target); }} catch(e) {{}} }}\
+                                    }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
+                                        var form2 = target.closest ? target.closest('form') : null;\
+                                        if (form2 && typeof form2.submit === 'function') {{ try {{ form2.submit(target); }} catch(e) {{}} }}\
+                                    }} else if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{\
+                                        target.checked = !target.checked;\
+                                        try {{ target.dispatchEvent(new Event('change', {{bubbles:true}})); }} catch(e) {{}}\
                                     }}\
                                 }}\
                             }}\
@@ -46,7 +60,7 @@ pub async fn handle(
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             var evt = new MouseEvent('mouseup', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}});\
                             target.dispatchEvent(evt);\
