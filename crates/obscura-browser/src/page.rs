@@ -70,15 +70,17 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Sub-resource fetch policy. A page may only pull a `<script src>` /
-/// `<link rel=stylesheet href>` / etc. when the URL scheme is safe for
-/// the page's origin. http(s) pages cannot reach into file: or data:
-/// to fabricate scripts, and pages with no origin only get http/https.
+/// Sub-resource fetch policy. http(s) is always fine; data: is allowed
+/// because the bytes are inline in the URI (no network fetch, no SSRF);
+/// file: is only allowed when the page itself was loaded from file:;
+/// everything else (javascript:, chrome:, etc) is blocked.
+/// Real Chrome allows data: subresources by default; Instagram and most
+/// Meta properties depend on this for their inline bootstrap scripts.
 fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
     let Ok(target) = Url::parse(resource) else { return false };
     let scheme = target.scheme().to_ascii_lowercase();
     match scheme.as_str() {
-        "http" | "https" => true,
+        "http" | "https" | "data" => true,
         "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
         _ => false,
     }
@@ -276,6 +278,7 @@ impl Page {
             is_defer: bool,
             is_async: bool,
             is_module: bool,
+            nid: u32,
         }
 
         let all_scripts = match &self.js {
@@ -313,6 +316,7 @@ impl Page {
                                     is_defer,
                                     is_async,
                                     is_module,
+                                    nid: sid.raw(),
                                 });
                             }
                         }
@@ -393,6 +397,30 @@ impl Page {
             let idx = *idx;
             async move {
                 let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                if parsed.scheme() == "data" {
+                    // data: URIs are inline; decode locally, no network fetch.
+                    // Instagram and other Meta properties serve their bootstrap
+                    // as <script src="data:application/x-javascript;base64,...">.
+                    let body = decode_data_uri(&url).unwrap_or_default();
+                    let content_type = url
+                        .strip_prefix("data:")
+                        .and_then(|s| s.split(',').next())
+                        .unwrap_or("application/javascript")
+                        .split(';')
+                        .next()
+                        .unwrap_or("application/javascript")
+                        .to_string();
+                    let mut headers = std::collections::HashMap::new();
+                    headers.insert("content-type".to_string(), content_type);
+                    let resp = obscura_net::Response {
+                        url: parsed,
+                        status: 200,
+                        headers,
+                        body,
+                        redirected_from: Vec::new(),
+                    };
+                    return Some((idx, url, resp));
+                }
                 match client.fetch(&parsed).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
@@ -442,16 +470,20 @@ impl Page {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                     self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
                     if let Some(js) = &mut self.js {
+                        let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
                         }
+                        let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
                     }
                 }
             } else if !script.inline.is_empty() {
                 if let Some(js) = &mut self.js {
+                    let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
                     if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
                         tracing::warn!("Inline script error: {}", e);
                     }
+                    let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
                 }
             }
         }

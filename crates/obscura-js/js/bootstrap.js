@@ -279,19 +279,30 @@ class Node {
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
-      if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
+      const isModule = scriptType === 'module';
+      if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
         return c;
       }
       const src = c.getAttribute('src');
+      const prevNid = globalThis.__currentScriptNid;
       if (src) {
-        const fullUrl = src.startsWith('http') ? src : new URL(src, globalThis.location?.href || 'http://localhost/').href;
+        const fullUrl = src.startsWith('http') || src.startsWith('data:')
+          ? src
+          : new URL(src, globalThis.location?.href || 'http://localhost/').href;
         const pageOrigin = (function() { try { return new URL(globalThis.location?.href || "about:blank").origin; } catch(e) { return ""; } })();
         (async () => {
           try {
-            const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
-            const parsed = JSON.parse(raw);
-            if (parsed.body) {
-              try { (0, eval)(parsed.body); } catch(e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+            if (isModule) {
+              await import(fullUrl);
+            } else {
+              const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+              const parsed = JSON.parse(raw);
+              if (parsed.body) {
+                globalThis.__currentScriptNid = c._nid;
+                try { (0, eval)(parsed.body); }
+                catch(e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+                finally { globalThis.__currentScriptNid = prevNid || 0; }
+              }
             }
             if (typeof c.onload === 'function') try { c.onload(new Event('load')); } catch(e) {}
               try { c.dispatchEvent(new Event('load')); } catch(e) {}
@@ -302,7 +313,20 @@ class Node {
         })();
       } else {
         const code = c.textContent;
-        if (code) { try { (0, eval)(code); } catch(e) { console.error('Dynamic inline script error:', e.message); } }
+        if (code) {
+          if (isModule) {
+            const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
+            (async () => {
+              try { await import(dataUrl); }
+              catch(e) { console.error('Dynamic inline module error:', e.message); }
+            })();
+          } else {
+            globalThis.__currentScriptNid = c._nid;
+            try { (0, eval)(code); }
+            catch(e) { console.error('Dynamic inline script error:', e.message); }
+            finally { globalThis.__currentScriptNid = prevNid || 0; }
+          }
+        }
       }
     }
     return c;
@@ -933,6 +957,13 @@ class Document extends Node {
   get characterSet() { return "UTF-8"; }
   get contentType() { return "text/html"; }
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
+  get currentScript() {
+    // Next.js / Turbopack chunk loader reads document.currentScript.src to
+    // derive its base path. page.rs sets __currentScriptNid before each
+    // <script> body runs and clears it after, mirroring real Chrome.
+    const nid = globalThis.__currentScriptNid;
+    return nid ? _wrapEl(+nid) : null;
+  }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
