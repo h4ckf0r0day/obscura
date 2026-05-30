@@ -101,10 +101,19 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
+    /// Wire up the interception channel without enabling interception.
+    /// Use set_intercept_enabled separately. The two were entangled before
+    /// and every navigation auto-enabled interception, which made
+    /// `fetch()` from page JS hang forever waiting for a CDP client to
+    /// answer Fetch.requestPaused events that the client never asked for.
     pub fn set_intercept_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
-        state.intercept_enabled = true;
+    }
+
+    pub fn set_intercept_enabled(&self, enabled: bool) {
+        let mut state = self.state.borrow_mut();
+        state.intercept_enabled = enabled;
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {

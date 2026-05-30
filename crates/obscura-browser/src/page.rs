@@ -134,6 +134,11 @@ pub struct Page {
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
+    /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
+    /// Entries are URLs in visit order; `history_index` is the current position.
+    /// Pushed on every successful navigation; truncated on goBack -> new nav.
+    pub history: Vec<String>,
+    pub history_index: usize,
     pub network_events: Vec<NetworkEvent>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -183,6 +188,8 @@ impl Page {
             http_client,
             context,
             title: String::new(),
+            history: Vec::new(),
+            history_index: 0,
             network_events: Vec::new(),
             network_event_counter: 0,
             intercept_enabled: false,
@@ -640,7 +647,7 @@ impl Page {
             .unwrap_or(30_000);
         let nav_timeout = tokio::time::Duration::from_millis(nav_timeout_ms);
 
-        match tokio::time::timeout(
+        let result = match tokio::time::timeout(
             nav_timeout,
             self.navigate_with_wait_post_inner(url_str, wait_until, method, body),
         )
@@ -653,6 +660,34 @@ impl Page {
                     "navigation exceeded {nav_timeout_ms}ms deadline"
                 )))
             }
+        };
+        if result.is_ok() {
+            self.push_history(self.url_string());
+        }
+        result
+    }
+
+    /// Append the current URL to the history stack, truncating any forward
+    /// entries past the cursor (matches real Chrome: navigating after a
+    /// goBack clobbers the forward history).
+    pub fn push_history(&mut self, url: String) {
+        if url.is_empty() { return; }
+        // Don't dupe consecutive entries (Page.reload would otherwise pile up).
+        if self.history.get(self.history_index) == Some(&url) {
+            return;
+        }
+        if !self.history.is_empty() && self.history_index < self.history.len() - 1 {
+            self.history.truncate(self.history_index + 1);
+        }
+        self.history.push(url);
+        self.history_index = self.history.len() - 1;
+    }
+
+    /// Move the history cursor without re-navigating; used by
+    /// Page.navigateToHistoryEntry which then drives the actual fetch.
+    pub fn set_history_index(&mut self, idx: usize) {
+        if idx < self.history.len() {
+            self.history_index = idx;
         }
     }
 
@@ -1204,6 +1239,13 @@ impl Page {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
+        }
+    }
+
+    pub fn enable_intercept(&mut self, enabled: bool) {
+        self.intercept_enabled = enabled;
+        if let Some(js) = &self.js {
+            js.set_intercept_enabled(enabled);
         }
     }
 }

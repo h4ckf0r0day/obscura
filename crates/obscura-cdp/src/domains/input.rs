@@ -94,6 +94,9 @@ pub async fn handle(
                         page.evaluate(&js);
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
+                            // Need to escape backslash BEFORE single-quote so the new
+                            // backslashes from quote escaping don't get double-escaped.
+                            let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
                             let js = format!(
                                 "(function() {{\
                                     var target = document.activeElement;\
@@ -102,17 +105,25 @@ pub async fn handle(
                                         target.dispatchEvent(new Event('input', {{bubbles:true}}));\
                                     }}\
                                 }})()",
-                                text = text.replace('\'', "\\'").replace('\\', "\\\\"),
+                                text = escaped_text,
                             );
                             page.evaluate(&js);
                         }
 
                         if key == "Enter" {
+                            // In a textarea Enter inserts a newline; in input fields
+                            // it submits the containing form. Real Chrome distinguishes
+                            // these two and we should too: previously every Enter tried
+                            // to submit the nearest form even from a textarea.
                             let js = "(function() {\
                                 var target = document.activeElement;\
-                                if (target) {\
-                                    target.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'}));\
-                                    var form = target.form || target.closest && target.closest('form');\
+                                if (!target) return;\
+                                target.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'}));\
+                                if (target.localName === 'textarea') {\
+                                    target.value = (target.value || '') + '\\n';\
+                                    target.dispatchEvent(new Event('input', {bubbles:true}));\
+                                } else {\
+                                    var form = target.form || (target.closest && target.closest('form'));\
                                     if (form && typeof form.submit === 'function') form.submit();\
                                 }\
                             })()";

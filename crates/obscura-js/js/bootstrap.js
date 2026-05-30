@@ -697,14 +697,44 @@ class Element extends Node {
   focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
   get value() {
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     const tag = this.localName;
+    if (tag === 'select') {
+      // Selected option wins; otherwise first option (HTML default).
+      const opts = this.querySelectorAll('option');
+      for (let i = 0; i < opts.length; i++) {
+        if (opts[i].selected) {
+          return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
+        }
+      }
+      if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
+      return '';
+    }
+    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
+    if (tag === 'option') {
+      const attr = this.getAttribute('value');
+      return attr !== null ? attr : this.textContent;
+    }
     return this.getAttribute("value") || "";
   }
   set value(v) {
-    _formValues[this._nid] = String(v);
     const tag = this.localName;
+    if (tag === 'select') {
+      // Set selected on matching option, clear on others. Puppeteer's
+      // page.select(selector, value) round-trips through this setter.
+      const wanted = String(v);
+      const opts = this.querySelectorAll('option');
+      let matched = false;
+      for (let i = 0; i < opts.length; i++) {
+        const attrV = opts[i].getAttribute('value');
+        const optVal = attrV !== null ? attrV : opts[i].textContent;
+        if (optVal === wanted) { opts[i].selected = true; matched = true; }
+        else { opts[i].selected = false; }
+      }
+      if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+      return;
+    }
+    _formValues[this._nid] = String(v);
     if (tag === 'textarea') {
       this.textContent = String(v);
     }

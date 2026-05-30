@@ -374,16 +374,77 @@ pub async fn handle(
         }
         "getNavigationHistory" => {
             let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-            Ok(json!({
-                "currentIndex": 0,
-                "entries": [{
+            // Synthesize an entry for the current page when history is empty
+            // (initial about:blank, never-navigated targets). Puppeteer's
+            // goBack reads `currentIndex` and `entries[currentIndex-1]`;
+            // an empty entries[] used to make every back/forward fail.
+            let entries: Vec<Value> = if page.history.is_empty() {
+                vec![json!({
                     "id": 0,
                     "url": page.url_string(),
                     "userTypedURL": page.url_string(),
                     "title": page.title,
                     "transitionType": "typed",
-                }]
+                })]
+            } else {
+                page.history.iter().enumerate().map(|(i, url)| json!({
+                    "id": i as u64,
+                    "url": url,
+                    "userTypedURL": url,
+                    "title": if i == page.history_index { page.title.clone() } else { String::new() },
+                    "transitionType": "typed",
+                })).collect()
+            };
+            Ok(json!({
+                "currentIndex": if page.history.is_empty() { 0 } else { page.history_index },
+                "entries": entries,
             }))
+        }
+        "navigateToHistoryEntry" => {
+            let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let target_url = {
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                let url = page.history.get(entry_id).cloned();
+                if url.is_some() {
+                    page.set_history_index(entry_id);
+                }
+                url
+            };
+            if let Some(url) = target_url {
+                // Stash + restore history so push_history doesn't clobber
+                // the cursor we just moved.
+                let stash = {
+                    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                    (page.history.clone(), page.history_index)
+                };
+                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded).await.map_err(|e| e.to_string())?;
+                    page.history = stash.0;
+                    page.history_index = stash.1;
+                    (
+                        page.frame_id.clone(),
+                        page.id.clone(),
+                        page.network_events.drain(..).collect::<Vec<_>>(),
+                        page.url_string(),
+                        page.lifecycle.is_network_idle(),
+                    )
+                };
+                let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+                emit_navigation_events(
+                    ctx, session_id,
+                    &frame_id, &loader_id, &page_url, &page_id,
+                    &network_events, WaitUntil::DomContentLoaded, reached_idle,
+                );
+            }
+            Ok(json!({}))
+        }
+        "resetNavigationHistory" => {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.history.clear();
+                page.history_index = 0;
+            }
+            Ok(json!({}))
         }
         "printToPDF" => {
             // Obscura has no layout/rendering engine, so PDF generation is
