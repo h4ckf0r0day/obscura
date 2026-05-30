@@ -381,10 +381,17 @@ async fn cdp_processor(
                 );
             }
             ServerMessage::Cdp(cdp_msg) => {
+                // Route every Page.navigate through the spawn-and-defer path,
+                // not just intercepted ones. Holding the V8 lock across a
+                // multi-second navigate inside the regular dispatch wedges the
+                // entire processor (40-site sweep: 39/40 timeouts). Spawning
+                // navigation lets `cdp_processor` keep multiplexing other CDP
+                // messages via the `process_with_interception` select loop;
+                // unrelated requests get deferred only briefly and are drained
+                // as soon as the nav settles.
                 let is_navigation = cdp_msg.text.contains("Page.navigate");
-                let has_interception = ctx.fetch_intercept.enabled;
 
-                if is_navigation && has_interception {
+                if is_navigation {
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                         &mut intercept_rx, &mut intercepted_paused,
@@ -509,25 +516,9 @@ async fn process_with_interception(
     }
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let wait_until = req.params.get("waitUntil")
-        .and_then(|v| {
-            if let Some(s) = v.as_str() {
-                Some(obscura_browser::WaitUntil::from_str(s))
-            } else if let Some(arr) = v.as_array() {
-                arr.iter()
-                    .filter_map(|item| item.as_str())
-                    .map(obscura_browser::WaitUntil::from_str)
-                    .max_by_key(|w| match w {
-                        obscura_browser::WaitUntil::DomContentLoaded => 0,
-                        obscura_browser::WaitUntil::Load => 1,
-                        obscura_browser::WaitUntil::NetworkIdle2 => 2,
-                        obscura_browser::WaitUntil::NetworkIdle0 => 3,
-                    })
-            } else {
-                None
-            }
-        })
-        .unwrap_or(obscura_browser::WaitUntil::Load);
+    let wait_until = crate::domains::page::parse_wait_until(&req.params);
+    let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
+    let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
@@ -552,7 +543,12 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
-        let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
+        let result = if nav_method == "POST" && !nav_body.is_empty() {
+            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+        } else {
+            page.navigate_with_wait(&url_owned, wait_until).await
+        }
+        .map_err(|e| e.to_string());
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
@@ -722,43 +718,27 @@ async fn process_with_interception(
         let _ = reply_tx.send(json);
     }
 
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-    let es = session_for_events;
-
-    for event in [
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id_for_events), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
-    ] {
-        if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
-    }
-
-    for net_event in &network_events {
-        for event in [
-            crate::types::CdpEvent { method: "Network.requestWillBeSent".into(), params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}), session_id: es.clone() },
-            crate::types::CdpEvent { method: "Network.responseReceived".into(), params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": ""}, "frameId": frame_id}), session_id: es.clone() },
-            crate::types::CdpEvent { method: "Network.loadingFinished".into(), params: json!({"requestId": net_event.request_id, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}), session_id: es.clone() },
-        ] {
-            if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
+    // Shared event emission: includes the post-#190 Network.requestWillBeSent
+    // -before-frameNavigated ordering, the #189 requestId=loaderId trick that
+    // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
+    // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
+    // to the WS reply channel.
+    crate::domains::page::emit_navigation_events(
+        ctx,
+        &session_for_events,
+        &frame_id,
+        &loader_id,
+        &page_url,
+        &page_id_for_events,
+        &network_events,
+        wait_until,
+        reached_network_idle,
+    );
+    for event in ctx.pending_events.drain(..) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
         }
     }
-
-    for event in [
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-    ] {
-        if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
-    }
-    if reached_network_idle {
-        let idle_event = crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() };
-        if let Ok(json) = serde_json::to_string(&idle_event) { let _ = reply_tx.send(json); }
-    }
-    let stop_event = crate::types::CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es };
-    if let Ok(json) = serde_json::to_string(&stop_event) { let _ = reply_tx.send(json); }
 }
 
 async fn process_cdp_message(

@@ -93,7 +93,12 @@ async fn runtime_click_submit_prevent_default_navigation_updates_page() {
         &mut ctx,
         1,
         "Page.navigate",
-        json!({"url": url}),
+        // Explicit `waitUntil: 'load'` so the inline `<script>` that defines
+        // `submitCompat` runs. `Page.navigate` now defaults to
+        // `DomContentLoaded` (matches real Chrome's lifecycle streaming so
+        // Puppeteer/Playwright clients don't time out on JS-heavy pages),
+        // which by design returns before parser-discovered scripts execute.
+        json!({"url": url, "waitUntil": "load"}),
         session_id,
     )
     .await;

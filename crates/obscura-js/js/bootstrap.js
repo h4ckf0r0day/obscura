@@ -237,11 +237,19 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
-    const children = _domParse("child_nodes", this._nid) || [];
-    for (const c of children) _dom("remove_child", c);
+    const oldChildren = _domParse("child_nodes", this._nid) || [];
+    for (const c of oldChildren) _dom("remove_child", c);
+    let added = [];
     if (v != null && v !== "") {
       const tn = +_dom("create_text_node", String(v));
       _dom("append_child", this._nid, tn);
+      added = [tn];
+    }
+    // Real MutationObserver fires childList for the children swap.
+    // Without this React 18+ hydration mismatch detection and many polling
+    // libs (intersection-driven lazy load, content sync) silently stall.
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
     }
   }
   get nodeValue() {
@@ -386,7 +394,11 @@ class CharacterData extends Node {
     return _domParse("text_content", this._nid) ?? "";
   }
   set data(v) {
+    const oldValue = _domParse("text_content", this._nid) ?? "";
     _dom("set_text_content", this._nid, String(v ?? ""));
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
+    }
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
@@ -454,7 +466,22 @@ class Element extends Node {
       this.content.innerHTML = v;
       return;
     }
+    // Capture the children that are about to be replaced so we can deliver
+    // them as `removedNodes` in the MutationObserver record. Without this,
+    // libraries that mutate via `innerHTML =` (jQuery's `.html(s)`, React
+    // `dangerouslySetInnerHTML`, vue-style content swaps) silently bypass
+    // every MutationObserver subscriber and downstream hydration / polling
+    // logic stalls.
+    let oldChildren = [];
+    let newChildren = [];
+    if (globalThis.__mutationObservers?.length) {
+      oldChildren = _domParse("child_nodes", this._nid) || [];
+    }
     _dom("set_inner_html", this._nid, String(v ?? ""));
+    if (globalThis.__mutationObservers?.length) {
+      newChildren = _domParse("child_nodes", this._nid) || [];
+      globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
+    }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
@@ -1083,8 +1110,31 @@ class Document extends Node {
   get activeElement() { return globalThis.__obscura_focused || this.body; }
   get implementation() {
     return {
-      createHTMLDocument(title) { return globalThis.document; },
-      createDocument() { return globalThis.document; },
+      // Spec: createHTMLDocument returns a NEW detached Document. jQuery
+      // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
+      // the result — when we returned `globalThis.document`, the real
+      // `<body>` was wiped, taking every page on the open web that ships
+      // jQuery 3.x with it. Reuse the DOMParser path to build a detached
+      // document, then optionally set the title.
+      createHTMLDocument(title) {
+        const skeleton = `<html><head><title></title></head><body></body></html>`;
+        const doc = new DOMParser().parseFromString(skeleton, "text/html");
+        if (title != null) {
+          const t = doc.querySelector("title");
+          if (t) t.textContent = String(title);
+        }
+        return doc;
+      },
+      // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
+      // an XML document with a root element of the given name. We don't
+      // have a separate XML stack, so return a minimal detached document
+      // with an element of the requested local name as documentElement.
+      createDocument(_ns, qualifiedName, _doctype) {
+        const name = (qualifiedName && String(qualifiedName)) || "root";
+        const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
+        const html = `<${safe}></${safe}>`;
+        return new DOMParser().parseFromString(html, "application/xml");
+      },
       hasFeature() { return true; },
     };
   }
@@ -1205,9 +1255,19 @@ function _resolveUrl(url) {
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
   try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
 }
+// `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
+// any real navigation). When set, `location.href` and friends read it instead
+// of the underlying `document_url`. Without this, client-side routers
+// (Next.js, React Router, vue-router) call `pushState` but the URL never
+// changes, so their `useLocation` hooks return the wrong path and the UI
+// freezes on the original route.
+globalThis.__virtualUrl = null;
+function __currentUrl() {
+  return globalThis.__virtualUrl || _domParse("document_url") || "about:blank";
+}
 globalThis.location = {
-  get href() { return _domParse("document_url") ?? "about:blank"; },
-  set href(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  get href() { return __currentUrl(); },
+  set href(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -1217,9 +1277,9 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  assign(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
   reload() {},
-  replace(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  replace(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
@@ -1849,19 +1909,42 @@ if (!('isConnected' in Node.prototype)) {
 }
 
 globalThis.ResizeObserver = class ResizeObserver {
-  constructor(callback) { this._callback = callback; this._targets = []; }
+  constructor(callback) {
+    this._callback = callback;
+    this._targets = new Set();
+    this._connected = true;
+    this._fireCount = 0;
+  }
+  _fireFor(targets) {
+    if (!this._connected || !targets.length) return;
+    const records = targets.map(target => {
+      const r = target.getBoundingClientRect ? target.getBoundingClientRect() : { x: 0, y: 0, width: 100, height: 20 };
+      return {
+        target,
+        contentRect: { x: r.x || 0, y: r.y || 0, width: r.width || 100, height: r.height || 20, top: r.top || 0, left: r.left || 0, bottom: r.bottom || 20, right: r.right || 100 },
+        borderBoxSize: [{ blockSize: r.height || 20, inlineSize: r.width || 100 }],
+        contentBoxSize: [{ blockSize: r.height || 20, inlineSize: r.width || 100 }],
+        devicePixelContentBoxSize: [{ blockSize: r.height || 20, inlineSize: r.width || 100 }],
+      };
+    });
+    try { this._callback(records, this); } catch (e) { /* RO callbacks must not propagate */ }
+  }
   observe(el) {
-    this._targets.push(el);
-    Promise.resolve().then(() => {
-      this._callback([{
-        target: el, contentRect: { x:0, y:0, width:100, height:20, top:0, left:0, bottom:20, right:100 },
-        borderBoxSize: [{ blockSize: 20, inlineSize: 100 }],
-        contentBoxSize: [{ blockSize: 20, inlineSize: 100 }],
-      }], this);
+    if (!el || !this._connected) return;
+    if (this._targets.has(el)) return;
+    this._targets.add(el);
+    Promise.resolve().then(() => this._fireFor([el]));
+    [200, 800].forEach(delay => {
+      setTimeout(() => {
+        if (this._connected && this._targets.has(el) && this._fireCount < 16) {
+          this._fireCount++;
+          this._fireFor([el]);
+        }
+      }, delay);
     });
   }
-  unobserve(el) { this._targets = this._targets.filter(t => t !== el); }
-  disconnect() { this._targets = []; }
+  unobserve(el) { this._targets.delete(el); }
+  disconnect() { this._connected = false; this._targets.clear(); }
 };
 
 if (typeof TextEncoder === 'undefined') {
@@ -1907,45 +1990,86 @@ globalThis.matchMedia = _markNative(function matchMedia(q) { return { matches: f
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
+  // React virtualization libraries (react-window, tanstack-virtual,
+  // react-virtuoso) all compute container dimensions via getComputedStyle.
+  // The defaults table previously returned `auto` for width/height and
+  // `'static'` for position, which made every list render 0 items. Pulling
+  // width/height from the synthesized bounding rect makes those libraries
+  // actually render content.
+  const dimensionFor = (name) => {
+    try {
+      const r = el.getBoundingClientRect && el.getBoundingClientRect();
+      if (!r) return null;
+      switch (name) {
+        case 'width': case 'inline-size':
+          return r.width != null ? `${r.width}px` : null;
+        case 'height': case 'block-size':
+          return r.height != null ? `${r.height}px` : null;
+        case 'left': return r.left != null ? `${r.left}px` : null;
+        case 'top': return r.top != null ? `${r.top}px` : null;
+        case 'right': return r.right != null ? `${r.right}px` : null;
+        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
+        case 'client-width': case 'offset-width':
+          return r.width != null ? `${r.width}px` : null;
+        case 'client-height': case 'offset-height':
+          return r.height != null ? `${r.height}px` : null;
+      }
+    } catch (e) {}
+    return null;
+  };
+
+  const defaultsKebab = {
+    display: 'block', visibility: 'visible', opacity: '1',
+    position: 'static', overflow: 'visible',
+    transform: 'none', 'transform-origin': '0px 0px',
+    transition: 'none', animation: 'none',
+    float: 'none', clear: 'none',
+    margin: '0px', padding: '0px',
+    'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
+    'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
+    'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
+    'font-family': 'Times',
+    color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
+    'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
+    'border-top-width': '0px', 'border-right-width': '0px',
+    'border-bottom-width': '0px', 'border-left-width': '0px',
+    'border-radius': '0px',
+    'z-index': 'auto', 'pointer-events': 'auto',
+    'box-sizing': 'content-box', cursor: 'auto',
+    'white-space': 'normal', 'text-align': 'start',
+    'flex-direction': 'row', 'flex-wrap': 'nowrap', 'align-items': 'normal',
+    'justify-content': 'normal', gap: 'normal',
+    'grid-template-columns': 'none', 'grid-template-rows': 'none',
+    'will-change': 'auto', 'backface-visibility': 'visible',
+  };
+
+  const lookup = (rawProp) => {
+    if (typeof rawProp !== 'string') return '';
+    // Inline value first.
+    const inlineVal = target.getPropertyValue ? target.getPropertyValue(rawProp) : '';
+    if (inlineVal) return inlineVal;
+    const kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
+    const dim = dimensionFor(kebab);
+    if (dim != null) return dim;
+    if (defaultsKebab[rawProp]) return defaultsKebab[rawProp];
+    if (defaultsKebab[kebab]) return defaultsKebab[kebab];
+    return '';
+  };
+
+  const target = style;
   return new Proxy(style, {
-    get(target, prop) {
+    get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
       if (prop in target) return target[prop];
-      if (typeof prop === 'string') {
-        const v = target.getPropertyValue ? target.getPropertyValue(prop) : '';
-        if (v) return v;
-        const defaults = {
-          display: 'block', visibility: 'visible', opacity: '1',
-          position: 'static', overflow: 'visible',
-          transform: 'none', transition: 'none', animation: 'none',
-          float: 'none', clear: 'none',
-          width: 'auto', height: 'auto',
-          top: 'auto', left: 'auto', right: 'auto', bottom: 'auto',
-          margin: '0px', padding: '0px',
-          'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
-          'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
-          'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
-          color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
-          'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
-          'z-index': 'auto', 'pointer-events': 'auto',
-          'box-sizing': 'content-box', cursor: 'auto',
-        };
-        const kebabProp = prop.replace(/([A-Z])/g, '-$1').toLowerCase();
-        if (defaults[prop]) return defaults[prop];
-        if (defaults[kebabProp]) return defaults[kebabProp];
-        return '';
-      }
-      if (prop === 'getPropertyValue') {
-        return (name) => {
-          const v = target.getPropertyValue ? target.getPropertyValue(name) : '';
-          if (v) return v;
-          const defaults = {transform:'none',opacity:'1',display:'block',visibility:'visible'};
-          return defaults[name] || defaults[name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase())] || '';
-        };
-      }
+      if (prop === 'getPropertyValue') return (name) => lookup(name);
+      if (prop === 'getPropertyPriority') return () => '';
+      if (prop === 'item') return (i) => '';
       if (prop === 'length') return 0;
+      if (prop === 'cssText') return '';
+      if (prop === 'parentRule') return null;
+      if (typeof prop === 'string') return lookup(prop);
       return undefined;
-    }
+    },
   });
 };
 globalThis.getSelection = _markNative(function getSelection() {
@@ -2034,27 +2158,59 @@ globalThis.MutationObserver = class MutationObserver {
     });
   }
 };
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName) {
+globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue) {
   if (!globalThis.__mutationObservers.length) return;
-  const target = globalThis._cache?.get(target_nid) || null;
+  // Use `_wrap` (the canonical node-id → wrapper resolver) instead of a
+  // direct cache poke. The previous code referenced `globalThis._cache`,
+  // but `_cache` is a module-local Map — the lookup always returned
+  // undefined, so the function silently bailed every time. Result: no
+  // MutationObserver fired in obscura, ever, despite the call sites being
+  // wired up at appendChild / setAttribute. _wrap also lazily creates a
+  // wrapper for nodes that didn't have one yet (e.g. children parsed from
+  // `set innerHTML`), which we need for record.target/added/removed.
+  const target = _wrap(target_nid);
   if (!target) return;
   const record = {
     type: type, // 'childList', 'attributes', 'characterData'
     target: target,
-    addedNodes: (addedNodes || []).map(nid => globalThis._cache?.get(nid) || null).filter(Boolean),
-    removedNodes: (removedNodes || []).map(nid => globalThis._cache?.get(nid) || null).filter(Boolean),
+    addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
+    removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     attributeName: attributeName || null,
-    oldValue: null,
+    oldValue: oldValue ?? null,
     previousSibling: null,
     nextSibling: null,
   };
+  // Walk target → ancestors so a subtree-mode observer rooted at any
+  // ancestor matches. The previous implementation just checked that
+  // `target.contains` and `target.closest` were defined (always true on
+  // any Element), so subtree=true silently behaved like subtree=false and
+  // every nested mutation missed its subscriber.
   for (const obs of globalThis.__mutationObservers) {
+    let matched = false;
     for (const t of obs._targets) {
-      if (t.target._nid === target_nid || (t.options.subtree && target.contains && target.closest && true)) {
-        obs._notify([record]);
-        break;
+      const root = t.target;
+      if (!root) continue;
+      // Filter by type per the observer options. Default behaviour matches
+      // real MutationObserver: attribute mutations need options.attributes,
+      // characterData mutations need options.characterData, childList
+      // needs options.childList.
+      const wantsType =
+        (type === 'attributes' && t.options.attributes) ||
+        (type === 'characterData' && t.options.characterData) ||
+        (type === 'childList' && t.options.childList);
+      if (!wantsType) continue;
+      if (root._nid === target_nid) { matched = true; break; }
+      if (t.options.subtree) {
+        // Walk parents until we hit the observed root or run off the tree.
+        let cur = target.parentNode;
+        while (cur) {
+          if (cur._nid === root._nid) { matched = true; break; }
+          cur = cur.parentNode;
+        }
+        if (matched) break;
       }
     }
+    if (matched) obs._notify([record]);
   }
 };
 
@@ -2067,24 +2223,112 @@ globalThis.customElements = {
   upgrade() {},
 };
 globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
-globalThis.ResizeObserver = class { constructor(){} observe(){} unobserve(){} disconnect(){} };
-globalThis.IntersectionObserver = class {
-  constructor(callback) { this._callback = callback; }
+// ResizeObserver is defined earlier with real per-target firing; the stub
+// that previously lived here was a no-op that clobbered the real class.
+//
+// IntersectionObserver: without a layout engine we can't compute real
+// intersection geometry, so every observed target is treated as fully
+// in-viewport (`isIntersecting: true`, `intersectionRatio: 1`). Real
+// libraries lean on this in three patterns we must support:
+//
+//   1. Lazy load: observe(img) -> first intersection -> load src -> unobserve.
+//      One fire is enough — covered by the initial microtask fire.
+//   2. Infinite scroll: observe(sentinel) -> on intersection load more ->
+//      new sentinel mounts -> fire again. Needs re-fires as DOM grows.
+//   3. Reveal-on-scroll animations: observe(card) -> isIntersecting flips
+//      true once and an animation runs. One fire is enough.
+//
+// To cover (2) without spinning forever, we burst-fire at an exponential
+// backoff schedule and ALSO re-fire whenever the DOM mutates (a strong
+// signal that the page just rendered something new). Per-observer total
+// fire cap stops us from looping on a never-disconnected observer.
+globalThis.__intersectionObservers = [];
+globalThis.IntersectionObserver = class IntersectionObserver {
+  constructor(callback, options) {
+    this._callback = callback;
+    this._options = options || {};
+    this._targets = new Set();
+    this._connected = true;
+    this._fireCount = 0;
+    globalThis.__intersectionObservers.push(this);
+  }
+  _fireFor(targets) {
+    if (!this._connected || !targets.length || this._fireCount >= 256) return;
+    this._fireCount++;
+    const records = targets.map(target => ({
+      target,
+      isIntersecting: true,
+      intersectionRatio: 1,
+      boundingClientRect: target.getBoundingClientRect
+        ? target.getBoundingClientRect()
+        : { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 },
+      intersectionRect: target.getBoundingClientRect
+        ? target.getBoundingClientRect()
+        : { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 },
+      rootBounds: { x: 0, y: 0, width: 1280, height: 720, top: 0, left: 0, right: 1280, bottom: 720 },
+      time: Date.now(),
+    }));
+    try { this._callback(records, this); } catch (e) { /* IO callbacks must not propagate */ }
+  }
   observe(el) {
-    Promise.resolve().then(() => {
-      this._callback([{
-        target: el,
-        isIntersecting: true,
-        intersectionRatio: 1,
-        boundingClientRect: el.getBoundingClientRect ? el.getBoundingClientRect() : {x:0,y:0,width:100,height:20},
-        intersectionRect: el.getBoundingClientRect ? el.getBoundingClientRect() : {x:0,y:0,width:100,height:20},
-        rootBounds: {x:0,y:0,width:1280,height:720},
-      }], this);
+    if (!el || !this._connected) return;
+    if (this._targets.has(el)) return;
+    this._targets.add(el);
+    Promise.resolve().then(() => this._fireFor([el]));
+    // Exponential burst to cover infinite-scroll sentinels that "re-arm"
+    // after content lands. Without a real scroll/layout signal, we fake the
+    // re-fire schedule. Beyond ~10s the page has usually settled.
+    [120, 500, 1500, 3500, 7000].forEach(delay => {
+      setTimeout(() => {
+        if (this._connected && this._targets.has(el)) this._fireFor([el]);
+      }, delay);
     });
   }
-  unobserve() {}
-  disconnect() {}
+  unobserve(el) { this._targets.delete(el); }
+  disconnect() {
+    this._connected = false;
+    this._targets.clear();
+    const idx = globalThis.__intersectionObservers.indexOf(this);
+    if (idx >= 0) globalThis.__intersectionObservers.splice(idx, 1);
+  }
+  takeRecords() { return []; }
+  get root() { return this._options.root || null; }
+  get rootMargin() { return this._options.rootMargin || "0px 0px 0px 0px"; }
+  get thresholds() {
+    const t = this._options.threshold;
+    if (t == null) return [0];
+    return Array.isArray(t) ? t.slice() : [t];
+  }
 };
+// When the DOM mutates (e.g. infinite scroll loads a batch of items), re-fire
+// every active IntersectionObserver so libraries observing dynamic content
+// see a fresh isIntersecting=true event. Uses the same per-observer fire cap
+// to prevent runaway loops if the page is mutating in a tight cycle.
+(function() {
+  const reFire = () => {
+    for (const obs of globalThis.__intersectionObservers) {
+      if (!obs._connected) continue;
+      const ts = [...obs._targets];
+      if (ts.length) obs._fireFor(ts);
+    }
+  };
+  // Lazy-attach a single MutationObserver on document.body once the page is
+  // ready, debounced via a microtask so a flurry of mutations only triggers
+  // one IO sweep.
+  let pending = false;
+  const wireUp = () => {
+    if (!globalThis.document?.body) return;
+    const mo = new MutationObserver(() => {
+      if (pending) return;
+      pending = true;
+      Promise.resolve().then(() => { pending = false; reFire(); });
+    });
+    try { mo.observe(globalThis.document.body, {childList: true, subtree: true}); } catch {}
+  };
+  if (globalThis.document?.body) wireUp();
+  else Promise.resolve().then(wireUp);
+})();
+globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
 globalThis.Event = class Event {
@@ -2115,7 +2359,16 @@ globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
 globalThis.UIEvent = class extends Event {};
 globalThis.WheelEvent = class extends Event {};
-globalThis.PopStateEvent = class extends Event {};
+globalThis.PopStateEvent = class extends Event {
+  constructor(type, init) {
+    super(type, init || {});
+    // Real PopStateEvent exposes `state` from the entry being navigated to.
+    // The earlier stub inherited Event but never stored state, so
+    // `popstate.state` was always undefined and SPA routers reading
+    // `event.state` to restore route info would mis-render.
+    this.state = init && 'state' in init ? init.state : null;
+  }
+};
 globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
 globalThis.ClipboardEvent = class extends Event {};
@@ -2146,7 +2399,84 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
   forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
 };
 
-globalThis.DOMParser = class { parseFromString(s,t) { return globalThis.document; } };
+// Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
+// so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
+// then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
+// feature-detect writes `<form></form>` and wiped real bodies). We parse the
+// input into a detached `<html>` element and wrap it so the common Document
+// API surface (body / head / documentElement / querySelector* / getElementById /
+// getElementsByTagName / getElementsByClassName / title / cloneNode) works.
+globalThis.DOMParser = class DOMParser {
+  parseFromString(source, mimeType) {
+    const html = String(source ?? "");
+    const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
+    const root = document.createElement("html");
+    // innerHTML parses children via html5ever fragment-parsing rules. Most
+    // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
+    // fragment parser strips the outer `<html>` and emits its head+body
+    // children, which is what callers want.
+    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+
+    // Helper: depth-first walk to find an element by predicate.
+    const walk = (node, pred) => {
+      if (!node) return null;
+      if (node.nodeType === 1 && pred(node)) return node;
+      const children = node.children || [];
+      for (let i = 0; i < children.length; i++) {
+        const r = walk(children[i], pred);
+        if (r) return r;
+      }
+      return null;
+    };
+
+    const findByTagName = (name) => walk(root, n => n.tagName === name);
+
+    const docNode = {
+      _root: root,
+      nodeName: "#document",
+      nodeType: 9,
+      contentType: isXml ? (mimeType || "application/xml") : "text/html",
+      get documentElement() { return root; },
+      get body() { return findByTagName("BODY"); },
+      get head() { return findByTagName("HEAD"); },
+      get title() {
+        const t = findByTagName("TITLE");
+        return t ? (t.textContent || "") : "";
+      },
+      get firstChild() { return root; },
+      get lastChild() { return root; },
+      get children() { return [root]; },
+      get childNodes() { return [root]; },
+      querySelector(s) { return root.querySelector(s); },
+      querySelectorAll(s) { return root.querySelectorAll(s); },
+      getElementById(id) {
+        return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
+      },
+      getElementsByTagName(t) {
+        return root.querySelectorAll(t);
+      },
+      getElementsByClassName(c) {
+        return root.querySelectorAll("." + c);
+      },
+      getElementsByName(n) {
+        return root.querySelectorAll(`[name="${n}"]`);
+      },
+      createElement: (t) => document.createElement(t),
+      createElementNS: (ns, t) => document.createElement(t),
+      createTextNode: (t) => document.createTextNode(t),
+      createComment: (t) => document.createComment(t),
+      createDocumentFragment: () => document.createDocumentFragment(),
+      adoptNode: (n) => n,
+      importNode: (n) => n,
+      cloneNode: function (deep) {
+        return new DOMParser().parseFromString(root.outerHTML, mimeType);
+      },
+      contains(n) { return root.contains ? root.contains(n) : false; },
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    };
+    return docNode;
+  }
+};
 globalThis.XMLSerializer = class XMLSerializer {
   serializeToString(node) {
     if (!node) return "";
@@ -2226,7 +2556,80 @@ globalThis.sessionStorage = _mkStore();
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
 
-globalThis.history = { length:1, state:null, pushState(){}, replaceState(){}, go(){}, back(){}, forward(){}, scrollRestoration:"auto" };
+// Functional History API. The earlier stub returned constant state and was a
+// no-op on push/replace, so any SPA that tried to update its URL (Next.js
+// client router, React Router, vue-router, hash-based routers) silently
+// failed: location.href stayed pinned to the initial page, useLocation hooks
+// never updated, and popstate-driven UI froze.
+//
+// Internally we keep a tiny in-memory stack of {state, url} entries. push/
+// replace mutate the stack and set globalThis.__virtualUrl so location.href
+// reads the new URL. Real Chrome doesn't fire popstate on push/replace,
+// only on user-driven back/forward — we match that exactly.
+(() => {
+  const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
+  let idx = 0;
+  const resolveOrFallback = (url) => {
+    if (url === null || url === undefined) return undefined;
+    try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
+  };
+  const applyVirtual = () => {
+    const entry = stack[idx];
+    globalThis.__virtualUrl = entry.url ?? null;
+  };
+  const fireHashChangeIfNeeded = (prevUrl) => {
+    try {
+      const next = __currentUrl();
+      if (!prevUrl || !next) return;
+      const a = new URL(prevUrl), b = new URL(next);
+      if (a.origin === b.origin && a.pathname === b.pathname && a.search === b.search && a.hash !== b.hash) {
+        const ev = new Event('hashchange');
+        ev.oldURL = prevUrl; ev.newURL = next;
+        try { globalThis.dispatchEvent(ev); } catch {}
+      }
+    } catch {}
+  };
+  globalThis.history = {
+    get length() { return stack.length; },
+    get state() { return stack[idx].state; },
+    scrollRestoration: "auto",
+    pushState(state, _title, url) {
+      const prevUrl = __currentUrl();
+      const resolved = resolveOrFallback(url);
+      // Truncate forward entries (real Chrome drops the forward stack on a
+      // new push) then append + advance.
+      stack.length = idx + 1;
+      stack.push({state: state ?? null, url: resolved});
+      idx = stack.length - 1;
+      applyVirtual();
+      fireHashChangeIfNeeded(prevUrl);
+    },
+    replaceState(state, _title, url) {
+      const prevUrl = __currentUrl();
+      const resolved = resolveOrFallback(url);
+      stack[idx] = {state: state ?? null, url: resolved};
+      applyVirtual();
+      fireHashChangeIfNeeded(prevUrl);
+    },
+    go(n) {
+      n = (n | 0);
+      if (n === 0) return; // real spec: go(0) reloads. We don't reload SPAs.
+      const next = Math.max(0, Math.min(stack.length - 1, idx + n));
+      if (next === idx) return;
+      const prevUrl = __currentUrl();
+      idx = next;
+      applyVirtual();
+      // Real Chrome fires popstate on back/forward with the destination entry's state.
+      try {
+        const ev = new PopStateEvent('popstate', {state: stack[idx].state});
+        globalThis.dispatchEvent(ev);
+      } catch {}
+      fireHashChangeIfNeeded(prevUrl);
+    },
+    back() { this.go(-1); },
+    forward() { this.go(1); },
+  };
+})();
 globalThis.screenX = 0; globalThis.screenY = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
@@ -2887,18 +3290,126 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
+// Minimal but spec-shape-correct IndexedDB shim. We don't persist anything,
+// but authentication libraries (Firebase, Supabase, dexie) hang forever on
+// the first `get` because their request's `onsuccess` is never called. Fire
+// `onsuccess` asynchronously with `null` so reads complete-but-empty, which
+// most libraries treat as a cache miss and fall back to the network.
+function _idbRequest(produceResult) {
+  const req = {
+    result: undefined,
+    error: null,
+    source: null,
+    transaction: null,
+    readyState: 'pending',
+    onsuccess: null,
+    onerror: null,
+    addEventListener(type, fn) { req['on' + type] = fn; },
+    removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
+  };
+  Promise.resolve().then(() => {
+    try {
+      req.result = produceResult();
+      req.readyState = 'done';
+      if (typeof req.onsuccess === 'function') {
+        try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
+      }
+    } catch (e) {
+      req.error = e; req.readyState = 'done';
+      if (typeof req.onerror === 'function') {
+        try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
+      }
+    }
+  });
+  return req;
+}
+
+function _idbObjectStore(name) {
+  const data = new Map();
+  return {
+    name,
+    keyPath: null,
+    autoIncrement: false,
+    indexNames: { contains() { return false; }, length: 0, item() { return null; } },
+    transaction: null,
+    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
+    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
+    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
+    getAll() { return _idbRequest(() => Array.from(data.values())); },
+    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
+    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
+    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
+    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
+    count() { return _idbRequest(() => data.size); },
+    openCursor() { return _idbRequest(() => null); },
+    openKeyCursor() { return _idbRequest(() => null); },
+    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
+    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
+    deleteIndex() {},
+  };
+}
+
+function _idbTransaction(storeNames) {
+  const stores = new Map();
+  const names = Array.isArray(storeNames) ? storeNames : [storeNames];
+  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
+  const tx = {
+    db: null,
+    mode: 'readonly',
+    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
+    onabort: null, oncomplete: null, onerror: null,
+    error: null,
+    objectStore(name) {
+      let s = stores.get(name);
+      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
+      s.transaction = tx;
+      return s;
+    },
+    abort() {},
+    commit() {},
+    addEventListener(type, fn) { tx['on' + type] = fn; },
+    removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
+  };
+  Promise.resolve().then(() => {
+    if (typeof tx.oncomplete === 'function') {
+      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
+    }
+  });
+  return tx;
+}
+
+function _idbDatabase(name, version) {
+  return {
+    name,
+    version,
+    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
+    createObjectStore(n) { return _idbObjectStore(n); },
+    deleteObjectStore() {},
+    transaction(storeNames, mode) {
+      const tx = _idbTransaction(storeNames);
+      tx.mode = mode || 'readonly';
+      return tx;
+    },
+    close() {},
+    onversionchange: null, onabort: null, onerror: null, onclose: null,
+    addEventListener() {}, removeEventListener() {},
+  };
+}
+
 globalThis.indexedDB = {
   open(name, version) {
-    const req = { result: null, error: null, onsuccess: null, onerror: null, onupgradeneeded: null };
-    Promise.resolve().then(() => {
-      req.result = { name, version: version||1, objectStoreNames: { contains(){return false;}, length:0 }, createObjectStore(){return {createIndex(){}}; }, transaction(){return {objectStore(){return {get(){return {onsuccess:null,onerror:null};},put(){return {onsuccess:null};},delete(){return {onsuccess:null};}};}}; }, close(){} };
-      if (req.onsuccess) req.onsuccess({ target: req });
-    });
-    return req;
+    return _idbRequest(() => _idbDatabase(name, version || 1));
   },
-  deleteDatabase() { return { onsuccess: null, onerror: null }; },
+  deleteDatabase(_name) { return _idbRequest(() => undefined); },
+  databases() { return Promise.resolve([]); },
+  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
 };
-globalThis.IDBKeyRange = { only(v){return v;}, lowerBound(v){return v;}, upperBound(v){return v;}, bound(l,u){return [l,u];} };
+globalThis.IDBKeyRange = {
+  only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
+  lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
+  upperBound(v, open) { return { lower: null, upper: v, lowerOpen: false, upperOpen: !!open, includes(x) { return open ? x < v : x <= v; } }; },
+  bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
+};
 
 globalThis.caches = {
   open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
@@ -3103,14 +3614,19 @@ if (!globalThis.crypto) globalThis.crypto = {};
 if (!globalThis.crypto.subtle) {
   globalThis.crypto.subtle = {
     async digest(algorithm, data) {
-      const name = typeof algorithm === 'string' ? algorithm : algorithm?.name || 'SHA-256';
-      const bytes = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer || data);
-      let hash = 0x811c9dc5;
-      for (let i = 0; i < bytes.length; i++) { hash ^= bytes[i]; hash = Math.imul(hash, 0x01000193); }
-      const size = name.includes('512') ? 64 : name.includes('384') ? 48 : 32;
-      const result = new Uint8Array(size);
-      for (let i = 0; i < size; i++) { hash = Math.imul(hash ^ i, 0x45d9f3b); result[i] = (hash >>> 0) & 0xff; }
-      return result.buffer;
+      // Real WebCrypto digest. Delegates to `op_subtle_digest` which runs
+      // the actual SHA-1/256/384/512 via Rust's `sha1` and `sha2` crates.
+      // The previous JS implementation was a custom FNV variant that
+      // produced bytes shaped like the hash but with wrong contents, so
+      // SRI checks, JWS signature verification, and OAuth PKCE silently
+      // accepted invalid input.
+      const name = (typeof algorithm === 'string' ? algorithm : algorithm?.name) || 'SHA-256';
+      let bytes;
+      if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+      else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else bytes = new Uint8Array(data || []);
+      const out = Deno.core.ops.op_subtle_digest(name, bytes);
+      return new Uint8Array(out).buffer;
     },
     async encrypt() { throw new DOMException('NotSupportedError'); },
     async decrypt() { throw new DOMException('NotSupportedError'); },
@@ -3183,29 +3699,101 @@ if (typeof FileReader === 'undefined') {
   };
 }
 
+// Real network sockets aren't implemented; we don't have a runtime WS / SSE
+// client in V8. But pages that wait for an `open` event (Vite HMR clients
+// embedded on docs sites, live-dashboards, anything calling
+// `await new Promise(r => ws.addEventListener('open', r))`) silently hang
+// forever otherwise. Fire `open` after a microtask so the consumer at least
+// proceeds; subsequent messages never arrive, which is no worse than the
+// current "no signal whatsoever" behaviour.
+// Minimal EventTarget shared by socket-like classes. Real `EventTarget` is
+// currently aliased to `Node`, which would drag DOM-tree assumptions into a
+// `WebSocket`. Defining a private shim avoids that.
+function _makeListenerBox(self) {
+  const map = new Map();
+  self.addEventListener = function (type, fn) {
+    if (typeof fn !== 'function') return;
+    let bucket = map.get(type);
+    if (!bucket) { bucket = []; map.set(type, bucket); }
+    bucket.push(fn);
+  };
+  self.removeEventListener = function (type, fn) {
+    const bucket = map.get(type);
+    if (!bucket) return;
+    const i = bucket.indexOf(fn);
+    if (i >= 0) bucket.splice(i, 1);
+  };
+  self.dispatchEvent = function (event) {
+    const bucket = map.get(event.type);
+    if (!bucket) return true;
+    for (const fn of bucket.slice()) {
+      try { fn.call(self, event); } catch (e) { /* swallow */ }
+    }
+    return true;
+  };
+}
+
 if (typeof EventSource === 'undefined') {
   globalThis.EventSource = class EventSource {
-    constructor(url) { this.url = url; this.readyState = 0; this.onopen = null; this.onmessage = null; this.onerror = null; }
+    constructor(url, init) {
+      this.url = url;
+      this.readyState = 0; // CONNECTING
+      this.withCredentials = !!(init && init.withCredentials);
+      this.onopen = null; this.onmessage = null; this.onerror = null;
+      _makeListenerBox(this);
+      Promise.resolve().then(() => {
+        if (this.readyState !== 0) return;
+        this.readyState = 1; // OPEN
+        const ev = new Event('open');
+        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
+        try { this.dispatchEvent(ev); } catch (e) {}
+      });
+    }
     close() { this.readyState = 2; }
-    addEventListener() {} removeEventListener() {}
     static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
   };
 }
 
 if (typeof WebSocket === 'undefined') {
   globalThis.WebSocket = class WebSocket {
-    constructor(url, protocols) { this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null; this.protocol = ''; }
-    send(data) {} close(code, reason) { this.readyState = 3; if (this.onclose) this.onclose({code:code||1000,reason:reason||'',wasClean:true}); }
-    addEventListener() {} removeEventListener() {}
+    constructor(url, protocols) {
+      this.url = url;
+      this.readyState = 0; // CONNECTING
+      this.bufferedAmount = 0;
+      this.binaryType = 'blob';
+      this.extensions = '';
+      this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
+      this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+      _makeListenerBox(this);
+      Promise.resolve().then(() => {
+        if (this.readyState !== 0) return;
+        this.readyState = 1; // OPEN
+        const ev = new Event('open');
+        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
+        try { this.dispatchEvent(ev); } catch (e) {}
+      });
+    }
+    send(data) { /* drop; no real socket */ }
+    close(code, reason) {
+      if (this.readyState >= 2) return;
+      this.readyState = 3; // CLOSED
+      const ev = new Event('close');
+      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
+      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
+      try { this.dispatchEvent(ev); } catch (e) {}
+    }
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   };
 }
 
 if (typeof BroadcastChannel === 'undefined') {
   globalThis.BroadcastChannel = class BroadcastChannel {
-    constructor(name) { this.name = name; this.onmessage = null; }
-    postMessage(msg) {} close() {}
-    addEventListener() {} removeEventListener() {}
+    constructor(name) {
+      this.name = name; this.onmessage = null; this.onmessageerror = null;
+      _makeListenerBox(this);
+    }
+    postMessage(msg) {}
+    close() {}
   };
 }
 

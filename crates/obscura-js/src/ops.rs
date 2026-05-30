@@ -777,12 +777,30 @@ async fn op_sleep(#[number] millis: u64) {
 
 // Records a binding call from page JS. The CDP layer drains this queue
 // after every dispatch and emits one `Runtime.bindingCalled` event per
-// entry — that's how puppeteer's `page.exposeFunction` callbacks fire.
+// entry, that's how puppeteer's `page.exposeFunction` callbacks fire.
 #[op2(fast)]
 fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     gs.pending_binding_calls.push((name.to_string(), payload.to_string()));
+}
+
+/// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
+/// algorithm name (`SHA-1` / `SHA-256` / `SHA-384` / `SHA-512`); unknown
+/// names fall through to SHA-256 to match the previous JS fallback. Returns
+/// the raw digest bytes so the JS shim can hand them back as an ArrayBuffer.
+#[op2]
+#[buffer]
+fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8> {
+    use sha1::Digest as _;
+    let alg = algorithm.to_ascii_uppercase();
+    match alg.as_str() {
+        "SHA-1" => sha1::Sha1::digest(data).to_vec(),
+        "SHA-256" => sha2::Sha256::digest(data).to_vec(),
+        "SHA-384" => sha2::Sha384::digest(data).to_vec(),
+        "SHA-512" => sha2::Sha512::digest(data).to_vec(),
+        _ => sha2::Sha256::digest(data).to_vec(),
+    }
 }
 
 pub fn build_extension() -> Extension {
@@ -797,6 +815,7 @@ pub fn build_extension() -> Extension {
             op_navigate(),
             op_sleep(),
             op_binding_called(),
+            op_subtle_digest(),
         ]),
         ..Default::default()
     }

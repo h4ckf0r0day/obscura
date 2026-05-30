@@ -21,3 +21,5 @@ reqwest = { workspace = true }
 html5ever = { workspace = true }
 deno_error = "0.6"
 base64 = { workspace = true }
+sha1 = "0.10"
+sha2 = "0.10"

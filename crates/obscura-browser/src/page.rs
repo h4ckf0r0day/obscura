@@ -501,9 +501,21 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
+            // Bound the post-script settle loop by wall clock, not just by the
+            // 10ms-tick branch. The old code only consulted `deadline` inside
+            // the `Err(_)` arm (when the inner tick timed out), so a steady
+            // stream of inflight XHR/fetch (active_requests() > 0) kept the
+            // loop running indefinitely because it took the `Ok(Ok(()))` arm
+            // and slept 1ms each iteration without ever checking the clock.
+            // On busy sites this could keep the V8 lock held for tens of
+            // seconds, wedging the entire CDP dispatcher (see triage for
+            // issue series around the 40-site compat sweep).
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
             let mut idle_count = 0u32;
             loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
                 let result = tokio::time::timeout(
                     tokio::time::Duration::from_millis(10),
                     js.run_event_loop(),
@@ -525,9 +537,6 @@ impl Page {
                     Ok(Err(_)) => break,
                     Err(_) => {
                         idle_count = 0;
-                        if tokio::time::Instant::now() >= deadline {
-                            break;
-                        }
                     }
                 }
             }
@@ -547,6 +556,43 @@ impl Page {
     }
 
     pub async fn navigate_with_wait_post(
+        &mut self,
+        url_str: &str,
+        wait_until: crate::lifecycle::WaitUntil,
+        method: &str,
+        body: &str,
+    ) -> Result<(), PageError> {
+        // Hard ceiling on a single end-to-end navigation. Without this a slow
+        // primary fetch or a runaway settle loop can hold the V8 lock for
+        // arbitrarily long (we've measured 60+ seconds on JS-heavy news
+        // sites), wedging every other in-flight CDP request because the
+        // dispatcher holds the lock across the entire handler. 30 seconds
+        // matches reqwest's default per-request timeout — the worst case is
+        // one slow primary GET plus one slow JS-redirect chain step. Override
+        // with `OBSCURA_NAV_TIMEOUT_MS=NN`.
+        let nav_timeout_ms: u64 = std::env::var("OBSCURA_NAV_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000);
+        let nav_timeout = tokio::time::Duration::from_millis(nav_timeout_ms);
+
+        match tokio::time::timeout(
+            nav_timeout,
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                Err(PageError::NetworkError(format!(
+                    "navigation exceeded {nav_timeout_ms}ms deadline"
+                )))
+            }
+        }
+    }
+
+    async fn navigate_with_wait_post_inner(
         &mut self,
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,

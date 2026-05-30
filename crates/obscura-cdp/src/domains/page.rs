@@ -5,13 +5,138 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
-async fn do_navigate(
-    url: &str,
-    params: &Value,
+/// Emit the post-navigation event stream into `ctx.pending_events`. Shared
+/// by both the in-process `do_navigate` path and the spawned path in
+/// `server::process_navigation`, so the recent goto-returns-Response /
+/// per-isolated-world fixes don't have to be duplicated.
+pub fn emit_navigation_events(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
-) -> Result<Value, String> {
-    let wait_until = params.get("waitUntil")
+    frame_id: &str,
+    loader_id: &str,
+    page_url: &str,
+    page_id: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+    wait_until: WaitUntil,
+    reached_network_idle: bool,
+) {
+    let es = session_id.clone();
+    let ts = timestamp();
+
+    // Real Chrome uses the navigation's loaderId as the main document's
+    // request id, and Puppeteer/Playwright identify the navigation response
+    // via `requestId === loaderId && type === "Document"` (issue #189).
+    let nav_request_ids: Vec<String> = {
+        let mut nav_seen = false;
+        network_events.iter().map(|ev| {
+            if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
+                nav_seen = true;
+                loader_id.to_string()
+            } else {
+                ev.request_id.clone()
+            }
+        }).collect()
+    };
+    let nav_idx: Option<usize> = network_events
+        .iter()
+        .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
+
+    // Playwright needs `Network.requestWillBeSent` for the main document to
+    // arrive BEFORE `Page.frameNavigated` (issue #190).
+    if let Some(idx) = nav_idx {
+        let net_event = &network_events[idx];
+        let rid = &nav_request_ids[idx];
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            session_id: es.clone(),
+        });
+    }
+
+    let mut phase1 = vec![
+        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
+        CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
+        CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
+        CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
+    ];
+    let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
+        vec!["__puppeteer_utility_world__24.40.0".to_string()]
+    } else {
+        ctx.isolated_worlds.clone()
+    };
+    // Issue #192: fresh, monotonically increasing executionContextId per re-create.
+    for world_name in &world_names {
+        let world_ctx_id = ctx.next_isolated_context();
+        phase1.push(CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
+            session_id: es.clone(),
+        });
+    }
+    phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
+    ctx.pending_events.extend(phase1);
+
+    if ctx.fetch_intercept.enabled {
+        for (i, net_event) in network_events.iter().enumerate() {
+            let rid = &nav_request_ids[i];
+            ctx.pending_events.push(CdpEvent {
+                method: "Fetch.requestPaused".into(),
+                params: json!({
+                    "requestId": rid,
+                    "request": {
+                        "url": net_event.url,
+                        "method": net_event.method,
+                        "headers": net_event.headers,
+                    },
+                    "frameId": frame_id,
+                    "resourceType": net_event.resource_type,
+                    "networkId": rid,
+                }),
+                session_id: es.clone(),
+            });
+        }
+    }
+
+    for (i, net_event) in network_events.iter().enumerate() {
+        let rid = &nav_request_ids[i];
+        if Some(i) != nav_idx {
+            ctx.pending_events.push(CdpEvent {
+                method: "Network.requestWillBeSent".into(),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                session_id: es.clone(),
+            });
+        }
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.responseReceived".into(),
+            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
+            session_id: es.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.loadingFinished".into(),
+            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
+            session_id: es.clone(),
+        });
+    }
+
+    let mut phase3 = vec![
+        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
+        CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
+        CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+    ];
+    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
+        let idle_ts = timestamp();
+        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
+    }
+    phase3.push(CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es });
+    ctx.pending_events.extend(phase3);
+}
+
+/// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
+/// `Page.navigate`.
+pub fn parse_wait_until(params: &Value) -> WaitUntil {
+    params
+        .get("waitUntil")
         .and_then(|v| {
             if let Some(s) = v.as_str() {
                 Some(WaitUntil::from_str(s))
@@ -29,7 +154,27 @@ async fn do_navigate(
                 None
             }
         })
-        .unwrap_or(WaitUntil::Load);
+        // Puppeteer and Playwright drive navigation via `Page.navigate`
+        // without a server-side waitUntil — they wait for `Page.lifecycleEvent`
+        // on the client side. Defaulting the server to `Load` means we run
+        // every parser/deferred/async script on JS-heavy pages before
+        // emitting `load`, which on sites like github.com / reddit.com
+        // pushes nav past 25s and clients time out at 15s. Real Chrome
+        // streams `DOMContentLoaded` as soon as the parser is done; we
+        // batch our event emission at the end of navigation, so the
+        // closest we can get is to default to `DomContentLoaded` and skip
+        // the full-load wait. CLI callers that pass `--wait-until load`
+        // (or `networkidle*`) are unaffected; they get the old behaviour.
+        .unwrap_or(WaitUntil::DomContentLoaded)
+}
+
+async fn do_navigate(
+    url: &str,
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) -> Result<Value, String> {
+    let wait_until = parse_wait_until(params);
 
     // Block CDP-initiated file:// navigation by default.
     // Anyone who can reach the CDP port (default localhost,
@@ -70,131 +215,17 @@ async fn do_navigate(
         (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle)
     };
 
-    let es = session_id.clone();
-    let ts = timestamp();
-
-    // Real Chrome uses the navigation's loaderId as the main document's
-    // request id, and Puppeteer/Playwright identify the navigation response
-    // via `requestId === loaderId && type === "Document"` (issue #189).
-    // Override the first Document event's request id with loaderId so
-    // `page.goto()` resolves to the navigation Response instead of null.
-    let nav_request_ids: Vec<String> = {
-        let mut nav_seen = false;
-        network_events.iter().map(|ev| {
-            if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
-                nav_seen = true;
-                loader_id.clone()
-            } else {
-                ev.request_id.clone()
-            }
-        }).collect()
-    };
-    let nav_idx: Option<usize> = network_events
-        .iter()
-        .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
-
-    // Playwright needs `Network.requestWillBeSent` for the main document to
-    // arrive BEFORE `Page.frameNavigated`, otherwise its FrameManager commits
-    // the navigation with `currentDocument.request = void 0` and never
-    // attaches the response. Mirrors real Chrome's event order. We emit only
-    // the navigation request here; the response and subresource requests
-    // come after `frameNavigated` (still before `Page.lifecycleEvent: load`).
-    if let Some(idx) = nav_idx {
-        let net_event = &network_events[idx];
-        let rid = &nav_request_ids[idx];
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
-    }
-
-    let mut phase1 = vec![
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
-        CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
-    ];
-    let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
-        vec!["__puppeteer_utility_world__24.40.0".to_string()]
-    } else {
-        ctx.isolated_worlds.clone()
-    };
-    // Issue #192: real Chrome emits a fresh, monotonically increasing
-    // executionContextId on every re-creation. Reusing ids 100, 101, …
-    // across navigations made Playwright's client-side counter and our
-    // server-side `valid_context_ids` diverge after the first nav, so
-    // Runtime.evaluate failed with "Cannot find context with specified
-    // id: 101". Each post-nav isolated world now claims a fresh id from
-    // the same counter that backs Page.createIsolatedWorld.
-    for world_name in &world_names {
-        let world_ctx_id = ctx.next_isolated_context();
-        phase1.push(CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        });
-    }
-    phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
-    ctx.pending_events.extend(phase1);
-
-    if ctx.fetch_intercept.enabled {
-        for (i, net_event) in network_events.iter().enumerate() {
-            let rid = &nav_request_ids[i];
-            ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
-                session_id: es.clone(),
-            });
-        }
-    }
-
-    for (i, net_event) in network_events.iter().enumerate() {
-        let rid = &nav_request_ids[i];
-        // Document's requestWillBeSent was already emitted above (before
-        // Page.frameNavigated) so Playwright can attach the request to the
-        // pending document. Skip re-emitting it here.
-        if Some(i) != nav_idx {
-            ctx.pending_events.push(CdpEvent {
-                method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-                session_id: es.clone(),
-            });
-        }
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
-            session_id: es.clone(),
-        });
-    }
-
-    let mut phase3 = vec![
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-    ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
-        let idle_ts = timestamp();
-        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
-    }
-    phase3.push(CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es });
-    ctx.pending_events.extend(phase3);
+    emit_navigation_events(
+        ctx,
+        session_id,
+        &frame_id,
+        &loader_id,
+        &page_url,
+        &page_id,
+        &network_events,
+        wait_until,
+        reached_network_idle,
+    );
 
     Ok(json!({
         "frameId": frame_id,
