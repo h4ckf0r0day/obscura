@@ -2802,7 +2802,25 @@ globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 
-globalThis.CSS = { supports(){return false;}, escape(s){return s;} };
+globalThis.CSS = {
+  supports(prop, value){
+    try {
+      var p, v;
+      if (arguments.length >= 2) { p = String(prop).trim(); v = String(value).trim(); }
+      else {
+        var cond = String(prop).trim().replace(/^\(+|\)+$/g, "").trim();
+        var idx = cond.indexOf(":");
+        if (idx === -1) return false;
+        p = cond.slice(0, idx).trim(); v = cond.slice(idx + 1).trim();
+      }
+      if (!p || !v) return false;
+      // The engine renders standard CSS; report it as supported so feature-gated
+      // SPAs don't bail to /unsupported. (Previous stub always returned false.)
+      return true;
+    } catch (e) { return false; }
+  },
+  escape(s){ return String(s); }
+};
 
 globalThis.HTMLElement = Element;
 globalThis.HTMLDivElement = Element;
