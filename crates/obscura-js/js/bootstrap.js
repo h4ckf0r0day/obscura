@@ -2248,10 +2248,66 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
 globalThis.ShadowRoot = class ShadowRoot {};
 globalThis.customElements = {
   _registry: new Map(),
-  define(name, cls, opts) { this._registry.set(name, cls); },
+  _whenDefinedResolvers: new Map(),
+  define(name, cls, opts) {
+    if (this._registry.has(name)) return;
+    this._registry.set(name, cls);
+    // Upgrade existing matching elements: instantiate the class on each,
+    // fire connectedCallback if the element is in the document. Without
+    // this, lit / MusicKit / Polymer components never wire up their
+    // shadow DOM or render, leaving heavy chunks of YouTube,
+    // music.apple.com, and any web-component site as empty shells.
+    try {
+      const matches = globalThis.document?.querySelectorAll(name) || [];
+      for (const el of matches) this._upgradeElement(el, cls);
+    } catch (e) {}
+    const resolvers = this._whenDefinedResolvers.get(name);
+    if (resolvers) {
+      for (const r of resolvers) r(cls);
+      this._whenDefinedResolvers.delete(name);
+    }
+  },
+  _upgradeElement(el, cls) {
+    if (el.__customUpgraded) return;
+    el.__customUpgraded = true;
+    try {
+      // Web Components spec: copy own props from the prototype onto the
+      // element. JS-side classes define behavior via methods on the
+      // prototype; we don't truly swap prototypes (Element is shared),
+      // so attach the prototype methods directly to the instance.
+      const proto = cls.prototype;
+      for (const key of Object.getOwnPropertyNames(proto)) {
+        if (key === 'constructor') continue;
+        const desc = Object.getOwnPropertyDescriptor(proto, key);
+        if (desc) Object.defineProperty(el, key, desc);
+      }
+      // Run constructor-side init on the element. Real custom elements
+      // run the class constructor, but Element instances aren't a `cls`
+      // subclass here; calling `.call(el)` runs whatever init logic the
+      // class defines without needing a new allocation.
+      try { cls.call(el); } catch (e) {}
+      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
+        try { el.connectedCallback(); } catch (e) {}
+      }
+    } catch (e) {}
+  },
   get(name) { return this._registry.get(name); },
-  whenDefined(name) { return Promise.resolve(this._registry.get(name)); },
-  upgrade() {},
+  whenDefined(name) {
+    const cls = this._registry.get(name);
+    if (cls) return Promise.resolve(cls);
+    return new Promise((resolve) => {
+      const list = this._whenDefinedResolvers.get(name) || [];
+      list.push(resolve);
+      this._whenDefinedResolvers.set(name, list);
+    });
+  },
+  upgrade(root) {
+    if (!root || !root.querySelectorAll) return;
+    for (const [name, cls] of this._registry.entries()) {
+      const matches = root.querySelectorAll(name);
+      for (const el of matches) this._upgradeElement(el, cls);
+    }
+  },
 };
 globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
 // ResizeObserver is defined earlier with real per-target firing; the stub
