@@ -412,9 +412,27 @@ impl ObscuraJsRuntime {
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
 
+        // Fetch the module source. The old impl registered an empty string
+        // and called it loaded, so every Vite / Next module bundle "loaded"
+        // in 1ms with zero code and the SPA never mounted (issue #205).
+        let client = self.state.borrow().http_client.clone();
+        let source_code = match client {
+            Some(c) => match c.fetch(&specifier).await {
+                Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
+                Err(e) => {
+                    tracing::warn!("Module fetch failed ({}): {}", url, e);
+                    String::new()
+                }
+            },
+            None => {
+                tracing::warn!("No http_client wired to runtime; module {} will be empty", url);
+                String::new()
+            }
+        };
+
         let module_id = self
             .runtime
-            .load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from_static(""))
+            .load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from(source_code))
             .await
             .map_err(|e| format!("Module load error: {}", e))?;
 
