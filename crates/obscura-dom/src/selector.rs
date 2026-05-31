@@ -491,11 +491,44 @@ impl<'a> Element for DomElement<'a> {
     }
 }
 
-pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
+// Thread-local LRU cache of parsed selectors. Without this every
+// querySelector / querySelectorAll re-parses the selector string;
+// for batch-heavy DOM access (agent scraping a table, framework
+// repeatedly polling for elements) the parse cost adds up to tens
+// of ms per page. Cap of 256 entries fits a typical page's distinct
+// selectors without unbounded memory growth.
+thread_local! {
+    static SELECTOR_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, std::sync::Arc<SelectorList<ObscuraSelector>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::with_capacity(64));
+}
+const SELECTOR_CACHE_CAP: usize = 256;
+
+fn parse_selector_uncached(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
     let mut parser_input = cssparser::ParserInput::new(selector);
     let mut parser = cssparser::Parser::new(&mut parser_input);
     SelectorList::parse(&ObscuraSelectorParser, &mut parser, ParseRelative::No)
         .map_err(|e| format!("Failed to parse selector '{}': {:?}", selector, e))
+}
+
+pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
+    // Hot path: cached. Cold path: parse + insert.
+    if let Some(cached) = SELECTOR_CACHE.with(|c| c.borrow().get(selector).cloned()) {
+        return Ok((*cached).clone());
+    }
+    let parsed = parse_selector_uncached(selector)?;
+    let cached = std::sync::Arc::new(parsed.clone());
+    SELECTOR_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        // Crude eviction: if at cap, dump the whole table. A real LRU
+        // would be more memory-friendly but selectors are small and 256
+        // is comfortably above a single page's distinct-selector count.
+        if cache.len() >= SELECTOR_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(selector.to_string(), cached);
+    });
+    Ok(parsed)
 }
 
 impl DomTree {

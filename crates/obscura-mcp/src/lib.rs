@@ -856,6 +856,11 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
     let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0) as u64;
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    // Exponential backoff: 5 -> 10 -> 20 -> ... -> 200 ms. The old fixed
+    // 200ms tick added up to a full poll cycle of latency every time;
+    // a selector that appears in 30ms now returns in ~35ms instead of
+    // the next 200ms tick.
+    let mut tick_ms: u64 = 5;
     loop {
         let found = state.page_mut().with_dom(|dom| {
             dom.query_selector(selector).ok().flatten().is_some()
@@ -869,7 +874,8 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
             return Err(format!("Timeout waiting for '{selector}'"));
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
+        if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
 
@@ -1156,6 +1162,8 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
         var t = (document.body && (document.body.innerText || document.body.textContent)) || '';
         return t.indexOf({needle}) >= 0;
     }})()"#, needle = escaped);
+    // Exponential backoff like browser_wait_for (see comment there).
+    let mut tick_ms: u64 = 5;
     loop {
         let found = state.page_mut().evaluate(&js).as_bool().unwrap_or(false);
         if found {
@@ -1164,7 +1172,8 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("Timeout waiting for text {needle:?}"));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
+        if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
 
