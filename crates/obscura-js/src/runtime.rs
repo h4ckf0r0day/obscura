@@ -158,6 +158,7 @@ impl ObscuraJsRuntime {
         // swallows the closing paren and our wrapper breaks. A newline
         // before the `)` terminates any trailing line comment so the
         // parens close on their own line.
+        let done_counter = self.object_counter;
         let meta_code = if await_promise {
             format!(
                 "(async function() {{\n\
@@ -171,11 +172,13 @@ impl ObscuraJsRuntime {
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
                         globalThis.__obscura_await_rejected = true;\n\
                     }}\n\
+                    globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
                 expr = cleaned_expr,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = Self::meta_extract_js("e"),
+                done_counter = done_counter,
             )
         } else {
             format!(
@@ -197,7 +200,28 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
-            self.resolve_promises().await;
+            let __t0 = std::time::Instant::now();
+            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            self.resolve_promises_until(
+                |rt| rt.runtime.execute_script("<done?>", sentinel.clone())
+                    .ok()
+                    .and_then(|v| rt.v8_to_json(v).ok())
+                    .and_then(|j| j.as_bool())
+                    .unwrap_or(false),
+                5000,
+            ).await;
+            let __dt = __t0.elapsed();
+            if __dt > std::time::Duration::from_secs(1) {
+                let preview: String = expression
+                    .chars()
+                    .take(200)
+                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+                    .collect();
+                tracing::debug!(
+                    "Runtime.evaluate awaitPromise took {}ms; expr={}",
+                    __dt.as_millis(), preview,
+                );
+            }
             let rejected = self.runtime.execute_script("<readRejected>", "globalThis.__obscura_await_rejected".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
@@ -246,14 +270,25 @@ impl ObscuraJsRuntime {
         let oid = self.make_oid(self.object_counter);
 
         if await_promise {
+            let done_counter = self.object_counter;
+            let err_meta_fn = Self::meta_extract_js("__result");
             let code = format!(
                 "(async function() {{\n\
                     {setup}\n\
                     var __fn = ({fn_decl});\n\
                     var __this = ({this_expr});\n\
-                    var __result = await __fn.call(__this, {args});\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
-                    globalThis.__obscura_await_meta = {meta_fn};\n\
+                    var __result;\n\
+                    try {{\n\
+                        __result = await __fn.call(__this, {args});\n\
+                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        globalThis.__obscura_await_meta = {meta_fn};\n\
+                    }} catch(e) {{\n\
+                        __result = e;\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                    }} finally {{\n\
+                        globalThis.__obscura_done_{done_counter} = true;\n\
+                    }}\n\
                 }})()",
                 setup = setup,
                 fn_decl = function_declaration,
@@ -261,13 +296,36 @@ impl ObscuraJsRuntime {
                 args = args_list,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = err_meta_fn,
+                done_counter = done_counter,
             );
 
             self.runtime
                 .execute_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
-            self.resolve_promises().await;
+            let __t0 = std::time::Instant::now();
+            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
+            self.resolve_promises_until(
+                |rt| rt.runtime.execute_script("<done?>", sentinel.clone())
+                    .ok()
+                    .and_then(|v| rt.v8_to_json(v).ok())
+                    .and_then(|j| j.as_bool())
+                    .unwrap_or(false),
+                5000,
+            ).await;
+            let __dt = __t0.elapsed();
+            if __dt > std::time::Duration::from_secs(1) {
+                let preview: String = function_declaration
+                    .chars()
+                    .take(300)
+                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+                    .collect();
+                tracing::debug!(
+                    "Runtime.callFunctionOn awaitPromise took {}ms; fn={}",
+                    __dt.as_millis(), preview,
+                );
+            }
 
             if return_by_value {
                 let read = self.runtime.execute_script(
@@ -607,10 +665,47 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn resolve_promises(&mut self) {
+        // Default settle: just pump until idle or 5s.
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
             self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
         ).await;
+    }
+
+    /// Pump the event loop until `done_check` returns true (e.g. an IIFE
+    /// has written its result sentinel), or `max_total_ms` elapses.
+    ///
+    /// Why this exists: `run_event_loop(default)` only returns when there is
+    /// no pending work. Page JS routinely schedules long setTimeouts
+    /// (IntersectionObserver re-fires at 7s, requestIdleCallback, etc.) that
+    /// the caller does not care about. With the plain timeout we waited 5s
+    /// even when the IIFE we cared about resolved in <1ms — the click flow
+    /// added ~7s per click because Puppeteer's `isIntersectingViewport`
+    /// disconnects its observer in the callback, but our scheduled
+    /// re-fires keep the event loop "busy" until they all fire.
+    pub async fn resolve_promises_until<F>(&mut self, mut done_check: F, max_total_ms: u64)
+    where
+        F: FnMut(&mut Self) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_total_ms);
+        let mut tick_ms: u64 = 1;
+        loop {
+            if done_check(self) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            // Pump for a short slice. If the loop returns idle in <tick_ms,
+            // run_event_loop returns Ok and we check the predicate again.
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(tick_ms),
+                self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
+            ).await;
+            // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
+            // worst case we miss the result by <50ms.
+            if tick_ms < 50 { tick_ms = (tick_ms * 2).min(50); }
+        }
     }
     pub fn take_dom(&self) -> Option<DomTree> {
         self.state.borrow_mut().dom.take()
