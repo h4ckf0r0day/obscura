@@ -491,9 +491,23 @@ class Element extends Node {
     return ids.map(_wrapEl).filter(Boolean);
   }
   get content() {
-    if (this.localName !== 'template') return undefined;
-    if (!this._templateContent) this._templateContent = document.createDocumentFragment();
-    return this._templateContent;
+    // <template>.content is a DocumentFragment; <meta>.content reflects
+    // the content attribute (read/write per spec). Next.js' next/head
+    // iterates <meta> tags and sets .content during hydration, which
+    // threw with the previous getter-only stub and put React into an
+    // infinite retry loop (issue #210).
+    const tag = this.localName;
+    if (tag === 'template') {
+      if (!this._templateContent) this._templateContent = document.createDocumentFragment();
+      return this._templateContent;
+    }
+    if (tag === 'meta') return this.getAttribute('content') || '';
+    return undefined;
+  }
+  set content(v) {
+    if (this.localName === 'meta') {
+      this.setAttribute('content', v == null ? '' : String(v));
+    }
   }
   get childElementCount() { return this.children.length; }
   get firstElementChild() { return this.children[0] || null; }
