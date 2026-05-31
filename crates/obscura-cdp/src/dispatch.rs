@@ -206,6 +206,44 @@ impl CdpContext {
     }
 }
 
+/// Whether a CDP method can be served WITHOUT acquiring the global V8 lock.
+///
+/// Methods listed here were audited to confirm they do not transitively
+/// call into a `JsRuntime`. They either don't touch any `Page` at all, or
+/// use only the immutable `get_session_page` accessor and Rust-side field
+/// reads. `get_session_page_mut` triggers `suspend_js`/`resume_js` and
+/// must stay behind the lock.
+fn is_v8_free_method(method: &str) -> bool {
+    matches!(method,
+        "Target.getTargets" | "Target.setDiscoverTargets"
+        | "Target.attachToTarget" | "Target.attachToBrowserTarget"
+        | "Target.setAutoAttach"
+        | "Target.getBrowserContexts" | "Target.createBrowserContext"
+        | "Target.disposeBrowserContext" | "Target.getTargetInfo"
+        | "Browser.getVersion" | "Browser.close" | "Browser.getWindowForTarget"
+        | "Browser.setDownloadBehavior" | "Browser.getWindowBounds" | "Browser.setWindowBounds"
+        | "Page.enable" | "Page.disable" | "Page.getFrameTree"
+        | "Page.setLifecycleEventsEnabled"
+        | "Page.addScriptToEvaluateOnNewDocument" | "Page.removeScriptToEvaluateOnNewDocument"
+        | "Page.setInterceptFileChooserDialog" | "Page.getNavigationHistory"
+        | "Page.resetNavigationHistory" | "Page.printToPDF"
+        | "Page.captureScreenshot" | "Page.captureSnapshot"
+        | "Page.createIsolatedWorld"
+        | "Runtime.enable" | "Runtime.disable"
+        | "Runtime.runIfWaitingForDebugger" | "Runtime.getExceptionDetails"
+        | "Runtime.discardConsoleEntries"
+        | "Network.enable" | "Network.disable" | "Network.setCacheDisabled"
+        | "Network.setRequestInterception" | "Network.setExtraHTTPHeaders"
+        | "Network.setUserAgentOverride"
+        | "Network.getCookies" | "Network.getAllCookies"
+        | "Network.setCookie" | "Network.setCookies"
+        | "Network.deleteCookies" | "Network.clearBrowserCookies"
+        | "Fetch.continueRequest" | "Fetch.fulfillRequest"
+        | "Fetch.failRequest" | "Fetch.getResponseBody"
+        | "Storage.getCookies" | "Storage.setCookies" | "Storage.deleteCookies"
+    )
+}
+
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
@@ -234,7 +272,21 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     //
     // The properly concurrent fix is to pin each `JsRuntime` to its own OS
     // thread and message-pass; that's tracked as the larger #19 follow-up.
-    let _v8_guard = obscura_js::v8_lock::global().lock().await;
+    //
+    // Optimization: methods that demonstrably never touch V8 bypass the
+    // lock. During Puppeteer's newPage() setup ~8 such calls (Page.enable,
+    // Runtime.enable, Page.getFrameTree, Page.addScriptToEvaluateOnNewDocument,
+    // Page.createIsolatedWorld, etc.) used to serialize behind any
+    // in-flight V8 work on a sibling page. Bypassing keeps the setup chain
+    // running while a separate nav executes. Each listed method was audited
+    // to confirm it never reaches `JsRuntime::execute_script` or DOM
+    // mutation that re-enters V8; `get_session_page_mut` (which can
+    // trigger `suspend_js`/`resume_js`) is NOT in the list.
+    let _v8_guard = if is_v8_free_method(&req.method) {
+        None
+    } else {
+        Some(obscura_js::v8_lock::global().lock().await)
+    };
 
     let (domain, method) = match req.method.split_once('.') {
         Some((d, m)) => (d, m),
