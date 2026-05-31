@@ -331,7 +331,12 @@ static FETCH_CLIENT_CACHE: std::sync::OnceLock<
     std::sync::RwLock<std::collections::HashMap<String, reqwest::Client>>,
 > = std::sync::OnceLock::new();
 
-fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+/// Shared HTTP client cache for any code in obscura-js that needs a
+/// reqwest::Client (op_fetch_url for JS-side fetch/XHR, the ES module
+/// loader for dynamic imports). Keyed by proxy URL ("" = direct).
+/// One client per distinct proxy, reused for every request, so the
+/// connection pool actually warms up.
+pub fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
     let key = proxy_url.unwrap_or("").to_string();
     let cache = FETCH_CLIENT_CACHE
         .get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));

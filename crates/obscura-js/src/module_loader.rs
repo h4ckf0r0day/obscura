@@ -66,21 +66,15 @@ impl ModuleLoader for ObscuraModuleLoader {
         let proxy_url = self.proxy_url.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            let mut builder = reqwest::Client::builder();
-            if let Some(ref proxy) = proxy_url {
-                match reqwest::Proxy::all(proxy) {
-                    Ok(p) => builder = builder.proxy(p),
-                    Err(e) => {
-                        return Err(io_err(format!(
-                            "Invalid module proxy '{}': {}",
-                            proxy, e
-                        )));
-                    }
-                }
-            }
-            let client = builder
-                .build()
-                .map_err(|e| io_err(format!("HTTP client error: {}", e)))?;
+            // Reuse the process-wide cached client (same one op_fetch_url
+            // uses). Modern SPAs dynamic-import 20-50 chunks per page; the
+            // old code built a fresh reqwest::Client per import, each with
+            // its own empty connection pool, no reuse, fresh TLS init for
+            // every chunk. The cache means the first import on a given
+            // proxy pays the build cost once and every chunk after reuses
+            // the same warm pool.
+            let client = crate::ops::cached_request_client(proxy_url.as_deref())
+                .map_err(io_err)?;
 
             tracing::debug!(
                 "Loading ES module: {} (proxy: {})",

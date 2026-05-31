@@ -491,9 +491,26 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
-    let host = host.to_lowercase();
-    let domain = domain.trim_start_matches('.').to_lowercase();
-    host == domain || host.ends_with(&format!(".{}", domain))
+    // Avoid allocations on the hot path. Cookie lookup runs per fetch
+    // (every subresource on a page) and walks every domain in the jar.
+    // Previously this allocated 2 lowercase Strings + a "." prefix
+    // per (host, domain) pair.
+    let domain = domain.trim_start_matches('.');
+    if host.len() < domain.len() {
+        return false;
+    }
+    // Exact match (case-insensitive)
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    // Suffix match with a '.' boundary: host = "sub.example.com",
+    // domain = "example.com". The byte before the suffix in host
+    // must be '.'.
+    let prefix_len = host.len() - domain.len();
+    if prefix_len < 1 { return false; }
+    if !host.is_char_boundary(prefix_len) { return false; }
+    if host.as_bytes()[prefix_len - 1] != b'.' { return false; }
+    host[prefix_len..].eq_ignore_ascii_case(domain)
 }
 
 #[cfg(test)]

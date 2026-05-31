@@ -448,9 +448,17 @@ impl Page {
             }
         }).collect();
 
+        // Bound concurrency: a page with 100 external scripts would
+        // otherwise open 100 sockets at once, exhausting the connection
+        // pool / ephemeral ports and triggering OS-level backpressure.
+        // 16 is well above the per-host pool ceiling most browsers use
+        // and matches what real Chrome does for a given origin.
+        use futures::StreamExt as _;
+        let fetch_stream = futures::stream::iter(fetch_futures)
+            .buffer_unordered(16);
         let fetch_results = match tokio::time::timeout_at(
             script_deadline,
-            futures::future::join_all(fetch_futures),
+            fetch_stream.collect::<Vec<_>>(),
         ).await {
             Ok(results) => results,
             Err(_) => {
@@ -897,7 +905,12 @@ impl Page {
             }
         }).collect();
 
-        let css_results = futures::future::join_all(css_futures).await;
+        // Same concurrency cap as script fetches.
+        use futures::StreamExt as _;
+        let css_results: Vec<_> = futures::stream::iter(css_futures)
+            .buffer_unordered(16)
+            .collect()
+            .await;
         let mut css_sources = Vec::new();
         for result in css_results {
             if let Some((url_str, resp)) = result {

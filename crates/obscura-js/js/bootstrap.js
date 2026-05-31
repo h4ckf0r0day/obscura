@@ -4140,19 +4140,23 @@ globalThis.__obscura_init = function() {
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
 
-  const hide = (obj, props) => {
-    for (const p of props) {
-      if (p in obj) {
-        try { Object.defineProperty(obj, p, { enumerable: false, configurable: true }); } catch(e) {}
-      }
-    }
-  };
-  const toHide = Object.keys(globalThis).filter(k =>
-    k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
-  );
-  for (const p of toHide) {
-    try { Object.defineProperty(globalThis, p, { enumerable: false }); } catch(e) {
-    }
+  // Hide internals (_*, obscura, Obscura). The set of keys is static at
+  // snapshot-build time, so we precompute it ONCE below (after this
+  // function definition) and reuse it on every page init. Was an
+  // Object.keys + filter on every navigation, ~5-40ms per page on
+  // SPAs that load 1000+ globals.
+  const toHide = globalThis.__obscura_hide_list || [];
+  for (let i = 0; i < toHide.length; i++) {
+    try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
   delete globalThis.__obscura_init;
 };
+
+// Snapshot-time pre-computation of the hide list. Bootstrap.js runs once
+// during the V8 snapshot build (build.rs); this line captures the set of
+// globals defined by bootstrap that we want to hide and stashes them
+// for __obscura_init to consume on every subsequent page. The snapshot
+// preserves the array as a regular global.
+globalThis.__obscura_hide_list = Object.keys(globalThis).filter(k =>
+  k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+);
