@@ -12,6 +12,7 @@ obscura-browser = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 tokio = { workspace = true }
+url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
