@@ -1,3 +1,8 @@
+// The tools/list JSON literal expanded by serde_json::json! is large
+// enough now (32 tool definitions) that the default macro recursion
+// limit (128) overflows. Bumping for this crate only.
+#![recursion_limit = "512"]
+
 pub mod http;
 
 use std::collections::HashMap;
@@ -54,23 +59,30 @@ impl RpcResponse {
 }
 
 pub struct BrowserState {
-    page: Option<Page>,
+    /// Open tabs keyed by tab_id (e.g. "tab-1"). BTreeMap so list ordering
+    /// is stable across calls (agents reason about "tab #2" deterministically).
+    tabs: std::collections::BTreeMap<String, Page>,
+    /// The tab id every tool call operates on. None means there are no
+    /// open tabs; the next page_mut() call creates one.
+    active_tab: Option<String>,
+    tab_counter: u32,
     context: Arc<BrowserContext>,
     user_agent: Option<String>,
     console_messages: Vec<String>,
-    /// Element-ref table from the last `browser_snapshot`. Agents click /
-    /// fill / type by `ref` (e.g. `"e3"`) instead of guessing a CSS
-    /// selector — this is the single biggest agent UX win, ported from
-    /// playwright-mcp. Refs are stable within a single snapshot; the
-    /// table is wiped on every navigation and refilled on the next
-    /// snapshot call.
+    /// Element-ref table from the last `browser_snapshot` on the ACTIVE
+    /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
+    /// guessing a CSS selector. Refs are stable within a snapshot; the
+    /// table is wiped on every navigation / tab switch and refilled on
+    /// the next snapshot call.
     interactive_refs: HashMap<String, NodeId>,
 }
 
 impl BrowserState {
     pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
         BrowserState {
-            page: None,
+            tabs: std::collections::BTreeMap::new(),
+            active_tab: None,
+            tab_counter: 0,
             context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
             user_agent,
             console_messages: Vec::new(),
@@ -78,11 +90,28 @@ impl BrowserState {
         }
     }
 
+    /// Make sure there is at least one tab and return a &mut to the
+    /// active tab's Page. Auto-creates a default tab if none exist so
+    /// every legacy single-page tool continues to work without
+    /// requiring an explicit browser_tab_new.
     fn page_mut(&mut self) -> &mut Page {
-        if self.page.is_none() {
-            self.page = Some(Page::new("mcp-page".to_string(), self.context.clone()));
+        if self.active_tab.is_none() {
+            self.tab_counter += 1;
+            let id = format!("tab-{}", self.tab_counter);
+            self.tabs.insert(id.clone(), Page::new("mcp-page".to_string(), self.context.clone()));
+            self.active_tab = Some(id);
         }
-        self.page.as_mut().unwrap()
+        let id = self.active_tab.as_ref().unwrap().clone();
+        self.tabs.get_mut(&id).expect("active tab must exist")
+    }
+
+    fn new_tab(&mut self) -> String {
+        self.tab_counter += 1;
+        let id = format!("tab-{}", self.tab_counter);
+        self.tabs.insert(id.clone(), Page::new(format!("mcp-{id}"), self.context.clone()));
+        self.active_tab = Some(id.clone());
+        self.interactive_refs.clear();
+        id
     }
 
     /// Resolve `ref=eN` to a CSS selector that uniquely targets the
@@ -390,6 +419,122 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                     },
                     "required": ["text"]
                 }
+            },
+            {
+                "name": "browser_detect_forms",
+                "description": "List every <form> on the page with its action URL, method, and a description of each input/textarea/select. Use to understand a form's structure before filling it in.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "browser_fill_form",
+                "description": "Fill multiple inputs in one call. `fields` is an array of {ref?, selector?, value, type?}. type='text' (default) sets value, type='check'/'uncheck' toggles checkboxes, type='select' picks an option by value or visible text. Saves N round-trips vs N browser_fill calls.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "fields": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "ref": { "type": "string" },
+                                    "selector": { "type": "string" },
+                                    "value": { "type": "string" },
+                                    "type": { "type": "string", "enum": ["text", "check", "uncheck", "select"] }
+                                }
+                            }
+                        },
+                        "submit_ref": { "type": "string", "description": "Optional: click this element after filling (e.g. submit button ref)" },
+                        "submit_selector": { "type": "string" }
+                    },
+                    "required": ["fields"]
+                }
+            },
+            {
+                "name": "browser_scroll",
+                "description": "Scroll the page or an element. `direction` is 'top'|'bottom'|'up'|'down'|'left'|'right' (default 'down'). `amount` in pixels (default viewport height). Use 'bottom' to trigger infinite-scroll loaders.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "direction": { "type": "string", "enum": ["top", "bottom", "up", "down", "left", "right"] },
+                        "amount": { "type": "number", "description": "Pixels (default: one viewport)" },
+                        "ref": { "type": "string", "description": "Optional element to scroll into view" },
+                        "selector": { "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "browser_get_attribute",
+                "description": "Read an attribute of an element (href, src, value, class, data-*, etc.). Returns the raw attribute value as a string, or empty string if missing.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "ref": { "type": "string" },
+                        "selector": { "type": "string" },
+                        "attribute": { "type": "string", "description": "Attribute name (e.g. href, value, src)" }
+                    },
+                    "required": ["attribute"]
+                }
+            },
+            {
+                "name": "browser_count",
+                "description": "Count how many elements on the page match a CSS selector. Cheap existence / pagination probe.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "selector": { "type": "string" }
+                    },
+                    "required": ["selector"]
+                }
+            },
+            {
+                "name": "browser_extract",
+                "description": "Extract a structured object from the page given a map of {field_name: css_selector}. Returns one JSON object with each field set to the matching element's text content (or attribute via 'selector@attr' syntax, e.g. 'a@href'). For list extraction, append '[]' to the field name (e.g. 'rows[]') and the value will be an array.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "schema": {
+                            "type": "object",
+                            "description": "Map of field_name to CSS selector. Suffix selector with '@attr' for attribute, suffix field name with '[]' for array."
+                        }
+                    },
+                    "required": ["schema"]
+                }
+            },
+            {
+                "name": "browser_tab_new",
+                "description": "Open a new tab (isolated browser page). Returns the tab ID; subsequent tool calls operate on the most recently opened or browser_tab_switch'd tab.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "Optional URL to navigate the new tab to" }
+                    }
+                }
+            },
+            {
+                "name": "browser_tab_list",
+                "description": "List all open tabs with their ID, URL, title, and which one is active.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "browser_tab_switch",
+                "description": "Switch the active tab. All subsequent tool calls (snapshot, click, etc.) target this tab.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tab_id": { "type": "string" }
+                    },
+                    "required": ["tab_id"]
+                }
+            },
+            {
+                "name": "browser_tab_close",
+                "description": "Close a tab by ID (default: the active tab). If you close the active tab, the next remaining tab becomes active.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tab_id": { "type": "string" }
+                    }
+                }
             }
         ]
     }))
@@ -426,6 +571,17 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_set_cookie" => tool_set_cookie(args, state),
         "browser_clear_cookies" => tool_clear_cookies(state),
         "browser_wait_for_text" => tool_wait_for_text(args, state).await,
+        // Tier 2 agent-UX additions
+        "browser_detect_forms" => tool_detect_forms(state),
+        "browser_fill_form" => tool_fill_form(args, state),
+        "browser_scroll" => tool_scroll(args, state),
+        "browser_get_attribute" => tool_get_attribute(args, state),
+        "browser_count" => tool_count(args, state),
+        "browser_extract" => tool_extract(args, state),
+        "browser_tab_new" => tool_tab_new(args, state).await,
+        "browser_tab_list" => tool_tab_list(state),
+        "browser_tab_switch" => tool_tab_switch(args, state),
+        "browser_tab_close" => tool_tab_close(args, state),
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -705,10 +861,11 @@ fn tool_console_messages(state: &BrowserState) -> Result<String, String> {
 }
 
 fn tool_close(state: &mut BrowserState) -> Result<String, String> {
-    state.page = None;
+    state.tabs.clear();
+    state.active_tab = None;
     state.console_messages.clear();
     state.interactive_refs.clear();
-    Ok("Browser page closed.".to_string())
+    Ok("All browser tabs closed.".to_string())
 }
 
 // ===== Tier 1 agent-UX additions =====
@@ -973,6 +1130,358 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
+}
+
+// ===== Tier 2 agent-UX additions =====
+
+/// Describe every <form> on the page. For each form, list its action,
+/// method, and every field (input/select/textarea) with its name, type,
+/// current value, and any visible label text. Agents call this to
+/// understand a form's shape before filling it.
+fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
+    let page = state.page_mut();
+    let js = r#"(function(){
+        var forms = document.querySelectorAll('form');
+        var out = [];
+        for (var i = 0; i < forms.length; i++) {
+            var f = forms[i];
+            var fields = [];
+            var inputs = f.querySelectorAll('input, select, textarea, button');
+            for (var j = 0; j < inputs.length; j++) {
+                var el = inputs[j];
+                var tag = el.tagName.toLowerCase();
+                var type = (el.getAttribute('type') || (tag === 'input' ? 'text' : tag)).toLowerCase();
+                if (tag === 'input' && type === 'hidden') continue;
+                var name = el.getAttribute('name') || '';
+                var label = '';
+                if (el.id) {
+                    var lab = document.querySelector('label[for="' + el.id + '"]');
+                    if (lab) label = (lab.innerText || lab.textContent || '').trim();
+                }
+                if (!label) label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+                var opts = null;
+                if (tag === 'select') {
+                    opts = [];
+                    var os = el.querySelectorAll('option');
+                    for (var k = 0; k < os.length; k++) {
+                        opts.push({ value: os[k].value, text: (os[k].textContent || '').trim() });
+                    }
+                }
+                fields.push({
+                    tag: tag,
+                    type: type,
+                    name: name,
+                    value: el.value || '',
+                    checked: el.checked || false,
+                    required: el.required || false,
+                    label: label.trim().slice(0, 100),
+                    ref: el.getAttribute('data-obscura-ref') || null,
+                    options: opts,
+                });
+            }
+            out.push({
+                index: i,
+                id: f.id || '',
+                name: f.getAttribute('name') || '',
+                action: f.action || '',
+                method: (f.method || 'get').toLowerCase(),
+                fields: fields,
+            });
+        }
+        return out;
+    })()"#;
+    let val = page.evaluate(js);
+    if val.is_null() {
+        return Ok("No forms found.".to_string());
+    }
+    serde_json::to_string_pretty(&val).map_err(|e| e.to_string())
+}
+
+/// Fill multiple fields in one call. Each entry: {ref|selector, value, type?}.
+/// type='text' (default) sets value, 'check'/'uncheck' toggles checkbox,
+/// 'select' picks an option by value or visible text. Optional
+/// `submit_ref`/`submit_selector` clicks after filling.
+fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let fields = args.get("fields").and_then(Value::as_array)
+        .ok_or("Missing fields array")?
+        .clone();
+    let mut filled = 0u32;
+    let mut errors = Vec::new();
+    for field in fields {
+        let value = field.get("value").and_then(Value::as_str).unwrap_or("");
+        let kind = field.get("type").and_then(Value::as_str).unwrap_or("text");
+        let selector = match resolve_target(&field, state) {
+            Ok(s) => s,
+            Err(e) => { errors.push(e); continue; }
+        };
+        let js = match kind {
+            "check" => format!(r#"(function(){{
+                var el = document.querySelector({sel});
+                if (!el) return "error:not found";
+                el.checked = true;
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return "ok";
+            }})()"#, sel = serde_json::to_string(&selector).unwrap()),
+            "uncheck" => format!(r#"(function(){{
+                var el = document.querySelector({sel});
+                if (!el) return "error:not found";
+                el.checked = false;
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return "ok";
+            }})()"#, sel = serde_json::to_string(&selector).unwrap()),
+            "select" => format!(r#"(function(){{
+                var el = document.querySelector({sel});
+                if (!el) return "error:not found";
+                var want = {val};
+                var matched = false;
+                for (var i = 0; i < el.options.length; i++) {{
+                    var o = el.options[i];
+                    if (o.value === want || (o.textContent || '').trim() === want) {{
+                        el.selectedIndex = i;
+                        matched = true;
+                        break;
+                    }}
+                }}
+                if (!matched) return "error:no matching option";
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return "ok";
+            }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
+            _ => format!(r#"(function(){{
+                var el = document.querySelector({sel});
+                if (!el) return "error:not found";
+                el.value = {val};
+                el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                return "ok";
+            }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
+        };
+        let res = state.page_mut().evaluate(&js);
+        match res.as_str() {
+            Some("ok") => filled += 1,
+            Some(e) => errors.push(format!("{selector}: {e}")),
+            None => errors.push(format!("{selector}: unknown error")),
+        }
+    }
+
+    // Optional submit click
+    let submit_target = if args.get("submit_ref").is_some() || args.get("submit_selector").is_some() {
+        let pseudo = json!({
+            "ref": args.get("submit_ref"),
+            "selector": args.get("submit_selector"),
+        });
+        resolve_target(&pseudo, state).ok()
+    } else { None };
+    if let Some(sel) = submit_target {
+        let js = format!(r#"(function(){{
+            var el = document.querySelector({sel});
+            if (!el) return "error:not found";
+            el.click();
+            return "ok";
+        }})()"#, sel = serde_json::to_string(&sel).unwrap());
+        let _ = state.page_mut().evaluate(&js);
+        state.interactive_refs.clear();
+    }
+
+    if errors.is_empty() {
+        Ok(format!("Filled {filled} fields."))
+    } else {
+        Ok(format!("Filled {filled} fields. Errors: {}", errors.join("; ")))
+    }
+}
+
+/// Scroll the page (or an element) by direction + amount, or scroll an
+/// element into view. Used to trigger infinite-scroll loaders or to
+/// reach off-viewport content. Returns the new scroll position.
+fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let direction = args.get("direction").and_then(Value::as_str).unwrap_or("down");
+    let amount = args.get("amount").and_then(Value::as_f64);
+
+    // Element scroll-into-view path
+    if args.get("ref").is_some() || args.get("selector").is_some() {
+        let selector = resolve_target(args, state)?;
+        let js = format!(r#"(function(){{
+            var el = document.querySelector({sel});
+            if (!el) return "error:not found";
+            el.scrollIntoView({{behavior:'instant', block:'center'}});
+            return JSON.stringify({{x: window.scrollX, y: window.scrollY}});
+        }})()"#, sel = serde_json::to_string(&selector).unwrap());
+        let res = state.page_mut().evaluate(&js);
+        if res.as_str() == Some("error:not found") {
+            return Err(format!("Element not found: {selector}"));
+        }
+        return Ok(format!("Scrolled element into view. {}", res.as_str().unwrap_or("")));
+    }
+
+    // Page-level scroll. Also dispatch a 'scroll' event so infinite-
+    // scroll handlers fire (we don't have a real layout engine, so the
+    // window.scrollY value won't change but the event is what matters).
+    let amt = amount.unwrap_or(720.0);
+    let js = format!(r#"(function(){{
+        var dir = {dir};
+        var amt = {amt};
+        switch (dir) {{
+            case 'top': window.scrollTo(0, 0); break;
+            case 'bottom': window.scrollTo(0, document.body.scrollHeight); break;
+            case 'up': window.scrollBy(0, -amt); break;
+            case 'down': window.scrollBy(0, amt); break;
+            case 'left': window.scrollBy(-amt, 0); break;
+            case 'right': window.scrollBy(amt, 0); break;
+        }}
+        try {{ window.dispatchEvent(new Event('scroll', {{bubbles:true}})); }} catch(e) {{}}
+        try {{ document.dispatchEvent(new Event('scroll', {{bubbles:true}})); }} catch(e) {{}}
+        return JSON.stringify({{x: window.scrollX, y: window.scrollY, max_y: document.body.scrollHeight, viewport_h: window.innerHeight}});
+    }})()"#,
+        dir = serde_json::to_string(direction).unwrap(),
+        amt = amt,
+    );
+    let res = state.page_mut().evaluate(&js);
+    // A scroll can reveal new DOM (infinite scroll); invalidate refs.
+    state.interactive_refs.clear();
+    Ok(format!("Scrolled {direction}. {}", res.as_str().unwrap_or("")))
+}
+
+fn tool_get_attribute(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let selector = resolve_target(args, state)?;
+    let attr = args.get("attribute").and_then(Value::as_str)
+        .ok_or("Missing attribute parameter")?;
+    let js = format!(r#"(function(){{
+        var el = document.querySelector({sel});
+        if (!el) return null;
+        var v = el.getAttribute({a});
+        if (v === null && {a} === 'value') v = el.value || '';
+        return v == null ? '' : v;
+    }})()"#,
+        sel = serde_json::to_string(&selector).unwrap(),
+        a = serde_json::to_string(attr).unwrap(),
+    );
+    let res = state.page_mut().evaluate(&js);
+    if res.is_null() {
+        return Err(format!("Element not found: {selector}"));
+    }
+    Ok(res.as_str().unwrap_or("").to_string())
+}
+
+fn tool_count(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let selector = args.get("selector").and_then(Value::as_str)
+        .ok_or("Missing selector parameter")?;
+    let js = format!(
+        "document.querySelectorAll({sel}).length",
+        sel = serde_json::to_string(selector).unwrap()
+    );
+    let res = state.page_mut().evaluate(&js);
+    // V8 numbers come back as f64 even when they are integer-valued; as_u64
+    // returns None for f64 in serde_json, so coerce via f64.
+    let n = res.as_u64()
+        .or_else(|| res.as_f64().map(|f| f as u64))
+        .unwrap_or(0);
+    Ok(n.to_string())
+}
+
+/// Extract structured data: `schema` is a map of field name to CSS
+/// selector. Suffix selector with `@attr` to read an attribute instead
+/// of text. Suffix field name with `[]` to return an array (queries all
+/// matching elements rather than the first).
+fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let schema = args.get("schema").and_then(Value::as_object)
+        .ok_or("Missing schema object")?
+        .clone();
+    let schema_json = serde_json::to_string(&schema).unwrap();
+    let js = format!(r#"(function(){{
+        var schema = {schema};
+        var out = {{}};
+        for (var key in schema) {{
+            if (!Object.prototype.hasOwnProperty.call(schema, key)) continue;
+            var spec = schema[key];
+            var is_array = key.endsWith('[]');
+            var name = is_array ? key.slice(0, -2) : key;
+            // Selector may end with `@attr` to read an attribute.
+            var attr = null;
+            var sel = spec;
+            var at = spec.lastIndexOf('@');
+            if (at > 0 && spec.indexOf(' ', at) < 0) {{
+                attr = spec.slice(at + 1);
+                sel = spec.slice(0, at);
+            }}
+            var get = function(el) {{
+                if (!el) return null;
+                if (attr) return el.getAttribute(attr) || '';
+                return ((el.innerText || el.textContent) || '').trim();
+            }};
+            if (is_array) {{
+                var els = document.querySelectorAll(sel);
+                var arr = [];
+                for (var i = 0; i < els.length; i++) arr.push(get(els[i]));
+                out[name] = arr;
+            }} else {{
+                out[name] = get(document.querySelector(sel));
+            }}
+        }}
+        return out;
+    }})()"#, schema = schema_json);
+    let res = state.page_mut().evaluate(&js);
+    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+}
+
+async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let url = args.get("url").and_then(Value::as_str);
+    let id = state.new_tab();
+    if let Some(u) = url {
+        let ua = state.user_agent.clone();
+        let page = state.page_mut();
+        if let Some(ref ua) = ua {
+            page.http_client.set_user_agent(ua).await;
+        }
+        page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
+            .await.map_err(|e| e.to_string())?;
+        Ok(format!("Opened {id} and navigated to {}", page.url_string()))
+    } else {
+        Ok(format!("Opened {id} (about:blank)."))
+    }
+}
+
+fn tool_tab_list(state: &BrowserState) -> Result<String, String> {
+    if state.tabs.is_empty() {
+        return Ok("No tabs open.".to_string());
+    }
+    let lines: Vec<String> = state.tabs.iter().map(|(id, page)| {
+        let active = if Some(id) == state.active_tab.as_ref() { "*" } else { " " };
+        let url = page.url_string();
+        let title = page.title.replace('\n', " ");
+        format!("{active} {id}  {url}  \"{title}\"")
+    }).collect();
+    Ok(lines.join("\n"))
+}
+
+fn tool_tab_switch(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let tab_id = args.get("tab_id").and_then(Value::as_str)
+        .ok_or("Missing tab_id parameter")?;
+    if !state.tabs.contains_key(tab_id) {
+        return Err(format!("No such tab: {tab_id}"));
+    }
+    state.active_tab = Some(tab_id.to_string());
+    state.interactive_refs.clear();
+    Ok(format!("Active tab: {tab_id}"))
+}
+
+fn tool_tab_close(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let tab_id = args.get("tab_id").and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| state.active_tab.clone())
+        .ok_or("No tab to close")?;
+    if state.tabs.remove(&tab_id).is_none() {
+        return Err(format!("No such tab: {tab_id}"));
+    }
+    if state.active_tab.as_deref() == Some(&tab_id) {
+        // Promote some remaining tab to active, if any.
+        state.active_tab = state.tabs.keys().next().cloned();
+        state.interactive_refs.clear();
+    }
+    let summary = if let Some(ref a) = state.active_tab {
+        format!("Closed {tab_id}. Active tab now {a}.")
+    } else {
+        format!("Closed {tab_id}. No tabs remain.")
+    };
+    Ok(summary)
 }
 
 fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
