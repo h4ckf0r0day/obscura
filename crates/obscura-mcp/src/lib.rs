@@ -535,6 +535,39 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                         "tab_id": { "type": "string" }
                     }
                 }
+            },
+            {
+                "name": "browser_search",
+                "description": "Find substring matches in the visible page text. Returns each match with its surrounding context. Use this to confirm content exists before scraping or to locate a section.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "case_sensitive": { "type": "boolean" },
+                        "limit": { "type": "number", "description": "Max matches to return (default 10)" },
+                        "context_chars": { "type": "number", "description": "Chars on each side of the match (default 80)" }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "browser_storage_state",
+                "description": "Export the full authentication / session state (cookies + localStorage + sessionStorage) as a JSON object. Save this to skip a login on a subsequent run via browser_set_storage_state.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "browser_set_storage_state",
+                "description": "Restore session state previously returned by browser_storage_state. Pass the JSON object. Use to bring an authenticated session back without re-logging in.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "state": {
+                            "type": "object",
+                            "description": "{cookies: [...], origins: [{origin, localStorage: [...], sessionStorage: [...]}]}"
+                        }
+                    },
+                    "required": ["state"]
+                }
             }
         ]
     }))
@@ -582,6 +615,9 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_tab_list" => tool_tab_list(state),
         "browser_tab_switch" => tool_tab_switch(args, state),
         "browser_tab_close" => tool_tab_close(args, state),
+        "browser_search" => tool_search(args, state),
+        "browser_storage_state" => tool_storage_state(state),
+        "browser_set_storage_state" => tool_set_storage_state(args, state),
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -1535,4 +1571,151 @@ fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> Str
     }
 
     result
+}
+
+// ===== Tier 3 agent-UX additions =====
+
+/// Substring search in visible page text. Returns each match with N chars
+/// of surrounding context so the agent can locate the section without
+/// pulling the whole page into its window.
+fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let query = args.get("query").and_then(Value::as_str)
+        .ok_or("Missing query parameter")?;
+    let case_sensitive = args.get("case_sensitive").and_then(Value::as_bool).unwrap_or(false);
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let context = args.get("context_chars").and_then(Value::as_u64).unwrap_or(80) as usize;
+
+    let page = state.page_mut();
+    let body = page.with_dom(|dom| {
+        dom.query_selector("body").ok().flatten()
+            .map(|b| extract_text(dom, b))
+            .unwrap_or_default()
+    }).unwrap_or_default();
+
+    let haystack = if case_sensitive { body.clone() } else { body.to_lowercase() };
+    let needle = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while let Some(pos) = haystack[idx..].find(&needle) {
+        let abs = idx + pos;
+        let start = abs.saturating_sub(context);
+        let end = (abs + needle.len() + context).min(body.len());
+        // body and haystack share byte offsets even when lowercased (only ASCII fold).
+        // For safety on non-ASCII, fall back to char-boundary trimming.
+        let start = body[..start].rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1).unwrap_or(start);
+        let end = body[end..].find(|c: char| c.is_whitespace())
+            .map(|i| end + i).unwrap_or(end);
+        let snippet = body.get(start..end).unwrap_or("").trim().replace('\n', " ");
+        out.push(json!({
+            "offset": abs,
+            "snippet": snippet,
+        }));
+        idx = abs + needle.len();
+        if out.len() >= limit { break; }
+    }
+    if out.is_empty() {
+        Ok(format!("No matches for {query:?}."))
+    } else {
+        Ok(format!("{} match(es). {}", out.len(),
+            out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")))
+    }
+}
+
+/// Export full session state: cookies + localStorage + sessionStorage
+/// for every origin the page knows about. Agents stash this between
+/// runs to skip a login flow.
+fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
+    let cookies: Vec<Value> = state.context.cookie_jar.get_all_cookies().iter().map(|c| json!({
+        "name": c.name,
+        "value": c.value,
+        "domain": c.domain,
+        "path": c.path,
+        "secure": c.secure,
+        "http_only": c.http_only,
+        "same_site": c.same_site,
+        "expires": c.expires,
+    })).collect();
+    // Pull localStorage + sessionStorage for the current page's origin.
+    let storage_js = r#"(function(){
+        var ls = [], ss = [];
+        try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls.push([k, localStorage.getItem(k)]); } } catch(e) {}
+        try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); ss.push([k2, sessionStorage.getItem(k2)]); } } catch(e) {}
+        return { origin: location.origin || '', localStorage: ls, sessionStorage: ss };
+    })()"#;
+    let storage = if state.active_tab.is_some() {
+        state.page_mut().evaluate(storage_js)
+    } else {
+        Value::Null
+    };
+    let origins = if storage.is_object() { vec![storage] } else { vec![] };
+    let out = json!({ "cookies": cookies, "origins": origins });
+    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let s = args.get("state").ok_or("Missing state object")?;
+    let mut applied = 0u32;
+    // Cookies
+    if let Some(cookies) = s.get("cookies").and_then(Value::as_array) {
+        let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().filter_map(|c| {
+            Some(obscura_net::CookieInfo {
+                name: c.get("name")?.as_str()?.to_string(),
+                value: c.get("value")?.as_str()?.to_string(),
+                domain: c.get("domain")?.as_str()?.to_string(),
+                path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
+                secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+                http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
+                same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
+                expires: c.get("expires").and_then(Value::as_i64),
+            })
+        }).collect();
+        applied += parsed.len() as u32;
+        state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    }
+    // Storage (per origin). Only applies if there's an active page; we
+    // restore on whatever origin is currently loaded, which usually
+    // matches because agents navigate before restoring state.
+    if state.active_tab.is_some() {
+        if let Some(origins) = s.get("origins").and_then(Value::as_array) {
+            for origin_entry in origins {
+                let mut snippets = Vec::new();
+                if let Some(arr) = origin_entry.get("localStorage").and_then(Value::as_array) {
+                    for pair in arr {
+                        if let (Some(k), Some(v)) = (
+                            pair.get(0).and_then(Value::as_str),
+                            pair.get(1).and_then(Value::as_str),
+                        ) {
+                            snippets.push(format!(
+                                "try {{ localStorage.setItem({k},{v}); }} catch(e) {{}};",
+                                k = serde_json::to_string(k).unwrap(),
+                                v = serde_json::to_string(v).unwrap(),
+                            ));
+                            applied += 1;
+                        }
+                    }
+                }
+                if let Some(arr) = origin_entry.get("sessionStorage").and_then(Value::as_array) {
+                    for pair in arr {
+                        if let (Some(k), Some(v)) = (
+                            pair.get(0).and_then(Value::as_str),
+                            pair.get(1).and_then(Value::as_str),
+                        ) {
+                            snippets.push(format!(
+                                "try {{ sessionStorage.setItem({k},{v}); }} catch(e) {{}};",
+                                k = serde_json::to_string(k).unwrap(),
+                                v = serde_json::to_string(v).unwrap(),
+                            ));
+                            applied += 1;
+                        }
+                    }
+                }
+                if !snippets.is_empty() {
+                    let _ = state.page_mut().evaluate(&snippets.join("\n"));
+                }
+            }
+        }
+    }
+    Ok(format!("Restored {applied} state entries."))
 }
