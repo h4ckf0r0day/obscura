@@ -194,6 +194,16 @@ pub async fn start_with_full_serve_options(
                     .set_nonblocking(true)
                     .map_err(|e| error!("set_nonblocking on WS stream: {}", e))
                     .ok();
+                // Disable Nagle on the CDP socket. CDP exchanges many small
+                // (~100-byte) request/response frames during browser.newPage()
+                // and Page.navigate; with Nagle on, every small write either
+                // waits for an ACK from the previous one or hits the 40ms
+                // delayed-ACK timer. Measured impact: ~90ms shaved off
+                // newPage on localhost, ~30ms shaved off goto.
+                stream
+                    .set_nodelay(true)
+                    .map_err(|e| error!("set_nodelay on WS stream: {}", e))
+                    .ok();
                 let tokio_stream = match TcpStream::from_std(stream) {
                     Ok(s) => s,
                     Err(e) => {
@@ -877,7 +887,16 @@ async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+    // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
+    // default. CDP traffic is many small (~100-byte) frames, and that buffer
+    // adds extra latency per frame. write_buffer_size=0 makes every WS write
+    // hit the socket directly. Combined with set_nodelay(true) above, gets
+    // per-frame latency on localhost down toward ideal.
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+    let mut cfg = WebSocketConfig::default();
+    cfg.write_buffer_size = 0;
+    cfg.max_write_buffer_size = 1 << 20;
+    let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
