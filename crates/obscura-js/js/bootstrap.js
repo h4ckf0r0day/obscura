@@ -1542,7 +1542,18 @@ class DocumentFragment extends Node {
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
-  getElementById(id) { return null; }
+  getElementById(id) {
+    const needle = String(id);
+    const stack = Array.from(this.childNodes || []).reverse();
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node) continue;
+      if (node.nodeType === 1 && node.id === needle) return node;
+      const children = node.childNodes || [];
+      for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+    }
+    return null;
+  }
   cloneNode(deep) {
     const frag = document.createDocumentFragment();
     if (deep) frag.innerHTML = this.innerHTML;
