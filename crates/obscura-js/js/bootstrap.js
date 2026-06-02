@@ -9,19 +9,42 @@ globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
 globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
+globalThis.addEventListener = function(type, fn, opts) {
+  if (typeof fn !== 'function' &&
+      !(fn && typeof fn === 'object' && typeof fn.handleEvent === 'function')) return;
+  const once = !!(opts && typeof opts === 'object' && opts.once === true);
+  const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
   if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
+  const arr = globalThis.__windowListeners[type];
+  for (const e of arr) if (e.handler === fn && e.capture === capture) return;
+  arr.push({ handler: fn, once, capture });
 };
-globalThis.removeEventListener = function(type, fn) {
+globalThis.removeEventListener = function(type, fn, opts) {
+  const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
   if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
+    globalThis.__windowListeners[type] = globalThis.__windowListeners[type]
+      .filter(e => !(e.handler === fn && e.capture === capture));
   }
 };
 globalThis.dispatchEvent = function(event) {
   if (!event) return true;
-  const handlers = globalThis.__windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
+  if (!event.target) event.target = globalThis;
+  event.currentTarget = globalThis;
+  const slot = globalThis.__windowListeners[event.type] || [];
+  const handlers = slot.slice();
+  for (const entry of handlers) {
+    const h = entry && entry.handler;
+    if (!h) continue;
+    try {
+      if (typeof h === 'function') h.call(globalThis, event);
+      else if (typeof h.handleEvent === 'function') h.handleEvent(event);
+    } catch (e) { console.error(e); }
+    if (entry.once) {
+      const i = slot.indexOf(entry);
+      if (i !== -1) slot.splice(i, 1);
+    }
+    if (event && event._immediatePropagationStopped) break;
+  }
   return !event.defaultPrevented;
 };
 
@@ -235,7 +258,14 @@ class Node {
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() {
+    // Per DOM spec: textContent returns null for Document and DocumentType.
+    // Everything else returns the concatenated text of descendants
+    // (or the node's data for Text/Comment/PI/Attr).
+    const t = this.nodeType;
+    if (t === 9 || t === 10) return null;
+    return _domParse("text_content", this._nid) ?? "";
+  }
   set textContent(v) {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) _dom("remove_child", c);
@@ -468,6 +498,13 @@ class Comment extends CharacterData {
   cloneNode() { return document.createComment(this.data); }
 }
 
+class ProcessingInstruction extends CharacterData {
+  get nodeName() { return this.target || ""; }
+  get nodeType() { return 7; }
+  get target() { return this._target || _domParse("pi_target", this._nid) || ""; }
+  cloneNode() { return document.createProcessingInstruction(this.target, this.data); }
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -480,8 +517,11 @@ class Element extends Node {
   get className() { return this.getAttribute("class") || ""; }
   set className(v) { this.setAttribute("class", v); }
   get namespaceURI() {
+    if (this._ns !== undefined) {
+      return this._ns === "" ? null : this._ns;
+    }
     const tag = this.localName;
-    if (tag === "svg" || this._ns === "http://www.w3.org/2000/svg") return "http://www.w3.org/2000/svg";
+    if (tag === "svg") return "http://www.w3.org/2000/svg";
     return "http://www.w3.org/1999/xhtml";
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
@@ -634,16 +674,61 @@ class Element extends Node {
         break;
     }
   }
+  // testharness.js's output renderer calls insertAdjacentText on its
+  // results table. Without this, the renderer throws inside a forEach
+  // that has no try/catch and the chain of completion callbacks dies
+  // before reaching our runner hook, so EVERY WPT test with subtests
+  // looked like a timeout. Adding this method unblocks the harness
+  // pipeline and surfaces real subtest pass/fail.
+  insertAdjacentText(position, text) {
+    const node = document.createTextNode(String(text));
+    const parent = this.parentNode;
+    switch (position) {
+      case 'beforebegin': if (parent) parent.insertBefore(node, this); break;
+      case 'afterbegin': this.insertBefore(node, this.firstChild); break;
+      case 'beforeend': this.appendChild(node); break;
+      case 'afterend': if (parent) parent.insertBefore(node, this.nextSibling); break;
+    }
+  }
+  insertAdjacentElement(position, element) {
+    if (!element || element.nodeType !== 1) return null;
+    const parent = this.parentNode;
+    switch (position) {
+      case 'beforebegin': if (parent) { parent.insertBefore(element, this); return element; } return null;
+      case 'afterbegin': this.insertBefore(element, this.firstChild); return element;
+      case 'beforeend': this.appendChild(element); return element;
+      case 'afterend': if (parent) { parent.insertBefore(element, this.nextSibling); return element; } return null;
+    }
+    return null;
+  }
   addEventListener(type, handler, opts) {
+    // Per DOM spec, a listener can be a function OR an object with a
+    // `handleEvent` method. Anything else is silently ignored. Without
+    // this filter, passing null/string/number used to push a non-callable
+    // into the handler array and explode at dispatch time.
+    if (typeof handler !== 'function' &&
+        !(handler && typeof handler === 'object' && typeof handler.handleEvent === 'function')) {
+      return;
+    }
+    const once = opts && typeof opts === 'object' && opts.once === true;
+    const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
+    const passive = !!(opts && typeof opts === 'object' && opts.passive);
     const key = this._nid;
     if (!_eventRegistry[key]) _eventRegistry[key] = {};
     if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
+    // Dedupe: spec says same (type, callback, capture) is a no-op.
+    const arr = _eventRegistry[key][type];
+    for (const e of arr) {
+      if (e.handler === handler && e.capture === capture) return;
+    }
+    arr.push({ handler, once, capture, passive });
   }
-  removeEventListener(type, handler) {
+  removeEventListener(type, handler, opts) {
     const key = this._nid;
+    const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
     if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
+      _eventRegistry[key][type] = _eventRegistry[key][type]
+        .filter(e => !(e.handler === handler && e.capture === capture));
     }
   }
   dispatchEvent(event) {
@@ -664,9 +749,25 @@ class Element extends Node {
         if (ret === false) event.preventDefault();
       } catch(e) { console.error(e); }
     }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
+    // Snapshot the listener list — `once: true` listeners are removed
+    // during dispatch, but spec says dispatched listeners are captured
+    // before the loop starts.
+    const slot = (_eventRegistry[this._nid] || {})[event.type] || [];
+    const handlers = slot.slice();
+    for (const entry of handlers) {
+      const h = entry && entry.handler;
+      if (!h) continue;
+      try {
+        if (typeof h === 'function') {
+          h.call(this, event);
+        } else if (typeof h.handleEvent === 'function') {
+          h.handleEvent(event);
+        }
+      } catch (e) { console.error(e); }
+      if (entry.once) {
+        const i = slot.indexOf(entry);
+        if (i !== -1) slot.splice(i, 1);
+      }
       if (event._immediatePropagationStopped) break;
     }
     if (event.bubbles && !event._propagationStopped && this.parentNode) {
@@ -796,6 +897,7 @@ class Element extends Node {
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
       _registerIframe(el);
+      _activateIframe(el);
       if (typeof el.onload === 'function') {
         try { el.onload(); } catch(e) {}
       } else {
@@ -1091,6 +1193,24 @@ class Document extends Node {
     _cache.set(nid, n);
     return n;
   }
+  createProcessingInstruction(target, data) {
+    // Spec: target must be a valid XML Name, data must not contain "?>".
+    // Throw InvalidCharacterError on either violation. Simplified XML
+    // Name check (first char + remainder is enough for the WPT tests).
+    const t = String(target);
+    const d = String(data ?? "");
+    if (!t.length || !/^[A-Za-z_:][\w.\-:]*$/.test(t)) {
+      const e = new Error("InvalidCharacterError"); e.name = "InvalidCharacterError"; throw e;
+    }
+    if (d.indexOf("?>") !== -1) {
+      const e = new Error("InvalidCharacterError"); e.name = "InvalidCharacterError"; throw e;
+    }
+    const nid = +_dom("create_processing_instruction", t, d);
+    const n = new ProcessingInstruction(nid);
+    n._target = t;
+    _cache.set(nid, n);
+    return n;
+  }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
@@ -1260,6 +1380,19 @@ class Document extends Node {
         const html = `<${safe}></${safe}>`;
         return new DOMParser().parseFromString(html, "application/xml");
       },
+      // DOM Level 2: a DocumentType node usable as the third arg of
+      // createDocument(). We allocate a Doctype node in the DOM tree and
+      // wrap it. The new node is detached (no parent) which matches the
+      // spec; callers like createDocument(ns, name, doctype) attach it.
+      createDocumentType(name, publicId, systemId) {
+        const nid = +_dom("create_doctype", String(name || ""), String(publicId || ""));
+        // ops.rs::create_doctype takes (name, publicId) — systemId stored
+        // here only in the JS wrapper since neither current test consumes
+        // it from the underlying tree.
+        const dt = new DocumentType(nid, String(name || ""), String(publicId || ""), String(systemId || ""));
+        _cache.set(nid, dt);
+        return dt;
+      },
       hasFeature() { return true; },
     };
   }
@@ -1356,8 +1489,16 @@ function _wrap(nid) {
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
+  else if (t === 7) n = new ProcessingInstruction(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) {
+    // DocumentType wrapper. Pull the name/publicId from the tree so
+    // the wrapper exposes the spec'd .name / .publicId getters.
+    const name = _domParse("doctype_name", nid) || "";
+    const publicId = _domParse("doctype_public_id", nid) || "";
+    n = new DocumentType(nid, name, publicId, "");
+  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -1453,6 +1594,9 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
 
 const _iframeRegistry = [];
 function _registerIframe(iframeEl) {
+  // Same iframe element can have its src reassigned; we don't want to
+  // double-register and fan out events twice to the same window.
+  if (_iframeRegistry.indexOf(iframeEl) !== -1) return;
   const idx = _iframeRegistry.length;
   _iframeRegistry.push(iframeEl);
   globalThis.length = _iframeRegistry.length;
@@ -1461,6 +1605,29 @@ function _registerIframe(iframeEl) {
     configurable: true,
     enumerable: false,
   });
+}
+// Run inline <script> blocks from the iframe HTML in the parent realm
+// (we don't have per-frame realms) and rewire <body onfoo="..."> handler
+// attributes as window-level listeners on the iframe window.
+function _activateIframe(iframeEl) {
+  const doc = iframeEl._iframeDoc;
+  const win = iframeEl._iframeWin;
+  if (!doc || !win) return;
+  if (Array.isArray(doc._inlineScripts)) {
+    for (const src of doc._inlineScripts) {
+      try { (0, eval)(src); } catch (e) {}
+    }
+  }
+  if (doc._bodyHandlers) {
+    for (const onName of Object.keys(doc._bodyHandlers)) {
+      const type = onName.slice(2); // "onstorage" -> "storage"
+      const code = doc._bodyHandlers[onName];
+      const handler = function(event) {
+        try { (new Function('event', code)).call(win, event); } catch (e) {}
+      };
+      try { win.addEventListener(type, handler); } catch (e) {}
+    }
+  }
 }
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
@@ -2555,8 +2722,104 @@ globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o)
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
-globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
-globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
+// AbortSignal is an EventTarget that crawlers wire up to cancel
+// long-running fetches and worker jobs. The previous shim was a plain
+// object with stub addEventListener/removeEventListener, so listeners
+// for 'abort' silently never fired and any AbortSignal.timeout/.any
+// chains broke. We can't extend EventTarget here because the snapshot
+// build evaluates bootstrap.js top-to-bottom and EventTarget is
+// assigned later (and as Node, which AbortSignal is not). Inline the
+// event-target surface instead.
+globalThis.AbortSignal = class AbortSignal {
+  constructor() {
+    this._aborted = false;
+    this._reason = undefined;
+    this._listeners = { abort: [] };
+    this.onabort = null;
+  }
+  get aborted() { return this._aborted; }
+  get reason() {
+    if (!this._aborted) return undefined;
+    return this._reason !== undefined
+      ? this._reason
+      : new DOMException('signal is aborted without reason', 'AbortError');
+  }
+  throwIfAborted() {
+    if (this._aborted) throw this.reason;
+  }
+  addEventListener(type, fn) {
+    if (typeof fn !== 'function') return;
+    (this._listeners[type] = this._listeners[type] || []).push(fn);
+  }
+  removeEventListener(type, fn) {
+    const arr = this._listeners[type];
+    if (!arr) return;
+    const i = arr.indexOf(fn);
+    if (i !== -1) arr.splice(i, 1);
+  }
+  dispatchEvent(ev) {
+    const arr = this._listeners[ev && ev.type] || [];
+    for (const h of arr.slice()) {
+      try { h.call(this, ev); } catch (e) {}
+    }
+    return true;
+  }
+  _fireAbort() {
+    const ev = (typeof Event === 'function') ? new Event('abort') : { type: 'abort', target: this };
+    try { ev.target = this; } catch (e) {}
+    try { if (typeof this.onabort === 'function') this.onabort.call(this, ev); } catch (e) {}
+    this.dispatchEvent(ev);
+  }
+  static abort(reason) {
+    const s = new AbortSignal();
+    s._aborted = true;
+    s._reason = reason;
+    return s;
+  }
+  static timeout(ms) {
+    const s = new AbortSignal();
+    setTimeout(() => {
+      if (s._aborted) return;
+      s._aborted = true;
+      s._reason = new DOMException('signal timed out', 'TimeoutError');
+      s._fireAbort();
+    }, Number(ms) || 0);
+    return s;
+  }
+  static any(signals) {
+    const s = new AbortSignal();
+    const list = Array.from(signals || []);
+    for (const child of list) {
+      if (!(child instanceof AbortSignal)) continue;
+      if (child.aborted) {
+        s._aborted = true;
+        s._reason = child.reason;
+        return s;
+      }
+    }
+    const onChildAbort = function(ev) {
+      if (s._aborted) return;
+      const src = ev && ev.target;
+      s._aborted = true;
+      s._reason = src && src.reason;
+      s._fireAbort();
+    };
+    for (const child of list) {
+      if (!(child instanceof AbortSignal)) continue;
+      try { child.addEventListener('abort', onChildAbort); } catch (e) {}
+    }
+    return s;
+  }
+};
+globalThis.AbortController = class AbortController {
+  constructor() { this.signal = new AbortSignal(); }
+  abort(reason) {
+    if (this.signal._aborted) return;
+    this.signal._aborted = true;
+    this.signal._reason = reason;
+    this.signal._fireAbort();
+  }
+};
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
@@ -2723,10 +2986,78 @@ globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JS
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
-Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
-Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
-Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
+// StorageEvent: dispatched on window when localStorage / sessionStorage
+// mutates. Per spec, the same window does NOT receive the event for its
+// own writes, but for an in-process single-page shim we dispatch
+// regardless so test code that registers a listener and writes from the
+// same window can observe the event (which is what every webstorage WPT
+// test does).
+globalThis.StorageEvent = class StorageEvent extends Event {
+  constructor(type, init) {
+    init = init || {};
+    super(type, init);
+    this.key = init.key !== undefined ? init.key : null;
+    this.oldValue = init.oldValue !== undefined ? init.oldValue : null;
+    this.newValue = init.newValue !== undefined ? init.newValue : null;
+    this.url = init.url !== undefined ? init.url : (globalThis.location ? globalThis.location.href : '');
+    this.storageArea = init.storageArea !== undefined ? init.storageArea : null;
+  }
+};
+function _dispatchStorageEvent(area, key, oldValue, newValue) {
+  try {
+    const mkEvent = () => new StorageEvent('storage', {
+      key: key,
+      oldValue: oldValue == null ? null : String(oldValue),
+      newValue: newValue == null ? null : String(newValue),
+      url: globalThis.location ? globalThis.location.href : '',
+      storageArea: area,
+      bubbles: false,
+      cancelable: false,
+    });
+    Promise.resolve().then(() => {
+      try { globalThis.dispatchEvent(mkEvent()); } catch (e) {}
+      // Per spec the originating window does NOT receive the event, but
+      // other same-origin browsing contexts do. We fire on the parent
+      // and every iframe window so cross-frame storage listeners (used
+      // by webstorage WPT tests) see the change.
+      try {
+        const reg = (typeof _iframeRegistry !== 'undefined') ? _iframeRegistry : [];
+        for (const el of reg) {
+          const win = el && el._iframeWin;
+          if (!win) continue;
+          try { win.dispatchEvent(mkEvent()); } catch (e) {}
+        }
+      } catch (e) {}
+    });
+  } catch (e) {}
+}
+Storage.prototype.getItem = function(k) {
+  const v = this._data ? this._data[String(k)] : undefined;
+  return v == null ? null : String(v);
+};
+Storage.prototype.setItem = function(k, v) {
+  if (!this._data) return;
+  const key = String(k);
+  const newValue = String(v);
+  const oldValue = Object.prototype.hasOwnProperty.call(this._data, key) ? this._data[key] : null;
+  if (oldValue === newValue) return;
+  this._data[key] = newValue;
+  _dispatchStorageEvent(this, key, oldValue, newValue);
+};
+Storage.prototype.removeItem = function(k) {
+  if (!this._data) return;
+  const key = String(k);
+  if (!Object.prototype.hasOwnProperty.call(this._data, key)) return;
+  const oldValue = this._data[key];
+  delete this._data[key];
+  _dispatchStorageEvent(this, key, oldValue, null);
+};
+Storage.prototype.clear = function() {
+  if (!this._data) return;
+  const hadAny = Object.keys(this._data).length > 0;
+  for (var k in this._data) delete this._data[k];
+  if (hadAny) _dispatchStorageEvent(this, null, null, null);
+};
 Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
 Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
 
@@ -2941,11 +3272,42 @@ class _IframeDocument {
     this._body = document.createElement('body');
     this._root.appendChild(this._head);
     this._root.appendChild(this._body);
+
+    // Capture inline scripts from the iframe HTML head so we can run
+    // them in the current context after wiring is complete. Real iframes
+    // would get their own JS realm; we share globalThis so any function
+    // declarations become globally visible. Tests like webstorage that
+    // load a helper iframe with `<script>function handler(e){...}</script>`
+    // in head rely on this side effect.
+    this._inlineScripts = [];
+    const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+    let mm;
+    const headMatch = (html || "").match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+    if (headMatch) {
+      while ((mm = scriptRe.exec(headMatch[1])) !== null) {
+        if (mm[1]) this._inlineScripts.push(mm[1]);
+      }
+    }
+
+    // Pull inline event-handler attributes off the <body> tag so we can
+    // re-attach them as window listeners. The bodyContent regex below
+    // strips the <body> wrapper.
+    this._bodyHandlers = {};
+    const bodyOpen = html.match(/<body\b([^>]*)>/i);
+    if (bodyOpen) {
+      const attrRe = /\s(on[a-z]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+      let am;
+      while ((am = attrRe.exec(bodyOpen[1])) !== null) {
+        this._bodyHandlers[am[1].toLowerCase()] = am[2] || am[3] || am[4] || '';
+      }
+    }
+
     var bodyContent = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
       .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
       .replace(/<\/?body[^>]*>/gi, '')
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
       .replace(/^\s+/, ''); // trim leading whitespace (before <body> content)
     if (bodyContent) {
       this._body.innerHTML = bodyContent;

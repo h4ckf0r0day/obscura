@@ -283,6 +283,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
 
+    // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
+    // directly for its SSRF gate. Mirror the CLI flag into the env var so
+    // iframe loads and JS fetch() see the same policy the http_client layer
+    // already uses (issue #33).
+    if args.allow_private_network {
+        // SAFETY: set_var is unsafe in newer rustc; this runs before any
+        // spawned thread inspects the env, so it's effectively single
+        // threaded at this point.
+        unsafe { std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1"); }
+    }
+
     let global_proxy = args.proxy.clone();
 
     match args.command {
