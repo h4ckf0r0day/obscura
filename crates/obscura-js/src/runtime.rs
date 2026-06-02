@@ -5,6 +5,7 @@ use std::rc::Rc;
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
 
+use crate::deno_extensions;
 use crate::module_loader::ObscuraModuleLoader;
 use crate::ops::{build_extension, ObscuraState};
 
@@ -45,14 +46,18 @@ impl ObscuraJsRuntime {
 
         let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
 
+        let mut extensions = deno_extensions::build();
+        extensions.push(build_extension());
+
         let mut runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![build_extension()],
+            extensions,
             module_loader: Some(module_loader),
             startup_snapshot: Some(SNAPSHOT),
             ..Default::default()
         });
 
         runtime.op_state().borrow_mut().put(state_clone);
+        runtime.op_state().borrow_mut().put(deno_extensions::ObscuraTimersPermission);
 
         runtime
             .execute_script(
@@ -480,7 +485,7 @@ impl ObscuraJsRuntime {
         );
         self.object_store.clear();
     }
-    pub async fn load_module(&mut self, url: &str) -> Result<(), String> {
+    pub async fn load_module(&mut self, url: &str, timeout: std::time::Duration) -> Result<(), String> {
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
 
@@ -508,32 +513,10 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Module load error: {}", e))?;
 
-        let result = self.runtime.mod_evaluate(module_id);
-
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
-
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
-                tracing::warn!("Module evaluation timed out after 10s: {}", url);
-                return Ok(());
-            }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Module eval error: {}", e);
-                Ok(())
-            }
-        }
+        self.eval_module_with_timeout(module_id, timeout, url).await
     }
 
-    pub async fn load_inline_module(&mut self, code: &str, base_url: &str) -> Result<(), String> {
+    pub async fn load_inline_module(&mut self, code: &str, base_url: &str, timeout: std::time::Duration) -> Result<(), String> {
         let specifier = deno_core::ModuleSpecifier::parse(
             &format!("{}#inline-module-{}", base_url, self.object_counter),
         )
@@ -550,26 +533,51 @@ impl ObscuraJsRuntime {
             .await
             .map_err(|e| format!("Inline module load error: {}", e))?;
 
-        let result = self.runtime.mod_evaluate(module_id);
+        self.eval_module_with_timeout(module_id, timeout, base_url).await
+    }
 
-        let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
+    // Drive module evaluation with a deadline-aware tokio timeout.
+    // The tokio timeout fires when V8 yields (between ticks), bounding the
+    // overshoot to the module's natural completion time. A V8 watchdog thread
+    // (like execute_script_with_timeout) is intentionally NOT used here:
+    // terminate_execution is catchable by JS try-catch, and a single
+    // termination call on heavy module code with error-recovery paths ends up
+    // running the module LONGER than letting it complete naturally.
+    async fn eval_module_with_timeout(
+        &mut self,
+        module_id: deno_core::ModuleId,
+        timeout: std::time::Duration,
+        label: &str,
+    ) -> Result<(), String> {
+        let effective = if timeout.is_zero() {
+            std::time::Duration::from_secs(10)
+        } else {
+            timeout
+        };
+
+        let mod_eval = self.runtime.mod_evaluate(module_id);
+
+        // Drive the event loop concurrently with mod_evaluate, returning as
+        // soon as the module's top-level evaluation completes. Plain
+        // run_event_loop only resolves once ALL pending work in the runtime
+        // drains, so a page with a persistent setInterval would block here
+        // indefinitely.
+        let result = tokio::time::timeout(
+            effective,
+            self.runtime.with_event_loop_promise(
+                Box::pin(mod_eval),
+                deno_core::PollEventLoopOptions::default(),
+            ),
         ).await;
 
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
-            Err(_) => {
-                tracing::warn!("Inline module timed out after 10s");
-                return Ok(());
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!("Module eval error ({}): {}", label, e);
+                Ok(())
             }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Inline module eval error: {}", e);
+            Err(_) => {
+                tracing::warn!("Module eval timed out ({}s): {}", effective.as_secs_f64(), label);
                 Ok(())
             }
         }
@@ -596,9 +604,6 @@ impl ObscuraJsRuntime {
         timeout: std::time::Duration,
     ) -> Result<(), String> {
         if timeout.is_zero() {
-            self.runtime
-                .execute_script("<script>", source.to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
             return Ok(());
         }
 
@@ -618,8 +623,20 @@ impl ObscuraJsRuntime {
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    isolate_handle.terminate_execution();
-                    return;
+                    // Repeated firing: a single terminate_execution can be
+                    // swallowed by JS try-catch. Re-fire every 10 ms so that
+                    // scripts with catch-all handlers are eventually forced to
+                    // terminate.
+                    loop {
+                        isolate_handle.terminate_execution();
+                        let (c2, _) = cvar
+                            .wait_timeout(cancelled, std::time::Duration::from_millis(10))
+                            .unwrap();
+                        cancelled = c2;
+                        if *cancelled {
+                            return;
+                        }
+                    }
                 }
 
                 let result = cvar.wait_timeout(cancelled, remaining).unwrap();
@@ -2118,5 +2135,194 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["menu", "true"]));
+    }
+
+    // ---------------------------------------------------------------
+    // deno_web / deno_crypto regression tests.
+    //
+    // These pin the behavioral contract that the hand-rolled polyfills
+    // in bootstrap.js previously *broke* (see ISSUE_deno_web.md). If any
+    // of these start failing after a dep bump, the deno extension wiring
+    // in `deno_extensions.rs` has regressed.
+    // ---------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_blob_preserves_binary_data() {
+        // The old hand-rolled Blob `join("")`-ed its parts as strings, so
+        // `new Blob([Uint8Array]).text()` returned "[object Object]". The
+        // real Blob from deno_web must round-trip bytes intact.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const bytes = new Uint8Array([0xE2, 0x9C, 0x93]); // UTF-8 for U+2713 ✓
+                    const blob = new Blob([bytes]);
+                    return {
+                        size: blob.size,
+                        text: await blob.text(),
+                        buffer: Array.from(new Uint8Array(await blob.arrayBuffer())),
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let v = result.value.unwrap();
+        assert_eq!(v["size"].as_u64().unwrap(), 3);
+        assert_eq!(v["text"].as_str().unwrap(), "\u{2713}");
+        assert_eq!(v["buffer"], serde_json::json!([0xE2, 0x9C, 0x93]));
+    }
+
+    #[test]
+    fn test_text_encoder_handles_surrogate_pair() {
+        // A code point above U+FFFF requires a UTF-16 surrogate pair on input
+        // and four UTF-8 bytes on output. The old hand-rolled TextEncoder
+        // mishandled lone-surrogate edge cases; deno_web's ICU-backed
+        // encoder matches V8/Chrome exactly.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                // U+1F600 GRINNING FACE — UTF-8: F0 9F 98 80
+                "Array.from(new TextEncoder().encode('\\uD83D\\uDE00'))",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([0xF0, 0x9F, 0x98, 0x80]));
+    }
+
+    #[test]
+    fn test_structured_clone_preserves_date_and_typed_array() {
+        // Old polyfill was `JSON.parse(JSON.stringify(v))` — silently
+        // turned Date into a string, Uint8Array into an object with
+        // numeric keys, lost circular refs entirely.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const src = { d: new Date(1700000000000), bytes: new Uint8Array([1, 2, 3]) };
+                    const cloned = structuredClone(src);
+                    return {
+                        dateIsDate: cloned.d instanceof Date,
+                        dateMs: cloned.d.getTime(),
+                        bytesIsUint8: cloned.bytes instanceof Uint8Array,
+                        bytesLen: cloned.bytes.length,
+                        firstByte: cloned.bytes[0],
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["dateIsDate"], serde_json::json!(true));
+        assert_eq!(result["dateMs"].as_i64().unwrap(), 1700000000000);
+        assert_eq!(result["bytesIsUint8"], serde_json::json!(true));
+        assert_eq!(result["bytesLen"].as_u64().unwrap(), 3);
+        assert_eq!(result["firstByte"].as_u64().unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_abort_controller_fires_abort_event() {
+        // Old stub set `.aborted = true` on `abort()` but never invoked
+        // the listener. Real AbortSignal must actually fire `'abort'`.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const ctrl = new AbortController();
+                    let fired = 0;
+                    ctrl.signal.addEventListener('abort', () => { fired++; });
+                    ctrl.abort();
+                    // Allow microtask draining.
+                    await Promise.resolve();
+                    return { fired, aborted: ctrl.signal.aborted };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let v = result.value.unwrap();
+        assert_eq!(v["fired"].as_u64().unwrap(), 1);
+        assert_eq!(v["aborted"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_crypto_get_random_values_has_entropy() {
+        // Old crypto.getRandomValues used Math.random() — a fingerprinting
+        // tell and not actually random across calls in some patterns. The
+        // real CSPRNG from deno_crypto must produce different outputs on
+        // sequential calls (probability of collision over 32 bytes is
+        // negligible).
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const a = new Uint8Array(32); crypto.getRandomValues(a);
+                    const b = new Uint8Array(32); crypto.getRandomValues(b);
+                    let equal = true;
+                    for (let i = 0; i < 32; i++) if (a[i] !== b[i]) { equal = false; break; }
+                    return { equal, allZeroA: a.every(x => x === 0) };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result["equal"],
+            serde_json::json!(false),
+            "two 32-byte CSPRNG draws were identical"
+        );
+        assert_eq!(
+            result["allZeroA"],
+            serde_json::json!(false),
+            "CSPRNG returned all-zero buffer"
+        );
+    }
+
+    #[test]
+    fn test_crypto_random_uuid_is_v4_format() {
+        // Old stub used Math.random() with a `4xxx`/`yxxx` template — looked
+        // right but wasn't CSPRNG-backed. Real `randomUUID` must match the
+        // RFC 4122 v4 shape: xxxxxxxx-xxxx-4xxx-Yxxx-xxxxxxxxxxxxx where
+        // Y is one of 8/9/a/b.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate("crypto.randomUUID()").unwrap();
+        let uuid = result.as_str().unwrap();
+        assert_eq!(uuid.len(), 36, "uuid wrong length: {}", uuid);
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        assert!(
+            parts[2].starts_with('4'),
+            "v4 UUID must start its 3rd group with '4': {}",
+            uuid
+        );
+        let variant = parts[3].chars().next().unwrap();
+        assert!(
+            matches!(variant, '8' | '9' | 'a' | 'b'),
+            "RFC 4122 variant bits wrong (got {}): {}",
+            variant,
+            uuid
+        );
+    }
+
+    #[test]
+    fn test_btoa_handles_non_ascii_via_textencoder() {
+        // The old hand-rolled btoa depended on the broken hand-rolled
+        // TextEncoder, so multi-byte input produced wrong output. With
+        // both backed by deno_web/V8 ICU, base64 of UTF-8 is correct.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // btoa expects a binary string (latin-1). For UTF-8, pages typically
+        // do `btoa(String.fromCharCode(...new TextEncoder().encode(s)))`.
+        let result = rt
+            .evaluate(
+                "btoa(String.fromCharCode(...new TextEncoder().encode('\u{2713}')))",
+            )
+            .unwrap();
+        assert_eq!(result.as_str().unwrap(), "4pyT");
     }
 }

@@ -286,6 +286,15 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .map(|id| id.index() as i32).collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        "element_attributes" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let pairs: Vec<(String, String)> = dom.get_node(NodeId::new(nid))
+                .and_then(|n| if let NodeData::Element { attrs, .. } = &n.data {
+                    Some(attrs.iter().map(|a| (a.name.local.as_ref().to_string(), a.value.to_string())).collect())
+                } else { None })
+                .unwrap_or_default();
+            serde_json::to_string(&pairs).unwrap_or("[]".into())
+        }
         "has_child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.get_node(NodeId::new(nid)).map(|n| n.first_child.is_some()).unwrap_or(false).to_string()

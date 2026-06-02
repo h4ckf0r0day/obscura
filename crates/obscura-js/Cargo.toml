@@ -5,11 +5,21 @@ edition.workspace = true
 
 [build-dependencies]
 deno_core = "0.350"
+deno_url = "0.207"
+deno_webidl = "0.207"
+deno_console = "0.207"
+deno_web = "0.238"
+deno_crypto = "0.221"
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 deno_core = "0.350"
+deno_url = "0.207"
+deno_webidl = "0.207"
+deno_console = "0.207"
+deno_web = "0.238"
+deno_crypto = "0.221"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
