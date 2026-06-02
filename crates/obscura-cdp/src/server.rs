@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -143,27 +146,35 @@ pub async fn start_with_full_serve_options(
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
+    // Issue #225: coordinate Ctrl-C shutdown across the accept thread, the
+    // LocalSet accept loop, and `cdp_processor`. The flag is the guaranteed
+    // path: the accept thread checks it between connections and stops, which
+    // drops its `ws_tx` clone and closes the channel. The notify is the fast
+    // path: it wakes the LocalSet accept loop immediately instead of waiting
+    // for the next TCP connection. `cdp_processor` sets both when it catches
+    // Ctrl-C.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
+
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
     //
-    // Lifecycle note: this thread is spawned detached (no `join` handle).
-    // It is intended to run for the entire process lifetime — the same
-    // contract Chromium DevTools / Playwright clients expect from a CDP
-    // server. When `start_with_*` returns (whether by Ok or panic in the
-    // LocalSet), `ws_rx` drops; the next `ws_tx.blocking_send` then
-    // returns `SendError`, which `accept_dispatch` surfaces as
-    // "accept channel closed" and the loop logs+continues. The listener
-    // FD stays bound until the process exits. If we ever need to support
-    // graceful shutdown for embedded/library use, add an
-    // `Arc<AtomicBool>` shutdown flag checked between `accept()`s and
-    // switch to a non-blocking `set_nonblocking(true)` + poll loop.
-    // For the standalone `obscura serve` binary the detached lifetime is
-    // correct.
+    // Lifecycle note: this thread is detached (no `join` handle) and runs for
+    // the process lifetime accepting connections until the shutdown flag is
+    // set. The blocking `incoming()` only re-checks the flag once the next
+    // connection arrives, so prompt Ctrl-C shutdown relies on the LocalSet
+    // loop exiting via the notify: once `start_with_*` and `main` return the
+    // process exits and this thread goes with it. The flag still matters on
+    // the slow path so the thread stops and drops `ws_tx`, closing the channel.
+    let accept_flag = shutdown_flag.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
             for stream in std_listener.incoming() {
+                if accept_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 match stream {
                     Ok(stream) => {
                         if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
@@ -184,10 +195,23 @@ pub async fn start_with_full_serve_options(
 
             let _processor_handle = tokio::task::spawn_local(cdp_processor(
                 msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                allow_private_network,
+                allow_private_network, shutdown_flag.clone(), shutdown_notify.clone(),
             ));
 
-            while let Some(stream) = ws_rx.recv().await {
+            // Issue #225: exit on either the channel closing (accept thread
+            // stopped and dropped its ws_tx) or a shutdown notification from
+            // cdp_processor on Ctrl-C. Waiting only on ws_rx.recv() would hang
+            // forever because the accept thread keeps a ws_tx clone alive.
+            let accept_notify = shutdown_notify.clone();
+            loop {
+                let stream = tokio::select! {
+                    stream = ws_rx.recv() => stream,
+                    _ = accept_notify.notified() => None,
+                };
+                let stream = match stream {
+                    Some(s) => s,
+                    None => break,
+                };
                 // Convert std TcpStream → tokio TcpStream inside the LocalSet
                 // where the tokio runtime is active.
                 stream
@@ -334,6 +358,8 @@ async fn cdp_processor(
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    shutdown_flag: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 ) {
     let mut ctx = CdpContext::new_full(
         proxy,
@@ -378,6 +404,13 @@ async fn cdp_processor(
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received");
+                    // Issue #225: stop the accept thread (flag) and wake the
+                    // LocalSet accept loop (notify) so the process can exit.
+                    // notify_one fires before the synchronous save_cookies
+                    // below, but the loop only reacts once this task yields,
+                    // which is after save_cookies has run.
+                    shutdown_flag.store(true, Ordering::Relaxed);
+                    shutdown_notify.notify_one();
                     break;
                 }
             }
