@@ -32,6 +32,8 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            OBSCURA_VERSION=${{ steps.version.outputs.version }}
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/obscura:${{ steps.version.outputs.version }}
             ${{ secrets.DOCKERHUB_USERNAME }}/obscura:latest

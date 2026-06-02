@@ -29,9 +29,12 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
 
 RUN cargo build --release --bin obscura --bin obscura-worker 2>/dev/null || true
 
+ARG OBSCURA_VERSION
+
 # Copy real sources and build
 COPY crates/ crates/
-RUN touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker
+RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
+    touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker
 
 # ---
 

@@ -10,7 +10,7 @@ use tokio::time::{timeout, Duration};
 #[derive(Parser)]
 #[command(
     name = "obscura",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("OBSCURA_BUILD_VERSION"),
     about = "Obscura - A lightweight headless browser for web scraping and automation",
 )]
 struct Args {
@@ -189,9 +189,9 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.6
+  Headless Browser v{}
   CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+"#, env!("OBSCURA_BUILD_VERSION"), port);
 }
 
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
