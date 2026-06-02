@@ -1012,15 +1012,33 @@ class Element extends Node {
     return false;
   }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-  append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
+  append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
   prepend(...nodes) {
     const ref = this.firstChild;
-    for (const n of nodes) {
-      const node = (typeof n === "string") ? document.createTextNode(n) : n;
-      if (ref) this.insertBefore(node, ref);
-      else this.appendChild(node);
+    for (const n of _convertNodes(nodes)) {
+      if (ref) this.insertBefore(n, ref); else this.appendChild(n);
     }
   }
+  replaceChildren(...nodes) {
+    const converted = _convertNodes(nodes);
+    let c;
+    while ((c = this.firstChild)) this.removeChild(c);
+    for (const n of converted) this.appendChild(n);
+  }
+}
+
+// WHATWG "convert nodes into a node": a Node argument passes through, anything
+// else is stringified into a Text node, so e.g. append(null) inserts the text
+// "null" and append(undefined) inserts "undefined" per the (Node or DOMString)
+// union, rather than throwing.
+function _convertNodes(nodes) {
+  const out = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n && typeof n._nid === "number") out.push(n);
+    else out.push(document.createTextNode(String(n)));
+  }
+  return out;
 }
 
 class Document extends Node {
@@ -2570,11 +2588,55 @@ globalThis.IntersectionObserver = class IntersectionObserver {
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
+globalThis.DOMException = (function () {
+  const NAME_TO_CODE = {
+    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+    InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+    NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+    SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+    InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+    NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+    QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+    DataCloneError: 25,
+  };
+  class DOMException extends Error {
+    constructor(message = "", name = "Error") {
+      super(message);
+      this.name = name;
+      this.message = String(message);
+    }
+    get code() { return NAME_TO_CODE[this.name] || 0; }
+  }
+  const CONSTS = {
+    INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
+    WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+    NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
+    INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+    INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18,
+    NETWORK_ERR: 19, ABORT_ERR: 20, URL_MISMATCH_ERR: 21,
+    QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25,
+  };
+  for (const k in CONSTS) {
+    Object.defineProperty(DOMException, k, { value: CONSTS[k], enumerable: true });
+    Object.defineProperty(DOMException.prototype, k, { value: CONSTS[k], enumerable: true });
+  }
+  return DOMException;
+})();
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  composedPath() {
+    if (!this.target) return [];
+    const path = [];
+    let n = this.target;
+    while (n) { path.push(n); n = n.parentNode || null; }
+    if (typeof window !== "undefined" && window && path[path.length - 1] !== window) path.push(window);
+    return path;
+  }
 };
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { super(t,o);this.detail=o.detail; }
@@ -2960,7 +3022,27 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+// ParentNode mixin: Document and DocumentFragment are ParentNodes too, so they
+// share Element's append / prepend / replaceChildren.
+for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
+  _proto.append = Element.prototype.append;
+  _proto.prepend = Element.prototype.prepend;
+  _proto.replaceChildren = Element.prototype.replaceChildren;
+}
 globalThis.EventTarget = Node;
+globalThis.HTMLCollection = class HTMLCollection extends Array {
+  item(i) { return this[i] != null ? this[i] : null; }
+  namedItem(name) {
+    if (!name) return null;
+    for (const el of this) {
+      if (el && (el.id === name || (typeof el.getAttribute === "function" && el.getAttribute("name") === name))) return el;
+    }
+    return null;
+  }
+};
+globalThis.NodeList = class NodeList extends Array {
+  item(i) { return this[i] != null ? this[i] : null; }
+};
 globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
 
 [
