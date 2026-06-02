@@ -223,6 +223,14 @@ impl DomTree {
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
+        // Per DOM spec, appending a node to itself is a HierarchyRequestError;
+        // here we treat it as a no-op rather than panic. Without this the
+        // sibling-pointer fixup below sets the node's prev_sibling to itself
+        // and every later child-walk loops forever (same failure mode that
+        // insert_before's self-cycle guard was added to prevent).
+        if parent_id == child_id {
+            return;
+        }
         self.detach(child_id);
 
         let mut inner = self.inner.borrow_mut();

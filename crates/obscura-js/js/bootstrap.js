@@ -304,7 +304,29 @@ class Node {
   get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
-    if (!c) return c;
+    if (!c || typeof c._nid !== 'number') return c;
+    if (c._nid === this._nid) return c;
+    // DocumentFragment per spec: move its children up to `this` and leave
+    // the fragment empty. Pages that build subtrees off-DOM (Bing's
+    // anti-malware shim, Google Shopping result rows, React/Preact
+    // hydration) appendChild a fragment and then read its former
+    // children's properties; without flattening, the fragment node
+    // itself gets grafted and the next `.something.length` access on
+    // the assumed-Element children explodes with
+    // "Cannot read properties of undefined (reading 'length')".
+    if (c.nodeType === 11) {
+      const kids = (c.childNodes || []).slice();
+      const added = [];
+      for (const k of kids) {
+        if (typeof k._nid !== 'number') continue;
+        _dom("append_child", this._nid, k._nid);
+        added.push(k._nid);
+      }
+      if (globalThis.__mutationObservers?.length && added.length) {
+        globalThis.__notifyMutation('childList', this._nid, added, []);
+      }
+      return c;
+    }
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
@@ -368,14 +390,40 @@ class Node {
     return c;
   }
   replaceChild(newChild, oldChild) {
-    if (!oldChild || !newChild) return oldChild;
+    if (!oldChild || !newChild || typeof oldChild._nid !== 'number') return oldChild;
+    if (newChild.nodeType === 11) {
+      // Flatten fragment: insert each child before oldChild, then remove oldChild.
+      // op_dom("insert_before", newNode, refNode) -> insert newNode before refNode.
+      const kids = (newChild.childNodes || []).slice();
+      for (const k of kids) {
+        if (typeof k._nid !== 'number') continue;
+        if (k._nid === oldChild._nid) continue;
+        _dom("insert_before", k._nid, oldChild._nid);
+      }
+      _dom("remove_child", oldChild._nid);
+      return oldChild;
+    }
+    if (typeof newChild._nid !== 'number') return oldChild;
+    if (newChild._nid === oldChild._nid) return oldChild;
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
   }
   insertBefore(n, ref) {
-    if (!n) return n;
+    if (!n || typeof n._nid !== 'number') return n;
     if (!ref) { this.appendChild(n); return n; }
+    if (typeof ref._nid !== 'number') return n;
+    // DocumentFragment: flatten — insert each child of the fragment
+    // before ref (in order), then leave the fragment empty.
+    if (n.nodeType === 11) {
+      const kids = (n.childNodes || []).slice();
+      for (const k of kids) {
+        if (typeof k._nid !== 'number') continue;
+        if (k._nid === ref._nid) continue;
+        _dom("insert_before", k._nid, ref._nid);
+      }
+      return n;
+    }
     _dom("insert_before", n._nid, ref._nid);
     return n;
   }
@@ -872,8 +920,49 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
-  get href() { return this.getAttribute("href") || ""; }
+  get href() {
+    const raw = this.getAttribute("href");
+    if (raw == null) return "";
+    // Per spec, HTMLAnchorElement.href / HTMLAreaElement.href returns the
+    // serialized resolved URL (the content attribute resolved against the
+    // document base). Bing's anti-malware shim and many other libraries
+    // rely on this resolution to read `.hostname` / `.protocol`. We only
+    // resolve for <a>/<area>/<base>/<link> so other elements that happen
+    // to carry an `href` attribute (custom elements, SVG <a>, etc) keep
+    // the raw value they were assigned.
+    const tag = this.localName;
+    if (tag === 'a' || tag === 'area' || tag === 'base' || tag === 'link') {
+      try {
+        return new URL(raw, _domParse("document_url") || globalThis.location?.href || "about:blank").href;
+      } catch { return raw; }
+    }
+    return raw;
+  }
   set href(v) { this.setAttribute("href", v); }
+  // URL-decomposition IDL attributes for <a> / <area>. Without these,
+  // libraries that build an anchor and read parts of the resolved URL
+  // (Bing's CI.AntiMalware shim does `n=createElement("A"); n.href=src;
+  // n.hostname.length`) crash with "Cannot read properties of undefined".
+  _urlPart(part) {
+    const tag = this.localName;
+    if (tag !== 'a' && tag !== 'area') return "";
+    const raw = this.getAttribute("href");
+    if (raw == null || raw === "") return "";
+    try {
+      const u = new URL(raw, _domParse("document_url") || globalThis.location?.href || "about:blank");
+      return u[part] || "";
+    } catch { return ""; }
+  }
+  get origin() { return this._urlPart('origin'); }
+  get protocol() { return this._urlPart('protocol'); }
+  get username() { return this._urlPart('username'); }
+  get password() { return this._urlPart('password'); }
+  get host() { return this._urlPart('host'); }
+  get hostname() { return this._urlPart('hostname'); }
+  get port() { return this._urlPart('port'); }
+  get pathname() { return this._urlPart('pathname'); }
+  get search() { return this._urlPart('search'); }
+  get hash() { return this._urlPart('hash'); }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
