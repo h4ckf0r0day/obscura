@@ -1654,12 +1654,18 @@ class Document extends Node {
       // jQuery 3.x with it. Reuse the DOMParser path to build a detached
       // document, then optionally set the title.
       createHTMLDocument(title) {
-        const skeleton = `<html><head><title></title></head><body></body></html>`;
-        const doc = new DOMParser().parseFromString(skeleton, "text/html");
-        if (title != null) {
-          const t = doc.querySelector("title");
-          if (t) t.textContent = String(title);
-        }
+        // Build head>title and body explicitly. Parsing a full skeleton string
+        // as innerHTML of <html> collapses through the fragment parser (it
+        // dropped head/body and kept only <title>), leaving doc.body null.
+        const doc = new DOMParser().parseFromString("", "text/html");
+        const root = doc.documentElement;
+        const head = document.createElement("head");
+        const titleEl = document.createElement("title");
+        if (title != null) titleEl.textContent = String(title);
+        head.appendChild(titleEl);
+        const body = document.createElement("body");
+        root.appendChild(head);
+        root.appendChild(body);
         return doc;
       },
       // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
@@ -1669,8 +1675,10 @@ class Document extends Node {
       createDocument(_ns, qualifiedName, _doctype) {
         const name = (qualifiedName && String(qualifiedName)) || "root";
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = `<${safe}></${safe}>`;
-        return new DOMParser().parseFromString(html, "application/xml");
+        const html = qualifiedName ? `<${safe}></${safe}>` : "";
+        const doc = new DOMParser().parseFromString(html, "application/xml");
+        if (_doctype) doc._docType = _doctype;
+        return doc;
       },
       // createDocumentType(qualifiedName, publicId, systemId): build a detached
       // DocumentType node. Browsers validate leniently here (only a name with
@@ -3177,6 +3185,15 @@ globalThis.PopStateEvent = class extends Event {
 };
 globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
+globalThis.ProgressEvent = class ProgressEvent extends Event {
+  constructor(type, init) {
+    super(type, init || {});
+    const i = init || {};
+    this.lengthComputable = !!i.lengthComputable;
+    this.loaded = i.loaded != null ? Number(i.loaded) : 0;
+    this.total = i.total != null ? Number(i.total) : 0;
+  }
+};
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
@@ -3331,6 +3348,14 @@ globalThis.DOMParser = class DOMParser {
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
+      // Document-level node insertion. Detached docs from createHTMLDocument /
+      // createDocument back onto the same tree, so appending lands under the
+      // documentElement; enough for dom/common.js to build its Range fixtures.
+      appendChild: function (n) { try { root.appendChild(n); } catch (e) {} return n; },
+      removeChild: function (n) { try { root.removeChild(n); } catch (e) {} return n; },
+      insertBefore: function (n, ref) { try { root.insertBefore(n, ref); } catch (e) {} return n; },
+      _docType: null,
+      get doctype() { return this._docType; },
       cloneNode: function (deep) {
         return new DOMParser().parseFromString(root.outerHTML, mimeType);
       },
@@ -4424,6 +4449,13 @@ Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) { this.innerHTML 
 Element.prototype.getHTML = function getHTML() { return this.innerHTML; };
 _markNative(Element.prototype.setHTMLUnsafe);
 _markNative(Element.prototype.getHTML);
+// Document.parseHTMLUnsafe(html): static that parses into a new HTML document.
+if (typeof Document !== 'undefined' && typeof Document.parseHTMLUnsafe !== 'function') {
+  Document.parseHTMLUnsafe = function parseHTMLUnsafe(html) {
+    return new DOMParser().parseFromString(String(html == null ? "" : html), "text/html");
+  };
+  _markNative(Document.parseHTMLUnsafe);
+}
 
 globalThis.AudioContext = class AudioContext {
   constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }
