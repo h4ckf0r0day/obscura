@@ -526,6 +526,12 @@ async fn run_fetch(
         eprintln!("Page loaded: {} - \"{}\"", page.url_string(), page.title);
     }
 
+    // --wait is a post-load settle: drive the event loop so timers, async work,
+    // and completion callbacks (e.g. testharness's add_completion_callback) run
+    // before we read the page. Returns early once the loop is idle, so static
+    // pages stay fast.
+    page.settle(wait_secs.saturating_mul(1000)).await;
+
     if let Some(ref sel) = selector {
         let found = wait_for_selector(&mut page, sel, wait_secs).await;
         if !found {
