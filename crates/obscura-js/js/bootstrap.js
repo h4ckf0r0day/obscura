@@ -1083,13 +1083,17 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
+  // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
+  // and what scrapers want). It uses op_url_resolve, which returns just the
+  // resolved string, rather than the full-component op the decomposition
+  // members use. Other elements reflect the raw attribute.
   get href() {
     const ln = this.localName;
     if (ln === 'a' || ln === 'area') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
-      const c = _urlParseOp(raw, _anchorBase());
-      return c ? c.href : raw;
+      const r = _urlResolveOp(raw, _anchorBase());
+      return r !== null ? r : raw;
     }
     return this.getAttribute("href") || "";
   }
@@ -2385,6 +2389,14 @@ function _urlSetOp(href, part, value) {
     const s = Deno.core.ops.op_url_set(String(href), part, String(value));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
+  } catch (e) { return null; }
+}
+// Returns just the resolved absolute URL string (no component JSON), or null on
+// failure. Cheaper than _urlParseOp for callers that only need the href.
+function _urlResolveOp(href, base) {
+  try {
+    const r = Deno.core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
+    return r ? r : null;
   } catch (e) { return null; }
 }
 if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {

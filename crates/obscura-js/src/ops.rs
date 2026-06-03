@@ -1040,6 +1040,24 @@ fn set_host_port(u: &mut url::Url, value: &str) {
     let _ = u.set_host(Some(value));
 }
 
+/// Resolve `href` against optional `base` and return only the serialized
+/// absolute URL (no component breakdown). Used by the hot `a.href`/`area.href`
+/// getter, which only needs the resolved string, so it avoids building and
+/// re-parsing the full component JSON. Returns "" when the input is invalid.
+#[op2]
+#[string]
+fn op_url_resolve(#[string] href: &str, #[string] base: &str) -> String {
+    std::panic::catch_unwind(|| {
+        let parsed = if base.is_empty() {
+            url::Url::parse(href)
+        } else {
+            url::Url::parse(base).and_then(|b| b.join(href))
+        };
+        parsed.map(|u| u.as_str().to_string()).unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -1055,6 +1073,7 @@ pub fn build_extension() -> Extension {
             op_subtle_digest(),
             op_url_parse(),
             op_url_set(),
+            op_url_resolve(),
         ]),
         ..Default::default()
     }
