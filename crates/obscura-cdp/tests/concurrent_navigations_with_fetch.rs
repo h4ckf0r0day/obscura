@@ -173,7 +173,7 @@ async fn one_client_with_fetch(port: u16, id_base: u64, target_url: &str) -> Res
 
 /// PR #36 maintainer's exact repro.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "boots a real CDP server + makes outbound HTTP; opt-in with --ignored"]
+
 async fn fetch_intercept_concurrency_5_does_not_abort_v8() {
     // Use example.com first — minimal subresources but real network. If this
     // doesn't reproduce, escalate to a JS-heavy page in a follow-up.

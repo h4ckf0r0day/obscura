@@ -146,27 +146,13 @@ pub async fn start_with_full_serve_options(
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
-    // Issue #225: coordinate Ctrl-C shutdown across the accept thread, the
-    // LocalSet accept loop, and `cdp_processor`. The flag is the guaranteed
-    // path: the accept thread checks it between connections and stops, which
-    // drops its `ws_tx` clone and closes the channel. The notify is the fast
-    // path: it wakes the LocalSet accept loop immediately instead of waiting
-    // for the next TCP connection. `cdp_processor` sets both when it catches
-    // Ctrl-C.
+    // Ctrl-C / graceful shutdown coordination.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
 
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
-    //
-    // Lifecycle note: this thread is detached (no `join` handle) and runs for
-    // the process lifetime accepting connections until the shutdown flag is
-    // set. The blocking `incoming()` only re-checks the flag once the next
-    // connection arrives, so prompt Ctrl-C shutdown relies on the LocalSet
-    // loop exiting via the notify: once `start_with_*` and `main` return the
-    // process exits and this thread goes with it. The flag still matters on
-    // the slow path so the thread stops and drops `ws_tx`, closing the channel.
     let accept_flag = shutdown_flag.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
@@ -195,18 +181,15 @@ pub async fn start_with_full_serve_options(
 
             let _processor_handle = tokio::task::spawn_local(cdp_processor(
                 msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                allow_private_network, shutdown_flag.clone(), shutdown_notify.clone(),
+                allow_private_network,
+                shutdown_flag,
+                shutdown_notify.clone(),
             ));
 
-            // Issue #225: exit on either the channel closing (accept thread
-            // stopped and dropped its ws_tx) or a shutdown notification from
-            // cdp_processor on Ctrl-C. Waiting only on ws_rx.recv() would hang
-            // forever because the accept thread keeps a ws_tx clone alive.
-            let accept_notify = shutdown_notify.clone();
             loop {
                 let stream = tokio::select! {
                     stream = ws_rx.recv() => stream,
-                    _ = accept_notify.notified() => None,
+                    _ = shutdown_notify.notified() => None,
                 };
                 let stream = match stream {
                     Some(s) => s,
@@ -319,11 +302,11 @@ fn handle_http_json_blocking(
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Obscura/0.1.0",
+            "Browser": "Chrome/145.0.0.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
-            "V8-Version": "N/A",
-            "WebKit-Version": "N/A",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "V8-Version": "14.5.0.0",
+            "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
         }))?,
         "list" => serde_json::to_string_pretty(&json!([{
@@ -404,11 +387,6 @@ async fn cdp_processor(
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received");
-                    // Issue #225: stop the accept thread (flag) and wake the
-                    // LocalSet accept loop (notify) so the process can exit.
-                    // notify_one fires before the synchronous save_cookies
-                    // below, but the loop only reacts once this task yields,
-                    // which is after save_cookies has run.
                     shutdown_flag.store(true, Ordering::Relaxed);
                     shutdown_notify.notify_one();
                     break;
@@ -879,10 +857,10 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Browser.getVersion" => {
             Some(json!({
                 "protocolVersion": "1.3",
-                "product": "Obscura/0.1.0",
-                "revision": "0",
-                "userAgent": "Obscura/0.1.0",
-                "jsVersion": "V8",
+                "product": "Chrome/145.0.0.0",
+                "revision": "@0000000000000000000000000000000000000000",
+                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                "jsVersion": "14.5.0.0",
             }))
         }
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {

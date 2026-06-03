@@ -259,7 +259,6 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 match &mut n.data {
                     NodeData::Text { contents } => { *contents = arg2.clone(); }
                     NodeData::Comment { contents } => { *contents = arg2.clone(); }
-                    NodeData::ProcessingInstruction { data, .. } => { *data = arg2.clone(); }
                     _ => {}
                 }
             });
@@ -279,47 +278,6 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "create_comment_node" => {
             dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
-        }
-        "create_processing_instruction" => {
-            // arg1 = target, arg2 = data
-            dom.new_node(NodeData::ProcessingInstruction {
-                target: arg1.clone(),
-                data: arg2.clone(),
-            }).index().to_string()
-        }
-        "create_doctype" => {
-            // arg1 = name, arg2 = public_id. system_id stored only in the
-            // JS wrapper since neither current WPT test reads it back from
-            // the underlying tree.
-            dom.new_node(NodeData::Doctype {
-                name: arg1.clone(),
-                public_id: arg2.clone(),
-                system_id: String::new(),
-            }).index().to_string()
-        }
-        "pi_target" => {
-            let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| match &n.data {
-                NodeData::ProcessingInstruction { target, .. } => Some(target.clone()),
-                _ => None,
-            }).unwrap_or_default();
-            serde_json::to_string(&val).unwrap_or("\"\"".into())
-        }
-        "doctype_name" => {
-            let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| match &n.data {
-                NodeData::Doctype { name, .. } => Some(name.clone()),
-                _ => None,
-            }).unwrap_or_default();
-            serde_json::to_string(&val).unwrap_or("\"\"".into())
-        }
-        "doctype_public_id" => {
-            let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| match &n.data {
-                NodeData::Doctype { public_id, .. } => Some(public_id.clone()),
-                _ => None,
-            }).unwrap_or_default();
-            serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -768,7 +726,7 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
         ));
     }
 
-    if scheme == "file" || obscura_net::env_allows_private_network() {
+    if scheme == "file" {
         return Ok(());
     }
 

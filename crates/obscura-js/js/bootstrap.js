@@ -9,42 +9,19 @@ globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
 globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn, opts) {
-  if (typeof fn !== 'function' &&
-      !(fn && typeof fn === 'object' && typeof fn.handleEvent === 'function')) return;
-  const once = !!(opts && typeof opts === 'object' && opts.once === true);
-  const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
+globalThis.addEventListener = function(type, fn) {
   if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  const arr = globalThis.__windowListeners[type];
-  for (const e of arr) if (e.handler === fn && e.capture === capture) return;
-  arr.push({ handler: fn, once, capture });
+  globalThis.__windowListeners[type].push(fn);
 };
-globalThis.removeEventListener = function(type, fn, opts) {
-  const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
+globalThis.removeEventListener = function(type, fn) {
   if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type]
-      .filter(e => !(e.handler === fn && e.capture === capture));
+    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
   }
 };
 globalThis.dispatchEvent = function(event) {
   if (!event) return true;
-  if (!event.target) event.target = globalThis;
-  event.currentTarget = globalThis;
-  const slot = globalThis.__windowListeners[event.type] || [];
-  const handlers = slot.slice();
-  for (const entry of handlers) {
-    const h = entry && entry.handler;
-    if (!h) continue;
-    try {
-      if (typeof h === 'function') h.call(globalThis, event);
-      else if (typeof h.handleEvent === 'function') h.handleEvent(event);
-    } catch (e) { console.error(e); }
-    if (entry.once) {
-      const i = slot.indexOf(entry);
-      if (i !== -1) slot.splice(i, 1);
-    }
-    if (event && event._immediatePropagationStopped) break;
-  }
+  const handlers = globalThis.__windowListeners[event.type] || [];
+  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
   return !event.defaultPrevented;
 };
 
@@ -258,14 +235,7 @@ class Node {
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
-  get textContent() {
-    // Per DOM spec: textContent returns null for Document and DocumentType.
-    // Everything else returns the concatenated text of descendants
-    // (or the node's data for Text/Comment/PI/Attr).
-    const t = this.nodeType;
-    if (t === 9 || t === 10) return null;
-    return _domParse("text_content", this._nid) ?? "";
-  }
+  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) _dom("remove_child", c);
@@ -304,29 +274,7 @@ class Node {
   get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
-    if (!c || typeof c._nid !== 'number') return c;
-    if (c._nid === this._nid) return c;
-    // DocumentFragment per spec: move its children up to `this` and leave
-    // the fragment empty. Pages that build subtrees off-DOM (Bing's
-    // anti-malware shim, Google Shopping result rows, React/Preact
-    // hydration) appendChild a fragment and then read its former
-    // children's properties; without flattening, the fragment node
-    // itself gets grafted and the next `.something.length` access on
-    // the assumed-Element children explodes with
-    // "Cannot read properties of undefined (reading 'length')".
-    if (c.nodeType === 11) {
-      const kids = (c.childNodes || []).slice();
-      const added = [];
-      for (const k of kids) {
-        if (typeof k._nid !== 'number') continue;
-        _dom("append_child", this._nid, k._nid);
-        added.push(k._nid);
-      }
-      if (globalThis.__mutationObservers?.length && added.length) {
-        globalThis.__notifyMutation('childList', this._nid, added, []);
-      }
-      return c;
-    }
+    if (!c) return c;
     _dom("append_child", this._nid, c._nid);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
@@ -390,40 +338,14 @@ class Node {
     return c;
   }
   replaceChild(newChild, oldChild) {
-    if (!oldChild || !newChild || typeof oldChild._nid !== 'number') return oldChild;
-    if (newChild.nodeType === 11) {
-      // Flatten fragment: insert each child before oldChild, then remove oldChild.
-      // op_dom("insert_before", newNode, refNode) -> insert newNode before refNode.
-      const kids = (newChild.childNodes || []).slice();
-      for (const k of kids) {
-        if (typeof k._nid !== 'number') continue;
-        if (k._nid === oldChild._nid) continue;
-        _dom("insert_before", k._nid, oldChild._nid);
-      }
-      _dom("remove_child", oldChild._nid);
-      return oldChild;
-    }
-    if (typeof newChild._nid !== 'number') return oldChild;
-    if (newChild._nid === oldChild._nid) return oldChild;
+    if (!oldChild || !newChild) return oldChild;
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
   }
   insertBefore(n, ref) {
-    if (!n || typeof n._nid !== 'number') return n;
+    if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
-    if (typeof ref._nid !== 'number') return n;
-    // DocumentFragment: flatten — insert each child of the fragment
-    // before ref (in order), then leave the fragment empty.
-    if (n.nodeType === 11) {
-      const kids = (n.childNodes || []).slice();
-      for (const k of kids) {
-        if (typeof k._nid !== 'number') continue;
-        if (k._nid === ref._nid) continue;
-        _dom("insert_before", k._nid, ref._nid);
-      }
-      return n;
-    }
     _dom("insert_before", n._nid, ref._nid);
     return n;
   }
@@ -546,13 +468,6 @@ class Comment extends CharacterData {
   cloneNode() { return document.createComment(this.data); }
 }
 
-class ProcessingInstruction extends CharacterData {
-  get nodeName() { return this.target || ""; }
-  get nodeType() { return 7; }
-  get target() { return this._target || _domParse("pi_target", this._nid) || ""; }
-  cloneNode() { return document.createProcessingInstruction(this.target, this.data); }
-}
-
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -565,11 +480,8 @@ class Element extends Node {
   get className() { return this.getAttribute("class") || ""; }
   set className(v) { this.setAttribute("class", v); }
   get namespaceURI() {
-    if (this._ns !== undefined) {
-      return this._ns === "" ? null : this._ns;
-    }
     const tag = this.localName;
-    if (tag === "svg") return "http://www.w3.org/2000/svg";
+    if (tag === "svg" || this._ns === "http://www.w3.org/2000/svg") return "http://www.w3.org/2000/svg";
     return "http://www.w3.org/1999/xhtml";
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
@@ -722,61 +634,16 @@ class Element extends Node {
         break;
     }
   }
-  // testharness.js's output renderer calls insertAdjacentText on its
-  // results table. Without this, the renderer throws inside a forEach
-  // that has no try/catch and the chain of completion callbacks dies
-  // before reaching our runner hook, so EVERY WPT test with subtests
-  // looked like a timeout. Adding this method unblocks the harness
-  // pipeline and surfaces real subtest pass/fail.
-  insertAdjacentText(position, text) {
-    const node = document.createTextNode(String(text));
-    const parent = this.parentNode;
-    switch (position) {
-      case 'beforebegin': if (parent) parent.insertBefore(node, this); break;
-      case 'afterbegin': this.insertBefore(node, this.firstChild); break;
-      case 'beforeend': this.appendChild(node); break;
-      case 'afterend': if (parent) parent.insertBefore(node, this.nextSibling); break;
-    }
-  }
-  insertAdjacentElement(position, element) {
-    if (!element || element.nodeType !== 1) return null;
-    const parent = this.parentNode;
-    switch (position) {
-      case 'beforebegin': if (parent) { parent.insertBefore(element, this); return element; } return null;
-      case 'afterbegin': this.insertBefore(element, this.firstChild); return element;
-      case 'beforeend': this.appendChild(element); return element;
-      case 'afterend': if (parent) { parent.insertBefore(element, this.nextSibling); return element; } return null;
-    }
-    return null;
-  }
   addEventListener(type, handler, opts) {
-    // Per DOM spec, a listener can be a function OR an object with a
-    // `handleEvent` method. Anything else is silently ignored. Without
-    // this filter, passing null/string/number used to push a non-callable
-    // into the handler array and explode at dispatch time.
-    if (typeof handler !== 'function' &&
-        !(handler && typeof handler === 'object' && typeof handler.handleEvent === 'function')) {
-      return;
-    }
-    const once = opts && typeof opts === 'object' && opts.once === true;
-    const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
-    const passive = !!(opts && typeof opts === 'object' && opts.passive);
     const key = this._nid;
     if (!_eventRegistry[key]) _eventRegistry[key] = {};
     if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    // Dedupe: spec says same (type, callback, capture) is a no-op.
-    const arr = _eventRegistry[key][type];
-    for (const e of arr) {
-      if (e.handler === handler && e.capture === capture) return;
-    }
-    arr.push({ handler, once, capture, passive });
+    _eventRegistry[key][type].push(handler);
   }
-  removeEventListener(type, handler, opts) {
+  removeEventListener(type, handler) {
     const key = this._nid;
-    const capture = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
     if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type]
-        .filter(e => !(e.handler === handler && e.capture === capture));
+      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
     }
   }
   dispatchEvent(event) {
@@ -797,25 +664,9 @@ class Element extends Node {
         if (ret === false) event.preventDefault();
       } catch(e) { console.error(e); }
     }
-    // Snapshot the listener list — `once: true` listeners are removed
-    // during dispatch, but spec says dispatched listeners are captured
-    // before the loop starts.
-    const slot = (_eventRegistry[this._nid] || {})[event.type] || [];
-    const handlers = slot.slice();
-    for (const entry of handlers) {
-      const h = entry && entry.handler;
-      if (!h) continue;
-      try {
-        if (typeof h === 'function') {
-          h.call(this, event);
-        } else if (typeof h.handleEvent === 'function') {
-          h.handleEvent(event);
-        }
-      } catch (e) { console.error(e); }
-      if (entry.once) {
-        const i = slot.indexOf(entry);
-        if (i !== -1) slot.splice(i, 1);
-      }
+    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
+    for (const h of handlers) {
+      try { h.call(this, event); } catch(e) { console.error(e); }
       if (event._immediatePropagationStopped) break;
     }
     if (event.bubbles && !event._propagationStopped && this.parentNode) {
@@ -920,49 +771,8 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
-  get href() {
-    const raw = this.getAttribute("href");
-    if (raw == null) return "";
-    // Per spec, HTMLAnchorElement.href / HTMLAreaElement.href returns the
-    // serialized resolved URL (the content attribute resolved against the
-    // document base). Bing's anti-malware shim and many other libraries
-    // rely on this resolution to read `.hostname` / `.protocol`. We only
-    // resolve for <a>/<area>/<base>/<link> so other elements that happen
-    // to carry an `href` attribute (custom elements, SVG <a>, etc) keep
-    // the raw value they were assigned.
-    const tag = this.localName;
-    if (tag === 'a' || tag === 'area' || tag === 'base' || tag === 'link') {
-      try {
-        return new URL(raw, _domParse("document_url") || globalThis.location?.href || "about:blank").href;
-      } catch { return raw; }
-    }
-    return raw;
-  }
+  get href() { return this.getAttribute("href") || ""; }
   set href(v) { this.setAttribute("href", v); }
-  // URL-decomposition IDL attributes for <a> / <area>. Without these,
-  // libraries that build an anchor and read parts of the resolved URL
-  // (Bing's CI.AntiMalware shim does `n=createElement("A"); n.href=src;
-  // n.hostname.length`) crash with "Cannot read properties of undefined".
-  _urlPart(part) {
-    const tag = this.localName;
-    if (tag !== 'a' && tag !== 'area') return "";
-    const raw = this.getAttribute("href");
-    if (raw == null || raw === "") return "";
-    try {
-      const u = new URL(raw, _domParse("document_url") || globalThis.location?.href || "about:blank");
-      return u[part] || "";
-    } catch { return ""; }
-  }
-  get origin() { return this._urlPart('origin'); }
-  get protocol() { return this._urlPart('protocol'); }
-  get username() { return this._urlPart('username'); }
-  get password() { return this._urlPart('password'); }
-  get host() { return this._urlPart('host'); }
-  get hostname() { return this._urlPart('hostname'); }
-  get port() { return this._urlPart('port'); }
-  get pathname() { return this._urlPart('pathname'); }
-  get search() { return this._urlPart('search'); }
-  get hash() { return this._urlPart('hash'); }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
@@ -986,7 +796,6 @@ class Element extends Node {
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
       _registerIframe(el);
-      _activateIframe(el);
       if (typeof el.onload === 'function') {
         try { el.onload(); } catch(e) {}
       } else {
@@ -1282,24 +1091,6 @@ class Document extends Node {
     _cache.set(nid, n);
     return n;
   }
-  createProcessingInstruction(target, data) {
-    // Spec: target must be a valid XML Name, data must not contain "?>".
-    // Throw InvalidCharacterError on either violation. Simplified XML
-    // Name check (first char + remainder is enough for the WPT tests).
-    const t = String(target);
-    const d = String(data ?? "");
-    if (!t.length || !/^[A-Za-z_:][\w.\-:]*$/.test(t)) {
-      const e = new Error("InvalidCharacterError"); e.name = "InvalidCharacterError"; throw e;
-    }
-    if (d.indexOf("?>") !== -1) {
-      const e = new Error("InvalidCharacterError"); e.name = "InvalidCharacterError"; throw e;
-    }
-    const nid = +_dom("create_processing_instruction", t, d);
-    const n = new ProcessingInstruction(nid);
-    n._target = t;
-    _cache.set(nid, n);
-    return n;
-  }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
@@ -1469,19 +1260,6 @@ class Document extends Node {
         const html = `<${safe}></${safe}>`;
         return new DOMParser().parseFromString(html, "application/xml");
       },
-      // DOM Level 2: a DocumentType node usable as the third arg of
-      // createDocument(). We allocate a Doctype node in the DOM tree and
-      // wrap it. The new node is detached (no parent) which matches the
-      // spec; callers like createDocument(ns, name, doctype) attach it.
-      createDocumentType(name, publicId, systemId) {
-        const nid = +_dom("create_doctype", String(name || ""), String(publicId || ""));
-        // ops.rs::create_doctype takes (name, publicId) — systemId stored
-        // here only in the JS wrapper since neither current test consumes
-        // it from the underlying tree.
-        const dt = new DocumentType(nid, String(name || ""), String(publicId || ""), String(systemId || ""));
-        _cache.set(nid, dt);
-        return dt;
-      },
       hasFeature() { return true; },
     };
   }
@@ -1578,16 +1356,8 @@ function _wrap(nid) {
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
-  else if (t === 7) n = new ProcessingInstruction(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
-  else if (t === 10) {
-    // DocumentType wrapper. Pull the name/publicId from the tree so
-    // the wrapper exposes the spec'd .name / .publicId getters.
-    const name = _domParse("doctype_name", nid) || "";
-    const publicId = _domParse("doctype_public_id", nid) || "";
-    n = new DocumentType(nid, name, publicId, "");
-  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -1683,9 +1453,6 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
 
 const _iframeRegistry = [];
 function _registerIframe(iframeEl) {
-  // Same iframe element can have its src reassigned; we don't want to
-  // double-register and fan out events twice to the same window.
-  if (_iframeRegistry.indexOf(iframeEl) !== -1) return;
   const idx = _iframeRegistry.length;
   _iframeRegistry.push(iframeEl);
   globalThis.length = _iframeRegistry.length;
@@ -1694,29 +1461,6 @@ function _registerIframe(iframeEl) {
     configurable: true,
     enumerable: false,
   });
-}
-// Run inline <script> blocks from the iframe HTML in the parent realm
-// (we don't have per-frame realms) and rewire <body onfoo="..."> handler
-// attributes as window-level listeners on the iframe window.
-function _activateIframe(iframeEl) {
-  const doc = iframeEl._iframeDoc;
-  const win = iframeEl._iframeWin;
-  if (!doc || !win) return;
-  if (Array.isArray(doc._inlineScripts)) {
-    for (const src of doc._inlineScripts) {
-      try { (0, eval)(src); } catch (e) {}
-    }
-  }
-  if (doc._bodyHandlers) {
-    for (const onName of Object.keys(doc._bodyHandlers)) {
-      const type = onName.slice(2); // "onstorage" -> "storage"
-      const code = doc._bodyHandlers[onName];
-      const handler = function(event) {
-        try { (new Function('event', code)).call(win, event); } catch (e) {}
-      };
-      try { win.addEventListener(type, handler); } catch (e) {}
-    }
-  }
 }
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
@@ -1741,6 +1485,7 @@ globalThis.navigator = {
     p.item = (i) => p[i] || null;
     p.namedItem = (name) => p.find(x => x.name === name) || null;
     p.refresh = () => {};
+    p[Symbol.iterator] = function() { return this[Symbol.iterator](); };
     return p;
   },
   get mimeTypes() {
@@ -1798,18 +1543,75 @@ globalThis.navigator = {
   getGamepads() { return []; },
   sendBeacon() { return true; },
   javaEnabled() { return false; },
+  geolocation: {
+    getCurrentPosition(success, error) {
+      const coords = {
+        latitude: 50.1109 + (_fpRand(500) - 0.5) * 0.1,
+        longitude: 8.6821 + (_fpRand(501) - 0.5) * 0.1,
+        accuracy: 10 + _fpRand(502) * 40,
+        altitude: null,
+        altitudeAccuracy: null,
+        heading: null,
+        speed: null,
+      };
+      const pos = { coords, timestamp: Date.now() };
+      if (typeof success === 'function') success(pos);
+    },
+    watchPosition(success, error) {
+      if (typeof success === 'function') {
+        const coords = {
+          latitude: 50.1109 + (_fpRand(503) - 0.5) * 0.1,
+          longitude: 8.6821 + (_fpRand(504) - 0.5) * 0.1,
+          accuracy: 10 + _fpRand(505) * 40,
+          altitude: null,
+          altitudeAccuracy: null,
+          heading: null,
+          speed: null,
+        };
+        success({ coords, timestamp: Date.now() });
+      }
+      return 0;
+    },
+    clearWatch() {},
+  },
+  storage: {
+    estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
+    persist() { return Promise.resolve(false); },
+    persisted() { return Promise.resolve(false); },
+  },
 };
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
   runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { return {}; }, sendMessage() {} },
-  csi() { return {}; },
-  loadTimes() { return {}; },
+  csi() {
+    const t = Date.now();
+    return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
+  },
+  loadTimes() {
+    const t = Date.now() / 1000;
+    const request = t - 0.5 - _fpRand(611) * 0.5;
+    const startLoad = request + 0.05 + _fpRand(612) * 0.02;
+    const commit = request + 0.3 + _fpRand(613) * 0.4;
+    const finishDoc = commit + 0.1 + _fpRand(614) * 0.2;
+    const finish = finishDoc + 0.05 + _fpRand(615) * 0.1;
+    const firstPaint = commit + 0.03 + _fpRand(616) * 0.1;
+    const navTypes = ["BackForward","Reload","Link","Other"];
+    return {
+      requestTime: request, startLoadTime: startLoad * 1000, commitLoadTime: commit * 1000,
+      finishDocumentLoadTime: finishDoc * 1000, finishLoadTime: finish * 1000,
+      firstPaintTime: firstPaint * 1000, firstPaintAfterLoadTime: 0,
+      navigationType: navTypes[Math.floor(_fpRand(617) * 4)],
+      wasFetchedViaSpdy: false, wasNpnNegotiated: false,
+      npnNegotiatedProtocol: "http/1.1",
+      wasAlternateProtocolAvailable: false, connectionInfo: "http/1.1",
+    };
+  },
 };
 
 globalThis.Notification = class Notification {
   static permission = "default";
-  static requestPermission() { return Promise.resolve("default"); }
+  static requestPermission() { return Promise.resolve(Notification.permission); }
   constructor() {}
 };
 
@@ -1819,8 +1621,8 @@ globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 globalThis.screen = { width:1920, height:1080, availWidth:1920, availHeight:1040, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
-globalThis.innerWidth = 1280; globalThis.innerHeight = 720;
-globalThis.outerWidth = 1280; globalThis.outerHeight = 720;
+globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
+globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 
@@ -2811,104 +2613,8 @@ globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o)
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
-// AbortSignal is an EventTarget that crawlers wire up to cancel
-// long-running fetches and worker jobs. The previous shim was a plain
-// object with stub addEventListener/removeEventListener, so listeners
-// for 'abort' silently never fired and any AbortSignal.timeout/.any
-// chains broke. We can't extend EventTarget here because the snapshot
-// build evaluates bootstrap.js top-to-bottom and EventTarget is
-// assigned later (and as Node, which AbortSignal is not). Inline the
-// event-target surface instead.
-globalThis.AbortSignal = class AbortSignal {
-  constructor() {
-    this._aborted = false;
-    this._reason = undefined;
-    this._listeners = { abort: [] };
-    this.onabort = null;
-  }
-  get aborted() { return this._aborted; }
-  get reason() {
-    if (!this._aborted) return undefined;
-    return this._reason !== undefined
-      ? this._reason
-      : new DOMException('signal is aborted without reason', 'AbortError');
-  }
-  throwIfAborted() {
-    if (this._aborted) throw this.reason;
-  }
-  addEventListener(type, fn) {
-    if (typeof fn !== 'function') return;
-    (this._listeners[type] = this._listeners[type] || []).push(fn);
-  }
-  removeEventListener(type, fn) {
-    const arr = this._listeners[type];
-    if (!arr) return;
-    const i = arr.indexOf(fn);
-    if (i !== -1) arr.splice(i, 1);
-  }
-  dispatchEvent(ev) {
-    const arr = this._listeners[ev && ev.type] || [];
-    for (const h of arr.slice()) {
-      try { h.call(this, ev); } catch (e) {}
-    }
-    return true;
-  }
-  _fireAbort() {
-    const ev = (typeof Event === 'function') ? new Event('abort') : { type: 'abort', target: this };
-    try { ev.target = this; } catch (e) {}
-    try { if (typeof this.onabort === 'function') this.onabort.call(this, ev); } catch (e) {}
-    this.dispatchEvent(ev);
-  }
-  static abort(reason) {
-    const s = new AbortSignal();
-    s._aborted = true;
-    s._reason = reason;
-    return s;
-  }
-  static timeout(ms) {
-    const s = new AbortSignal();
-    setTimeout(() => {
-      if (s._aborted) return;
-      s._aborted = true;
-      s._reason = new DOMException('signal timed out', 'TimeoutError');
-      s._fireAbort();
-    }, Number(ms) || 0);
-    return s;
-  }
-  static any(signals) {
-    const s = new AbortSignal();
-    const list = Array.from(signals || []);
-    for (const child of list) {
-      if (!(child instanceof AbortSignal)) continue;
-      if (child.aborted) {
-        s._aborted = true;
-        s._reason = child.reason;
-        return s;
-      }
-    }
-    const onChildAbort = function(ev) {
-      if (s._aborted) return;
-      const src = ev && ev.target;
-      s._aborted = true;
-      s._reason = src && src.reason;
-      s._fireAbort();
-    };
-    for (const child of list) {
-      if (!(child instanceof AbortSignal)) continue;
-      try { child.addEventListener('abort', onChildAbort); } catch (e) {}
-    }
-    return s;
-  }
-};
-globalThis.AbortController = class AbortController {
-  constructor() { this.signal = new AbortSignal(); }
-  abort(reason) {
-    if (this.signal._aborted) return;
-    this.signal._aborted = true;
-    this.signal._reason = reason;
-    this.signal._fireAbort();
-  }
-};
+globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
+globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
@@ -3051,22 +2757,50 @@ globalThis.performance = globalThis.performance || {
   },
 };
 
+var _commonFonts = [
+  'Arial', 'Arial Black', 'Arial Narrow',
+  'Baskerville', 'Book Antiqua',
+  'Calibri', 'Cambria', 'Candara', 'Consolas', 'Courier New',
+  'DejaVu Sans', 'DejaVu Sans Mono', 'DejaVu Serif',
+  'Futura',
+  'Garamond', 'Georgia', 'Gill Sans',
+  'Helvetica',
+  'Impact',
+  'Liberation Sans', 'Liberation Sans Mono', 'Liberation Serif',
+  'Lucida Console', 'Lucida Handwriting',
+  'Microsoft Sans Serif', 'Monaco',
+  'Noto Sans', 'Noto Serif',
+  'Palatino Linotype',
+  'Segoe UI',
+  'Tahoma', 'Times New Roman', 'Trebuchet MS',
+  'Verdana',
+  'Webdings', 'Wingdings',
+];
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
-    return {
-      ready: Promise.resolve(),
-      check() { return true; },
-      load() { return Promise.resolve([]); },
-      add() {},
-      delete() { return false; },
-      clear() {},
-      has() { return false; },
-      forEach() {},
-      get size() { return 0; },
-      get status() { return 'loaded'; },
-      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-      [Symbol.iterator]() { return [][Symbol.iterator](); },
+    const _set = _commonFonts.map((name, i) => ({
+      family: name, style: 'normal', weight: '400', stretch: 'normal',
+      status: 'loaded', loaded: Promise.resolve(this),
+      [Symbol.toStringTag]: 'FontFace',
+    }));
+    _set.forEach = (fn) => { _set.forEach(fn); };
+    _set.has = (f) => typeof f === 'string'
+      ? _commonFonts.some(n => n.toLowerCase() === f.toLowerCase())
+      : _set.some(ff => ff.family === f?.family);
+    _set.delete = (f) => false;
+    _set.clear = () => {};
+    _set.add = () => {};
+    _set.load = () => Promise.resolve(_set);
+    _set.check = (font) => {
+      const m = typeof font === 'string' ? font.match(/["']([^"']+)["']/) : null;
+      return m ? _commonFonts.some(n => n.toLowerCase() === m[1].toLowerCase()) : true;
     };
+    _set.ready = Promise.resolve(_set);
+    _set.status = 'loaded';
+    _set.addEventListener = () => {};
+    _set.removeEventListener = () => {};
+    _set.dispatchEvent = () => true;
+    return _set;
   },
   configurable: true,
 });
@@ -3075,78 +2809,10 @@ globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JS
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
 globalThis.Storage = function Storage() {};
-// StorageEvent: dispatched on window when localStorage / sessionStorage
-// mutates. Per spec, the same window does NOT receive the event for its
-// own writes, but for an in-process single-page shim we dispatch
-// regardless so test code that registers a listener and writes from the
-// same window can observe the event (which is what every webstorage WPT
-// test does).
-globalThis.StorageEvent = class StorageEvent extends Event {
-  constructor(type, init) {
-    init = init || {};
-    super(type, init);
-    this.key = init.key !== undefined ? init.key : null;
-    this.oldValue = init.oldValue !== undefined ? init.oldValue : null;
-    this.newValue = init.newValue !== undefined ? init.newValue : null;
-    this.url = init.url !== undefined ? init.url : (globalThis.location ? globalThis.location.href : '');
-    this.storageArea = init.storageArea !== undefined ? init.storageArea : null;
-  }
-};
-function _dispatchStorageEvent(area, key, oldValue, newValue) {
-  try {
-    const mkEvent = () => new StorageEvent('storage', {
-      key: key,
-      oldValue: oldValue == null ? null : String(oldValue),
-      newValue: newValue == null ? null : String(newValue),
-      url: globalThis.location ? globalThis.location.href : '',
-      storageArea: area,
-      bubbles: false,
-      cancelable: false,
-    });
-    Promise.resolve().then(() => {
-      try { globalThis.dispatchEvent(mkEvent()); } catch (e) {}
-      // Per spec the originating window does NOT receive the event, but
-      // other same-origin browsing contexts do. We fire on the parent
-      // and every iframe window so cross-frame storage listeners (used
-      // by webstorage WPT tests) see the change.
-      try {
-        const reg = (typeof _iframeRegistry !== 'undefined') ? _iframeRegistry : [];
-        for (const el of reg) {
-          const win = el && el._iframeWin;
-          if (!win) continue;
-          try { win.dispatchEvent(mkEvent()); } catch (e) {}
-        }
-      } catch (e) {}
-    });
-  } catch (e) {}
-}
-Storage.prototype.getItem = function(k) {
-  const v = this._data ? this._data[String(k)] : undefined;
-  return v == null ? null : String(v);
-};
-Storage.prototype.setItem = function(k, v) {
-  if (!this._data) return;
-  const key = String(k);
-  const newValue = String(v);
-  const oldValue = Object.prototype.hasOwnProperty.call(this._data, key) ? this._data[key] : null;
-  if (oldValue === newValue) return;
-  this._data[key] = newValue;
-  _dispatchStorageEvent(this, key, oldValue, newValue);
-};
-Storage.prototype.removeItem = function(k) {
-  if (!this._data) return;
-  const key = String(k);
-  if (!Object.prototype.hasOwnProperty.call(this._data, key)) return;
-  const oldValue = this._data[key];
-  delete this._data[key];
-  _dispatchStorageEvent(this, key, oldValue, null);
-};
-Storage.prototype.clear = function() {
-  if (!this._data) return;
-  const hadAny = Object.keys(this._data).length > 0;
-  for (var k in this._data) delete this._data[k];
-  if (hadAny) _dispatchStorageEvent(this, null, null, null);
-};
+Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
+Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
+Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
+Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
 Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
 Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
 
@@ -3299,8 +2965,11 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
 
 [
   navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
-  navigator.javaEnabled, navigator.serviceWorker?.register,
+  navigator.javaEnabled, navigator.geolocation?.getCurrentPosition,
+  navigator.geolocation?.watchPosition,
+  navigator.serviceWorker?.register,
   navigator.permissions?.query, navigator.credentials?.get,
+  navigator.storage?.estimate, navigator.storage?.persist, navigator.storage?.persisted,
   globalThis.fetch, globalThis.matchMedia, globalThis.getComputedStyle,
   globalThis.getSelection, globalThis.requestAnimationFrame,
   globalThis.cancelAnimationFrame, globalThis.setTimeout, globalThis.clearTimeout,
@@ -3361,42 +3030,11 @@ class _IframeDocument {
     this._body = document.createElement('body');
     this._root.appendChild(this._head);
     this._root.appendChild(this._body);
-
-    // Capture inline scripts from the iframe HTML head so we can run
-    // them in the current context after wiring is complete. Real iframes
-    // would get their own JS realm; we share globalThis so any function
-    // declarations become globally visible. Tests like webstorage that
-    // load a helper iframe with `<script>function handler(e){...}</script>`
-    // in head rely on this side effect.
-    this._inlineScripts = [];
-    const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-    let mm;
-    const headMatch = (html || "").match(/<head[^>]*>([\s\S]*?)<\/head>/i);
-    if (headMatch) {
-      while ((mm = scriptRe.exec(headMatch[1])) !== null) {
-        if (mm[1]) this._inlineScripts.push(mm[1]);
-      }
-    }
-
-    // Pull inline event-handler attributes off the <body> tag so we can
-    // re-attach them as window listeners. The bodyContent regex below
-    // strips the <body> wrapper.
-    this._bodyHandlers = {};
-    const bodyOpen = html.match(/<body\b([^>]*)>/i);
-    if (bodyOpen) {
-      const attrRe = /\s(on[a-z]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
-      let am;
-      while ((am = attrRe.exec(bodyOpen[1])) !== null) {
-        this._bodyHandlers[am[1].toLowerCase()] = am[2] || am[3] || am[4] || '';
-      }
-    }
-
     var bodyContent = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
       .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
       .replace(/<\/?body[^>]*>/gi, '')
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
       .replace(/^\s+/, ''); // trim leading whitespace (before <body> content)
     if (bodyContent) {
       this._body.innerHTML = bodyContent;
@@ -4057,7 +3695,7 @@ _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
 const _OrigDateTimeFormat = Intl.DateTimeFormat;
-const _defaultTZ = 'America/New_York';
+const _defaultTZ = 'Europe/Germany';
 Intl.DateTimeFormat = function(locales, options) {
   if (!options) options = {};
   if (!options.timeZone) options.timeZone = _defaultTZ;
@@ -4587,9 +4225,20 @@ globalThis.__obscura_init = function() {
   globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
   globalThis.outerWidth = sw; globalThis.outerHeight = sh;
 
-  const t0 = Date.now();
+  var hwValues = [2, 4, 6, 8, 12, 16];
+  globalThis.navigator.hardwareConcurrency = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
+  var memValues = [0.25, 0.5, 1, 2, 4, 8];
+  globalThis.navigator.deviceMemory = memValues[Math.floor(_fpRand(401) * memValues.length)];
+
+  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  globalThis.performance.memory = {
+    jsHeapSizeLimit: 2172649472,
+    totalJSHeapSize: 15000000 + Math.floor(_fpRand(620) * 85000000),
+    usedJSHeapSize: 8000000 + Math.floor(_fpRand(621) * 42000000),
+  };
+  globalThis.Notification.permission = _fpRand(630) > 0.5 ? "granted" : "default";
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

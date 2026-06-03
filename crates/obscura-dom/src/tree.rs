@@ -223,14 +223,6 @@ impl DomTree {
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
-        // Per DOM spec, appending a node to itself is a HierarchyRequestError;
-        // here we treat it as a no-op rather than panic. Without this the
-        // sibling-pointer fixup below sets the node's prev_sibling to itself
-        // and every later child-walk loops forever (same failure mode that
-        // insert_before's self-cycle guard was added to prevent).
-        if parent_id == child_id {
-            return;
-        }
         self.detach(child_id);
 
         let mut inner = self.inner.borrow_mut();
@@ -260,15 +252,6 @@ impl DomTree {
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
-        // Per DOM spec: if the node being inserted IS the reference node,
-        // the operation is a no-op (the node is already in its target
-        // position). Without this, the linked-list fixup below sets the
-        // node's prev_sibling and next_sibling to itself, creating a cycle
-        // — every later traversal (childNodes, querySelectorAll, etc) then
-        // loops forever and the test page hangs while obscura burns RAM.
-        if existing_id == new_sibling_id {
-            return;
-        }
         let (parent_id, prev_id) = {
             let inner = self.inner.borrow();
             let node = match inner.nodes.get(existing_id.index()).and_then(|n| n.as_ref()) {
@@ -480,20 +463,6 @@ impl DomTree {
 
     pub fn text_content(&self, node_id: NodeId) -> String {
         let inner = self.inner.borrow();
-        // Per DOM spec, calling textContent ON a CharacterData node
-        // (Text, Comment, ProcessingInstruction) returns its .data.
-        // Calling textContent on an Element walks descendants and
-        // concatenates Text node content only (Comment + PI are
-        // skipped). Handle the direct-CharacterData case here so the
-        // descent helper can keep its element-centric behavior.
-        if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
-            match &node.data {
-                NodeData::Text { contents } => return contents.clone(),
-                NodeData::Comment { contents } => return contents.clone(),
-                NodeData::ProcessingInstruction { data, .. } => return data.clone(),
-                _ => {}
-            }
-        }
         let mut result = String::new();
         collect_text_inner(&inner, node_id, &mut result);
         result
@@ -601,10 +570,6 @@ fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
     if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
         match &node.data {
             NodeData::Text { contents } => buf.push_str(contents),
-            // Comment and ProcessingInstruction are intentionally NOT
-            // appended when traversing descendants: per spec, textContent
-            // on an Element only includes Text descendants. Direct
-            // textContent on a Comment/PI is handled by the caller.
             _ => {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {

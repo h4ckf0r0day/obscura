@@ -72,6 +72,20 @@ impl StealthHttpClient {
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         let mut current_url = url.clone();
+
+        if let Some(host) = current_url.host_str() {
+            if crate::blocklist::is_blocked(host) {
+                tracing::debug!("Blocked tracker: {}", current_url);
+                return Ok(Response {
+                    status: 0,
+                    url: current_url,
+                    headers: HashMap::new(),
+                    body: Vec::new(),
+                    redirected_from: Vec::new(),
+                });
+            }
+        }
+
         let mut redirects = Vec::new();
 
         for _ in 0..20 {
