@@ -111,7 +111,7 @@ async fn one_client(port: u16, id_base: u64) -> Result<(), String> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "boots a real CDP server; opt-in with --ignored"]
+
 async fn concurrency_5_does_not_abort_v8() {
     let port = pick_port().await;
     let local = tokio::task::LocalSet::new();

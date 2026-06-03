@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -143,27 +146,21 @@ pub async fn start_with_full_serve_options(
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
+    // Ctrl-C / graceful shutdown coordination.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
+
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
-    //
-    // Lifecycle note: this thread is spawned detached (no `join` handle).
-    // It is intended to run for the entire process lifetime — the same
-    // contract Chromium DevTools / Playwright clients expect from a CDP
-    // server. When `start_with_*` returns (whether by Ok or panic in the
-    // LocalSet), `ws_rx` drops; the next `ws_tx.blocking_send` then
-    // returns `SendError`, which `accept_dispatch` surfaces as
-    // "accept channel closed" and the loop logs+continues. The listener
-    // FD stays bound until the process exits. If we ever need to support
-    // graceful shutdown for embedded/library use, add an
-    // `Arc<AtomicBool>` shutdown flag checked between `accept()`s and
-    // switch to a non-blocking `set_nonblocking(true)` + poll loop.
-    // For the standalone `obscura serve` binary the detached lifetime is
-    // correct.
+    let accept_flag = shutdown_flag.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
             for stream in std_listener.incoming() {
+                if accept_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 match stream {
                     Ok(stream) => {
                         if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
@@ -185,9 +182,19 @@ pub async fn start_with_full_serve_options(
             let _processor_handle = tokio::task::spawn_local(cdp_processor(
                 msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
                 allow_private_network,
+                shutdown_flag,
+                shutdown_notify.clone(),
             ));
 
-            while let Some(stream) = ws_rx.recv().await {
+            loop {
+                let stream = tokio::select! {
+                    stream = ws_rx.recv() => stream,
+                    _ = shutdown_notify.notified() => None,
+                };
+                let stream = match stream {
+                    Some(s) => s,
+                    None => break,
+                };
                 // Convert std TcpStream → tokio TcpStream inside the LocalSet
                 // where the tokio runtime is active.
                 stream
@@ -295,11 +302,11 @@ fn handle_http_json_blocking(
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Obscura/0.1.0",
+            "Browser": "Chrome/145.0.0.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
-            "V8-Version": "N/A",
-            "WebKit-Version": "N/A",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "V8-Version": "14.5.0.0",
+            "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
         }))?,
         "list" => serde_json::to_string_pretty(&json!([{
@@ -334,6 +341,8 @@ async fn cdp_processor(
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    shutdown_flag: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 ) {
     let mut ctx = CdpContext::new_full(
         proxy,
@@ -378,6 +387,8 @@ async fn cdp_processor(
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received");
+                    shutdown_flag.store(true, Ordering::Relaxed);
+                    shutdown_notify.notify_one();
                     break;
                 }
             }
@@ -846,10 +857,10 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Browser.getVersion" => {
             Some(json!({
                 "protocolVersion": "1.3",
-                "product": "Obscura/0.1.0",
-                "revision": "0",
-                "userAgent": "Obscura/0.1.0",
-                "jsVersion": "V8",
+                "product": "Chrome/145.0.0.0",
+                "revision": "@0000000000000000000000000000000000000000",
+                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                "jsVersion": "14.5.0.0",
             }))
         }
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {

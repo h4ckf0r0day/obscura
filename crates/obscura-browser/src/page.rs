@@ -675,6 +675,26 @@ impl Page {
         result
     }
 
+    /// Drive the JS event loop after navigation so deferred work can run:
+    /// pending timers (setTimeout / setInterval), queued microtasks, in-flight
+    /// fetches, and completion callbacks such as testharness's
+    /// `add_completion_callback`. Returns as soon as the loop goes idle, or
+    /// after `max_ms`. Without this the page is observed exactly as it stood at
+    /// the load event, before any async work settles, which silently strands
+    /// timer-driven tests and dynamic pages.
+    pub async fn settle(&mut self, max_ms: u64) {
+        if max_ms == 0 {
+            return;
+        }
+        if let Some(js) = &mut self.js {
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(max_ms),
+                js.run_event_loop(),
+            )
+            .await;
+        }
+    }
+
     /// Append the current URL to the history stack, truncating any forward
     /// entries past the cursor (matches real Chrome: navigating after a
     /// goBack clobbers the forward history).

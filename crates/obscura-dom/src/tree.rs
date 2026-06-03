@@ -264,7 +264,7 @@ impl DomTree {
         // the operation is a no-op (the node is already in its target
         // position). Without this, the linked-list fixup below sets the
         // node's prev_sibling and next_sibling to itself, creating a cycle
-        // — every later traversal (childNodes, querySelectorAll, etc) then
+        // -- every later traversal (childNodes, querySelectorAll, etc) then
         // loops forever and the test page hangs while obscura burns RAM.
         if existing_id == new_sibling_id {
             return;

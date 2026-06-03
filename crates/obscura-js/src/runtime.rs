@@ -1046,6 +1046,44 @@ mod tests {
     }
 
     #[test]
+    fn document_fragment_get_element_by_id_searches_descendants() {
+        let mut rt = setup_runtime(r#"<div id="target">document</div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const frag = document.createDocumentFragment();
+                    const section = document.createElement('section');
+                    section.innerHTML = '<div><span id="target">fragment</span></div><p id="a.b">literal</p>';
+                    frag.appendChild(section);
+
+                    const dup = document.createDocumentFragment();
+                    const deepParent = document.createElement('div');
+                    deepParent.innerHTML = '<span id="dup">deep</span>';
+                    const shallow = document.createElement('p');
+                    shallow.id = 'dup';
+                    shallow.textContent = 'shallow';
+                    dup.appendChild(deepParent);
+                    dup.appendChild(shallow);
+
+                    return [
+                        frag.getElementById('target').textContent,
+                        frag.getElementById('missing') === null,
+                        frag.getElementById('a.b').textContent,
+                        frag.getElementById(123) === null,
+                        dup.getElementById('dup').textContent,
+                    ];
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["fragment", true, "literal", true, "deep"])
+        );
+    }
+
+    #[test]
     fn test_inner_html() {
         let mut rt = setup_runtime(r#"<div id="x"><p>Hello</p></div>"#);
         let html = rt.evaluate("document.getElementById('x').innerHTML").unwrap();

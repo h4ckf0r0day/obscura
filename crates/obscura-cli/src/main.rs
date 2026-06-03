@@ -10,7 +10,7 @@ use tokio::time::{timeout, Duration};
 #[derive(Parser)]
 #[command(
     name = "obscura",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("OBSCURA_BUILD_VERSION"),
     about = "Obscura - A lightweight headless browser for web scraping and automation",
 )]
 struct Args {
@@ -189,9 +189,9 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.6
+  Headless Browser v{}
   CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+"#, env!("OBSCURA_BUILD_VERSION"), port);
 }
 
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
@@ -213,26 +213,6 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
 
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
-}
-
-/// `--stealth` routes outbound traffic through `wreq`, which doesn't speak
-/// SOCKS5. A previous workaround silently rewrote `socks5://` to `http://`,
-/// which broke plain SOCKS5 servers (#160). Refuse the combination at
-/// startup so the user gets a clear message instead of `TunnelUnexpectedEof`.
-fn reject_stealth_with_socks5(proxy: Option<&str>, stealth: bool) -> anyhow::Result<()> {
-    if !stealth {
-        return Ok(());
-    }
-    let Some(p) = proxy else { return Ok(()) };
-    let scheme = p.split("://").next().unwrap_or("").to_ascii_lowercase();
-    if scheme == "socks5" || scheme == "socks5h" {
-        anyhow::bail!(
-            "--stealth does not support SOCKS5 proxies (the stealth HTTP \
-             client cannot reach the upstream). Use --proxy http://... \
-             or drop --stealth."
-        );
-    }
-    Ok(())
 }
 
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
@@ -299,7 +279,6 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access, storage_dir }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
-            reject_stealth_with_socks5(proxy.as_deref(), stealth)?;
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -330,19 +309,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
-            reject_stealth_with_socks5(global_proxy.as_deref(), stealth)?;
             run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network).await?;
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
         }
         Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
-            let mcp_proxy = merge_proxy(global_proxy.clone(), proxy.clone());
-            reject_stealth_with_socks5(mcp_proxy.as_deref(), stealth)?;
+            let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(port, proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run(port, mcp_proxy, user_agent, stealth).await?;
             } else {
-                obscura_mcp::run(proxy, user_agent, stealth).await?;
+                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
             }
         }
         None => {
@@ -548,6 +525,12 @@ async fn run_fetch(
     if !quiet {
         eprintln!("Page loaded: {} - \"{}\"", page.url_string(), page.title);
     }
+
+    // --wait is a post-load settle: drive the event loop so timers, async work,
+    // and completion callbacks (e.g. testharness's add_completion_callback) run
+    // before we read the page. Returns early once the loop is idle, so static
+    // pages stay fast.
+    page.settle(wait_secs.saturating_mul(1000)).await;
 
     if let Some(ref sel) = selector {
         let found = wait_for_selector(&mut page, sel, wait_secs).await;
@@ -1114,7 +1097,7 @@ mod tests {
     use super::{
         effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
         is_quiet_command, link_kind_from_rel, merge_proxy, normalize_v8_flags,
-        reject_stealth_with_socks5, resolve_asset_url, select_log_filter, write_or_print,
+        resolve_asset_url, select_log_filter, write_or_print,
         write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
@@ -1386,41 +1369,6 @@ mod tests {
         let merged = effective_v8_flags(Some("--expose-gc"));
         assert!(merged.contains(DEFAULT_V8_FLAGS));
         assert!(merged.contains("--expose-gc"));
-    }
-
-    #[test]
-    fn reject_stealth_with_socks5_passes_when_no_stealth() {
-        assert!(reject_stealth_with_socks5(Some("socks5://127.0.0.1:1080"), false).is_ok());
-    }
-
-    #[test]
-    fn reject_stealth_with_socks5_passes_when_no_proxy() {
-        assert!(reject_stealth_with_socks5(None, true).is_ok());
-    }
-
-    #[test]
-    fn reject_stealth_with_socks5_passes_for_http_proxy() {
-        assert!(reject_stealth_with_socks5(Some("http://127.0.0.1:8080"), true).is_ok());
-        assert!(reject_stealth_with_socks5(Some("https://proxy.example:443"), true).is_ok());
-    }
-
-    #[test]
-    fn reject_stealth_with_socks5_fails_for_socks5() {
-        let err = reject_stealth_with_socks5(Some("socks5://127.0.0.1:9999"), true).unwrap_err();
-        assert!(err.to_string().contains("SOCKS5"));
-        assert!(err.to_string().contains("--stealth"));
-    }
-
-    #[test]
-    fn reject_stealth_with_socks5_fails_for_socks5h() {
-        let err = reject_stealth_with_socks5(Some("socks5h://127.0.0.1:9999"), true).unwrap_err();
-        assert!(err.to_string().contains("SOCKS5"));
-    }
-
-    #[test]
-    fn reject_stealth_with_socks5_is_case_insensitive() {
-        let err = reject_stealth_with_socks5(Some("SOCKS5://127.0.0.1:9999"), true).unwrap_err();
-        assert!(err.to_string().contains("SOCKS5"));
     }
 
     #[test]

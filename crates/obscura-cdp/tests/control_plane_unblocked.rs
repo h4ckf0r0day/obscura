@@ -35,7 +35,7 @@ async fn pick_port() -> u16 {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "boots a real CDP server; opt-in with --ignored"]
+
 async fn http_control_plane_unblocked_during_long_js() {
     let port = pick_port().await;
     let port_clone = port;
