@@ -3704,26 +3704,22 @@ function _rngNodeLength(n) {
   if (t === 3 || t === 4 || t === 8 || t === 7) return (n.data || n.nodeValue || "").length;
   return n.childNodes.length;
 }
+// Index among siblings, computed in Rust (one op) instead of serializing the
+// whole childNodes list per call: the Range matrices call this heavily.
 function _rngNodeIndex(n) {
-  const p = n.parentNode;
-  if (!p) return 0;
-  const kids = p.childNodes;
-  for (let i = 0; i < kids.length; i++) if (kids[i] && kids[i]._nid === n._nid) return i;
-  return 0;
+  if (!n.parentNode) return 0;
+  return +_dom("node_index", n._nid);
 }
 function _rngSame(a, b) { return a === b || (!!a && !!b && a._nid === b._nid); }
-function _rngRoot(n) { let r = n; while (r && r.parentNode) r = r.parentNode; return r; }
+// Root nid in one op (callers only read ._nid), instead of an O(depth) walk.
+function _rngRoot(n) { return { _nid: +_dom("node_root", n._nid) }; }
 function _rngAncestors(n) { const a = []; let c = n; while (c) { a.push(c); c = c.parentNode; } return a; }
 // document (preorder) tree order: -1 if a precedes b, 1 if a follows b, 0 same.
+// Computed in Rust (one op) rather than walking ancestor chains over per-step
+// DOM ops, which made the large dom/ranges matrices time out.
 function _rngOrder(a, b) {
   if (_rngSame(a, b)) return 0;
-  const aa = _rngAncestors(a).reverse(), bb = _rngAncestors(b).reverse();
-  if (aa[0]._nid !== bb[0]._nid) return (a._nid | 0) < (b._nid | 0) ? -1 : 1;
-  let i = 0;
-  while (i < aa.length && i < bb.length && aa[i]._nid === bb[i]._nid) i++;
-  if (i >= aa.length) return -1; // a is an ancestor of b -> a precedes
-  if (i >= bb.length) return 1;  // b is an ancestor of a -> a follows
-  return _rngNodeIndex(aa[i]) < _rngNodeIndex(bb[i]) ? -1 : 1;
+  return +_dom("compare_order", a._nid, b._nid) || 0;
 }
 // Position of (nA,oA) relative to (nB,oB): -1 before, 0 equal, 1 after.
 function _rngCmp(nA, oA, nB, oB) {
