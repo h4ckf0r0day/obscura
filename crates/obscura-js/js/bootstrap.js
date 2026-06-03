@@ -1409,6 +1409,12 @@ class Document extends Node {
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get contentType() {
+    // An explicit type set by DOMParser/createDocument wins.
+    if (this._contentType) return this._contentType;
+    // `new Document()` (the WHATWG constructor, no backing node id) creates an
+    // XML document, so createCDATASection/etc. must not throw. Live documents
+    // wrapped from the tree carry a real nid and fall through to URL-derived.
+    if (this._nid === undefined || this._nid === null) return "application/xml";
     const url = this.URL || "";
     // data: URLs carry their MIME type explicitly.
     const dm = /^data:([^,;]+)/i.exec(url);
@@ -1635,6 +1641,7 @@ class Document extends Node {
   getSelection() { return globalThis.getSelection(); }
   get activeElement() { return globalThis.__obscura_focused || this.body; }
   get implementation() {
+    const ownerDoc = this;
     return {
       // Spec: createHTMLDocument returns a NEW detached Document. jQuery
       // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
@@ -1660,6 +1667,24 @@ class Document extends Node {
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
         const html = `<${safe}></${safe}>`;
         return new DOMParser().parseFromString(html, "application/xml");
+      },
+      // createDocumentType(qualifiedName, publicId, systemId): build a detached
+      // DocumentType node. Browsers validate leniently here (only a name with
+      // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
+      // owner document is the document whose implementation was used.
+      createDocumentType(qualifiedName, publicId, systemId) {
+        const name = String(qualifiedName);
+        if (name === "" || /[\t\n\f\r >]/.test(name)) {
+          throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
+        }
+        const dt = new DocumentType(
+          +_dom("create_comment_node", ""),
+          name,
+          publicId === undefined ? "" : String(publicId),
+          systemId === undefined ? "" : String(systemId)
+        );
+        dt._ownerDocument = ownerDoc;
+        return dt;
       },
       hasFeature() { return true; },
     };
@@ -1750,7 +1775,9 @@ class DocumentType extends Node {
   get name() { return this._name; }
   get publicId() { return this._publicId; }
   get systemId() { return this._systemId; }
-  get ownerDocument() { return globalThis.document; }
+  get nodeValue() { return null; }
+  set nodeValue(v) {}
+  get ownerDocument() { return this._ownerDocument || globalThis.document; }
 }
 
 const _cache = new Map();
@@ -3630,7 +3657,165 @@ globalThis.DOMTokenList = DOMTokenList;
 globalThis.NodeList = class NodeList extends Array {
   item(i) { return this[i] != null ? this[i] : null; }
 };
-globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
+// Live Range over the real DOM tree. dom/ranges/* tests are pure boundary-point
+// algorithms (no layout, no editing engine), so a property-storing Range with
+// correct tree-order comparison passes them. Mutating ops (extract/delete/
+// insert/surround) are kept minimal: they do not throw, but do not rewrite the
+// tree (that is the editing mega-bucket, out of scope).
+function _rngNodeLength(n) {
+  const t = n.nodeType;
+  if (t === 3 || t === 4 || t === 8 || t === 7) return (n.data || n.nodeValue || "").length;
+  return n.childNodes.length;
+}
+function _rngNodeIndex(n) {
+  const p = n.parentNode;
+  if (!p) return 0;
+  const kids = p.childNodes;
+  for (let i = 0; i < kids.length; i++) if (kids[i] && kids[i]._nid === n._nid) return i;
+  return 0;
+}
+function _rngSame(a, b) { return a === b || (!!a && !!b && a._nid === b._nid); }
+function _rngRoot(n) { let r = n; while (r && r.parentNode) r = r.parentNode; return r; }
+function _rngAncestors(n) { const a = []; let c = n; while (c) { a.push(c); c = c.parentNode; } return a; }
+// document (preorder) tree order: -1 if a precedes b, 1 if a follows b, 0 same.
+function _rngOrder(a, b) {
+  if (_rngSame(a, b)) return 0;
+  const aa = _rngAncestors(a).reverse(), bb = _rngAncestors(b).reverse();
+  if (aa[0]._nid !== bb[0]._nid) return (a._nid | 0) < (b._nid | 0) ? -1 : 1;
+  let i = 0;
+  while (i < aa.length && i < bb.length && aa[i]._nid === bb[i]._nid) i++;
+  if (i >= aa.length) return -1; // a is an ancestor of b -> a precedes
+  if (i >= bb.length) return 1;  // b is an ancestor of a -> a follows
+  return _rngNodeIndex(aa[i]) < _rngNodeIndex(bb[i]) ? -1 : 1;
+}
+// Position of (nA,oA) relative to (nB,oB): -1 before, 0 equal, 1 after.
+function _rngCmp(nA, oA, nB, oB) {
+  if (_rngSame(nA, nB)) return oA < oB ? -1 : (oA > oB ? 1 : 0);
+  if (_rngOrder(nA, nB) > 0) return -_rngCmp(nB, oB, nA, oA);
+  if (nA.contains && nA.contains(nB)) { // nA is a strict ancestor of nB
+    let child = nB;
+    while (child && child.parentNode && child.parentNode._nid !== nA._nid) child = child.parentNode;
+    if (child && child.parentNode && child.parentNode._nid === nA._nid && _rngNodeIndex(child) < oA) return 1;
+    return -1;
+  }
+  return -1;
+}
+function _rngCheckOffset(n, o) {
+  if (n && n.nodeType === 10) throw new DOMException("Range boundary cannot be a DocumentType", "InvalidNodeTypeError");
+  if (o < 0 || o > _rngNodeLength(n)) throw new DOMException("Range offset out of bounds", "IndexSizeError");
+}
+globalThis.Range = class Range {
+  constructor() {
+    const d = globalThis.document || null;
+    this._sc = d; this._so = 0; this._ec = d; this._eo = 0;
+  }
+  get startContainer() { return this._sc; }
+  get startOffset() { return this._so; }
+  get endContainer() { return this._ec; }
+  get endOffset() { return this._eo; }
+  get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
+  get commonAncestorContainer() {
+    if (!this._sc || !this._ec) return null;
+    const setA = new Set(_rngAncestors(this._sc).map(n => n._nid));
+    let c = this._ec;
+    while (c) { if (setA.has(c._nid)) return c; c = c.parentNode; }
+    return null;
+  }
+  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n)._nid !== _rngRoot(this._ec)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
+  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
+  setStartBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n)); }
+  setStartAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n) + 1); }
+  setEndBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n)); }
+  setEndAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n) + 1); }
+  collapse(toStart) { if (toStart) { this._ec = this._sc; this._eo = this._so; } else { this._sc = this._ec; this._so = this._eo; } }
+  selectNode(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); const i = _rngNodeIndex(n); this._sc = p; this._so = i; this._ec = p; this._eo = i + 1; }
+  selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); this._sc = n; this._so = 0; this._ec = n; this._eo = len; }
+  comparePoint(n, o) {
+    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) throw new DOMException("nodes are in different trees", "WrongDocumentError");
+    if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
+    if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
+    if (_rngCmp(n, o, this._sc, this._so) < 0) return -1;
+    if (_rngCmp(n, o, this._ec, this._eo) > 0) return 1;
+    return 0;
+  }
+  isPointInRange(n, o) {
+    if (!this._sc || _rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
+    if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
+    return _rngCmp(n, o, this._sc, this._so) >= 0 && _rngCmp(n, o, this._ec, this._eo) <= 0;
+  }
+  compareBoundaryPoints(how, other) {
+    let a, b;
+    switch (how) {
+      case 0: a = [this._sc, this._so]; b = [other._sc, other._so]; break; // START_TO_START
+      case 1: a = [this._ec, this._eo]; b = [other._sc, other._so]; break; // START_TO_END
+      case 2: a = [this._ec, this._eo]; b = [other._ec, other._eo]; break; // END_TO_END
+      case 3: a = [this._sc, this._so]; b = [other._ec, other._eo]; break; // END_TO_START
+      default: throw new DOMException("invalid comparison type", "NotSupportedError");
+    }
+    if (_rngRoot(a[0])._nid !== _rngRoot(b[0])._nid) throw new DOMException("ranges are in different trees", "WrongDocumentError");
+    return _rngCmp(a[0], a[1], b[0], b[1]);
+  }
+  intersectsNode(n) {
+    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    const p = n.parentNode;
+    if (!p) return true;
+    const o = _rngNodeIndex(n);
+    return _rngCmp(p, o, this._ec, this._eo) < 0 && _rngCmp(p, o + 1, this._sc, this._so) > 0;
+  }
+  cloneRange() { const r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; }
+  toString() {
+    const sc = this._sc, ec = this._ec;
+    if (!sc) return "";
+    if (_rngSame(sc, ec) && (sc.nodeType === 3 || sc.nodeType === 4)) return (sc.data || "").slice(this._so, this._eo);
+    let s = "";
+    if (sc.nodeType === 3 || sc.nodeType === 4) s += (sc.data || "").slice(this._so);
+    const cac = this.commonAncestorContainer;
+    if (cac) {
+      const walk = (node) => {
+        if (node.nodeType === 3 || node.nodeType === 4) {
+          if (!_rngSame(node, sc) && !_rngSame(node, ec) &&
+              _rngCmp(node, 0, this._sc, this._so) >= 0 && _rngCmp(node, _rngNodeLength(node), this._ec, this._eo) <= 0) {
+            s += (node.data || "");
+          }
+        }
+        const kids = node.childNodes;
+        for (let i = 0; i < kids.length; i++) if (kids[i]) walk(kids[i]);
+      };
+      walk(cac);
+    }
+    if (!_rngSame(sc, ec) && (ec.nodeType === 3 || ec.nodeType === 4)) s += (ec.data || "").slice(0, this._eo);
+    return s;
+  }
+  cloneContents() { return (globalThis.document || document).createDocumentFragment(); }
+  extractContents() { return (globalThis.document || document).createDocumentFragment(); }
+  deleteContents() {}
+  insertNode(node) { if (node && this._sc && this._sc.insertBefore) { const kids = this._sc.childNodes; this._sc.insertBefore(node, kids[this._so] || null); } }
+  surroundContents(node) { this.insertNode(node); }
+  detach() {}
+  getBoundingClientRect() { return new DOMRect(); }
+  getClientRects() { return []; }
+  static get START_TO_START() { return 0; }
+  static get START_TO_END() { return 1; }
+  static get END_TO_END() { return 2; }
+  static get END_TO_START() { return 3; }
+};
+Object.assign(globalThis.Range.prototype, { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 });
+globalThis.StaticRange = class StaticRange {
+  constructor(init) {
+    if (!init || init.startContainer == null || init.endContainer == null)
+      throw new TypeError("Failed to construct 'StaticRange': required members are undefined");
+    const sc = init.startContainer, ec = init.endContainer;
+    if (sc.nodeType === 10 || ec.nodeType === 10 || sc.nodeType === 7 || ec.nodeType === 7)
+      throw new DOMException("StaticRange endpoints cannot be DocumentType or ProcessingInstruction", "InvalidNodeTypeError");
+    this._sc = sc; this._so = init.startOffset >>> 0; this._ec = ec; this._eo = init.endOffset >>> 0;
+  }
+  get startContainer() { return this._sc; }
+  get startOffset() { return this._so; }
+  get endContainer() { return this._ec; }
+  get endOffset() { return this._eo; }
+  get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
+};
 
 [
   navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
