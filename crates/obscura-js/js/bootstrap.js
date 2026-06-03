@@ -631,13 +631,37 @@ class ProcessingInstruction extends CharacterData {
   cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
 }
 
+// HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
+// The element's href attribute is parsed against the document base URL via the
+// WHATWG url op; component getters read it, setters rewrite the href attribute.
+function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+function _elemHrefURL(el) {
+  const raw = el.getAttribute('href');
+  if (raw === null || raw === undefined) return null;
+  return _urlParseOp(raw, _anchorBase());
+}
+function _setElemHrefPart(el, part, value) {
+  const u = _elemHrefURL(el);
+  if (!u) return;
+  const c = _urlSetOp(u.href, part, value);
+  if (c) el.setAttribute('href', c.href);
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
-  get localName() { return (this.tagName || "").toLowerCase(); }
+  get localName() {
+    // tagName is an op call and the tag never changes, so cache the lowercased
+    // localName. This keeps the new <a>/<area> href getters (which read
+    // localName) and every other localName consumer off the op path.
+    if (this._lname !== undefined) return this._lname;
+    const ln = (this.tagName || "").toLowerCase();
+    if (ln) this._lname = ln;
+    return ln;
+  }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
   get className() { return this.getAttribute("class") || ""; }
@@ -1059,8 +1083,37 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
-  get href() { return this.getAttribute("href") || ""; }
+  get href() {
+    const ln = this.localName;
+    if (ln === 'a' || ln === 'area') {
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const c = _urlParseOp(raw, _anchorBase());
+      return c ? c.href : raw;
+    }
+    return this.getAttribute("href") || "";
+  }
   set href(v) { this.setAttribute("href", v); }
+  // HTMLHyperlinkElementUtils URL-decomposition members, live on <a>/<area>.
+  get protocol() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.protocol : ''; }
+  set protocol(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'protocol', v); }
+  get username() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.username : ''; }
+  set username(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'username', v); }
+  get password() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.password : ''; }
+  set password(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'password', v); }
+  get host() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.host : ''; }
+  set host(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'host', v); }
+  get hostname() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.hostname : ''; }
+  set hostname(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'hostname', v); }
+  get port() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.port : ''; }
+  set port(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'port', v); }
+  get pathname() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.pathname : ''; }
+  set pathname(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'pathname', v); }
+  get search() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.search : ''; }
+  set search(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'search', v); }
+  get hash() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.hash : ''; }
+  set hash(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'hash', v); }
+  get origin() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.origin : ''; }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
@@ -2288,50 +2341,70 @@ _markNative(XMLHttpRequest.prototype.setRequestHeader);
 _markNative(XMLHttpRequest.prototype.getResponseHeader);
 _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 
-if (typeof URL === 'undefined' || !URL.prototype) {
-  globalThis.URL = class URL {
+// WHATWG URL parsing/serialization is delegated to the Rust `url` crate via
+// op_url_parse / op_url_set. The op returns the full component set as JSON; the
+// constructor caches it so getters are plain field reads (no per-access op) and
+// the hot paths (navigation, fetch, _resolveUrl) stay cheap. Returns null when
+// the input is not a valid URL.
+function _urlParseOp(url, base) {
+  try {
+    const s = Deno.core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
+    const c = JSON.parse(s);
+    return (c && c.ok) ? c : null;
+  } catch (e) { return null; }
+}
+function _urlSetOp(href, part, value) {
+  try {
+    const s = Deno.core.ops.op_url_set(String(href), part, String(value));
+    const c = JSON.parse(s);
+    return (c && c.ok) ? c : null;
+  } catch (e) { return null; }
+}
+if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
+  const _URL = class URL {
     constructor(url, base) {
-      // Per WHATWG URL spec, both arguments are stringified — callers
-      // routinely pass `window.location` (Location object) or a URL
-      // instance as `base`. Coerce explicitly so the regex .match() calls
-      // below don't blow up on non-strings.
-      url = String(url);
-      if (base !== undefined && base !== null) base = String(base);
-      let full = url;
-      if (base && !url.includes('://')) {
-        var bm = base.match(/^(https?:\/\/[^\/\?#]+)(\/[^?#]*)?/);
-        if (bm) {
-          var bOrigin = bm[1];
-          var bPath = bm[2] || '/';
-          if (url.startsWith('/')) {
-            full = bOrigin + url;
-          } else if (url.startsWith('?') || url.startsWith('#')) {
-            full = bOrigin + bPath + url;
-          } else {
-            var dir = bPath.substring(0, bPath.lastIndexOf('/') + 1);
-            full = bOrigin + dir + url;
-          }
-        }
-      }
-      const m = full.match(/^(https?):\/\/([^\/\?#]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-      if (m) {
-        this.protocol = m[1] + ':';
-        this.host = m[2]; this.hostname = m[2].split(':')[0];
-        this.port = m[2].includes(':') ? m[2].split(':')[1] : '';
-        this.pathname = m[3] || '/';
-        this.search = m[4] || ''; this.hash = m[5] || '';
-      } else {
-        this.protocol = ''; this.host = ''; this.hostname = '';
-        this.port = ''; this.pathname = full; this.search = ''; this.hash = '';
-      }
-      this.href = full; this.origin = this.protocol + '//' + this.host;
-      this.searchParams = new URLSearchParams(this.search);
+      const c = _urlParseOp(url, base);
+      if (!c) throw new TypeError("Failed to construct 'URL': Invalid URL");
+      this._c = c;
+      this._sp = null;
     }
-    toString() { return this.href; }
-    toJSON() { return this.href; }
+    get href() { return this._c.href; }
+    set href(v) { const c = _urlParseOp(v, undefined); if (!c) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); this._c = c; this._refreshSP(); }
+    get protocol() { return this._c.protocol; }
+    set protocol(v) { this._set('protocol', v); }
+    get username() { return this._c.username; }
+    set username(v) { this._set('username', v); }
+    get password() { return this._c.password; }
+    set password(v) { this._set('password', v); }
+    get host() { return this._c.host; }
+    set host(v) { this._set('host', v); }
+    get hostname() { return this._c.hostname; }
+    set hostname(v) { this._set('hostname', v); }
+    get port() { return this._c.port; }
+    set port(v) { this._set('port', v); }
+    get pathname() { return this._c.pathname; }
+    set pathname(v) { this._set('pathname', v); }
+    get search() { return this._c.search; }
+    set search(v) { this._set('search', v); this._refreshSP(); }
+    get hash() { return this._c.hash; }
+    set hash(v) { this._set('hash', v); }
+    get origin() { return this._c.origin; }
+    get searchParams() {
+      if (!this._sp) { this._sp = new URLSearchParams(this._c.search); this._sp._url = this; }
+      return this._sp;
+    }
+    _set(part, value) { const c = _urlSetOp(this._c.href, part, value); if (c) this._c = c; }
+    // search changed on the URL side: refresh the bound searchParams contents.
+    _refreshSP() { if (this._sp && this._sp._setFromString) this._sp._setFromString(this._c.search); }
+    // searchParams mutated: write the serialized query back without re-refreshing.
+    _updateSearch(qs) { this._set('search', qs ? ('?' + qs) : ''); }
+    toString() { return this._c.href; }
+    toJSON() { return this._c.href; }
     static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
     static revokeObjectURL() {}
   };
+  _URL.__obscura = true;
+  globalThis.URL = _URL;
 }
 
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function requestIdleCallback(cb, opts) {
@@ -3086,24 +3159,54 @@ globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
+// application/x-www-form-urlencoded serializer: like encodeURIComponent but
+// space -> '+' and also percent-encoding the chars encodeURIComponent leaves
+// bare ( ! ~ ' ( ) ), keeping the form-urlencoded safe set ( * - . _ ).
+function _formEncode(s){
+  return encodeURIComponent(String(s)).replace(/%20/g,'+').replace(/[!'()~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class URLSearchParams {
   constructor(init=""){
     this._p=[];
-    if(typeof init==="string"){
-      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(decodeURIComponent(k),decodeURIComponent(v.join("=")));});
+    this._url=null; // set by URL.searchParams so mutations write back to the URL
+    if (typeof URLSearchParams === 'function' && init instanceof URLSearchParams) {
+      this._p = init._p.map(pair => [pair[0], pair[1]]);
+    } else if(typeof init==="string"){
+      this._parseString(init);
     } else if (init && typeof init[Symbol.iterator] === 'function') {
-      for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
+      for (const pair of init) { const a = Array.from(pair); if (a.length >= 2) this._p.push([String(a[0]), String(a[1])]); }
     } else if (init && typeof init === 'object') {
-      Object.keys(init).forEach(k => this.append(k, init[k]));
+      Object.keys(init).forEach(k => this._p.push([String(k), String(init[k])]));
     }
   }
-  append(k,v){this._p.push([String(k),String(v)]);}
-  get(k){const p=this._p.find(([key])=>key===String(k)); return p?p[1]:null;}
-  set(k,v){this.delete(k); this.append(k,v);}
-  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k);}
+  _decode(s){ try { return decodeURIComponent(String(s).replace(/\+/g, ' ')); } catch(e) { return String(s); } }
+  _parseString(s){
+    s = String(s).replace(/^\?/, "");
+    if (s === "") return;
+    for (const pair of s.split("&")) {
+      if (pair === "") continue;
+      const i = pair.indexOf("=");
+      const k = i === -1 ? pair : pair.slice(0, i);
+      const v = i === -1 ? "" : pair.slice(i + 1);
+      this._p.push([this._decode(k), this._decode(v)]);
+    }
+  }
+  _setFromString(s){ this._p = []; this._parseString(s); }
+  _notify(){ if (this._url) this._url._updateSearch(this.toString()); }
+  append(k,v){ this._p.push([String(k),String(v)]); this._notify(); }
+  get(k){k=String(k); const p=this._p.find(([key])=>key===k); return p?p[1]:null;}
+  getAll(k){k=String(k); return this._p.filter(([key])=>key===k).map(pair=>pair[1]);}
+  set(k,v){k=String(k); v=String(v); let done=false; const out=[]; for (const pair of this._p){ if(pair[0]===k){ if(!done){ out.push([k,v]); done=true; } } else out.push(pair); } if(!done) out.push([k,v]); this._p=out; this._notify(); }
+  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k); this._notify();}
   has(k){k=String(k); return this._p.some(([key])=>key===k);}
-  toString(){return this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");}
-  forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
+  sort(){ this._p.sort((a,b)=> a[0]<b[0]?-1:(a[0]>b[0]?1:0)); this._notify(); }
+  get size(){ return this._p.length; }
+  toString(){return this._p.map(pair=>_formEncode(pair[0])+"="+_formEncode(pair[1])).join("&");}
+  forEach(cb,thisArg){this._p.slice().forEach(pair=>cb.call(thisArg,pair[1],pair[0],this));}
+  *entries(){ for (const pair of this._p) yield [pair[0],pair[1]]; }
+  *keys(){ for (const pair of this._p) yield pair[0]; }
+  *values(){ for (const pair of this._p) yield pair[1]; }
+  [Symbol.iterator](){ return this.entries(); }
 };
 
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
