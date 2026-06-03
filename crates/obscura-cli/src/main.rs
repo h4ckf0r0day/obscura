@@ -10,7 +10,7 @@ use tokio::time::{timeout, Duration};
 #[derive(Parser)]
 #[command(
     name = "obscura",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("OBSCURA_BUILD_VERSION"),
     about = "Obscura - A lightweight headless browser for web scraping and automation",
 )]
 struct Args {
@@ -189,9 +189,9 @@ fn print_banner(port: u16) {
  | |__| | |_) \__ \ (__| |_| | | | (_| |
   \____/|_.__/|___/\___|\__,_|_|  \__,_|
                    
-  Headless Browser v0.1.6
+  Headless Browser v{}
   CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+"#, env!("OBSCURA_BUILD_VERSION"), port);
 }
 
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
@@ -262,6 +262,17 @@ async fn main() -> anyhow::Result<()> {
     let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
     obscura_js::set_v8_flags(&v8_flags);
+
+    // The js-side fetch path (op_fetch_url) reads OBSCURA_ALLOW_PRIVATE_NETWORK
+    // directly for its SSRF gate. Mirror the CLI flag into the env var so
+    // iframe loads and JS fetch() see the same policy the http_client layer
+    // already uses (issue #33).
+    if args.allow_private_network {
+        // SAFETY: set_var is unsafe in newer rustc; this runs before any
+        // spawned thread inspects the env, so it's effectively single
+        // threaded at this point.
+        unsafe { std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1"); }
+    }
 
     let global_proxy = args.proxy.clone();
 
