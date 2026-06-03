@@ -121,6 +121,41 @@ const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+
+// HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
+// Class token splitting (classList, getElementsByClassName) uses exactly this set.
+// JS \s is wider (U+000B, U+00A0, U+2028, etc.), so it must not be used here.
+const _ASCII_WS = /[ \t\n\f\r]+/;
+function _splitAsciiWhitespace(s) {
+  // WebIDL DOMString coercion: null -> "null", undefined -> "undefined".
+  return String(s).split(_ASCII_WS).filter(Boolean);
+}
+// Shared getElementsByClassName: split the argument into an ordered set of
+// tokens on ASCII whitespace, then return descendants (in tree order) whose
+// class attribute contains every token, as an HTMLCollection (so namedItem and
+// named access work on the result). `root` must expose querySelectorAll.
+function _getElementsByClassName(root, classNames) {
+  const tokens = _splitAsciiWhitespace(classNames);
+  if (tokens.length === 0) return HTMLCollection._from([]);
+  // Fast path: a single CSS-identifier token goes straight to the native
+  // selector engine (the common case). Only multi-token sets or exotic class
+  // names (NBSP, leading digits, etc.) fall back to the O(n) JS scan below.
+  if (tokens.length === 1 && /^[A-Za-z_-][\w-]*$/.test(tokens[0])) {
+    return HTMLCollection._from(root.querySelectorAll("." + tokens[0]));
+  }
+  const all = root.querySelectorAll("*");
+  const matched = [];
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i];
+    const elTokens = _splitAsciiWhitespace(el.getAttribute ? (el.getAttribute("class") || "") : "");
+    let ok = true;
+    for (let t = 0; t < tokens.length; t++) {
+      if (elTokens.indexOf(tokens[t]) < 0) { ok = false; break; }
+    }
+    if (ok) matched.push(el);
+  }
+  return HTMLCollection._from(matched);
+}
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
@@ -468,6 +503,134 @@ class Comment extends CharacterData {
   cloneNode() { return document.createComment(this.data); }
 }
 
+// DOMTokenList backs class/rel/sandbox/etc. attribute reflection. It parses the
+// associated content attribute as an ordered set of tokens and writes changes
+// straight back, so reads and writes stay live with the element. A Proxy is
+// layered on top so numeric indexing (list[0]) hits item().
+class DOMTokenList {
+  constructor(el, attr, supportedTokens) {
+    // Non-enumerable so the element <-> token-list cycle is not visible to
+    // enumeration/serialization (JSON.stringify(classList) would otherwise
+    // throw "circular structure").
+    Object.defineProperty(this, "_el", { value: el, writable: true, enumerable: false });
+    Object.defineProperty(this, "_attr", { value: attr, writable: true, enumerable: false });
+    Object.defineProperty(this, "_supported", { value: supportedTokens || null, writable: true, enumerable: false });
+    return new Proxy(this, {
+      get(t, k, r) {
+        if (typeof k === "string" && /^\d+$/.test(k)) return t.item(+k);
+        return Reflect.get(t, k, r);
+      },
+      has(t, k) {
+        if (typeof k === "string" && /^\d+$/.test(k)) return +k < t.length;
+        return Reflect.has(t, k);
+      },
+    });
+  }
+  get [Symbol.toStringTag]() { return "DOMTokenList"; }
+  _tokens() {
+    const v = this._el.getAttribute(this._attr);
+    if (!v) return [];
+    const seen = new Set();
+    const out = [];
+    for (const tok of v.split(/[ \t\n\f\r]+/)) {
+      if (tok && !seen.has(tok)) { seen.add(tok); out.push(tok); }
+    }
+    return out;
+  }
+  _write(tokens) {
+    this._el.setAttribute(this._attr, tokens.join(" "));
+  }
+  get length() { return this._tokens().length; }
+  get value() { return this._el.getAttribute(this._attr) || ""; }
+  set value(v) { this._el.setAttribute(this._attr, String(v)); }
+  item(i) { const t = this._tokens(); return (i >= 0 && i < t.length) ? t[i] : null; }
+  contains(token) { return this._tokens().includes(String(token)); }
+  add(...tokens) {
+    const t = this._tokens();
+    for (const raw of tokens) {
+      const tok = String(raw);
+      if (tok === "") throw new DOMException("The token provided must not be empty.", "SyntaxError");
+      if (/[ \t\n\f\r]/.test(tok)) throw new DOMException("The token provided contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError");
+      if (!t.includes(tok)) t.push(tok);
+    }
+    this._write(t);
+  }
+  remove(...tokens) {
+    let t = this._tokens();
+    for (const raw of tokens) {
+      const tok = String(raw);
+      if (tok === "") throw new DOMException("The token provided must not be empty.", "SyntaxError");
+      if (/[ \t\n\f\r]/.test(tok)) throw new DOMException("The token provided contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError");
+      t = t.filter((x) => x !== tok);
+    }
+    this._write(t);
+  }
+  toggle(token, force) {
+    const tok = String(token);
+    if (tok === "") throw new DOMException("The token provided must not be empty.", "SyntaxError");
+    if (/[ \t\n\f\r]/.test(tok)) throw new DOMException("The token provided contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError");
+    const t = this._tokens();
+    const has = t.includes(tok);
+    if (has) {
+      if (force === true) return true;
+      this._write(t.filter((x) => x !== tok));
+      return false;
+    }
+    if (force === false) return false;
+    t.push(tok);
+    this._write(t);
+    return true;
+  }
+  replace(token, newToken) {
+    const a = String(token), b = String(newToken);
+    if (a === "" || b === "") throw new DOMException("The token provided must not be empty.", "SyntaxError");
+    if (/[ \t\n\f\r]/.test(a) || /[ \t\n\f\r]/.test(b)) throw new DOMException("The token provided contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError");
+    const t = this._tokens();
+    const i = t.indexOf(a);
+    if (i === -1) return false;
+    if (t.includes(b) && b !== a) { t.splice(i, 1); } else { t[i] = b; }
+    this._write(t);
+    return true;
+  }
+  supports(token) {
+    if (!this._supported) throw new TypeError("DOMTokenList has no supported tokens.");
+    return this._supported.includes(String(token).toLowerCase());
+  }
+  forEach(cb, thisArg) {
+    const t = this._tokens();
+    for (let i = 0; i < t.length; i++) cb.call(thisArg, t[i], i, this);
+  }
+  *values() { yield* this._tokens(); }
+  *keys() { const t = this._tokens(); for (let i = 0; i < t.length; i++) yield i; }
+  *entries() { const t = this._tokens(); for (let i = 0; i < t.length; i++) yield [i, t[i]]; }
+  [Symbol.iterator]() { return this._tokens()[Symbol.iterator](); }
+  toString() { return this.value; }
+}
+
+// CDATASection: a Text-derived node (nodeType 4) used only in XML documents.
+// Extends Text so data/length/textContent/childNodes reuse the working text
+// node machinery; only the type-identifying getters differ.
+class CDATASection extends Text {
+  get nodeName() { return "#cdata-section"; }
+  get nodeType() { return 4; }
+  get nodeValue() { return this.data; }
+  set nodeValue(v) { this.data = v; }
+  cloneNode() { return new CDATASection(+_dom("create_text_node", this.data)); }
+}
+
+// ProcessingInstruction: nodeType 7, nodeName === target. Extends CharacterData
+// and carries a separate target. Backed by a text node so data/nodeValue/
+// textContent/length work without native PI support.
+class ProcessingInstruction extends CharacterData {
+  constructor(nid, target) { super(nid); this._target = target; }
+  get target() { return this._target; }
+  get nodeName() { return this._target; }
+  get nodeType() { return 7; }
+  get nodeValue() { return this.data; }
+  set nodeValue(v) { this.data = v; }
+  cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -480,8 +643,11 @@ class Element extends Node {
   get className() { return this.getAttribute("class") || ""; }
   set className(v) { this.setAttribute("class", v); }
   get namespaceURI() {
-    const tag = this.localName;
-    if (tag === "svg" || this._ns === "http://www.w3.org/2000/svg") return "http://www.w3.org/2000/svg";
+    // createElementNS records the requested namespace on _ns; an empty string
+    // maps to the null namespace per spec. Elements made via createElement (or
+    // parsed) have no _ns: default to XHTML, except <svg> which is SVG.
+    if (this._ns !== undefined) return this._ns === "" ? null : this._ns;
+    if (this.localName === "svg") return "http://www.w3.org/2000/svg";
     return "http://www.w3.org/1999/xhtml";
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
@@ -512,7 +678,7 @@ class Element extends Node {
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
-    return ids.map(_wrapEl).filter(Boolean);
+    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
   }
   get content() {
     // <template>.content is a DocumentFragment; <meta>.content reflects
@@ -539,28 +705,53 @@ class Element extends Node {
   get nextElementSibling() { let s = this.nextSibling; while(s && s.nodeType !== 1) s = s.nextSibling; return s; }
   get previousElementSibling() { let s = this.previousSibling; while(s && s.nodeType !== 1) s = s.previousSibling; return s; }
   get classList() {
-    const el = this;
-    const obj = {
-      add: (...c) => { const s = new Set((el.className||"").split(/\s+/).filter(Boolean)); c.forEach(x=>s.add(x)); el.className=[...s].join(" "); },
-      remove: (...c) => { const s = new Set((el.className||"").split(/\s+/).filter(Boolean)); c.forEach(x=>s.delete(x)); el.className=[...s].join(" "); },
-      contains: c => (el.className||"").split(/\s+/).includes(c),
-      toggle: (c, force) => { const has = obj.contains(c); if(force===true||(!has&&force!==false)){obj.add(c);return true;} obj.remove(c); return false; },
-      get length() { return (el.className||"").split(/\s+/).filter(Boolean).length; },
-      item: i => (el.className||"").split(/\s+/).filter(Boolean)[i] || null,
-      forEach: (cb) => (el.className||"").split(/\s+/).filter(Boolean).forEach(cb),
-      toString: () => el.className || "",
-    };
-    return obj;
+    if (!this._classList) this._classList = new DOMTokenList(this, "class");
+    return this._classList;
+  }
+  get relList() {
+    const ns = this.namespaceURI, ln = this.localName;
+    const ok = (ns === "http://www.w3.org/2000/svg" && ln === "a") ||
+               (ns === "http://www.w3.org/1999/xhtml" && (ln === "a" || ln === "area" || ln === "link"));
+    if (!ok) return undefined;
+    if (!this._relList) this._relList = new DOMTokenList(this, "rel");
+    return this._relList;
+  }
+  get sandbox() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return undefined;
+    if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox");
+    return this._sandboxList;
+  }
+  get sizes() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "link") return undefined;
+    if (!this._sizesList) this._sizesList = new DOMTokenList(this, "sizes");
+    return this._sizesList;
+  }
+  get htmlFor() {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml") return undefined;
+    const ln = this.localName;
+    if (ln === "output") {
+      if (!this._htmlForList) this._htmlForList = new DOMTokenList(this, "for");
+      return this._htmlForList;
+    }
+    if (ln === "label") return this.getAttribute("for") || "";
+    return undefined;
+  }
+  set htmlFor(v) {
+    if (this.namespaceURI === "http://www.w3.org/1999/xhtml" && this.localName === "label") {
+      this.setAttribute("for", String(v));
+    }
   }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
   setAttribute(n, v) {
+    const popoverPrev = (n === "popover" || (typeof n === "string" && n.length === 7 && n.toLowerCase() === "popover")) ? this.popover : undefined;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
+    if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
-  removeAttribute(n) { _dom("remove_attribute", this._nid, n); }
+  removeAttribute(n) { const popoverPrev = (n === "popover" || (typeof n === "string" && n.length === 7 && n.toLowerCase() === "popover")) ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
@@ -593,14 +784,20 @@ class Element extends Node {
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    list.forEach = Array.prototype.forEach.bind(list);
-    return list;
+    return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return this.querySelectorAll(t); }
-  getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
+  getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
+    // :popover-open is a JS-observable popover state, not understood by the
+    // native selector engine. Handle it here (and strip it from compound
+    // selectors so the rest can still be matched natively).
+    if (typeof s === "string" && s.indexOf(":popover-open") !== -1) {
+      if (this._popoverState !== "showing") return false;
+      const rest = s.replace(/:popover-open/g, "").trim();
+      if (rest === "") return true;
+      return this.matches(rest);
+    }
     const parent = this.parentNode;
     if (!parent || !parent.querySelectorAll) return false;
     const matches = parent.querySelectorAll(s);
@@ -710,6 +907,97 @@ class Element extends Node {
   }
   focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
+
+  // --- Popover API (HTML "popover") ---------------------------------------
+  // Read the popover content attribute case-insensitively. The HTML parser
+  // lowercases attribute names, but runtime setAttribute("PoPoVeR", ...)
+  // preserves case, and the IDL reflection matches the name ASCII-case-
+  // insensitively. Returns the raw stored string, or null if absent.
+  _popoverAttrValue() {
+    const v = this.getAttribute("popover");
+    if (v !== null) return v;
+    const names = _domParse("attribute_names", this._nid) || [];
+    for (let i = 0; i < names.length; i++) {
+      if (names[i].toLowerCase() === "popover") return this.getAttribute(names[i]);
+    }
+    return null;
+  }
+  // The reflected (effective) popover type: null (No Popover), "auto",
+  // "hint", or "manual". Empty string maps to "auto"; any non-keyword value
+  // (invalid) maps to "manual".
+  get popover() {
+    const raw = this._popoverAttrValue();
+    if (raw === null) return null;
+    const v = String(raw).toLowerCase();
+    if (v === "auto" || v === "hint" || v === "manual") return v;
+    if (v === "") return "auto";
+    return "manual";
+  }
+  set popover(value) {
+    if (value === null || value === undefined) { this._popoverRemoveAttr(); return; }
+    this.setAttribute("popover", String(value));
+  }
+  _popoverRemoveAttr() {
+    if (this.getAttribute("popover") !== null) { this.removeAttribute("popover"); return; }
+    const names = _domParse("attribute_names", this._nid) || [];
+    for (let i = 0; i < names.length; i++) {
+      if (names[i].toLowerCase() === "popover") { this.removeAttribute(names[i]); return; }
+    }
+  }
+  // "check popover validity". expectedToBeShowing is true for hide, false for
+  // show. Throws NotSupportedError when there is no valid popover type, and
+  // InvalidStateError when the element is not connected; returns false (no
+  // throw) when the current state does not match expectedToBeShowing.
+  _checkPopoverValidity(expectedToBeShowing) {
+    if (this.popover === null) throw new DOMException("Not supported on elements that don't have a valid value for the popover attribute", "NotSupportedError");
+    const showing = this._popoverState === "showing";
+    if ((expectedToBeShowing && !showing) || (!expectedToBeShowing && showing)) return false;
+    if (!this.isConnected) throw new DOMException("Invalid on popover elements which aren't connected", "InvalidStateError");
+    return true;
+  }
+  showPopover() {
+    if (!this._checkPopoverValidity(/*expectedToBeShowing*/false)) return;
+    const beforeEvent = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
+    if (!this.dispatchEvent(beforeEvent)) return;
+    // The beforetoggle handler may have changed our type or shown us; re-check.
+    if (!this._checkPopoverValidity(/*expectedToBeShowing*/false)) return;
+    this._popoverState = "showing";
+    const target = this;
+    setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
+  }
+  hidePopover() {
+    if (!this._checkPopoverValidity(/*expectedToBeShowing*/true)) return;
+    this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
+    this._popoverState = "hidden";
+    const target = this;
+    setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
+  }
+  togglePopover(force) {
+    let options = force;
+    if (options && typeof options === "object") force = options.force;
+    const showing = this._popoverState === "showing";
+    if (showing && (force === undefined || force === null || force === false)) {
+      this.hidePopover();
+    } else if (force === undefined || force === null || force === true) {
+      this.showPopover();
+    }
+    return this._popoverState === "showing";
+  }
+  // Called from setAttribute/removeAttribute/IDL setter when the popover
+  // attribute may have changed. If the effective type changed while showing,
+  // hide the popover (firing the hide events) per the HTML spec.
+  _popoverTypeMaybeChanged(prevType) {
+    const newType = this.popover;
+    if (this._popoverState === "showing" && prevType !== newType) {
+      // Hide directly. Do not call hidePopover(): it re-validates against the
+      // popover attribute, which may now be removed (No Popover), and would
+      // throw NotSupportedError. This mirrors the spec hide with throw=false.
+      this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
+      this._popoverState = "hidden";
+      const target = this;
+      setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
+    }
+  }
   get value() {
     const tag = this.localName;
     if (tag === 'select') {
@@ -846,7 +1134,7 @@ class Element extends Node {
   }
   get options() {
     if (this.localName !== 'select') return [];
-    return this.querySelectorAll('option');
+    return HTMLCollection._from(this.querySelectorAll('option'));
   }
   get selectedIndex() {
     const opts = this.options;
@@ -1067,7 +1355,20 @@ class Document extends Node {
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
-  get contentType() { return "text/html"; }
+  get contentType() {
+    const url = this.URL || "";
+    // data: URLs carry their MIME type explicitly.
+    const dm = /^data:([^,;]+)/i.exec(url);
+    if (dm) {
+      const mime = dm[1].toLowerCase();
+      if (mime === "application/xhtml+xml") return "application/xhtml+xml";
+      if (mime === "text/xml") return "text/xml";
+      if (mime === "application/xml" || mime.endsWith("+xml")) return "application/xml";
+    }
+    if (/\.xhtml(?:[?#]|$)/i.test(url)) return "application/xhtml+xml";
+    if (/\.(?:xml|svg)(?:[?#]|$)/i.test(url)) return "application/xml";
+    return "text/html";
+  }
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
   get currentScript() {
     // Next.js / Turbopack chunk loader reads document.currentScript.src to
@@ -1082,13 +1383,10 @@ class Document extends Node {
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all", s) || [];
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    list.forEach = Array.prototype.forEach.bind(list);
-    return list;
+    return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return this.querySelectorAll(t); }
-  getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
+  getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
@@ -1106,6 +1404,37 @@ class Document extends Node {
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
+    _cache.set(nid, n);
+    return n;
+  }
+  createCDATASection(data) {
+    // Spec: throw NotSupportedError on an HTML document, reject data
+    // containing "]]>", then return a CDATASection node.
+    if (!_isXMLDocument(this)) {
+      throw new DOMException("createCDATASection is not supported in HTML documents", "NotSupportedError");
+    }
+    const str = String(data);
+    if (str.indexOf("]]>") !== -1) {
+      throw new DOMException("CDATA section data must not contain ']]>'", "InvalidCharacterError");
+    }
+    const nid = +_dom("create_text_node", str);
+    const n = new CDATASection(nid);
+    _cache.set(nid, n);
+    return n;
+  }
+  createProcessingInstruction(target, data) {
+    // Spec: not gated on document type. Reject targets that are not an XML
+    // Name, then reject data containing "?>", then return a PI node.
+    const tgt = String(target);
+    const str = String(data);
+    if (!_isValidPITarget(tgt)) {
+      throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
+    }
+    if (str.indexOf("?>") !== -1) {
+      throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
+    }
+    const nid = +_dom("create_text_node", str);
+    const n = new ProcessingInstruction(nid, tgt);
     _cache.set(nid, n);
     return n;
   }
@@ -1127,6 +1456,7 @@ class Document extends Node {
       'focusevent': FocusEvent,
       'inputevent': InputEvent,
       'uievent': UIEvent, 'uievents': UIEvent,
+      'compositionevent': CompositionEvent,
       'wheelevent': WheelEvent,
       'pointerevent': PointerEvent,
       'errorevent': ErrorEvent,
@@ -1137,7 +1467,7 @@ class Document extends Node {
     const Cls = map[String(type || '').toLowerCase()] || Event;
     return new Cls('');
   }
-  createRange() { return { setStart(){}, setEnd(){}, collapse(){}, selectNodeContents(){}, cloneContents(){ return document.createDocumentFragment(); } }; }
+  createRange() { return new Range(); }
   addEventListener(type, fn, opts) {
     if (typeof fn !== 'function') return;
     if (!this._listeners) this._listeners = {};
@@ -1328,13 +1658,11 @@ class DocumentFragment extends Node {
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    return list;
+    return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
-    return ids.map(_wrapEl).filter(Boolean);
+    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
@@ -2426,7 +2754,8 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   }
 };
 
-globalThis.ShadowRoot = class ShadowRoot {};
+globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
+globalThis.__obscura_shadowHostNames = new Set(['article','aside','blockquote','body','div','footer','h1','h2','h3','h4','h5','h6','header','main','nav','p','section','span']);
 globalThis.customElements = {
   _registry: new Map(),
   _whenDefinedResolvers: new Map(),
@@ -2639,7 +2968,7 @@ globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
     if (!this.target) return [];
     const path = [];
@@ -2661,16 +2990,69 @@ globalThis.CustomEvent = class extends Event {
     this.detail = detail;
   }
 };
-globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
-globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
-globalThis.FocusEvent = class extends Event {};
+globalThis.MouseEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
+  // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
+  initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
+    this.initEvent(type,canBubble,cancelable);
+    this.view=view===undefined?null:view;
+    this.detail=detail||0;
+    this.screenX=screenX||0;
+    this.screenY=screenY||0;
+    this.clientX=clientX||0;
+    this.clientY=clientY||0;
+    this.ctrlKey=!!ctrlKey;
+    this.altKey=!!altKey;
+    this.shiftKey=!!shiftKey;
+    this.metaKey=!!metaKey;
+    this.button=button||0;
+    this.relatedTarget=relatedTarget===undefined?null:relatedTarget;
+  }
+};
+globalThis.KeyboardEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
+  // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
+  initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
+    this.initEvent(type,canBubble,cancelable);
+    this.view=view===undefined?null:view;
+    this.key=key===undefined?"":String(key);
+    this.location=location||0;
+    this.ctrlKey=!!ctrlKey;
+    this.altKey=!!altKey;
+    this.shiftKey=!!shiftKey;
+    this.metaKey=!!metaKey;
+  }
+};
+globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
-globalThis.UIEvent = class extends Event {};
-globalThis.WheelEvent = class extends Event {};
+globalThis.UIEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0; }
+  // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
+  initUIEvent(type,canBubble,cancelable,view,detail) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");
+    this.initEvent(type,canBubble,cancelable);
+    this.view=view===undefined?null:view;
+    this.detail=detail||0;
+  }
+};
+globalThis.WheelEvent = class extends Event { constructor(t,o={}) { super(t,o);this.deltaX=o.deltaX||0;this.deltaY=o.deltaY||0;this.deltaZ=o.deltaZ||0;this.deltaMode=o.deltaMode||0; } };
+
+globalThis.CompositionEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.data=o.data||""; }
+  // Legacy DOM Level 3 initializer. Positional signature per UI Events spec.
+  initCompositionEvent(type,canBubble,cancelable,view,data) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initCompositionEvent' on 'CompositionEvent': 1 argument required, but only 0 present.");
+    this.initEvent(type,canBubble,cancelable);
+    this.view=view===undefined?null:view;
+    this.data=data===undefined?"":String(data);
+  }
+};
 globalThis.PopStateEvent = class extends Event {
   constructor(type, init) {
     super(type, init || {});
@@ -2685,6 +3067,19 @@ globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
+
+// ToggleEvent backs the popover beforetoggle/toggle events. oldState and
+// newState are "open"/"closed". These events do not bubble; beforetoggle is
+// cancelable only for the closed -> open (show) transition, toggle is never
+// cancelable. See HTML "popover" and html/semantics/popovers WPT.
+globalThis.ToggleEvent = class ToggleEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.oldState = init.oldState !== undefined ? String(init.oldState) : "";
+    this.newState = init.newState !== undefined ? String(init.newState) : "";
+  }
+};
+_markNative(globalThis.ToggleEvent);
 
 globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
 globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
@@ -2768,7 +3163,7 @@ globalThis.DOMParser = class DOMParser {
         return root.querySelectorAll(t);
       },
       getElementsByClassName(c) {
-        return root.querySelectorAll("." + c);
+        return _getElementsByClassName(root, c);
       },
       getElementsByName(n) {
         return root.querySelectorAll(`[name="${n}"]`);
@@ -2778,6 +3173,20 @@ globalThis.DOMParser = class DOMParser {
       createTextNode: (t) => document.createTextNode(t),
       createComment: (t) => document.createComment(t),
       createDocumentFragment: () => document.createDocumentFragment(),
+      createRange: () => new Range(),
+      createEvent: (type) => document.createEvent(type),
+      createCDATASection: (data) => {
+        if (mimeType === "text/html") throw new DOMException("createCDATASection is not supported in HTML documents", "NotSupportedError");
+        const s = String(data);
+        if (s.indexOf("]]>") !== -1) throw new DOMException("CDATA section data must not contain ']]>'", "InvalidCharacterError");
+        return new CDATASection(+_dom("create_text_node", s));
+      },
+      createProcessingInstruction: (target, data) => {
+        const t = String(target), s = String(data);
+        if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
+        if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
+        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+      },
       adoptNode: (n) => n,
       importNode: (n) => n,
       cloneNode: function (deep) {
@@ -2986,7 +3395,7 @@ globalThis.HTMLImageElement = Element;
 globalThis.HTMLInputElement = Element;
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
-  get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
+  get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
@@ -3028,6 +3437,22 @@ globalThis.SVGSVGElement = Element;
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
+
+globalThis.CDATASection = CDATASection;
+globalThis.ProcessingInstruction = ProcessingInstruction;
+// True when the document was loaded from an XML/XHTML source. Obscura has no
+// native XML tree, so this is inferred from contentType (derived from the URL).
+function _isXMLDocument(doc) {
+  const ct = (doc && doc.contentType) || "text/html";
+  return ct !== "text/html";
+}
+// XML Name production, sufficient for createProcessingInstruction targets.
+const _piNameStart = "A-Za-z_:\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD";
+const _piNameChar = _piNameStart + "0-9.\\u00B7\\u0300-\\u036F\\u203F-\\u2040\\-";
+const _piNameRe = new RegExp("^[" + _piNameStart + "][" + _piNameChar + "]*$");
+function _isValidPITarget(target) {
+  return typeof target === "string" && target.length > 0 && _piNameRe.test(target);
+}
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
@@ -3042,15 +3467,63 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
 }
 globalThis.EventTarget = Node;
 globalThis.HTMLCollection = class HTMLCollection extends Array {
-  item(i) { return this[i] != null ? this[i] : null; }
+  item(i) {
+    i = i >>> 0;
+    return this[i] != null ? this[i] : null;
+  }
   namedItem(name) {
-    if (!name) return null;
-    for (const el of this) {
-      if (el && (el.id === name || (typeof el.getAttribute === "function" && el.getAttribute("name") === name))) return el;
+    if (name === undefined || name === null || name === "") return null;
+    name = String(name);
+    for (let i = 0; i < this.length; i++) {
+      const el = this[i];
+      if (!el) continue;
+      // id always contributes; name only for HTML elements in HTML documents.
+      if (el.id === name) return el;
+      if (_isHTMLEl(el) && typeof el.getAttribute === "function" && el.getAttribute("name") === name) return el;
     }
     return null;
   }
+  // Factory: build an HTMLCollection from an array of elements. Named access
+  // (collection[name]) is served lazily by a Proxy so there is NO per-element
+  // work at build time (eager defineProperty per id was an O(n) build cost that
+  // made querySelectorAll on large result sets ~26x slower). The Proxy only
+  // resolves a name when an unknown string key is actually read.
+  static _from(arr) {
+    const c = new HTMLCollection();
+    if (arr) for (let i = 0; i < arr.length; i++) { if (arr[i]) c[c.length] = arr[i]; }
+    return new Proxy(c, _htmlCollectionProxy);
+  }
 };
+_markNative(HTMLCollection.prototype.item);
+_markNative(HTMLCollection.prototype.namedItem);
+// Shared (allocated once) Proxy traps for HTMLCollection named access. Indices,
+// length, and inherited methods resolve normally via Reflect; only an unknown
+// non-numeric string key falls back to namedItem(), so item/namedItem and the
+// Array methods are never shadowed and id="namedItem" cannot recurse.
+const _htmlCollectionProxy = {
+  get(t, k, r) {
+    const v = Reflect.get(t, k, r);
+    if (v !== undefined || typeof k !== "string") return v;
+    return t.namedItem ? (t.namedItem(k) || undefined) : undefined;
+  },
+  has(t, k) {
+    if (Reflect.has(t, k)) return true;
+    return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
+  },
+};
+// True for elements in the HTML namespace (the only ones whose name attribute
+// contributes to an HTMLCollection's supported property names).
+function _isHTMLEl(el) {
+  return !!el && (el.namespaceURI === undefined || el.namespaceURI === "http://www.w3.org/1999/xhtml");
+}
+// Build a NodeList (no named access, per spec) for querySelectorAll. Kept light
+// on purpose: querySelectorAll is the hottest query API.
+function _nodeList(els) {
+  const nl = new NodeList();
+  for (let i = 0; i < els.length; i++) nl[nl.length] = els[i];
+  return nl;
+}
+globalThis.DOMTokenList = DOMTokenList;
 globalThis.NodeList = class NodeList extends Array {
   item(i) { return this[i] != null ? this[i] : null; }
 };
@@ -3081,6 +3554,7 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Element.prototype.addEventListener, Element.prototype.removeEventListener,
   Element.prototype.dispatchEvent, Element.prototype.click,
   Element.prototype.focus, Element.prototype.blur,
+  Element.prototype.showPopover, Element.prototype.hidePopover, Element.prototype.togglePopover,
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.scrollIntoView,
   Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
@@ -3096,6 +3570,7 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Document.prototype.querySelectorAll, Document.prototype.getElementsByTagName,
   Document.prototype.createElement, Document.prototype.createElementNS,
   Document.prototype.createTextNode, Document.prototype.createComment,
+  Document.prototype.createCDATASection, Document.prototype.createProcessingInstruction,
   Document.prototype.createDocumentFragment, Document.prototype.createEvent,
   Document.prototype.hasFocus,
   Storage, Storage.prototype.getItem, Storage.prototype.setItem,
@@ -3166,7 +3641,7 @@ class _IframeDocument {
     return this._root.querySelectorAll(tag);
   }
   getElementsByClassName(cls) {
-    return this._root.querySelectorAll('.' + cls);
+    return _getElementsByClassName(this._root, cls);
   }
   createElement(tag) { return document.createElement(tag); }
   createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
@@ -3174,6 +3649,7 @@ class _IframeDocument {
   createComment(text) { return document.createComment(text); }
   createDocumentFragment() { return document.createDocumentFragment(); }
   createEvent(type) { return document.createEvent(type); }
+  createRange() { return new Range(); }
   hasFocus() { return false; }
 
   get cookie() { return ''; }
@@ -3525,10 +4001,21 @@ _markNative(Element.prototype.toDataURL);
 _markNative(Element.prototype.toBlob);
 
 Element.prototype.attachShadow = function attachShadow(opts) {
+  var _mode = opts == null ? undefined : opts.mode;
+  if (_mode !== 'open' && _mode !== 'closed') {
+    throw new TypeError('Failed to execute attachShadow on Element: the mode value is not a valid ShadowRootMode.');
+  }
+  var _ln = (this.localName || '').toLowerCase();
+  if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
+    throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
+  }
+  if (this._shadowRoot) {
+    throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
+  }
   const host = this;
   const children = [];
   const shadow = {
-    mode: opts?.mode || 'open',
+    mode: opts.mode,
     host: host,
     get innerHTML() { return children.map(c => c.outerHTML || c.textContent || '').join(''); },
     set innerHTML(v) {
@@ -3595,13 +4082,39 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); },
     getHTML() { return this.innerHTML; },
-    cloneNode() { return shadow; },
+    // Own textContent: ShadowRoot now extends DocumentFragment, so without
+    // these the inherited Node accessors run against this._nid. The setter in
+    // particular would target the host document and wipe it. Operate on the
+    // shadow's own `children` store instead.
+    get textContent() { return children.map(c => c.textContent || "").join(""); },
+    set textContent(v) {
+      children.length = 0;
+      if (v != null && v !== "") children.push(document.createTextNode(String(v)));
+    },
+    hasChildNodes() { return children.length > 0; },
+    // A detached fragment id backs any inherited nid-based method we do not
+    // override, so they stay non-destructive (operate on an empty fragment)
+    // rather than falling through to node 0 / the document.
+    _nid: +_dom("create_document_fragment"),
+    activeElement: null,
+    get styleSheets() { return []; },
+    cloneNode() { throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError'); },
   };
-  this.shadowRoot = shadow;
+  Object.setPrototypeOf(shadow, ShadowRoot.prototype);
+  this._shadowRoot = shadow;
   return shadow;
 };
 
 _markNative(Element.prototype.attachShadow);
+
+Object.defineProperty(Element.prototype, 'shadowRoot', {
+  configurable: true,
+  enumerable: true,
+  get: function () {
+    var sr = this._shadowRoot;
+    return sr && sr.mode === 'open' ? sr : null;
+  },
+});
 
 // setHTMLUnsafe / getHTML: shims over innerHTML. setHTMLUnsafe parses markup
 // like innerHTML (declarative shadow roots inside are not expanded yet, but the
