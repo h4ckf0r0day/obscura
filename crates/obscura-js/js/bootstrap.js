@@ -2488,6 +2488,10 @@ if (typeof Request === 'undefined') {
     async text() { return this.body ? String(this.body) : ''; }
     async json() { return JSON.parse(await this.text()); }
     async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
+    async blob() {
+      const ct = this.headers && this.headers.get ? (this.headers.get('content-type') || '') : '';
+      return new Blob(this.body != null ? [this.body] : [], { type: ct });
+    }
   };
 }
 
@@ -3212,8 +3216,61 @@ _markNative(globalThis.ToggleEvent);
 
 globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
 globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
-if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
-if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
+// Normalize one Blob part to bytes. `native` newline normalization applies to
+// string parts when the Blob/File `endings` option is "native".
+function _blobPartToBytes(p, native) {
+  if (p == null) return new Uint8Array(0);
+  if (typeof Blob === "function" && p instanceof Blob) return p._bytes || new Uint8Array(0);
+  if (p instanceof ArrayBuffer) return new Uint8Array(p.slice(0));
+  if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer.slice(p.byteOffset, p.byteOffset + p.byteLength));
+  let s = String(p);
+  if (native) s = s.replace(/\r\n|\r|\n/g, "\n");
+  return new TextEncoder().encode(s);
+}
+function _bytesToBinaryString(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return s; }
+if (typeof Blob === "undefined") globalThis.Blob = class Blob {
+  constructor(parts, opts) {
+    opts = opts || {};
+    const endings = opts.endings != null ? String(opts.endings) : "transparent";
+    if (endings !== "transparent" && endings !== "native") throw new TypeError("Failed to construct 'Blob': The provided value '" + endings + "' is not a valid enum value of type EndingType.");
+    const native = endings === "native";
+    const chunks = []; let total = 0;
+    if (parts != null) {
+      if (typeof parts === "string" || typeof parts[Symbol.iterator] !== "function") throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+      for (const p of parts) { const b = _blobPartToBytes(p, native); chunks.push(b); total += b.length; }
+    }
+    const data = new Uint8Array(total); let off = 0;
+    for (const c of chunks) { data.set(c, off); off += c.length; }
+    this._bytes = data;
+    this.size = total;
+    const t = opts.type != null ? String(opts.type) : "";
+    this.type = /^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : "";
+  }
+  get [Symbol.toStringTag]() { return "Blob"; }
+  slice(start, end, contentType) {
+    const len = this.size;
+    const s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
+    let e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
+    if (e < s) e = s;
+    const out = new Blob([], contentType != null ? { type: contentType } : {});
+    out._bytes = this._bytes.slice(s, e);
+    out.size = out._bytes.length;
+    return out;
+  }
+  text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
+  arrayBuffer() { return Promise.resolve(_arrayBufferFromBytes(this._bytes)); }
+  bytes() { return Promise.resolve(this._bytes.slice()); }
+};
+if (typeof File === "undefined") globalThis.File = class File extends Blob {
+  constructor(parts, name, opts) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
+    opts = opts || {};
+    super(parts, opts);
+    this.name = String(name);
+    this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
+  }
+  get [Symbol.toStringTag]() { return "File"; }
+};
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
 // application/x-www-form-urlencoded serializer: like encodeURIComponent but
 // space -> '+' and also percent-encoding the chars encodeURIComponent leaves
@@ -4904,14 +4961,53 @@ if (typeof Audio === 'undefined') {
 
 if (typeof FileReader === 'undefined') {
   globalThis.FileReader = class FileReader {
-    constructor() { this.result = null; this.readyState = 0; this.onload = null; this.onerror = null; }
-    readAsText(blob) { if (blob?.text) blob.text().then(t => { this.result = t; this.readyState = 2; if (this.onload) this.onload({target:this}); }); }
-    readAsDataURL(blob) { this.result = 'data:;base64,'; this.readyState = 2; if (this.onload) setTimeout(() => this.onload({target:this}), 0); }
-    readAsArrayBuffer(blob) { this.result = new ArrayBuffer(0); this.readyState = 2; if (this.onload) setTimeout(() => this.onload({target:this}), 0); }
-    abort() { this.readyState = 0; }
-    addEventListener(t, fn) { if (t === 'load') this.onload = fn; }
-    removeEventListener() {}
+    constructor() {
+      this.result = null; this.error = null; this.readyState = 0; // EMPTY
+      this.onloadstart = null; this.onprogress = null; this.onload = null;
+      this.onabort = null; this.onerror = null; this.onloadend = null;
+      this._listeners = {};
+    }
+    get [Symbol.toStringTag]() { return "FileReader"; }
+    _read(blob, kind, encoding) {
+      // Spec: reading while LOADING throws InvalidStateError.
+      if (this.readyState === 1) throw new DOMException("The object is already busy reading Blobs.", "InvalidStateError");
+      this.readyState = 1; // LOADING
+      this.result = null; this.error = null;
+      this._fire("loadstart");
+      const self = this;
+      Promise.resolve().then(function () {
+        if (self.readyState !== 1) return; // aborted before completion
+        const bytes = (blob && blob._bytes) ? blob._bytes : new Uint8Array(0);
+        try {
+          if (kind === "text") self.result = new TextDecoder(encoding || "utf-8").decode(bytes);
+          else if (kind === "binary") self.result = _bytesToBinaryString(bytes);
+          else if (kind === "dataurl") self.result = "data:" + ((blob && blob.type) || "application/octet-stream") + ";base64," + btoa(_bytesToBinaryString(bytes));
+          else self.result = _arrayBufferFromBytes(bytes);
+        } catch (e) { self.error = e; }
+        self.readyState = 2; // DONE
+        self._fire("progress"); self._fire("load"); self._fire("loadend");
+      });
+    }
+    readAsText(blob, encoding) { this._read(blob, "text", encoding); }
+    readAsDataURL(blob) { this._read(blob, "dataurl"); }
+    readAsArrayBuffer(blob) { this._read(blob, "arraybuffer"); }
+    readAsBinaryString(blob) { this._read(blob, "binary"); }
+    abort() {
+      const wasReading = this.readyState === 1;
+      this.readyState = 0; this.result = null;
+      if (wasReading) { this._fire("abort"); this._fire("loadend"); }
+    }
+    _fire(type) {
+      const ev = { type: type, target: this, currentTarget: this, lengthComputable: false, loaded: 0, total: 0 };
+      const h = this["on" + type]; if (typeof h === "function") { try { h.call(this, ev); } catch (e) {} }
+      const ls = this._listeners[type]; if (ls) for (const fn of ls.slice()) { try { fn.call(this, ev); } catch (e) {} }
+    }
+    addEventListener(t, fn) { if (typeof fn === "function") (this._listeners[t] = this._listeners[t] || []).push(fn); }
+    removeEventListener(t, fn) { const ls = this._listeners[t]; if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); } }
+    dispatchEvent() { return true; }
   };
+  globalThis.FileReader.EMPTY = 0; globalThis.FileReader.LOADING = 1; globalThis.FileReader.DONE = 2;
+  Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
 
 // Real network sockets aren't implemented; we don't have a runtime WS / SSE
