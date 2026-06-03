@@ -1842,7 +1842,7 @@ globalThis.navigator = {
     p.item = (i) => p[i] || null;
     p.namedItem = (name) => p.find(x => x.name === name) || null;
     p.refresh = () => {};
-    p[Symbol.iterator] = function() { return this[Symbol.iterator](); };
+    p[Symbol.iterator] = Array.prototype[Symbol.iterator].bind(p);
     return p;
   },
   get mimeTypes() {
@@ -4312,7 +4312,7 @@ _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
 const _OrigDateTimeFormat = Intl.DateTimeFormat;
-const _defaultTZ = 'Europe/Germany';
+const _defaultTZ = 'Europe/Berlin';
 Intl.DateTimeFormat = function(locales, options) {
   if (!options) options = {};
   if (!options.timeZone) options.timeZone = _defaultTZ;
