@@ -1654,12 +1654,18 @@ class Document extends Node {
       // jQuery 3.x with it. Reuse the DOMParser path to build a detached
       // document, then optionally set the title.
       createHTMLDocument(title) {
-        const skeleton = `<html><head><title></title></head><body></body></html>`;
-        const doc = new DOMParser().parseFromString(skeleton, "text/html");
-        if (title != null) {
-          const t = doc.querySelector("title");
-          if (t) t.textContent = String(title);
-        }
+        // Build head>title and body explicitly. Parsing a full skeleton string
+        // as innerHTML of <html> collapses through the fragment parser (it
+        // dropped head/body and kept only <title>), leaving doc.body null.
+        const doc = new DOMParser().parseFromString("", "text/html");
+        const root = doc.documentElement;
+        const head = document.createElement("head");
+        const titleEl = document.createElement("title");
+        if (title != null) titleEl.textContent = String(title);
+        head.appendChild(titleEl);
+        const body = document.createElement("body");
+        root.appendChild(head);
+        root.appendChild(body);
         return doc;
       },
       // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
@@ -1669,8 +1675,10 @@ class Document extends Node {
       createDocument(_ns, qualifiedName, _doctype) {
         const name = (qualifiedName && String(qualifiedName)) || "root";
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = `<${safe}></${safe}>`;
-        return new DOMParser().parseFromString(html, "application/xml");
+        const html = qualifiedName ? `<${safe}></${safe}>` : "";
+        const doc = new DOMParser().parseFromString(html, "application/xml");
+        if (_doctype) doc._docType = _doctype;
+        return doc;
       },
       // createDocumentType(qualifiedName, publicId, systemId): build a detached
       // DocumentType node. Browsers validate leniently here (only a name with
@@ -2480,6 +2488,10 @@ if (typeof Request === 'undefined') {
     async text() { return this.body ? String(this.body) : ''; }
     async json() { return JSON.parse(await this.text()); }
     async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
+    async blob() {
+      const ct = this.headers && this.headers.get ? (this.headers.get('content-type') || '') : '';
+      return new Blob(this.body != null ? [this.body] : [], { type: ct });
+    }
   };
 }
 
@@ -3177,6 +3189,15 @@ globalThis.PopStateEvent = class extends Event {
 };
 globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
+globalThis.ProgressEvent = class ProgressEvent extends Event {
+  constructor(type, init) {
+    super(type, init || {});
+    const i = init || {};
+    this.lengthComputable = !!i.lengthComputable;
+    this.loaded = i.loaded != null ? Number(i.loaded) : 0;
+    this.total = i.total != null ? Number(i.total) : 0;
+  }
+};
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
@@ -3195,8 +3216,61 @@ _markNative(globalThis.ToggleEvent);
 
 globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
 globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
-if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
-if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
+// Normalize one Blob part to bytes. `native` newline normalization applies to
+// string parts when the Blob/File `endings` option is "native".
+function _blobPartToBytes(p, native) {
+  if (p == null) return new Uint8Array(0);
+  if (typeof Blob === "function" && p instanceof Blob) return p._bytes || new Uint8Array(0);
+  if (p instanceof ArrayBuffer) return new Uint8Array(p.slice(0));
+  if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer.slice(p.byteOffset, p.byteOffset + p.byteLength));
+  let s = String(p);
+  if (native) s = s.replace(/\r\n|\r|\n/g, "\n");
+  return new TextEncoder().encode(s);
+}
+function _bytesToBinaryString(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return s; }
+if (typeof Blob === "undefined") globalThis.Blob = class Blob {
+  constructor(parts, opts) {
+    opts = opts || {};
+    const endings = opts.endings != null ? String(opts.endings) : "transparent";
+    if (endings !== "transparent" && endings !== "native") throw new TypeError("Failed to construct 'Blob': The provided value '" + endings + "' is not a valid enum value of type EndingType.");
+    const native = endings === "native";
+    const chunks = []; let total = 0;
+    if (parts != null) {
+      if (typeof parts === "string" || typeof parts[Symbol.iterator] !== "function") throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+      for (const p of parts) { const b = _blobPartToBytes(p, native); chunks.push(b); total += b.length; }
+    }
+    const data = new Uint8Array(total); let off = 0;
+    for (const c of chunks) { data.set(c, off); off += c.length; }
+    this._bytes = data;
+    this.size = total;
+    const t = opts.type != null ? String(opts.type) : "";
+    this.type = /^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : "";
+  }
+  get [Symbol.toStringTag]() { return "Blob"; }
+  slice(start, end, contentType) {
+    const len = this.size;
+    const s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
+    let e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
+    if (e < s) e = s;
+    const out = new Blob([], contentType != null ? { type: contentType } : {});
+    out._bytes = this._bytes.slice(s, e);
+    out.size = out._bytes.length;
+    return out;
+  }
+  text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
+  arrayBuffer() { return Promise.resolve(_arrayBufferFromBytes(this._bytes)); }
+  bytes() { return Promise.resolve(this._bytes.slice()); }
+};
+if (typeof File === "undefined") globalThis.File = class File extends Blob {
+  constructor(parts, name, opts) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
+    opts = opts || {};
+    super(parts, opts);
+    this.name = String(name);
+    this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
+  }
+  get [Symbol.toStringTag]() { return "File"; }
+};
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
 // application/x-www-form-urlencoded serializer: like encodeURIComponent but
 // space -> '+' and also percent-encoding the chars encodeURIComponent leaves
@@ -3331,6 +3405,14 @@ globalThis.DOMParser = class DOMParser {
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
+      // Document-level node insertion. Detached docs from createHTMLDocument /
+      // createDocument back onto the same tree, so appending lands under the
+      // documentElement; enough for dom/common.js to build its Range fixtures.
+      appendChild: function (n) { try { root.appendChild(n); } catch (e) {} return n; },
+      removeChild: function (n) { try { root.removeChild(n); } catch (e) {} return n; },
+      insertBefore: function (n, ref) { try { root.insertBefore(n, ref); } catch (e) {} return n; },
+      _docType: null,
+      get doctype() { return this._docType; },
       cloneNode: function (deep) {
         return new DOMParser().parseFromString(root.outerHTML, mimeType);
       },
@@ -3679,26 +3761,22 @@ function _rngNodeLength(n) {
   if (t === 3 || t === 4 || t === 8 || t === 7) return (n.data || n.nodeValue || "").length;
   return n.childNodes.length;
 }
+// Index among siblings, computed in Rust (one op) instead of serializing the
+// whole childNodes list per call: the Range matrices call this heavily.
 function _rngNodeIndex(n) {
-  const p = n.parentNode;
-  if (!p) return 0;
-  const kids = p.childNodes;
-  for (let i = 0; i < kids.length; i++) if (kids[i] && kids[i]._nid === n._nid) return i;
-  return 0;
+  if (!n.parentNode) return 0;
+  return +_dom("node_index", n._nid);
 }
 function _rngSame(a, b) { return a === b || (!!a && !!b && a._nid === b._nid); }
-function _rngRoot(n) { let r = n; while (r && r.parentNode) r = r.parentNode; return r; }
+// Root nid in one op (callers only read ._nid), instead of an O(depth) walk.
+function _rngRoot(n) { return { _nid: +_dom("node_root", n._nid) }; }
 function _rngAncestors(n) { const a = []; let c = n; while (c) { a.push(c); c = c.parentNode; } return a; }
 // document (preorder) tree order: -1 if a precedes b, 1 if a follows b, 0 same.
+// Computed in Rust (one op) rather than walking ancestor chains over per-step
+// DOM ops, which made the large dom/ranges matrices time out.
 function _rngOrder(a, b) {
   if (_rngSame(a, b)) return 0;
-  const aa = _rngAncestors(a).reverse(), bb = _rngAncestors(b).reverse();
-  if (aa[0]._nid !== bb[0]._nid) return (a._nid | 0) < (b._nid | 0) ? -1 : 1;
-  let i = 0;
-  while (i < aa.length && i < bb.length && aa[i]._nid === bb[i]._nid) i++;
-  if (i >= aa.length) return -1; // a is an ancestor of b -> a precedes
-  if (i >= bb.length) return 1;  // b is an ancestor of a -> a follows
-  return _rngNodeIndex(aa[i]) < _rngNodeIndex(bb[i]) ? -1 : 1;
+  return +_dom("compare_order", a._nid, b._nid) || 0;
 }
 // Position of (nA,oA) relative to (nB,oB): -1 before, 0 equal, 1 after.
 function _rngCmp(nA, oA, nB, oB) {
@@ -4424,6 +4502,13 @@ Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) { this.innerHTML 
 Element.prototype.getHTML = function getHTML() { return this.innerHTML; };
 _markNative(Element.prototype.setHTMLUnsafe);
 _markNative(Element.prototype.getHTML);
+// Document.parseHTMLUnsafe(html): static that parses into a new HTML document.
+if (typeof Document !== 'undefined' && typeof Document.parseHTMLUnsafe !== 'function') {
+  Document.parseHTMLUnsafe = function parseHTMLUnsafe(html) {
+    return new DOMParser().parseFromString(String(html == null ? "" : html), "text/html");
+  };
+  _markNative(Document.parseHTMLUnsafe);
+}
 
 globalThis.AudioContext = class AudioContext {
   constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }
@@ -4876,14 +4961,53 @@ if (typeof Audio === 'undefined') {
 
 if (typeof FileReader === 'undefined') {
   globalThis.FileReader = class FileReader {
-    constructor() { this.result = null; this.readyState = 0; this.onload = null; this.onerror = null; }
-    readAsText(blob) { if (blob?.text) blob.text().then(t => { this.result = t; this.readyState = 2; if (this.onload) this.onload({target:this}); }); }
-    readAsDataURL(blob) { this.result = 'data:;base64,'; this.readyState = 2; if (this.onload) setTimeout(() => this.onload({target:this}), 0); }
-    readAsArrayBuffer(blob) { this.result = new ArrayBuffer(0); this.readyState = 2; if (this.onload) setTimeout(() => this.onload({target:this}), 0); }
-    abort() { this.readyState = 0; }
-    addEventListener(t, fn) { if (t === 'load') this.onload = fn; }
-    removeEventListener() {}
+    constructor() {
+      this.result = null; this.error = null; this.readyState = 0; // EMPTY
+      this.onloadstart = null; this.onprogress = null; this.onload = null;
+      this.onabort = null; this.onerror = null; this.onloadend = null;
+      this._listeners = {};
+    }
+    get [Symbol.toStringTag]() { return "FileReader"; }
+    _read(blob, kind, encoding) {
+      // Spec: reading while LOADING throws InvalidStateError.
+      if (this.readyState === 1) throw new DOMException("The object is already busy reading Blobs.", "InvalidStateError");
+      this.readyState = 1; // LOADING
+      this.result = null; this.error = null;
+      this._fire("loadstart");
+      const self = this;
+      Promise.resolve().then(function () {
+        if (self.readyState !== 1) return; // aborted before completion
+        const bytes = (blob && blob._bytes) ? blob._bytes : new Uint8Array(0);
+        try {
+          if (kind === "text") self.result = new TextDecoder(encoding || "utf-8").decode(bytes);
+          else if (kind === "binary") self.result = _bytesToBinaryString(bytes);
+          else if (kind === "dataurl") self.result = "data:" + ((blob && blob.type) || "application/octet-stream") + ";base64," + btoa(_bytesToBinaryString(bytes));
+          else self.result = _arrayBufferFromBytes(bytes);
+        } catch (e) { self.error = e; }
+        self.readyState = 2; // DONE
+        self._fire("progress"); self._fire("load"); self._fire("loadend");
+      });
+    }
+    readAsText(blob, encoding) { this._read(blob, "text", encoding); }
+    readAsDataURL(blob) { this._read(blob, "dataurl"); }
+    readAsArrayBuffer(blob) { this._read(blob, "arraybuffer"); }
+    readAsBinaryString(blob) { this._read(blob, "binary"); }
+    abort() {
+      const wasReading = this.readyState === 1;
+      this.readyState = 0; this.result = null;
+      if (wasReading) { this._fire("abort"); this._fire("loadend"); }
+    }
+    _fire(type) {
+      const ev = { type: type, target: this, currentTarget: this, lengthComputable: false, loaded: 0, total: 0 };
+      const h = this["on" + type]; if (typeof h === "function") { try { h.call(this, ev); } catch (e) {} }
+      const ls = this._listeners[type]; if (ls) for (const fn of ls.slice()) { try { fn.call(this, ev); } catch (e) {} }
+    }
+    addEventListener(t, fn) { if (typeof fn === "function") (this._listeners[t] = this._listeners[t] || []).push(fn); }
+    removeEventListener(t, fn) { const ls = this._listeners[t]; if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); } }
+    dispatchEvent() { return true; }
   };
+  globalThis.FileReader.EMPTY = 0; globalThis.FileReader.LOADING = 1; globalThis.FileReader.DONE = 2;
+  Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
 
 // Real network sockets aren't implemented; we don't have a runtime WS / SSE
