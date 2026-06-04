@@ -186,7 +186,10 @@ impl DomTree {
 
         if let NodeData::Element { ref attrs, .. } = data {
             if let Some(id_attr) = attrs.iter().find(|a| a.name.local.as_ref() == "id") {
-                inner.id_index.insert(id_attr.value.clone(), id);
+                // Keep the FIRST element created with a given id. Parse order is
+                // document order, so getElementById / querySelector('#id') return
+                // the first-in-tree-order element on duplicate ids, per spec.
+                inner.id_index.entry(id_attr.value.clone()).or_insert(id);
             }
         }
 

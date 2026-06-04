@@ -531,6 +531,22 @@ pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, S
     Ok(parsed)
 }
 
+/// If `selector` is a bare ASCII id selector like `#main`, return the id (without
+/// the `#`). Conservative: escapes, combinators, commas, whitespace, non-ASCII, or
+/// a non-letter/underscore first character fall through to the full selector engine.
+fn simple_id_selector(selector: &str) -> Option<&str> {
+    let id = selector.trim().strip_prefix('#')?;
+    let first = id.as_bytes().first().copied()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 impl DomTree {
     pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.query_selector_from(self.document(), selector)
@@ -541,6 +557,21 @@ impl DomTree {
     }
 
     pub fn query_selector_from(&self, root: NodeId, selector: &str) -> Result<Option<NodeId>, String> {
+        // Fast path: a bare "#id" selector resolves through the id index in O(1)
+        // instead of scanning every descendant. The index holds the first element
+        // in tree order per id, which is exactly what the full scan would return.
+        if let Some(id) = simple_id_selector(selector) {
+            match self.get_element_by_id(id) {
+                // querySelector matches strict descendants of root only, so the
+                // indexed element must have root among its ancestors.
+                Some(nid) if self.ancestors(nid).contains(&root) => return Ok(Some(nid)),
+                // No element has this id at all: a bare id selector cannot match.
+                None => return Ok(None),
+                // Indexed (first) element is not under a scoped root; a later
+                // duplicate could still be a descendant, so fall through to scan.
+                Some(_) => {}
+            }
+        }
         let selector_list = parse_selector(selector)?;
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
