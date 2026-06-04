@@ -2754,9 +2754,15 @@ function _utf8DecodeBytes(bytes, start) {
 if (typeof TextDecoder === 'undefined') {
   globalThis.TextDecoder = class TextDecoder {
     constructor(label, options) {
-      const requested = label === undefined ? 'utf-8' : String(label);
-      const name = Deno.core.ops.op_encoding_for_label(requested);
-      if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + requested + "') is invalid.");
+      // No-arg construction (Response.text()/Blob.text() and most pages) is
+      // UTF-8; skip the label-validation op on that hot path.
+      let name;
+      if (label === undefined) {
+        name = 'utf-8';
+      } else {
+        name = Deno.core.ops.op_encoding_for_label(String(label));
+        if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+      }
       const o = options || {};
       Object.defineProperty(this, 'encoding', { value: name, enumerable: true });
       Object.defineProperty(this, 'fatal', { value: !!o.fatal, enumerable: true });
