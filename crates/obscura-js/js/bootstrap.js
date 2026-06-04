@@ -261,10 +261,23 @@ const _styleProxy = (decl) => new Proxy(decl, {
 
 class Node {
   static ELEMENT_NODE = 1;
+  static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
+  static CDATA_SECTION_NODE = 4;
+  static ENTITY_REFERENCE_NODE = 5;
+  static ENTITY_NODE = 6;
+  static PROCESSING_INSTRUCTION_NODE = 7;
   static COMMENT_NODE = 8;
   static DOCUMENT_NODE = 9;
+  static DOCUMENT_TYPE_NODE = 10;
   static DOCUMENT_FRAGMENT_NODE = 11;
+  static NOTATION_NODE = 12;
+  static DOCUMENT_POSITION_DISCONNECTED = 1;
+  static DOCUMENT_POSITION_PRECEDING = 2;
+  static DOCUMENT_POSITION_FOLLOWING = 4;
+  static DOCUMENT_POSITION_CONTAINS = 8;
+  static DOCUMENT_POSITION_CONTAINED_BY = 16;
+  static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
   constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
@@ -417,9 +430,16 @@ class Node {
   compareDocumentPosition(other) {
     if (!other) return 0;
     if (this._nid === other._nid) return 0;
-    if (this.contains(other)) return 16 | 4; // DOCUMENT_POSITION_CONTAINED_BY | FOLLOWING
-    if (other.contains && other.contains(this)) return 8 | 2; // DOCUMENT_POSITION_CONTAINS | PRECEDING
-    return 4; // DOCUMENT_POSITION_FOLLOWING
+    // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
+    // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
+    if (+_dom("node_root", this._nid) !== +_dom("node_root", other._nid)) {
+      return 1 | 32 | ((this._nid < other._nid) ? 4 : 2);
+    }
+    if (this.contains(other)) return 16 | 4;          // CONTAINED_BY | FOLLOWING
+    if (other.contains && other.contains(this)) return 8 | 2; // CONTAINS | PRECEDING
+    // Same root, neither contains the other: real tree order (compare_order op:
+    // -1 => this precedes other => other FOLLOWS this(4); +1 => this PRECEDING(2)).
+    return (+_dom("compare_order", this._nid, other._nid) < 0) ? 4 : 2;
   }
   getRootNode() { return globalThis.document; }
   normalize() {
@@ -745,6 +765,33 @@ function _inputFormatNumber(type, n) {
   return String(n);
 }
 
+// WebIDL interface constants live on both the interface object and the interface
+// prototype object (instances inherit; idlharness checks Node.prototype).
+Object.assign(Node.prototype, {
+  ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+  ENTITY_REFERENCE_NODE: 5, ENTITY_NODE: 6, PROCESSING_INSTRUCTION_NODE: 7,
+  COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+  NOTATION_NODE: 12, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2,
+  DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8,
+  DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
+});
+
+// HTML elements ASCII-lowercase attribute names (setAttribute('accessKey') is
+// stored as 'accesskey'). The toLowerCase is gated behind a cheap uppercase
+// charCode scan so the all-lowercase common case (href, class, id, data-*)
+// allocates nothing and never consults the namespace; only when an uppercase
+// ASCII letter is present do we check the element is HTML before folding.
+function _htmlAttrName(el, n) {
+  n = typeof n === "string" ? n : String(n);
+  for (let i = 0; i < n.length; i++) {
+    const c = n.charCodeAt(i);
+    if (c >= 65 && c <= 90) {
+      return el.namespaceURI === "http://www.w3.org/1999/xhtml" ? n.toLowerCase() : n;
+    }
+  }
+  return n;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -865,16 +912,24 @@ class Element extends Node {
   }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
-  getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
+  getAttribute(n) {
+    // Fast path: HTML attributes are stored lowercase, so a direct hit needs no
+    // case folding. Only on a miss do we lowercase (gated) and retry, so the hot
+    // case (reading an existing lowercase attribute) pays zero scan.
+    let v = _domParse("get_attribute", this._nid, n);
+    if (v === null) { const ln = _htmlAttrName(this, n); if (ln !== n) v = _domParse("get_attribute", this._nid, ln); }
+    return v;
+  }
   setAttribute(n, v) {
-    const popoverPrev = (n === "popover" || (typeof n === "string" && n.length === 7 && n.toLowerCase() === "popover")) ? this.popover : undefined;
+    n = _htmlAttrName(this, n);
+    const popoverPrev = (n === "popover") ? this.popover : undefined;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
   }
-  setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
-  removeAttribute(n) { const popoverPrev = (n === "popover" || (typeof n === "string" && n.length === 7 && n.toLowerCase() === "popover")) ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
-  removeAttributeNS(ns, n) { this.removeAttribute(n); }
+  setAttributeNS(ns, n, v) { _dom("set_attribute", this._nid, String(n) + "\0" + String(v)); } // exact name, no HTML folding
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
   get attributes() {
@@ -902,7 +957,7 @@ class Element extends Node {
     }
     return list;
   }
-  getAttributeNS(ns, n) { return this.getAttribute(n); }
+  getAttributeNS(ns, n) { return _domParse("get_attribute", this._nid, String(n)); }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
@@ -1893,7 +1948,9 @@ class Document extends Node {
     return !event.defaultPrevented;
   }
   createTreeWalker(root, whatToShow, filter) {
-    whatToShow = whatToShow || 0xFFFFFFFF; // NodeFilter.SHOW_ALL
+    // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
+    // An explicit 0 (show nothing) must stay 0, not become SHOW_ALL.
+    whatToShow = (whatToShow === undefined) ? 0xFFFFFFFF : (whatToShow >>> 0);
     const walker = {
       root: root,
       currentNode: root,
@@ -2793,6 +2850,9 @@ if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
     toJSON() { return this._c.href; }
     static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
     static revokeObjectURL() {}
+    // WHATWG URL.parse: like the constructor but returns null instead of throwing.
+    static parse(url, base) { const c = _urlParseOp(url, base); if (!c) return null; const u = Object.create(_URL.prototype); u._c = c; u._sp = null; return u; }
+    static canParse(url, base) { return _urlParseOp(url, base) !== null; }
   };
   _URL.__obscura = true;
   globalThis.URL = _URL;
@@ -3717,6 +3777,7 @@ if (typeof FormData === "undefined") globalThis.FormData = class FormData { cons
 function _formEncode(s){
   return encodeURIComponent(String(s)).replace(/%20/g,'+').replace(/[!'()~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 }
+function _hexv(c){ if(c>=48&&c<=57)return c-48; if(c>=65&&c<=70)return c-55; if(c>=97&&c<=102)return c-87; return -1; }
 if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class URLSearchParams {
   constructor(init=""){
     this._p=[];
@@ -3726,12 +3787,32 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
     } else if(typeof init==="string"){
       this._parseString(init);
     } else if (init && typeof init[Symbol.iterator] === 'function') {
-      for (const pair of init) { const a = Array.from(pair); if (a.length >= 2) this._p.push([String(a[0]), String(a[1])]); }
+      for (const pair of init) {
+        const a = Array.from(pair);
+        if (a.length !== 2) throw new TypeError("Failed to construct 'URLSearchParams': Each query pair must be an iterable [name, value] tuple");
+        this._p.push([String(a[0]), String(a[1])]);
+      }
     } else if (init && typeof init === 'object') {
       Object.keys(init).forEach(k => this._p.push([String(k), String(init[k])]));
     }
   }
-  _decode(s){ try { return decodeURIComponent(String(s).replace(/\+/g, ' ')); } catch(e) { return String(s); } }
+  _decode(s){
+    // application/x-www-form-urlencoded percent-decoding: decode each valid %XX
+    // byte, leave invalid escapes literal (decodeURIComponent throws on the whole
+    // string instead), '+' -> space, then UTF-8 decode the resulting bytes.
+    s = String(s);
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c === 0x2B) { out.push(0x20); }
+      else if (c === 0x25 && i + 2 < s.length) {
+        const a = _hexv(s.charCodeAt(i + 1)), b = _hexv(s.charCodeAt(i + 2));
+        if (a >= 0 && b >= 0) { out.push(a * 16 + b); i += 2; } else { out.push(c); }
+      } else if (c < 0x80) { out.push(c); }
+      else { const e = new TextEncoder().encode(s[i]); for (let j = 0; j < e.length; j++) out.push(e[j]); }
+    }
+    try { return new TextDecoder().decode(new Uint8Array(out)); } catch (e) { return s; }
+  }
   _parseString(s){
     s = String(s).replace(/^\?/, "");
     if (s === "") return;
@@ -3749,8 +3830,8 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   get(k){k=String(k); const p=this._p.find(([key])=>key===k); return p?p[1]:null;}
   getAll(k){k=String(k); return this._p.filter(([key])=>key===k).map(pair=>pair[1]);}
   set(k,v){k=String(k); v=String(v); let done=false; const out=[]; for (const pair of this._p){ if(pair[0]===k){ if(!done){ out.push([k,v]); done=true; } } else out.push(pair); } if(!done) out.push([k,v]); this._p=out; this._notify(); }
-  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k); this._notify();}
-  has(k){k=String(k); return this._p.some(([key])=>key===k);}
+  delete(k,v){k=String(k); const hv=(v!==undefined); v=String(v); this._p=this._p.filter(([key,val])=> hv ? !(key===k&&val===v) : key!==k); this._notify();}
+  has(k,v){k=String(k); const hv=(v!==undefined); v=String(v); return this._p.some(([key,val])=> hv ? (key===k&&val===v) : key===k);}
   sort(){ this._p.sort((a,b)=> a[0]<b[0]?-1:(a[0]>b[0]?1:0)); this._notify(); }
   get size(){ return this._p.length; }
   toString(){return this._p.map(pair=>_formEncode(pair[0])+"="+_formEncode(pair[1])).join("&");}
@@ -3809,6 +3890,21 @@ globalThis.DOMParser = class DOMParser {
       get lastChild() { return root; },
       get children() { return [root]; },
       get childNodes() { return [root]; },
+      // Document metadata the WHATWG interface exposes; DOMParser documents have
+      // URL about:blank, are already fully parsed, and carry no stylesheets.
+      get URL() { return "about:blank"; },
+      get documentURI() { return "about:blank"; },
+      get baseURI() { return "about:blank"; },
+      get compatMode() { return "CSS1Compat"; },
+      get characterSet() { return "UTF-8"; },
+      get charset() { return "UTF-8"; },
+      get inputEncoding() { return "UTF-8"; },
+      get readyState() { return "complete"; },
+      get styleSheets() { return { length: 0, item() { return null; }, [Symbol.iterator]: function* () {} }; },
+      get defaultView() { return null; },
+      get ownerDocument() { return null; },
+      createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
+      createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
       querySelector(s) { return root.querySelector(s); },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
@@ -4142,6 +4238,9 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+// XMLDocument is a subclass of Document (DOMParser of an XML type and
+// implementation.createDocument produce one). The interface must exist globally.
+if (typeof XMLDocument === "undefined") globalThis.XMLDocument = class XMLDocument extends Document {};
 // ParentNode mixin: Document and DocumentFragment are ParentNodes too, so they
 // share Element's append / prepend / replaceChildren.
 for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
@@ -4281,6 +4380,7 @@ globalThis.Range = class Range {
   selectNode(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); const i = _rngNodeIndex(n); this._sc = p; this._so = i; this._ec = p; this._eo = i + 1; }
   selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); this._sc = n; this._so = 0; this._ec = n; this._eo = len; }
   comparePoint(n, o) {
+    o = o >>> 0; // offset is a WebIDL unsigned long: -1 -> 4294967295 -> IndexSizeError
     if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) throw new DOMException("nodes are in different trees", "WrongDocumentError");
     if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
     if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
@@ -4289,6 +4389,7 @@ globalThis.Range = class Range {
     return 0;
   }
   isPointInRange(n, o) {
+    o = o >>> 0;
     if (!this._sc || _rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
     if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
     if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
