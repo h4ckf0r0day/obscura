@@ -422,7 +422,24 @@ class Node {
     return 4; // DOCUMENT_POSITION_FOLLOWING
   }
   getRootNode() { return globalThis.document; }
-  normalize() {} // no-op
+  normalize() {
+    // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
+    // removed nodes keep their own data (read from the backing node by nid).
+    let child = this.firstChild;
+    while (child) {
+      const next = child.nextSibling;
+      if (child.nodeType === 3) {
+        let data = child.data, sib = child.nextSibling;
+        while (sib && sib.nodeType === 3) { const after = sib.nextSibling; data += sib.data; this.removeChild(sib); sib = after; }
+        if (data.length === 0) { this.removeChild(child); child = sib; continue; }
+        if (data !== child.data) child.data = data;
+        child = sib; continue;
+      } else if (child.nodeType === 1 || child.nodeType === 11) {
+        child.normalize();
+      }
+      child = next;
+    }
+  }
   isEqualNode(other) {
     if (!other) return false;
     if (this._nid === other._nid) return true;
@@ -858,6 +875,14 @@ class Element extends Node {
       if (rest === "") return true;
       return this.matches(rest);
     }
+    // :modal is a JS-observable dialog state (a dialog opened via showModal()),
+    // not understood by the native selector engine; handle it like :popover-open.
+    if (typeof s === "string" && s.indexOf(":modal") !== -1) {
+      if (this._dialogModal !== true) return false;
+      const rest = s.replace(/:modal/g, "").trim();
+      if (rest === "") return true;
+      return this.matches(rest);
+    }
     const parent = this.parentNode;
     if (!parent || !parent.querySelectorAll) return false;
     const matches = parent.querySelectorAll(s);
@@ -1057,6 +1082,57 @@ class Element extends Node {
       const target = this;
       setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
     }
+  }
+  // HTMLDialogElement members (live on Element.prototype like popover/input;
+  // meaningful only when localName === 'dialog'). Modal top-layer/focus/render
+  // is layout (out of scope); the open state, returnValue, and beforetoggle/
+  // toggle/close/cancel events are JS-observable and implemented here.
+  get open() { return this.hasAttribute('open'); }
+  set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
+  get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
+  set returnValue(v) { this._returnValue = String(v); }
+  get oncancel() { return this._oncancel || null; }
+  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
+  get onclose() { return this._onclose || null; }
+  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
+  set closedBy(v) { this.setAttribute('closedby', String(v)); }
+  show() {
+    if (this.hasAttribute('open')) { if (this._dialogModal) throw new DOMException("The dialog is already open as a modal dialog.", "InvalidStateError"); return; }
+    const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
+    if (!this.dispatchEvent(before)) return;
+    if (this.hasAttribute('open')) return;
+    this.setAttribute('open', ''); this._dialogModal = false;
+    const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
+  }
+  showModal() {
+    if (this.hasAttribute('open')) throw new DOMException("The dialog is already open.", "InvalidStateError");
+    if (!this.isConnected) throw new DOMException("The dialog is not connected to a document.", "InvalidStateError");
+    const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
+    if (!this.dispatchEvent(before)) return;
+    if (this.hasAttribute('open')) return;
+    this.setAttribute('open', ''); this._dialogModal = true;
+    const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
+  }
+  _dialogClose(result, fireClose) {
+    if (!this.hasAttribute('open')) return;
+    this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
+    this.removeAttribute('open'); this._dialogModal = false;
+    if (result !== undefined) this._returnValue = String(result);
+    const self = this;
+    setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
+    if (fireClose) setTimeout(() => { try { self.dispatchEvent(new Event('close', { bubbles: false, cancelable: false })); } catch (e) {} }, 0);
+  }
+  close(result) { this._dialogClose(result, true); }
+  requestClose(result) {
+    if (!this.hasAttribute('open')) return;
+    if (this._dialogCancelFiring) return; // no re-entrant cancel
+    this._dialogCancelFiring = true;
+    let canceled = false;
+    try { const ev = new Event('cancel', { bubbles: false, cancelable: true }); this.dispatchEvent(ev); canceled = ev.defaultPrevented; }
+    finally { this._dialogCancelFiring = false; }
+    if (canceled) return;
+    this._dialogClose(result, true);
   }
   get value() {
     const tag = this.localName;
@@ -3985,6 +4061,14 @@ globalThis.Range = class Range {
     return _rngCmp(p, o, this._ec, this._eo) < 0 && _rngCmp(p, o + 1, this._sc, this._so) > 0;
   }
   cloneRange() { const r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; }
+  createContextualFragment(html) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'createContextualFragment' on 'Range': 1 argument required, but only 0 present.");
+    const node = this._sc;
+    const ownerDoc = (node && node.ownerDocument) || globalThis.document;
+    const frag = ownerDoc.createDocumentFragment();
+    frag.innerHTML = String(html);
+    return frag;
+  }
   toString() {
     const sc = this._sc, ec = this._ec;
     if (!sc) return "";
