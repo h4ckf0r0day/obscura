@@ -1,5 +1,5 @@
 /// Full example: launch, navigate, interact, check cookies.
-use obscura_api::Browser;
+use obscura::Browser;
 use std::time::Duration;
 
 #[tokio::main]

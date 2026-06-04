@@ -1,7 +1,7 @@
 //! Rust API for the Obscura headless browser.
 //!
 //! ```rust,no_run
-//! use obscura_api::Browser;
+//! use obscura::Browser;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {

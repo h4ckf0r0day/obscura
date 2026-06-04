@@ -7,6 +7,14 @@ use serde_json::Value;
 
 use crate::error::Error;
 
+/// Read a DOM node id from a JS `evaluate` result. obscura serializes JS numbers
+/// as f64, so `Value::as_u64` returns None for an integer-valued result; accept
+/// either an integer or a non-negative finite float. null / non-numbers -> None.
+fn nid_from_value(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))
+}
+
 /// A browser tab/page.
 pub struct Page {
     pub(crate) inner: InnerPage,
@@ -46,7 +54,7 @@ impl Page {
             escaped
         );
         let val = self.evaluate(&js);
-        val.as_u64().map(|nid| Element { node_id: nid, page: self as *const Page })
+        nid_from_value(&val).map(|nid| Element { node_id: nid, page: self as *const Page })
     }
 
     /// Wait for CSS selector to appear (polls every 100ms).
@@ -63,7 +71,7 @@ impl Page {
                 escaped
             );
             let val = self.evaluate(&js);
-            if let Some(nid) = val.as_u64() {
+            if let Some(nid) = nid_from_value(&val) {
                 return Ok(Element { node_id: nid, page: self as *const Page });
             }
             if start.elapsed() > timeout {
