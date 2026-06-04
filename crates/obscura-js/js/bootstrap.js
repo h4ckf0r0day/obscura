@@ -1134,6 +1134,14 @@ class Element extends Node {
     if (canceled) return;
     this._dialogClose(result, true);
   }
+  attachInternals() {
+    const reg = (typeof customElements !== 'undefined' && customElements._registry) ? customElements._registry : null;
+    if (!reg || !reg.get(this.localName)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
+    if (this.getAttribute('is')) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to a customized built-in element.", "NotSupportedError");
+    if (this._internalsAttached) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': ElementInternals for the specified element was already attached.", "NotSupportedError");
+    this._internalsAttached = true;
+    return new ElementInternals(this);
+  }
   get value() {
     const tag = this.localName;
     if (tag === 'select') {
@@ -3087,11 +3095,28 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
 
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
 globalThis.__obscura_shadowHostNames = new Set(['article','aside','blockquote','body','div','footer','h1','h2','h3','h4','h5','h6','header','main','nav','p','section','span']);
-globalThis.customElements = {
-  _registry: new Map(),
-  _whenDefinedResolvers: new Map(),
+function _isConstructorCE(v) {
+  if (typeof v !== 'function') return false;
+  try { Reflect.construct(function () {}, [], v); return true; } catch (e) { return false; }
+}
+const _CE_RESERVED = new Set(['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph']);
+function _isValidCustomElementName(name) {
+  if (typeof name !== 'string' || _CE_RESERVED.has(name)) return false;
+  // PotentialCustomElementName (approx): lowercase start, a hyphen, no uppercase.
+  return /^[a-z][a-z0-9._·À-￿-]*-[a-z0-9._·À-￿-]*$/.test(name);
+}
+class CustomElementRegistry {
+  constructor() { this._registry = new Map(); this._byCtor = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
   define(name, cls, opts) {
-    if (this._registry.has(name)) return;
+    if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not a constructor.");
+    if (!_isValidCustomElementName(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError");
+    if (this._defining) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': operation is not supported while a definition is in progress", "NotSupportedError");
+    if (this._registry.has(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
+    if (this._byCtor.has(cls)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the constructor has already been used with this registry", "NotSupportedError");
+    this._defining = true;
+    try { this._byCtor.set(cls, name); this._defineInner(name, cls, opts); } finally { this._defining = false; }
+  }
+  _defineInner(name, cls, opts) {
     this._registry.set(name, cls);
     // Upgrade existing matching elements: instantiate the class on each,
     // fire connectedCallback if the element is in the document. Without
@@ -3107,7 +3132,7 @@ globalThis.customElements = {
       for (const r of resolvers) r(cls);
       this._whenDefinedResolvers.delete(name);
     }
-  },
+  }
   _upgradeElement(el, cls) {
     if (el.__customUpgraded) return;
     el.__customUpgraded = true;
@@ -3131,9 +3156,14 @@ globalThis.customElements = {
         try { el.connectedCallback(); } catch (e) {}
       }
     } catch (e) {}
-  },
-  get(name) { return this._registry.get(name); },
+  }
+  get(name) { return this._registry.get(name); }
+  getName(cls) {
+    if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'getName' on 'CustomElementRegistry': parameter 1 is not a constructor.");
+    return this._byCtor.has(cls) ? this._byCtor.get(cls) : null;
+  }
   whenDefined(name) {
+    if (!_isValidCustomElementName(name)) return Promise.reject(new DOMException("Failed to execute 'whenDefined' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError"));
     const cls = this._registry.get(name);
     if (cls) return Promise.resolve(cls);
     return new Promise((resolve) => {
@@ -3141,14 +3171,41 @@ globalThis.customElements = {
       list.push(resolve);
       this._whenDefinedResolvers.set(name, list);
     });
-  },
+  }
   upgrade(root) {
     if (!root || !root.querySelectorAll) return;
     for (const [name, cls] of this._registry.entries()) {
       const matches = root.querySelectorAll(name);
       for (const el of matches) this._upgradeElement(el, cls);
     }
-  },
+  }
+}
+globalThis.CustomElementRegistry = CustomElementRegistry;
+globalThis.customElements = new CustomElementRegistry();
+globalThis.HTMLUnknownElement = Element;
+// ElementInternals: form-associated custom element internals. Validity/state
+// are JS-observable; ARIA reflection that needs the accessibility tree is not.
+globalThis.ElementInternals = class ElementInternals {
+  constructor(el) { this._el = el; this._valid = true; this._flags = {}; this._message = ''; this._value = null; this._states = new Set(); }
+  setFormValue(value, state) { this._value = value; }
+  setValidity(flags, message, anchor) {
+    flags = flags || {};
+    const bad = Object.keys(flags).some((k) => k !== 'valid' && flags[k]);
+    if (bad && (message == null || message === '')) throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': The second argument should not be empty if one or more flags in the first argument are true.");
+    this._flags = flags; this._valid = !bad; this._message = bad ? String(message) : '';
+  }
+  checkValidity() { return this._valid; }
+  reportValidity() { return this._valid; }
+  get validity() {
+    const f = this._flags || {};
+    return { valid: this._valid, valueMissing: !!f.valueMissing, typeMismatch: !!f.typeMismatch, patternMismatch: !!f.patternMismatch, tooLong: !!f.tooLong, tooShort: !!f.tooShort, rangeUnderflow: !!f.rangeUnderflow, rangeOverflow: !!f.rangeOverflow, stepMismatch: !!f.stepMismatch, badInput: !!f.badInput, customError: !!f.customError };
+  }
+  get validationMessage() { return this._message || ''; }
+  get willValidate() { return true; }
+  get form() { return this._el && this._el.closest ? this._el.closest('form') : null; }
+  get labels() { return _nodeList([]); }
+  get shadowRoot() { return (this._el && this._el._shadowRoot) || null; }
+  get states() { return this._states; }
 };
 globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
 // ResizeObserver is defined earlier with real per-target firing; the stub
