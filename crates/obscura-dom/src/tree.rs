@@ -234,6 +234,40 @@ impl DomTree {
         if parent_id == child_id {
             return;
         }
+        // Appending an ancestor of the parent under that parent makes the
+        // parent/child graph cyclic, and every later descendants()/children()/
+        // textContent walk (none carry a visited set) would loop forever, pinning
+        // the thread in native Rust where neither tokio nor the V8 watchdog can
+        // interrupt it. Per the DOM spec this is a HierarchyRequestError; treat it
+        // as a no-op, like the self-append guard above. Only a node that already
+        // has children can be an ancestor, so a fresh/leaf child (the common
+        // append) skips the walk: O(1) hot path, O(depth) only when relocating a
+        // populated subtree.
+        {
+            let inner = self.inner.borrow();
+            let child_has_children = inner.nodes.get(child_id.index())
+                .and_then(|n| n.as_ref())
+                .map(|n| n.first_child.is_some())
+                .unwrap_or(false);
+            if child_has_children {
+                let mut cur = inner.nodes.get(parent_id.index())
+                    .and_then(|n| n.as_ref())
+                    .and_then(|n| n.parent);
+                let mut steps = 0usize;
+                while let Some(p) = cur {
+                    if p == child_id {
+                        return;
+                    }
+                    steps += 1;
+                    if steps > inner.nodes.len() {
+                        return; // pre-existing corruption: refuse rather than risk a cycle
+                    }
+                    cur = inner.nodes.get(p.index())
+                        .and_then(|n| n.as_ref())
+                        .and_then(|n| n.parent);
+                }
+            }
+        }
         self.detach(child_id);
 
         let mut inner = self.inner.borrow_mut();
@@ -283,6 +317,35 @@ impl DomTree {
                 None => return,
             }
         };
+
+        // Inserting the parent itself, or any ancestor of the parent, as a child
+        // of that parent would create a cycle (same non-terminating-walk hang as
+        // append_child). Reject it, matching the self-insert guard above. Gate on
+        // the inserted node actually having children, so the common case (insert a
+        // fresh node) stays O(1).
+        {
+            let inner = self.inner.borrow();
+            let new_has_children = inner.nodes.get(new_sibling_id.index())
+                .and_then(|n| n.as_ref())
+                .map(|n| n.first_child.is_some())
+                .unwrap_or(false);
+            if new_has_children {
+                let mut cur = Some(parent_id);
+                let mut steps = 0usize;
+                while let Some(p) = cur {
+                    if p == new_sibling_id {
+                        return;
+                    }
+                    steps += 1;
+                    if steps > inner.nodes.len() {
+                        return;
+                    }
+                    cur = inner.nodes.get(p.index())
+                        .and_then(|n| n.as_ref())
+                        .and_then(|n| n.parent);
+                }
+            }
+        }
 
         self.detach(new_sibling_id);
 
@@ -443,6 +506,14 @@ impl DomTree {
 
         while let Some(current) = stack.pop() {
             result.push(current);
+            // Defense in depth: a well-formed subtree has at most nodes.len()
+            // descendants. Exceeding that means the parent/child graph is cyclic
+            // (which the append_child / insert_before guards prevent); stop rather
+            // than grow the stack and result forever and wedge the engine. On a
+            // valid tree this bound is never reached, so the hot path is unchanged.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
 
             let mut child = inner.nodes.get(current.index())
                 .and_then(|n| n.as_ref())
@@ -739,6 +810,47 @@ mod tests {
 
         assert_eq!(tree.get_element_by_id("main"), Some(div));
         assert_eq!(tree.get_element_by_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_reparent_cycle_is_rejected() {
+        // document -> html -> body -> div. Moving an ancestor under one of its
+        // own descendants would make the parent/child graph cyclic and hang
+        // every later descendants() walk. Both append_child and insert_before
+        // must reject it as a no-op (DOM HierarchyRequestError).
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let html = mk("html");
+        let body = mk("body");
+        let div = mk("div");
+        tree.append_child(doc, html);
+        tree.append_child(html, body);
+        tree.append_child(body, div);
+
+        let before = tree.descendants(doc).len();
+        assert_eq!(before, 3);
+
+        // append_child: html is an ancestor of div -> must be a no-op, no cycle.
+        tree.append_child(div, html);
+        assert_eq!(tree.descendants(doc).len(), before, "cyclic append must be a no-op");
+        assert_eq!(tree.descendants(div).len(), 0, "div must stay a leaf");
+
+        // insert_before: html is an ancestor of body (div's parent) -> no-op.
+        tree.insert_before(div, html);
+        assert_eq!(tree.descendants(doc).len(), before, "cyclic insert_before must be a no-op");
+
+        // self-append / self-insert remain no-ops (existing guards).
+        tree.append_child(div, div);
+        tree.insert_before(div, div);
+        assert_eq!(tree.descendants(doc).len(), before);
     }
 
     #[test]
