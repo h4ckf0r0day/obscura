@@ -647,6 +647,42 @@ function _setElemHrefPart(el, part, value) {
   if (c) el.setAttribute('href', c.href);
 }
 
+// --- <input> number/date conversion (valueAsNumber/valueAsDate/stepUp/Down) ---
+// Applicable types and their step scale factor + default step (HTML spec).
+const _INPUT_NUM_TYPES = { date: 1, month: 1, week: 1, time: 1, 'datetime-local': 1, number: 1, range: 1 };
+const _INPUT_DATE_TYPES = { date: 1, month: 1, week: 1, time: 1, 'datetime-local': 1 };
+const _INPUT_STEP_SCALE = { date: 86400000, 'datetime-local': 1000, month: 1, number: 1, range: 1, time: 1000, week: 604800000 };
+const _INPUT_STEP_DEFAULT = { date: 1, 'datetime-local': 60, month: 1, number: 1, range: 1, time: 60, week: 1 };
+function _pad(n, w) { n = String(Math.abs(n | 0)); while (n.length < w) n = '0' + n; return n; }
+function _daysInMonth(y, m) { return [31, ((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]; }
+function _isoWeek1Monday(y) { const jan4 = Date.UTC(y, 0, 4); const dow = (new Date(jan4).getUTCDay() + 6) % 7; return jan4 - dow * 86400000; }
+// Parse an <input> value string to its numeric form per type; NaN if invalid.
+function _inputParseNumber(type, v) {
+  v = String(v == null ? '' : v);
+  let m;
+  switch (type) {
+    case 'number': case 'range': { if (v === '') return NaN; const n = Number(v); return isFinite(n) ? n : NaN; }
+    case 'date': if ((m = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(v))) { const y = +m[1], mo = +m[2], d = +m[3]; if (mo >= 1 && mo <= 12 && d >= 1 && d <= _daysInMonth(y, mo)) return Date.UTC(y, mo - 1, d); } return NaN;
+    case 'month': if ((m = /^(\d{4,})-(\d{2})$/.exec(v))) { const y = +m[1], mo = +m[2]; if (mo >= 1 && mo <= 12) return (y - 1970) * 12 + (mo - 1); } return NaN;
+    case 'week': if ((m = /^(\d{4,})-W(\d{2})$/.exec(v))) { const y = +m[1], w = +m[2]; if (w >= 1 && w <= 53) return _isoWeek1Monday(y) + (w - 1) * 604800000; } return NaN;
+    case 'time': if ((m = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(v))) { const h = +m[1], mi = +m[2], s = m[3] ? +m[3] : 0, ms = m[4] ? +((m[4] + '00').slice(0, 3)) : 0; if (h <= 23 && mi <= 59 && s <= 59) return ((h * 60 + mi) * 60 + s) * 1000 + ms; } return NaN;
+    case 'datetime-local': if ((m = /^(\d{4,})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(v))) { const y = +m[1], mo = +m[2], d = +m[3], h = +m[4], mi = +m[5], s = m[6] ? +m[6] : 0, ms = m[7] ? +((m[7] + '00').slice(0, 3)) : 0; if (mo >= 1 && mo <= 12 && d >= 1 && d <= _daysInMonth(y, mo) && h <= 23 && mi <= 59 && s <= 59) return Date.UTC(y, mo - 1, d, h, mi, s, ms); } return NaN;
+  }
+  return NaN;
+}
+// Format a numeric value back to an <input> value string per type.
+function _inputFormatNumber(type, n) {
+  switch (type) {
+    case 'number': case 'range': return String(n);
+    case 'date': { const dt = new Date(n); return _pad(dt.getUTCFullYear(), 4) + '-' + _pad(dt.getUTCMonth() + 1, 2) + '-' + _pad(dt.getUTCDate(), 2); }
+    case 'month': { const y = 1970 + Math.floor(n / 12); const mo = ((n % 12) + 12) % 12 + 1; return _pad(y, 4) + '-' + _pad(mo, 2); }
+    case 'week': { const d = new Date(n); const dow = (d.getUTCDay() + 6) % 7; const thu = n - dow * 86400000 + 3 * 86400000; const ty = new Date(thu).getUTCFullYear(); const w = Math.round((n - dow * 86400000 - _isoWeek1Monday(ty)) / 604800000) + 1; return _pad(ty, 4) + '-W' + _pad(w, 2); }
+    case 'time': { n = ((n % 86400000) + 86400000) % 86400000; const ms = n % 1000; n = Math.floor(n / 1000); const s = n % 60; n = Math.floor(n / 60); const mi = n % 60; const h = Math.floor(n / 60); let str = _pad(h, 2) + ':' + _pad(mi, 2); if (s || ms) { str += ':' + _pad(s, 2); if (ms) str += '.' + _pad(ms, 3); } return str; }
+    case 'datetime-local': { const dt = new Date(n); let str = _pad(dt.getUTCFullYear(), 4) + '-' + _pad(dt.getUTCMonth() + 1, 2) + '-' + _pad(dt.getUTCDate(), 2) + 'T' + _pad(dt.getUTCHours(), 2) + ':' + _pad(dt.getUTCMinutes(), 2); const s = dt.getUTCSeconds(), ms = dt.getUTCMilliseconds(); if (s || ms) { str += ':' + _pad(s, 2); if (ms) str += '.' + _pad(ms, 3); } return str; }
+  }
+  return String(n);
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1064,6 +1100,78 @@ class Element extends Node {
     if (tag === 'textarea') {
       this.textContent = String(v);
     }
+  }
+  get min() { return this.getAttribute('min') || ''; }
+  set min(v) { this.setAttribute('min', v); }
+  get max() { return this.getAttribute('max') || ''; }
+  set max(v) { this.setAttribute('max', v); }
+  get step() { return this.getAttribute('step') || ''; }
+  set step(v) { this.setAttribute('step', v); }
+  _inputType() { return this.localName === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : ''; }
+  get valueAsNumber() {
+    const t = this._inputType();
+    if (!_INPUT_NUM_TYPES[t]) return NaN;
+    if (t === 'range') {
+      let minN = _inputParseNumber('range', this.getAttribute('min')); if (isNaN(minN)) minN = 0;
+      let maxN = _inputParseNumber('range', this.getAttribute('max')); if (isNaN(maxN)) maxN = 100;
+      if (maxN < minN) maxN = minN;
+      const v = _inputParseNumber('range', this.value);
+      let n = isNaN(v) ? (minN + (maxN - minN) / 2) : v;
+      if (n < minN) n = minN; if (n > maxN) n = maxN;
+      return n;
+    }
+    return _inputParseNumber(t, this.value);
+  }
+  set valueAsNumber(n) {
+    const t = this._inputType();
+    if (!_INPUT_NUM_TYPES[t]) throw new DOMException("Failed to set the 'valueAsNumber' property on 'HTMLInputElement': This input element does not support Number values.", 'InvalidStateError');
+    n = Number(n);
+    if (isNaN(n)) { this.value = ''; return; }
+    if (!isFinite(n)) throw new TypeError("Failed to set the 'valueAsNumber' property on 'HTMLInputElement': The value provided is infinite.");
+    this.value = _inputFormatNumber(t, n);
+  }
+  get valueAsDate() {
+    const t = this._inputType();
+    if (!_INPUT_DATE_TYPES[t]) return null;
+    const n = _inputParseNumber(t, this.value);
+    if (isNaN(n)) return null;
+    if (t === 'month') { const y = 1970 + Math.floor(n / 12); const mo = ((n % 12) + 12) % 12; return new Date(Date.UTC(y, mo, 1)); }
+    return new Date(n);
+  }
+  set valueAsDate(d) {
+    const t = this._inputType();
+    if (!_INPUT_DATE_TYPES[t]) throw new DOMException("Failed to set the 'valueAsDate' property on 'HTMLInputElement': This input element does not support Date values.", 'InvalidStateError');
+    if (d === null) { this.value = ''; return; }
+    if (!(d instanceof Date)) throw new TypeError("Failed to set the 'valueAsDate' property on 'HTMLInputElement': The provided value is not a Date.");
+    const ms = d.getTime();
+    if (isNaN(ms)) { this.value = ''; return; }
+    if (t === 'month') { this.value = _inputFormatNumber('month', (d.getUTCFullYear() - 1970) * 12 + d.getUTCMonth()); return; }
+    this.value = _inputFormatNumber(t, ms);
+  }
+  stepUp(n) { this._stepBy(n === undefined ? 1 : (n | 0)); }
+  stepDown(n) { this._stepBy(-(n === undefined ? 1 : (n | 0))); }
+  _stepBy(delta) {
+    const t = this._inputType();
+    const stepAttr = this.getAttribute('step');
+    if (!_INPUT_STEP_SCALE[t] || (stepAttr && stepAttr.trim().toLowerCase() === 'any')) {
+      throw new DOMException("Failed to execute 'stepUp' on 'HTMLInputElement': This form element does not have allowed value steps.", 'InvalidStateError');
+    }
+    const scale = _INPUT_STEP_SCALE[t];
+    let stepN = _INPUT_STEP_DEFAULT[t];
+    if (stepAttr) { const s = Number(stepAttr); if (isFinite(s) && s > 0) stepN = s; }
+    const allowed = stepN * scale;
+    const minN = _inputParseNumber(t, this.getAttribute('min'));
+    const maxN = _inputParseNumber(t, this.getAttribute('max'));
+    const stepBase = isNaN(minN) ? 0 : minN;
+    let value = this.valueAsNumber;
+    if (isNaN(value)) value = isNaN(minN) ? 0 : minN;
+    value += delta * allowed;
+    value = stepBase + Math.round((value - stepBase) / allowed) * allowed;
+    const effMin = (t === 'range' && isNaN(minN)) ? 0 : minN;
+    const effMax = (t === 'range' && isNaN(maxN)) ? 100 : maxN;
+    if (!isNaN(effMin) && value < effMin) value = effMin;
+    if (!isNaN(effMax) && value > effMax) value = effMax;
+    this.value = _inputFormatNumber(t, value);
   }
   get checked() {
     if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
