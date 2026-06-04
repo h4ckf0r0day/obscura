@@ -1132,6 +1132,26 @@ fn op_url_resolve(#[string] href: &str, #[string] base: &str) -> String {
     .unwrap_or_default()
 }
 
+/// Canonical (lowercased) WHATWG name for a TextDecoder label, or "" if the
+/// label is unknown (the JS constructor turns "" into a RangeError).
+#[op2]
+#[string]
+fn op_encoding_for_label(#[string] label: &str) -> String {
+    obscura_net::label_name(label).unwrap_or_default()
+}
+
+/// Decode bytes with a legacy/explicit encoding via encoding_rs. Returns
+/// {"ok":true,"v":<string>} or {"ok":false} (unknown label, or a fatal decode
+/// error). The UTF-8 non-fatal common case is handled in JS without this op.
+#[op2]
+#[string]
+fn op_text_decode(#[string] label: &str, #[buffer] bytes: &[u8], fatal: bool, ignore_bom: bool) -> String {
+    match obscura_net::decode_with_label(label, bytes, fatal, ignore_bom) {
+        Some(s) => serde_json::json!({ "ok": true, "v": s }).to_string(),
+        None => "{\"ok\":false}".to_string(),
+    }
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -1148,6 +1168,8 @@ pub fn build_extension() -> Extension {
             op_url_parse(),
             op_url_set(),
             op_url_resolve(),
+            op_encoding_for_label(),
+            op_text_decode(),
         ]),
         ..Default::default()
     }

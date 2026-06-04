@@ -12,7 +12,7 @@ pub use client::{
     Response,
 };
 pub use cookies::{CookieInfo, CookieJar};
-pub use encoding::{decode_non_html, decode_response};
+pub use encoding::{decode_non_html, decode_response, decode_with_label, label_name};
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]

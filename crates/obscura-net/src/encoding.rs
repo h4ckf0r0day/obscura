@@ -13,7 +13,38 @@
 //!
 //! For non-HTML resources (JS, CSS, JSON), only steps 1 and 3 apply.
 
-use encoding_rs::{Encoding, UTF_8};
+use encoding_rs::{DecoderResult, Encoding, UTF_8};
+
+/// WHATWG canonical (lowercased) name for an encoding label, or None if the
+/// label is not a known encoding. Backs `TextDecoder`'s label validation and
+/// its `.encoding` property.
+pub fn label_name(label: &str) -> Option<String> {
+    Encoding::for_label(label.as_bytes()).map(|e| e.name().to_ascii_lowercase())
+}
+
+/// Decode `bytes` with an explicit encoding label, with TextDecoder semantics.
+/// Returns None when the label is unknown, or (when `fatal`) when the input is
+/// not valid in that encoding. Non-fatal decoding replaces errors with U+FFFD.
+pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: bool) -> Option<String> {
+    let enc = Encoding::for_label(label.as_bytes())?;
+    let mut dec = if ignore_bom {
+        enc.new_decoder_without_bom_handling()
+    } else {
+        enc.new_decoder()
+    };
+    if fatal {
+        let mut out = String::with_capacity(bytes.len() + 1);
+        let (res, _) = dec.decode_to_string_without_replacement(bytes, &mut out, true);
+        match res {
+            DecoderResult::InputEmpty => Some(out),
+            _ => None,
+        }
+    } else {
+        let mut out = String::with_capacity(bytes.len() * 2 + 1);
+        let _ = dec.decode_to_string(bytes, &mut out, true);
+        Some(out)
+    }
+}
 
 /// Decode an HTTP response body. `content_type_header` is the raw header
 /// value if present (e.g. `text/html; charset=gbk`). For HTML resources,
