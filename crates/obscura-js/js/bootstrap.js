@@ -3094,6 +3094,12 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
 };
 
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
+// Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
+Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
+  get() { return this._adoptedStyleSheets || []; },
+  set(sheets) { this._adoptedStyleSheets = sheets; },
+  configurable: true,
+});
 globalThis.__obscura_shadowHostNames = new Set(['article','aside','blockquote','body','div','footer','h1','h2','h3','h4','h5','h6','header','main','nav','p','section','span']);
 function _isConstructorCE(v) {
   if (typeof v !== 'function') return false;
