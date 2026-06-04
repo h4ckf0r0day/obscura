@@ -515,18 +515,22 @@ impl DomTree {
         };
 
         if last_child_is_text {
+            // Re-read last_child without unwrap: if it vanished between the two
+            // borrows, fall through to appending a fresh text node rather than
+            // panicking (a panic here aborts the whole engine via V8_Fatal).
             let last_child_id = {
                 let inner = self.inner.borrow();
                 inner.nodes.get(parent_id.index())
                     .and_then(|n| n.as_ref())
                     .and_then(|n| n.last_child)
-                    .unwrap()
             };
-            let mut inner = self.inner.borrow_mut();
-            if let Some(Some(node)) = inner.nodes.get_mut(last_child_id.index()) {
-                if let NodeData::Text { contents } = &mut node.data {
-                    contents.push_str(text);
-                    return;
+            if let Some(last_child_id) = last_child_id {
+                let mut inner = self.inner.borrow_mut();
+                if let Some(Some(node)) = inner.nodes.get_mut(last_child_id.index()) {
+                    if let NodeData::Text { contents } = &mut node.data {
+                        contents.push_str(text);
+                        return;
+                    }
                 }
             }
         }

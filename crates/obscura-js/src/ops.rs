@@ -83,6 +83,22 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[op2]
 #[string]
 fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[string] arg2: String) -> String {
+    // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
+    // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
+    // engine (and every CDP client) down. Catch it so one malformed selector or
+    // inconsistent tree node degrades to a null result for that single call.
+    // No per-call clone: on the happy path this is just a landing pad, so the
+    // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        op_dom_inner(state, cmd, arg1, arg2)
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("op_dom panicked; returning null");
+        "null".to_string()
+    })
+}
+
+fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
     let gs = state.borrow::<SharedState>().clone();
     let gs = gs.borrow();
     let dom = match &gs.dom {

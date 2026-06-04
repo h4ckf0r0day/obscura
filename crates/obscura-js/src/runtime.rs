@@ -27,6 +27,15 @@ pub struct ObscuraJsRuntime {
     object_counter: u64,
 }
 
+/// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
+/// Holds the cancel channel and the watchdog thread; pass it back to
+/// `disarm_watchdog` to stop the watchdog and learn whether it fired.
+pub struct WatchdogToken {
+    pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    join: Option<std::thread::JoinHandle<()>>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 impl ObscuraJsRuntime {
     pub fn new() -> Self {
         Self::with_base_url("about:blank")
@@ -669,6 +678,109 @@ impl ObscuraJsRuntime {
             .run_event_loop(deno_core::PollEventLoopOptions::default())
             .await
             .map_err(|e| format!("Event loop error: {}", e))
+    }
+
+    /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
+    /// synchronous loop or a microtask storm pins the OS thread inside V8, so
+    /// `tokio::time::timeout` (which can only cancel at await points) never
+    /// fires. This spawns a watchdog thread that terminates the isolate once
+    /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
+    /// control back. Always balance with [`Self::disarm_watchdog`].
+    pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
+        let handle = self.runtime.v8_isolate().thread_safe_handle();
+        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pair_c = pair.clone();
+        let fired_c = fired.clone();
+        let join = std::thread::spawn(move || {
+            let (lock, cvar) = &*pair_c;
+            let mut cancelled = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    fired_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                    handle.terminate_execution();
+                    return;
+                }
+                let (guard, _) = cvar.wait_timeout(cancelled, remaining).unwrap();
+                cancelled = guard;
+                if *cancelled {
+                    return;
+                }
+            }
+        });
+        WatchdogToken { pair, join: Some(join), fired }
+    }
+
+    /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
+    /// (terminated the isolate), clear V8's termination flag so the isolate is
+    /// usable again, and return `true`.
+    pub fn disarm_watchdog(&mut self, mut token: WatchdogToken) -> bool {
+        {
+            let (lock, cvar) = &*token.pair;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+        }
+        if let Some(j) = token.join.take() {
+            let _ = j.join();
+        }
+        let fired = token.fired.load(std::sync::atomic::Ordering::SeqCst);
+        if fired {
+            self.runtime.v8_isolate().cancel_terminate_execution();
+            tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
+        }
+        fired
+    }
+
+    /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
+    /// idle (tokio timeout) and synchronous hangs (V8 watchdog). A microtask
+    /// storm that pins the thread is terminated ~500ms past the budget; a
+    /// well-behaved page returns as soon as the loop goes idle.
+    pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
+        if budget_ms == 0 {
+            return self.run_event_loop().await;
+        }
+        let budget = std::time::Duration::from_millis(budget_ms);
+        let token = self.arm_watchdog(budget + std::time::Duration::from_millis(500));
+        let result = tokio::time::timeout(budget, self.run_event_loop()).await;
+        self.disarm_watchdog(token);
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) if e.contains("execution terminated") => Ok(()),
+            Ok(Err(e)) => Err(e),
+            // tokio idle-timeout is the normal "settled" exit, not an error.
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Like [`Self::evaluate`] but bounded by a V8 watchdog, so a `--eval`
+    /// expression that loops forever (or awaits a promise that never settles in
+    /// synchronous form) cannot hang the process.
+    pub fn evaluate_with_timeout(
+        &mut self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        if timeout.is_zero() {
+            return self.evaluate(expression);
+        }
+        let wrapped = Self::wrap_expression(expression);
+        let token = self.arm_watchdog(timeout);
+        let result = self.runtime.execute_script("<eval>", wrapped);
+        let fired = self.disarm_watchdog(token);
+        match result {
+            Ok(v) if !fired => self.v8_to_json(v),
+            Ok(_) => Err("eval timed out".to_string()),
+            Err(e) => {
+                let msg = e.to_string();
+                if fired || msg.contains("execution terminated") {
+                    Err("eval timed out".to_string())
+                } else {
+                    Err(format!("JS error: {}", msg))
+                }
+            }
+        }
     }
 
     pub async fn resolve_promises(&mut self) {

@@ -295,6 +295,17 @@ impl Page {
         let script_deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_millis(script_deadline_ms);
 
+        // Hard backstop over the WHOLE script-execution phase. Inline scripts
+        // run back-to-back with no await between them, so neither the soft
+        // deadline above (only checked between scripts) nor the per-script guard
+        // can interrupt a page that burns the budget across many synchronous
+        // scripts (the real-world SPA / anti-bot busy-loop hang). This watchdog
+        // terminates the isolate if cumulative synchronous script work overruns.
+        let exec_wd = self
+            .js
+            .as_mut()
+            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
+
         #[derive(Debug)]
         struct ScriptInfo {
             src: Option<String>,
@@ -596,6 +607,10 @@ impl Page {
             // On busy sites this could keep the V8 lock held for tens of
             // seconds, wedging the entire CDP dispatcher (see triage for
             // issue series around the 40-site compat sweep).
+            // A single run_event_loop poll that pins the thread inside V8 makes
+            // the per-poll tokio timeouts below useless, so guard the whole loop
+            // with a watchdog that fires ~250ms past its 500ms deadline.
+            let settle_wd = js.arm_watchdog(std::time::Duration::from_millis(750));
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
             let mut idle_count = 0u32;
             loop {
@@ -625,6 +640,12 @@ impl Page {
                         idle_count = 0;
                     }
                 }
+            }
+            js.disarm_watchdog(settle_wd);
+        }
+        if let Some(token) = exec_wd {
+            if let Some(js) = self.js.as_mut() {
+                js.disarm_watchdog(token);
             }
         }
     }
@@ -694,11 +715,11 @@ impl Page {
             return;
         }
         if let Some(js) = &mut self.js {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_millis(max_ms),
-                js.run_event_loop(),
-            )
-            .await;
+            // Bounded against both async idle and synchronous microtask storms:
+            // a plain tokio timeout cannot preempt a page that pins the thread
+            // inside V8 (the real-world SPA hang), so settle drives the loop
+            // through the watchdog-guarded path.
+            let _ = js.run_event_loop_bounded(max_ms).await;
         }
     }
 
@@ -1010,6 +1031,13 @@ impl Page {
                 _ => 0,
             };
 
+            // Same hazard as the post-script settle: a synchronous poll can pin
+            // the thread past the 5s network-idle deadline, so arm a watchdog
+            // that terminates the isolate ~500ms past it.
+            let netidle_wd = self
+                .js
+                .as_mut()
+                .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             let mut idle_since: Option<tokio::time::Instant> = None;
 
@@ -1043,6 +1071,11 @@ impl Page {
                 }
             }
 
+            if let Some(token) = netidle_wd {
+                if let Some(js) = self.js.as_mut() {
+                    js.disarm_watchdog(token);
+                }
+            }
             self.lifecycle = LifecycleState::NetworkIdle;
         }
 
@@ -1073,6 +1106,27 @@ impl Page {
 
     pub fn dom(&self) -> Option<&DomTree> {
         self.dom.as_ref()
+    }
+
+    /// Like [`Self::evaluate`] but bounded by a V8 watchdog so a runaway
+    /// expression cannot hang the process. A non-zero `timeout` of zero falls
+    /// back to the unbounded path.
+    pub fn evaluate_with_timeout(
+        &mut self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> serde_json::Value {
+        if let Some(js) = &mut self.js {
+            match js.evaluate_with_timeout(expression, timeout) {
+                Ok(val) => val,
+                Err(e) => {
+                    tracing::debug!("JS eval error/timeout for '{}': {}", &expression[..expression.len().min(80)], e);
+                    serde_json::Value::Null
+                }
+            }
+        } else {
+            self.evaluate(expression)
+        }
     }
 
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {

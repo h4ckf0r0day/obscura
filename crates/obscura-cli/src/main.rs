@@ -513,6 +513,22 @@ async fn run_fetch(
         eprintln!("Fetching {}...", url_str);
     }
 
+    // Process-level hard deadline. A synchronous hang inside a Rust op invoked
+    // from page JS cannot be cancelled by tokio (there is no await to interrupt)
+    // nor by the V8 watchdog (terminate_execution only unwinds JS bytecode, not
+    // native Rust running beneath a V8->op call). As an absolute backstop so one
+    // fetch can never wedge the worker, a daemon thread force-exits if the whole
+    // operation overruns timeout + wait + grace. A normal fetch returns first and
+    // the process exits before this fires.
+    {
+        let hard = Duration::from_secs(timeout_secs.saturating_add(wait_secs).saturating_add(10));
+        std::thread::spawn(move || {
+            std::thread::sleep(hard);
+            eprintln!("obscura: hard timeout exceeded ({}s); forcing exit", hard.as_secs());
+            std::process::exit(124);
+        });
+    }
+
     match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
         Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
         Err(_) => anyhow::bail!(
@@ -540,7 +556,9 @@ async fn run_fetch(
     }
 
     if let Some(ref expr) = eval {
-        let result = page.evaluate(expr);
+        // Bound the eval by the same budget as navigation so a runaway
+        // expression (infinite loop, never-settling sync work) cannot hang.
+        let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
         let rendered = match result {
             serde_json::Value::String(s) => s,
             serde_json::Value::Null => "null".to_string(),
