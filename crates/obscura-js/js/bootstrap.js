@@ -648,6 +648,49 @@ class ProcessingInstruction extends CharacterData {
   cloneNode() { return new ProcessingInstruction(+_dom("create_text_node", this.data), this._target); }
 }
 
+// Document character encoding (WHATWG canonical name, e.g. "UTF-8", "EUC-JP").
+// Cached per runtime: the encoding is fixed for a document's lifetime and this
+// is read on every <a>/<area> URL-component access, so the UTF-8 common case
+// must reduce to a single cached-boolean read with no op call and no allocation.
+let __docEncoding;
+let __docIsUtf8;
+function _docEncoding() {
+  if (__docEncoding === undefined) {
+    const e = _domParse("document_encoding");
+    __docEncoding = (typeof e === 'string' && e) ? e : 'UTF-8';
+    __docIsUtf8 = __docEncoding.toLowerCase() === 'utf-8';
+  }
+  return __docEncoding;
+}
+function _docIsUtf8() { if (__docIsUtf8 === undefined) _docEncoding(); return __docIsUtf8; }
+// WHATWG "special scheme" check (these get the special-query percent-encode set).
+function _isSpecialScheme(protocol) {
+  const s = (protocol || '').replace(/:$/, '').toLowerCase();
+  return s === 'http' || s === 'https' || s === 'ws' || s === 'wss' || s === 'ftp' || s === 'file';
+}
+// Apply the WHATWG URL "encoding override": in a legacy (non-UTF-8) document
+// the query of an <a>/<area> href is percent-encoded in the document charset,
+// not UTF-8. The url op already produced a UTF-8-encoded query; recover the
+// original characters (percent-decode + UTF-8) and re-encode them through the
+// document charset. Pure-ASCII queries round-trip unchanged.
+function _applyDocQueryEncoding(u) {
+  if (!u || !u.search || u.search.length < 2) return u;
+  let decoded;
+  try { decoded = decodeURIComponent(u.search.slice(1)); } catch (e) { return u; }
+  let reencoded;
+  try { reencoded = Deno.core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
+  catch (e) { return u; }
+  const newSearch = '?' + reencoded;
+  if (newSearch === u.search) return u;
+  const hashIdx = u.href.indexOf('#');
+  const frag = hashIdx >= 0 ? u.href.slice(hashIdx) : '';
+  const beforeHash = hashIdx >= 0 ? u.href.slice(0, hashIdx) : u.href;
+  const qIdx = beforeHash.indexOf('?');
+  u.href = (qIdx >= 0 ? beforeHash.slice(0, qIdx) : beforeHash) + newSearch + frag;
+  u.search = newSearch;
+  return u;
+}
+
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
@@ -655,7 +698,9 @@ function _anchorBase() { return _domParse("document_url") || "about:blank"; }
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
-  return _urlParseOp(raw, _anchorBase());
+  const u = _urlParseOp(raw, _anchorBase());
+  if (u && !_docIsUtf8()) return _applyDocQueryEncoding(u);
+  return u;
 }
 function _setElemHrefPart(el, part, value) {
   const u = _elemHrefURL(el);
@@ -1284,6 +1329,8 @@ class Element extends Node {
     if (ln === 'a' || ln === 'area') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
+      // Legacy-charset document: href must reflect the encoding-override query.
+      if (!_docIsUtf8()) { const u = _elemHrefURL(this); return u ? u.href : raw; }
       const r = _urlResolveOp(raw, _anchorBase());
       return r !== null ? r : raw;
     }
@@ -1578,6 +1625,105 @@ function _convertNodes(nodes) {
   return out;
 }
 
+// ---- Reflected IDL attributes (WHATWG) ---------------------------------------
+// Installed ONCE on Element.prototype as shared getter/setter pairs. This is
+// data-driven so there is no per-element defineProperty: element creation and
+// the querySelector/mutation hot paths are unaffected (each access is a normal
+// prototype getter that reads the backing attribute). Covers the global content
+// attributes reflected on every element plus the ARIAMixin (aria-* + ariaXxx).
+(function installElementReflectors() {
+  const P = Element.prototype;
+  const def = (name, get, set) => {
+    if (Object.prototype.hasOwnProperty.call(P, name)) return; // never clobber an existing member
+    Object.defineProperty(P, name, { get, set, enumerable: true, configurable: true });
+  };
+  // WHATWG "rules for parsing integers"; returns a JS number or null on failure.
+  const parseIntAttr = (s) => {
+    if (s === null || s === undefined) return null;
+    const m = /^[ \t\n\f\r]*([+-]?[0-9]+)/.exec(String(s));
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  // IDL `long` conversion (ToInt32): finite, truncated, wrapped to 32-bit signed.
+  const toLong = (v) => {
+    let n = Number(v);
+    if (!Number.isFinite(n)) n = 0;
+    n = Math.trunc(n) % 4294967296;
+    if (n >= 2147483648) n -= 4294967296;
+    else if (n < -2147483648) n += 4294967296;
+    return n;
+  };
+  // DOMString reflect: get -> attribute or ""; set -> setAttribute(String(v)).
+  const reflectStr = (name, attr) => def(name,
+    function () { const v = this.getAttribute(attr); return v === null ? "" : v; },
+    function (v) { this.setAttribute(attr, String(v)); });
+  // boolean reflect: get -> hasAttribute; set -> truthy ? add("") : remove.
+  const reflectBool = (name, attr) => def(name,
+    function () { return this.hasAttribute(attr); },
+    function (v) { if (v) this.setAttribute(attr, ""); else this.removeAttribute(attr); });
+  // long reflect: get -> parse else default (static value or per-element fn);
+  // set -> setAttribute(String(ToInt32(v))).
+  const reflectLong = (name, attr, dflt) => def(name,
+    function () {
+      const r = parseIntAttr(this.getAttribute(attr));
+      if (r !== null && r >= -2147483648 && r <= 2147483647) return r;
+      return typeof dflt === "function" ? dflt.call(this) : dflt;
+    },
+    function (v) { this.setAttribute(attr, String(toLong(v))); });
+  // enumerated reflect: get -> canonical (lowercased) keyword, else missing/
+  // invalid default; set -> setAttribute(String(v)) (canonicalization on get).
+  const reflectEnum = (name, attr, keywords, missingDefault, invalidDefault) => def(name,
+    function () {
+      const v = this.getAttribute(attr);
+      if (v === null) return missingDefault;
+      const lc = String(v).toLowerCase();
+      return keywords.indexOf(lc) !== -1 ? lc : invalidDefault;
+    },
+    function (v) { this.setAttribute(attr, String(v)); });
+  // nullable DOMString reflect (ARIA): get -> attribute or null; set -> null/
+  // undefined removes, else setAttribute(String(v)).
+  const reflectNullable = (name, attr) => def(name,
+    function () { return this.getAttribute(attr); },
+    function (v) { if (v === null || v === undefined) this.removeAttribute(attr); else this.setAttribute(attr, String(v)); });
+
+  // Global content attributes reflected on every element (HTML "global attributes").
+  reflectStr("title", "title");
+  reflectStr("lang", "lang");
+  reflectStr("accessKey", "accesskey");
+  reflectStr("slot", "slot");
+  reflectEnum("dir", "dir", ["ltr", "rtl", "auto"], "", "");
+  reflectBool("autofocus", "autofocus");
+  reflectBool("hidden", "hidden");
+  // tabIndex default is element-dependent (0 for natively-focusable, else -1);
+  // reflection.js does not assert it, but match the common case anyway.
+  reflectLong("tabIndex", "tabindex", function () {
+    const ln = this.localName;
+    if (ln === "a" || ln === "area" || ln === "link") return this.hasAttribute("href") ? 0 : -1;
+    return (ln === "button" || ln === "input" || ln === "select" || ln === "textarea" || ln === "iframe") ? 0 : -1;
+  });
+
+  // ARIAMixin: aria-* content attributes reflected as nullable DOMString IDL
+  // properties (ariaAtomic <-> aria-atomic, ...).
+  const ARIA = {
+    ariaAtomic: "aria-atomic", ariaAutoComplete: "aria-autocomplete", ariaBrailleLabel: "aria-braillelabel",
+    ariaBrailleRoleDescription: "aria-brailleroledescription", ariaBusy: "aria-busy", ariaChecked: "aria-checked",
+    ariaColCount: "aria-colcount", ariaColIndex: "aria-colindex", ariaColIndexText: "aria-colindextext",
+    ariaColSpan: "aria-colspan", ariaCurrent: "aria-current", ariaDescription: "aria-description",
+    ariaDisabled: "aria-disabled", ariaExpanded: "aria-expanded", ariaHasPopup: "aria-haspopup",
+    ariaHidden: "aria-hidden", ariaInvalid: "aria-invalid", ariaKeyShortcuts: "aria-keyshortcuts",
+    ariaLabel: "aria-label", ariaLevel: "aria-level", ariaLive: "aria-live", ariaModal: "aria-modal",
+    ariaMultiLine: "aria-multiline", ariaMultiSelectable: "aria-multiselectable", ariaOrientation: "aria-orientation",
+    ariaPlaceholder: "aria-placeholder", ariaPosInSet: "aria-posinset", ariaPressed: "aria-pressed",
+    ariaReadOnly: "aria-readonly", ariaRelevant: "aria-relevant", ariaRequired: "aria-required",
+    ariaRoleDescription: "aria-roledescription", ariaRowCount: "aria-rowcount", ariaRowIndex: "aria-rowindex",
+    ariaRowIndexText: "aria-rowindextext", ariaRowSpan: "aria-rowspan", ariaSelected: "aria-selected",
+    ariaSetSize: "aria-setsize", ariaSort: "aria-sort", ariaValueMax: "aria-valuemax",
+    ariaValueMin: "aria-valuemin", ariaValueNow: "aria-valuenow", ariaValueText: "aria-valuetext",
+  };
+  for (const prop in ARIA) reflectNullable(prop, ARIA[prop]);
+})();
+
 class Document extends Node {
   get documentElement() { return _wrapEl(+_dom("document_element")); }
   get head() { return this.querySelector("head"); }
@@ -1603,7 +1749,13 @@ class Document extends Node {
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() { return "CSS1Compat"; }
-  get characterSet() { return "UTF-8"; }
+  // The document's character encoding, detected from the response charset
+  // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
+  // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
+  // backing encoding and reports UTF-8.
+  get characterSet() { return (this._nid === undefined || this._nid === null) ? "UTF-8" : _docEncoding(); }
+  get charset() { return this.characterSet; }
+  get inputEncoding() { return this.characterSet; }
   get contentType() {
     // An explicit type set by DOMParser/createDocument wins.
     if (this._contentType) return this._contentType;
@@ -2687,6 +2839,23 @@ if (typeof Request === 'undefined') {
   };
 }
 
+// Decode a response body honoring the Content-Type charset, so fetch()/XHR
+// over non-UTF-8 resources (GBK, Shift_JIS, ISO-8859-x, ...) return correctly
+// decoded text instead of mojibake. The UTF-8 case (the overwhelming majority)
+// takes the plain TextDecoder fast path; only an explicit non-UTF-8 charset
+// routes through TextDecoder(label), which falls back to UTF-8 on a bad label.
+function _decodeBodyWithCharset(bytes, headers) {
+  let label = '';
+  try {
+    const ct = headers && typeof headers.get === 'function' ? (headers.get('content-type') || '') : '';
+    const m = /charset\s*=\s*"?([^";]+)"?/i.exec(ct);
+    if (m) label = m[1].trim();
+  } catch (e) {}
+  if (!label || /^utf-?8$/i.test(label)) return new TextDecoder().decode(bytes);
+  try { return new TextDecoder(label).decode(bytes); }
+  catch (e) { return new TextDecoder().decode(bytes); }
+}
+
 if (typeof Response === 'undefined') {
   globalThis.Response = class Response {
     constructor(body, init = {}) {
@@ -2695,7 +2864,7 @@ if (typeof Response === 'undefined') {
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
     }
-    async text() { return new TextDecoder().decode(this._bodyBytes); }
+    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
     async json() { return JSON.parse(await this.text()); }
     async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
     async blob() { return new Blob([this._bodyBytes]); }
@@ -3784,15 +3953,36 @@ globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<
 globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
+// WHATWG Storage as a legacy platform object: a Proxy routes property access
+// (localStorage.foo, localStorage["foo"], delete, `in`, Object.keys) through
+// the named getter/setter so length/key()/iteration stay in sync with the
+// backing map. Plain prototype methods alone could not intercept direct
+// property access, so `localStorage.foo = x` never updated length before.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
-Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
-Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
-Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
-Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
+Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
+Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
+Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
+Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
+Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
 
-const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {}; return s; };
+const _mkStore = () => {
+  const target = Object.create(Storage.prototype);
+  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
+  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
+  return new Proxy(target, {
+    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
+    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
+    ownKeys(t) { return Object.keys(t._data); },
+    getOwnPropertyDescriptor(t, p) {
+      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
+        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(t, p);
+    },
+  });
+};
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
@@ -4105,15 +4295,25 @@ globalThis.Range = class Range {
     return _rngCmp(n, o, this._sc, this._so) >= 0 && _rngCmp(n, o, this._ec, this._eo) <= 0;
   }
   compareBoundaryPoints(how, other) {
+    // `how` is a WebIDL `unsigned short`: ToUint16-convert before validating,
+    // so NaN/Infinity become 0 (START_TO_START) rather than throwing.
+    let h = Math.trunc(Number(how));
+    if (!Number.isFinite(h)) h = 0;
+    h = ((h % 65536) + 65536) % 65536;
     let a, b;
-    switch (how) {
+    switch (h) {
       case 0: a = [this._sc, this._so]; b = [other._sc, other._so]; break; // START_TO_START
       case 1: a = [this._ec, this._eo]; b = [other._sc, other._so]; break; // START_TO_END
       case 2: a = [this._ec, this._eo]; b = [other._ec, other._eo]; break; // END_TO_END
       case 3: a = [this._sc, this._so]; b = [other._ec, other._eo]; break; // END_TO_START
       default: throw new DOMException("invalid comparison type", "NotSupportedError");
     }
-    if (_rngRoot(a[0])._nid !== _rngRoot(b[0])._nid) throw new DOMException("ranges are in different trees", "WrongDocumentError");
+    // Different roots -> WrongDocumentError. Guard so a null/foreign container
+    // raises that DOMException rather than a raw TypeError from _rngRoot.
+    let differ;
+    try { differ = _rngRoot(a[0])._nid !== _rngRoot(b[0])._nid; }
+    catch (e) { differ = true; }
+    if (differ) throw new DOMException("The two Ranges are not in the same tree.", "WrongDocumentError");
     return _rngCmp(a[0], a[1], b[0], b[1]);
   }
   intersectsNode(n) {

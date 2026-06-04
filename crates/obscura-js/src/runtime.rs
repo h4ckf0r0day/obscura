@@ -85,6 +85,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().url = url.to_string();
     }
 
+    /// Set the document's character encoding (WHATWG canonical name). Backs
+    /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
+    /// override for legacy-charset documents.
+    pub fn set_encoding(&self, encoding: &str) {
+        self.state.borrow_mut().encoding = encoding.to_string();
+    }
+
     pub fn set_title(&self, title: &str) {
         self.state.borrow_mut().title = title.to_string();
     }

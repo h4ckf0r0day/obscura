@@ -134,6 +134,11 @@ pub struct Page {
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
     pub title: String,
+    /// WHATWG canonical name of the current document's character encoding
+    /// (e.g. "UTF-8", "EUC-JP"), detected when the response body is decoded.
+    /// Exposed to JS as `document.characterSet` and used for the URL query
+    /// encoding override on `<a>`/`<area>` hrefs in legacy-charset documents.
+    pub encoding: String,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -188,6 +193,7 @@ impl Page {
             http_client,
             context,
             title: String::new(),
+            encoding: "UTF-8".to_string(),
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -248,6 +254,7 @@ impl Page {
             self.context.proxy_url.clone(),
         );
         rt.set_url(&self.url_string());
+        rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
 
         #[cfg(feature = "stealth")]
@@ -861,7 +868,9 @@ impl Page {
         // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
         // page (GBK, Big5, Shift-JIS, Windows-125x, EUC-KR, ISO-8859-x)
         // came through as replacement characters.
-        let body_text = obscura_net::decode_response(&response.body, response.content_type());
+        let (body_text, encoding_name) =
+            obscura_net::decode_response_with_name(&response.body, response.content_type());
+        self.encoding = encoding_name.to_string();
         let dom = parse_html(&body_text);
 
         self.title = dom

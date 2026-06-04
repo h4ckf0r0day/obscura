@@ -41,6 +41,10 @@ pub struct InterceptedRequest {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    /// WHATWG canonical name of the document's character encoding (e.g.
+    /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
+    /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
+    pub encoding: String,
     pub title: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
@@ -60,6 +64,7 @@ impl ObscuraState {
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            encoding: "UTF-8".to_string(),
             title: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
@@ -89,6 +94,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "document_node_id" => dom.document().index().to_string(),
         "document_title" => serde_json::to_string(&gs.title).unwrap_or("\"\"".into()),
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
@@ -1152,6 +1158,18 @@ fn op_text_decode(#[string] label: &str, #[buffer] bytes: &[u8], fatal: bool, ig
     }
 }
 
+/// Re-encode a URL query component using a non-UTF-8 document encoding override
+/// (the WHATWG "encoding override"). `query` is the already-UTF-8-decoded query
+/// string; `label` the target charset; `special` whether the URL has a special
+/// scheme (adds `'` to the percent-encode set). Returns the encoded query, or
+/// the input unchanged if the label is unknown. Only called by the JS anchor
+/// path when the document is non-UTF-8, so the UTF-8 hot path never reaches it.
+#[op2]
+#[string]
+fn op_url_encode_query(#[string] query: &str, #[string] label: &str, special: bool) -> String {
+    obscura_net::url_encode_query(query, label, special).unwrap_or_else(|| query.to_string())
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -1170,6 +1188,7 @@ pub fn build_extension() -> Extension {
             op_url_resolve(),
             op_encoding_for_label(),
             op_text_decode(),
+            op_url_encode_query(),
         ]),
         ..Default::default()
     }

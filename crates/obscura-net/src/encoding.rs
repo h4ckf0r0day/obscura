@@ -13,7 +13,7 @@
 //!
 //! For non-HTML resources (JS, CSS, JSON), only steps 1 and 3 apply.
 
-use encoding_rs::{DecoderResult, Encoding, UTF_8};
+use encoding_rs::{DecoderResult, EncoderResult, Encoding, UTF_8};
 
 /// WHATWG canonical (lowercased) name for an encoding label, or None if the
 /// label is not a known encoding. Backs `TextDecoder`'s label validation and
@@ -53,6 +53,98 @@ pub fn decode_response(bytes: &[u8], content_type_header: Option<&str>) -> Strin
     let (encoding, _) = detect_encoding(bytes, content_type_header);
     let (cow, _, _) = encoding.decode(bytes);
     cow.into_owned()
+}
+
+/// Like `decode_response`, but also returns the WHATWG canonical name of the
+/// encoding that was used (e.g. "EUC-JP", "Shift_JIS", "UTF-8"). Callers use
+/// the name to expose `document.characterSet` and to do document-encoding-aware
+/// URL query serialization (the WHATWG "encoding override").
+pub fn decode_response_with_name(
+    bytes: &[u8],
+    content_type_header: Option<&str>,
+) -> (String, &'static str) {
+    let (encoding, _) = detect_encoding(bytes, content_type_header);
+    let (cow, _, _) = encoding.decode(bytes);
+    (cow.into_owned(), encoding.name())
+}
+
+const PCT_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+fn push_pct(out: &mut String, b: u8) {
+    out.push('%');
+    out.push(PCT_HEX[(b >> 4) as usize] as char);
+    out.push(PCT_HEX[(b & 0x0F) as usize] as char);
+}
+
+/// Append an ASCII `byte` to a URL query string, percent-encoding it when it is
+/// in the WHATWG query percent-encode set (C0 controls, space, `"`, `#`, `<`,
+/// `>`, 0x7F), plus `'` for special schemes (the special-query set). ASCII
+/// delimiters like `=` and `&` are left literal, so structured queries survive.
+fn push_query_ascii(out: &mut String, b: u8, special: bool) {
+    let must_encode = b <= 0x20
+        || b == 0x7F
+        || matches!(b, 0x22 | 0x23 | 0x3C | 0x3E)
+        || (special && b == 0x27);
+    if must_encode {
+        push_pct(out, b);
+    } else {
+        out.push(b as char);
+    }
+}
+
+/// Encode a run of non-ASCII code points to the target charset and percent-
+/// encode EVERY resulting byte. The bytes serialize a non-ASCII character, so
+/// all of them are escaped (this is what the WPT legacy-mb encode-href tests
+/// expect, e.g. Big5 `一` -> `%A4%40` even though the 0x40 trail byte is ASCII).
+/// Unmappable code points become the literal `%26%23<decimal>%3B` sequence (a
+/// percent-encoded `&#NNN;` numeric character reference), per the URL spec.
+fn encode_run_pct(out: &mut String, run: &str, enc: &'static Encoding) {
+    let mut encoder = enc.new_encoder();
+    let mut input = run;
+    let mut buf = [0u8; 256];
+    loop {
+        let (result, read, written) =
+            encoder.encode_from_utf8_without_replacement(input, &mut buf, true);
+        for &b in &buf[..written] {
+            push_pct(out, b);
+        }
+        input = &input[read..];
+        match result {
+            EncoderResult::InputEmpty => break,
+            EncoderResult::OutputFull => continue,
+            EncoderResult::Unmappable(c) => {
+                out.push_str("%26%23");
+                out.push_str(&(c as u32).to_string());
+                out.push_str("%3B");
+            }
+        }
+    }
+}
+
+/// WHATWG URL "percent-encode after encoding" for the query component, using a
+/// non-UTF-8 document encoding override (`label`). `query` is the already
+/// UTF-8-percent-decoded query string. ASCII code points use the (special-)
+/// query percent-encode set so real query delimiters (`=`, `&`) stay literal;
+/// runs of non-ASCII code points are encoded to the target charset with every
+/// byte percent-encoded. Returns None when the label is unknown.
+pub fn url_encode_query(query: &str, label: &str, special: bool) -> Option<String> {
+    let enc = Encoding::for_label(label.as_bytes())?;
+    let mut out = String::with_capacity(query.len() * 3);
+    let mut run_start: Option<usize> = None;
+    for (idx, c) in query.char_indices() {
+        if c.is_ascii() {
+            if let Some(s) = run_start.take() {
+                encode_run_pct(&mut out, &query[s..idx], enc);
+            }
+            push_query_ascii(&mut out, c as u8, special);
+        } else if run_start.is_none() {
+            run_start = Some(idx);
+        }
+    }
+    if let Some(s) = run_start {
+        encode_run_pct(&mut out, &query[s..], enc);
+    }
+    Some(out)
 }
 
 /// Same as `decode_response` but skips the `<meta charset>` sniff. Use for
@@ -215,6 +307,37 @@ mod tests {
         let bytes = br#"var x = '<meta charset="gbk">'; // not the real charset"#;
         let s = decode_non_html(bytes, Some("application/javascript"));
         assert!(s.contains("<meta charset="));
+    }
+
+    #[test]
+    fn url_encode_query_eucjp_high_bytes() {
+        // U+8108 (脈) is EUC-JP CC AE; both bytes are above 0x7E so both encode.
+        assert_eq!(url_encode_query("\u{8108}", "euc-jp", true).unwrap(), "%CC%AE");
+    }
+
+    #[test]
+    fn url_encode_query_unmappable_becomes_ncr() {
+        // A code point not in shift_jis becomes the percent-encoded &#NNN;.
+        // U+3402 is a CJK ext-A han char not in shift_jis.
+        let got = url_encode_query("\u{3402}", "shift_jis", true).unwrap();
+        assert_eq!(got, "%26%2313314%3B");
+    }
+
+    #[test]
+    fn url_encode_query_big5_low_trail_byte_is_escaped() {
+        // U+4E00 (一) is Big5 A4 40; the 0x40 trail byte is ASCII '@' but must
+        // still be percent-encoded because it serializes a non-ASCII char.
+        assert_eq!(url_encode_query("\u{4e00}", "big5", true).unwrap(), "%A4%40");
+    }
+
+    #[test]
+    fn url_encode_query_keeps_ascii_structure() {
+        // ASCII delimiters in a real query stay literal (standard query set):
+        // only the non-ASCII value is re-encoded to the target charset.
+        assert_eq!(
+            url_encode_query("a=\u{8108}&b=c", "euc-jp", true).unwrap(),
+            "a=%CC%AE&b=c"
+        );
     }
 
     #[test]
