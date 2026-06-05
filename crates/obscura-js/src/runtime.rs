@@ -5,6 +5,10 @@ use std::rc::Rc;
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
 
+/// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
+/// isolate handle without taking a direct dependency on deno_core.
+pub use deno_core::v8::IsolateHandle;
+
 use crate::module_loader::ObscuraModuleLoader;
 use crate::ops::{build_extension, ObscuraState};
 
@@ -25,6 +29,10 @@ pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     object_counter: u64,
+    /// Thread-safe handle to this runtime's V8 isolate, captured at
+    /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
+    /// only holds `&Page` on the hot path) and is stable for the isolate's life.
+    isolate_handle: IsolateHandle,
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
@@ -34,6 +42,62 @@ pub struct WatchdogToken {
     pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     join: Option<std::thread::JoinHandle<()>>,
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Arm a V8 termination watchdog directly from an isolate handle, with no
+/// runtime borrow. The CDP dispatcher uses this to bound every command so a
+/// hung page cannot hold the process-wide V8 lock forever. Pair with
+/// [`WatchdogToken::stop`]; if `stop` returns true, clear the termination flag
+/// via [`ObscuraJsRuntime::cancel_termination`] before reusing the isolate.
+pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> WatchdogToken {
+    let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pair_c = pair.clone();
+    let fired_c = fired.clone();
+    let join = std::thread::spawn(move || {
+        let (lock, cvar) = &*pair_c;
+        let mut cancelled = lock.lock().unwrap();
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            // Check first: stop() may have set this (and notified into the void)
+            // before this thread even started, which happens constantly for fast
+            // CDP commands where stop() is called right after spawn. Without this
+            // top check the lost notify means we wait the full budget before
+            // noticing, and stop()'s join() blocks for that whole time.
+            if *cancelled {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                fired_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                handle.terminate_execution();
+                return;
+            }
+            let (guard, _) = cvar.wait_timeout(cancelled, remaining).unwrap();
+            cancelled = guard;
+            if *cancelled {
+                return;
+            }
+        }
+    });
+    WatchdogToken { pair, join: Some(join), fired }
+}
+
+impl WatchdogToken {
+    /// Stop the watchdog. Returns true if it had already fired (terminated the
+    /// isolate). The caller must then clear the termination flag via
+    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
+    pub fn stop(mut self) -> bool {
+        {
+            let (lock, cvar) = &*self.pair;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl ObscuraJsRuntime {
@@ -70,11 +134,14 @@ impl ObscuraJsRuntime {
             )
             .expect("init should not fail");
 
+        let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+
         ObscuraJsRuntime {
             runtime,
             state,
             object_store: HashMap::new(),
             object_counter: 0,
+            isolate_handle,
         }
     }
 
@@ -687,50 +754,33 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        let handle = self.runtime.v8_isolate().thread_safe_handle();
-        let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pair_c = pair.clone();
-        let fired_c = fired.clone();
-        let join = std::thread::spawn(move || {
-            let (lock, cvar) = &*pair_c;
-            let mut cancelled = lock.lock().unwrap();
-            let deadline = std::time::Instant::now() + budget;
-            loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    fired_c.store(true, std::sync::atomic::Ordering::SeqCst);
-                    handle.terminate_execution();
-                    return;
-                }
-                let (guard, _) = cvar.wait_timeout(cancelled, remaining).unwrap();
-                cancelled = guard;
-                if *cancelled {
-                    return;
-                }
-            }
-        });
-        WatchdogToken { pair, join: Some(join), fired }
+        spawn_watchdog(self.runtime.v8_isolate().thread_safe_handle(), budget)
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
     /// (terminated the isolate), clear V8's termination flag so the isolate is
     /// usable again, and return `true`.
-    pub fn disarm_watchdog(&mut self, mut token: WatchdogToken) -> bool {
-        {
-            let (lock, cvar) = &*token.pair;
-            *lock.lock().unwrap() = true;
-            cvar.notify_one();
-        }
-        if let Some(j) = token.join.take() {
-            let _ = j.join();
-        }
-        let fired = token.fired.load(std::sync::atomic::Ordering::SeqCst);
+    pub fn disarm_watchdog(&mut self, token: WatchdogToken) -> bool {
+        let fired = token.stop();
         if fired {
             self.runtime.v8_isolate().cancel_terminate_execution();
             tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
         }
         fired
+    }
+
+    /// This runtime's V8 isolate handle (captured at construction, stable for
+    /// the isolate's life). Lets the CDP dispatcher arm a per-command watchdog
+    /// from `&self`.
+    pub fn isolate_handle(&self) -> IsolateHandle {
+        self.isolate_handle.clone()
+    }
+
+    /// Clear V8's termination flag after a watchdog armed externally (via the
+    /// isolate handle) fired, so the isolate is usable for the next command.
+    /// No-op when the isolate is not terminating.
+    pub fn cancel_termination(&mut self) {
+        self.runtime.v8_isolate().cancel_terminate_execution();
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async

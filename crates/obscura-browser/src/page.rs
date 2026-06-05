@@ -1131,6 +1131,22 @@ impl Page {
         self.dom.as_ref()
     }
 
+    /// V8 isolate handle for this page's runtime, if it has been initialized.
+    /// Lets the CDP dispatcher arm a per-command watchdog (which bounds any one
+    /// command so a hung page cannot hold the process-wide V8 lock forever)
+    /// without taking `&mut self`.
+    pub fn isolate_handle(&self) -> Option<obscura_js::runtime::IsolateHandle> {
+        self.js.as_ref().map(|js| js.isolate_handle())
+    }
+
+    /// Clear a V8 termination left by a per-command watchdog so the next command
+    /// on this page can run. No-op if the runtime is absent or not terminating.
+    pub fn cancel_v8_termination(&mut self) {
+        if let Some(js) = self.js.as_mut() {
+            js.cancel_termination();
+        }
+    }
+
     /// Like [`Self::evaluate`] but bounded by a V8 watchdog so a runaway
     /// expression cannot hang the process. A non-zero `timeout` of zero falls
     /// back to the unbounded path.

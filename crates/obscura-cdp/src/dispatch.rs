@@ -288,6 +288,27 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         Some(obscura_js::v8_lock::global().lock().await)
     };
 
+    // Per-command V8 watchdog. The lock above keeps each handler contiguous on
+    // the thread, but it does not bound how long a handler runs: a hung page (a
+    // runaway Runtime.evaluate, a synchronous DOM op) would hold the
+    // process-wide V8 lock and wedge every other session forever. The one-shot
+    // CLI uses a process-level hard deadline for this; the long-running server
+    // cannot force-exit, so we terminate just the offending isolate instead.
+    // OBSCURA_CDP_COMMAND_TIMEOUT_MS tunes the bound (0 disables); the default
+    // leaves headroom for the slowest legitimate navigation, which already
+    // self-bounds via OBSCURA_NAV_TIMEOUT_MS plus the watchdog-bounded settle.
+    let cmd_budget_ms: u64 = std::env::var("OBSCURA_CDP_COMMAND_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60_000);
+    let cmd_watchdog = if cmd_budget_ms == 0 || is_v8_free_method(&req.method) {
+        None
+    } else {
+        ctx.get_session_page(&req.session_id)
+            .and_then(|p| p.isolate_handle())
+            .map(|h| obscura_js::cdp_watchdog::arm(h, std::time::Duration::from_millis(cmd_budget_ms)))
+    };
+
     let (domain, method) = match req.method.split_once('.') {
         Some((d, m)) => (d, m),
         None => {
@@ -323,6 +344,22 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         }
         _ => Err(format!("Unknown domain: {}", domain)),
     };
+
+    // Stop the per-command watchdog. If it fired (the handler held V8 past the
+    // budget), V8 is left in a terminating state, so clear that flag before the
+    // next command runs on this page.
+    if let Some(wd) = cmd_watchdog {
+        if obscura_js::cdp_watchdog::disarm(wd) {
+            tracing::warn!(
+                "CDP command {} held V8 past {}ms; terminated the isolate to free the dispatcher",
+                req.method,
+                cmd_budget_ms
+            );
+            if let Some(page) = ctx.get_session_page_mut(&req.session_id) {
+                page.cancel_v8_termination();
+            }
+        }
+    }
 
     drain_binding_calls(ctx);
 
