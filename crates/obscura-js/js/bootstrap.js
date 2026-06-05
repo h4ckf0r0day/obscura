@@ -351,9 +351,22 @@ class Node {
       const src = c.getAttribute('src');
       const prevNid = globalThis.__currentScriptNid;
       if (src) {
+        // Resolve relative to document base URL, respecting <base href>.
+        // Dynamic imports (Angular lazy chunks) need this because the Rust
+        // execute_scripts base-href fix only covers initial <script> tags.
+        const baseUrl = (() => {
+          try {
+            const baseEl = document.querySelector('base[href]');
+            if (baseEl) {
+              const href = baseEl.getAttribute('href');
+              if (href) return new URL(href, globalThis.location?.href || 'http://localhost/').href;
+            }
+          } catch(e) {}
+          return globalThis.location?.href || 'http://localhost/';
+        })();
         const fullUrl = src.startsWith('http') || src.startsWith('data:')
           ? src
-          : new URL(src, globalThis.location?.href || 'http://localhost/').href;
+          : new URL(src, baseUrl).href;
         const pageOrigin = (function() { try { return new URL(globalThis.location?.href || "about:blank").origin; } catch(e) { return ""; } })();
         (async () => {
           try {
