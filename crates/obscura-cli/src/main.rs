@@ -89,8 +89,12 @@ enum Command {
     Fetch {
         url: String,
 
-        #[arg(long, default_value = "html")]
-        dump: DumpFormat,
+        // Default is html. Kept as Option so we can tell whether --dump was
+        // explicitly passed: a bare --eval returns its own value, while --eval
+        // combined with --dump (or --selector) runs the eval, lets its async
+        // work settle, then reads the page (issue #248).
+        #[arg(long)]
+        dump: Option<DumpFormat>,
 
         #[arg(long)]
         selector: Option<String>,
@@ -463,7 +467,7 @@ async fn run_multi_worker_serve(
 
 async fn run_fetch(
     url_str: &str,
-    dump: DumpFormat,
+    dump: Option<DumpFormat>,
     selector: Option<String>,
     wait_secs: u64,
     timeout_secs: u64,
@@ -477,6 +481,12 @@ async fn run_fetch(
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
 ) -> anyhow::Result<()> {
+    // Whether the user explicitly passed --dump. With --eval also present this
+    // decides whether we return the eval value or read the page after the
+    // eval's async work settles (issue #248).
+    let dump_specified = dump.is_some();
+    let dump = dump.unwrap_or(DumpFormat::Html);
+
     // --dump original short-circuits the browser stack entirely: fetch the raw
     // response body via HTTP and stream the bytes verbatim. Useful for binary
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
@@ -548,25 +558,38 @@ async fn run_fetch(
     // pages stay fast.
     page.settle(wait_secs.saturating_mul(1000)).await;
 
+    if let Some(ref expr) = eval {
+        // Bound the eval by the same budget as navigation so a runaway
+        // expression (infinite loop, never-settling sync work) cannot hang.
+        let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
+
+        // A bare --eval (no --selector, no --dump) returns the eval value
+        // directly, so synchronous expressions (JSON.stringify, ...) are
+        // unchanged.
+        if !dump_specified && selector.is_none() {
+            let rendered = match result {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => "null".to_string(),
+                other => other.to_string(),
+            };
+            write_or_print(rendered, output.as_ref()).await?;
+            context.save_cookies();
+            return Ok(());
+        }
+
+        // --eval combined with --selector and/or --dump: the eval typically
+        // kicks off async work (a fetch promise, a timer) that writes the DOM.
+        // Drive the event loop again so that work completes, then fall through
+        // to the selector wait and the dump path instead of returning the
+        // still-pending eval value (issue #248).
+        page.settle(wait_secs.saturating_mul(1000)).await;
+    }
+
     if let Some(ref sel) = selector {
         let found = wait_for_selector(&mut page, sel, wait_secs).await;
         if !found {
             eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
         }
-    }
-
-    if let Some(ref expr) = eval {
-        // Bound the eval by the same budget as navigation so a runaway
-        // expression (infinite loop, never-settling sync work) cannot hang.
-        let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
-        let rendered = match result {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Null => "null".to_string(),
-            other => other.to_string(),
-        };
-        write_or_print(rendered, output.as_ref()).await?;
-        context.save_cookies();
-        return Ok(());
     }
 
     let rendered = match dump {
@@ -1143,7 +1166,7 @@ mod tests {
         .expect("clap should accept --dump original");
         match args.command {
             Some(Command::Fetch { dump, .. }) => {
-                assert_eq!(dump, DumpFormat::Original);
+                assert_eq!(dump, Some(DumpFormat::Original));
             }
             _ => panic!("expected Fetch command"),
         }
@@ -1406,7 +1429,7 @@ mod tests {
     fn matcher_still_uses_fetch_variant() {
         let cmd = Some(Command::Fetch {
             url: "https://x".to_string(),
-            dump: super::DumpFormat::Html,
+            dump: Some(super::DumpFormat::Html),
             selector: None,
             wait: 5,
             timeout: 30,
@@ -1495,7 +1518,7 @@ mod tests {
         .expect("clap should accept --dump assets");
         match args.command {
             Some(Command::Fetch { dump, .. }) => {
-                assert_eq!(dump, DumpFormat::Assets);
+                assert_eq!(dump, Some(DumpFormat::Assets));
             }
             _ => panic!("expected Fetch command"),
         }
