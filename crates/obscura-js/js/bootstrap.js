@@ -283,6 +283,23 @@ class Node {
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
+  // https://dom.spec.whatwg.org/#dom-node-baseuri
+  get baseURI() {
+    try {
+      const doc = globalThis.document;
+      const docUrl = (doc && doc.URL) || "";
+      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
+      if (baseEl) {
+        const href = baseEl.getAttribute("href");
+        if (href) {
+          return docUrl ? new URL(href, docUrl).href : href;
+        }
+      }
+      return docUrl;
+    } catch (e) {
+      return "";
+    }
+  }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
     const oldChildren = _domParse("child_nodes", this._nid) || [];
