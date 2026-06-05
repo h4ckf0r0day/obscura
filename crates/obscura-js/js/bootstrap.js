@@ -2601,7 +2601,42 @@ if (typeof Headers === "undefined") {
   };
 }
 
-globalThis.XMLHttpRequest = class XMLHttpRequest {
+// XMLHttpRequestEventTarget — spec-required ancestor for XHR EventTarget methods.
+// zone.js prefers to walk XMLHttpRequestEventTarget.prototype for addEventListener/
+// removeEventListener/dispatchEvent descriptors before falling back to XHR.prototype.
+class XMLHttpRequestEventTarget {
+  addEventListener(type, handler) {
+    if (!this._listeners) this._listeners = {};
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(handler);
+  }
+  removeEventListener(type, handler) {
+    if (this._listeners && this._listeners[type]) {
+      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
+    }
+  }
+  dispatchEvent(event) {
+    if (!event || !event.type) return false;
+    const ev = (typeof event === 'object') ? event : { type: event };
+    ev.target = ev.target || this;
+    ev.currentTarget = ev.currentTarget || this;
+    const type = ev.type;
+    const handlers = (this._listeners && this._listeners[type]) || [];
+    for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
+    const prop = 'on' + type;
+    if (typeof this[prop] === 'function') {
+      try { this[prop](ev); } catch (e) {}
+    }
+    return true;
+  }
+}
+globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
+_markNative(XMLHttpRequestEventTarget);
+_markNative(XMLHttpRequestEventTarget.prototype.addEventListener);
+_markNative(XMLHttpRequestEventTarget.prototype.removeEventListener);
+_markNative(XMLHttpRequestEventTarget.prototype.dispatchEvent);
+
+globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarget {
   static UNSENT = 0;
   static OPENED = 1;
   static HEADERS_RECEIVED = 2;
@@ -2761,16 +2796,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.readyState = 0;
   }
 
-  addEventListener(type, handler) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(handler);
-  }
-
-  removeEventListener(type, handler) {
-    if (this._listeners[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
-    }
-  }
+  // addEventListener/removeEventListener/dispatchEvent inherited from XMLHttpRequestEventTarget
 
   _setReadyState(state) {
     this.readyState = state;
