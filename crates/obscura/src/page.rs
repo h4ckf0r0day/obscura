@@ -84,6 +84,15 @@ impl Page {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    /// Drive the page's JS event loop for up to `max_ms` milliseconds.
+    ///
+    /// Call this after `evaluate()` kicks off async work (Promises, fetch,
+    /// setTimeout, RxJS subscribers) to let the V8 event loop pump and
+    /// resolve scheduled microtasks/macrotasks before the next `evaluate()`.
+    pub async fn settle(&mut self, max_ms: u64) {
+        self.inner.settle(max_ms).await
+    }
 }
 
 /// Handle to a DOM element.
