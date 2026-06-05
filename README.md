@@ -29,7 +29,7 @@ Designed for automation at scale, not desktop browsing.
 
 ## 🎉 10,000 stars and what's next
 
-I'm working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
+We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
 
 The open-source engine stays Apache-2.0, fully featured. No feature gating, ever.
 
@@ -220,6 +220,8 @@ Page load:
 | Static HTML | **51 ms** | ~500 ms |
 | JS + XHR + fetch | **84 ms** | ~800 ms |
 | Dynamic scripts | **78 ms** | ~700 ms |
+
+The full benchmark suite (WPT conformance, obstacle course, real-world corpus, and vs-Chrome speed) lives in a separate repo: https://github.com/h4ckf0r0day/obscura-benchmark
 
 ## Stealth Mode
 
