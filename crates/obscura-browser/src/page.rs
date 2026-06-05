@@ -282,8 +282,31 @@ impl Page {
         self.js = Some(rt);
     }
 
+    /// Resolve the document base URL per HTML spec:
+    /// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
+    /// Falls back to self.url when no <base href> exists.
+    fn resolve_base_url(&self) -> Option<url::Url> {
+        let doc_url = self.url.as_ref()?;
+        let base_href: Option<String> = self.js.as_ref().and_then(|js| {
+            js.with_dom(|dom| {
+                match dom.query_selector("base[href]") {
+                    Ok(Some(nid)) => {
+                        dom.get_node(nid).and_then(|n| n.get_attribute("href").map(|s| s.to_string()))
+                    }
+                    _ => None,
+                }
+            }).flatten()
+        });
+        match base_href {
+            Some(href) => doc_url.join(&href).ok(),
+            None => Some(doc_url.clone()),
+        }
+    }
+
     async fn execute_scripts(&mut self) {
         tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        // Compute document base URL, respecting <base href>.
+        let document_base = self.resolve_base_url();
         // Soft deadline on the entire script-execution phase. Heavy SPAs
         // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
         // fetch + execute loop can blow past a 25s Puppeteer goto timeout.
@@ -397,7 +420,7 @@ impl Page {
             if let Some(src_url) = &script.src {
                 let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
                     src_url.clone()
-                } else if let Some(base) = &self.url {
+                } else if let Some(base) = &document_base {
                     base.join(src_url).map(|u| u.to_string()).unwrap_or_else(|_| src_url.clone())
                 } else {
                     src_url.clone()
@@ -557,7 +580,7 @@ impl Page {
             if let Some(ref src) = module_script.src {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
-                } else if let Some(base) = &self.url {
+                } else if let Some(base) = &document_base {
                     base.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.clone())
                 } else {
                     src.clone()
