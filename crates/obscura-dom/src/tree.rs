@@ -306,14 +306,10 @@ impl DomTree {
         if existing_id == new_sibling_id {
             return;
         }
-        let (parent_id, prev_id) = {
+        let parent_id = {
             let inner = self.inner.borrow();
-            let node = match inner.nodes.get(existing_id.index()).and_then(|n| n.as_ref()) {
-                Some(n) => n,
-                None => return,
-            };
-            match node.parent {
-                Some(p) => (p, node.prev_sibling),
+            match inner.nodes.get(existing_id.index()).and_then(|n| n.as_ref()).and_then(|n| n.parent) {
+                Some(p) => p,
                 None => return,
             }
         };
@@ -348,6 +344,17 @@ impl DomTree {
         }
 
         self.detach(new_sibling_id);
+
+        // Read existing's prev AFTER detaching new. If new was existing's
+        // immediate previous sibling, detach moved that pointer; using the
+        // pre-detach value would splice new.next_sibling = new (a self-cycle)
+        // and hang every later sibling walk. This is what hung ebay.com.
+        let prev_id = {
+            let inner = self.inner.borrow();
+            inner.nodes.get(existing_id.index())
+                .and_then(|n| n.as_ref())
+                .and_then(|n| n.prev_sibling)
+        };
 
         let mut inner = self.inner.borrow_mut();
 
@@ -496,6 +503,10 @@ impl DomTree {
         let mut children_to_push = Vec::new();
         while let Some(child_id) = first {
             children_to_push.push(child_id);
+            if children_to_push.len() > inner.nodes.len() {
+                eprintln!("obscura: sibling-chain cap hit at node {} - cycle", node_id.index());
+                break;
+            }
             first = inner.nodes.get(child_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.next_sibling);
@@ -512,6 +523,11 @@ impl DomTree {
             // than grow the stack and result forever and wedge the engine. On a
             // valid tree this bound is never reached, so the hot path is unchanged.
             if result.len() > inner.nodes.len() {
+                eprintln!(
+                    "obscura: descendants() cap hit at node {} ({} nodes) - tree has a cycle",
+                    node_id.index(),
+                    inner.nodes.len()
+                );
                 break;
             }
 
@@ -521,6 +537,10 @@ impl DomTree {
             let mut children_to_push = Vec::new();
             while let Some(child_id) = child {
                 children_to_push.push(child_id);
+                if children_to_push.len() > inner.nodes.len() {
+                    eprintln!("obscura: sibling-chain cap hit at node {} - cycle", current.index());
+                    break;
+                }
                 child = inner.nodes.get(child_id.index())
                     .and_then(|n| n.as_ref())
                     .and_then(|n| n.next_sibling);
@@ -851,6 +871,37 @@ mod tests {
         tree.append_child(div, div);
         tree.insert_before(div, div);
         assert_eq!(tree.descendants(doc).len(), before);
+    }
+
+    #[test]
+    fn test_insert_before_previous_sibling_no_cycle() {
+        // Inserting a node before its own immediate previous sibling is a no-op
+        // reorder that frameworks do constantly. It used to splice
+        // next_sibling = self via a prev_id captured before detach, hanging every
+        // later sibling walk (this hung ebay.com). The result must stay a
+        // well-formed [a, b] with no cycle.
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let parent = mk("div");
+        let a = mk("a");
+        let b = mk("b");
+        tree.append_child(doc, parent);
+        tree.append_child(parent, a);
+        tree.append_child(parent, b); // parent -> [a, b]
+
+        // a is already b's previous sibling; this reorder must not create a cycle.
+        tree.insert_before(b, a);
+
+        let kids = tree.descendants(parent);
+        assert_eq!(kids, vec![a, b], "order preserved, no cycle");
     }
 
     #[test]
