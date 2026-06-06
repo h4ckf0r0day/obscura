@@ -160,14 +160,14 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
+            dom.with_node(NodeId::new(nid), |n| match &n.data {
                 NodeData::Document => "9", NodeData::Element { .. } => "1", NodeData::Text { .. } => "3",
                 NodeData::Comment { .. } => "8", NodeData::Doctype { .. } => "10", NodeData::ProcessingInstruction { .. } => "7",
             }).unwrap_or("0").into()
         }
         "node_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name: String = dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
+            let name: String = dom.with_node(NodeId::new(nid), |n| match &n.data {
                 NodeData::Document => "#document".to_string(), NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
                 NodeData::Text { .. } => "#text".to_string(), NodeData::Comment { .. } => "#comment".to_string(),
                 NodeData::Doctype { name, .. } => name.clone(), NodeData::ProcessingInstruction { target, .. } => target.clone(),
@@ -180,11 +180,11 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.get_node(NodeId::new(nid)).and_then(|n| match cmd.as_str() {
+            dom.with_node(NodeId::new(nid), |n| match cmd.as_str() {
                 "parent_node" => n.parent, "first_child" => n.first_child,
                 "last_child" => n.last_child, "next_sibling" => n.next_sibling,
                 "prev_sibling" => n.prev_sibling, _ => None,
-            }).map(|id| id.index().to_string()).unwrap_or("-1".into())
+            }).flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
         }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -193,19 +193,18 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom.get_node(NodeId::new(nid)).and_then(|n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).unwrap_or_default();
+            let name = dom.with_node(NodeId::new(nid), |n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).flatten().unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
+            let val = dom.with_node(NodeId::new(nid), |n| n.get_attribute(&arg2).map(|s| s.to_string())).flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
         "attribute_names" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let names: Vec<String> = dom
-                .get_node(NodeId::new(nid))
-                .map(|n| {
+                .with_node(NodeId::new(nid), |n| {
                     n.attrs()
                         .map(|a| a.iter().map(|x| x.name.local.as_ref().to_string()).collect())
                         .unwrap_or_default()
@@ -218,7 +217,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let node_id = NodeId::new(nid);
             if let Some((name, value)) = arg2.split_once('\0') {
                 if name == "id" {
-                    let old_id = dom.get_node(node_id).and_then(|n| n.get_attribute("id").map(|s| s.to_string()));
+                    let old_id = dom.with_node(node_id, |n| n.get_attribute("id").map(|s| s.to_string())).flatten();
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                     dom.update_id_index(node_id, old_id.as_deref(), Some(value));
                 } else {
@@ -321,26 +320,26 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "pi_target" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| match &n.data {
+            let val = dom.with_node(NodeId::new(nid), |n| match &n.data {
                 NodeData::ProcessingInstruction { target, .. } => Some(target.clone()),
                 _ => None,
-            }).unwrap_or_default();
+            }).flatten().unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "doctype_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| match &n.data {
+            let val = dom.with_node(NodeId::new(nid), |n| match &n.data {
                 NodeData::Doctype { name, .. } => Some(name.clone()),
                 _ => None,
-            }).unwrap_or_default();
+            }).flatten().unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "doctype_public_id" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| match &n.data {
+            let val = dom.with_node(NodeId::new(nid), |n| match &n.data {
                 NodeData::Doctype { public_id, .. } => Some(public_id.clone()),
                 _ => None,
-            }).unwrap_or_default();
+            }).flatten().unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
         }
         "element_children" => {
@@ -352,7 +351,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "has_child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.get_node(NodeId::new(nid)).map(|n| n.first_child.is_some()).unwrap_or(false).to_string()
+            dom.with_node(NodeId::new(nid), |n| n.first_child.is_some()).unwrap_or(false).to_string()
         }
         "contains" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -377,7 +376,7 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         // walk of parentNode ops from JS.
         "node_root" => {
             let mut cur = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
-            while let Some(p) = dom.get_node(cur).and_then(|x| x.parent) {
+            while let Some(p) = dom.with_node(cur, |x| x.parent).flatten() {
                 cur = p;
             }
             cur.index().to_string()
@@ -389,10 +388,10 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
 /// Index of `n` among its parent's children (0-based).
 fn node_child_index(dom: &DomTree, n: NodeId) -> usize {
     let mut i = 0usize;
-    let mut cur = dom.get_node(n).and_then(|x| x.prev_sibling);
+    let mut cur = dom.with_node(n, |x| x.prev_sibling).flatten();
     while let Some(p) = cur {
         i += 1;
-        cur = dom.get_node(p).and_then(|x| x.prev_sibling);
+        cur = dom.with_node(p, |x| x.prev_sibling).flatten();
     }
     i
 }
@@ -401,7 +400,7 @@ fn node_child_index(dom: &DomTree, n: NodeId) -> usize {
 fn node_ancestors_root_first(dom: &DomTree, n: NodeId) -> Vec<NodeId> {
     let mut v = vec![n];
     let mut cur = n;
-    while let Some(p) = dom.get_node(cur).and_then(|x| x.parent) {
+    while let Some(p) = dom.with_node(cur, |x| x.parent).flatten() {
         v.push(p);
         cur = p;
     }
