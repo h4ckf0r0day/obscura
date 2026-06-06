@@ -150,6 +150,9 @@ enum Command {
         #[arg(long)]
         http: bool,
 
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
         #[arg(long, default_value_t = 3000)]
         port: u16,
 
@@ -318,10 +321,10 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
         }
-        Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+        Some(Command::Mcp { http, host, port, proxy, user_agent, stealth }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(port, mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
             } else {
                 obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
             }

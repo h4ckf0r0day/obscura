@@ -10,10 +10,10 @@ use crate::{dispatch, BrowserState};
 /// Connections are handled sequentially on the current thread — the browser
 /// session (including the V8 runtime) is single-threaded and `!Send`, so we
 /// never need to move state across threads.
-pub async fn run(port: u16, proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("MCP HTTP server on http://127.0.0.1:{}/mcp", port);
+    tracing::info!("MCP HTTP server on http://{}:{}/mcp", host, port);
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
 

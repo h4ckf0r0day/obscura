@@ -27,7 +27,7 @@ async fn options_preflight_lists_required_browser_headers() {
     // end of the test. `current_thread` + LocalSet is required because the
     // browser state is `!Send` (Page holds V8 handles).
     let server = local.spawn_local(async move {
-        let _ = obscura_mcp::http::run(port, None, None, false).await;
+        let _ = obscura_mcp::http::run("127.0.0.1".to_string(), port, None, None, false).await;
     });
 
     local.run_until(async {
