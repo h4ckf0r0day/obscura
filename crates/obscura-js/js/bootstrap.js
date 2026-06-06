@@ -1433,7 +1433,16 @@ class Element extends Node {
   get hash() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.hash : ''; }
   set hash(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'hash', v); }
   get origin() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.origin : ''; }
-  get src() { return this.getAttribute("src") || ""; }
+  get src() {
+    // IDL reflection: HTMLScriptElement/HTMLImageElement/etc. `.src` returns the
+    // resolved absolute URL, not the literal attribute. Loaders that compute their
+    // base via `new URL(document.currentScript.src).origin` break on a relative
+    // value (issue #255). getAttribute("src") still returns the literal.
+    const v = this.getAttribute("src");
+    if (!v) return "";
+    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
+    catch (e) { return v; }
+  }
   set src(v) {
     this.setAttribute("src", v);
     if (this.localName === 'iframe' && v && v !== 'about:blank') {
