@@ -814,6 +814,10 @@ class Element extends Node {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
+  // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
+  // Element for element nodes, and node ids are never freed-and-reused), so this
+  // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
+  get nodeType() { return 1; }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
   get localName() {
     // tagName is an op call and the tag never changes, so cache the lowercased
@@ -956,18 +960,21 @@ class Element extends Node {
   get attributes() {
     const el = this;
     const names = _domParse("attribute_names", el._nid) || [];
-    const list = names.map((name) => ({
-      name,
-      localName: name,
-      value: el.getAttribute(name) ?? "",
-      namespaceURI: null,
-      prefix: null,
-      specified: true,
-      ownerElement: el,
-      nodeName: name,
-      nodeValue: el.getAttribute(name) ?? "",
-      nodeType: 2,
-    }));
+    const list = names.map((name) => {
+      const v = el.getAttribute(name) ?? "";
+      return {
+        name,
+        localName: name,
+        value: v,
+        namespaceURI: null,
+        prefix: null,
+        specified: true,
+        ownerElement: el,
+        nodeName: name,
+        nodeValue: v,
+        nodeType: 2,
+      };
+    });
     list.length = names.length;
     list.getNamedItem = (n) => names.includes(n) ? list[names.indexOf(n)] : null;
     list.setNamedItem = (a) => { if (a && a.name) el.setAttribute(a.name, a.value); return a; };
@@ -1573,11 +1580,13 @@ class Element extends Node {
     this.dispatchEvent(new Event('reset', { bubbles: true }));
   }
   get dataset() {
+    if (this._dataset) return this._dataset;
     const el = this;
-    return new Proxy({}, {
+    this._dataset = new Proxy({}, {
       get(_, k) { if(typeof k!=="string")return undefined; return el.getAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase()); },
       set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
     });
+    return this._dataset;
   }
   get offsetWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
   get offsetHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }

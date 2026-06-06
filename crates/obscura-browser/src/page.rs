@@ -929,12 +929,17 @@ impl Page {
             .unwrap_or_default()
             .iter()
             .filter_map(|&nid| {
-                let node = dom.get_node(nid)?;
-                let rel = node.get_attribute("rel")?;
-                if rel.to_lowercase() != "stylesheet" {
-                    return None;
-                }
-                node.get_attribute("href").map(|s| s.to_string())
+                // Borrow the node instead of deep-cloning it; rel keywords are
+                // ASCII so eq_ignore_ascii_case matches to_lowercase() exactly
+                // without allocating a lowercased String.
+                dom.with_node(nid, |node| {
+                    let rel = node.get_attribute("rel")?;
+                    if !rel.eq_ignore_ascii_case("stylesheet") {
+                        return None;
+                    }
+                    node.get_attribute("href").map(|s| s.to_string())
+                })
+                .flatten()
             })
             .collect();
 
