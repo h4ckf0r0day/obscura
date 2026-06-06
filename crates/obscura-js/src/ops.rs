@@ -495,8 +495,21 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
     // With reqwest's default auto-follow, an attacker-controlled origin can
     // 302 to http://127.0.0.1 and read the internal-service body.
+    // Per-request timeout so a scripted fetch()/XHR, or a CORS preflight OPTIONS
+    // (issue #251), to a server that accepts the connection but never responds
+    // cannot hang forever. Without it op_fetch_url never returns, the fetch
+    // promise never settles, and the JS XHR is stuck at readyState 1 with no
+    // completion event (which stranded Angular HttpClient). On timeout reqwest's
+    // send().await errors, which op_fetch_url propagates and the fetch shim turns
+    // into an XHR `error`/`loadend`. 30s matches the other clients in the
+    // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
+    let timeout_ms: u64 = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_millis(timeout_ms))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
         // workloads where the same origin is hit dozens of times across
