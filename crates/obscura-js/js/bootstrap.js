@@ -4997,6 +4997,15 @@ class _Canvas2D {
   createPattern() { return {}; }
   isPointInPath() { return false; }
   isPointInStroke() { return false; }
+  // Line-dash plus a few path/style methods that charting libraries (Highcharts,
+  // ECharts) call on every animation frame. A missing setLineDash threw
+  // "is not a function" from a timer each tick, spamming errors (#258).
+  setLineDash() {}
+  getLineDash() { return []; }
+  ellipse() {}
+  roundRect() {}
+  createConicGradient() { return { addColorStop(){} }; }
+  getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
 Element.prototype.getContext = function getContext(type) {
