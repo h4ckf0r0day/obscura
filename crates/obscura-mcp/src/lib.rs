@@ -102,6 +102,7 @@ impl BrowserState {
             self.active_tab = Some(id);
         }
         let id = self.active_tab.as_ref().unwrap().clone();
+        self.activate(&id);
         self.tabs.get_mut(&id).expect("active tab must exist")
     }
 
@@ -112,6 +113,34 @@ impl BrowserState {
         self.active_tab = Some(id.clone());
         self.interactive_refs.clear();
         id
+    }
+
+    /// Enforce the single-live-isolate invariant. rusty_v8 enters each V8
+    /// isolate on creation and requires isolates be dropped in reverse order of
+    /// creation, so keeping more than one tab's isolate live at once and then
+    /// dropping a non-newest one aborts the whole process (#258). Suspend every
+    /// other tab (drops its isolate, keeps its DOM in self.dom) and make the
+    /// active tab the only live isolate, mirroring the CDP server's
+    /// Dispatcher::get_session_page_mut.
+    fn activate(&mut self, tab_id: &str) {
+        for (id, page) in self.tabs.iter_mut() {
+            if id.as_str() != tab_id && page.has_js() {
+                page.suspend_js();
+            }
+        }
+        if let Some(page) = self.tabs.get_mut(tab_id) {
+            page.resume_js();
+        }
+    }
+
+    /// Close a tab without breaking the LIFO isolate-drop rule. suspend_js drops
+    /// this tab's isolate (if it is the live one) while it is still the only
+    /// entered isolate, so the following remove disposes no isolate (#258).
+    fn close_tab(&mut self, tab_id: &str) -> bool {
+        if let Some(page) = self.tabs.get_mut(tab_id) {
+            page.suspend_js();
+        }
+        self.tabs.remove(tab_id).is_some()
     }
 
     /// Resolve `ref=eN` to a CSS selector that uniquely targets the
@@ -903,6 +932,12 @@ fn tool_console_messages(state: &BrowserState) -> Result<String, String> {
 }
 
 fn tool_close(state: &mut BrowserState) -> Result<String, String> {
+    // Drop the one live isolate (if any) via suspend_js before clearing, so the
+    // map drop disposes no isolate and the LIFO rule holds regardless of the
+    // BTreeMap's ascending drop order (#258).
+    for page in state.tabs.values_mut() {
+        page.suspend_js();
+    }
     state.tabs.clear();
     state.active_tab = None;
     state.console_messages.clear();
@@ -1513,7 +1548,7 @@ fn tool_tab_close(args: &Value, state: &mut BrowserState) -> Result<String, Stri
         .map(String::from)
         .or_else(|| state.active_tab.clone())
         .ok_or("No tab to close")?;
-    if state.tabs.remove(&tab_id).is_none() {
+    if !state.close_tab(&tab_id) {
         return Err(format!("No such tab: {tab_id}"));
     }
     if state.active_tab.as_deref() == Some(&tab_id) {
