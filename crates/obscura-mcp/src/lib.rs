@@ -1608,14 +1608,20 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
     let mut idx = 0;
     while let Some(pos) = haystack[idx..].find(&needle) {
         let abs = idx + pos;
-        let start = abs.saturating_sub(context);
-        let end = (abs + needle.len() + context).min(body.len());
-        // body and haystack share byte offsets even when lowercased (only ASCII fold).
-        // For safety on non-ASCII, fall back to char-boundary trimming.
-        let start = body[..start].rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1).unwrap_or(start);
-        let end = body[end..].find(|c: char| c.is_whitespace())
-            .map(|i| end + i).unwrap_or(end);
+        let mut start = abs.saturating_sub(context);
+        let mut end = (abs + needle.len() + context).min(body.len());
+        // start/end are byte offsets derived from char counts and needle.len(),
+        // so they can land inside a multi-byte (CJK) character. Snap to char
+        // boundaries before slicing or body[..start] panics (#257).
+        while start > 0 && !body.is_char_boundary(start) { start -= 1; }
+        while end < body.len() && !body.is_char_boundary(end) { end += 1; }
+        // Trim inward to the nearest whitespace so snippets start/end on words.
+        if let Some(i) = body[..start].rfind(|c: char| c.is_whitespace()) {
+            start = i + body[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        if let Some(i) = body[end..].find(|c: char| c.is_whitespace()) {
+            end += i;
+        }
         let snippet = body.get(start..end).unwrap_or("").trim().replace('\n', " ");
         out.push(json!({
             "offset": abs,
