@@ -240,10 +240,16 @@ fn normalize_v8_flags(raw: Option<&str>) -> Option<String> {
 /// (e.g. demo.fingerprint.com — issue #199) don't SIGTRAP out of the box.
 /// V8 parses flags left-to-right and later wins, so anything the user
 /// passes via `--v8-flags` overrides these.
+///
+/// `--max-semi-space-size=4` caps V8's young generation (default 16 MB per
+/// semi-space) so a parse/JS allocation burst does not inflate RSS, and
+/// `--optimize-for-size` trades memory-heavy codegen choices for a smaller
+/// footprint. Together they cut RSS ~18% on heavy pages (ycombinator.com
+/// 173 MB -> 140 MB) at no measurable speed cost (V8 still JITs hot paths).
 #[cfg(target_pointer_width = "64")]
-const DEFAULT_V8_FLAGS: &str = "--max-old-space-size=4096";
+const DEFAULT_V8_FLAGS: &str = "--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-size";
 #[cfg(not(target_pointer_width = "64"))]
-const DEFAULT_V8_FLAGS: &str = "--max-old-space-size=1024";
+const DEFAULT_V8_FLAGS: &str = "--max-old-space-size=1024 --max-semi-space-size=4 --optimize-for-size";
 
 fn effective_v8_flags(user: Option<&str>) -> String {
     match normalize_v8_flags(user) {
