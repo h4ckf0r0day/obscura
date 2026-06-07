@@ -563,7 +563,8 @@ impl ObscuraJsRuntime {
         );
         self.object_store.clear();
     }
-    pub async fn load_module(&mut self, url: &str) -> Result<(), String> {
+    pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
+        let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
 
@@ -585,16 +586,27 @@ impl ObscuraJsRuntime {
             }
         };
 
-        let module_id = self
-            .runtime
-            .load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from(source_code))
-            .await
-            .map_err(|e| format!("Module load error: {}", e))?;
+        // Bound the recursive import-graph fetch. deno_core fetches the graph
+        // concurrently, but a module whose top-level eval idle-waits forever (no
+        // CPU, no network) otherwise blocks here until the phase watchdog fires.
+        // The caller sizes the budget: short for enhancement modules on an
+        // already-rendered page, full for an unmounted SPA shell (#205).
+        let module_id = match tokio::time::timeout(
+            budget,
+            self.runtime.load_side_es_module_from_code(&specifier, deno_core::ModuleCodeString::from(source_code)),
+        ).await {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
+            Err(_) => {
+                tracing::warn!("Module graph load timed out after {}ms: {}", budget_ms, url);
+                return Ok(());
+            }
+        };
 
         let result = self.runtime.mod_evaluate(module_id);
 
         let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
+            budget,
             self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
         ).await;
 
@@ -602,7 +614,7 @@ impl ObscuraJsRuntime {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
             Err(_) => {
-                tracing::warn!("Module evaluation timed out after 10s: {}", url);
+                tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
                 return Ok(());
             }
         }
@@ -616,7 +628,8 @@ impl ObscuraJsRuntime {
         }
     }
 
-    pub async fn load_inline_module(&mut self, code: &str, base_url: &str) -> Result<(), String> {
+    pub async fn load_inline_module(&mut self, code: &str, base_url: &str, budget_ms: u64) -> Result<(), String> {
+        let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(
             &format!("{}#inline-module-{}", base_url, self.object_counter),
         )
@@ -624,19 +637,25 @@ impl ObscuraJsRuntime {
 
         self.object_counter += 1;
 
-        let module_id = self
-            .runtime
-            .load_side_es_module_from_code(
+        let module_id = match tokio::time::timeout(
+            budget,
+            self.runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
-            )
-            .await
-            .map_err(|e| format!("Inline module load error: {}", e))?;
+            ),
+        ).await {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
+            Err(_) => {
+                tracing::warn!("Inline module graph load timed out after {}ms", budget_ms);
+                return Ok(());
+            }
+        };
 
         let result = self.runtime.mod_evaluate(module_id);
 
         let timeout = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
+            budget,
             self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
         ).await;
 
@@ -644,7 +663,7 @@ impl ObscuraJsRuntime {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
             Err(_) => {
-                tracing::warn!("Inline module timed out after 10s");
+                tracing::warn!("Inline module timed out after {}ms", budget_ms);
                 return Ok(());
             }
         }

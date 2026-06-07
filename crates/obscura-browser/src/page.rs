@@ -572,6 +572,35 @@ impl Page {
             }
         }
 
+        // Per-module budget. Modules on an already-rendered page are
+        // enhancement, not the app: give them a short budget so one slow
+        // non-essential module (e.g. YC's bookface, whose top-level eval
+        // idle-waits ~10s) cannot block navigation completion. A page whose
+        // body is still an empty shell IS the SPA (issue #205), so give it the
+        // full script budget and the app module still mounts.
+        let module_budget_ms: u64 = {
+            let body_nodes = self
+                .js
+                .as_ref()
+                .and_then(|js| {
+                    js.with_dom(|dom| {
+                        dom.query_selector("body")
+                            .ok()
+                            .flatten()
+                            .map(|b| dom.descendants(b).len())
+                            .unwrap_or(0)
+                    })
+                })
+                .unwrap_or(0);
+            let short_ms: u64 = std::env::var("OBSCURA_MODULE_BUDGET_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3_000);
+            // A rendered body has hundreds of descendants; an unmounted Vite/Next
+            // shell is <root> plus maybe a spinner.
+            if body_nodes > 50 { short_ms } else { script_deadline_ms }
+        };
+
         for module_script in &module_scripts {
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached, skipping remaining module scripts");
@@ -588,7 +617,7 @@ impl Page {
 
                 tracing::info!("Loading ES module: {}", full_url);
                 if let Some(js) = &mut self.js {
-                    match js.load_module(&full_url).await {
+                    match js.load_module(&full_url, module_budget_ms).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
                             self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
@@ -601,7 +630,7 @@ impl Page {
             } else if !module_script.inline.is_empty() {
                 let base = self.url_string();
                 if let Some(js) = &mut self.js {
-                    if let Err(e) = js.load_inline_module(&module_script.inline, &base).await {
+                    if let Err(e) = js.load_inline_module(&module_script.inline, &base, module_budget_ms).await {
                         tracing::warn!("Inline ES module error: {}", e);
                     }
                 }
