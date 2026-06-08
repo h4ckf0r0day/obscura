@@ -84,6 +84,11 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Suppress all logs (same as on `fetch`). Useful when scraping pages
+        /// that flood the console with per-page script warnings (issue #264).
+        #[arg(long)]
+        quiet: bool,
     },
 
     Fetch {
@@ -214,7 +219,9 @@ fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
 fn is_quiet_command(cmd: &Option<Command>) -> bool {
     matches!(
         cmd,
-        Some(Command::Fetch { quiet: true, .. }) | Some(Command::Scrape { quiet: true, .. })
+        Some(Command::Fetch { quiet: true, .. })
+            | Some(Command::Scrape { quiet: true, .. })
+            | Some(Command::Serve { quiet: true, .. })
     )
 }
 
@@ -290,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
     let global_proxy = args.proxy.clone();
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access, storage_dir }) => {
+        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access, storage_dir, quiet: _ }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
             print_banner(port);
             if let Some(ref dir) = storage_dir {
