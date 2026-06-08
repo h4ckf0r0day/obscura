@@ -2447,8 +2447,8 @@ globalThis.navigator = {
   geolocation: {
     getCurrentPosition(success, error) {
       const coords = {
-        latitude: 50.1109 + (_fpRand(500) - 0.5) * 0.1,
-        longitude: 8.6821 + (_fpRand(501) - 0.5) * 0.1,
+        latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
+        longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(501) - 0.5) * 0.1,
         accuracy: 10 + _fpRand(502) * 40,
         altitude: null,
         altitudeAccuracy: null,
@@ -2461,8 +2461,8 @@ globalThis.navigator = {
     watchPosition(success, error) {
       if (typeof success === 'function') {
         const coords = {
-          latitude: 50.1109 + (_fpRand(503) - 0.5) * 0.1,
-          longitude: 8.6821 + (_fpRand(504) - 0.5) * 0.1,
+          latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(503) - 0.5) * 0.1,
+          longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(504) - 0.5) * 0.1,
           accuracy: 10 + _fpRand(505) * 40,
           altitude: null,
           altitudeAccuracy: null,
