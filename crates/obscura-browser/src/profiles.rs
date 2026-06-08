@@ -64,3 +64,40 @@ pub fn random_profile() -> &'static BrowserProfile {
         % PROFILES.len();
     &PROFILES[idx]
 }
+
+/// Pick the profile for a new browser context.
+///
+/// The default is a single stable profile. Cycling through different browser
+/// identities from one address is itself a bot signal (a real address maps to a
+/// stable device), and the rotated profile does not yet carry a matching TLS or
+/// timezone fingerprint, so rotation is opt-in:
+///   OBSCURA_PROFILE=<index>   pin a specific profile from PROFILES
+///   OBSCURA_ROTATE_PROFILE=1  pick a random profile per context
+pub fn select_profile() -> &'static BrowserProfile {
+    if let Some(idx) = std::env::var("OBSCURA_PROFILE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if idx < PROFILES.len() {
+            return &PROFILES[idx];
+        }
+    }
+    if env_enabled("OBSCURA_ROTATE_PROFILE") {
+        return random_profile();
+    }
+    &PROFILES[0]
+}
+
+fn env_enabled(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}

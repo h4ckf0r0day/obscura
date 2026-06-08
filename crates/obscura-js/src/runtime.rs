@@ -1524,7 +1524,7 @@ mod tests {
         let ua = rt.evaluate("navigator.userAgent").unwrap();
         assert!(ua.as_str().unwrap().contains("Chrome"), "UA should contain Chrome: {}", ua);
         let wd = rt.evaluate("navigator.webdriver").unwrap();
-        assert_eq!(wd, serde_json::Value::Null);
+        assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
         let chrome = rt.evaluate("typeof window.chrome").unwrap();

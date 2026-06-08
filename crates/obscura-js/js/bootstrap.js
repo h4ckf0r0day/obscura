@@ -5521,21 +5521,10 @@ _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
-const _OrigDateTimeFormat = Intl.DateTimeFormat;
-const _defaultTZ = 'Europe/Berlin';
-Intl.DateTimeFormat = function(locales, options) {
-  if (!options) options = {};
-  if (!options.timeZone) options.timeZone = _defaultTZ;
-  return new _OrigDateTimeFormat(locales, options);
-};
-Intl.DateTimeFormat.prototype = _OrigDateTimeFormat.prototype;
-Intl.DateTimeFormat.supportedLocalesOf = _OrigDateTimeFormat.supportedLocalesOf;
-const _origResolved = _OrigDateTimeFormat.prototype.resolvedOptions;
-_OrigDateTimeFormat.prototype.resolvedOptions = function() {
-  const r = _origResolved.call(this);
-  if (r.timeZone === 'UTC') r.timeZone = _defaultTZ;
-  return r;
-};
+// Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
+// so native Intl.DateTimeFormat and Date report the same zone. No JS override:
+// forcing a fixed zone here only on Intl left Date on UTC, which is the exact
+// cross-surface mismatch a fingerprinting script looks for.
 
 if (typeof PointerEvent === 'undefined') {
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {

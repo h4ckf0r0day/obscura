@@ -106,7 +106,7 @@ impl BrowserContext {
         if stealth {
             client.block_trackers = true;
         }
-        let profile = crate::profiles::random_profile();
+        let profile = crate::profiles::select_profile();
         let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
         let platform = profile.platform.to_string();
         let ua_platform = profile.ua_platform.to_string();

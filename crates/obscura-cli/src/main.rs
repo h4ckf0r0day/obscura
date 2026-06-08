@@ -269,6 +269,20 @@ fn effective_v8_flags(user: Option<&str>) -> String {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
+    // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
+    // unset it defaults to UTC for Date while the page layer advertised a different
+    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
+    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
+    // TZ from the host is respected.
+    // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
+    // effectively single threaded here.
+    if let Some(tz) = std::env::var("OBSCURA_TIMEZONE").ok().filter(|s| !s.trim().is_empty()) {
+        unsafe { std::env::set_var("TZ", tz); }
+    } else if std::env::var_os("TZ").is_none() {
+        unsafe { std::env::set_var("TZ", "Europe/Berlin"); }
+    }
+
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
     tracing_subscriber::fmt()
