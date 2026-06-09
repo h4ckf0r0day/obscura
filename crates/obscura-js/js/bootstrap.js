@@ -2819,7 +2819,7 @@ globalThis.CSS = {
       return true;
     } catch (e) { return false; }
   },
-  escape(s){ return String(s); }
+  escape(s){ return s; }
 };
 
 globalThis.HTMLElement = Element;
