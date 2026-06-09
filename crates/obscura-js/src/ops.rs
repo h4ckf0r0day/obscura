@@ -509,6 +509,10 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(timeout_ms))
+        // SSRF: same DNS-resolving guard as the navigation client, so a scripted
+        // fetch()/XHR cannot reach a private/loopback IP via a public hostname
+        // (env/--allow-private-network still relaxes it inside the resolver).
+        .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(false)))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
         // workloads where the same origin is hit dozens of times across
@@ -893,12 +897,7 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     if let Some(host) = url.host() {
         match host {
             url::Host::Ipv4(ip) => {
-                if ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                {
+                if obscura_net::is_forbidden_ip(std::net::IpAddr::V4(ip)) {
                     return Err(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
@@ -906,7 +905,7 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
                 }
             }
             url::Host::Ipv6(ip) => {
-                if ip.is_loopback() || ip.is_unicast_link_local() {
+                if obscura_net::is_forbidden_ip(std::net::IpAddr::V6(ip)) {
                     return Err(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
