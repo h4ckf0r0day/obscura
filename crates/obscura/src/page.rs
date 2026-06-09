@@ -1,8 +1,7 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use obscura_browser::lifecycle::WaitUntil;
-use obscura_browser::{BrowserContext, Page as InnerPage};
+use obscura_browser::Page as InnerPage;
 use serde_json::Value;
 
 use crate::error::Error;
@@ -18,7 +17,6 @@ fn nid_from_value(v: &Value) -> Option<u64> {
 /// A browser tab/page.
 pub struct Page {
     pub(crate) inner: InnerPage,
-    pub(crate) context: Arc<BrowserContext>,
 }
 
 impl Page {
