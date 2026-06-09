@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test & Clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Informational for now (the tree has pre-existing style lints); tighten
+      # to `-- -D warnings` once they are cleared with `cargo clippy --fix`.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      # No `--features stealth`: tests don't need the BoringSSL/TLS-impersonation
+      # path, and it keeps CI off the fragile boring-sys build.
+      - name: Test
+        run: cargo test --workspace
+
+  advisories:
+    name: Audit & Deny
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources
+
+  semgrep:
+    name: Semgrep (Rust SAST)
+    runs-on: ubuntu-22.04
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      # Informational: Rust support is experimental and semgrep cannot run on
+      # the maintainers' Windows hosts, so CI (Linux) is its natural home.
+      - name: Semgrep scan
+        run: semgrep scan --config p/rust --error
+        continue-on-error: true
