@@ -59,6 +59,38 @@ if (_origStackDesc && _origStackDesc.get) {
 }
 
 let _fpSeed = 0;
+// Dynamic script import queue — serializes concurrent import() calls
+// to prevent re-entrant RefCell panic in deno_core's futures_unordered_driver
+// when SPAs dynamically insert multiple <script module> tags at once.
+let __dynScriptQueue = [];
+let __dynScriptBusy = false;
+async function __processDynScriptQueue() {
+  if (__dynScriptBusy) return;
+  __dynScriptBusy = true;
+  while (__dynScriptQueue.length > 0) {
+    const task = __dynScriptQueue.shift();
+    try {
+      if (task.isModule) {
+        await import(task.url);
+      } else {
+        const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+        const parsed = JSON.parse(raw);
+        if (parsed.body) {
+          globalThis.__currentScriptNid = task.nid;
+          try { (0, eval)(parsed.body); }
+          catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+          finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+        }
+      }
+      if (typeof task.onload === 'function') try { task.onload(new Event('load')); } catch(e) {}
+      try { task.dispatchEvent(new Event('load')); } catch(e) {}
+    } catch(e) {
+      console.error('Dynamic script fetch error:', e.message);
+      if (typeof task.onerror === 'function') try { task.onerror(e); } catch(ex) {}
+    }
+  }
+  __dynScriptBusy = false;
+}
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -351,40 +383,46 @@ class Node {
       const src = c.getAttribute('src');
       const prevNid = globalThis.__currentScriptNid;
       if (src) {
+        // Resolve URL against <base href> first, falling back to location.href
+        let baseHref;
+        try {
+          const baseEl = globalThis.document?.querySelector('base[href]');
+          baseHref = baseEl ? baseEl.getAttribute('href') : null;
+        } catch(e) { baseHref = null; }
+        const baseUrl = baseHref || globalThis.location?.href || 'http://localhost/';
         const fullUrl = src.startsWith('http') || src.startsWith('data:')
           ? src
-          : new URL(src, globalThis.location?.href || 'http://localhost/').href;
-        const pageOrigin = (function() { try { return new URL(globalThis.location?.href || "about:blank").origin; } catch(e) { return ""; } })();
-        (async () => {
-          try {
-            if (isModule) {
-              await import(fullUrl);
-            } else {
-              const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
-              const parsed = JSON.parse(raw);
-              if (parsed.body) {
-                globalThis.__currentScriptNid = c._nid;
-                try { (0, eval)(parsed.body); }
-                catch(e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
-                finally { globalThis.__currentScriptNid = prevNid || 0; }
-              }
-            }
-            if (typeof c.onload === 'function') try { c.onload(new Event('load')); } catch(e) {}
-              try { c.dispatchEvent(new Event('load')); } catch(e) {}
-          } catch(e) {
-            console.error('Dynamic script fetch error:', e.message);
-            if (typeof c.onerror === 'function') try { c.onerror(e); } catch(ex) {}
-          }
-        })();
+          : new URL(src, baseUrl).href;
+        const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
+        // Enqueue — serialized via __processDynScriptQueue to prevent
+        // concurrent import() calls from triggering deno_core RefCell panic.
+        __dynScriptQueue.push({
+          url: fullUrl,
+          isModule,
+          nid: c._nid,
+          prevNid,
+          pageOrigin,
+          onload: typeof c.onload === 'function' ? c.onload : null,
+          onerror: typeof c.onerror === 'function' ? c.onerror : null,
+          dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
+        });
+        __processDynScriptQueue();
       } else {
         const code = c.textContent;
         if (code) {
           if (isModule) {
             const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
-            (async () => {
-              try { await import(dataUrl); }
-              catch(e) { console.error('Dynamic inline module error:', e.message); }
-            })();
+            __dynScriptQueue.push({
+              url: dataUrl,
+              isModule: true,
+              nid: c._nid,
+              prevNid,
+              pageOrigin: "",
+              onload: null,
+              onerror: null,
+              dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
+            });
+            __processDynScriptQueue();
           } else {
             globalThis.__currentScriptNid = c._nid;
             try { (0, eval)(code); }
