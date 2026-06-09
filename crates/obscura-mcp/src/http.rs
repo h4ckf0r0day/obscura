@@ -5,6 +5,42 @@ use tokio::net::TcpListener;
 
 use crate::{dispatch, BrowserState};
 
+/// Hard cap on a single MCP request body. The client-supplied `Content-Length`
+/// is used to pre-size the read buffer; without a ceiling a request advertising
+/// e.g. `Content-Length: 4294967296` makes the server allocate and zero-fill
+/// that many bytes before reading any body — an unauthenticated OOM/DoS. 16 MiB
+/// is far above any real JSON-RPC tool call.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Origin allowlist for browser callers, read from `OBSCURA_MCP_ALLOWED_ORIGINS`
+/// (comma-separated). Unset/empty → permissive (unchanged `*`) so hosted
+/// dashboards keep working (issue #175).
+fn allowed_origins_env() -> Option<String> {
+    std::env::var("OBSCURA_MCP_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Whether a request's `Origin` is permitted. A request with no `Origin`
+/// (native, non-browser MCP clients) is always allowed — the same-origin
+/// policy only constrains browser callers. When an allowlist is configured, a
+/// browser `Origin` must match one of its entries (case-insensitive); this
+/// stops a malicious local web page from driving the loopback MCP port.
+fn origin_allowed(origin: Option<&str>, allowlist: Option<&str>) -> bool {
+    match allowlist {
+        None => true,
+        Some(list) => match origin {
+            None => true,
+            Some(o) => {
+                let o = o.trim();
+                list.split(',')
+                    .map(str::trim)
+                    .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(o))
+            }
+        },
+    }
+}
+
 /// MCP Streamable HTTP transport (POST /mcp → JSON response).
 ///
 /// Connections are handled sequentially on the current thread — the browser
@@ -55,6 +91,7 @@ async fn handle_connection(
         let mut content_length: Option<usize> = None;
         let mut accept_sse = false;
         let mut keep_alive = false;
+        let mut origin: Option<String> = None;
 
         loop {
             let mut line = String::new();
@@ -67,6 +104,11 @@ async fn handle_connection(
             if let Some(v) = lower.strip_prefix("content-length: ") {
                 content_length = v.trim().parse().ok();
             }
+            if lower.starts_with("origin:") {
+                if let Some(idx) = trimmed.find(':') {
+                    origin = Some(trimmed[idx + 1..].trim().to_string());
+                }
+            }
             if lower.contains("text/event-stream") {
                 accept_sse = true;
             }
@@ -78,6 +120,16 @@ async fn handle_connection(
         // ── routing ──────────────────────────────────────────────────────────
         if path != "/mcp" {
             respond(&mut writer, 404, b"{\"error\":\"not found\"}").await?;
+            break;
+        }
+
+        // Origin gate: when OBSCURA_MCP_ALLOWED_ORIGINS is configured, a browser
+        // request from a non-listed origin is refused before it can drive the
+        // browser session (mitigates a malicious local web page issuing
+        // cross-origin POSTs to the loopback MCP port). The permissive default
+        // and no-Origin native clients are unaffected.
+        if !origin_allowed(origin.as_deref(), allowed_origins_env().as_deref()) {
+            respond(&mut writer, 403, b"{\"error\":\"origin not allowed\"}").await?;
             break;
         }
 
@@ -123,6 +175,14 @@ async fn handle_connection(
                         break;
                     }
                 };
+
+                // Reject oversized bodies BEFORE allocating: `vec![0u8; len]`
+                // commits `len` bytes up front, so an attacker-chosen
+                // Content-Length would otherwise OOM the process (DoS).
+                if len > MAX_BODY_BYTES {
+                    respond(&mut writer, 413, b"{\"error\":\"payload too large\"}").await?;
+                    break;
+                }
 
                 let mut body = vec![0u8; len];
                 reader.read_exact(&mut body).await?;
@@ -193,8 +253,10 @@ async fn respond_json(writer: &mut (impl AsyncWriteExt + Unpin), body: &[u8]) ->
 async fn respond(writer: &mut (impl AsyncWriteExt + Unpin), status: u16, body: &[u8]) -> Result<()> {
     let status_text = match status {
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         _ => "OK",
     };
     let hdr = format!(
@@ -208,4 +270,32 @@ async fn respond(writer: &mut (impl AsyncWriteExt + Unpin), status: u16, body: &
     writer.write_all(body).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mcp_hardening_tests {
+    use super::{origin_allowed, MAX_BODY_BYTES};
+
+    #[test]
+    fn no_allowlist_is_permissive() {
+        assert!(origin_allowed(Some("https://evil.example"), None));
+        assert!(origin_allowed(None, None));
+    }
+
+    #[test]
+    fn allowlist_matches_case_insensitively_and_rejects_others() {
+        let list = Some("http://localhost:3000, https://app.example.com");
+        assert!(origin_allowed(Some("http://localhost:3000"), list));
+        assert!(origin_allowed(Some("https://APP.example.com"), list));
+        assert!(!origin_allowed(Some("https://evil.example"), list));
+        // A native client (no Origin header) is always allowed.
+        assert!(origin_allowed(None, list));
+    }
+
+    #[test]
+    fn body_cap_is_sane() {
+        // Far above a real JSON-RPC tool call, far below an OOM-inducing value.
+        assert!(MAX_BODY_BYTES >= 1 << 20);
+        assert!(MAX_BODY_BYTES <= 64 << 20);
+    }
 }
