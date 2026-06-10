@@ -1111,6 +1111,51 @@ class Element extends Node {
         break;
     }
   }
+  // Same insertion semantics as insertAdjacentHTML but inserts a Text node
+  // instead of parsing markup — that distinction is the whole point of the API
+  // (DDoS-Guard, reCAPTCHA, and others use it precisely because it does NOT
+  // parse HTML). Position string is case-insensitive per spec. See issue #285.
+  insertAdjacentText(position, text) {
+    const parent = this.parentNode;
+    const node = document.createTextNode(String(text));
+    switch (String(position).toLowerCase()) {
+      case 'beforebegin':
+        if (parent) parent.insertBefore(node, this);
+        break;
+      case 'afterbegin':
+        this.insertBefore(node, this.firstChild);
+        break;
+      case 'beforeend':
+        this.appendChild(node);
+        break;
+      case 'afterend':
+        if (parent) parent.insertBefore(node, this.nextSibling);
+        break;
+    }
+  }
+  // Per spec, returns the inserted element, or null when position is
+  // beforebegin/afterend and this element has no parent (so the node could
+  // not be placed). See issue #285.
+  insertAdjacentElement(position, element) {
+    const parent = this.parentNode;
+    switch (String(position).toLowerCase()) {
+      case 'beforebegin':
+        if (!parent) return null;
+        parent.insertBefore(element, this);
+        return element;
+      case 'afterbegin':
+        this.insertBefore(element, this.firstChild);
+        return element;
+      case 'beforeend':
+        this.appendChild(element);
+        return element;
+      case 'afterend':
+        if (!parent) return null;
+        parent.insertBefore(element, this.nextSibling);
+        return element;
+    }
+    return null;
+  }
   addEventListener(type, handler, opts) {
     const key = this._nid;
     if (!_eventRegistry[key]) _eventRegistry[key] = {};
@@ -4823,7 +4868,8 @@ _markNative(globalThis.Selection);
   Element.prototype.focus, Element.prototype.blur,
   Element.prototype.showPopover, Element.prototype.hidePopover, Element.prototype.togglePopover,
   Element.prototype.cloneNode, Element.prototype.attachShadow,
-  Element.prototype.insertAdjacentHTML, Element.prototype.scrollIntoView,
+  Element.prototype.insertAdjacentHTML, Element.prototype.insertAdjacentText,
+  Element.prototype.insertAdjacentElement, Element.prototype.scrollIntoView,
   Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,

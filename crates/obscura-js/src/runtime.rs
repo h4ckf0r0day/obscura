@@ -2357,6 +2357,80 @@ mod tests {
     /// Setting an ARIA reflection property must write through to the
     /// underlying attribute so frameworks that toggle state via
     /// `el.ariaExpanded = 'true'` actually update the DOM.
+    /// Regression test for #285: DDoS-Guard's challenge calls
+    /// `t.insertAdjacentText(...)` and dies with `TypeError: ... is not a
+    /// function` because `Element.prototype.insertAdjacentText` was missing.
+    /// Verify all four positions place a Text node (NOT parsed HTML) at the
+    /// right spot. Tests `insertAdjacentText` exists, is callable, and that
+    /// inserted content remains literal text — angle brackets must not be
+    /// parsed as markup, which is the whole point of the API.
+    #[test]
+    fn element_insert_adjacent_text_polyfill() {
+        let mut rt = setup_runtime(r#"<div id="p"><span id="t">X</span></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.getElementById('t');
+                t.insertAdjacentText('afterbegin', 'AB');
+                t.insertAdjacentText('beforeend', 'BE');
+                t.insertAdjacentText('beforebegin', 'BB');
+                t.insertAdjacentText('afterend', 'AE');
+                t.insertAdjacentText('beforeend', '<b>raw</b>');
+                return [
+                    typeof Element.prototype.insertAdjacentText,
+                    document.getElementById('p').textContent,
+                    t.getElementsByTagName('b').length,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["function", "BBABXBE<b>raw</b>AE", 0])
+        );
+    }
+
+    /// Regression test for #285: `Element.prototype.insertAdjacentElement`
+    /// was missing alongside `insertAdjacentText`. Verify all four positions
+    /// place the given element correctly and that the inserted element is
+    /// returned (per spec — that's the contract callers rely on for chaining).
+    #[test]
+    fn element_insert_adjacent_element_polyfill() {
+        let mut rt = setup_runtime(r#"<div id="p"><span id="t">X</span></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.getElementById('t');
+                const before = document.createElement('b');  before.id = 'before';
+                const after  = document.createElement('i');  after.id  = 'after';
+                const inside = document.createElement('em'); inside.id = 'inside';
+                const last   = document.createElement('u');  last.id   = 'last';
+                const r1 = t.insertAdjacentElement('beforebegin', before);
+                const r2 = t.insertAdjacentElement('afterend',    after);
+                const r3 = t.insertAdjacentElement('afterbegin',  inside);
+                const r4 = t.insertAdjacentElement('beforeend',   last);
+                const siblings = Array.from(document.getElementById('p').children).map(c => c.id);
+                const inT = Array.from(t.children).map(c => c.id);
+                return [
+                    typeof Element.prototype.insertAdjacentElement,
+                    r1 === before && r2 === after && r3 === inside && r4 === last,
+                    siblings,
+                    inT,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "function",
+                true,
+                ["before", "t", "after"],
+                ["inside", "last"]
+            ])
+        );
+    }
+
     #[test]
     fn element_aria_reflection_setters_write_through() {
         let mut rt = setup_runtime(r#"<div id="d"></div>"#);
