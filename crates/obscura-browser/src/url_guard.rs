@@ -1,13 +1,23 @@
-/// Helpers shared across CDP domain handlers.
-///
-/// The file-scheme detector lives in `obscura-browser` (the crate that owns
-/// `BrowserContext::allow_file_access`) so every navigation entrypoint enforces
-/// the `--allow-file-access` gate on identical logic: CDP `Page.navigate` /
-/// `Target.createTarget` here, and the MCP `browser_navigate` /
-/// `browser_tab_new` tools in `obscura-mcp`. Re-exported (not re-implemented) so
-/// the two surfaces can never drift and silently let `file://` through (see
-/// GHSA-q55h-vfv9-qcr5 and its incomplete-fix variant in `Target.createTarget`).
-pub(crate) use obscura_browser::url_is_file_scheme;
+//! Shared `file:`-scheme detector backing the `--allow-file-access` gate.
+//!
+//! This lives in `obscura-browser` — the crate that owns
+//! [`BrowserContext::allow_file_access`](crate::BrowserContext) — so every
+//! navigation entrypoint gates on the *exact same* logic and none can drift:
+//! CDP `Page.navigate` / `Target.createTarget` (via `obscura-cdp`) and the MCP
+//! `browser_navigate` / `browser_tab_new` tools (via `obscura-mcp`) all call
+//! this one function. Keeping a second copy per crate is how a surface ends up
+//! silently letting `file://` through (see GHSA-q55h-vfv9-qcr5 and its
+//! incomplete-fix variant in `Target.createTarget`).
+
+/// Returns true when `raw` parses as a `file:`-scheme URL, or syntactically
+/// starts with `file:` after a possible leading-whitespace strip. Matching is
+/// case-insensitive on the scheme so neither `FILE://` nor `File://` slips past
+/// callers that gate on `file://`.
+pub fn url_is_file_scheme(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or_else(|_| raw.trim_start().to_ascii_lowercase().starts_with("file:"))
+}
 
 #[cfg(test)]
 mod tests {
