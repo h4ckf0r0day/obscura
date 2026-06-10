@@ -212,7 +212,13 @@ const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
-    if (a instanceof Error) return a.stack || a.message || String(a);
+    if (a instanceof Error) {
+      const _pst = Error.prepareStackTrace;
+      if (_pst !== undefined) Error.prepareStackTrace = undefined;
+      const _s = a.stack || a.message || String(a);
+      if (_pst !== undefined) Error.prepareStackTrace = _pst;
+      return _s;
+    }
     if (typeof a === "object") {
       try {
         const s = JSON.stringify(a);

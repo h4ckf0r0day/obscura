@@ -2453,6 +2453,21 @@ mod tests {
     }
 
     #[test]
+    fn console_log_error_does_not_trigger_prepare_stack_trace() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate(r#"
+            let called = false;
+            const saved = Error.prepareStackTrace;
+            Error.prepareStackTrace = function() { called = true; return saved; };
+            const e = new Error("test");
+            console.log(e);
+            Error.prepareStackTrace = saved;
+            return called;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(false));
+    }
+
+    #[test]
     fn element_aria_reflection_setters_write_through() {
         let mut rt = setup_runtime(r#"<div id="d"></div>"#);
         let result = rt
