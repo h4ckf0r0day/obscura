@@ -27,15 +27,28 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// Mirrors `ObscuraHttpClient::allow_private_network`. When false (default),
+    /// `fetch` applies the same SSRF guard as the reqwest client to the initial
+    /// URL and every redirect hop. Without this the `--stealth` path was a hole
+    /// straight through the PR#279 protections.
+    allow_private_network: bool,
 }
 
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None)
+        Self::with_proxy_and_network(cookie_jar, None, false)
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_proxy_and_network(cookie_jar, proxy_url, false)
+    }
+
+    pub fn with_proxy_and_network(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+    ) -> Self {
         // Issue #184: `set_default_paths()` reads OpenSSL's compile-time CA
         // paths, which only resolve on Linux. On Windows the store ends up
         // empty and every TLS handshake fails with CERTIFICATE_VERIFY_FAILED.
@@ -67,6 +80,7 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_private_network,
         }
     }
 
@@ -89,6 +103,13 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
 
         for _ in 0..20 {
+            // SSRF guard — same policy as the reqwest client. Runs on the
+            // initial URL (first iteration) and on every redirect target
+            // (`current_url` is reassigned to the hop below before `continue`),
+            // so a 302 to 169.254.169.254 / 127.0.0.1 / a non-http scheme is
+            // rejected before any connection is made.
+            crate::client::validate_url(&current_url, self.allow_private_network)?;
+
             let mut req = self.client.get(current_url.as_str());
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
@@ -135,6 +156,18 @@ impl StealthHttpClient {
                 }
             }
 
+            // NAVDOS-02: bound host memory by the declared Content-Length.
+            // (Chunked bodies without Content-Length still read in full here; a
+            // streaming cap for the wreq client is a CI follow-up, alongside the
+            // wreq SSRF resolver — neither is buildable without libclang locally.)
+            if let Some(len) = resp.content_length() {
+                if len as usize > crate::client::max_response_body() {
+                    return Err(ObscuraNetError::Network(format!(
+                        "Response body too large: {} bytes",
+                        len
+                    )));
+                }
+            }
             let body = resp.bytes().await.map_err(|e| {
                 ObscuraNetError::Network(format!("Failed to read body: {}", e))
             })?.to_vec();

@@ -191,9 +191,10 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            Some(Arc::new(StealthHttpClient::with_proxy_and_network(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                context.allow_private_network,
             )))
         } else {
             None

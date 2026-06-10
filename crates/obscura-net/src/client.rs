@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,7 +89,154 @@ pub fn env_allows_private_network() -> bool {
     )
 }
 
-fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+/// Returns true if `ip` is a forbidden SSRF target: loopback, private, internal,
+/// or otherwise non-publicly-routable. Canonicalizes IPv4-mapped and NAT64 IPv6
+/// addresses to their embedded IPv4 and re-checks, so `::ffff:127.0.0.1` and
+/// `64:ff9b::7f00:1` cannot smuggle an internal v4 address past the v6 arm.
+///
+/// Shared by the URL-string pre-check ([`validate_url`]) and the resolve-time
+/// guard ([`SsrfDnsResolver`]) so the policy can never drift between the two
+/// layers. The previous hand-rolled predicate missed `0.0.0.0`, IPv4-mapped
+/// IPv6, IPv6 ULA, CGNAT and NAT64 (audit SSRF-04 / OPS-02).
+pub fn is_forbidden_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ipv4(&v4);
+            }
+            // NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 target in the
+            // last 32 bits — re-check that v4 so it can't reach an internal host.
+            let s = v6.segments();
+            if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+                let v4 = Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    (s[6] & 0xff) as u8,
+                    (s[7] >> 8) as u8,
+                    (s[7] & 0xff) as u8,
+                );
+                return is_forbidden_ipv4(&v4);
+            }
+            is_forbidden_ipv6(v6)
+        }
+    }
+}
+
+fn is_forbidden_ipv4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()                          // 127.0.0.0/8
+        || ip.is_private()                    // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()                 // 169.254.0.0/16 (cloud metadata)
+        || ip.is_broadcast()                  // 255.255.255.255
+        || ip.is_documentation()              // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || ip.is_unspecified()                // 0.0.0.0
+        || o[0] == 0                          // 0.0.0.0/8 "this host" (reaches loopback on Linux)
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+        || ip.is_multicast()                  // 224.0.0.0/4
+        || o[0] >= 240                        // 240.0.0.0/4 reserved
+}
+
+fn is_forbidden_ipv6(ip: &Ipv6Addr) -> bool {
+    ip.is_loopback()                               // ::1
+        || ip.is_unspecified()                     // ::
+        || ip.is_unicast_link_local()              // fe80::/10
+        || (ip.segments()[0] & 0xfe00) == 0xfc00   // fc00::/7 unique local (ULA)
+        || ip.is_multicast()                       // ff00::/8
+}
+
+/// reqwest DNS resolver that resolves a host and rejects the request if **any**
+/// resolved address is a forbidden SSRF target. reqwest connects to exactly the
+/// addresses this resolver returns (it does not re-resolve), so this closes the
+/// DNS-rebinding / TOCTOU window that a URL-string check alone leaves wide open
+/// (audit SSRF-01: a domain with a short-TTL record pointing at 169.254.169.254
+/// or 127.0.0.1). IP-literal hosts never reach a custom resolver, so
+/// [`validate_url`]'s literal check (same [`is_forbidden_ip`]) is the first layer.
+#[derive(Debug, Clone)]
+pub struct SsrfDnsResolver {
+    allow_private_network: bool,
+}
+
+impl SsrfDnsResolver {
+    pub fn new(allow_private_network: bool) -> Self {
+        Self { allow_private_network }
+    }
+}
+
+impl reqwest::dns::Resolve for SsrfDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow = self.allow_private_network || env_allows_private_network();
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            // getaddrinfo via tokio's blocking pool. Port 0 is a placeholder;
+            // reqwest substitutes the URL's real port when it connects.
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if !allow {
+                if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(&a.ip())) {
+                    let bad_ip = bad.ip();
+                    return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "SSRF blocked: '{host}' resolves to forbidden address {bad_ip}"
+                    )));
+                }
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Default cap (bytes) on a single response body buffered into memory
+/// (NAVDOS-01/02). A hostile server can stream an endless or huge body; without
+/// a cap the native `Vec` grows until the host is OOM-killed — V8's `--max-old-
+/// space-size` bounds the JS heap, not this native buffer. Override with
+/// `OBSCURA_MAX_BODY_BYTES`.
+pub fn max_response_body() -> usize {
+    const DEFAULT: usize = 256 * 1024 * 1024; // 256 MiB
+    std::env::var("OBSCURA_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Read a reqwest response body into memory, stopping at `max` bytes. A larger
+/// (or endless / wrong-`Content-Length`) body is truncated rather than allowed
+/// to exhaust host memory.
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, ObscuraNetError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
+    {
+        let remaining = max.saturating_sub(buf.len());
+        if remaining == 0 {
+            tracing::warn!("Response body exceeded {} bytes; truncated", max);
+            break;
+        }
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            tracing::warn!("Response body exceeded {} bytes; truncated", max);
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// SSRF guard shared by every HTTP path in this crate. Rejects non-`http`/
+/// `https`/`file` schemes unconditionally, and — unless `allow_private_network`
+/// is set (flag or `OBSCURA_ALLOW_PRIVATE_NETWORK`) — IP-literal hosts that are
+/// forbidden per [`is_forbidden_ip`] plus the `localhost` / `127.0.0.1` / `::1`
+/// hostnames. Called on the initial URL and on every redirect hop. This is the
+/// pre-flight literal layer; resolvable hostnames are enforced at connect time
+/// by [`SsrfDnsResolver`] (rebinding-safe). `pub(crate)` so the stealth (`wreq`)
+/// client enforces the exact same policy.
+pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -105,12 +253,7 @@ fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNet
     if let Some(host) = url.host() {
         match host {
             url::Host::Ipv4(ip) => {
-                if ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                {
+                if is_forbidden_ip(&IpAddr::V4(ip)) {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
@@ -118,7 +261,7 @@ fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNet
                 }
             }
             url::Host::Ipv6(ip) => {
-                if ip.is_loopback() || ip.is_unicast_link_local() {
+                if is_forbidden_ip(&IpAddr::V6(ip)) {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
@@ -137,6 +280,9 @@ fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNet
                         domain
                     )));
                 }
+                // Resolvable hostnames are enforced at connect time by
+                // SsrfDnsResolver (rebinding-safe); the string check above is
+                // only a cheap fast-path for the obvious loopback literals.
             }
         }
     }
@@ -234,11 +380,17 @@ impl ObscuraHttpClient {
     }
 
     async fn get_client(&self) -> &Client {
+        let allow_private = self.allow_private_network;
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(30))
                 .danger_accept_invalid_certs(false)
+                // Resolve-time SSRF guard: rejects any host that resolves to a
+                // forbidden address, closing the DNS-rebinding window that the
+                // URL-string check cannot (a name passes validate_url, then
+                // re-resolves to 127.0.0.1/169.254.169.254 at connect time).
+                .dns_resolver(Arc::new(SsrfDnsResolver::new(allow_private)))
 ;
 
             if let Some(ref proxy) = self.proxy_url {
@@ -470,9 +622,7 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = resp.bytes().await.map_err(|e| {
-                ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            let body_bytes = read_body_capped(resp, max_response_body()).await?;
 
             let response = Response {
                 url: current_url,
@@ -525,4 +675,158 @@ pub enum ObscuraNetError {
 
     #[error("Request blocked: {0}")]
     Blocked(String),
+}
+
+#[cfg(test)]
+mod ssrf_guard_tests {
+    use super::*;
+
+    fn check(raw: &str, allow_private: bool) -> Result<(), ObscuraNetError> {
+        validate_url(&Url::parse(raw).unwrap(), allow_private)
+    }
+
+    // This is the exact guard the reqwest client (initial URL + every redirect
+    // hop) and the stealth client now share. These IPs/hosts are what a 302 to
+    // an internal target resolves to before being followed.
+    #[test]
+    fn rejects_internal_ip_literals_when_guard_on() {
+        for raw in [
+            "http://127.0.0.1/",
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/", // cloud metadata
+            "http://10.0.0.1/",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+            "http://[::1]/",
+            "http://[::1]:9/",
+            "http://localhost/",
+            "http://sub.localhost/",
+        ] {
+            assert!(check(raw, false).is_err(), "{raw} should be rejected with guard on");
+        }
+    }
+
+    #[test]
+    fn allows_public_hosts_when_guard_on() {
+        for raw in ["http://93.184.216.34/", "https://example.com/", "http://8.8.8.8/"] {
+            assert!(check(raw, false).is_ok(), "{raw} should pass with guard on");
+        }
+    }
+
+    #[test]
+    fn allow_private_network_opens_internal_targets() {
+        // With the opt-in, the same internal targets pass — this is the flag
+        // the stealth client must honour identically to the reqwest client.
+        for raw in ["http://127.0.0.1:8080/", "http://169.254.169.254/", "http://10.0.0.1/"] {
+            assert!(check(raw, true).is_ok(), "{raw} should pass with allow_private_network");
+        }
+    }
+
+    #[test]
+    fn rejects_non_http_schemes_unconditionally() {
+        // Scheme check runs before the allow_private_network short-circuit, so
+        // a redirect to e.g. ftp:// / gopher:// is rejected even with the opt-in.
+        for raw in ["ftp://example.com/", "gopher://169.254.169.254/", "data:text/html,x"] {
+            assert!(check(raw, true).is_err(), "{raw} scheme should be rejected even with opt-in");
+        }
+    }
+
+    // Audit SSRF-04 / OPS-02: the previous predicate let all of these through.
+    #[test]
+    fn rejects_extended_internal_literals() {
+        for raw in [
+            "http://0.0.0.0/",                  // unspecified / "this host"
+            "http://0.1.2.3/",                  // 0.0.0.0/8
+            "http://100.64.0.1/",               // CGNAT 100.64/10
+            "http://224.0.0.1/",                // IPv4 multicast
+            "http://240.0.0.1/",                // reserved 240/4
+            "http://[::]/",                     // IPv6 unspecified
+            "http://[::ffff:127.0.0.1]/",       // IPv4-mapped loopback
+            "http://[::ffff:169.254.169.254]/", // IPv4-mapped cloud metadata
+            "http://[::ffff:10.0.0.1]/",        // IPv4-mapped RFC1918
+            "http://[fc00::1]/",                // IPv6 ULA
+            "http://[fd00::1]/",                // IPv6 ULA
+            "http://[64:ff9b::7f00:1]/",        // NAT64 -> 127.0.0.1
+            "http://[ff02::1]/",                // IPv6 multicast
+        ] {
+            assert!(check(raw, false).is_err(), "{raw} must be rejected (guard on)");
+        }
+    }
+
+    #[test]
+    fn is_forbidden_ip_classifies_canonical_forms() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let forbidden: &[IpAddr] = &[
+            "127.0.0.1".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "169.254.169.254".parse().unwrap(),
+            "0.0.0.0".parse().unwrap(),
+            "100.64.0.1".parse().unwrap(),
+            IpAddr::V6("::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap()),
+            IpAddr::V6("fc00::1".parse::<Ipv6Addr>().unwrap()),
+            IpAddr::V6("64:ff9b::7f00:1".parse::<Ipv6Addr>().unwrap()),
+        ];
+        for ip in forbidden {
+            assert!(is_forbidden_ip(ip), "{ip} should be forbidden");
+        }
+        let allowed: &[IpAddr] = &[
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            "2606:4700:4700::1111".parse().unwrap(), // public IPv6 (Cloudflare)
+        ];
+        for ip in allowed {
+            assert!(!is_forbidden_ip(ip), "{ip} should be allowed");
+        }
+    }
+
+    // Resolve-time guard: a hostname that resolves to a forbidden address must
+    // be rejected at connect time, closing the rebinding window. `localhost`
+    // resolves locally (no network) to 127.0.0.1 / ::1, both forbidden.
+    #[tokio::test]
+    async fn resolver_rejects_host_resolving_to_loopback() {
+        let client = reqwest::Client::builder()
+            .dns_resolver(std::sync::Arc::new(SsrfDnsResolver::new(false)))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = client
+            .get("http://localhost:9/")
+            .send()
+            .await
+            .expect_err("localhost must be rejected by the resolve-time SSRF guard");
+        let mut chain = err.to_string();
+        let mut src = std::error::Error::source(&err);
+        while let Some(e) = src {
+            chain.push_str(" | ");
+            chain.push_str(&e.to_string());
+            src = e.source();
+        }
+        assert!(
+            chain.contains("SSRF blocked") || chain.contains("forbidden address"),
+            "expected an SSRF-guard rejection, got: {chain}"
+        );
+    }
+
+    // With the opt-in, the resolver must NOT pre-emptively reject loopback
+    // (the failure, if any, is a plain connection error to the closed port).
+    #[tokio::test]
+    async fn resolver_allows_loopback_with_opt_in() {
+        let client = reqwest::Client::builder()
+            .dns_resolver(std::sync::Arc::new(SsrfDnsResolver::new(true)))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        if let Err(err) = client.get("http://localhost:9/").send().await {
+            let mut chain = err.to_string();
+            let mut src = std::error::Error::source(&err);
+            while let Some(e) = src {
+                chain.push_str(&e.to_string());
+                src = e.source();
+            }
+            assert!(
+                !chain.contains("SSRF blocked"),
+                "opt-in must bypass the SSRF guard, got: {chain}"
+            );
+        }
+    }
 }

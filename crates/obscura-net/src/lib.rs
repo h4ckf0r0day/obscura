@@ -8,8 +8,8 @@ pub mod blocklist;
 pub mod wreq_client;
 
 pub use client::{
-    env_allows_private_network, ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType,
-    Response,
+    env_allows_private_network, is_forbidden_ip, max_response_body, read_body_capped,
+    ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType, Response, SsrfDnsResolver,
 };
 pub use cookies::{CookieInfo, CookieJar};
 pub use encoding::{

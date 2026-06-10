@@ -66,6 +66,15 @@ impl ModuleLoader for ObscuraModuleLoader {
         let proxy_url = self.proxy_url.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
+            // SSRF: a dynamic `import()` is a network egress reachable from page
+            // JS, so apply the same guard as op_fetch_url. This pre-flight check
+            // catches IP-literal targets (which never reach a custom resolver);
+            // resolvable hostnames (incl. rebinding) are caught at connect time
+            // by the SsrfDnsResolver installed on the shared client below.
+            if let Ok(parsed) = url::Url::parse(&url) {
+                crate::ops::validate_fetch_url(&parsed).map_err(io_err)?;
+            }
+
             // Reuse the process-wide cached client (same one op_fetch_url
             // uses). Modern SPAs dynamic-import 20-50 chunks per page; the
             // old code built a fresh reqwest::Client per import, each with
@@ -79,7 +88,8 @@ impl ModuleLoader for ObscuraModuleLoader {
             tracing::debug!(
                 "Loading ES module: {} (proxy: {})",
                 url,
-                proxy_url.as_deref().unwrap_or("direct")
+                // OPS-04: never log the proxy URL (it may carry credentials).
+                if proxy_url.is_some() { "via-proxy" } else { "direct" }
             );
 
             let resp = client
