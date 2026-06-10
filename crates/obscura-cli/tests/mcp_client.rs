@@ -268,6 +268,47 @@ fn test_navigate_missing_url_returns_error() {
     assert_eq!(resp["result"]["isError"], true);
 }
 
+// Regression: an MCP client (or a web page reaching the MCP HTTP port) must not
+// be able to read arbitrary local files via browser_navigate + browser_snapshot.
+// Without --allow-file-access (the default, as spawned by McpClient), file://
+// navigation must be rejected by the gate BEFORE any filesystem read — so the
+// error is the gate message, not a "file not found", on every platform.
+#[test]
+fn test_navigate_file_scheme_rejected_by_default() {
+    let mut c = McpClient::spawn();
+    let resp = c.tool("browser_navigate", serde_json::json!({"url": "file:///etc/passwd"}));
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "file:// navigation must be rejected without --allow-file-access: {resp}"
+    );
+    let text = content_text(&resp);
+    assert!(
+        text.contains("file://") && text.contains("disabled"),
+        "expected the file:// gate message, got: {text}"
+    );
+}
+
+// The gate is case-insensitive on the scheme so FILE:// / File:// can't slip past.
+#[test]
+fn test_navigate_file_scheme_rejected_case_insensitive() {
+    let mut c = McpClient::spawn();
+    let resp = c.tool("browser_navigate", serde_json::json!({"url": "FILE:///etc/passwd"}));
+    assert_eq!(resp["result"]["isError"], true, "FILE:// must be rejected: {resp}");
+    assert!(content_text(&resp).contains("disabled"));
+}
+
+// browser_tab_new also takes an attacker-controlled url and must honour the gate.
+#[test]
+fn test_tab_new_file_scheme_rejected_by_default() {
+    let mut c = McpClient::spawn();
+    let resp = c.tool("browser_tab_new", serde_json::json!({"url": "file:///etc/passwd"}));
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "browser_tab_new to file:// must be rejected without --allow-file-access: {resp}"
+    );
+    assert!(content_text(&resp).contains("disabled"));
+}
+
 #[test]
 fn test_unknown_tool_returns_error() {
     let mut c = McpClient::spawn();

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{url_is_file_scheme, BrowserContext, Page};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -78,16 +78,44 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+    pub fn new(
+        proxy: Option<String>,
+        user_agent: Option<String>,
+        stealth: bool,
+        allow_file_access: bool,
+    ) -> Self {
+        // The net layer reads any `file://` path unconditionally, so the only
+        // barrier against an MCP client (or a web page that can reach the MCP
+        // port) reading arbitrary local files via
+        // `browser_navigate {url:"file:///etc/passwd"}` + `browser_snapshot`
+        // is this flag, gated in `guard_navigation`. Mirrors the CDP server's
+        // `--allow-file-access` (off by default).
+        let mut context = BrowserContext::with_options("mcp".to_string(), proxy, stealth);
+        context.allow_file_access = allow_file_access;
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
+            context: Arc::new(context),
             user_agent,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
         }
+    }
+
+    /// Reject navigation to `file://` URLs unless `--allow-file-access` was
+    /// passed. The same gate the CDP server applies in `Page.navigate` and
+    /// `Target.createTarget` (see `obscura-cdp`): without it, anyone who can
+    /// drive the MCP tools can read any file the obscura process can read,
+    /// regardless of transport (stdio or HTTP).
+    fn guard_navigation(&self, url: &str) -> Result<(), String> {
+        if url_is_file_scheme(url) && !self.context.allow_file_access {
+            return Err(
+                "Navigation to file:// is disabled. Restart the MCP server with \
+                 `obscura mcp --allow-file-access` to enable.".to_string()
+            );
+        }
+        Ok(())
     }
 
     /// Make sure there is at least one tab and return a &mut to the
@@ -170,13 +198,18 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
     }
 }
 
-pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
+pub async fn run(
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    stealth: bool,
+    allow_file_access: bool,
+) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::new(proxy, user_agent, stealth, allow_file_access);
 
     loop {
         // MCP stdio transport: newline-delimited JSON (one message per line)
@@ -690,6 +723,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str)
         .ok_or("Missing url parameter")?;
+    state.guard_navigation(url)?;
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
@@ -1086,6 +1120,12 @@ fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
     Ok(())
 }
 
+// tool_back / tool_forward / tool_reload replay URLs already in `page.history`
+// (or the current URL). They need no file:// re-check: the only way a URL enters
+// history is a successful load through `tool_navigate` / `tool_tab_new`, both of
+// which call `guard_navigation`, and a redirect can't reach file:// (the net
+// layer's file:// fast-path is outside its redirect loop, so reqwest rejects
+// such a hop). So the gate is enforced at insertion, not at replay.
 async fn tool_back(state: &mut BrowserState) -> Result<String, String> {
     let history_url = state.page_mut().with_dom(|_| ()).map(|_| ());
     let _ = history_url;
@@ -1504,6 +1544,9 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
 
 async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str);
+    if let Some(u) = url {
+        state.guard_navigation(u)?;
+    }
     let id = state.new_tab();
     if let Some(u) = url {
         let ua = state.user_agent.clone();
