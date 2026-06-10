@@ -130,6 +130,30 @@ pub fn emit_navigation_events(
     }
     phase3.push(CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es });
     ctx.pending_events.extend(phase3);
+
+    // Target.targetInfoChanged: strict CDP clients (browser-use, and
+    // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
+    // attachedToTarget and only refresh it on this event. Without it they keep
+    // reporting the pre-navigation url/title (about:blank) and never see the
+    // loaded page. Emit it browser-level (no sessionId) with the new url/title.
+    let (tic_title, tic_ctx) = ctx
+        .get_page(page_id)
+        .map(|p| (p.title.clone(), p.context.id.clone()))
+        .unwrap_or_default();
+    ctx.pending_events.push(CdpEvent::new(
+        "Target.targetInfoChanged",
+        json!({
+            "targetInfo": {
+                "targetId": page_id,
+                "type": "page",
+                "title": tic_title,
+                "url": page_url,
+                "attached": true,
+                "canAccessOpener": false,
+                "browserContextId": tic_ctx,
+            }
+        }),
+    ));
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -583,5 +607,55 @@ mod tests {
             !err2.contains("Unknown Page method"),
             "captureSnapshot must NOT fall through: {err2}"
         );
+    }
+
+    #[tokio::test]
+    async fn navigation_emits_target_info_changed_with_url_and_title() {
+        // Strict CDP clients (browser-use, Puppeteer/Playwright `page.url()`)
+        // refresh a target's url/title only on Target.targetInfoChanged. A
+        // navigation must emit it with the post-nav url/title, otherwise those
+        // clients stay stuck on the pre-nav about:blank.
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{}-session", page_id);
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+
+        let params = json!({
+            "url": "data:text/html,<title>Hello</title><button>B</button>",
+            "waitUntil": "load",
+        });
+        handle("navigate", &params, &mut ctx, &Some(session_id.clone()))
+            .await
+            .expect("navigate should succeed");
+
+        let evt = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.targetInfoChanged")
+            .expect("navigation must emit Target.targetInfoChanged");
+        // Browser-level event (no sessionId) so the root connection's
+        // targetInfoChanged handler receives it.
+        assert!(
+            evt.session_id.is_none(),
+            "targetInfoChanged must be browser-level (no sessionId)"
+        );
+        let info = evt.params["targetInfo"].clone();
+
+        // The payload must carry the live post-navigation url/title and the
+        // canAccessOpener field strict clients require on every TargetInfo.
+        let (exp_url, exp_title) = {
+            let page = ctx.get_page(&page_id).expect("page exists");
+            (page.url_string(), page.title.clone())
+        };
+        assert_eq!(info["targetId"], json!(page_id));
+        assert_eq!(info["type"], "page");
+        assert_eq!(info["url"], json!(exp_url));
+        assert_eq!(info["title"], json!(exp_title));
+        assert!(
+            info["url"].as_str().unwrap_or_default().starts_with("data:"),
+            "url should reflect the navigated page, got {}",
+            info["url"]
+        );
+        assert_eq!(info["canAccessOpener"], json!(false));
     }
 }

@@ -219,6 +219,20 @@ impl ObscuraJsRuntime {
             ),
         );
     }
+
+    /// Override the coordinates the navigator.geolocation shim reports. The
+    /// values are injected as numeric globals the bootstrap reads; when unset it
+    /// keeps the built-in default. Callers validate the range before calling.
+    pub fn set_geolocation(&mut self, latitude: f64, longitude: f64) {
+        let _ = self.runtime.execute_script(
+            "<set-geo>",
+            format!(
+                "globalThis.__obscura_geo_lat={};globalThis.__obscura_geo_lon={};",
+                latitude, longitude
+            ),
+        );
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         let wrapped = Self::wrap_expression(expression);
         let result = self

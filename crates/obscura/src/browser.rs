@@ -57,7 +57,6 @@ impl Browser {
         );
         Ok(Page {
             inner: page,
-            context: self.context.clone(),
         })
     }
 

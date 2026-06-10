@@ -9,6 +9,22 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
+/// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
+/// Returns None when unset or malformed, leaving the built-in default in place.
+/// Lets a deployment align the reported coordinates with the region its exit IP
+/// resolves to, so timezone and location stay consistent (issue #228).
+fn env_geolocation() -> Option<(f64, f64)> {
+    let raw = std::env::var("OBSCURA_GEOLOCATION").ok()?;
+    let (lat, lon) = raw.split_once(',')?;
+    let lat: f64 = lat.trim().parse().ok()?;
+    let lon: f64 = lon.trim().parse().ok()?;
+    let valid = lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon);
+    valid.then_some((lat, lon))
+}
+
 fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix("data:")?;
     let comma = rest.find(',')?;
@@ -272,6 +288,9 @@ impl Page {
             &self.context.ua_platform,
             &self.context.ua_platform_version,
         );
+        if let Some((lat, lon)) = env_geolocation() {
+            rt.set_geolocation(lat, lon);
+        }
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());

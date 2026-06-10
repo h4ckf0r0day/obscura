@@ -165,6 +165,21 @@ pub async fn handle(
         }
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
+        "focus" => {
+            // No layout engine, but obscura's JS focus() sets document.activeElement,
+            // which Input.dispatchKeyEvent targets. CDP clients (browser-use) focus an
+            // input via DOM.focus before typing; without this their keystrokes land on
+            // nothing and the field stays empty.
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
+            let code = format!(
+                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
+                 if (el && typeof el.focus === 'function') {{ el.focus(); return true; }} return false; }})()",
+                node_id
+            );
+            let _ = page.evaluate(&code);
+            Ok(json!({}))
+        }
         "getBoxModel" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = match resolve_node_id(page, params) {
@@ -281,4 +296,50 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
         result["children"] = json!(children);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::CdpContext;
+
+    #[tokio::test]
+    async fn dom_focus_sets_active_element() {
+        // CDP clients (browser-use) focus an input via DOM.focus before typing;
+        // dispatchKeyEvent then targets document.activeElement. DOM.focus must
+        // actually move focus or keystrokes land on nothing.
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<input id=q>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let qs = handle("querySelector", &json!({ "selector": "input" }), &mut ctx, &session)
+            .await
+            .expect("querySelector should succeed");
+        let nid = qs["nodeId"].as_u64().expect("input nodeId");
+        assert!(nid > 0, "the input element should be found");
+
+        handle("focus", &json!({ "nodeId": nid }), &mut ctx, &session)
+            .await
+            .expect("DOM.focus should succeed");
+
+        let active = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("(function(){return document.activeElement?document.activeElement.tagName:'NONE';})()");
+        assert_eq!(
+            active,
+            json!("INPUT"),
+            "DOM.focus must set document.activeElement to the focused input"
+        );
+    }
 }
