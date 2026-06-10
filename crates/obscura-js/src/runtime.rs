@@ -1225,6 +1225,53 @@ mod tests {
         rt
     }
 
+    // Regression for audit OPS-01: hostile page JS could reach every privileged
+    // op via `Deno.core.ops`, bypassing all JS-layer guards. After the fix the
+    // Deno bridge and bootstrap internals must be unreachable from page scripts,
+    // while op-backed capabilities (DOM via op_dom) keep working through the
+    // private op table.
+    #[test]
+    fn page_js_cannot_reach_sensitive_ops_or_internals() {
+        let mut rt = setup_runtime("<html><body><h1>Hi</h1><p id=\"x\">BODY</p></body></html>");
+
+        // The SENSITIVE ops that backed OPS-02/03/04 (cross-origin fetch, cookie
+        // read/write, navigation) must be unreachable from page JS.
+        for op in [
+            "op_fetch_url",
+            "op_get_cookies",
+            "op_set_cookie",
+            "op_navigate",
+            "op_subtle_digest",
+            "op_url_parse",
+        ] {
+            let v = rt
+                .evaluate(&format!(
+                    "(function(){{ try {{ return typeof Deno.core.ops.{op}; }} catch(e){{ return 'undefined'; }} }})()"
+                ))
+                .unwrap();
+            assert_eq!(v, serde_json::json!("undefined"), "{op} must be unreachable from page JS");
+        }
+
+        // Bootstrap internals no longer leak via the shared global lexical scope.
+        assert_eq!(rt.evaluate("typeof _dom").unwrap(), serde_json::json!("undefined"));
+        assert_eq!(rt.evaluate("typeof __ops").unwrap(), serde_json::json!("undefined"));
+
+        // The two non-sensitive ops that CDP-injected page JS needs remain
+        // (op_dom == DOM access page already has; op_binding_called == A2 binding).
+        assert_eq!(rt.evaluate("typeof Deno.core.ops.op_dom").unwrap(), serde_json::json!("function"));
+        assert_eq!(rt.evaluate("typeof Deno.core.ops.op_binding_called").unwrap(), serde_json::json!("function"));
+
+        // Op-backed capabilities still work end to end through the private table.
+        assert_eq!(
+            rt.evaluate("document.querySelector('h1').textContent").unwrap(),
+            serde_json::json!("Hi")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('x').textContent").unwrap(),
+            serde_json::json!("BODY")
+        );
+    }
+
     #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
@@ -1945,26 +1992,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_fetch_url_input_decodes_binary_body_base64() {
+    async fn test_fetch_binary_response_arraybuffer_round_trips() {
+        // Previously this stubbed `Deno.core.ops.op_fetch_url` from page JS to
+        // inject a fake binary body. That op seam is intentionally no longer
+        // reachable from the page realm (audit OPS-01 fix), so we stub the
+        // page-facing fetch() instead and assert the fetch()->arrayBuffer()
+        // binary path yields the exact bytes (the wasm magic header).
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.call_function_on_for_cdp(
             r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const realFetch = globalThis.fetch;
                 try {
-                    Deno.core.ops.op_fetch_url = (url) => {
-                        globalThis.__capturedFetchUrl = url;
-                        return JSON.stringify({
+                    globalThis.fetch = async (input) => {
+                        globalThis.__capturedFetchUrl = String(input);
+                        const u8 = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+                        return new Response(u8, {
                             status: 200,
                             headers: { "content-type": "application/wasm" },
-                            bodyBase64: "AGFzbQEAAAA=",
-                            url,
                         });
                     };
                     const response = await fetch(new URL("/pkg/app_bg.wasm", document.URL));
                     const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
                     return { url: globalThis.__capturedFetchUrl, bytes };
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    globalThis.fetch = realFetch;
                 }
             }"#,
             None,

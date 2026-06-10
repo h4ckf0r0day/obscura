@@ -1,5 +1,18 @@
 "use strict";
 
+// Bootstrap runs inside this IIFE so its internals — the op bridges, helper
+// functions, and the captured op table below — are NOT visible on the global
+// lexical scope. Page <script> bodies execute in the SAME V8 realm, so any
+// top-level `const`/`let`/`function` here would otherwise be readable by name
+// from hostile page JS (audit OPS-01). Page-facing API is published via
+// globalThis.* and is unaffected.
+(() => {
+
+// deno_core's op table, captured privately at RUNTIME in __obscura_init (ops are
+// not registered at snapshot-build time, so this must not capture at top level).
+// Every op bridge in this file calls through `__ops`; page JS cannot name it.
+let __ops = null;
+
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
@@ -25,7 +38,7 @@ globalThis.dispatchEvent = function(event) {
   return !event.defaultPrevented;
 };
 
-const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+const _dom = (cmd, a1, a2) => __ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
 
 const _nativeFns = new Set();
 const _origToString = Function.prototype.toString;
@@ -77,7 +90,7 @@ async function __processDynScriptQueue() {
         if (task.isModule) {
           await import(task.url);
         } else {
-          const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+          const raw = await __ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
           const parsed = JSON.parse(raw);
           if (parsed.body) {
             globalThis.__currentScriptNid = task.nid;
@@ -209,7 +222,7 @@ function _getElementsByClassName(root, classNames) {
   return HTMLCollection._from(matched);
 }
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
+  try { __ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
     if (a instanceof Error) return a.stack || a.message || String(a);
@@ -239,7 +252,7 @@ const _intervals = new Set();
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
   if (d === 0) Promise.resolve().then(fn);
-  else Deno.core.ops.op_sleep(d).then(fn);
+  else __ops.op_sleep(d).then(fn);
 };
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
@@ -782,7 +795,7 @@ function _applyDocQueryEncoding(u) {
   let decoded;
   try { decoded = decodeURIComponent(u.search.slice(1)); } catch (e) { return u; }
   let reencoded;
-  try { reencoded = Deno.core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
+  try { reencoded = __ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
   catch (e) { return u; }
   const newSearch = '?' + reencoded;
   if (newSearch === u.search) return u;
@@ -1646,10 +1659,10 @@ class Element extends Node {
 
     const encoded = pairs.join('&');
     if (method === 'POST') {
-      Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
+      __ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
       const sep = targetUrl.includes('?') ? '&' : '?';
-      Deno.core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      __ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
     }
   }
   reset() {
@@ -1904,7 +1917,7 @@ class Document extends Node {
   get URL() { return _domParse("document_url") ?? ""; }
   get documentURI() { return this.URL; }
   get location() { return globalThis.location; }
-  set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  set location(url) { __ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
@@ -2214,11 +2227,11 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
-    return Deno.core.ops.op_get_cookies();
+    return __ops.op_get_cookies();
   }
   set cookie(v) {
     if (!v) return;
-    Deno.core.ops.op_set_cookie(v);
+    __ops.op_set_cookie(v);
   }
   write(...args) {
     var html = args.join('');
@@ -2348,7 +2361,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  set href(url) { globalThis.__virtualUrl = null; __ops.op_navigate(_resolveUrl(url), 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -2358,14 +2371,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  assign(url) { globalThis.__virtualUrl = null; __ops.op_navigate(_resolveUrl(url), 'GET', ''); },
   reload() {},
-  replace(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  replace(url) { globalThis.__virtualUrl = null; __ops.op_navigate(_resolveUrl(url), 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
+  set(url) { __ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -2667,7 +2680,7 @@ globalThis.fetch = async (input, init = {}) => {
   const body = init.body ? String(init.body) : "";
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const raw = await __ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -2964,14 +2977,14 @@ _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 // the input is not a valid URL.
 function _urlParseOp(url, base) {
   try {
-    const s = Deno.core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
+    const s = __ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
 }
 function _urlSetOp(href, part, value) {
   try {
-    const s = Deno.core.ops.op_url_set(String(href), part, String(value));
+    const s = __ops.op_url_set(String(href), part, String(value));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
@@ -2980,7 +2993,7 @@ function _urlSetOp(href, part, value) {
 // failure. Cheaper than _urlParseOp for callers that only need the href.
 function _urlResolveOp(href, base) {
   try {
-    const r = Deno.core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
+    const r = __ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
     return r ? r : null;
   } catch (e) { return null; }
 }
@@ -3249,7 +3262,7 @@ if (typeof TextDecoder === 'undefined') {
       if (label === undefined) {
         name = 'utf-8';
       } else {
-        name = Deno.core.ops.op_encoding_for_label(String(label));
+        name = __ops.op_encoding_for_label(String(label));
         if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
       }
       const o = options || {};
@@ -3269,7 +3282,7 @@ if (typeof TextDecoder === 'undefined') {
         return _utf8DecodeBytes(bytes, off);
       }
       // Legacy encodings / fatal mode: encoding_rs via the op.
-      const r = JSON.parse(Deno.core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
+      const r = JSON.parse(__ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
       if (!r.ok) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
       return r.v;
     }
@@ -5784,7 +5797,7 @@ if (!globalThis.crypto.subtle) {
       if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
       else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       else bytes = new Uint8Array(data || []);
-      const out = Deno.core.ops.op_subtle_digest(name, bytes);
+      const out = __ops.op_subtle_digest(name, bytes);
       return new Uint8Array(out).buffer;
     },
     async encrypt() { throw new DOMException('NotSupportedError'); },
@@ -6139,6 +6152,27 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 }
 
 globalThis.__obscura_init = function() {
+  // Capture the full op table into the IIFE-private `__ops` (used by every
+  // bridge in this file), then NARROW the page-reachable `Deno.core.ops` to the
+  // only two ops that page-context JS legitimately needs and that grant nothing
+  // beyond the existing page/DOM API:
+  //   - op_dom: in-memory DOM-tree access, already fully exposed via document.*
+  //     (the DOM API is built on it), used by the CDP DOM.resolveNode shim.
+  //   - op_binding_called: delivers Runtime.addBinding/exposeFunction calls to
+  //     the (A2) CDP client that registered the binding.
+  // Every SENSITIVE op (op_fetch_url, op_get_cookies, op_set_cookie, op_navigate,
+  // op_url_*, op_subtle_digest, …) is removed from the page realm, closing audit
+  // OPS-01/02/03/04: hostile page JS can no longer call the network/cookie/
+  // navigation ops directly to bypass the JS-layer guards (CORS/SSRF/cookie
+  // scoping). deno_core's own internals use `ext:` module refs, not globalThis.Deno.
+  if (!__ops && typeof Deno !== "undefined") { __ops = Deno.core.ops; }
+  try {
+    delete globalThis.Deno;
+    globalThis.Deno = { core: { ops: {
+      op_dom: __ops.op_dom,
+      op_binding_called: __ops.op_binding_called,
+    } } };
+  } catch (e) {}
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   _installWasmStreamingFallback();
@@ -6653,3 +6687,5 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // arrayBuffer is the body primitive that blob/text/json derive from; the
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
+
+})(); // end bootstrap IIFE — internals (op bridges, __ops, helpers) stay private
