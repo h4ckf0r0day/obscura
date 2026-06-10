@@ -320,4 +320,58 @@ mod tests {
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
     }
+
+    // Build a `depth`-deep linear element chain with a text leaf, directly via
+    // the DOM API (O(depth)). Parsing such a tree out of HTML would hit
+    // html5ever's super-linear deep-nesting cost; building it lets the DoS tests
+    // reach a depth that genuinely overflows a recursive walk while staying fast.
+    fn build_deep_tree(depth: usize) -> crate::tree::DomTree {
+        use crate::tree::NodeData;
+        use html5ever::{LocalName, Namespace, QualName};
+        let tree = crate::tree::DomTree::new();
+        let name = QualName::new(None, Namespace::from("http://www.w3.org/1999/xhtml"), LocalName::from("div"));
+        let mut parent = tree.document();
+        for _ in 0..depth {
+            let el = tree.new_node(NodeData::Element {
+                name: name.clone(),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            });
+            tree.append_child(parent, el);
+            parent = el;
+        }
+        let leaf = tree.new_node(NodeData::Text { contents: "leaf".to_string() });
+        tree.append_child(parent, leaf);
+        tree
+    }
+
+    // DOM-01: serializing a deeply nested DOM must not overflow the native stack
+    // (which aborts the process). The depth cap turns it into bounded output.
+    #[test]
+    fn deeply_nested_outer_html_does_not_overflow() {
+        let tree = build_deep_tree(50_000);
+        let html = tree.outer_html(tree.document());
+        assert!(!html.is_empty());
+    }
+
+    // DOM-02: text extraction over a deeply nested DOM must not overflow. The
+    // walk is iterative, so it stays correct (finds the deep leaf) AND bounded.
+    #[test]
+    fn deeply_nested_text_content_does_not_overflow() {
+        let tree = build_deep_tree(50_000);
+        let text = tree.text_content(tree.document());
+        assert!(text.contains("leaf"));
+    }
+
+    // DOM-03: importing a deeply nested subtree (the innerHTML setter path) must
+    // not overflow the stack. The iterative import stays bounded.
+    #[test]
+    fn deeply_nested_import_does_not_overflow() {
+        let src = build_deep_tree(50_000);
+        let dest = crate::tree::DomTree::new();
+        let root = dest.document();
+        dest.import_children_from(root, &src, src.document());
+        assert!(dest.len() > 50_000);
+    }
 }

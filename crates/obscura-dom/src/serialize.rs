@@ -1,19 +1,30 @@
 use crate::tree::{DomTree, NodeData, NodeId};
 
+/// Hard cap on serialization recursion depth. The DOM tree depth equals the
+/// HTML nesting depth and html5ever imposes no nesting limit, so a hostile page
+/// (`'<div>'.repeat(200000)`) would otherwise recurse deep enough to overflow
+/// the native stack — a SIGSEGV/abort that the op-layer `catch_unwind` cannot
+/// recover from (audit DOM-01). Beyond this depth serialization stops (the
+/// output is truncated, not aborted). Far deeper than any real page nests.
+const MAX_SERIALIZE_DEPTH: usize = 1000;
+
 impl DomTree {
     pub fn outer_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_node(node_id, true, &mut buf);
+        self.serialize_node(node_id, true, 0, &mut buf);
         buf
     }
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_children(node_id, &mut buf);
+        self.serialize_children(node_id, 0, &mut buf);
         buf
     }
 
-    fn serialize_node(&self, node_id: NodeId, include_self: bool, buf: &mut String) {
+    fn serialize_node(&self, node_id: NodeId, include_self: bool, depth: usize, buf: &mut String) {
+        if depth > MAX_SERIALIZE_DEPTH {
+            return;
+        }
         let node = match self.get_node(node_id) {
             Some(n) => n,
             None => return,
@@ -21,7 +32,7 @@ impl DomTree {
 
         match &node.data {
             NodeData::Document => {
-                self.serialize_children(node_id, buf);
+                self.serialize_children(node_id, depth, buf);
             }
             NodeData::Doctype { name, .. } => {
                 buf.push_str("<!DOCTYPE ");
@@ -45,7 +56,7 @@ impl DomTree {
                 }
 
                 if !is_void_element(tag) {
-                    self.serialize_children(node_id, buf);
+                    self.serialize_children(node_id, depth, buf);
                     if include_self {
                         buf.push_str("</");
                         buf.push_str(tag);
@@ -85,9 +96,12 @@ impl DomTree {
         }
     }
 
-    fn serialize_children(&self, node_id: NodeId, buf: &mut String) {
+    fn serialize_children(&self, node_id: NodeId, depth: usize, buf: &mut String) {
+        if depth > MAX_SERIALIZE_DEPTH {
+            return;
+        }
         for child_id in self.children(node_id) {
-            self.serialize_node(child_id, true, buf);
+            self.serialize_node(child_id, true, depth + 1, buf);
         }
     }
 }
@@ -175,4 +189,5 @@ mod tests {
         assert!(html.contains("<img"));
         assert!(!html.contains("</img>"));
     }
+
 }

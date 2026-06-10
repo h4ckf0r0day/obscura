@@ -138,6 +138,11 @@ pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
 
+/// Hard ceiling on live DOM nodes (gap-3). A hostile page could otherwise build
+/// a multi-million-node tree (or grow one via repeated `innerHTML`) until the
+/// host is OOM-killed. ~10x larger than the largest real-world pages.
+const MAX_NODES: usize = 1_000_000;
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
@@ -176,6 +181,15 @@ impl DomTree {
 
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
+        // gap-3: bound the node arena so a hostile multi-million-node document
+        // (or repeated innerHTML growth) cannot OOM the host. Past the ceiling,
+        // collapse new nodes onto the document — append_child's ancestor guard
+        // makes appending the document a no-op, so the tree is simply truncated
+        // rather than grown without limit. MAX_NODES is ~10x the largest real
+        // pages, so legitimate content is unaffected.
+        if inner.nodes.len() - inner.free_list.len() >= MAX_NODES {
+            return inner.document;
+        }
         let id = if let Some(slot) = inner.free_list.pop() {
             NodeId(slot)
         } else {
@@ -659,20 +673,34 @@ impl DomTree {
     }
 
     fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
-        let node_data = {
-            let source_inner = source.inner.borrow();
-            match source_inner.nodes.get(source_node_id.index()) {
-                Some(Some(node)) => node.data.clone(),
-                _ => return,
+        // Iterative (source node, destination parent) traversal. A recursive
+        // import overflows the native stack when a hostile page does
+        // `el.innerHTML = '<div>'.repeat(200000)` (parse_fragment -> import),
+        // aborting the engine (audit DOM-03). Bounded by the source node count.
+        let max = source.inner.borrow().nodes.len() + 1;
+        let mut stack: Vec<(NodeId, NodeId)> = vec![(source_node_id, parent_id)];
+        let mut imported = 0usize;
+        while let Some((src_id, dest_parent)) = stack.pop() {
+            imported += 1;
+            if imported > max {
+                break;
             }
-        };
+            let node_data = {
+                let source_inner = source.inner.borrow();
+                match source_inner.nodes.get(src_id.index()) {
+                    Some(Some(node)) => node.data.clone(),
+                    _ => continue,
+                }
+            };
 
-        let new_id = self.new_node(node_data);
-        self.append_child(parent_id, new_id);
+            let new_id = self.new_node(node_data);
+            self.append_child(dest_parent, new_id);
 
-        let children = source.children(source_node_id);
-        for child_id in children {
-            self.import_node_from(new_id, source, child_id);
+            // Push children in reverse so they are imported (popped) in order.
+            let children = source.children(src_id);
+            for child_id in children.into_iter().rev() {
+                stack.push((child_id, new_id));
+            }
         }
     }
 
@@ -696,20 +724,45 @@ impl DomTree {
 }
 
 fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
-    if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+    // Iterative DFS in document order. A recursive walk overflows the native
+    // stack on a deeply nested hostile DOM (`'<div>'.repeat(200000)`), aborting
+    // the process — and this runs on paths with no catch_unwind landing pad
+    // (navigation `--dump text`, CDP getOuterHTML) (audit DOM-02). The
+    // node-count bound also stops a cyclic tree.
+    let max = inner.nodes.len() + 1;
+    let mut stack: Vec<NodeId> = vec![node_id];
+    let mut visited = 0usize;
+    while let Some(id) = stack.pop() {
+        visited += 1;
+        if visited > max {
+            break;
+        }
+        let node = match inner.nodes.get(id.index()).and_then(|n| n.as_ref()) {
+            Some(n) => n,
+            None => continue,
+        };
         match &node.data {
             NodeData::Text { contents } => buf.push_str(contents),
-            // Comment and ProcessingInstruction are intentionally NOT
-            // appended when traversing descendants: per spec, textContent
-            // on an Element only includes Text descendants. Direct
-            // textContent on a Comment/PI is handled by the caller.
+            // Comment and ProcessingInstruction are intentionally NOT appended
+            // when traversing descendants: per spec, textContent on an Element
+            // only includes Text descendants. They have no children, so the
+            // generic descent below is a no-op for them. Direct textContent on a
+            // Comment/PI is handled by the caller.
             _ => {
+                // Collect children, then push in reverse so they pop in order.
+                let mut kids = Vec::new();
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
-                    collect_text_inner(inner, child_id, buf);
+                    kids.push(child_id);
+                    if kids.len() > max {
+                        break;
+                    }
                     child = inner.nodes.get(child_id.index())
                         .and_then(|n| n.as_ref())
                         .and_then(|n| n.next_sibling);
+                }
+                for child_id in kids.into_iter().rev() {
+                    stack.push(child_id);
                 }
             }
         }
