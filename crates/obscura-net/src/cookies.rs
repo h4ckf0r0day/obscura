@@ -36,6 +36,7 @@ impl CookieJar {
         };
 
         let mut domain = url.host_str().unwrap_or("").to_lowercase();
+        let mut domain_explicit = false;
         let mut path = url.path().to_string();
         let mut secure = false;
         let mut http_only = false;
@@ -49,6 +50,7 @@ impl CookieJar {
                     match key.trim().to_lowercase().as_str() {
                         "domain" => {
                             domain = val.trim().trim_start_matches('.').to_lowercase();
+                            domain_explicit = true;
                         }
                         "path" => {
                             path = val.trim().to_string();
@@ -84,6 +86,15 @@ impl CookieJar {
                     }
                 }
             }
+        }
+
+        // COOK-01: an explicit Domain= must be one the request host is actually
+        // under, and must not be a public suffix — otherwise a hostile response
+        // could scope a cookie to an unrelated parent/sibling/TLD (cross-site
+        // cookie injection / session fixation).
+        if domain_explicit && !is_cookie_domain_allowed(url.host_str().unwrap_or(""), &domain) {
+            tracing::debug!("Rejected cross-scope cookie '{}' for Domain={}", name, domain);
+            return;
         }
 
         if let Some(exp) = expires {
@@ -245,6 +256,7 @@ impl CookieJar {
         };
 
         let mut domain = url.host_str().unwrap_or("").to_lowercase();
+        let mut domain_explicit = false;
         let mut path = url.path().to_string();
         let mut secure = false;
         let mut expires: Option<u64> = None;
@@ -257,6 +269,7 @@ impl CookieJar {
                     match key.trim().to_lowercase().as_str() {
                         "domain" => {
                             domain = val.trim().trim_start_matches('.').to_lowercase();
+                            domain_explicit = true;
                         }
                         "path" => {
                             path = val.trim().to_string();
@@ -291,6 +304,14 @@ impl CookieJar {
                     }
                 }
             }
+        }
+
+        // COOK-01: page JS (document.cookie) must not scope a cookie to an
+        // unrelated parent/sibling/TLD. Reject an explicit Domain= the document
+        // host is not under, or that is a public suffix.
+        if domain_explicit && !is_cookie_domain_allowed(url.host_str().unwrap_or(""), &domain) {
+            tracing::debug!("Rejected cross-scope JS cookie '{}' for Domain={}", name, domain);
+            return;
         }
 
         if let Some(exp) = expires {
@@ -415,6 +436,14 @@ impl CookieJar {
             path.parent().unwrap_or(std::path::Path::new(".")),
         )?;
         tmp.write_all(json.as_bytes())?;
+        // COOK-06: the jar stores session credentials (including HttpOnly/Secure
+        // values) in cleartext, so restrict the file to the owner. Best-effort
+        // on Windows, which relies on the user-profile ACL instead of mode bits.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600));
+        }
         tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }
@@ -488,6 +517,57 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     days_total += day - 1;
 
     Ok(days_total * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// RFC 6265 domain-match for cookie *storage* validation: true if `host` is
+/// exactly `domain` or a dot-boundary subdomain of it.
+fn host_is_under_domain(host: &str, domain: &str) -> bool {
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    if host.len() <= domain.len() {
+        return false;
+    }
+    let prefix = host.len() - domain.len();
+    host.is_char_boundary(prefix)
+        && host.as_bytes()[prefix - 1] == b'.'
+        && host[prefix..].eq_ignore_ascii_case(domain)
+}
+
+/// Best-effort public-suffix test. A `Domain=` equal to a public suffix would
+/// scope the cookie to EVERY site under it. A full PSL (the `publicsuffix`
+/// crate) is the complete answer; this built-in covers bare TLDs plus the most
+/// common multi-label suffixes without adding a dependency.
+fn is_public_suffix(domain: &str) -> bool {
+    if !domain.contains('.') {
+        return true; // bare TLD / single label: com, localhost, internal, …
+    }
+    const COMMON: &[&str] = &[
+        "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "ltd.uk", "plc.uk",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+        "co.nz", "org.nz", "net.nz", "govt.nz", "ac.nz",
+        "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp", "ed.jp", "gr.jp",
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "com.br", "net.br", "org.br", "gov.br",
+        "com.mx", "com.ar", "com.co", "com.tr", "com.tw", "com.hk", "com.sg", "com.my", "com.ph",
+        "co.in", "net.in", "org.in", "co.za", "co.kr", "co.il", "co.id", "co.th",
+        "github.io", "gitlab.io", "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com",
+        "pages.dev", "workers.dev", "vercel.app", "netlify.app",
+    ];
+    COMMON.iter().any(|s| domain.eq_ignore_ascii_case(s))
+}
+
+/// Validate an explicit `Domain=` attribute against the request host (audit
+/// COOK-01): a page must not be able to scope a cookie to an unrelated parent,
+/// sibling, or TLD — that is cross-site cookie injection / session fixation.
+/// Only applied when a `Domain=` attribute is explicitly present; host-only
+/// cookies (no `Domain=`) are always stored under the exact host.
+fn is_cookie_domain_allowed(host: &str, domain: &str) -> bool {
+    let host = host.trim_start_matches('.');
+    if host.is_empty() || domain.is_empty() {
+        return false;
+    }
+    host_is_under_domain(host, domain) && !is_public_suffix(domain)
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -801,5 +881,52 @@ mod tests {
         let header = jar.get_cookie_header(&url);
         assert!(header.contains("a1=testval"), "Missing a1 in: '{}'", header);
         assert!(header.contains("web_session=sess123"), "Missing web_session in: '{}'", header);
+    }
+
+    // ── COOK-01: Domain= scoping validation ──────────────────────────────────
+
+    #[test]
+    fn cook01_rejects_cross_site_domain_injection() {
+        let jar = CookieJar::new();
+        let evil = Url::parse("https://evil.example/").unwrap();
+        // A page / response on evil.example must not set a cookie for victim.com.
+        jar.set_cookie_from_js("sid=attacker; Domain=victim.com; Path=/", &evil);
+        jar.set_cookie("sid2=attacker; Domain=victim.com", &evil);
+        let victim = Url::parse("https://victim.com/").unwrap();
+        assert!(
+            jar.get_cookie_header(&victim).is_empty(),
+            "cross-site Domain= cookie must be rejected"
+        );
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
+    fn cook01_rejects_public_suffix_domain() {
+        let jar = CookieJar::new();
+        jar.set_cookie_from_js(
+            "a=1; Domain=co.uk",
+            &Url::parse("https://shop.example.co.uk/").unwrap(),
+        );
+        jar.set_cookie_from_js("b=2; Domain=com", &Url::parse("https://evil.com/").unwrap());
+        assert!(
+            jar.get_all_cookies().is_empty(),
+            "public-suffix Domain= cookies must be rejected"
+        );
+    }
+
+    #[test]
+    fn cook01_allows_legitimate_parent_and_host_only() {
+        let jar = CookieJar::new();
+        // Parent domain the host is under: allowed and shared with siblings.
+        jar.set_cookie_from_js(
+            "ok=1; Domain=example.com",
+            &Url::parse("https://www.example.com/").unwrap(),
+        );
+        let api = Url::parse("https://api.example.com/").unwrap();
+        assert!(jar.get_cookie_header(&api).contains("ok=1"));
+        // Host-only cookie (no Domain=) on a single-label host still works.
+        let local = Url::parse("http://localhost:3000/").unwrap();
+        jar.set_cookie_from_js("h=2", &local);
+        assert!(jar.get_cookie_header(&local).contains("h=2"));
     }
 }
