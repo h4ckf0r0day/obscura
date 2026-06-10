@@ -1,0 +1,42 @@
+From 8f00781dd2ce45f9aa79dc95c231e134f4fe2efc Mon Sep 17 00:00:00 2001
+From: charlesmamane26-sketch <charlesmamane1826@gmail.com>
+Date: Wed, 10 Jun 2026 14:48:36 +0200
+Subject: [PATCH 10/11] ci: add stealth (wreq/BoringSSL) build+test job
+
+ci.yml only built the default (non-stealth) path, so the wreq client and the browser stealth wiring were never compiled in CI. Add a Linux job that installs libclang and runs the obscura-net stealth tests + builds the stealth surfaces, validating the stealth SSRF re-validation and Content-Length body cap.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5e06016..5adf802 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -33,6 +33,25 @@ jobs:
+       - name: Test
+         run: cargo test --workspace --locked
+ 
++  stealth:
++    name: Build & test (stealth / wreq)
++    runs-on: ubuntu-22.04
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@stable
++      - uses: Swatinem/rust-cache@v2
++      # boring-sys (BoringSSL) runs bindgen, which needs libclang. Without it the
++      # `--features stealth` build fails — which is why this path was previously
++      # untested (the maintainers' Windows hosts lack libclang). Run it on Linux
++      # so the stealth wreq client (SSRF re-validation, body-size pre-check) and
++      # the browser stealth wiring are actually compiled and exercised.
++      - name: Install libclang (BoringSSL bindgen)
++        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
++      - name: Test obscura-net (stealth)
++        run: cargo test -p obscura-net --features stealth --locked
++      - name: Build stealth surfaces
++        run: cargo build -p obscura-browser --features stealth --locked
++
+   advisories:
+     name: Audit & Deny
+     runs-on: ubuntu-22.04
+-- 
+2.51.0.windows.1
+

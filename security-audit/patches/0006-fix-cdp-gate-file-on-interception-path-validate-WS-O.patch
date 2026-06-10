@@ -1,0 +1,339 @@
+From 124edceaaf2a93f6a3b833e767ed4874f0b3495a Mon Sep 17 00:00:00 2001
+From: charlesmamane26-sketch <charlesmamane1826@gmail.com>
+Date: Wed, 10 Jun 2026 14:13:17 +0200
+Subject: [PATCH 06/11] fix(cdp): gate file:// on interception path, validate
+ WS Origin/Host, safe logs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CDP-01/SSRF-05: the file:// gate lived only in do_navigate, but a normal Puppeteer/Playwright attach routes every Page.navigate through process_with_interception, which navigated with no gate — any CDP client could read arbitrary local files by default. Enforce the gate at that entry too.
+
+CDP-02: the WebSocket handshake did no Origin/Host validation, so a web page in the victim's browser could new WebSocket('ws://127.0.0.1:9222/...') and drive the engine. Inspect the handshake: reject non-allowlisted Origins (OBSCURA_CDP_ALLOWED_ORIGINS) and pin Host to loopback. CDP-04: char-boundary-safe log truncation (a byte slice panicked the task on multi-byte input).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/crates/obscura-cdp/src/server.rs b/crates/obscura-cdp/src/server.rs
+index fd1fd0e..d5b4ed0 100644
+--- a/crates/obscura-cdp/src/server.rs
++++ b/crates/obscura-cdp/src/server.rs
+@@ -174,6 +174,7 @@ pub async fn start_with_full_serve_options(
+             }
+         })?;
+ 
++    let bind_host = host.to_string();
+     let local = tokio::task::LocalSet::new();
+     local
+         .run_until(async {
+@@ -219,8 +220,9 @@ pub async fn start_with_full_serve_options(
+                     }
+                 };
+                 let tx = msg_tx.clone();
++                let bh = bind_host.clone();
+                 tokio::task::spawn_local(async move {
+-                    if let Err(e) = handle_connection_ws(tokio_stream, tx).await {
++                    if let Err(e) = handle_connection_ws(tokio_stream, tx, bh).await {
+                         error!("WebSocket connection error: {}", e);
+                     }
+                 });
+@@ -496,6 +498,27 @@ async fn process_with_interception(
+         }
+     };
+ 
++    // CDP-01 / SSRF-05: the file:// gate (`--allow-file-access`) is enforced in
++    // `do_navigate` (domains/page.rs) and `Target.createTarget`, but after a
++    // normal Puppeteer/Playwright attach the session resolves, so EVERY
++    // `Page.navigate` is routed here — and this spawn path used to call
++    // `navigate_with_wait` with no gate, letting any CDP client read arbitrary
++    // local files by default. Enforce the identical gate here, before any page
++    // state is touched, so the protection cannot be skipped by the routing.
++    let nav_url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
++    if crate::util::url_is_file_scheme(nav_url) && !ctx.default_context.allow_file_access {
++        let resp = crate::types::CdpResponse::error(
++            req.id,
++            -32601,
++            "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string(),
++            req.session_id.clone(),
++        );
++        if let Ok(json) = serde_json::to_string(&resp) {
++            let _ = reply_tx.send(json);
++        }
++        return;
++    }
++
+     tracing::info!("INTERCEPTION navigate: {} (id={})", req.method, req.id);
+ 
+     let session_id = &req.session_id;
+@@ -658,7 +681,7 @@ async fn process_with_interception(
+                     "sessionId": session_for_events,
+                 });
+                 let event_str = event_json.to_string();
+-                tracing::info!("INTERCEPTION event JSON: {}", &event_str[..event_str.len().min(300)]);
++                tracing::info!("INTERCEPTION event JSON: {}", log_truncate(&event_str, 300));
+                 let _ = reply_tx.send(event_str);
+                 intercepted_paused.insert(intercepted.request_id.clone(), intercepted.resolver);
+                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+@@ -770,7 +793,7 @@ async fn process_cdp_message(
+     let req: CdpRequest = match serde_json::from_str(text) {
+         Ok(r) => r,
+         Err(e) => {
+-            warn!("Invalid CDP: {}: {}", e, &text[..text.len().min(200)]);
++            warn!("Invalid CDP: {}: {}", e, log_truncate(&text, 200));
+             return;
+         }
+     };
+@@ -894,9 +917,63 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
+     page.take_pending_navigation()
+ }
+ 
++/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary (CDP-04).
++/// Slicing `&s[..max]` panics when `max` lands inside a multi-byte char, and
++/// these are debug/trace strings built from attacker-controlled CDP payloads —
++/// a panic on the connection task is a remote DoS.
++fn log_truncate(s: &str, max: usize) -> &str {
++    if s.len() <= max {
++        return s;
++    }
++    let mut end = max;
++    while end > 0 && !s.is_char_boundary(end) {
++        end -= 1;
++    }
++    &s[..end]
++}
++
++/// A browser WebSocket handshake carries an Origin; native CDP clients do not.
++/// Allow only origins explicitly listed in `OBSCURA_CDP_ALLOWED_ORIGINS`
++/// (comma-separated). Default (unset) denies every browser-originated handshake.
++fn cdp_origin_allowed(origin: &str) -> bool {
++    match std::env::var("OBSCURA_CDP_ALLOWED_ORIGINS") {
++        Ok(list) => list
++            .split(',')
++            .map(str::trim)
++            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(origin)),
++        Err(_) => false,
++    }
++}
++
++/// Host-header pinning to blunt DNS rebinding: a rebinding attack points an
++/// attacker *domain* at loopback, so a Host that is loopback / the bound host /
++/// an IP literal is accepted while a foreign domain name is rejected.
++fn ws_host_is_safe(host_header: &str, bind_host: &str) -> bool {
++    let h = host_header.trim();
++    let hostname = if let Some(rest) = h.strip_prefix('[') {
++        rest.split(']').next().unwrap_or(rest)
++    } else {
++        h.rsplit_once(':').map(|(a, _)| a).unwrap_or(h)
++    };
++    hostname.eq_ignore_ascii_case("localhost")
++        || hostname.eq_ignore_ascii_case(bind_host)
++        || hostname.parse::<std::net::IpAddr>().is_ok()
++}
++
++fn forbidden_ws(
++    msg: &str,
++) -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
++    use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
++    Response::builder()
++        .status(StatusCode::FORBIDDEN)
++        .body(Some(msg.to_string()))
++        .expect("static forbidden response builds")
++}
++
+ async fn handle_connection_ws(
+     stream: TcpStream,
+     msg_tx: mpsc::UnboundedSender<ServerMessage>,
++    bind_host: String,
+ ) -> anyhow::Result<()> {
+     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
+     // default. CDP traffic is many small (~100-byte) frames, and that buffer
+@@ -907,7 +984,32 @@ async fn handle_connection_ws(
+     let mut cfg = WebSocketConfig::default();
+     cfg.write_buffer_size = 0;
+     cfg.max_write_buffer_size = 1 << 20;
+-    let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
++
++    // CDP-02: validate the handshake headers. The CDP port has no auth, so a web
++    // page the victim visits could otherwise `new WebSocket('ws://127.0.0.1:9222
++    // /devtools/browser')` and drive the full protocol (file read, cookie jar,
++    // engine control). A browser handshake always carries an Origin header;
++    // native CDP clients (Puppeteer/Playwright over ws://) do not. Reject any
++    // Origin not in OBSCURA_CDP_ALLOWED_ORIGINS, and pin the Host to loopback /
++    // the bound host to blunt DNS rebinding.
++    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
++    let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
++        let headers = req.headers();
++        if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
++            if !cdp_origin_allowed(origin) {
++                warn!("CDP WS handshake rejected: Origin '{}' not allowed", origin);
++                return Err(forbidden_ws("origin not allowed"));
++            }
++        }
++        if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
++            if !ws_host_is_safe(host, &bind_host) {
++                warn!("CDP WS handshake rejected: Host '{}' not allowed", host);
++                return Err(forbidden_ws("host not allowed"));
++            }
++        }
++        Ok(resp)
++    };
++    let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(cfg)).await?;
+     info!("WebSocket connected");
+     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+ 
+@@ -917,7 +1019,7 @@ async fn handle_connection_ws(
+         reply_tx: reply_tx.clone(),
+     });
+     if let Some(init_msg) = reply_rx.recv().await {
+-        tracing::debug!("Connection init: {}", &init_msg[..init_msg.len().min(100)]);
++        tracing::debug!("Connection init: {}", log_truncate(&init_msg, 100));
+     }
+ 
+     let send_task = tokio::task::spawn_local(async move {
+diff --git a/crates/obscura-cdp/tests/file_scheme_gate.rs b/crates/obscura-cdp/tests/file_scheme_gate.rs
+new file mode 100644
+index 0000000..bb4ef63
+--- /dev/null
++++ b/crates/obscura-cdp/tests/file_scheme_gate.rs
+@@ -0,0 +1,139 @@
++//! Regression test for CDP-01 / SSRF-05: the file:// navigation gate
++//! (`--allow-file-access`, off by default) must be enforced on the
++//! `Page.navigate` *interception* path, not only in `do_navigate`.
++//!
++//! After a normal attach the session resolves, so `Page.navigate` is routed
++//! through `process_with_interception` (server.rs), which previously called
++//! `navigate_with_wait` with no gate — letting any CDP client read arbitrary
++//! local files with default flags. This test drives that exact path.
++
++use std::time::Duration;
++
++use futures_util::{SinkExt, Stream, StreamExt};
++use serde_json::{json, Value};
++use tokio::net::TcpListener;
++use tokio_tungstenite::{connect_async, tungstenite::Message};
++
++async fn pick_port() -> u16 {
++    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = l.local_addr().unwrap().port();
++    drop(l);
++    port
++}
++
++/// Read websocket messages until one whose `id` matches `want_id`; return it.
++async fn read_response(
++    ws: &mut (impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
++    want_id: u64,
++) -> Result<Value, String> {
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
++    loop {
++        let remaining = deadline
++            .checked_duration_since(tokio::time::Instant::now())
++            .ok_or("timeout waiting for response")?;
++        let msg = tokio::time::timeout(remaining, ws.next())
++            .await
++            .map_err(|_| "timeout".to_string())?
++            .ok_or("ws closed")?
++            .map_err(|e| e.to_string())?;
++        let text = match msg {
++            Message::Text(t) => t.to_string(),
++            _ => continue,
++        };
++        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
++        if v.get("id").and_then(|x| x.as_u64()) == Some(want_id) {
++            return Ok(v);
++        }
++    }
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn page_navigate_file_scheme_rejected_by_default() {
++    let port = pick_port().await;
++    let local = tokio::task::LocalSet::new();
++    local
++        .run_until(async {
++            tokio::task::spawn_local(async move {
++                // start() builds the context with allow_file_access = false.
++                let _ = obscura_cdp::server::start(port).await;
++            });
++            tokio::time::sleep(Duration::from_millis(200)).await;
++
++            let url = format!("ws://127.0.0.1:{}/devtools/browser", port);
++            let (mut ws, _) = connect_async(&url).await.expect("ws connect");
++
++            // createTarget -> auto-attach gives us a sessionId, so the
++            // subsequent Page.navigate resolves the session and is routed
++            // through process_with_interception (the path under test).
++            ws.send(Message::Text(
++                json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}})
++                    .to_string()
++                    .into(),
++            ))
++            .await
++            .unwrap();
++
++            let mut session_id: Option<String> = None;
++            while session_id.is_none() {
++                let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
++                    .await
++                    .expect("timeout for createTarget")
++                    .expect("ws closed")
++                    .expect("ws error");
++                if let Message::Text(t) = msg {
++                    let v: Value = serde_json::from_str(&t).unwrap();
++                    if let Some(s) = v
++                        .get("params")
++                        .and_then(|p| p.get("sessionId"))
++                        .and_then(|s| s.as_str())
++                    {
++                        session_id = Some(s.to_string());
++                    }
++                }
++            }
++            let sid = session_id.unwrap();
++
++            // file:// must be rejected by the gate, before any fs read — so the
++            // error is the gate message on every platform (no "file not found").
++            ws.send(Message::Text(
++                json!({"id": 10, "method": "Page.navigate", "sessionId": sid,
++                       "params": {"url": "file:///etc/passwd"}})
++                    .to_string()
++                    .into(),
++            ))
++            .await
++            .unwrap();
++            let resp = read_response(&mut ws, 10).await.expect("navigate response");
++            let err = resp.get("error");
++            assert!(
++                err.is_some(),
++                "file:// Page.navigate must be rejected on the interception path, got: {resp}"
++            );
++            let msg = err.unwrap().get("message").and_then(|m| m.as_str()).unwrap_or("");
++            assert!(
++                msg.contains("file://") && msg.contains("disabled"),
++                "expected the file:// gate message, got: {msg}"
++            );
++            assert!(
++                resp.get("result").is_none(),
++                "rejected navigate must not return a result: {resp}"
++            );
++
++            // Control: a normal navigate on the SAME session must still succeed,
++            // proving the early-return gate left page state intact.
++            ws.send(Message::Text(
++                json!({"id": 11, "method": "Page.navigate", "sessionId": sid,
++                       "params": {"url": "data:text/html,<html><body><h1>ok</h1></body></html>"}})
++                    .to_string()
++                    .into(),
++            ))
++            .await
++            .unwrap();
++            let ok = read_response(&mut ws, 11).await.expect("control navigate response");
++            assert!(
++                ok.get("result").is_some() && ok.get("error").is_none(),
++                "normal navigate after a rejected file:// must still succeed: {ok}"
++            );
++        })
++        .await;
++}
+-- 
+2.51.0.windows.1
+

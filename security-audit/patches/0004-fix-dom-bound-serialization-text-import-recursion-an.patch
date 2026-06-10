@@ -1,0 +1,287 @@
+From a3d3d511ba328f24bd0bc65bf50ba9adc22acd9e Mon Sep 17 00:00:00 2001
+From: charlesmamane26-sketch <charlesmamane1826@gmail.com>
+Date: Wed, 10 Jun 2026 14:13:16 +0200
+Subject: [PATCH 04/11] fix(dom): bound serialization/text/import recursion and
+ node arena (DoS)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A hostile page ('<div>'.repeat(200000)) could drive unbounded recursion in the HTML serializer, text_content and innerHTML import, overflowing the native stack and aborting the process — uncatchable by the op-layer catch_unwind (DOM-01/02/03, MEM-01, gap-5, AX-01 via aria-labelledby). Cap the serializer depth and make collect_text_inner / import_node_from iterative. Also bound the node arena (gap-3: MAX_NODES = 1M) so a multi-million-node document cannot OOM the host.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/crates/obscura-dom/src/serialize.rs b/crates/obscura-dom/src/serialize.rs
+index 7a489a5..3e8662e 100644
+--- a/crates/obscura-dom/src/serialize.rs
++++ b/crates/obscura-dom/src/serialize.rs
+@@ -1,19 +1,30 @@
+ use crate::tree::{DomTree, NodeData, NodeId};
+ 
++/// Hard cap on serialization recursion depth. The DOM tree depth equals the
++/// HTML nesting depth and html5ever imposes no nesting limit, so a hostile page
++/// (`'<div>'.repeat(200000)`) would otherwise recurse deep enough to overflow
++/// the native stack — a SIGSEGV/abort that the op-layer `catch_unwind` cannot
++/// recover from (audit DOM-01). Beyond this depth serialization stops (the
++/// output is truncated, not aborted). Far deeper than any real page nests.
++const MAX_SERIALIZE_DEPTH: usize = 1000;
++
+ impl DomTree {
+     pub fn outer_html(&self, node_id: NodeId) -> String {
+         let mut buf = String::new();
+-        self.serialize_node(node_id, true, &mut buf);
++        self.serialize_node(node_id, true, 0, &mut buf);
+         buf
+     }
+ 
+     pub fn inner_html(&self, node_id: NodeId) -> String {
+         let mut buf = String::new();
+-        self.serialize_children(node_id, &mut buf);
++        self.serialize_children(node_id, 0, &mut buf);
+         buf
+     }
+ 
+-    fn serialize_node(&self, node_id: NodeId, include_self: bool, buf: &mut String) {
++    fn serialize_node(&self, node_id: NodeId, include_self: bool, depth: usize, buf: &mut String) {
++        if depth > MAX_SERIALIZE_DEPTH {
++            return;
++        }
+         let node = match self.get_node(node_id) {
+             Some(n) => n,
+             None => return,
+@@ -21,7 +32,7 @@ impl DomTree {
+ 
+         match &node.data {
+             NodeData::Document => {
+-                self.serialize_children(node_id, buf);
++                self.serialize_children(node_id, depth, buf);
+             }
+             NodeData::Doctype { name, .. } => {
+                 buf.push_str("<!DOCTYPE ");
+@@ -45,7 +56,7 @@ impl DomTree {
+                 }
+ 
+                 if !is_void_element(tag) {
+-                    self.serialize_children(node_id, buf);
++                    self.serialize_children(node_id, depth, buf);
+                     if include_self {
+                         buf.push_str("</");
+                         buf.push_str(tag);
+@@ -85,9 +96,12 @@ impl DomTree {
+         }
+     }
+ 
+-    fn serialize_children(&self, node_id: NodeId, buf: &mut String) {
++    fn serialize_children(&self, node_id: NodeId, depth: usize, buf: &mut String) {
++        if depth > MAX_SERIALIZE_DEPTH {
++            return;
++        }
+         for child_id in self.children(node_id) {
+-            self.serialize_node(child_id, true, buf);
++            self.serialize_node(child_id, true, depth + 1, buf);
+         }
+     }
+ }
+@@ -175,4 +189,5 @@ mod tests {
+         assert!(html.contains("<img"));
+         assert!(!html.contains("</img>"));
+     }
++
+ }
+diff --git a/crates/obscura-dom/src/tree.rs b/crates/obscura-dom/src/tree.rs
+index 1b2e471..b07c76a 100644
+--- a/crates/obscura-dom/src/tree.rs
++++ b/crates/obscura-dom/src/tree.rs
+@@ -138,6 +138,11 @@ pub struct DomTree {
+     inner: RefCell<DomTreeInner>,
+ }
+ 
++/// Hard ceiling on live DOM nodes (gap-3). A hostile page could otherwise build
++/// a multi-million-node tree (or grow one via repeated `innerHTML`) until the
++/// host is OOM-killed. ~10x larger than the largest real-world pages.
++const MAX_NODES: usize = 1_000_000;
++
+ pub(crate) struct DomTreeInner {
+     pub(crate) nodes: Vec<Option<Node>>,
+     pub(crate) free_list: Vec<u32>,
+@@ -176,6 +181,15 @@ impl DomTree {
+ 
+     pub fn new_node(&self, data: NodeData) -> NodeId {
+         let mut inner = self.inner.borrow_mut();
++        // gap-3: bound the node arena so a hostile multi-million-node document
++        // (or repeated innerHTML growth) cannot OOM the host. Past the ceiling,
++        // collapse new nodes onto the document — append_child's ancestor guard
++        // makes appending the document a no-op, so the tree is simply truncated
++        // rather than grown without limit. MAX_NODES is ~10x the largest real
++        // pages, so legitimate content is unaffected.
++        if inner.nodes.len() - inner.free_list.len() >= MAX_NODES {
++            return inner.document;
++        }
+         let id = if let Some(slot) = inner.free_list.pop() {
+             NodeId(slot)
+         } else {
+@@ -659,20 +673,34 @@ impl DomTree {
+     }
+ 
+     fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
+-        let node_data = {
+-            let source_inner = source.inner.borrow();
+-            match source_inner.nodes.get(source_node_id.index()) {
+-                Some(Some(node)) => node.data.clone(),
+-                _ => return,
++        // Iterative (source node, destination parent) traversal. A recursive
++        // import overflows the native stack when a hostile page does
++        // `el.innerHTML = '<div>'.repeat(200000)` (parse_fragment -> import),
++        // aborting the engine (audit DOM-03). Bounded by the source node count.
++        let max = source.inner.borrow().nodes.len() + 1;
++        let mut stack: Vec<(NodeId, NodeId)> = vec![(source_node_id, parent_id)];
++        let mut imported = 0usize;
++        while let Some((src_id, dest_parent)) = stack.pop() {
++            imported += 1;
++            if imported > max {
++                break;
+             }
+-        };
++            let node_data = {
++                let source_inner = source.inner.borrow();
++                match source_inner.nodes.get(src_id.index()) {
++                    Some(Some(node)) => node.data.clone(),
++                    _ => continue,
++                }
++            };
+ 
+-        let new_id = self.new_node(node_data);
+-        self.append_child(parent_id, new_id);
++            let new_id = self.new_node(node_data);
++            self.append_child(dest_parent, new_id);
+ 
+-        let children = source.children(source_node_id);
+-        for child_id in children {
+-            self.import_node_from(new_id, source, child_id);
++            // Push children in reverse so they are imported (popped) in order.
++            let children = source.children(src_id);
++            for child_id in children.into_iter().rev() {
++                stack.push((child_id, new_id));
++            }
+         }
+     }
+ 
+@@ -696,21 +724,46 @@ impl DomTree {
+ }
+ 
+ fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
+-    if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
++    // Iterative DFS in document order. A recursive walk overflows the native
++    // stack on a deeply nested hostile DOM (`'<div>'.repeat(200000)`), aborting
++    // the process — and this runs on paths with no catch_unwind landing pad
++    // (navigation `--dump text`, CDP getOuterHTML) (audit DOM-02). The
++    // node-count bound also stops a cyclic tree.
++    let max = inner.nodes.len() + 1;
++    let mut stack: Vec<NodeId> = vec![node_id];
++    let mut visited = 0usize;
++    while let Some(id) = stack.pop() {
++        visited += 1;
++        if visited > max {
++            break;
++        }
++        let node = match inner.nodes.get(id.index()).and_then(|n| n.as_ref()) {
++            Some(n) => n,
++            None => continue,
++        };
+         match &node.data {
+             NodeData::Text { contents } => buf.push_str(contents),
+-            // Comment and ProcessingInstruction are intentionally NOT
+-            // appended when traversing descendants: per spec, textContent
+-            // on an Element only includes Text descendants. Direct
+-            // textContent on a Comment/PI is handled by the caller.
++            // Comment and ProcessingInstruction are intentionally NOT appended
++            // when traversing descendants: per spec, textContent on an Element
++            // only includes Text descendants. They have no children, so the
++            // generic descent below is a no-op for them. Direct textContent on a
++            // Comment/PI is handled by the caller.
+             _ => {
++                // Collect children, then push in reverse so they pop in order.
++                let mut kids = Vec::new();
+                 let mut child = node.first_child;
+                 while let Some(child_id) = child {
+-                    collect_text_inner(inner, child_id, buf);
++                    kids.push(child_id);
++                    if kids.len() > max {
++                        break;
++                    }
+                     child = inner.nodes.get(child_id.index())
+                         .and_then(|n| n.as_ref())
+                         .and_then(|n| n.next_sibling);
+                 }
++                for child_id in kids.into_iter().rev() {
++                    stack.push(child_id);
++                }
+             }
+         }
+     }
+diff --git a/crates/obscura-dom/src/tree_sink.rs b/crates/obscura-dom/src/tree_sink.rs
+index 674732f..5cd3ac5 100644
+--- a/crates/obscura-dom/src/tree_sink.rs
++++ b/crates/obscura-dom/src/tree_sink.rs
+@@ -320,4 +320,58 @@ mod tests {
+         assert!(text.contains("Hello"));
+         assert!(text.contains("World"));
+     }
++
++    // Build a `depth`-deep linear element chain with a text leaf, directly via
++    // the DOM API (O(depth)). Parsing such a tree out of HTML would hit
++    // html5ever's super-linear deep-nesting cost; building it lets the DoS tests
++    // reach a depth that genuinely overflows a recursive walk while staying fast.
++    fn build_deep_tree(depth: usize) -> crate::tree::DomTree {
++        use crate::tree::NodeData;
++        use html5ever::{LocalName, Namespace, QualName};
++        let tree = crate::tree::DomTree::new();
++        let name = QualName::new(None, Namespace::from("http://www.w3.org/1999/xhtml"), LocalName::from("div"));
++        let mut parent = tree.document();
++        for _ in 0..depth {
++            let el = tree.new_node(NodeData::Element {
++                name: name.clone(),
++                attrs: vec![],
++                template_contents: None,
++                mathml_annotation_xml_integration_point: false,
++            });
++            tree.append_child(parent, el);
++            parent = el;
++        }
++        let leaf = tree.new_node(NodeData::Text { contents: "leaf".to_string() });
++        tree.append_child(parent, leaf);
++        tree
++    }
++
++    // DOM-01: serializing a deeply nested DOM must not overflow the native stack
++    // (which aborts the process). The depth cap turns it into bounded output.
++    #[test]
++    fn deeply_nested_outer_html_does_not_overflow() {
++        let tree = build_deep_tree(50_000);
++        let html = tree.outer_html(tree.document());
++        assert!(!html.is_empty());
++    }
++
++    // DOM-02: text extraction over a deeply nested DOM must not overflow. The
++    // walk is iterative, so it stays correct (finds the deep leaf) AND bounded.
++    #[test]
++    fn deeply_nested_text_content_does_not_overflow() {
++        let tree = build_deep_tree(50_000);
++        let text = tree.text_content(tree.document());
++        assert!(text.contains("leaf"));
++    }
++
++    // DOM-03: importing a deeply nested subtree (the innerHTML setter path) must
++    // not overflow the stack. The iterative import stays bounded.
++    #[test]
++    fn deeply_nested_import_does_not_overflow() {
++        let src = build_deep_tree(50_000);
++        let dest = crate::tree::DomTree::new();
++        let root = dest.document();
++        dest.import_children_from(root, &src, src.document());
++        assert!(dest.len() > 50_000);
++    }
+ }
+-- 
+2.51.0.windows.1
+

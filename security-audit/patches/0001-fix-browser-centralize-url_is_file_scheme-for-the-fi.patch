@@ -1,0 +1,132 @@
+From 5d03669589d4f321c6ee71f49b583224aaa3eb4a Mon Sep 17 00:00:00 2001
+From: charlesmamane26-sketch <charlesmamane1826@gmail.com>
+Date: Wed, 10 Jun 2026 14:12:53 +0200
+Subject: [PATCH 01/11] fix(browser): centralize url_is_file_scheme for the
+ file:// gate
+
+The file:// scheme detector backing the --allow-file-access gate lived only in obscura-cdp (pub(crate)). Move it into obscura-browser (which owns BrowserContext::allow_file_access) and re-export it from obscura-cdp's util, so the CDP and MCP navigation surfaces enforce the gate on identical logic and cannot drift (GHSA-q55h-vfv9-qcr5).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/crates/obscura-browser/src/lib.rs b/crates/obscura-browser/src/lib.rs
+index 376b816..9217766 100644
+--- a/crates/obscura-browser/src/lib.rs
++++ b/crates/obscura-browser/src/lib.rs
+@@ -2,8 +2,10 @@ pub mod page;
+ pub mod context;
+ pub mod lifecycle;
+ pub mod profiles;
++pub mod url_guard;
+ 
+ pub use page::{NetworkEvent, Page, PageError};
+ pub use context::BrowserContext;
+ pub use lifecycle::{LifecycleState, WaitUntil};
++pub use url_guard::url_is_file_scheme;
+ pub use obscura_js::HTML_TO_MARKDOWN_JS;
+diff --git a/crates/obscura-browser/src/url_guard.rs b/crates/obscura-browser/src/url_guard.rs
+new file mode 100644
+index 0000000..0260d9a
+--- /dev/null
++++ b/crates/obscura-browser/src/url_guard.rs
+@@ -0,0 +1,63 @@
++//! Shared `file:`-scheme detector backing the `--allow-file-access` gate.
++//!
++//! This lives in `obscura-browser` — the crate that owns
++//! [`BrowserContext::allow_file_access`](crate::BrowserContext) — so every
++//! navigation entrypoint gates on the *exact same* logic and none can drift:
++//! CDP `Page.navigate` / `Target.createTarget` (via `obscura-cdp`) and the MCP
++//! `browser_navigate` / `browser_tab_new` tools (via `obscura-mcp`) all call
++//! this one function. Keeping a second copy per crate is how a surface ends up
++//! silently letting `file://` through (see GHSA-q55h-vfv9-qcr5 and its
++//! incomplete-fix variant in `Target.createTarget`).
++
++/// Returns true when `raw` parses as a `file:`-scheme URL, or syntactically
++/// starts with `file:` after a possible leading-whitespace strip. Matching is
++/// case-insensitive on the scheme so neither `FILE://` nor `File://` slips past
++/// callers that gate on `file://`.
++pub fn url_is_file_scheme(raw: &str) -> bool {
++    url::Url::parse(raw)
++        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
++        .unwrap_or_else(|_| raw.trim_start().to_ascii_lowercase().starts_with("file:"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn matches_plain_file_url() {
++        assert!(url_is_file_scheme("file:///etc/passwd"));
++    }
++
++    #[test]
++    fn matches_case_insensitively() {
++        assert!(url_is_file_scheme("FILE:///etc/passwd"));
++        assert!(url_is_file_scheme("File:///etc/passwd"));
++        assert!(url_is_file_scheme("fIlE:///etc/passwd"));
++    }
++
++    #[test]
++    fn matches_with_leading_whitespace_fallback() {
++        // url::Url::parse rejects leading whitespace, but the syntactic
++        // fallback still catches `   file:...` so callers can't be tricked
++        // into letting it through.
++        assert!(url_is_file_scheme("   file:///etc/passwd"));
++    }
++
++    #[test]
++    fn rejects_http_https_about_data() {
++        assert!(!url_is_file_scheme("http://example.com"));
++        assert!(!url_is_file_scheme("https://example.com"));
++        assert!(!url_is_file_scheme("about:blank"));
++        assert!(!url_is_file_scheme("data:text/plain,hi"));
++        assert!(!url_is_file_scheme(""));
++    }
++
++    #[test]
++    fn rejects_lookalikes_that_are_not_file_scheme() {
++        // The URL parser rejects these (no `://`), so the syntactic fallback
++        // kicks in. `file` appearing anywhere except as the leading scheme
++        // must not match.
++        assert!(!url_is_file_scheme("notfile:///x"));
++        assert!(!url_is_file_scheme("http://file/"));
++    }
++}
+diff --git a/crates/obscura-cdp/src/util.rs b/crates/obscura-cdp/src/util.rs
+index 10d940e..8f95c75 100644
+--- a/crates/obscura-cdp/src/util.rs
++++ b/crates/obscura-cdp/src/util.rs
+@@ -1,22 +1,13 @@
+ /// Helpers shared across CDP domain handlers.
+ ///
+-/// The file-scheme detector here is reused by every CDP entrypoint that can
+-/// trigger a navigation, so we don't end up with one domain enforcing the
+-/// `--allow-file-access` gate and another silently letting `file://` through
+-/// (see GHSA-q55h-vfv9-qcr5 and its incomplete-fix variant in
+-/// `Target.createTarget`).
+-
+-/// Returns true when `raw` parses as a `file:`-scheme URL, or syntactically
+-/// starts with `file:` after a possible leading-whitespace strip. Matching is
+-/// case-insensitive on the scheme so neither `FILE://` nor `File://` slips
+-/// past callers that gate on `file://`.
+-pub(crate) fn url_is_file_scheme(raw: &str) -> bool {
+-    url::Url::parse(raw)
+-        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+-        .unwrap_or_else(|_| {
+-            raw.trim_start().to_ascii_lowercase().starts_with("file:")
+-        })
+-}
++/// The file-scheme detector lives in `obscura-browser` (the crate that owns
++/// `BrowserContext::allow_file_access`) so every navigation entrypoint enforces
++/// the `--allow-file-access` gate on identical logic: CDP `Page.navigate` /
++/// `Target.createTarget` here, and the MCP `browser_navigate` /
++/// `browser_tab_new` tools in `obscura-mcp`. Re-exported (not re-implemented) so
++/// the two surfaces can never drift and silently let `file://` through (see
++/// GHSA-q55h-vfv9-qcr5 and its incomplete-fix variant in `Target.createTarget`).
++pub(crate) use obscura_browser::url_is_file_scheme;
+ 
+ #[cfg(test)]
+ mod tests {
+-- 
+2.51.0.windows.1
+

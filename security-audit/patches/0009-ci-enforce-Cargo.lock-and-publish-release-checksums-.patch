@@ -1,0 +1,94 @@
+From 4eab9250323594f79cadb9bfef0b46a333de06c1 Mon Sep 17 00:00:00 2001
+From: charlesmamane26-sketch <charlesmamane1826@gmail.com>
+Date: Wed, 10 Jun 2026 14:13:37 +0200
+Subject: [PATCH 09/11] ci: enforce Cargo.lock and publish release checksums;
+ document hardening
+
+SUPPLY-02: add --locked to CI and release builds so artifacts use the audited dependency set. SUPPLY-01: generate and upload a SHA-256 checksum next to each release archive (the curl|tar install can now be verified). Update SECURITY.md for the CDP/MCP Origin allowlists and Host pinning.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index beae2a4..5e06016 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -25,11 +25,13 @@ jobs:
+       # Informational for now (the tree has pre-existing style lints); tighten
+       # to `-- -D warnings` once they are cleared with `cargo clippy --fix`.
+       - name: Clippy
+-        run: cargo clippy --workspace --all-targets
++        run: cargo clippy --workspace --all-targets --locked
+       # No `--features stealth`: tests don't need the BoringSSL/TLS-impersonation
+       # path, and it keeps CI off the fragile boring-sys build.
++      # `--locked` enforces the committed Cargo.lock (SUPPLY-02): a build must use
++      # the audited dependency set, not silently resolve to newer versions.
+       - name: Test
+-        run: cargo test --workspace
++        run: cargo test --workspace --locked
+ 
+   advisories:
+     name: Audit & Deny
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 8275029..7217115 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -66,10 +66,12 @@ jobs:
+           CARGO_EOF
+ 
+       - name: Build
+-        run: cargo build --release --target ${{ matrix.target }}
++        # --locked: release artifacts must build from the committed, audited
++        # Cargo.lock, never a silently-newer dependency set (SUPPLY-02).
++        run: cargo build --release --locked --target ${{ matrix.target }}
+ 
+       - name: Build stealth
+-        run: cargo build --release --target ${{ matrix.target }} --features stealth
++        run: cargo build --release --locked --target ${{ matrix.target }} --features stealth
+         continue-on-error: true
+ 
+       - name: Package (Unix)
+@@ -86,9 +88,24 @@ jobs:
+           7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+           cd ../../..
+ 
++      # SUPPLY-01: publish a SHA-256 checksum next to each archive so the
++      # `curl | tar` install instructions can be verified before extraction.
++      - name: Checksum (Unix)
++        if: runner.os != 'Windows'
++        run: shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
++
++      - name: Checksum (Windows)
++        if: runner.os == 'Windows'
++        shell: pwsh
++        run: |
++          $h = (Get-FileHash ${{ matrix.name }}.zip -Algorithm SHA256).Hash.ToLower()
++          "$h  ${{ matrix.name }}.zip" | Out-File -Encoding ascii ${{ matrix.name }}.zip.sha256
++
+       - name: Upload
+         uses: softprops/action-gh-release@v2
+         with:
+           files: |
+             ${{ matrix.name }}.tar.gz
++            ${{ matrix.name }}.tar.gz.sha256
+             ${{ matrix.name }}.zip
++            ${{ matrix.name }}.zip.sha256
+diff --git a/SECURITY.md b/SECURITY.md
+index 71cf0d9..6c1fd4d 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -24,7 +24,11 @@ scraped site as adversarial. The trust boundaries that matter:
+   a trusted network.
+ - Do **not** set `OBSCURA_ALLOW_PRIVATE_NETWORK` / `--allow-private-network` in
+   production; it disables the SSRF guard.
+-- If serving MCP over HTTP, set `OBSCURA_MCP_ALLOWED_ORIGINS` to an allow-list.
++- A web page in the victim's browser cannot drive the CDP/MCP HTTP port
++  cross-origin by default: a handshake/request carrying an `Origin` is rejected
++  unless allow-listed, and the `Host` is pinned to loopback to blunt DNS
++  rebinding. Allow specific browser origins via `OBSCURA_CDP_ALLOWED_ORIGINS`
++  (CDP WebSocket) / `OBSCURA_MCP_ALLOWED_ORIGINS` (MCP HTTP).
+ - Restrict permissions on any `--storage-dir` — cookies are persisted in clear
+   text.
+ - Run scraping of unknown targets in an isolated container/user with filtered
+-- 
+2.51.0.windows.1
+

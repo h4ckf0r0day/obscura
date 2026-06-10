@@ -1,0 +1,502 @@
+From f88d61530ab4be77d1ec5c1aaf5e84c57596cb88 Mon Sep 17 00:00:00 2001
+From: charlesmamane26-sketch <charlesmamane1826@gmail.com>
+Date: Wed, 10 Jun 2026 14:13:35 +0200
+Subject: [PATCH 07/11] fix(mcp): file:// gate, Content-Length cap, Origin
+ allowlist + Host pinning
+
+MCP-01: browser_navigate / browser_tab_new called navigate with no file:// gate, so an MCP client (or a web page reaching the HTTP port) could read arbitrary local files via browser_navigate + browser_snapshot. Gate them behind allow_file_access (off by default), threaded through BrowserState; new 'obscura mcp --allow-file-access' opt-in.
+
+MCP-02/03: the HTTP transport allocated vec![0u8; Content-Length] with no cap and emitted Access-Control-Allow-Origin: *. Cap the body (413), reject cross-origin requests whose Origin is not in OBSCURA_MCP_ALLOWED_ORIGINS (403), pin Host to loopback (anti DNS-rebinding), and echo only the validated Origin.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/crates/obscura-cli/tests/mcp_client.rs b/crates/obscura-cli/tests/mcp_client.rs
+index ff1a8d9..fcba17c 100644
+--- a/crates/obscura-cli/tests/mcp_client.rs
++++ b/crates/obscura-cli/tests/mcp_client.rs
+@@ -268,6 +268,47 @@ fn test_navigate_missing_url_returns_error() {
+     assert_eq!(resp["result"]["isError"], true);
+ }
+ 
++// Regression: an MCP client (or a web page reaching the MCP HTTP port) must not
++// be able to read arbitrary local files via browser_navigate + browser_snapshot.
++// Without --allow-file-access (the default, as spawned by McpClient), file://
++// navigation must be rejected by the gate BEFORE any filesystem read — so the
++// error is the gate message, not a "file not found", on every platform.
++#[test]
++fn test_navigate_file_scheme_rejected_by_default() {
++    let mut c = McpClient::spawn();
++    let resp = c.tool("browser_navigate", serde_json::json!({"url": "file:///etc/passwd"}));
++    assert_eq!(
++        resp["result"]["isError"], true,
++        "file:// navigation must be rejected without --allow-file-access: {resp}"
++    );
++    let text = content_text(&resp);
++    assert!(
++        text.contains("file://") && text.contains("disabled"),
++        "expected the file:// gate message, got: {text}"
++    );
++}
++
++// The gate is case-insensitive on the scheme so FILE:// / File:// can't slip past.
++#[test]
++fn test_navigate_file_scheme_rejected_case_insensitive() {
++    let mut c = McpClient::spawn();
++    let resp = c.tool("browser_navigate", serde_json::json!({"url": "FILE:///etc/passwd"}));
++    assert_eq!(resp["result"]["isError"], true, "FILE:// must be rejected: {resp}");
++    assert!(content_text(&resp).contains("disabled"));
++}
++
++// browser_tab_new also takes an attacker-controlled url and must honour the gate.
++#[test]
++fn test_tab_new_file_scheme_rejected_by_default() {
++    let mut c = McpClient::spawn();
++    let resp = c.tool("browser_tab_new", serde_json::json!({"url": "file:///etc/passwd"}));
++    assert_eq!(
++        resp["result"]["isError"], true,
++        "browser_tab_new to file:// must be rejected without --allow-file-access: {resp}"
++    );
++    assert!(content_text(&resp).contains("disabled"));
++}
++
+ #[test]
+ fn test_unknown_tool_returns_error() {
+     let mut c = McpClient::spawn();
+diff --git a/crates/obscura-mcp/src/http.rs b/crates/obscura-mcp/src/http.rs
+index ff6121b..d2cfcf3 100644
+--- a/crates/obscura-mcp/src/http.rs
++++ b/crates/obscura-mcp/src/http.rs
+@@ -5,22 +5,61 @@ use tokio::net::TcpListener;
+ 
+ use crate::{dispatch, BrowserState};
+ 
++/// Cap on a single MCP request body (MCP-02). Without it, an attacker-supplied
++/// `Content-Length` makes the server `vec![0u8; len]` up to `usize::MAX`,
++/// instantly OOM-killing the process. 16 MiB is far above any real JSON-RPC call.
++const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
++
++/// DNS-rebinding defense (MCP-03): the Host header must name loopback, the bound
++/// host, or an IP literal. A rebinding attack points an attacker *domain* at
++/// 127.0.0.1, so rejecting domain-name Hosts (other than the bind host) blunts
++/// it. Empty Host is allowed (HTTP/1.0 / native clients).
++fn header_host_is_safe(host_header: &str, bind_host: &str) -> bool {
++    let h = host_header.trim();
++    let hostname = if let Some(rest) = h.strip_prefix('[') {
++        rest.split(']').next().unwrap_or(rest) // [::1]:port
++    } else {
++        h.rsplit_once(':').map(|(a, _)| a).unwrap_or(h)
++    };
++    hostname.eq_ignore_ascii_case("localhost")
++        || hostname.eq_ignore_ascii_case(bind_host)
++        || hostname.parse::<std::net::IpAddr>().is_ok()
++}
++
++/// Cross-origin defense (MCP-03): a browser page ALWAYS sends an Origin header,
++/// so any Origin that is not explicitly allowlisted is rejected — this is the
++/// A1-page → 127.0.0.1 pivot the threat model calls out. Native clients (curl,
++/// Claude Desktop) send no Origin and are allowed. Allowlist is opt-in via
++/// `OBSCURA_MCP_ALLOWED_ORIGINS` (comma-separated).
++fn origin_allowed(origin: &str) -> bool {
++    if origin.is_empty() {
++        return true;
++    }
++    match std::env::var("OBSCURA_MCP_ALLOWED_ORIGINS") {
++        Ok(list) => list
++            .split(',')
++            .map(str::trim)
++            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(origin)),
++        Err(_) => false,
++    }
++}
++
+ /// MCP Streamable HTTP transport (POST /mcp → JSON response).
+ ///
+ /// Connections are handled sequentially on the current thread — the browser
+ /// session (including the V8 runtime) is single-threaded and `!Send`, so we
+ /// never need to move state across threads.
+-pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
++pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Option<String>, stealth: bool, allow_file_access: bool) -> Result<()> {
+     let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
+     let listener = TcpListener::bind(&addr).await?;
+     tracing::info!("MCP HTTP server on http://{}:{}/mcp", host, port);
+ 
+-    let mut state = BrowserState::new(proxy, user_agent, stealth);
++    let mut state = BrowserState::new(proxy, user_agent, stealth, allow_file_access);
+ 
+     loop {
+         let (stream, peer) = listener.accept().await?;
+         tracing::debug!("MCP HTTP connection from {}", peer);
+-        if let Err(e) = handle_connection(stream, &mut state).await {
++        if let Err(e) = handle_connection(stream, &mut state, &host).await {
+             tracing::debug!("connection closed: {}", e);
+         }
+     }
+@@ -29,6 +68,7 @@ pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Opt
+ async fn handle_connection(
+     stream: tokio::net::TcpStream,
+     state: &mut BrowserState,
++    bind_host: &str,
+ ) -> Result<()> {
+     let (reader, mut writer) = stream.into_split();
+     let mut reader = BufReader::new(reader);
+@@ -55,6 +95,8 @@ async fn handle_connection(
+         let mut content_length: Option<usize> = None;
+         let mut accept_sse = false;
+         let mut keep_alive = false;
++        let mut origin = String::new();
++        let mut host_hdr = String::new();
+ 
+         loop {
+             let mut line = String::new();
+@@ -63,15 +105,20 @@ async fn handle_connection(
+             if trimmed.is_empty() {
+                 break;
+             }
+-            let lower = trimmed.to_lowercase();
+-            if let Some(v) = lower.strip_prefix("content-length: ") {
+-                content_length = v.trim().parse().ok();
+-            }
+-            if lower.contains("text/event-stream") {
+-                accept_sse = true;
+-            }
+-            if lower.starts_with("connection: ") && lower.contains("keep-alive") {
+-                keep_alive = true;
++            if let Some((name, value)) = trimmed.split_once(':') {
++                let value = value.trim();
++                match name.trim().to_ascii_lowercase().as_str() {
++                    "content-length" => content_length = value.parse().ok(),
++                    "origin" => origin = value.to_string(),
++                    "host" => host_hdr = value.to_string(),
++                    "accept" if value.to_ascii_lowercase().contains("text/event-stream") => {
++                        accept_sse = true;
++                    }
++                    "connection" if value.to_ascii_lowercase().contains("keep-alive") => {
++                        keep_alive = true;
++                    }
++                    _ => {}
++                }
+             }
+         }
+ 
+@@ -81,29 +128,63 @@ async fn handle_connection(
+             break;
+         }
+ 
++        // ── security gates (MCP-03) ────────────────────────────────────────────
++        // DNS-rebinding: reject a Host that names an attacker domain.
++        if !host_hdr.is_empty() && !header_host_is_safe(&host_hdr, bind_host) {
++            respond(&mut writer, 403, b"{\"error\":\"forbidden host\"}").await?;
++            break;
++        }
++        // Cross-origin: reject an actual request (POST / SSE GET) from a browser
++        // page whose Origin is not allowlisted. The preflight (OPTIONS) is not
++        // hard-rejected — it simply receives no Access-Control-Allow-Origin, so
++        // the browser blocks the real request itself.
++        let origin_ok = origin_allowed(&origin);
++        if method != "OPTIONS" && !origin_ok {
++            respond(&mut writer, 403, b"{\"error\":\"forbidden origin\"}").await?;
++            break;
++        }
++        // The only value we echo as Access-Control-Allow-Origin: the validated
++        // request Origin, never `*` (empty when the Origin is absent or denied).
++        let acao = if origin_ok && !origin.is_empty() { origin.clone() } else { String::new() };
++
+         match method {
+             "OPTIONS" => {
+                 // mcp-protocol-version is part of the MCP spec, Authorization /
+                 // X-API-Key are common for hosted deployments. Without these
+                 // listed the browser preflight check fails and blocks the actual
+-                // request.
+-                let hdr = "HTTP/1.1 204 No Content\r\n\
+-                    Access-Control-Allow-Origin: *\r\n\
++                // request. ACAO is echoed only for an allowlisted Origin (never
++                // `*`); an unlisted Origin gets no ACAO and the browser blocks.
++                let acao_line = if acao.is_empty() {
++                    String::new()
++                } else {
++                    format!("Access-Control-Allow-Origin: {acao}\r\n")
++                };
++                let hdr = format!(
++                    "HTTP/1.1 204 No Content\r\n\
++                    {acao_line}\
+                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                     Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key, mcp-protocol-version\r\n\
+                     Access-Control-Max-Age: 86400\r\n\
+-                    \r\n";
++                    \r\n"
++                );
+                 writer.write_all(hdr.as_bytes()).await?;
+             }
+ 
+             "GET" if accept_sse => {
+                 // SSE stream: hold open and send periodic keep-alive comments
+-                let hdr = "HTTP/1.1 200 OK\r\n\
++                let acao_line = if acao.is_empty() {
++                    String::new()
++                } else {
++                    format!("Access-Control-Allow-Origin: {acao}\r\n")
++                };
++                let hdr = format!(
++                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/event-stream\r\n\
+                     Cache-Control: no-cache\r\n\
+                     Connection: keep-alive\r\n\
+-                    Access-Control-Allow-Origin: *\r\n\
+-                    \r\n";
++                    {acao_line}\
++                    \r\n"
++                );
+                 writer.write_all(hdr.as_bytes()).await?;
+                 loop {
+                     tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+@@ -117,7 +198,13 @@ async fn handle_connection(
+ 
+             "POST" => {
+                 let len = match content_length {
+-                    Some(n) => n,
++                    // MCP-02: cap the body so a forged Content-Length can't
++                    // allocate an arbitrarily large Vec and OOM the process.
++                    Some(n) if n <= MAX_MCP_BODY => n,
++                    Some(_) => {
++                        respond(&mut writer, 413, b"{\"error\":\"payload too large\"}").await?;
++                        break;
++                    }
+                     None => {
+                         respond(&mut writer, 400, b"{\"error\":\"missing Content-Length\"}").await?;
+                         break;
+@@ -129,7 +216,7 @@ async fn handle_connection(
+ 
+                 let response = process_body(&body, state).await;
+                 let bytes = serde_json::to_vec(&response)?;
+-                respond_json(&mut writer, &bytes).await?;
++                respond_json(&mut writer, &bytes, &acao).await?;
+ 
+                 if !keep_alive {
+                     break;
+@@ -174,12 +261,17 @@ async fn process_one(msg: &Value, state: &mut BrowserState) -> Option<Value> {
+     Some(serde_json::to_value(resp).unwrap())
+ }
+ 
+-async fn respond_json(writer: &mut (impl AsyncWriteExt + Unpin), body: &[u8]) -> Result<()> {
++async fn respond_json(writer: &mut (impl AsyncWriteExt + Unpin), body: &[u8], acao: &str) -> Result<()> {
++    let acao_line = if acao.is_empty() {
++        String::new()
++    } else {
++        format!("Access-Control-Allow-Origin: {acao}\r\n")
++    };
+     let hdr = format!(
+         "HTTP/1.1 200 OK\r\n\
+          Content-Type: application/json\r\n\
+          Content-Length: {}\r\n\
+-         Access-Control-Allow-Origin: *\r\n\
++         {acao_line}\
+          Connection: keep-alive\r\n\
+          \r\n",
+         body.len()
+@@ -193,8 +285,10 @@ async fn respond_json(writer: &mut (impl AsyncWriteExt + Unpin), body: &[u8]) ->
+ async fn respond(writer: &mut (impl AsyncWriteExt + Unpin), status: u16, body: &[u8]) -> Result<()> {
+     let status_text = match status {
+         400 => "Bad Request",
++        403 => "Forbidden",
+         404 => "Not Found",
+         405 => "Method Not Allowed",
++        413 => "Payload Too Large",
+         _ => "OK",
+     };
+     let hdr = format!(
+diff --git a/crates/obscura-mcp/src/lib.rs b/crates/obscura-mcp/src/lib.rs
+index 9543068..146892c 100644
+--- a/crates/obscura-mcp/src/lib.rs
++++ b/crates/obscura-mcp/src/lib.rs
+@@ -9,7 +9,7 @@ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ use anyhow::Result;
+-use obscura_browser::{BrowserContext, Page};
++use obscura_browser::{url_is_file_scheme, BrowserContext, Page};
+ use obscura_dom::NodeId;
+ use serde::{Deserialize, Serialize};
+ use serde_json::{json, Value};
+@@ -78,18 +78,46 @@ pub struct BrowserState {
+ }
+ 
+ impl BrowserState {
+-    pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
++    pub fn new(
++        proxy: Option<String>,
++        user_agent: Option<String>,
++        stealth: bool,
++        allow_file_access: bool,
++    ) -> Self {
++        // The net layer reads any `file://` path unconditionally, so the only
++        // barrier against an MCP client (or a web page that can reach the MCP
++        // port) reading arbitrary local files via
++        // `browser_navigate {url:"file:///etc/passwd"}` + `browser_snapshot`
++        // is this flag, gated in `guard_navigation`. Mirrors the CDP server's
++        // `--allow-file-access` (off by default).
++        let mut context = BrowserContext::with_options("mcp".to_string(), proxy, stealth);
++        context.allow_file_access = allow_file_access;
+         BrowserState {
+             tabs: std::collections::BTreeMap::new(),
+             active_tab: None,
+             tab_counter: 0,
+-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
++            context: Arc::new(context),
+             user_agent,
+             console_messages: Vec::new(),
+             interactive_refs: HashMap::new(),
+         }
+     }
+ 
++    /// Reject navigation to `file://` URLs unless `--allow-file-access` was
++    /// passed. The same gate the CDP server applies in `Page.navigate` and
++    /// `Target.createTarget` (see `obscura-cdp`): without it, anyone who can
++    /// drive the MCP tools can read any file the obscura process can read,
++    /// regardless of transport (stdio or HTTP).
++    fn guard_navigation(&self, url: &str) -> Result<(), String> {
++        if url_is_file_scheme(url) && !self.context.allow_file_access {
++            return Err(
++                "Navigation to file:// is disabled. Restart the MCP server with \
++                 `obscura mcp --allow-file-access` to enable.".to_string()
++            );
++        }
++        Ok(())
++    }
++
+     /// Make sure there is at least one tab and return a &mut to the
+     /// active tab's Page. Auto-creates a default tab if none exist so
+     /// every legacy single-page tool continues to work without
+@@ -170,13 +198,18 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
+     }
+ }
+ 
+-pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
++pub async fn run(
++    proxy: Option<String>,
++    user_agent: Option<String>,
++    stealth: bool,
++    allow_file_access: bool,
++) -> Result<()> {
+     let stdin = tokio::io::stdin();
+     let stdout = tokio::io::stdout();
+     let mut reader = BufReader::new(stdin);
+     let mut writer = stdout;
+ 
+-    let mut state = BrowserState::new(proxy, user_agent, stealth);
++    let mut state = BrowserState::new(proxy, user_agent, stealth, allow_file_access);
+ 
+     loop {
+         // MCP stdio transport: newline-delimited JSON (one message per line)
+@@ -690,6 +723,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
+ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+     let url = args.get("url").and_then(Value::as_str)
+         .ok_or("Missing url parameter")?;
++    state.guard_navigation(url)?;
+     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
+ 
+     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
+@@ -1086,6 +1120,12 @@ fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
+     Ok(())
+ }
+ 
++// tool_back / tool_forward / tool_reload replay URLs already in `page.history`
++// (or the current URL). They need no file:// re-check: the only way a URL enters
++// history is a successful load through `tool_navigate` / `tool_tab_new`, both of
++// which call `guard_navigation`, and a redirect can't reach file:// (the net
++// layer's file:// fast-path is outside its redirect loop, so reqwest rejects
++// such a hop). So the gate is enforced at insertion, not at replay.
+ async fn tool_back(state: &mut BrowserState) -> Result<String, String> {
+     let history_url = state.page_mut().with_dom(|_| ()).map(|_| ());
+     let _ = history_url;
+@@ -1504,6 +1544,9 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
+ 
+ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+     let url = args.get("url").and_then(Value::as_str);
++    if let Some(u) = url {
++        state.guard_navigation(u)?;
++    }
+     let id = state.new_tab();
+     if let Some(u) = url {
+         let ua = state.user_agent.clone();
+diff --git a/crates/obscura-mcp/tests/cors_preflight.rs b/crates/obscura-mcp/tests/cors_preflight.rs
+index b874439..aa1ee7f 100644
+--- a/crates/obscura-mcp/tests/cors_preflight.rs
++++ b/crates/obscura-mcp/tests/cors_preflight.rs
+@@ -27,7 +27,7 @@ async fn options_preflight_lists_required_browser_headers() {
+     // end of the test. `current_thread` + LocalSet is required because the
+     // browser state is `!Send` (Page holds V8 handles).
+     let server = local.spawn_local(async move {
+-        let _ = obscura_mcp::http::run("127.0.0.1".to_string(), port, None, None, false).await;
++        let _ = obscura_mcp::http::run("127.0.0.1".to_string(), port, None, None, false, false).await;
+     });
+ 
+     local.run_until(async {
+@@ -84,3 +84,65 @@ async fn options_preflight_lists_required_browser_headers() {
+     })
+     .await;
+ }
++
++// MCP-02 / MCP-03: the HTTP transport must reject a cross-origin browser POST,
++// an oversized Content-Length, and a DNS-rebinding Host header.
++#[tokio::test(flavor = "current_thread")]
++async fn http_transport_rejects_cross_origin_oversized_and_rebinding() {
++    let port = pick_free_port();
++    let local = LocalSet::new();
++    let server = local.spawn_local(async move {
++        let _ = obscura_mcp::http::run("127.0.0.1".to_string(), port, None, None, false, false).await;
++    });
++
++    local
++        .run_until(async {
++            for _ in 0..40 {
++                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
++                    break;
++                }
++                sleep(Duration::from_millis(50)).await;
++            }
++
++            async fn send(port: u16, req: &[u8]) -> String {
++                let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
++                s.write_all(req).await.unwrap();
++                s.flush().await.unwrap();
++                let mut buf = [0u8; 1024];
++                let n = timeout(Duration::from_secs(2), s.read(&mut buf))
++                    .await
++                    .expect("read timed out")
++                    .expect("read failed");
++                String::from_utf8_lossy(&buf[..n]).to_string()
++            }
++
++            // 1. Cross-origin POST (browser page) -> 403.
++            let r = send(
++                port,
++                b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\n\
++                  Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
++            )
++            .await;
++            assert!(r.starts_with("HTTP/1.1 403"), "cross-origin POST must be 403; got:\n{r}");
++
++            // 2. Oversized Content-Length -> 413 (no body actually sent).
++            let huge = format!(
++                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
++                17 * 1024 * 1024
++            );
++            let r = send(port, huge.as_bytes()).await;
++            assert!(r.starts_with("HTTP/1.1 413"), "oversized body must be 413; got:\n{r}");
++
++            // 3. DNS-rebinding Host (attacker domain) -> 403.
++            let r = send(
++                port,
++                b"POST /mcp HTTP/1.1\r\nHost: attacker.example\r\n\
++                  Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
++            )
++            .await;
++            assert!(r.starts_with("HTTP/1.1 403"), "rebinding Host must be 403; got:\n{r}");
++
++            server.abort();
++        })
++        .await;
++}
+-- 
+2.51.0.windows.1
+
