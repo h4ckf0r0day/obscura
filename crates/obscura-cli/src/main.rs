@@ -169,6 +169,14 @@ enum Command {
 
         #[arg(long)]
         stealth: bool,
+
+        /// Allow MCP clients to navigate to file:// URLs. Off by
+        /// default so an MCP client (or a web page that can reach the
+        /// MCP HTTP port) cannot read arbitrary local files via
+        /// browser_navigate + browser_snapshot. Mirrors `serve
+        /// --allow-file-access`; enable only for trusted local-HTML use.
+        #[arg(long)]
+        allow_file_access: bool,
     },
 
 }
@@ -227,6 +235,19 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
 
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
+}
+
+/// Strip any userinfo from a proxy URL before it is logged (OPS-04):
+/// `socks5://user:pass@host:1080` -> `socks5://***@host:1080`. Proxy
+/// credentials must never reach logs.
+fn redact_proxy(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = &url[scheme_end + 3..];
+        if let Some(at) = after.find('@') {
+            return format!("{}://***@{}", &url[..scheme_end], &after[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
@@ -318,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Storage dir: {}", dir.display());
             }
             if let Some(ref proxy) = proxy {
-                tracing::info!("Using proxy: {}", proxy);
+                tracing::info!("Using proxy: {}", redact_proxy(proxy));
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
@@ -348,18 +369,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
         }
-        Some(Command::Mcp { http, host, port, proxy, user_agent, stealth }) => {
+        Some(Command::Mcp { http, host, port, proxy, user_agent, stealth, allow_file_access }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth, allow_file_access).await?;
             } else {
-                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::run(mcp_proxy, user_agent, stealth, allow_file_access).await?;
             }
         }
         None => {
             print_banner(args.port);
             if let Some(ref proxy) = args.proxy {
-                tracing::info!("Using proxy: {}", proxy);
+                tracing::info!("Using proxy: {}", redact_proxy(proxy));
             }
             obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
         }
