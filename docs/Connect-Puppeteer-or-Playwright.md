@@ -72,12 +72,14 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 
 - `page.goto`, `page.reload`, `page.goBack`, `page.goForward`
 - `page.evaluate`, `page.evaluateHandle`
-- `page.click`, `page.type`, `page.fill`
+- `page.click`, `page.type`, `page.fill`, `page.focus`
 - `page.waitForSelector`, `page.waitForFunction`, `page.waitForNavigation`
 - `page.cookies`, `page.setCookie`, `context.cookies`
 - `page.setRequestInterception`, block / modify
 - `page.exposeFunction`
 - `page.content`, `page.title`, `page.url`
+
+DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
 
 ## Not supported
 

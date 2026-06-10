@@ -61,6 +61,7 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+-q, --quiet                  Suppress info logging
 -v, --verbose                Enable info logging
 ```
 
@@ -95,6 +96,7 @@ Run obscura as an MCP server.
 
 ```
     --http                   HTTP transport instead of stdio
+    --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
     --user-agent <UA>        Override the User-Agent
@@ -102,5 +104,7 @@ Run obscura as an MCP server.
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -v, --verbose                Enable info logging
 ```
+
+`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only; set `0.0.0.0` to bind all interfaces (for example a Docker Compose sidecar) and pair it with `OBSCURA_MCP_ALLOWED_ORIGINS`.
 
 Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).

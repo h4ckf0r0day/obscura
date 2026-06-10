@@ -60,6 +60,31 @@ obscura serve --user-agent "Mozilla/5.0 (...) ..."
 
 Default UA matches a recent Chrome on the build platform.
 
+## Browser profile, timezone, and geolocation
+
+The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), the UA string, and the WebGL/GPU renderer internally consistent, so the surfaces a site fingerprints agree with each other. Windows profiles report ANGLE Direct3D11 renderers, macOS profiles report ANGLE Metal renderers.
+
+A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
+
+```bash
+OBSCURA_PROFILE=2 obscura serve          # pin a specific profile by index
+OBSCURA_ROTATE_PROFILE=1 obscura serve   # random profile per browser context
+```
+
+Timezone is driven by the process zone so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report the same region. Default is `Europe/Berlin`; set it to match the exit IP:
+
+```bash
+OBSCURA_TIMEZONE=America/New_York obscura serve
+```
+
+`navigator.geolocation` reports configurable coordinates. Set them as `lat,lon` and keep them consistent with the timezone and proxy region:
+
+```bash
+OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
+```
+
+Keep these aligned. A rotated or mismatched profile carries no matching TLS or timezone fingerprint, so when you pin a proxy region or TLS fingerprint, leave rotation off and set the timezone and geolocation to the same region. See [Environment variables](Environment-variables.md) for the full list.
+
 ## Combine
 
 ```bash

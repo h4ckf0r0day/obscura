@@ -50,13 +50,13 @@ Use one worker per CPU core. Each worker handles its own pool of pages. Sessions
 
 ## V8 heap
 
-Default V8 heap is 4 GB on 64-bit systems. Override:
+Default V8 heap is 4 GB on 64-bit systems. The defaults also cap the young generation (`--max-semi-space-size=4`) and pass `--optimize-for-size` to hold RSS down. Override:
 
 ```bash
 obscura serve --v8-flags "--max-old-space-size=2048"
 ```
 
-Lower for memory-constrained hosts, raise for heavy SPAs.
+Flags you pass are appended after the defaults, and V8 uses the last value for a repeated flag, so your `--max-old-space-size` wins while the memory-tuning defaults stay in effect. Lower for memory-constrained hosts, raise for heavy SPAs.
 
 ## Parallel scrape
 
@@ -119,6 +119,17 @@ Obscura's CDP server has no built-in auth. Anyone who can reach the port can dri
 - Use Docker network isolation.
 
 Never bind `0.0.0.0` on a public IP without one of the above.
+
+## MCP HTTP transport
+
+`obscura mcp --http` binds `127.0.0.1` by default. To reach it from another container, bind with `--host 0.0.0.0` and set an `Origin` allowlist so a browser page cannot drive it cross-origin:
+
+```bash
+OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
+  obscura mcp --http --host 0.0.0.0 --port 3000
+```
+
+Request bodies are capped at 16 MiB. Like the CDP server it has no built-in auth, so keep it on an internal network or behind an authenticating proxy. See [Use the MCP server](Use-the-MCP-server.md).
 
 ## Observability
 
