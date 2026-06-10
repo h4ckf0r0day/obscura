@@ -24,7 +24,11 @@ scraped site as adversarial. The trust boundaries that matter:
   a trusted network.
 - Do **not** set `OBSCURA_ALLOW_PRIVATE_NETWORK` / `--allow-private-network` in
   production; it disables the SSRF guard.
-- If serving MCP over HTTP, set `OBSCURA_MCP_ALLOWED_ORIGINS` to an allow-list.
+- A web page in the victim's browser cannot drive the CDP/MCP HTTP port
+  cross-origin by default: a handshake/request carrying an `Origin` is rejected
+  unless allow-listed, and the `Host` is pinned to loopback to blunt DNS
+  rebinding. Allow specific browser origins via `OBSCURA_CDP_ALLOWED_ORIGINS`
+  (CDP WebSocket) / `OBSCURA_MCP_ALLOWED_ORIGINS` (MCP HTTP).
 - Restrict permissions on any `--storage-dir` — cookies are persisted in clear
   text.
 - Run scraping of unknown targets in an isolated container/user with filtered

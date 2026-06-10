@@ -25,11 +25,13 @@ jobs:
       # Informational for now (the tree has pre-existing style lints); tighten
       # to `-- -D warnings` once they are cleared with `cargo clippy --fix`.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
       # No `--features stealth`: tests don't need the BoringSSL/TLS-impersonation
       # path, and it keeps CI off the fragile boring-sys build.
+      # `--locked` enforces the committed Cargo.lock (SUPPLY-02): a build must use
+      # the audited dependency set, not silently resolve to newer versions.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   advisories:
     name: Audit & Deny

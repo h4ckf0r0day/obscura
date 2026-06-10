@@ -66,10 +66,12 @@ jobs:
           CARGO_EOF
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        # --locked: release artifacts must build from the committed, audited
+        # Cargo.lock, never a silently-newer dependency set (SUPPLY-02).
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build stealth
-        run: cargo build --release --target ${{ matrix.target }} --features stealth
+        run: cargo build --release --locked --target ${{ matrix.target }} --features stealth
         continue-on-error: true
 
       - name: Package (Unix)
@@ -86,9 +88,24 @@ jobs:
           7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
           cd ../../..
 
+      # SUPPLY-01: publish a SHA-256 checksum next to each archive so the
+      # `curl | tar` install instructions can be verified before extraction.
+      - name: Checksum (Unix)
+        if: runner.os != 'Windows'
+        run: shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+
+      - name: Checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash ${{ matrix.name }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$h  ${{ matrix.name }}.zip" | Out-File -Encoding ascii ${{ matrix.name }}.zip.sha256
+
       - name: Upload
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.tar.gz.sha256
             ${{ matrix.name }}.zip
+            ${{ matrix.name }}.zip.sha256
