@@ -33,6 +33,25 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  stealth:
+    name: Build & test (stealth / wreq)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # boring-sys (BoringSSL) runs bindgen, which needs libclang. Without it the
+      # `--features stealth` build fails — which is why this path was previously
+      # untested (the maintainers' Windows hosts lack libclang). Run it on Linux
+      # so the stealth wreq client (SSRF re-validation, body-size pre-check) and
+      # the browser stealth wiring are actually compiled and exercised.
+      - name: Install libclang (BoringSSL bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Test obscura-net (stealth)
+        run: cargo test -p obscura-net --features stealth --locked
+      - name: Build stealth surfaces
+        run: cargo build -p obscura-browser --features stealth --locked
+
   advisories:
     name: Audit & Deny
     runs-on: ubuntu-22.04
