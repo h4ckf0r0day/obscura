@@ -565,11 +565,11 @@ impl DomTree {
                 // querySelector matches strict descendants of root only, so the
                 // indexed element must have root among its ancestors.
                 Some(nid) if self.ancestors(nid).contains(&root) => return Ok(Some(nid)),
-                // No element has this id at all: a bare id selector cannot match.
-                None => return Ok(None),
-                // Indexed (first) element is not under a scoped root; a later
-                // duplicate could still be a descendant, so fall through to scan.
-                Some(_) => {}
+                // Index miss or stale entry (detached node) — fall through to full scan.
+                // The id_index is best-effort: it only registers nodes at creation time
+                // and does not update on reparent, so it can point to a detached clone
+                // while the live node (with the same id) is elsewhere in the tree.
+                _ => {}
             }
         }
         let selector_list = parse_selector(selector)?;
