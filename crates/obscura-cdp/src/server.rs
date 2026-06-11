@@ -392,7 +392,7 @@ fn emit_intercepted_request(
             frame_id,
             String::new(),
             request_id.clone(),
-            resource_type,
+            resource_type.clone(),
             response_rx,
         );
         if paused_sent {
@@ -844,7 +844,7 @@ async fn process_with_interception(
     let mut page = ctx.pages.remove(page_index);
 
     if let Some(tx) = &ctx.intercept_tx {
-        page.set_intercept_tx(tx.clone());
+        page.set_intercept_tx(tx.clone(), ctx.fetch_intercept.patterns.clone());
     }
 
     let (nav_done_tx, mut nav_done_rx) =
@@ -949,7 +949,7 @@ async fn process_with_interception(
                             body: None,
                         });
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                yield_after_navigation_intercept().await;
             }
             Some(msg) = rx.recv() => {
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
@@ -1129,6 +1129,10 @@ async fn process_with_interception(
     if let Ok(json) = serde_json::to_string(&stop_event) {
         let _ = reply_tx.send(json);
     }
+}
+
+async fn yield_after_navigation_intercept() {
+    tokio::task::yield_now().await;
 }
 
 async fn cleanup_after_all_clients_disconnected(
@@ -1522,6 +1526,7 @@ async fn handle_http_json(stream: TcpStream, port: u16, endpoint: &str) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{Duration, Instant};
     use url::Url;
 
     #[test]
@@ -1700,6 +1705,18 @@ mod tests {
             resolution,
             Some(obscura_js::ops::InterceptResolution::Continue { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn navigation_intercept_yield_does_not_add_fixed_latency() {
+        let started = Instant::now();
+
+        yield_after_navigation_intercept().await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(10),
+            "navigation interception should yield without fixed wall-clock delay"
+        );
     }
 
     #[tokio::test]

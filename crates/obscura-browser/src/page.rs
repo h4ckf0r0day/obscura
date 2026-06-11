@@ -42,6 +42,7 @@ pub struct Page {
     pub device_scale_factor: f64,
     pub user_agent_override: Option<serde_json::Value>,
     pub intercept_enabled: bool,
+    pub intercept_patterns: Vec<String>,
     pub intercept_block_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     #[cfg(feature = "stealth")]
@@ -81,6 +82,7 @@ impl Page {
             device_scale_factor: 2.0,
             user_agent_override: None,
             intercept_enabled: false,
+            intercept_patterns: Vec::new(),
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
             #[cfg(feature = "stealth")]
@@ -189,7 +191,7 @@ impl Page {
 
         if let Some(tx) = &self.intercept_tx {
             if self.intercept_enabled {
-                rt.set_intercept_tx(tx.clone());
+                rt.set_intercept_tx(tx.clone(), self.intercept_patterns.clone());
             } else {
                 rt.set_network_event_tx(tx.clone());
             }
@@ -1077,11 +1079,13 @@ impl Page {
     pub fn set_intercept_tx(
         &mut self,
         tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+        patterns: Vec<String>,
     ) {
         self.intercept_tx = Some(tx.clone());
         self.intercept_enabled = true;
+        self.intercept_patterns = patterns.clone();
         if let Some(js) = &self.js {
-            js.set_intercept_tx(tx);
+            js.set_intercept_tx(tx, patterns);
         }
     }
 

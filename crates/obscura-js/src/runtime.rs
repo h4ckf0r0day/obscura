@@ -15,6 +15,8 @@ use crate::ops::{build_extension, ObscuraState};
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
 const BOOTSTRAP_JS: &str = include_str!("../js/bootstrap.js");
+const AWAIT_PROMISE_POLL_SLICE: tokio::time::Duration = tokio::time::Duration::from_millis(25);
+const AWAIT_PROMISE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
@@ -103,10 +105,12 @@ impl ObscuraJsRuntime {
     pub fn set_intercept_tx(
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>,
+        patterns: Vec<String>,
     ) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
         state.intercept_enabled = true;
+        state.intercept_patterns = patterns;
     }
 
     pub fn set_network_event_tx(
@@ -261,13 +265,25 @@ impl ObscuraJsRuntime {
 
         if await_promise {
             let code = format!(
-                "(async function() {{\n\
+                "globalThis.__obscura_await_slots = globalThis.__obscura_await_slots || {{}};\n\
+                globalThis.__obscura_await_slots['{oid}'] = {{ done: false }};\n\
+                (async function() {{\n\
+                    var __slot = globalThis.__obscura_await_slots['{oid}'];\n\
+                    var __result;\n\
                     {setup}\n\
-                    var __fn = ({fn_decl});\n\
-                    var __this = ({this_expr});\n\
-                    var __result = await __fn.call(__this, {args});\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
-                    globalThis.__obscura_await_meta = {meta_fn};\n\
+                    try {{\n\
+                        var __fn = ({fn_decl});\n\
+                        var __this = ({this_expr});\n\
+                        __result = await __fn.call(__this, {args});\n\
+                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        __slot.meta = {meta_fn};\n\
+                    }} catch (e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = undefined;\n\
+                        __slot.error = String((e && (e.stack || e.message)) || e);\n\
+                        __slot.meta = {meta_fn};\n\
+                    }} finally {{\n\
+                        __slot.done = true;\n\
+                    }}\n\
                 }})()",
                 setup = setup,
                 fn_decl = function_declaration,
@@ -281,7 +297,7 @@ impl ObscuraJsRuntime {
                 .execute_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
-            self.resolve_promises().await;
+            self.wait_for_await_slot(&oid).await?;
 
             if return_by_value {
                 let read = self
@@ -297,7 +313,15 @@ impl ObscuraJsRuntime {
 
             let meta_result = self
                 .runtime
-                .execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_script(
+                    "<readMeta>",
+                    format!(
+                        "globalThis.__obscura_await_slots && \
+                         globalThis.__obscura_await_slots['{oid}'] && \
+                         globalThis.__obscura_await_slots['{oid}'].meta",
+                        oid = oid,
+                    ),
+                )
                 .map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -660,6 +684,43 @@ impl ObscuraJsRuntime {
                 std::time::Duration::from_secs(2),
             )
             .await;
+    }
+
+    async fn wait_for_await_slot(&mut self, oid: &str) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + AWAIT_PROMISE_TIMEOUT;
+
+        loop {
+            self.run_event_loop_slice(AWAIT_PROMISE_POLL_SLICE, std::time::Duration::from_secs(2))
+                .await?;
+
+            if self.await_slot_done(oid)? {
+                return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("Timed out waiting for awaited function {}", oid));
+            }
+        }
+    }
+
+    fn await_slot_done(&mut self, oid: &str) -> Result<bool, String> {
+        let result = self
+            .runtime
+            .execute_script(
+                "<awaitDone>",
+                format!(
+                    "Boolean(globalThis.__obscura_await_slots && \
+                     globalThis.__obscura_await_slots['{oid}'] && \
+                     globalThis.__obscura_await_slots['{oid}'].done)",
+                    oid = oid,
+                ),
+            )
+            .map_err(|e| format!("JS error: {}", e))?;
+
+        Ok(matches!(
+            self.v8_to_json(result)?,
+            serde_json::Value::Bool(true)
+        ))
     }
 
     async fn poll_event_loop_once(&mut self) -> Result<bool, String> {
@@ -1982,6 +2043,26 @@ mod tests {
                 "bytes": [0, 97, 115, 109, 1, 0, 0, 0],
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_call_function_on_awaits_promises_beyond_short_poll_slice() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    await new Promise(resolve => setTimeout(resolve, 150));
+                    return "settled";
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("settled"));
     }
 
     #[tokio::test(flavor = "current_thread")]

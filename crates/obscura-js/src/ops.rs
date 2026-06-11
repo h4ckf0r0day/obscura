@@ -58,6 +58,8 @@ pub struct InterceptedResponse {
     pub encoded_data_length: usize,
 }
 
+const FETCH_INTERCEPT_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub page_id: Option<String>,
@@ -70,6 +72,7 @@ pub struct ObscuraState {
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
+    pub intercept_patterns: Vec<String>,
 }
 
 impl ObscuraState {
@@ -86,6 +89,7 @@ impl ObscuraState {
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
+            intercept_patterns: Vec::new(),
         }
     }
 }
@@ -459,7 +463,8 @@ async fn op_fetch_url(
             gs.intercept_enabled,
             gs.intercept_tx.is_some()
         );
-        let should_pause = gs.intercept_enabled;
+        let should_pause = gs.intercept_enabled
+            && intercept_patterns_should_pause_url(&gs.intercept_patterns, &url);
         let itx = if gs.intercept_tx.is_some() {
             gs.intercept_counter += 1;
             let request_prefix = page_id
@@ -512,7 +517,7 @@ async fn op_fetch_url(
         if tx.send(intercepted).is_ok() {
             response_tx = Some(completion_tx);
             let resolution = if should_pause {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), resolve_rx).await {
+                match tokio::time::timeout(FETCH_INTERCEPT_RESOLUTION_TIMEOUT, resolve_rx).await {
                     Ok(Ok(resolution)) => Some(resolution),
                     Ok(Err(_)) => None,
                     Err(_) => {
@@ -910,19 +915,47 @@ fn is_cors_safelisted_or_browser_header(key: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, url: &str) -> bool {
-    if pattern == "*" {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
         return true;
     }
-    if pattern.starts_with('*') && pattern.ends_with('*') {
-        return url.contains(&pattern[1..pattern.len() - 1]);
+
+    wildcard_match(pattern, url)
+}
+
+fn intercept_patterns_should_pause_url(patterns: &[String], url: &str) -> bool {
+    patterns.is_empty() || patterns.iter().any(|pattern| glob_match(pattern, url))
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star = None;
+    let mut star_text = 0usize;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            star_text = t;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            star_text += 1;
+            t = star_text;
+        } else {
+            return false;
+        }
     }
-    if pattern.starts_with('*') {
-        return url.ends_with(&pattern[1..]);
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
     }
-    if pattern.ends_with('*') {
-        return url.starts_with(&pattern[..pattern.len() - 1]);
-    }
-    url == pattern
+
+    p == pattern.len()
 }
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
@@ -1038,5 +1071,33 @@ pub fn build_extension() -> Extension {
             op_sleep(),
         ]),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intercept_pause_patterns_support_playwright_wildcards() {
+        let patterns = vec!["**/graphql/query**".to_string(), "**/*.mp4**".to_string()];
+
+        assert!(intercept_patterns_should_pause_url(
+            &patterns,
+            "https://www.instagram.com/graphql/query/?variables=abc"
+        ));
+        assert!(intercept_patterns_should_pause_url(
+            &patterns,
+            "https://scontent.example/video.mp4?bytestart=0&byteend=1000"
+        ));
+        assert!(!intercept_patterns_should_pause_url(
+            &patterns,
+            "https://www.instagram.com/ajax/bz?__a=1"
+        ));
+    }
+
+    #[test]
+    fn fetch_intercept_resolution_timeout_preserves_route_handler_window() {
+        assert!(FETCH_INTERCEPT_RESOLUTION_TIMEOUT >= std::time::Duration::from_secs(30));
     }
 }

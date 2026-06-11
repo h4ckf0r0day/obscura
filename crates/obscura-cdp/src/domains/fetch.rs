@@ -129,8 +129,9 @@ pub async fn handle(
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_enabled = true;
+                page.intercept_patterns = patterns.clone();
                 if let Some(tx) = tx_clone {
-                    page.set_intercept_tx(tx);
+                    page.set_intercept_tx(tx, patterns.clone());
                 }
             }
 
@@ -142,6 +143,7 @@ pub async fn handle(
             ctx.fetch_intercept.patterns.clear();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_enabled = false;
+                page.intercept_patterns.clear();
                 page.intercept_block_patterns.clear();
             }
             let paused: Vec<_> = ctx.fetch_intercept.paused.drain().collect();
