@@ -190,6 +190,10 @@ enum DumpFormat {
     /// replay the asset graph with their own HTTP client when they
     /// need the originals alongside the page (cf. issue 124).
     Assets,
+    /// Dump all cookies in the browser jar as a JSON array, including
+    /// HttpOnly cookies that are inaccessible via document.cookie.
+    /// Useful for extracting session tokens set by anti-bot challenges.
+    Cookies,
 }
 
 fn print_banner(port: u16) {
@@ -628,6 +632,7 @@ async fn run_fetch(
         DumpFormat::Links => dump_links(&page),
         DumpFormat::Markdown => dump_markdown(&mut page),
         DumpFormat::Assets => dump_assets(&page),
+        DumpFormat::Cookies => dump_cookies(&page),
         // Handled above via the short-circuit branch; unreachable here.
         DumpFormat::Original => unreachable!("Original dump handled before page navigation"),
     };
@@ -717,6 +722,11 @@ async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+}
+
+fn dump_cookies(page: &Page) -> String {
+    let cookies = page.context.cookie_jar.get_all_cookies();
+    serde_json::to_string_pretty(&cookies).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn dump_html(page: &Page) -> String {
