@@ -950,16 +950,56 @@ fn glob_match(pattern: &str, url: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if pattern.starts_with('*') && pattern.ends_with('*') {
-        return url.contains(&pattern[1..pattern.len() - 1]);
+
+    let mut remainder = url;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+
+        let Some(index) = remainder.find(part) else {
+            return false;
+        };
+
+        if first && !pattern.starts_with('*') && index != 0 {
+            return false;
+        }
+
+        remainder = &remainder[index + part.len()..];
+        first = false;
     }
-    if pattern.starts_with('*') {
-        return url.ends_with(&pattern[1..]);
+
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob_match;
+
+    #[test]
+    fn glob_match_handles_cdp_blocked_url_patterns() {
+        assert!(glob_match(
+            "*://*.google.com/maps/vt/*",
+            "https://www.google.com/maps/vt/pb=!1m4!1m3",
+        ));
+        assert!(glob_match(
+            "*://*.gstatic.com/*.woff2",
+            "https://fonts.gstatic.com/s/inter/v18/font.woff2",
+        ));
+        assert!(glob_match(
+            "https://example.com/assets/*",
+            "https://example.com/assets/app.js",
+        ));
+        assert!(!glob_match(
+            "https://example.com/assets/*",
+            "https://cdn.example.com/assets/app.js",
+        ));
+        assert!(!glob_match(
+            "*://*.gstatic.com/*.woff2",
+            "https://fonts.gstatic.com/s/inter/v18/font.woff",
+        ));
     }
-    if pattern.ends_with('*') {
-        return url.starts_with(&pattern[..pattern.len() - 1]);
-    }
-    url == pattern
 }
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {

@@ -172,6 +172,7 @@ pub struct Page {
     network_event_counter: u32,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
+    pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
@@ -226,6 +227,7 @@ impl Page {
             network_event_counter: 0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
+            blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
             #[cfg(feature = "stealth")]
@@ -234,19 +236,16 @@ impl Page {
     }
 
     fn should_block_url(&self, url: &str) -> bool {
-        if !self.intercept_enabled || self.intercept_block_patterns.is_empty() {
-            return false;
-        }
-        for pattern in &self.intercept_block_patterns {
-            if pattern == "*" { return true; }
-            if pattern.starts_with('*') && pattern.ends_with('*') {
-                if url.contains(&pattern[1..pattern.len()-1]) { return true; }
-            } else if pattern.starts_with('*') {
-                if url.ends_with(&pattern[1..]) { return true; }
-            } else if pattern.ends_with('*') {
-                if url.starts_with(&pattern[..pattern.len()-1]) { return true; }
-            } else if url.contains(pattern) {
+        for pattern in &self.blocked_url_patterns {
+            if url_matches_cdp_pattern(pattern, url) {
                 return true;
+            }
+        }
+        if self.intercept_enabled {
+            for pattern in &self.intercept_block_patterns {
+                if url_matches_cdp_pattern(pattern, url) {
+                    return true;
+                }
             }
         }
         false
@@ -317,6 +316,7 @@ impl Page {
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
+        rt.set_blocked_urls(self.blocked_url_patterns.clone());
 
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
@@ -1353,6 +1353,7 @@ impl Page {
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
+        self.blocked_url_patterns = patterns.clone();
         if let Some(js) = &self.js {
             js.set_blocked_urls(patterns);
         }
@@ -1546,6 +1547,62 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
         }
+    }
+}
+
+fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let mut remainder = url;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+
+        let Some(index) = remainder.find(part) else {
+            return false;
+        };
+
+        if first && !pattern.starts_with('*') && index != 0 {
+            return false;
+        }
+
+        remainder = &remainder[index + part.len()..];
+        first = false;
+    }
+
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_matches_cdp_pattern;
+
+    #[test]
+    fn url_matches_cdp_pattern_handles_wildcards_across_url_parts() {
+        assert!(url_matches_cdp_pattern(
+            "*://*.gstatic.com/*.woff2",
+            "https://fonts.gstatic.com/s/inter/v18/UcCO3FwrK3iLTcviYwYZ8UA3.woff2",
+        ));
+        assert!(url_matches_cdp_pattern(
+            "*://*.google.com/maps/vt/*",
+            "https://www.google.com/maps/vt/pb=!1m4!1m3",
+        ));
+        assert!(url_matches_cdp_pattern(
+            "https://example.com/assets/*",
+            "https://example.com/assets/app.js",
+        ));
+        assert!(!url_matches_cdp_pattern(
+            "https://example.com/assets/*",
+            "https://cdn.example.com/assets/app.js",
+        ));
+        assert!(!url_matches_cdp_pattern(
+            "*://*.gstatic.com/*.woff2",
+            "https://fonts.gstatic.com/s/inter/v18/font.woff",
+        ));
     }
 }
 

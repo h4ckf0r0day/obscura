@@ -96,6 +96,27 @@ pub async fn handle(
         }
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
+        "setBlockedURLs" => {
+            let patterns = params
+                .get("urls")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_blocked_urls(patterns);
+            } else {
+                for page in &mut ctx.pages {
+                    page.set_blocked_urls(patterns.clone());
+                }
+            }
+            Ok(json!({}))
+        }
         "getResponseBody" => {
             let request_id = params
                 .get("requestId")
@@ -222,6 +243,94 @@ mod tests {
             .await
             .expect("clearBrowserCookies must succeed");
         assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_blocked_urls_targets_session_page_without_enabling_interception() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        handle(
+            "setBlockedURLs",
+            &json!({
+                "urls": [
+                    "*://*.example.com/*.png",
+                    "*://cdn.example.com/*"
+                ]
+            }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("setBlockedURLs must succeed for a session page");
+
+        let page = ctx.get_page(&page_id).unwrap();
+        assert_eq!(
+            page.blocked_url_patterns,
+            vec![
+                "*://*.example.com/*.png".to_string(),
+                "*://cdn.example.com/*".to_string(),
+            ]
+        );
+        assert!(!page.intercept_enabled);
+        assert!(page.intercept_block_patterns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_blocked_urls_without_session_updates_existing_pages() {
+        let mut ctx = CdpContext::new();
+        let left = ctx.create_page();
+        let right = ctx.create_page();
+
+        handle(
+            "setBlockedURLs",
+            &json!({ "urls": ["*://tiles.example.test/*"] }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("setBlockedURLs must succeed without a session");
+
+        assert_eq!(
+            ctx.get_page(&left).unwrap().blocked_url_patterns,
+            vec!["*://tiles.example.test/*".to_string()]
+        );
+        assert_eq!(
+            ctx.get_page(&right).unwrap().blocked_url_patterns,
+            vec!["*://tiles.example.test/*".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_blocked_urls_replaces_existing_patterns() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        handle(
+            "setBlockedURLs",
+            &json!({ "urls": ["*://old.example.test/*"] }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+        handle(
+            "setBlockedURLs",
+            &json!({ "urls": ["*://new.example.test/*"] }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ctx.get_page(&page_id).unwrap().blocked_url_patterns,
+            vec!["*://new.example.test/*".to_string()]
+        );
     }
 
     #[tokio::test]
