@@ -2687,6 +2687,54 @@ _markNative(PluginArray.prototype.item);
 _markNative(PluginArray.prototype.namedItem);
 _markNative(PluginArray.prototype.refresh);
 
+// Plugin / MimeType / MimeTypeArray global interfaces. Chrome exposes these as
+// global constructors; their absence threw "ReferenceError: Plugin is not
+// defined" in site bundles that reference them (issue #305). Plain function
+// declarations (no globalThis assignment) so they survive the V8 snapshot, the
+// same pattern PluginArray uses.
+function Plugin(name, filename, description, mimeTypes) {
+  this.name = name;
+  this.filename = filename;
+  this.description = description;
+  var mt = mimeTypes || [];
+  for (var _i = 0; _i < mt.length; _i++) this[_i] = mt[_i];
+  this.length = mt.length;
+}
+Plugin.prototype.item = function(i) { return this[i] || null; };
+Plugin.prototype.namedItem = function(name) {
+  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
+  return null;
+};
+Plugin.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+Object.defineProperty(Plugin.prototype, Symbol.toStringTag, {value: 'Plugin', configurable: true});
+_markNative(Plugin);
+_markNative(Plugin.prototype.item);
+_markNative(Plugin.prototype.namedItem);
+
+function MimeType(type, description, suffixes, plugin) {
+  this.type = type;
+  this.description = description;
+  this.suffixes = suffixes;
+  this.enabledPlugin = plugin || null;
+}
+Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
+_markNative(MimeType);
+
+function MimeTypeArray(items) {
+  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
+  this.length = items.length;
+}
+MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
+MimeTypeArray.prototype.namedItem = function(name) {
+  for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
+  return null;
+};
+MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
+_markNative(MimeTypeArray);
+_markNative(MimeTypeArray.prototype.item);
+_markNative(MimeTypeArray.prototype.namedItem);
+
 class NetworkInformation {
   get downlink() { return 10; }
   get downlinkMax() { return Infinity; }
@@ -2716,23 +2764,19 @@ globalThis.navigator = {
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   get plugins() {
-    const p = new PluginArray([
-      { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
-      { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
-      { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
-      { name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
-      { name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", length: 1, [Symbol.toStringTag]: "Plugin" },
+    return new PluginArray([
+      new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+      new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+      new Plugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+      new Plugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
+      new Plugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format", []),
     ]);
-    return p;
   },
   get mimeTypes() {
-    const m = [
-      { type: "application/pdf", description: "Portable Document Format", suffixes: "pdf", enabledPlugin: null },
-      { type: "text/pdf", description: "Portable Document Format", suffixes: "pdf", enabledPlugin: null },
-    ];
-    m.item = (i) => m[i] || null;
-    m.namedItem = (name) => m.find(x => x.type === name) || null;
-    return m;
+    return new MimeTypeArray([
+      new MimeType("application/pdf", "Portable Document Format", "pdf", null),
+      new MimeType("text/pdf", "Portable Document Format", "pdf", null),
+    ]);
   },
   userAgentData: {
     brands: [
