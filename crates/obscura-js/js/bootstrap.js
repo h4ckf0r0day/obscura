@@ -6376,13 +6376,10 @@ if (!globalThis.crypto) globalThis.crypto = {};
 if (!globalThis.crypto.subtle) {
   globalThis.crypto.subtle = {
     async digest(algorithm, data) {
-      // Real WebCrypto digest. Delegates to `op_subtle_digest` which runs
-      // the actual SHA-1/256/384/512 via Rust's `sha1` and `sha2` crates.
-      // The previous JS implementation was a custom FNV variant that
-      // produced bytes shaped like the hash but with wrong contents, so
-      // SRI checks, JWS signature verification, and OAuth PKCE silently
-      // accepted invalid input.
-      const name = (typeof algorithm === 'string' ? algorithm : algorithm?.name) || 'SHA-256';
+      const name = (typeof algorithm === 'string' ? algorithm : algorithm?.name || '').toUpperCase().replace('_', '-');
+      if (name !== 'SHA-1' && name !== 'SHA-256' && name !== 'SHA-384' && name !== 'SHA-512') {
+        throw new DOMException('Unrecognized algorithm name', 'NotSupportedError');
+      }
       let bytes;
       if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
       else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);

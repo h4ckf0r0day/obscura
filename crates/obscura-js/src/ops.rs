@@ -1107,9 +1107,9 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
 }
 
 /// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
-/// algorithm name (`SHA-1` / `SHA-256` / `SHA-384` / `SHA-512`); unknown
-/// names fall through to SHA-256 to match the previous JS fallback. Returns
-/// the raw digest bytes so the JS shim can hand them back as an ArrayBuffer.
+/// algorithm name (`SHA-1` / `SHA-256` / `SHA-384` / `SHA-512`). The JS shim
+/// validates the name before calling this op; any other value is unreachable.
+/// Returns the raw digest bytes so the JS shim can hand them back as an ArrayBuffer.
 #[op2]
 #[buffer]
 fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8> {
@@ -1120,7 +1120,7 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
         "SHA-256" => sha2::Sha256::digest(data).to_vec(),
         "SHA-384" => sha2::Sha384::digest(data).to_vec(),
         "SHA-512" => sha2::Sha512::digest(data).to_vec(),
-        _ => sha2::Sha256::digest(data).to_vec(),
+        _ => vec![],
     }
 }
 
