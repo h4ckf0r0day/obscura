@@ -2588,7 +2588,12 @@ globalThis.location = {
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
   assign(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
-  reload() {},
+  // reload() previously was a no-op. That broke any page that relies on
+  // `location.reload()` to re-fetch with freshly-set cookies — e.g. AWS WAF
+  // challenge.js has a `setTimeout(() => document.location.reload(), 20000)`
+  // fallback that never fired, so the page sat on the challenge indefinitely.
+  // Now reload triggers a real navigation to the current URL.
+  reload() { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(this.href, 'GET', ''); },
   replace(url) { globalThis.__virtualUrl = null; Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
 };
 const _locationObj = globalThis.location;
@@ -3003,6 +3008,82 @@ function _installWasmStreamingFallback() {
 }
 _installWasmStreamingFallback();
 
+// Serialize a fetch() body to a string, applying the correct Content-Type
+// for typed bodies (FormData, URLSearchParams, Blob, ArrayBuffer, TypedArray).
+// Returns { body: string, contentType: string|null }.
+// Previously the fetch shim did `String(init.body)`, which silently turned
+// FormData into "[object FormData]" and dropped the multipart boundary,
+// causing AWS WAF / similar challenges that POST FormData to fail with
+// "400 Invalid boundary for multipart/form-data".
+function _serializeFetchBody(init) {
+  const body = init.body;
+  if (body == null || body === undefined) return { body: "", contentType: null };
+
+  // FormData → multipart/form-data
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    const boundary = '----ObscuraFormBoundary' +
+      Math.random().toString(36).slice(2) +
+      Date.now().toString(36);
+    let parts = '';
+    for (const [key, value] of body.entries()) {
+      parts += '--' + boundary + '\r\n';
+      // File / Blob fields use filename + content-type
+      if (value && (typeof File !== 'undefined' && value instanceof File) ||
+          (typeof Blob !== 'undefined' && value instanceof Blob)) {
+        const name = (value && value.name) ? value.name : 'blob';
+        const type = (value && value.type) ? value.type : 'application/octet-stream';
+        parts += 'Content-Disposition: form-data; name="' + key + '"; filename="' + name + '"\r\n';
+        parts += 'Content-Type: ' + type + '\r\n\r\n';
+        parts += (typeof value.text === 'function') ? String.fromCharCode.apply(null, _bodyToUint8Array(value)) : String(value);
+        parts += '\r\n';
+      } else {
+        parts += 'Content-Disposition: form-data; name="' + key + '"\r\n\r\n';
+        parts += String(value) + '\r\n';
+      }
+    }
+    parts += '--' + boundary + '--\r\n';
+    return { body: parts, contentType: 'multipart/form-data; boundary=' + boundary };
+  }
+
+  // URLSearchParams → application/x-www-form-urlencoded
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+    return { body: String(body), contentType: 'application/x-www-form-urlencoded;charset=UTF-8' };
+  }
+
+  // Blob → read text content
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    // Synchronous fallback: read what's available as a string.
+    // Real browsers return a Promise from blob.text() but the underlying
+    // op_fetch_url signature is sync (takes a String body), so we accept
+    // the small lossy risk for non-text blobs.
+    let text = '';
+    try { text = String.fromCharCode.apply(null, _bodyToUint8Array(body)); } catch(e) { text = String(body); }
+    return { body: text, contentType: body.type || null };
+  }
+
+  // ArrayBuffer / SharedArrayBuffer
+  if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) {
+    const bytes = new Uint8Array(body);
+    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return { body: s, contentType: null };
+  }
+
+  // TypedArray (Uint8Array, Int8Array, etc.) and DataView
+  if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(body) && body.buffer instanceof ArrayBuffer) {
+    const bytes = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return { body: s, contentType: null };
+  }
+
+  // ReadableStream — not supported. Fall back to empty body.
+  if (body && typeof body.getReader === 'function') {
+    return { body: '', contentType: null };
+  }
+
+  // String / number / anything else
+  return { body: String(body), contentType: null };
+}
+
 globalThis.fetch = async (input, init = {}) => {
   let url = typeof input === "string"
     ? input
@@ -3016,8 +3097,25 @@ globalThis.fetch = async (input, init = {}) => {
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
   const method = init.method || (input instanceof Request ? input.method : "GET");
-  const hdrs = JSON.stringify(init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : init.headers || {});
-  const body = init.body ? String(init.body) : "";
+  // Build headers object, merging any Content-Type that _serializeFetchBody prescribes.
+  let headerMap = {};
+  if (init.headers instanceof Headers) {
+    init.headers.forEach((v, k) => { headerMap[k] = v; });
+  } else if (init.headers && typeof init.headers === 'object') {
+    for (const k of Object.keys(init.headers)) headerMap[k] = String(init.headers[k]);
+  } else if (init.headers && typeof init.headers.forEach === 'function') {
+    init.headers.forEach((v, k) => { headerMap[k] = v; });
+  }
+
+  // Serialize body (handles FormData / Blob / ArrayBuffer / URLSearchParams / string)
+  const { body, contentType: bodyCt } = init.body != null ? _serializeFetchBody(init) : { body: '', contentType: null };
+  if (bodyCt) {
+    // Don't override an explicit Content-Type the caller set.
+    const hasCt = Object.keys(headerMap).some(k => k.toLowerCase() === 'content-type');
+    if (!hasCt) headerMap['Content-Type'] = bodyCt;
+  }
+
+  const hdrs = JSON.stringify(headerMap);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
