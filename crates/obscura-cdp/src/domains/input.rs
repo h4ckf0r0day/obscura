@@ -14,7 +14,7 @@ pub async fn handle(
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let _button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-            let _click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
+            let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
 
             if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
@@ -47,11 +47,21 @@ pub async fn handle(
                                     }} else if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{\
                                         target.checked = !target.checked;\
                                         try {{ target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
+                                    }} else if ({click_count} >= 3 && (tag === 'INPUT' || tag === 'TEXTAREA')) {{\
+                                        // Triple-click selects all text (browser native behavior not replicated
+                                        // by synthetic MouseEvent, so we do it manually).
+                                        var len = target.value ? target.value.length : 0;\
+                                        if (target.setSelectionRange) {{\
+                                            target.setSelectionRange(0, len);\
+                                        }} else {{\
+                                            target.selectionStart = 0;\
+                                            target.selectionEnd = len;\
+                                        }}\
                                     }}\
                                 }}\
                             }}\
                         }})()",
-                        x = x, y = y,
+                        x = x, y = y, click_count = click_count,
                     );
                     page.evaluate(&code);
                     page.process_pending_navigation().await.map_err(|e| e.to_string())?;
