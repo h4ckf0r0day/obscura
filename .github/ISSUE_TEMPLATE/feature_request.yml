@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability or API for obscura
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For larger API proposals, consider opening a Discussion first so the design can be talked through before you build it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that obscura does not support today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      description: Obscura targets web scraping and AI-agent automation, with performance and stability as hard constraints.
+      options:
+        - label: This should not regress performance (obscura's speed and memory footprint are a hard constraint).
+          required: false
+        - label: This is not detection-evasion for abusive purposes.
+          required: false

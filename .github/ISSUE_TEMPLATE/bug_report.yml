@@ -1,0 +1,94 @@
+name: Bug report
+description: Report a problem with obscura
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please fill in the fields below so we can reproduce it quickly.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you start
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I tested against the latest release or `main`.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md, not a public issue).
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: obscura version or commit
+      placeholder: "e.g. v0.1.3 or commit a8358cc"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "e.g. Ubuntu 22.04 x86_64, macOS 15 arm64, Windows 11 x64"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: How are you using obscura?
+      options:
+        - CLI (fetch / serve / scrape / mcp)
+        - CDP server with Puppeteer or Playwright
+        - Embedded Rust library (obscura crate)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: stealth
+    attributes:
+      label: Stealth mode
+      options:
+        - "Off (default build)"
+        - "On (--stealth, default build)"
+        - "On (--stealth, --features stealth build)"
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A URL, an `--eval` snippet, or a short CDP sequence. Multi-statement `--eval` that starts with `const` returns null, so wrap it in an IIFE.
+      placeholder: |
+        obscura fetch https://example.com --eval "(function(){ return document.title; })()"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: chrome
+    attributes:
+      label: Does headless Chrome behave the same?
+      description: Anti-bot, CAPTCHA, and login walls block headless Chrome too from a datacenter IP, so those are not engine bugs.
+      options:
+        - "No: headless Chrome renders or behaves correctly and obscura does not"
+        - "Yes: headless Chrome has the same problem"
+        - "I did not check"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output with `--verbose` if relevant.
+      render: shell
+    validations:
+      required: false
