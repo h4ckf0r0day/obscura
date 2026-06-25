@@ -26,6 +26,11 @@ struct CookieEntry {
     value: String,
     path: String,
     domain: String,
+    /// Cookies set without a Domain attribute are host-only: sent to the exact
+    /// origin host and never to subdomains. `serde(default)` keeps persisted
+    /// cookie files from before this field existed loadable.
+    #[serde(default)]
+    host_only: bool,
     secure: bool,
     http_only: bool,
     expires: Option<u64>,
@@ -47,7 +52,8 @@ impl CookieJar {
             None => return,
         };
 
-        let mut domain = url.host_str().unwrap_or("").to_lowercase();
+        let request_host = url.host_str().unwrap_or("").to_lowercase();
+        let mut domain_attr: Option<String> = None;
         let mut path = url.path().to_string();
         let mut secure = false;
         let mut http_only = false;
@@ -60,7 +66,7 @@ impl CookieJar {
                 if let Some((key, val)) = attr.split_once('=') {
                     match key.trim().to_lowercase().as_str() {
                         "domain" => {
-                            domain = val.trim().trim_start_matches('.').to_lowercase();
+                            domain_attr = Some(val.trim().trim_start_matches('.').to_lowercase());
                         }
                         "path" => {
                             path = val.trim().to_string();
@@ -98,6 +104,14 @@ impl CookieJar {
             }
         }
 
+        // Validate Domain against the response origin (RFC 6265): an unrelated
+        // or public-suffix Domain is ignored so a response from attacker.test
+        // cannot scope a cookie to victim.test (GHSA-f22c-8v6q-v6h6).
+        let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
+            Some(d) => d,
+            None => return,
+        };
+
         if let Some(exp) = expires {
             if exp == 0 {
                 let mut cookies = self.cookies.write().unwrap();
@@ -120,6 +134,7 @@ impl CookieJar {
             value,
             path,
             domain: domain.clone(),
+            host_only,
             secure,
             http_only,
             expires,
@@ -148,6 +163,9 @@ impl CookieJar {
                 continue;
             }
             for entry in domain_cookies.values() {
+                if entry.host_only && !host.eq_ignore_ascii_case(domain) {
+                    continue;
+                }
                 if let Some(exp) = entry.expires {
                     if exp < now {
                         continue;
@@ -200,6 +218,9 @@ impl CookieJar {
                 value: cookie.value,
                 path: cookie.path,
                 domain: cookie.domain.clone(),
+                // CDP/persisted import is trusted; honor the explicit domain as
+                // domain-scoped (matches the prior behavior).
+                host_only: false,
                 secure: cookie.secure,
                 http_only: cookie.http_only,
                 expires,
@@ -227,6 +248,9 @@ impl CookieJar {
                 continue;
             }
             for entry in domain_cookies.values() {
+                if entry.host_only && !host.eq_ignore_ascii_case(domain) {
+                    continue;
+                }
                 if entry.http_only {
                     continue;
                 }
@@ -256,7 +280,8 @@ impl CookieJar {
             None => return,
         };
 
-        let mut domain = url.host_str().unwrap_or("").to_lowercase();
+        let request_host = url.host_str().unwrap_or("").to_lowercase();
+        let mut domain_attr: Option<String> = None;
         let mut path = url.path().to_string();
         let mut secure = false;
         let mut expires: Option<u64> = None;
@@ -268,7 +293,7 @@ impl CookieJar {
                 if let Some((key, val)) = attr.split_once('=') {
                     match key.trim().to_lowercase().as_str() {
                         "domain" => {
-                            domain = val.trim().trim_start_matches('.').to_lowercase();
+                            domain_attr = Some(val.trim().trim_start_matches('.').to_lowercase());
                         }
                         "path" => {
                             path = val.trim().to_string();
@@ -305,6 +330,11 @@ impl CookieJar {
             }
         }
 
+        let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
+            Some(d) => d,
+            None => return,
+        };
+
         if let Some(exp) = expires {
             if exp == 0 {
                 let mut cookies = self.cookies.write().unwrap();
@@ -327,6 +357,7 @@ impl CookieJar {
             value,
             path,
             domain: domain.clone(),
+            host_only,
             secure,
             http_only: false,
             expires,
@@ -500,6 +531,40 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     days_total += day - 1;
 
     Ok(days_total * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Resolve the storage domain and host-only flag for a cookie being set from
+/// `origin_host` (RFC 6265 §5.2/§5.3). With no Domain attribute the cookie is
+/// host-only: scoped to the exact origin host. A Domain attribute is honored
+/// only when it domain-matches the origin (equal to it or a parent domain) and
+/// is not an obvious public suffix; otherwise the attribute is ignored and the
+/// cookie is stored host-only on the origin. This is what stops a response from
+/// attacker.test planting a cookie scoped to victim.test.
+///
+/// Returns None only when the origin host itself is absent (the cookie cannot
+/// be scoped and is dropped).
+///
+/// Note: a full public suffix list is not bundled, so multi-label public
+/// suffixes (co.uk, github.io) are not rejected; the domain-match check still
+/// blocks the reported cross-domain attack, and single-label suffixes (com,
+/// local) are rejected.
+fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option<(String, bool)> {
+    let origin = origin_host.trim().trim_start_matches('.').to_lowercase();
+    if origin.is_empty() {
+        return None;
+    }
+    let dom = match domain_attr {
+        None => return Some((origin, true)),
+        Some(raw) => raw.trim().trim_start_matches('.').to_lowercase(),
+    };
+    if dom.is_empty() || dom == origin {
+        return Some((origin, true));
+    }
+    if dom.contains('.') && origin.ends_with(&format!(".{dom}")) {
+        Some((dom, false))
+    } else {
+        Some((origin, true))
+    }
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -812,5 +877,75 @@ mod tests {
         let header = jar.get_cookie_header(&url);
         assert!(header.contains("a1=testval"), "Missing a1 in: '{}'", header);
         assert!(header.contains("web_session=sess123"), "Missing web_session in: '{}'", header);
+    }
+
+    #[test]
+    fn attacker_response_cannot_set_unrelated_victim_domain_cookie() {
+        // GHSA-f22c-8v6q-v6h6: a response from attacker.test must not be able to
+        // plant a cookie scoped to victim.test.
+        let jar = CookieJar::new();
+        let attacker = Url::parse("http://attacker.test/").unwrap();
+        jar.set_cookie("sid=attacker; Domain=victim.test; Path=/", &attacker);
+
+        let victim = Url::parse("http://victim.test/account").unwrap();
+        assert!(
+            !jar.get_cookie_header(&victim).contains("sid=attacker"),
+            "cross-domain cookie leaked to victim: {}",
+            jar.get_cookie_header(&victim)
+        );
+        // The cookie is stored host-only on the attacker origin instead.
+        assert!(jar.get_cookie_header(&attacker).contains("sid=attacker"));
+    }
+
+    #[test]
+    fn document_cookie_cannot_set_unrelated_victim_domain_cookie() {
+        let jar = CookieJar::new();
+        let attacker = Url::parse("http://attacker.test/").unwrap();
+        jar.set_cookie_from_js("js_sid=attacker; Domain=victim.test; Path=/", &attacker);
+
+        let victim = Url::parse("http://victim.test/account").unwrap();
+        assert!(
+            !jar.get_cookie_header(&victim).contains("js_sid=attacker"),
+            "cross-domain JS cookie leaked to victim: {}",
+            jar.get_cookie_header(&victim)
+        );
+    }
+
+    #[test]
+    fn public_suffix_domain_attribute_is_ignored() {
+        let jar = CookieJar::new();
+        let url = Url::parse("http://www.example.com/").unwrap();
+        jar.set_cookie("bad=1; Domain=com; Path=/", &url);
+        // "com" is a public suffix; the cookie must not be scoped to it.
+        let other = Url::parse("http://other.com/").unwrap();
+        assert!(!jar.get_cookie_header(&other).contains("bad=1"));
+    }
+
+    #[test]
+    fn host_only_cookie_not_sent_to_subdomain() {
+        let jar = CookieJar::new();
+        let www = Url::parse("http://www.example.com/").unwrap();
+        jar.set_cookie("hostonly=1; Path=/", &www); // no Domain attribute -> host-only
+
+        assert!(jar.get_cookie_header(&www).contains("hostonly=1"));
+        let sub = Url::parse("http://sub.www.example.com/").unwrap();
+        assert!(
+            !jar.get_cookie_header(&sub).contains("hostonly=1"),
+            "host-only cookie leaked to subdomain: {}",
+            jar.get_cookie_header(&sub)
+        );
+    }
+
+    #[test]
+    fn valid_subdomain_can_set_parent_domain_cookie() {
+        // A subdomain setting Domain=<parent> (a legitimate parent) still works.
+        let jar = CookieJar::new();
+        let www = Url::parse("http://www.example.com/").unwrap();
+        jar.set_cookie("token=1; Domain=example.com; Path=/", &www);
+
+        let apex = Url::parse("http://example.com/").unwrap();
+        assert!(jar.get_cookie_header(&apex).contains("token=1"));
+        let api = Url::parse("http://api.example.com/").unwrap();
+        assert!(jar.get_cookie_header(&api).contains("token=1"));
     }
 }
