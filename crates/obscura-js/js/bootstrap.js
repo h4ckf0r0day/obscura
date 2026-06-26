@@ -3088,6 +3088,24 @@ function _serializeBody(initBody, headers) {
     }
     return initBody.toString();
   }
+  if (typeof Blob !== 'undefined' && initBody instanceof Blob) {
+    let text = '';
+    try { text = String.fromCharCode.apply(null, _bodyToUint8Array(initBody)); } catch(e) { text = String(initBody); }
+    if (initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = initBody.type;
+    }
+    return text;
+  }
+  if (typeof ArrayBuffer !== 'undefined' && initBody instanceof ArrayBuffer) {
+    const bytes = new Uint8Array(initBody);
+    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+  }
+  if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
+    const bytes = new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
+    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+  }
   return typeof initBody === 'string' ? initBody : String(initBody);
 }
 
