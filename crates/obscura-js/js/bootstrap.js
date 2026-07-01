@@ -481,7 +481,9 @@ class Node {
         try {
           fullUrl = src.startsWith('http') || src.startsWith('data:')
             ? src
-            : new URL(src, baseUrl).href;
+            : src.startsWith('//')
+              ? (new URL(baseUrl).protocol || 'https:') + src
+              : new URL(src, baseUrl).href;
         } catch(e) {
           console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
           fullUrl = src;
