@@ -95,7 +95,9 @@ enum Command {
     },
 
     Fetch {
-        url: String,
+        // Optional so a batch run can pass URLs via --file instead. A single
+        // positional URL keeps the original one-shot behaviour.
+        url: Option<String>,
 
         // Default is html. Kept as Option so we can tell whether --dump was
         // explicitly passed: a bare --eval returns its own value, while --eval
@@ -103,6 +105,19 @@ enum Command {
         // work settle, then reads the page (issue #248).
         #[arg(long)]
         dump: Option<DumpFormat>,
+
+        /// Read newline-delimited URLs from a file (one per line; blank lines
+        /// and lines starting with `#` are skipped). Use `-` for stdin. Enables
+        /// batch mode: every URL is fetched raw (--dump original) and one JSON
+        /// status line is printed per URL. For rendered/DOM batch output use
+        /// `scrape` instead (issue #349).
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+
+        /// Number of URLs fetched concurrently in batch mode. Ignored without
+        /// --file.
+        #[arg(long, default_value_t = std::num::NonZeroUsize::new(1).unwrap())]
+        concurrency: std::num::NonZeroUsize,
 
         #[arg(long)]
         selector: Option<String>,
@@ -344,8 +359,27 @@ async fn main() -> anyhow::Result<()> {
                 ).await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, eval, output, quiet, storage_dir }) => {
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network).await?;
+        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, eval, output, quiet, storage_dir, file, concurrency }) => {
+            if let Some(file) = file {
+                if url.is_some() {
+                    anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
+                }
+                // Batch mode is raw HTTP only. Rendering each URL through the
+                // browser/JS stack is what `scrape` is for.
+                match dump {
+                    None | Some(DumpFormat::Original) => {}
+                    Some(_) => anyhow::bail!(
+                        "batch mode (--file) only supports --dump original. Use `scrape` for rendered/DOM output."
+                    ),
+                }
+                let urls = read_urls_from_file(&file)?;
+                run_batch_fetch(urls, concurrency.get(), timeout, user_agent, global_proxy, output, quiet).await?;
+            } else {
+                let url = url.ok_or_else(|| {
+                    anyhow::anyhow!("No URL provided. Pass a URL, or a list of URLs with --file <path>.")
+                })?;
+                run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir, args.allow_private_network).await?;
+            }
         }
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy, stealth).await?;
@@ -647,12 +681,12 @@ async fn run_fetch(
     Ok(())
 }
 
-async fn fetch_original_bytes(
+async fn fetch_original_response(
     url_str: &str,
     proxy: Option<String>,
     user_agent: Option<String>,
     timeout_secs: u64,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
 
@@ -664,13 +698,156 @@ async fn fetch_original_bytes(
         client.set_user_agent(&ua).await;
     }
 
-    let response = match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
-        Ok(Ok(resp)) => resp,
+    match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+        Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
         Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+    }
+}
+
+async fn fetch_original_bytes(
+    url_str: &str,
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    timeout_secs: u64,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(fetch_original_response(url_str, proxy, user_agent, timeout_secs).await?.body)
+}
+
+/// Read newline-delimited URLs from `path` (or stdin when `path` is `-`).
+/// Blank lines and `#` comments are dropped, and surrounding whitespace is
+/// trimmed so a list copy-pasted with indentation still works.
+fn read_urls_from_file(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let content = if path == std::path::Path::new("-") {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .map_err(|e| anyhow::anyhow!("Failed to read URLs from stdin: {}", e))?;
+        s
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?
     };
 
-    Ok(response.body)
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect())
+}
+
+/// Batch raw fetch: run `--dump original` over many URLs concurrently and print
+/// one JSON status line per URL (issue #349). This is the raw-resource-check
+/// counterpart to `scrape`; it never renders, so there is no browser/JS cost
+/// per URL. Output stays in input order regardless of completion order.
+async fn run_batch_fetch(
+    urls: Vec<String>,
+    concurrency: usize,
+    timeout_secs: u64,
+    user_agent: Option<String>,
+    proxy: Option<String>,
+    output: Option<std::path::PathBuf>,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let total = urls.len();
+    if total == 0 {
+        anyhow::bail!("No URLs to fetch (--file was empty).");
+    }
+
+    if !quiet {
+        eprintln!(
+            "Fetching {} URLs with {} concurrent request(s) (per-fetch timeout: {}s)...",
+            total, concurrency, timeout_secs
+        );
+    }
+
+    let start = Instant::now();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let user_agent = Arc::new(user_agent);
+    let proxy = Arc::new(proxy);
+
+    let mut handles = Vec::with_capacity(total);
+    for (i, url) in urls.into_iter().enumerate() {
+        let sem = semaphore.clone();
+        let user_agent = user_agent.clone();
+        let proxy = proxy.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let task_start = Instant::now();
+            let result =
+                fetch_original_response(&url, (*proxy).clone(), (*user_agent).clone(), timeout_secs)
+                    .await;
+            let elapsed_ms = task_start.elapsed().as_millis();
+
+            let line = match result {
+                Ok(resp) => serde_json::json!({
+                    "url": url,
+                    "ok": (200..400).contains(&resp.status),
+                    "status": resp.status,
+                    "content_type": resp.headers.get("content-type").cloned().unwrap_or_default(),
+                    "bytes": resp.body.len(),
+                    "elapsed_ms": elapsed_ms,
+                }),
+                Err(e) => serde_json::json!({
+                    "url": url,
+                    "ok": false,
+                    "error": e.to_string(),
+                    "elapsed_ms": elapsed_ms,
+                }),
+            };
+            (i, line)
+        }));
+    }
+
+    let mut results: Vec<Option<serde_json::Value>> = vec![None; total];
+    let mut failures = 0usize;
+    for handle in handles {
+        if let Ok((i, line)) = handle.await {
+            if !line["ok"].as_bool().unwrap_or(false) {
+                failures += 1;
+            }
+            results[i] = Some(line);
+        } else {
+            failures += 1;
+        }
+    }
+
+    let mut out = String::new();
+    for line in results.into_iter().flatten() {
+        out.push_str(&serde_json::to_string(&line).unwrap_or_default());
+        out.push('\n');
+    }
+
+    if let Some(path) = output {
+        tokio::fs::write(&path, out.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    } else {
+        let mut stdout = tokio::io::stdout();
+        stdout
+            .write_all(out.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to write to stdout: {}", e))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush stdout: {}", e))?;
+    }
+
+    if !quiet {
+        eprintln!(
+            "Done: {} URLs in {:.1}s ({} ok, {} failed).",
+            total,
+            start.elapsed().as_secs_f64(),
+            total - failures,
+            failures
+        );
+    }
+
+    Ok(())
 }
 
 async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
@@ -1206,7 +1383,7 @@ mod tests {
     use super::{
         effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
         is_quiet_command, link_kind_from_rel, merge_proxy, normalize_v8_flags,
-        resolve_asset_url, select_log_filter, write_or_print,
+        read_urls_from_file, resolve_asset_url, select_log_filter, write_or_print,
         write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
@@ -1238,6 +1415,61 @@ mod tests {
             }
             _ => panic!("expected Fetch command"),
         }
+    }
+
+    // Issue #349 — batch mode: `fetch --file urls.txt --dump original
+    // --concurrency N` with no positional URL.
+    #[test]
+    fn parsed_fetch_file_and_concurrency() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "fetch",
+            "--file",
+            "urls.txt",
+            "--dump",
+            "original",
+            "--concurrency",
+            "25",
+        ])
+        .expect("clap should accept --file with --concurrency and no positional URL");
+        match args.command {
+            Some(Command::Fetch { url, file, concurrency, dump, .. }) => {
+                assert!(url.is_none());
+                assert_eq!(file, Some(std::path::PathBuf::from("urls.txt")));
+                assert_eq!(concurrency.get(), 25);
+                assert_eq!(dump, Some(DumpFormat::Original));
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn concurrency_rejects_zero() {
+        // NonZeroUsize means --concurrency 0 is a parse error, not a silent hang
+        // on a zero-permit semaphore.
+        let err = Args::try_parse_from(["obscura", "fetch", "--file", "u.txt", "--concurrency", "0"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn read_urls_skips_blanks_and_comments() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("obscura_urls_{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "https://a.example/one.js\n\n  # a comment\n   https://b.example/two.css  \nhttps://c.example/three.json\n",
+        )
+        .unwrap();
+        let urls = read_urls_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.example/one.js".to_string(),
+                "https://b.example/two.css".to_string(),
+                "https://c.example/three.json".to_string(),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1496,9 +1728,11 @@ mod tests {
     #[test]
     fn matcher_still_uses_fetch_variant() {
         let cmd = Some(Command::Fetch {
-            url: "https://x".to_string(),
+            url: Some("https://x".to_string()),
             dump: Some(super::DumpFormat::Html),
             selector: None,
+            file: None,
+            concurrency: std::num::NonZeroUsize::new(1).unwrap(),
             wait: 5,
             timeout: 30,
             wait_until: "load".to_string(),
