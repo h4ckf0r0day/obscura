@@ -14,12 +14,12 @@ fn insert_text_js(escaped_text: &str) -> String {
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
             if (s == null) {{\
-                t.value = v + '{text}';\
+                globalThis.__obscura_setFieldValue(t, 'value', v + '{text}');\
             }} else {{\
                 s = Math.max(0, Math.min(s, v.length));\
                 e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
                 var lo = Math.min(s, e), hi = Math.max(s, e);\
-                t.value = v.slice(0, lo) + '{text}' + v.slice(hi);\
+                globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + '{text}' + v.slice(hi));\
                 var caret = lo + ('{text}').length;\
                 t.setSelectionRange(caret, caret);\
             }}\
@@ -39,16 +39,16 @@ const BACKSPACE_JS: &str = "(function() {\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
     if (s == null) {\
-        t.value = v.slice(0, -1);\
+        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, -1));\
     } else {\
         s = Math.max(0, Math.min(s, v.length));\
         e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
         if (s !== e) {\
             var lo = Math.min(s, e), hi = Math.max(s, e);\
-            t.value = v.slice(0, lo) + v.slice(hi);\
+            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + v.slice(hi));\
             t.setSelectionRange(lo, lo);\
         } else if (s > 0) {\
-            t.value = v.slice(0, s - 1) + v.slice(s);\
+            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, s - 1) + v.slice(s));\
             t.setSelectionRange(s - 1, s - 1);\
         }\
     }\
@@ -173,7 +173,7 @@ pub async fn handle(
                                 if (!target) return;\
                                 target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
                                 if (target.localName === 'textarea') {\
-                                    target.value = (target.value || '') + '\\n';\
+                                    globalThis.__obscura_setFieldValue(target, 'value', (target.value || '') + '\\n');\
                                     target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
                                     var form = target.form || (target.closest && target.closest('form'));\

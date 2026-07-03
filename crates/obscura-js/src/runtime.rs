@@ -1801,6 +1801,72 @@ mod tests {
         assert_eq!(checked2, serde_json::json!(false));
     }
 
+    // Issue #324: React/Preact/Vue install a value tracker by redefining `value`
+    // on the element instance so they can tell a real edit from their own
+    // controlled write. __obscura_setFieldValue must write through the prototype
+    // setter, leaving that per-instance tracker stale, so the following input
+    // event reads as a genuine change and onChange fires. A plain assignment
+    // keeps the tracker in sync and suppresses onChange.
+    #[test]
+    fn set_field_value_bypasses_instance_value_wrapper() {
+        let mut rt = setup_runtime(r#"<input id="i">"#);
+        let result = rt
+            .evaluate(
+                r#"
+                (function(){
+                    var el = document.getElementById('i');
+                    var d = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value');
+                    var set = d.set, get = d.get, tracked = '' + el.value;
+                    Object.defineProperty(el, 'value', {
+                        configurable: true,
+                        get: function(){ return get.call(this); },
+                        set: function(v){ tracked = '' + v; set.call(this, v); },
+                    });
+                    el.value = 'wrapped';
+                    var afterDirect = { value: el.value, tracked: tracked };
+                    globalThis.__obscura_setFieldValue(el, 'value', 'native');
+                    var afterHelper = { value: el.value, tracked: tracked };
+                    return JSON.stringify({ afterDirect: afterDirect, afterHelper: afterHelper });
+                })()
+                "#,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        // Direct assignment keeps tracker == value (the change that suppresses onChange).
+        assert_eq!(parsed["afterDirect"]["value"], "wrapped");
+        assert_eq!(parsed["afterDirect"]["tracked"], "wrapped");
+        // The helper updates the value but leaves the tracker stale, so onChange fires.
+        assert_eq!(parsed["afterHelper"]["value"], "native");
+        assert_eq!(parsed["afterHelper"]["tracked"], "wrapped");
+    }
+
+    // Issue #324: React feature-detects the modern input-event path with
+    // `('oninput' in document)`. If the GlobalEventHandlers on* attributes are
+    // only on window (not Document/Element), that check fails and React falls
+    // back to a legacy change-detection path, so controlled-input onChange never
+    // fires. These must be present on document and Element.prototype too.
+    #[test]
+    fn global_event_handlers_present_on_document_and_element() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"JSON.stringify({
+                    docInput: ('oninput' in document),
+                    docChange: ('onchange' in document),
+                    docClick: ('onclick' in document),
+                    elProtoInput: ('oninput' in Element.prototype),
+                    winInput: ('oninput' in window)
+                })"#,
+            )
+            .unwrap();
+        let p: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(p["docInput"], true);
+        assert_eq!(p["docChange"], true);
+        assert_eq!(p["docClick"], true);
+        assert_eq!(p["elProtoInput"], true);
+        assert_eq!(p["winInput"], true);
+    }
+
     #[test]
     fn test_matches_and_closest() {
         let mut rt = setup_runtime(r#"<div class="outer"><div class="inner"><span id="target">Hi</span></div></div>"#);

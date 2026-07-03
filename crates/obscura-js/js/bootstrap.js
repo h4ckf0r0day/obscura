@@ -2646,10 +2646,14 @@ globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
 
-// HTML spec exposes on* event handler IDL attributes on Window. Libraries like
-// jQuery feature-detect bubbling via `("on" + ev) in window` and fall back to
-// a legacy IE path that crashes on missing DOM APIs when the check returns
-// false. Initialising them to null makes the check match real browsers.
+// HTML spec exposes on* event handler IDL attributes via the GlobalEventHandlers
+// mixin on Window, Document, and HTMLElement. Libraries feature-detect the modern
+// event path through these: jQuery checks `("on" + ev) in window`, and React
+// decides whether the `input` event is supported via `("oninput" in document)`.
+// When that check fails React falls back to a legacy change-detection path that
+// never fires onChange for controlled inputs (issue #324). Initialising these to
+// null on all three targets makes the checks match real browsers. On Document and
+// Element they are non-enumerable so they don't surface in `for..in` over nodes.
 for (const _ev of [
   "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
   "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
@@ -2665,7 +2669,13 @@ for (const _ev of [
   "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
   "unload","volumechange","waiting","wheel",
 ]) {
-  if (!(("on" + _ev) in globalThis)) globalThis["on" + _ev] = null;
+  const _on = "on" + _ev;
+  if (!(_on in globalThis)) globalThis[_on] = null;
+  for (const _proto of [Document.prototype, Element.prototype]) {
+    if (!(_on in _proto)) {
+      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
+    }
+  }
 }
 
 globalThis.Window = globalThis.Window || function Window() {};
@@ -4286,6 +4296,27 @@ globalThis.DOMException = (function () {
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
 globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+
+// Write value/checked through the element's *prototype* accessor, skipping any
+// per-instance property a framework layered on top. React (and Preact/Vue)
+// install a value tracker by redefining `value`/`checked` on the element to
+// record the last value they wrote; a plain `el.value = x` runs that wrapper,
+// so their tracker updates in lockstep and the next input/change event looks
+// unchanged, so onChange never fires (issue #324). Writing through the
+// prototype setter leaves the tracker stale, so the edit is seen as a real
+// user change. When no framework wrapper is present this is identical to a
+// direct assignment.
+globalThis.__obscura_setFieldValue = function(el, field, value) {
+  try {
+    let proto = Object.getPrototypeOf(el);
+    let desc;
+    while (proto && !((desc = Object.getOwnPropertyDescriptor(proto, field)) && desc.set)) {
+      proto = Object.getPrototypeOf(proto);
+    }
+    if (desc && desc.set) { desc.set.call(el, value); return; }
+  } catch (_e) {}
+  el[field] = value;
+};
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return _trustedEvents.has(this); }
