@@ -6944,12 +6944,40 @@ if (typeof DOMMatrix === 'undefined') {
 }
 
 if (typeof Image === 'undefined') {
-  globalThis.Image = class Image {
-    constructor(w, h) { this.width = w || 0; this.height = h || 0; this.src = ''; this.onload = null; this.onerror = null; this.complete = false; this.naturalWidth = 0; this.naturalHeight = 0; }
-    addEventListener() {} removeEventListener() {}
-    setAttribute(k, v) { this[k] = v; if (k === 'src' && this.onload) setTimeout(() => { this.complete = true; this.onload(); }, 0); }
-    getAttribute(k) { return this[k]; }
+  // In a real browser `new Image()` is `document.createElement('img')`, i.e. a
+  // full HTMLImageElement. The old plain-class shim had no `.style`, so
+  // `new Image().style` was `undefined` and libraries that touch it on a
+  // detached image threw (issue #350). Build a real element so `.style`,
+  // attribute reflection, and event dispatch all come for free.
+  const _imgSrcDesc = Object.getOwnPropertyDescriptor(globalThis.HTMLImageElement.prototype, 'src');
+  globalThis.Image = function Image(width, height) {
+    const img = document.createElement('img');
+    img.onload = null; img.onerror = null;
+    img.complete = false; img.naturalWidth = 0; img.naturalHeight = 0;
+    img.width = width !== undefined ? (width >>> 0) : 0;
+    img.height = height !== undefined ? (height >>> 0) : 0;
+    // There is no real image decoder, so emulate a successful decode: assigning
+    // `.src` flips `complete` and fires `load` on a microtask-later tick. Lazy
+    // loaders and preloaders that create `new Image()`, set `.src`, and wait for
+    // `onload` (or addEventListener('load')) would hang forever otherwise.
+    Object.defineProperty(img, 'src', {
+      configurable: true, enumerable: true,
+      get() { return _imgSrcDesc.get.call(img); },
+      set(v) {
+        _imgSrcDesc.set.call(img, v);
+        if (!img.getAttribute('src')) return;
+        img.complete = false;
+        setTimeout(function () {
+          img.complete = true;
+          img.naturalWidth = img.naturalWidth || img.width || 0;
+          img.naturalHeight = img.naturalHeight || img.height || 0;
+          try { img.dispatchEvent(new Event('load')); } catch (e) {}
+        }, 0);
+      },
+    });
+    return img;
   };
+  globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
 }
 
 if (typeof Audio === 'undefined') {
