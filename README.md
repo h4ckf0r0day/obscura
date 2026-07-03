@@ -469,6 +469,10 @@ Optional flags (both transports):
 | `browser_console_messages` | Return console messages logged by the page |
 | `browser_close` | Close the page and reset browser state |
 
+## Integrations
+
+- **[Hermes agent plugin](https://github.com/SGavrl/hermes-plugin-obscura)**: run [Hermes](https://github.com/NousResearch/hermes-agent) agent browser tasks on Obscura. The plugin spawns `obscura serve` per session (or connects to an already running server) and drives it over CDP, with optional `--stealth`.
+
 ## License
 
 Apache 2.0
