@@ -350,13 +350,95 @@ class MessageChannel {
 globalThis.MessageChannel = MessageChannel;
 globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
 
+const _cssCamelToKebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+const _cssKebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+// Standard CSS property names (camelCase). Real CSSStyleDeclaration exposes every
+// property as an enumerable accessor, so feature-detection code (`'gap' in
+// el.style`) and enumeration (`Object.keys(el.style)`) see the whole set, not
+// just the ones that happen to be assigned (issue #356).
+const _CSS_PROPERTY_NAMES = [
+  "accentColor","alignContent","alignItems","alignSelf","all","animation","animationDelay",
+  "animationDirection","animationDuration","animationFillMode","animationIterationCount",
+  "animationName","animationPlayState","animationTimingFunction","appearance","aspectRatio",
+  "backdropFilter","backfaceVisibility","background","backgroundAttachment","backgroundBlendMode",
+  "backgroundClip","backgroundColor","backgroundImage","backgroundOrigin","backgroundPosition",
+  "backgroundPositionX","backgroundPositionY","backgroundRepeat","backgroundSize","blockSize",
+  "border","borderBlock","borderBlockColor","borderBlockEnd","borderBlockEndColor","borderBlockEndStyle",
+  "borderBlockEndWidth","borderBlockStart","borderBlockStartColor","borderBlockStartStyle",
+  "borderBlockStartWidth","borderBlockStyle","borderBlockWidth","borderBottom","borderBottomColor",
+  "borderBottomLeftRadius","borderBottomRightRadius","borderBottomStyle","borderBottomWidth",
+  "borderCollapse","borderColor","borderImage","borderImageOutset","borderImageRepeat",
+  "borderImageSlice","borderImageSource","borderImageWidth","borderInline","borderInlineColor",
+  "borderInlineEnd","borderInlineEndColor","borderInlineEndStyle","borderInlineEndWidth",
+  "borderInlineStart","borderInlineStartColor","borderInlineStartStyle","borderInlineStartWidth",
+  "borderInlineStyle","borderInlineWidth","borderLeft","borderLeftColor","borderLeftStyle",
+  "borderLeftWidth","borderRadius","borderRight","borderRightColor","borderRightStyle",
+  "borderRightWidth","borderSpacing","borderStyle","borderTop","borderTopColor","borderTopLeftRadius",
+  "borderTopRightRadius","borderTopStyle","borderTopWidth","borderWidth","bottom","boxShadow",
+  "boxSizing","breakAfter","breakBefore","breakInside","captionSide","caretColor","clear","clip",
+  "clipPath","color","colorScheme","columnCount","columnFill","columnGap","columnRule","columnRuleColor",
+  "columnRuleStyle","columnRuleWidth","columnSpan","columnWidth","columns","contain","container",
+  "containerName","containerType","content","counterIncrement","counterReset","counterSet","cssFloat",
+  "cursor","direction","display","emptyCells","filter","flex","flexBasis","flexDirection","flexFlow",
+  "flexGrow","flexShrink","flexWrap","float","font","fontFamily","fontFeatureSettings","fontKerning",
+  "fontOpticalSizing","fontSize","fontSizeAdjust","fontStretch","fontStyle","fontVariant",
+  "fontVariantCaps","fontVariantLigatures","fontVariantNumeric","fontWeight","gap","grid","gridArea",
+  "gridAutoColumns","gridAutoFlow","gridAutoRows","gridColumn","gridColumnEnd","gridColumnGap",
+  "gridColumnStart","gridGap","gridRow","gridRowEnd","gridRowGap","gridRowStart","gridTemplate",
+  "gridTemplateAreas","gridTemplateColumns","gridTemplateRows","height","hyphens","imageRendering",
+  "inlineSize","inset","insetBlock","insetBlockEnd","insetBlockStart","insetInline","insetInlineEnd",
+  "insetInlineStart","isolation","justifyContent","justifyItems","justifySelf","left","letterSpacing",
+  "lineBreak","lineHeight","listStyle","listStyleImage","listStylePosition","listStyleType","margin",
+  "marginBlock","marginBlockEnd","marginBlockStart","marginBottom","marginInline","marginInlineEnd",
+  "marginInlineStart","marginLeft","marginRight","marginTop","mask","maxBlockSize","maxHeight",
+  "maxInlineSize","maxWidth","minBlockSize","minHeight","minInlineSize","minWidth","mixBlendMode",
+  "objectFit","objectPosition","offset","opacity","order","outline","outlineColor","outlineOffset",
+  "outlineStyle","outlineWidth","overflow","overflowAnchor","overflowWrap","overflowX","overflowY",
+  "overscrollBehavior","overscrollBehaviorBlock","overscrollBehaviorInline","overscrollBehaviorX",
+  "overscrollBehaviorY","padding","paddingBlock","paddingBlockEnd","paddingBlockStart","paddingBottom",
+  "paddingInline","paddingInlineEnd","paddingInlineStart","paddingLeft","paddingRight","paddingTop",
+  "pageBreakAfter","pageBreakBefore","pageBreakInside","perspective","perspectiveOrigin","placeContent",
+  "placeItems","placeSelf","pointerEvents","position","quotes","resize","right","rotate","rowGap",
+  "scale","scrollBehavior","scrollMargin","scrollPadding","scrollSnapAlign","scrollSnapStop",
+  "scrollSnapType","tabSize","tableLayout","textAlign","textAlignLast","textCombineUpright",
+  "textDecoration","textDecorationColor","textDecorationLine","textDecorationSkipInk",
+  "textDecorationStyle","textDecorationThickness","textEmphasis","textIndent","textJustify",
+  "textOrientation","textOverflow","textRendering","textShadow","textTransform","textUnderlineOffset",
+  "textUnderlinePosition","top","touchAction","transform","transformBox","transformOrigin",
+  "transformStyle","transition","transitionDelay","transitionDuration","transitionProperty",
+  "transitionTimingFunction","translate","unicodeBidi","userSelect","verticalAlign","visibility",
+  "whiteSpace","width","willChange","wordBreak","wordSpacing","wordWrap","writingMode","zIndex","zoom",
+];
+const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
+
 class CSSStyleDeclaration {
-  constructor() { this._props = {}; }
-  setProperty(name, value) { this._props[name] = String(value); }
-  removeProperty(name) { const old = this._props[name]; delete this._props[name]; return old || ""; }
-  getPropertyValue(name) { return this._props[name] || ""; }
-  get cssText() { return Object.entries(this._props).map(([k,v]) => `${k}: ${v}`).join("; "); }
-  set cssText(v) { this._props = {}; if(v) v.split(";").forEach(p => { const [k,...rest]=p.split(":"); if(k&&rest.length) this._props[k.trim()]=rest.join(":").trim(); }); }
+  constructor() {
+    // Non-enumerable so it never leaks through the proxy's own-key traps.
+    Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+  }
+  // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
+  // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
+  // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  setProperty(name, value) {
+    const k = _cssCamelToKebab(String(name));
+    if (value === "" || value == null) { delete this._props[k]; return; }
+    this._props[k] = String(value);
+  }
+  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; return old || ""; }
+  getPropertyValue(name) { return this._props[_cssCamelToKebab(String(name))] || ""; }
+  getPropertyPriority() { return ""; }
+  get cssText() {
+    const e = Object.entries(this._props);
+    return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
+  }
+  set cssText(v) {
+    for (const k in this._props) delete this._props[k];
+    if (v) String(v).split(";").forEach((p) => {
+      const i = p.indexOf(":");
+      if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
+    });
+  }
   get length() { return Object.keys(this._props).length; }
   item(i) { return Object.keys(this._props)[i] || ""; }
 }
@@ -364,13 +446,40 @@ class CSSStyleDeclaration {
 const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
-    if (typeof p === "string") return t._props[p] || "";
-    return undefined;
+    if (/^\d+$/.test(p)) return t.item(+p);
+    return t.getPropertyValue(p);
   },
   set(t, p, v) {
-    if (typeof p === "string") { t._props[p] = String(v); return true; }
-    t[p] = v; return true;
-  }
+    if (typeof p === "symbol") { t[p] = v; return true; }
+    if (p === "cssText") { t.cssText = v; return true; }
+    if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
+    t.setProperty(p, v);
+    return true;
+  },
+  has(t, p) {
+    if (typeof p !== "string") return Reflect.has(t, p);
+    if (p in Object.getPrototypeOf(t)) return true;
+    if (_cssCamelToKebab(p) in t._props) return true;
+    if (_CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) return true;
+    return /^\d+$/.test(p) && +p < t.length;
+  },
+  ownKeys(t) {
+    const keys = [];
+    const n = t.length;
+    for (let i = 0; i < n; i++) keys.push(String(i));
+    const names = new Set(_CSS_PROPERTY_NAMES);
+    for (const k of Object.keys(t._props)) names.add(_cssKebabToCamel(k));
+    for (const name of names) keys.push(name);
+    return keys;
+  },
+  getOwnPropertyDescriptor(t, p) {
+    if (typeof p !== "string") return Reflect.getOwnPropertyDescriptor(t, p);
+    if (/^\d+$/.test(p) && +p < t.length) return { value: t.item(+p), writable: false, enumerable: true, configurable: true };
+    if (_cssCamelToKebab(p) in t._props || _CSS_PROP_SET.has(p) || _CSS_PROP_SET.has(_cssKebabToCamel(p))) {
+      return { value: t.getPropertyValue(p), writable: true, enumerable: true, configurable: true };
+    }
+    return undefined;
+  },
 });
 
 class Node {
@@ -1789,9 +1898,23 @@ class Element extends Node {
   get dataset() {
     if (this._dataset) return this._dataset;
     const el = this;
+    const attrFor = (k) => "data-" + _cssCamelToKebab(k);
+    // camelCase the part after the `data-` prefix, e.g. data-foo-bar -> fooBar.
+    const dataKeys = () => el.getAttributeNames()
+      .filter((n) => n.startsWith("data-"))
+      .map((n) => _cssKebabToCamel(n.slice(5)));
     this._dataset = new Proxy({}, {
-      get(_, k) { if(typeof k!=="string")return undefined; return el.getAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase()); },
-      set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
+      get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
+      set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
+      has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
+      deleteProperty(_, k) { if (typeof k === "string") el.removeAttribute(attrFor(k)); return true; },
+      ownKeys() { return dataKeys(); },
+      getOwnPropertyDescriptor(_, k) {
+        if (typeof k === "string" && el.hasAttribute(attrFor(k))) {
+          return { value: el.getAttribute(attrFor(k)), writable: true, enumerable: true, configurable: true };
+        }
+        return undefined;
+      },
     });
     return this._dataset;
   }
