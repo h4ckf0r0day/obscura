@@ -1392,6 +1392,25 @@ mod tests {
         assert_eq!(text, serde_json::json!("BODY_TEXT"));
     }
 
+    /// Regression test for #355: an explicit `throw` in one inline <script> must
+    /// not stop later independent <script>s from running. Each <script> executes
+    /// as its own `execute_script` call, mirroring how page.rs runs them, so a
+    /// thrown error is reported but the next script still runs.
+    #[test]
+    fn thrown_error_in_one_script_does_not_stop_later_scripts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("s1", "globalThis.__ran1 = true;").unwrap();
+        let err = rt
+            .execute_script("s2", "throw new Error('only one instance of babel-polyfill is allowed');")
+            .unwrap_err();
+        assert!(err.contains("babel-polyfill"), "expected the thrown message, got: {}", err);
+        rt.execute_script("s3", "globalThis.__ran3 = true;").unwrap();
+        let ran = rt
+            .evaluate("JSON.stringify([globalThis.__ran1 === true, globalThis.__ran3 === true])")
+            .unwrap();
+        assert_eq!(ran, serde_json::json!("[true,true]"));
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
