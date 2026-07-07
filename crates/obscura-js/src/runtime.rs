@@ -1392,6 +1392,47 @@ mod tests {
         assert_eq!(text, serde_json::json!("BODY_TEXT"));
     }
 
+    /// Regression test for #356: the `in` operator and `Object.keys` must work on
+    /// `el.style` (CSSStyleDeclaration) and `el.dataset` (DOMStringMap), `_props`
+    /// must not leak, and cssText must serialize dashed names with a trailing
+    /// semicolon.
+    #[test]
+    fn style_and_dataset_support_in_operator_and_keys() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const el = document.createElement('div');
+                    el.style.color = 'red';
+                    el.style.fontSize = '14px';
+                    el.dataset.foo = 'bar';
+                    const keys = Object.keys(el.style);
+                    return JSON.stringify({
+                        colorInStyle: 'color' in el.style,
+                        objectFitInStyle: 'object-fit' in el.style,
+                        keysHasSet: keys.includes('color') && keys.includes('fontSize'),
+                        noPropsLeak: !keys.includes('_props'),
+                        fooInDataset: 'foo' in el.dataset,
+                        datasetKeys: Object.keys(el.dataset),
+                        cssText: el.style.cssText,
+                        length: el.style.length,
+                        getByDash: el.style.getPropertyValue('font-size')
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let p: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(p["colorInStyle"], true);
+        assert_eq!(p["objectFitInStyle"], true);
+        assert_eq!(p["keysHasSet"], true);
+        assert_eq!(p["noPropsLeak"], true);
+        assert_eq!(p["fooInDataset"], true);
+        assert_eq!(p["datasetKeys"], serde_json::json!(["foo"]));
+        assert_eq!(p["cssText"], "color: red; font-size: 14px;");
+        assert_eq!(p["length"], 2);
+        assert_eq!(p["getByDash"], "14px");
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
