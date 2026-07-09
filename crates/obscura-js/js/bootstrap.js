@@ -1584,8 +1584,20 @@ class Element extends Node {
         const attr = this.getAttribute('value');
         return attr !== null ? attr : 'on';
       }
+      if (itype === 'file') {
+        // Chrome exposes a file input's value as C:\fakepath\<first filename>.
+        return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
+      }
     }
     return this.getAttribute("value") || "";
+  }
+  // FileList for <input type=file>, populated by DOM.setFileInputFiles (Puppeteer
+  // uploadFile / Playwright setInputFiles). null for non-file inputs, matching
+  // the DOM. See __obscura_setInputFiles (issue #359).
+  get files() {
+    if (this.localName !== 'input') return undefined;
+    if ((this.getAttribute('type') || '').toLowerCase() !== 'file') return null;
+    return this._files || _emptyFileList();
   }
   set value(v) {
     const tag = this.localName;
@@ -4439,6 +4451,35 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
     if (desc && desc.set) { desc.set.call(el, value); return; }
   } catch (_e) {}
   el[field] = value;
+};
+
+// Build a FileList-like object: an array with the DOM's `item(i)` accessor.
+function _makeFileList(files) {
+  const list = files.slice();
+  Object.defineProperty(list, "item", { value: (i) => list[i] || null, enumerable: false });
+  return list;
+}
+function _emptyFileList() { return _makeFileList([]); }
+
+// Populate an <input type=file>'s FileList from the CDP DOM.setFileInputFiles
+// call (Puppeteer uploadFile / Playwright setInputFiles). `specs` is an array of
+// { name, type, b64 } where b64 is the base64-encoded file bytes read on the
+// Rust side. Real File objects (backed by the bytes) are created so page code can
+// read them via FileReader or upload them via fetch/FormData, then input+change
+// fire as a genuine selection would (issue #359).
+globalThis.__obscura_setInputFiles = function(el, specs) {
+  const files = (specs || []).map((s) => {
+    let bytes;
+    try {
+      const bin = atob(s.b64 || "");
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (_e) { bytes = new Uint8Array(0); }
+    return new File([bytes], s.name || "", { type: s.type || "" });
+  });
+  el._files = _makeFileList(files);
+  try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_e) {}
+  try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (_e) {}
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }

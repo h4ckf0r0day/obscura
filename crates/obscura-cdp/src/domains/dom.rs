@@ -31,6 +31,62 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     Err("nodeId, backendNodeId, or objectId required".to_string())
 }
 
+/// Standard base64 (with padding). Used to ferry file bytes to the JS layer for
+/// DOM.setFileInputFiles without pulling in a dependency.
+fn encode_base64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Best-effort MIME type from a file extension, for the File objects created by
+/// DOM.setFileInputFiles. Defaults to application/octet-stream.
+fn guess_mime(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -176,6 +232,41 @@ pub async fn handle(
                 "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
                  if (el && typeof el.focus === 'function') {{ el.focus(); return true; }} return false; }})()",
                 node_id
+            );
+            let _ = page.evaluate(&code);
+            Ok(json!({}))
+        }
+        "setFileInputFiles" => {
+            // Puppeteer's ElementHandle.uploadFile / Playwright's setInputFiles
+            // drive an <input type=file> through this CDP call (issue #359). Read
+            // each local file, then hand its bytes (base64) to the JS layer, which
+            // builds real File objects and fires input+change like a real
+            // selection so page code can read/upload them.
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
+            let paths: Vec<String> = params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let mut specs = Vec::with_capacity(paths.len());
+            for p in &paths {
+                let bytes = std::fs::read(p)
+                    .map_err(|e| format!("setFileInputFiles: cannot read '{}': {}", p, e))?;
+                let name = std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                specs.push(json!({ "name": name, "type": guess_mime(p), "b64": encode_base64(&bytes) }));
+            }
+
+            let specs_json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
+            let code = format!(
+                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
+                 if (el && globalThis.__obscura_setInputFiles) {{ globalThis.__obscura_setInputFiles(el, {1}); return true; }} return false; }})()",
+                node_id, specs_json
             );
             let _ = page.evaluate(&code);
             Ok(json!({}))
