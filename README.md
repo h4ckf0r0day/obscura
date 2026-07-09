@@ -394,6 +394,14 @@ Obscura embeds V8 directly. Use `--v8-flags` to pass raw flags through to V8, sa
 obscura --v8-flags "--max-old-space-size=4096" fetch <url>
 ```
 
+### Heavy SPAs (script execution budget)
+
+Obscura caps the page's script-execution phase so one slow or hung page cannot stall a worker. The default budget is 30s; pages that finish sooner return immediately, so the cap only affects pages that keep running. A very heavy React/Vue/Angular SPA on a slow network can need more time to boot before it fires its data requests. Raise the budget with `OBSCURA_SCRIPT_DEADLINE_MS` (milliseconds), and pair it with a matching navigation timeout in your CDP client:
+
+```bash
+OBSCURA_SCRIPT_DEADLINE_MS=60000 obscura serve --port 9222
+```
+
 ### `obscura serve`
 
 Start a CDP WebSocket server.

@@ -369,12 +369,21 @@ impl Page {
         let document_base = self.resolve_base_url();
         // Soft deadline on the entire script-execution phase. Heavy SPAs
         // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
-        // fetch + execute loop can blow past a 25s Puppeteer goto timeout.
-        // Override via OBSCURA_SCRIPT_DEADLINE_MS for slow networks.
+        // fetch + execute loop can blow past a Puppeteer/Playwright goto
+        // timeout. The old 10s default was too tight: a heavy React/Vue/Angular
+        // SPA had its remaining scripts skipped before the app booted, so it
+        // never fired its XHR/fetch calls and page.on('response') saw nothing
+        // (issue #361). Only pages that actually run past the deadline are
+        // affected; fast pages finish and return well before it, so a larger
+        // budget costs them nothing. 30s gives an app room to initialize while
+        // the per-phase watchdog (armed at this + 1s) still bounds a real
+        // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
+        // for very heavy SPAs on slow networks (pair it with a matching client
+        // navigation timeout).
         let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(10_000);
+            .unwrap_or(30_000);
         let script_deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_millis(script_deadline_ms);
 
