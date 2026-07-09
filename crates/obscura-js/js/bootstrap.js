@@ -7628,7 +7628,11 @@ globalThis.__obscura_init = function() {
 // globals defined by bootstrap that we want to hide and stashes them
 // for __obscura_init to consume on every subsequent page. The snapshot
 // preserves the array as a regular global.
-globalThis.__obscura_hide_list = Object.keys(globalThis).filter(k =>
+// Use getOwnPropertyNames, not Object.keys: the internal globals declared by
+// _preHideInternals are already non-enumerable, so Object.keys would omit them
+// and leave them out of the hide list (and thus visible to the reflection-API
+// filter and to fingerprinting scripts). getOwnPropertyNames captures them.
+globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
 );
 
