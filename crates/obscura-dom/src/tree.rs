@@ -659,25 +659,40 @@ impl DomTree {
     }
 
     fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
-        let node_data = {
-            let source_inner = source.inner.borrow();
-            match source_inner.nodes.get(source_node_id.index()) {
-                Some(Some(node)) => node.data.clone(),
-                _ => return,
+        // Iterative DFS with an explicit (dest_parent, source_node) stack so a
+        // deeply nested source tree cannot overflow the thread stack and abort
+        // the process. Children are pushed in reverse so they are appended in
+        // document order (append_child always appends to the end, so each level
+        // keeps the source ordering).
+        let mut stack = vec![(parent_id, source_node_id)];
+        while let Some((dest_parent, src_id)) = stack.pop() {
+            let node_data = {
+                let source_inner = source.inner.borrow();
+                match source_inner.nodes.get(src_id.index()) {
+                    Some(Some(node)) => node.data.clone(),
+                    _ => continue,
+                }
+            };
+
+            let new_id = self.new_node(node_data);
+            self.append_child(dest_parent, new_id);
+
+            for child_id in source.children(src_id).into_iter().rev() {
+                stack.push((new_id, child_id));
             }
-        };
-
-        let new_id = self.new_node(node_data);
-        self.append_child(parent_id, new_id);
-
-        let children = source.children(source_node_id);
-        for child_id in children {
-            self.import_node_from(new_id, source, child_id);
         }
     }
 
     pub fn len(&self) -> usize {
         self.inner.borrow().nodes.iter().filter(|n| n.is_some()).count()
+    }
+
+    // Number of node slots (live plus freed), i.e. the same upper bound
+    // descendants() uses to cap a tree walk. A well-formed subtree has at most
+    // this many nodes, so it is a safe ceiling for iterative walkers that need a
+    // cycle backstop.
+    pub(crate) fn node_slot_count(&self) -> usize {
+        self.inner.borrow().nodes.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -696,7 +711,28 @@ impl DomTree {
 }
 
 fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
-    if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+    // Iterative pre-order walk on an explicit heap stack. The recursive form
+    // overflowed the thread stack and aborted the process on deeply nested
+    // trees; descendants() is iterative + capped for the same reason. A valid
+    // subtree visits at most nodes.len() nodes, so exceeding that means the
+    // graph is cyclic (prevented by the append_child / insert_before guards);
+    // stop rather than spin forever.
+    let max_steps = inner.nodes.len().saturating_add(16);
+    let mut steps = 0usize;
+    let mut stack = vec![node_id];
+
+    while let Some(id) = stack.pop() {
+        steps += 1;
+        if steps > max_steps {
+            eprintln!("obscura: collect_text_inner cap hit - tree has a cycle");
+            break;
+        }
+
+        let node = match inner.nodes.get(id.index()) {
+            Some(Some(n)) => n,
+            _ => continue,
+        };
+
         match &node.data {
             NodeData::Text { contents } => buf.push_str(contents),
             // Comment and ProcessingInstruction are intentionally NOT
@@ -704,12 +740,22 @@ fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
             // on an Element only includes Text descendants. Direct
             // textContent on a Comment/PI is handled by the caller.
             _ => {
+                // Collect children, then push them in reverse so they pop in
+                // document order.
+                let mut kids = Vec::new();
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
-                    collect_text_inner(inner, child_id, buf);
+                    kids.push(child_id);
+                    if kids.len() > inner.nodes.len() {
+                        eprintln!("obscura: collect_text_inner sibling cap hit - cycle");
+                        break;
+                    }
                     child = inner.nodes.get(child_id.index())
                         .and_then(|n| n.as_ref())
                         .and_then(|n| n.next_sibling);
+                }
+                for child_id in kids.into_iter().rev() {
+                    stack.push(child_id);
                 }
             }
         }
@@ -932,5 +978,68 @@ mod tests {
         assert_eq!(tree.len(), 3);
         tree.remove(div);
         assert_eq!(tree.len(), 1);
+    }
+
+    // Builds a chain of `depth` nested <div> elements under the document and
+    // returns (outermost_div, innermost_div). Depth this large overflows a
+    // recursive tree walk and aborts the process, so it guards the iterative
+    // serialize / text_content / import paths against regressing to recursion.
+    fn build_deep_chain(tree: &DomTree, depth: usize) -> (NodeId, NodeId) {
+        let mk_div = || {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), local_name!("div")),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk_div();
+        tree.append_child(tree.document(), root);
+        let mut cur = root;
+        for _ in 1..depth {
+            let next = mk_div();
+            tree.append_child(cur, next);
+            cur = next;
+        }
+        (root, cur)
+    }
+
+    #[test]
+    fn test_outer_html_deeply_nested_does_not_overflow() {
+        let tree = DomTree::new();
+        let (root, leaf) = build_deep_chain(&tree, 100_000);
+        let marker = tree.new_node(NodeData::Text {
+            contents: "leaf".into(),
+        });
+        tree.append_child(leaf, marker);
+
+        let html = tree.outer_html(root);
+        assert!(html.starts_with("<div>"));
+        assert!(html.contains("leaf"));
+        assert!(html.ends_with("</div>"));
+    }
+
+    #[test]
+    fn test_text_content_deeply_nested_does_not_overflow() {
+        let tree = DomTree::new();
+        let (root, leaf) = build_deep_chain(&tree, 100_000);
+        let marker = tree.new_node(NodeData::Text {
+            contents: "deep".into(),
+        });
+        tree.append_child(leaf, marker);
+
+        assert_eq!(tree.text_content(root), "deep");
+    }
+
+    #[test]
+    fn test_import_deeply_nested_does_not_overflow() {
+        let source = DomTree::new();
+        build_deep_chain(&source, 100_000);
+
+        let dest = DomTree::new();
+        let dest_doc = dest.document();
+        dest.import_children_from(dest_doc, &source, source.document());
+
+        assert!(dest.len() >= 100_000);
     }
 }

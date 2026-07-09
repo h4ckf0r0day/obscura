@@ -1,103 +1,151 @@
 use crate::tree::{DomTree, NodeData, NodeId};
 
+// A unit of pending serialization work. Held on an explicit heap stack instead
+// of the call stack so a deeply nested tree cannot overflow the thread stack and
+// abort the process (a stack overflow is a hard abort that `op_dom`'s
+// catch_unwind cannot recover). `descendants()` is iterative + capped for the
+// same reason; the serializer must be too.
+enum SerializeWork {
+    // Serialize this node; `include_self` mirrors the old recursive param.
+    Node(NodeId, bool),
+    // Emit a previously-opened element's closing tag, after its children.
+    CloseTag(String),
+}
+
 impl DomTree {
     pub fn outer_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_node(node_id, true, &mut buf);
+        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf);
         buf
     }
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_children(node_id, &mut buf);
+        self.serialize_worklist(self.child_work(node_id), &mut buf);
         buf
     }
 
-    fn serialize_node(&self, node_id: NodeId, include_self: bool, buf: &mut String) {
-        let node = match self.get_node(node_id) {
-            Some(n) => n,
-            None => return,
-        };
-
-        match &node.data {
-            NodeData::Document => {
-                self.serialize_children(node_id, buf);
-            }
-            NodeData::Doctype { name, .. } => {
-                buf.push_str("<!DOCTYPE ");
-                buf.push_str(name);
-                buf.push('>');
-            }
-            NodeData::Element { name, attrs, .. } => {
-                let tag = name.local.as_ref();
-                if include_self {
-                    buf.push('<');
-                    buf.push_str(tag);
-                    for attr in attrs {
-                        buf.push(' ');
-                        let attr_name = attr.name.local.as_ref();
-                        buf.push_str(attr_name);
-                        buf.push_str("=\"");
-                        escape_attr(&attr.value, buf);
-                        buf.push('"');
-                    }
-                    buf.push('>');
-                }
-
-                if !is_void_element(tag) {
-                    self.serialize_children(node_id, buf);
-                    if include_self {
-                        buf.push_str("</");
-                        buf.push_str(tag);
-                        buf.push('>');
-                    }
-                }
-            }
-            NodeData::Text { contents } => {
-                let parent_is_raw = node.parent
-                    .and_then(|pid| {
-                        self.with_node(pid, |p| {
-                            p.as_element()
-                                .map(|name| is_raw_text_element(name.local.as_ref()))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-
-                if parent_is_raw {
-                    buf.push_str(contents);
-                } else {
-                    escape_text(contents, buf);
-                }
-            }
-            NodeData::Comment { contents } => {
-                buf.push_str("<!--");
-                // The HTML parser can never produce a comment whose data contains
-                // "-->" (that ends the comment), but script can via
-                // document.createComment("a-->b"). Emitting it verbatim would close
-                // the comment early and let the trailing text escape into markup.
-                // Neutralize the terminator so the serialized output round-trips as
-                // a single comment.
-                if contents.contains("-->") {
-                    buf.push_str(&contents.replace("-->", "--&gt;"));
-                } else {
-                    buf.push_str(contents);
-                }
-                buf.push_str("-->");
-            }
-            NodeData::ProcessingInstruction { target, data } => {
-                buf.push_str("<?");
-                buf.push_str(target);
-                buf.push(' ');
-                buf.push_str(data);
-                buf.push('>');
-            }
-        }
+    // Children as work items in document order (top of the LIFO stack first).
+    fn child_work(&self, node_id: NodeId) -> Vec<SerializeWork> {
+        self.children(node_id)
+            .into_iter()
+            .rev()
+            .map(|c| SerializeWork::Node(c, true))
+            .collect()
     }
 
-    fn serialize_children(&self, node_id: NodeId, buf: &mut String) {
-        for child_id in self.children(node_id) {
-            self.serialize_node(child_id, true, buf);
+    fn serialize_worklist(&self, mut stack: Vec<SerializeWork>, buf: &mut String) {
+        // Defense in depth, mirroring descendants(): a well-formed subtree emits
+        // at most one Node plus one CloseTag per node, so 2*nodes.len() work
+        // items bound a valid walk. Exceeding it means the graph is cyclic (the
+        // append_child / insert_before guards prevent that); stop rather than
+        // spin forever. On a valid tree this bound is never reached.
+        let max_steps = self
+            .node_slot_count()
+            .saturating_mul(2)
+            .saturating_add(16);
+        let mut steps = 0usize;
+
+        while let Some(work) = stack.pop() {
+            steps += 1;
+            if steps > max_steps {
+                eprintln!("obscura: serialize worklist cap hit - tree has a cycle");
+                break;
+            }
+
+            let (node_id, include_self) = match work {
+                SerializeWork::CloseTag(tag) => {
+                    buf.push_str("</");
+                    buf.push_str(&tag);
+                    buf.push('>');
+                    continue;
+                }
+                SerializeWork::Node(node_id, include_self) => (node_id, include_self),
+            };
+
+            let node = match self.get_node(node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            match &node.data {
+                NodeData::Document => {
+                    for w in self.child_work(node_id) {
+                        stack.push(w);
+                    }
+                }
+                NodeData::Doctype { name, .. } => {
+                    buf.push_str("<!DOCTYPE ");
+                    buf.push_str(name);
+                    buf.push('>');
+                }
+                NodeData::Element { name, attrs, .. } => {
+                    let tag = name.local.as_ref();
+                    if include_self {
+                        buf.push('<');
+                        buf.push_str(tag);
+                        for attr in attrs {
+                            buf.push(' ');
+                            let attr_name = attr.name.local.as_ref();
+                            buf.push_str(attr_name);
+                            buf.push_str("=\"");
+                            escape_attr(&attr.value, buf);
+                            buf.push('"');
+                        }
+                        buf.push('>');
+                    }
+
+                    if !is_void_element(tag) {
+                        // Push the closing tag first so it pops after all the
+                        // children we push next.
+                        if include_self {
+                            stack.push(SerializeWork::CloseTag(tag.to_string()));
+                        }
+                        for w in self.child_work(node_id) {
+                            stack.push(w);
+                        }
+                    }
+                }
+                NodeData::Text { contents } => {
+                    let parent_is_raw = node.parent
+                        .and_then(|pid| {
+                            self.with_node(pid, |p| {
+                                p.as_element()
+                                    .map(|name| is_raw_text_element(name.local.as_ref()))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    if parent_is_raw {
+                        buf.push_str(contents);
+                    } else {
+                        escape_text(contents, buf);
+                    }
+                }
+                NodeData::Comment { contents } => {
+                    buf.push_str("<!--");
+                    // The HTML parser can never produce a comment whose data contains
+                    // "-->" (that ends the comment), but script can via
+                    // document.createComment("a-->b"). Emitting it verbatim would close
+                    // the comment early and let the trailing text escape into markup.
+                    // Neutralize the terminator so the serialized output round-trips as
+                    // a single comment.
+                    if contents.contains("-->") {
+                        buf.push_str(&contents.replace("-->", "--&gt;"));
+                    } else {
+                        buf.push_str(contents);
+                    }
+                    buf.push_str("-->");
+                }
+                NodeData::ProcessingInstruction { target, data } => {
+                    buf.push_str("<?");
+                    buf.push_str(target);
+                    buf.push(' ');
+                    buf.push_str(data);
+                    buf.push('>');
+                }
+            }
         }
     }
 }
