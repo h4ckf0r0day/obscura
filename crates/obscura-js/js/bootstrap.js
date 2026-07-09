@@ -70,15 +70,71 @@ globalThis.dispatchEvent = function(event) {
 const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
 
 const _nativeFns = new Set();
+// Exact toString override for members whose native form is not just
+// `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
+// or functions whose `.name` does not match the real builtin.
+const _nativeStr = new Map();
 const _origToString = Function.prototype.toString;
-Function.prototype.toString = function() {
+Function.prototype.toString = function toString() {
+  if (_nativeStr.has(this)) { return _nativeStr.get(this); }
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
   }
   return _origToString.call(this);
 };
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+// Mark a function with an exact native-code toString (used for accessors).
+function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
 _nativeFns.add(Function.prototype.toString);
+
+// unusualWindowProperties: obscura's internal globals are made non-enumerable
+// (see _preHideInternals and __obscura_init), which hides them from
+// Object.keys / for-in. But fingerprinting scripts enumerate the global object
+// with Object.getOwnPropertyNames and Reflect.ownKeys, which return
+// non-enumerable properties too, so the internals still leak (pixelscan's
+// unusualWindowProperties check). Filter the engine's own globals out of the
+// reflection APIs when they target the global object. The canonical name set is
+// __obscura_hide_list, precomputed at snapshot-build time; referencing it lazily
+// means the list is already populated by the time any page calls these.
+(function _hideInternalsFromReflection() {
+  var _cache = null, _cacheLen = -1;
+  function _set() {
+    var list = globalThis.__obscura_hide_list;
+    if (!list) { return null; }
+    if (_cache && _cacheLen === list.length) { return _cache; }
+    _cache = new Set(list);
+    _cache.add('__obscura_hide_list');
+    _cacheLen = list.length;
+    return _cache;
+  }
+  function _isGlobal(t) { return t === globalThis; }
+  function _filter(t, names) {
+    if (!_isGlobal(t)) { return names; }
+    var set = _set();
+    if (!set) { return names; }
+    var out = [];
+    for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
+    return out;
+  }
+  var _oGOPN = Object.getOwnPropertyNames;
+  var _oOwnKeys = Reflect.ownKeys;
+  var _oKeys = Object.keys;
+  var _oGOPDs = Object.getOwnPropertyDescriptors;
+  function define(obj, prop, impl) {
+    try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
+  }
+  define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
+  define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
+  define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t)); });
+  define(Object, 'getOwnPropertyDescriptors', function getOwnPropertyDescriptors(t) {
+    var all = _oGOPDs(t);
+    if (_isGlobal(t)) {
+      var set = _set();
+      if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+    }
+    return all;
+  });
+})();
 
 [Error, TypeError, ReferenceError, SyntaxError, RangeError, URIError, EvalError].forEach(E => {
   try {
@@ -8040,3 +8096,43 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // arrayBuffer is the body primitive that blob/text/json derive from; the
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
+
+// tamperedFunctions: obscura reimplements much of the DOM/Web platform in JS.
+// Real Chrome reports "[native code]" from toString() for every builtin method,
+// accessor, and constructor; any JS-backed member that leaks its source is a
+// detection tell (pixelscan's tamperedFunctions check flags e.g.
+// Element.prototype.nodeType, whose getter returned "get nodeType() {...}").
+// Individual _markNative calls throughout this file cover methods but miss the
+// property accessors and several constructors. Sweep every builtin constructor
+// reachable from the global object and mark its prototype members (methods and
+// accessors) plus the constructor itself native. This runs once at snapshot
+// build time, so it costs nothing per page, and genuinely-native V8 builtins
+// already report native, so only the JS-backed members are affected.
+(function _markBuiltinsNative() {
+  var seen = new Set();
+  function walk(ctor) {
+    if (typeof ctor !== 'function') { return; }
+    _markNative(ctor);
+    var proto = ctor.prototype;
+    if (!proto || seen.has(proto)) { return; }
+    seen.add(proto);
+    var keys = Object.getOwnPropertyNames(proto);
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var d;
+      try { d = Object.getOwnPropertyDescriptor(proto, key); } catch (e) { continue; }
+      if (!d) { continue; }
+      if (typeof d.value === 'function') { _markNative(d.value); }
+      if (typeof d.get === 'function') { _markNativeAs(d.get, 'function get ' + key + '() { [native code] }'); }
+      if (typeof d.set === 'function') { _markNativeAs(d.set, 'function set ' + key + '() { [native code] }'); }
+    }
+  }
+  var names = Object.getOwnPropertyNames(globalThis);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (!/^[A-Z]/.test(name)) { continue; }
+    var val;
+    try { val = globalThis[name]; } catch (e) { continue; }
+    if (typeof val === 'function') { walk(val); }
+  }
+})();
