@@ -329,7 +329,11 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Command::Serve { port, host, proxy, user_agent, workers, allow_file_access, storage_dir, quiet: _ }) => {
-            let proxy = merge_proxy(global_proxy.clone(), proxy);
+            // Fall back to OBSCURA_PROXY so a proxy can be supplied without
+            // putting credentials on the command line. The multi-worker load
+            // balancer passes the proxy to each worker this way (issue #366).
+            let proxy = merge_proxy(global_proxy.clone(), proxy)
+                .or_else(|| std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty()));
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -423,7 +427,11 @@ async fn run_multi_worker_serve(
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
         if let Some(ref p) = proxy {
-            cmd.arg("--proxy").arg(p);
+            // Pass the proxy (which may embed credentials) via the environment,
+            // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
+            // to any local user; OBSCURA_PROXY is only readable by the owner
+            // (issue #366). The worker's serve path reads this env as a fallback.
+            cmd.env("OBSCURA_PROXY", p);
         }
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
