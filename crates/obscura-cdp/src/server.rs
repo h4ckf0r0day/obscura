@@ -432,7 +432,7 @@ async fn cdp_processor(
                 // messages via the `process_with_interception` select loop;
                 // unrelated requests get deferred only briefly and are drained
                 // as soon as the nav settles.
-                let is_navigation = cdp_msg.text.contains("Page.navigate");
+                let is_navigation = is_navigate_method(&cdp_msg.text);
 
                 if is_navigation {
                     process_with_interception(
@@ -455,6 +455,18 @@ async fn cdp_processor(
     // closed by the accept thread. Without this any cookies set during the
     // session are dropped on the floor.
     ctx.default_context.save_cookies();
+}
+
+// Whether a raw CDP frame is exactly a `Page.navigate` call, and so should take
+// the spawn-and-defer navigation path. Matching on the parsed method rather than
+// a `contains("Page.navigate")` substring avoids catching
+// `Page.navigateToHistoryEntry` (goBack / goForward), which has no `url` param
+// and belongs to its own handler, or any other frame that merely embeds the
+// literal text (e.g. a `Runtime.evaluate` expression). See issue #363.
+fn is_navigate_method(text: &str) -> bool {
+    serde_json::from_str::<CdpRequest>(text)
+        .map(|req| req.method == "Page.navigate")
+        .unwrap_or(false)
 }
 
 fn handle_fetch_resolution(
@@ -993,4 +1005,35 @@ async fn handle_connection_ws(
 
     send_task.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_navigate_method;
+
+    // Issue #363: only an exact Page.navigate may take the spawn-and-defer
+    // navigation path. A substring match also caught Page.navigateToHistoryEntry
+    // (goBack / goForward), which has no `url` param, so it was misrouted into
+    // the raw-navigate path and failed with "Invalid URL" instead of reaching
+    // its real handler.
+    #[test]
+    fn only_exact_page_navigate_routes_as_navigation() {
+        assert!(is_navigate_method(
+            r#"{"id":1,"method":"Page.navigate","params":{"url":"https://example.com"}}"#
+        ));
+        assert!(!is_navigate_method(
+            r#"{"id":2,"method":"Page.navigateToHistoryEntry","params":{"entryId":0}}"#
+        ));
+    }
+
+    // A Runtime.evaluate whose expression merely contains the literal
+    // "Page.navigate" must not be misrouted, and malformed input is not a
+    // navigation.
+    #[test]
+    fn unrelated_methods_do_not_route_as_navigation() {
+        assert!(!is_navigate_method(
+            r#"{"id":3,"method":"Runtime.evaluate","params":{"expression":"'Page.navigate'"}}"#
+        ));
+        assert!(!is_navigate_method("not json"));
+    }
 }
