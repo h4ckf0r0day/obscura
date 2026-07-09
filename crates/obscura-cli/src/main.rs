@@ -940,56 +940,85 @@ fn dump_markdown(page: &mut Page) -> String {
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
+    // Iterative DFS over an explicit work stack. A recursive walk overflowed the
+    // call stack (a hard abort, not a catchable panic) on deeply nested pages,
+    // taking down the process on `--dump text` (issue #362, the CLI counterpart
+    // of the serialize/textContent paths made iterative in obscura-dom). A
+    // `Newline` work item emits a block element's trailing newline after its
+    // children, matching the old pre/post-recursion output exactly.
+    enum Work {
+        Visit(obscura_dom::NodeId),
+        Newline,
+    }
+
+    // Defense-in-depth cap mirroring DomTree::descendants; never reached on a
+    // valid tree since append_child / insert_before reject cycles.
+    const MAX_NODES: usize = 5_000_000;
+
     let mut result = String::new();
-    let node = match dom.get_node(node_id) {
-        Some(n) => n,
-        None => return result,
-    };
+    let mut stack: Vec<Work> = vec![Work::Visit(node_id)];
+    let mut visited = 0usize;
 
-    match &node.data {
-        NodeData::Text { contents } => {
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                result.push_str(trimmed);
-            }
-        }
-        NodeData::Element { name, .. } => {
-            let tag = name.local.as_ref();
-            let is_block = matches!(
-                tag,
-                "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "li" | "tr" | "br" | "hr" | "blockquote" | "pre"
-                    | "section" | "article" | "header" | "footer" | "nav"
-                    | "main" | "aside" | "figure" | "figcaption" | "table"
-                    | "thead" | "tbody" | "tfoot" | "dl" | "dt" | "dd"
-                    | "ul" | "ol"
-            );
-
-            // Boilerplate elements rarely contain content the user wants to
-            // scrape — strip them so `--dump text` returns the article body
-            // instead of menus, footers, and cookie banners.
-            if matches!(
-                tag,
-                "script" | "style" | "nav" | "header" | "footer" | "aside"
-            ) {
-                return result;
-            }
-
-            if is_block {
+    while let Some(work) = stack.pop() {
+        let id = match work {
+            Work::Newline => {
                 result.push('\n');
+                continue;
             }
+            Work::Visit(id) => id,
+        };
 
-            for child_id in dom.children(node_id) {
-                result.push_str(&extract_readable_text(dom, child_id));
-            }
-
-            if is_block {
-                result.push('\n');
-            }
+        visited += 1;
+        if visited > MAX_NODES {
+            break;
         }
-        _ => {
-            for child_id in dom.children(node_id) {
-                result.push_str(&extract_readable_text(dom, child_id));
+
+        let node = match dom.get_node(id) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        match &node.data {
+            NodeData::Text { contents } => {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    result.push_str(trimmed);
+                }
+            }
+            NodeData::Element { name, .. } => {
+                let tag = name.local.as_ref();
+
+                // Boilerplate elements rarely contain content the user wants to
+                // scrape — strip them so `--dump text` returns the article body
+                // instead of menus, footers, and cookie banners.
+                if matches!(tag, "script" | "style" | "nav" | "header" | "footer" | "aside") {
+                    continue;
+                }
+
+                let is_block = matches!(
+                    tag,
+                    "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                        | "li" | "tr" | "br" | "hr" | "blockquote" | "pre"
+                        | "section" | "article" | "header" | "footer" | "nav"
+                        | "main" | "aside" | "figure" | "figcaption" | "table"
+                        | "thead" | "tbody" | "tfoot" | "dl" | "dt" | "dd"
+                        | "ul" | "ol"
+                );
+
+                if is_block {
+                    result.push('\n');
+                    // Processed after all children (stack is LIFO): the trailing newline.
+                    stack.push(Work::Newline);
+                }
+                // Push children in reverse so they pop in document order.
+                for child_id in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child_id));
+                }
+            }
+            _ => {
+                for child_id in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child_id));
+                }
             }
         }
     }
