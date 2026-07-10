@@ -45,6 +45,11 @@ pub struct CdpContext {
     pub next_isolated_context_id: i64,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    // Open IO streams for Fetch.takeResponseBodyAsStream: handle -> (bytes, cursor).
+    // Each holds a response body taken out of the page cache so a large download
+    // is streamed chunk-by-chunk via IO.read and freed on IO.close (issue #360).
+    pub io_streams: HashMap<String, (Vec<u8>, usize)>,
+    pub io_stream_counter: u64,
 }
 
 impl CdpContext {
@@ -141,6 +146,8 @@ impl CdpContext {
             isolated_worlds: Vec::new(),
             valid_context_ids,
             next_isolated_context_id: 100,
+            io_streams: HashMap::new(),
+            io_stream_counter: 0,
         }
     }
 
@@ -334,6 +341,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
+        "IO" => domains::io::handle(method, &req.params, ctx).await,
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,

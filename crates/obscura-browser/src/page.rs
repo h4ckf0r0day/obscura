@@ -1473,6 +1473,31 @@ impl Page {
         })
     }
 
+    /// Take a stored response body as raw bytes for CDP streaming
+    /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
+    /// transfers ownership to the caller, so a large body is held once and freed
+    /// when the stream is closed rather than lingering in this long-running
+    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
+    /// bodies return their UTF-8 bytes. Returns None if the body was never
+    /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
+    /// dropped) or the id is unknown.
+    pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
+        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
+            self.response_body_order.retain(|id| id != request_id);
+            body
+        } else {
+            self.js.as_ref()?.get_network_response_body(request_id).map(|b| StoredResponseBody {
+                body: b.body,
+                base64_encoded: b.base64_encoded,
+            })?
+        };
+        if stored.base64_encoded {
+            BASE64.decode(stored.body.as_bytes()).ok()
+        } else {
+            Some(stored.body.into_bytes())
+        }
+    }
+
     /// Make the body stored under `from_id` also retrievable under `to_id`.
     /// The main navigation resource is stored under its internal request id, but
     /// the CDP layer reports it to clients with the navigation's loaderId as the

@@ -181,6 +181,36 @@ pub async fn handle(
         "getResponseBody" => {
             Ok(json!({ "body": "", "base64Encoded": false }))
         }
+        "takeResponseBodyAsStream" => {
+            // Hand the client a streaming handle for a large response body so it
+            // can pull it in chunks via IO.read and free it with IO.close,
+            // instead of receiving one giant base64 blob (issue #360). The body
+            // is moved out of the page cache into the stream, so it is held once
+            // and released on close. Requires the body to have been cached
+            // (raise OBSCURA_NETWORK_BODY_BUFFER_BYTES for large downloads).
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("Fetch.takeResponseBodyAsStream requires requestId")?;
+
+            let bytes = {
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+                page.take_response_body_raw(request_id)
+            }
+            .or_else(|| {
+                ctx.pages
+                    .iter_mut()
+                    .find_map(|p| p.take_response_body_raw(request_id))
+            })
+            .ok_or_else(|| {
+                format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}")
+            })?;
+
+            let handle = format!("stream-{}", ctx.io_stream_counter);
+            ctx.io_stream_counter += 1;
+            ctx.io_streams.insert(handle.clone(), (bytes, 0));
+            Ok(json!({ "stream": handle }))
+        }
         _ => Err(format!("Unknown Fetch method: {}", method)),
     }
 }
