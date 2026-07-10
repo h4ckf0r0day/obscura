@@ -664,25 +664,33 @@ impl ObscuraJsRuntime {
         };
 
         let result = self.runtime.mod_evaluate(module_id);
+        tokio::pin!(result);
 
-        let timeout = tokio::time::timeout(
-            budget,
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
+        // Return as soon as the module finishes evaluating instead of waiting
+        // for the event loop to go fully idle: a page timer (setInterval) keeps
+        // the loop busy forever and would otherwise burn the whole budget, so a
+        // module that had already evaluated got abandoned (issue #374).
+        let outcome = tokio::time::timeout(budget, async {
+            let event_loop = self
+                .runtime
+                .run_event_loop(deno_core::PollEventLoopOptions::default());
+            tokio::pin!(event_loop);
+            tokio::select! {
+                biased;
+                r = &mut result => r,
+                e = &mut event_loop => { e?; (&mut result).await }
+            }
+        })
+        .await;
 
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!("Module eval error: {}", e);
+                Ok(())
+            }
             Err(_) => {
                 tracing::warn!("Module evaluation timed out after {}ms: {}", budget_ms, url);
-                return Ok(());
-            }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Module eval error: {}", e);
                 Ok(())
             }
         }
@@ -713,25 +721,35 @@ impl ObscuraJsRuntime {
         };
 
         let result = self.runtime.mod_evaluate(module_id);
+        tokio::pin!(result);
 
-        let timeout = tokio::time::timeout(
-            budget,
-            self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
-        ).await;
+        // Drive the event loop, but return as soon as the module finishes
+        // evaluating rather than waiting for the loop to go fully idle. A page
+        // timer (Vite's HMR / React-Refresh client installs a setInterval) keeps
+        // the loop busy forever; waiting for idle burned the whole budget on this
+        // preamble module and starved the later module that mounts the app,
+        // leaving #root empty (issue #374).
+        let outcome = tokio::time::timeout(budget, async {
+            let event_loop = self
+                .runtime
+                .run_event_loop(deno_core::PollEventLoopOptions::default());
+            tokio::pin!(event_loop);
+            tokio::select! {
+                biased;
+                r = &mut result => r,
+                e = &mut event_loop => { e?; (&mut result).await }
+            }
+        })
+        .await;
 
-        match timeout {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Module event loop error: {}", e)),
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!("Inline module eval error: {}", e);
+                Ok(())
+            }
             Err(_) => {
                 tracing::warn!("Inline module timed out after {}ms", budget_ms);
-                return Ok(());
-            }
-        }
-
-        match result.await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("Inline module eval error: {}", e);
                 Ok(())
             }
         }
