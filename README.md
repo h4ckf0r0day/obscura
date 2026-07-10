@@ -75,23 +75,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
   </tr>
   <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://www.swiftproxy.net/?ref=obscura" target="_blank">
-        <img alt="Swiftproxy" src="assets/sponsors/swiftproxy2.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://www.swiftproxy.net/?ref=obscura"><b>Swiftproxy</b></a>  — Premium residential proxies built for privacy, automation, and scale.<br><br>
-<b>80M+ residential IPs in 190+ countries<br>
-Rotating & sticky sessions<br>
-Non-expiring traffic<br>
-Free trial available<br>
-Country, state & city targeting<br>
-HTTP, HTTPS & SOCKS5 support<br><br>
-🎁 Use code <b>PROXY90</b> for <b>10% off</b>.<br><br></b>
-    </td>
-  </tr>
-  <tr>
-    <td width="200" align="center" valign="middle">
       <a href="https://proxyempire.io/?ref=obscura&utm_source=obscuragithub" target="_blank">
         <img alt="ProxyEmpire" src="assets/sponsors/proxyempire.png" width="180"/>
       </a>
