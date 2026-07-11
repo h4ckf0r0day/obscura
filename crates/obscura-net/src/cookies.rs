@@ -174,7 +174,7 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
                 matching.push(format!("{}={}", entry.name, entry.value));
@@ -262,7 +262,7 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
                 matching.push(format!("{}={}", entry.name, entry.value));
@@ -565,6 +565,21 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
     } else {
         Some((origin, true))
     }
+}
+
+// RFC 6265 5.1.4 path-match. A bare `starts_with` over-matches sibling paths
+// that share a string prefix (a Path=/admin cookie leaking to /administrator),
+// so a prefix match also requires the boundary to fall on a '/'.
+fn path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if request_path == cookie_path {
+        return true;
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    // Prefix match: exact when the cookie-path already ends in '/', otherwise
+    // the next char of the request-path must be the '/' boundary.
+    cookie_path.ends_with('/') || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -947,5 +962,28 @@ mod tests {
         assert!(jar.get_cookie_header(&apex).contains("token=1"));
         let api = Url::parse("http://api.example.com/").unwrap();
         assert!(jar.get_cookie_header(&api).contains("token=1"));
+    }
+
+    #[test]
+    fn cookie_path_requires_slash_boundary() {
+        // RFC 6265 5.1.4: a Path=/admin cookie must NOT be sent to a sibling
+        // path like /administrator that merely shares the string prefix. It is
+        // sent to /admin, /admin/, and /admin/x.
+        let jar = CookieJar::new();
+        let admin = Url::parse("https://example.com/admin").unwrap();
+        jar.set_cookie("sess=1; Path=/admin", &admin);
+
+        let sibling = Url::parse("https://example.com/administrator").unwrap();
+        assert!(
+            !jar.get_cookie_header(&sibling).contains("sess=1"),
+            "cookie leaked to sibling path /administrator: {}",
+            jar.get_cookie_header(&sibling)
+        );
+
+        assert!(jar.get_cookie_header(&admin).contains("sess=1"));
+        let exact_slash = Url::parse("https://example.com/admin/").unwrap();
+        assert!(jar.get_cookie_header(&exact_slash).contains("sess=1"));
+        let sub = Url::parse("https://example.com/admin/panel").unwrap();
+        assert!(jar.get_cookie_header(&sub).contains("sess=1"));
     }
 }
