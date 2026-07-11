@@ -4534,8 +4534,13 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
     return new File([bytes], s.name || "", { type: s.type || "" });
   });
   el._files = _makeFileList(files);
-  try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_e) {}
-  try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (_e) {}
+  // Mark the events trusted (isTrusted === true), like the Input domain does
+  // for synthesized clicks/keys. A real <input type=file> selection fires
+  // trusted events; upload flows that gate their change handler on
+  // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
+  // ones, which would silently break the exact case this feature targets.
+  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
+  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
