@@ -45,11 +45,12 @@ pub struct CdpContext {
     pub next_isolated_context_id: i64,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
-    // Open IO streams for Fetch.takeResponseBodyAsStream: handle -> (bytes, cursor).
-    // Each holds a response body taken out of the page cache so a large download
-    // is streamed chunk-by-chunk via IO.read and freed on IO.close (issue #360).
-    pub io_streams: HashMap<String, (Vec<u8>, usize)>,
-    pub io_stream_counter: u64,
+    // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
+    // body taken out of the page cache so a large download is streamed
+    // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
+    // caps how many bodies (and how many bytes) can be held at once, evicting
+    // the oldest, so an abandoned or disconnected stream cannot leak unbounded.
+    pub io_streams: crate::domains::io::IoStreamStore,
 }
 
 impl CdpContext {
@@ -146,8 +147,7 @@ impl CdpContext {
             isolated_worlds: Vec::new(),
             valid_context_ids,
             next_isolated_context_id: 100,
-            io_streams: HashMap::new(),
-            io_stream_counter: 0,
+            io_streams: crate::domains::io::IoStreamStore::default(),
         }
     }
 

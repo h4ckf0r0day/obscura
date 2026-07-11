@@ -206,9 +206,7 @@ pub async fn handle(
                 format!("Fetch.takeResponseBodyAsStream: no cached body for {request_id}")
             })?;
 
-            let handle = format!("stream-{}", ctx.io_stream_counter);
-            ctx.io_stream_counter += 1;
-            ctx.io_streams.insert(handle.clone(), (bytes, 0));
+            let handle = ctx.io_streams.insert(bytes);
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
