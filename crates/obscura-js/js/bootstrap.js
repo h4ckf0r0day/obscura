@@ -3020,13 +3020,8 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
-// Navigator fingerprint surfaces (userAgent, appVersion, platform, language,
-// languages, plugins, mimeTypes, hardwareConcurrency, deviceMemory, webdriver,
-// share, canShare) are intentionally NOT defined here. Defining them as own
-// instance accessors/data props is the textbook "navigator was patched" tell
-// that pixelscan's Navigator group flags. They are installed on a prototype
-// one hop above Navigator.prototype in the IIFE below, so
-// navigator.hasOwnProperty('platform') === false, exactly like real Chrome.
+// Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
+// hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
@@ -3120,16 +3115,9 @@ globalThis.navigator = {
   },
 };
 
-// Move spoofed navigator properties off the instance and onto a thin
-// prototype above Navigator.prototype, matching Chrome where they live on
-// Navigator.prototype. pixelscan's Navigator group flags any spoofed prop
-// that survives as an own-instance accessor/data property (hasOwnProperty /
-// getOwnPropertyDescriptor). Keep Navigator.prototype as the chain base so
-// navigator instanceof Navigator === true. Getters read the __obscura_*
-// globals lazily at call time: bootstrap.js is baked into the V8 snapshot at
-// build time, while those globals are set per page at runtime by set_user_agent
-// / set_platform / __obscura_init (runtime.rs:219-238). _markNative each getter
-// so its toString() reports [native code].
+// Put spoofed navigator props on a thin prototype above Navigator.prototype
+// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
+// Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
 (function() {
   var _navProto = Object.create(Navigator.prototype);
 
@@ -3140,13 +3128,7 @@ globalThis.navigator = {
     });
   }
 
-  // webdriver (unchanged behavior, moved here from the old single-prop block).
   defGetter('webdriver', function() { return false; });
-
-  // UA surfaces read the same globals set_user_agent / set_platform write
-  // (runtime.rs:219, runtime.rs:227), so those Rust methods keep working
-  // with no change. appVersion reads the global directly rather than via
-  // this.userAgent so the getter is this-independent.
   defGetter('userAgent', function() {
     return globalThis.__obscura_ua ||
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -3163,10 +3145,7 @@ globalThis.navigator = {
   defGetter('language', function() { return "en-US"; });
   defGetter('languages', function() { return ["en-US", "en"]; });
 
-  // plugins / mimeTypes: build once and cache, so navigator.plugins ===
-  // navigator.plugins (real Chrome returns a stable singleton). The
-  // PluginArray / Plugin / MimeType / MimeTypeArray constructors above
-  // already set Symbol.toStringTag and _markNative the item/namedItem methods.
+  // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([
     new Plugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
     new Plugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format", []),
@@ -3181,14 +3160,10 @@ globalThis.navigator = {
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
-  // hardwareConcurrency / deviceMemory: randomized per-page in __obscura_init
-  // via backing globals, so no own data prop is created on the instance.
+  // Values set per-page by __obscura_init (avoids own data props on navigator).
   defGetter('hardwareConcurrency', function() { return globalThis.__obscura_hw || 8; });
   defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
 
-  // share / canShare: own methods on the instance in real Chrome are also
-  // inherited from Navigator.prototype. DOMException resolves lazily at call
-  // time (its constructor is defined later in this file).
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
   });
