@@ -965,7 +965,7 @@ async fn handle_connection_ws(
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
     let mut cfg = WebSocketConfig::default();
     cfg.write_buffer_size = 0;
-    cfg.max_write_buffer_size = 1 << 20;
+    cfg.max_write_buffer_size = 64 << 20;
     let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
