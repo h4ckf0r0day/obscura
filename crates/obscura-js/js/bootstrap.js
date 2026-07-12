@@ -7526,6 +7526,29 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
 }
 
+// Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
+// nodes between documents (portals, iframe hand-off) call it; the missing
+// method throws "adoptNode is not a function". With no second document to
+// transfer ownership from, the node is already ours, so return it as-is,
+// matching the observable effect of adoption into this document.
+if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
+  Document.prototype.adoptNode = function(node) { return node || null; };
+}
+
+// Element.toggleAttribute: standard DOM. Lit/Stencil and several ad SDKs call
+// it; the missing method throws. Spec semantics: no force arg toggles, force
+// true adds, force false removes; returns the new presence.
+if (typeof Element !== 'undefined' && !Element.prototype.toggleAttribute) {
+  Element.prototype.toggleAttribute = function(name, force) {
+    const n = String(name);
+    const present = this.hasAttribute(n);
+    const want = arguments.length < 2 ? !present : !!force;
+    if (want && !present) { this.setAttribute(n, ''); return true; }
+    if (!want && present) { this.removeAttribute(n); return false; }
+    return want;
+  };
+}
+
 // Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
 // in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
 // Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
