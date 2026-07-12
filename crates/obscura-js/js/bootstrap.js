@@ -5120,7 +5120,74 @@ globalThis.Crypto = class Crypto {
   }
 };
 globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
-globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
+// Real structured clone (not JSON). JSON.parse(JSON.stringify) silently drops
+// ArrayBuffer/TypedArray (they serialize to {}), so Cloudflare's turnstile
+// orchestrate loses every byte it tries to round-trip through postMessage and
+// the challenge never completes (issue #389). Clone buffers, typed arrays,
+// maps/sets, dates, errors, and plain objects recursively; CryptoKey and other
+// types that register a clone hook (see crypto.subtle below) are routed there.
+function _structuredClone(value, seen) {
+  if (value === null || typeof value !== "object") return value;
+  if (typeof value === "function") throw new TypeError("Structured clone: functions are not cloneable");
+  // Typed arrays and DataView: copy the underlying buffer slice.
+  if (ArrayBuffer.isView(value)) {
+    const Ctor = value.constructor;
+    const copy = new Ctor(value.slice());
+    return copy;
+  }
+  if (value instanceof ArrayBuffer) {
+    return value.slice(0);
+  }
+  if (value instanceof SharedArrayBuffer) {
+    return value; // transferable, not copyable
+  }
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof Map) {
+    const m = new Map();
+    seen.set(value, m);
+    for (const [k, v] of value) m.set(_structuredClone(k, seen), _structuredClone(v, seen));
+    return m;
+  }
+  if (value instanceof Set) {
+    const s = new Set();
+    seen.set(value, s);
+    for (const v of value) s.add(_structuredClone(v, seen));
+    return s;
+  }
+  if (value instanceof Error) {
+    const Ctor = value.constructor || Error;
+    const e = new Ctor(value.message);
+    if (value.name) e.name = value.name;
+    if (value.stack) e.stack = value.stack;
+    if (value.cause !== undefined) e.cause = _structuredClone(value.cause, seen);
+    return e;
+  }
+  // Platform objects that carry internal slots opt into cloning via a hook
+  // (CryptoKey re-registers its key material so the clone stays usable by
+  // crypto.subtle). Anything else with a registered hook takes that path.
+  if (typeof value[Symbol.toStringTag] === "string" && globalThis.__obscura_clone_hooks) {
+    const hook = globalThis.__obscura_clone_hooks[value[Symbol.toStringTag]];
+    if (typeof hook === "function") return hook(value, seen);
+  }
+  // Cycles.
+  if (seen.has(value)) return seen.get(value);
+  const out = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, out);
+  for (const k in value) {
+    if (Object.prototype.hasOwnProperty.call(value, k)) {
+      out[k] = _structuredClone(value[k], seen);
+    }
+  }
+  // Symbols are not enumerable via for-in; copy own symbol-keyed properties.
+  const syms = Object.getOwnPropertySymbols(value);
+  for (const s of syms) {
+    const d = Object.getOwnPropertyDescriptor(value, s);
+    if (d && "value" in d) out[s] = _structuredClone(d.value, seen);
+  }
+  return out;
+}
+globalThis.structuredClone = globalThis.structuredClone || ((v) => _structuredClone(v, new Map()));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
 // WHATWG Storage as a legacy platform object: a Proxy routes property access
@@ -6916,6 +6983,17 @@ if (!globalThis.crypto.subtle) {
     }
     return keyMaterial.get(key);
   }
+  // A CryptoKey cloned via structuredClone or postMessage is a different
+  // object, so the WeakMap lookup above misses and crypto.subtle throws
+  // "Argument is not a valid CryptoKey". Re-register the (cloned) key's
+  // material so the clone stays usable. The clone hook is dispatched by
+  // _structuredClone via Symbol.toStringTag ("CryptoKey"); registered lazily
+  // because structuredClone is defined before this block (issue #389).
+  globalThis.__obscura_clone_hooks = globalThis.__obscura_clone_hooks || {};
+  globalThis.__obscura_clone_hooks["CryptoKey"] = function (src) {
+    const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    return copy;
+  };
 
   const toBytes = (data) => {
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
