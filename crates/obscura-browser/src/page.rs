@@ -67,6 +67,21 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+/// `&s[..max]` panics if `max` lands inside a multi-byte char; the evaluated
+/// expression logged below is caller-controlled, so slice it safely.
+/// (`str::floor_char_boundary` would do this but is still unstable.)
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 
@@ -1273,7 +1288,7 @@ impl Page {
             match js.evaluate_with_timeout(expression, timeout) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error/timeout for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!("JS eval error/timeout for '{}': {}", truncate_on_char_boundary(expression, 80), e);
                     serde_json::Value::Null
                 }
             }
@@ -1287,7 +1302,7 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!("JS eval error for '{}': {}", truncate_on_char_boundary(expression, 80), e);
                     serde_json::Value::Null
                 }
             }
@@ -1685,7 +1700,19 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::url_matches_cdp_pattern;
+    use super::{truncate_on_char_boundary, url_matches_cdp_pattern};
+
+    #[test]
+    fn truncate_never_splits_a_multibyte_char() {
+        // A caller-supplied expression whose byte 80 lands inside a multi-byte
+        // char would make `&expression[..80]` panic; the helper truncates safely.
+        let s = format!("{}€tail", "a".repeat(79));
+        assert!(!s.is_char_boundary(80), "setup: byte 80 splits the € char");
+        let t = truncate_on_char_boundary(&s, 80);
+        assert!(s.starts_with(t));
+        assert_eq!(t.len(), 79, "should stop right before the € char");
+        assert_eq!(truncate_on_char_boundary("short", 80), "short");
+    }
 
     #[test]
     fn url_matches_cdp_pattern_handles_wildcards_across_url_parts() {

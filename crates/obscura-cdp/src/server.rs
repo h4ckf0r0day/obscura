@@ -717,7 +717,7 @@ async fn process_with_interception(
                     "sessionId": session_for_events,
                 });
                 let event_str = event_json.to_string();
-                tracing::info!("INTERCEPTION event JSON: {}", &event_str[..event_str.len().min(300)]);
+                tracing::info!("INTERCEPTION event JSON: {}", crate::util::truncate_on_char_boundary(&event_str, 300));
                 let _ = reply_tx.send(event_str);
                 intercepted_paused.insert(intercepted.request_id.clone(), intercepted.resolver);
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -829,7 +829,7 @@ async fn process_cdp_message(
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}: {}", e, &text[..text.len().min(200)]);
+            warn!("Invalid CDP: {}: {}", e, crate::util::truncate_on_char_boundary(text, 200));
             return;
         }
     };
