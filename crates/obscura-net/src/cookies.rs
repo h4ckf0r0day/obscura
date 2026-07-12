@@ -54,7 +54,7 @@ impl CookieJar {
 
         let request_host = url.host_str().unwrap_or("").to_lowercase();
         let mut domain_attr: Option<String> = None;
-        let mut path = url.path().to_string();
+        let mut path = default_cookie_path(url.path());
         let mut secure = false;
         let mut http_only = false;
         let mut expires: Option<u64> = None;
@@ -282,7 +282,7 @@ impl CookieJar {
 
         let request_host = url.host_str().unwrap_or("").to_lowercase();
         let mut domain_attr: Option<String> = None;
-        let mut path = url.path().to_string();
+        let mut path = default_cookie_path(url.path());
         let mut secure = false;
         let mut expires: Option<u64> = None;
         let mut same_site = "Lax".to_string();
@@ -564,6 +564,25 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
         Some((dom, false))
     } else {
         Some((origin, true))
+    }
+}
+
+// RFC 6265 5.1.4 default-path: the path a cookie is scoped to when its
+// Set-Cookie carries no Path attribute. It is the request URI's directory — the
+// path up to but not including the right-most '/' — NOT the full request path.
+// Using the full path scopes a session cookie to the exact URL that set it: a
+// cookie set on `/app/login` would then not match `/app/dashboard`, silently
+// logging the user out on the next navigation. Browsers store `/app` here.
+fn default_cookie_path(request_path: &str) -> String {
+    // "If the uri-path is empty or if the first character is not '/', output /."
+    if !request_path.starts_with('/') {
+        return "/".to_string();
+    }
+    match request_path.rfind('/') {
+        // "If the uri-path contains no more than one '/', output /."
+        Some(0) | None => "/".to_string(),
+        // "Output the characters up to, but not including, the right-most '/'."
+        Some(idx) => request_path[..idx].to_string(),
     }
 }
 
@@ -985,5 +1004,61 @@ mod tests {
         assert!(jar.get_cookie_header(&exact_slash).contains("sess=1"));
         let sub = Url::parse("https://example.com/admin/panel").unwrap();
         assert!(jar.get_cookie_header(&sub).contains("sess=1"));
+    }
+
+    #[test]
+    fn default_cookie_path_is_request_directory() {
+        // RFC 6265 5.1.4 default-path: up to (not including) the right-most '/'.
+        assert_eq!(default_cookie_path("/app/login"), "/app");
+        assert_eq!(default_cookie_path("/app/"), "/app");
+        assert_eq!(default_cookie_path("/a/b/c"), "/a/b");
+        // No more than one '/', empty, or non-absolute -> "/".
+        assert_eq!(default_cookie_path("/foo"), "/");
+        assert_eq!(default_cookie_path("/"), "/");
+        assert_eq!(default_cookie_path(""), "/");
+        assert_eq!(default_cookie_path("relative"), "/");
+    }
+
+    #[test]
+    fn cookie_without_path_defaults_to_directory_not_full_path() {
+        // A Set-Cookie with no Path attribute on /app/login must scope to /app
+        // (RFC 6265 5.1.4), so the session survives navigation to /app/dashboard.
+        // Before this fix it was scoped to the full path /app/login and vanished
+        // on the next page, appearing as a silent logout.
+        let jar = CookieJar::new();
+        let login = Url::parse("https://example.com/app/login").unwrap();
+        jar.set_cookie("sid=abc", &login);
+
+        let dashboard = Url::parse("https://example.com/app/dashboard").unwrap();
+        assert!(
+            jar.get_cookie_header(&dashboard).contains("sid=abc"),
+            "session cookie was not sent to a sibling path under the same directory: {}",
+            jar.get_cookie_header(&dashboard)
+        );
+        // Still sent at the directory root and the original path.
+        let app_root = Url::parse("https://example.com/app/").unwrap();
+        assert!(jar.get_cookie_header(&app_root).contains("sid=abc"));
+        assert!(jar.get_cookie_header(&login).contains("sid=abc"));
+
+        // But not to an unrelated top-level path outside the directory.
+        let other = Url::parse("https://example.com/other").unwrap();
+        assert!(
+            !jar.get_cookie_header(&other).contains("sid=abc"),
+            "cookie leaked outside its default-path directory"
+        );
+    }
+
+    #[test]
+    fn js_cookie_without_path_also_defaults_to_directory() {
+        // document.cookie set on /shop/cart with no path must reach /shop/checkout.
+        let jar = CookieJar::new();
+        let cart = Url::parse("https://example.com/shop/cart").unwrap();
+        jar.set_cookie_from_js("cart=xyz", &cart);
+        let checkout = Url::parse("https://example.com/shop/checkout").unwrap();
+        assert!(
+            jar.get_js_visible_cookies(&checkout).contains("cart=xyz"),
+            "JS cookie not visible at sibling path: {}",
+            jar.get_js_visible_cookies(&checkout)
+        );
     }
 }
