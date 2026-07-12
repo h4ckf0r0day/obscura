@@ -125,14 +125,19 @@ impl DomTree {
                 }
                 NodeData::Comment { contents } => {
                     buf.push_str("<!--");
-                    // The HTML parser can never produce a comment whose data contains
-                    // "-->" (that ends the comment), but script can via
-                    // document.createComment("a-->b"). Emitting it verbatim would close
-                    // the comment early and let the trailing text escape into markup.
-                    // Neutralize the terminator so the serialized output round-trips as
-                    // a single comment.
-                    if contents.contains("-->") {
-                        buf.push_str(&contents.replace("-->", "--&gt;"));
+                    // The HTML parser can never produce a comment that closes early,
+                    // but script can via document.createComment(...). The tokenizer
+                    // ends a comment on ANY of four sequences: "-->", "--!>", a
+                    // leading ">", or a leading "->" (comment-start / -start-dash
+                    // abrupt-close). Every one requires a ">". Emitting it verbatim
+                    // would close the comment early and let the trailing text parse
+                    // as live markup (mXSS). Entities are not decoded inside
+                    // comments, so escaping every ">" to "&gt;" neutralizes all four
+                    // forms at once and keeps the data as a single comment.
+                    // (Supersedes the earlier "-->"-only guard, which left the
+                    // leading-">", leading-"->", and "--!>" forms exploitable.)
+                    if contents.contains('>') {
+                        buf.push_str(&contents.replace('>', "&gt;"));
                     } else {
                         buf.push_str(contents);
                     }
@@ -232,5 +237,46 @@ mod tests {
         let html = tree.outer_html(img);
         assert!(html.contains("<img"));
         assert!(!html.contains("</img>"));
+    }
+
+    #[test]
+    fn comment_serialization_neutralizes_all_terminator_forms() {
+        use crate::tree::NodeData;
+
+        // A comment ends on any of "-->", "--!>", a leading ">", or a leading
+        // "->". `document.createComment(...)` accepts arbitrary strings, so a
+        // scripted comment can carry each closing form followed by a real tag.
+        // Serializing must keep the payload inside a single comment; if it
+        // closes early, the trailing "<img>" becomes live markup (mXSS).
+        let payloads = [
+            "><img src=x onerror=alert(1)>", // leading ">" abrupt-closes empty comment
+            "-><img src=x>",                 // leading "->" abrupt-closes
+            "a--!><img src=x>",              // internal "--!>" closes (incorrectly-closed)
+            "a--><img src=x>",               // internal "-->" closes (the previously-fixed form)
+        ];
+
+        for payload in payloads {
+            let tree = parse_html(r#"<div id="host"></div>"#);
+            let host = tree.get_element_by_id("host").unwrap();
+            let comment = tree.new_node(NodeData::Comment { contents: payload.to_string() });
+            tree.append_child(host, comment);
+
+            let serialized = tree.outer_html(host);
+
+            // Re-parsing the serialized markup must not surface an <img>: the
+            // payload has to stay inside the comment.
+            let reparsed = parse_html(&serialized);
+            assert!(
+                reparsed.query_selector("img").unwrap().is_none(),
+                "payload {payload:?} escaped the comment; serialized = {serialized}"
+            );
+            // And the serialized comment data must carry no raw ">".
+            let inner = &serialized[serialized.find("<!--").unwrap() + 4..];
+            let inner = &inner[..inner.find("-->").unwrap()];
+            assert!(
+                !inner.contains('>'),
+                "comment data still contains a raw '>': {serialized}"
+            );
+        }
     }
 }
