@@ -338,11 +338,30 @@ pub async fn handle(
     }
 }
 
-fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth: u32) -> Value {
-    let node = match dom.get_node(node_id) {
-        Some(n) => n,
-        None => return json!(null),
-    };
+// Hard cap on how deep a getDocument/describeNode response may nest, independent
+// of the requested `depth`. DOM.getDocument{depth:-1} arrives here as u32::MAX,
+// which on a pathologically deep DOM (trivially scriptable, unbounded by
+// html5ever) produces a Value nested that far. Even built without recursion,
+// serde_json's own serialization and the Value's Drop recurse over that nesting
+// and overflow the stack — on tokio's ~2 MiB worker stacks especially. Bounding
+// the depth keeps the response safe to serialize and drop. Real DOMs are shallow
+// (deep React trees are a few hundred), so this only truncates pathological
+// nesting, which beats crashing the worker (AGENTS.md: "one page must never
+// crash a worker"). Mirrors DOMSnapshot's MAX_NODES guard (issue #341).
+//
+// The number is sized for the ~2 MiB stack of a tokio worker thread (where the
+// CDP processor runs, and where `#[test]` threads also run): each DOM level
+// becomes two nested JSON containers (object -> "children" array -> object ...),
+// so serde_json's recursive serialization and the Value's recursive Drop descend
+// ~2x this depth. 256 keeps that a few hundred frames deep with wide margin,
+// while still far exceeding any real page. Clients needing a deeper subtree
+// re-request it with DOM.requestChildNodes / describeNode on a specific node.
+const MAX_SERIALIZE_DEPTH: u32 = 256;
+
+/// Build the CDP Node object for a single node (without its `children` array),
+/// returning it together with that node's child ids. `None` for a missing node.
+fn node_value(dom: &DomTree, node_id: NodeId) -> Option<(Value, Vec<NodeId>)> {
+    let node = dom.get_node(node_id)?;
     let children_ids = dom.children(node_id);
     let child_count = children_ids.len();
     let mut result = json!({ "nodeId": node_id.index(), "backendNodeId": node_id.index(), "childNodeCount": child_count });
@@ -381,12 +400,85 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
         }
     }
 
-    if current_depth < max_depth && !children_ids.is_empty() {
-        let children: Vec<Value> = children_ids.iter()
-            .map(|&cid| serialize_node(dom, cid, max_depth, current_depth + 1)).collect();
-        result["children"] = json!(children);
+    Some((result, children_ids))
+}
+
+/// Serialize a node and its descendants into the CDP Node tree, iteratively.
+/// The requested `max_depth` is clamped to `current_depth + MAX_SERIALIZE_DEPTH`
+/// so a `depth:-1` (u32::MAX) request on a very deep DOM cannot produce a Value
+/// that overflows the stack when serde_json later serializes or drops it. An
+/// explicit heap worklist keeps the builder itself off the call stack.
+fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth: u32) -> Value {
+    let max_depth = max_depth.min(current_depth.saturating_add(MAX_SERIALIZE_DEPTH));
+
+    struct Frame {
+        value: Value,
+        children: Vec<NodeId>,
+        next: usize,
+        built: Vec<Value>,
+        depth: u32,
+        expand: bool,
     }
-    result
+
+    let (root_value, root_children) = match node_value(dom, node_id) {
+        Some(v) => v,
+        None => return json!(null),
+    };
+    let root_expand = current_depth < max_depth && !root_children.is_empty();
+    let mut stack = vec![Frame {
+        value: root_value,
+        children: root_children,
+        next: 0,
+        built: Vec::new(),
+        depth: current_depth,
+        expand: root_expand,
+    }];
+
+    loop {
+        // Decide the next step without holding a borrow across a push.
+        let next_child = {
+            let top = stack.last_mut().expect("stack is non-empty in loop");
+            if top.expand && top.next < top.children.len() {
+                let cid = top.children[top.next];
+                top.next += 1;
+                Some(cid)
+            } else {
+                None
+            }
+        };
+
+        match next_child {
+            Some(cid) => {
+                let child_depth = stack.last().unwrap().depth + 1;
+                match node_value(dom, cid) {
+                    Some((cval, cchildren)) => {
+                        let cexpand = child_depth < max_depth && !cchildren.is_empty();
+                        stack.push(Frame {
+                            value: cval,
+                            children: cchildren,
+                            next: 0,
+                            built: Vec::new(),
+                            depth: child_depth,
+                            expand: cexpand,
+                        });
+                    }
+                    // Missing child: match the old recursive behavior of emitting null.
+                    None => stack.last_mut().unwrap().built.push(json!(null)),
+                }
+            }
+            None => {
+                // This node's children are all built; finalize and fold into parent.
+                let mut frame = stack.pop().unwrap();
+                if !frame.built.is_empty() {
+                    frame.value["children"] = json!(frame.built);
+                }
+                match stack.last_mut() {
+                    Some(parent) => parent.built.push(frame.value),
+                    None => return frame.value,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +523,55 @@ mod tests {
             active,
             json!("INPUT"),
             "DOM.focus must set document.activeElement to the focused input"
+        );
+    }
+
+    // A hostile or heavy page can nest nodes tens of thousands deep (trivially
+    // scriptable, and html5ever puts no cap on generic nesting). DOM.getDocument
+    // with the standard depth:-1 (which becomes u32::MAX here) must handle such a
+    // tree without crashing the worker (AGENTS.md: "one page must never crash a
+    // worker"). Two failure modes: (1) a recursive serialize_node overflows the
+    // stack building the Value, and (2) even an iterative builder would emit a
+    // Value so deeply nested that serde_json's own recursive serialize/Drop
+    // overflow. The fix derecurses the builder AND bounds the depth, so the
+    // response is always safe to serialize and drop. With the old recursive
+    // serialize_node this test aborts with SIGABRT.
+    #[test]
+    fn get_document_deep_tree_does_not_overflow() {
+        use obscura_dom::{DomTree, NodeData};
+
+        // Build the deep chain directly (no parser) so setup is O(n) and fast.
+        let dom = DomTree::new();
+        let mut parent = dom.document();
+        let depth = 50_000usize;
+        for _ in 0..depth {
+            let n = dom.new_node(NodeData::Text { contents: String::new() });
+            dom.append_child(parent, n);
+            parent = n;
+        }
+
+        // Mirror getDocument {"depth": -1}: as_i64() == -1, then `depth as u32`.
+        let node = serialize_node(&dom, dom.document(), (-1i64) as u32, 0);
+
+        // serde_json's own serialization recurses over the Value nesting; this
+        // must not overflow either. That is why the fix bounds depth, not just
+        // the builder.
+        let s = serde_json::to_string(&node).expect("serialize");
+        assert!(!s.is_empty());
+
+        // Output nesting is bounded well below the tree's true depth (truncated,
+        // not crashed) yet still serializes a meaningful prefix.
+        let mut cur = &node;
+        let mut levels = 0usize;
+        while let Some(children) = cur.get("children").and_then(|c| c.as_array()) {
+            let Some(first) = children.first() else { break };
+            cur = first;
+            levels += 1;
+        }
+        assert!(levels >= 100, "should serialize a deep prefix, got {levels}");
+        assert!(
+            levels < depth,
+            "nesting must be bounded below the tree's true depth, got {levels}"
         );
     }
 }
