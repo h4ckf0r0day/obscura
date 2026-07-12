@@ -1455,7 +1455,11 @@ class Element extends Node {
       const type = (this.getAttribute('type') || '').toLowerCase();
       if (type === 'submit' || (this.localName === 'button' && type !== 'button' && type !== 'reset')) {
         const form = this.closest ? this.closest('form') : null;
-        if (form && typeof form.submit === 'function') {
+        // A real submit-button click fires the cancelable submit event, so use
+        // requestSubmit() (not the plain submit() method, which now bypasses it).
+        if (form && typeof form.requestSubmit === 'function') {
+          form.requestSubmit(this);
+        } else if (form && typeof form.submit === 'function') {
           form.submit(this);
         }
       }
@@ -1912,10 +1916,21 @@ class Element extends Node {
       opts[i]._selected = (i === v);
     }
   }
+  // Per the HTML spec, the submit() METHOD submits the form WITHOUT firing a
+  // cancelable `submit` event — a page's submit listener cannot veto it. Only
+  // requestSubmit() and user-initiated submits fire the cancelable event.
+  // Conflating the two broke sites whose submit listener preventDefault()s the
+  // native submit and then calls form.submit() from a callback (e.g. an
+  // invisible-reCAPTCHA data-callback) to actually send the form.
   submit(submitter) {
+    this._navigateSubmit(submitter);
+  }
+  requestSubmit(submitter) {
     const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     if (cancelled) return;
-
+    this._navigateSubmit(submitter);
+  }
+  _navigateSubmit(submitter) {
     const pairs = [];
     const fields = this.querySelectorAll('input, select, textarea');
     for (let i = 0; i < fields.length; i++) {
