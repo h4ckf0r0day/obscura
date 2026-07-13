@@ -149,3 +149,61 @@ async fn cryptokey_survives_structured_clone_and_still_signs() {
     assert_eq!(val["cloneTag"], "CryptoKey");
     assert_eq!(val["sigLen"], 32, "cloned CryptoKey must remain usable by crypto.subtle");
 }
+
+// DataView has no .slice() method, so the original TypedArray branch
+// (`new Ctor(value.slice())`) threw `TypeError: value.slice is not a function`
+// on every DataView clone. That is a new crash in the very buffers category
+// this feature targets, so it must clone cleanly.
+#[tokio::test(flavor = "current_thread")]
+async fn structured_clone_preserves_dataview() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(async () => {
+            const buf = new ArrayBuffer(8);
+            const view = new DataView(buf);
+            view.setUint32(0, 0x12345678);
+            view.setUint32(4, 0x9abcdef0);
+            const clone = structuredClone(view);
+            return JSON.stringify({
+                len: clone.byteLength,
+                a: clone.getUint32(0),
+                b: clone.getUint32(4),
+                independent: clone.buffer !== view.buffer,
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["len"], 8, "DataView clone must keep its length");
+    assert_eq!(val["a"], 0x12345678);
+    assert_eq!(val["b"], 0x9abcdef0u64 as i64);
+    assert_eq!(val["independent"], true, "clone must own its buffer, not alias the source");
+}
+
+// Functions and symbols are not structured-cloneable. The original early
+// `typeof !== "object"` return passed them through by reference instead of
+// throwing DataCloneError, so this guards both the throw and the name.
+#[tokio::test(flavor = "current_thread")]
+async fn structured_clone_rejects_functions_and_symbols() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(async () => {
+            const out = {};
+            try { structuredClone(function f(){}); out.fn = "cloned"; }
+            catch (e) { out.fn = e instanceof DOMException ? e.name : "TypeError:" + e.message; }
+            try { structuredClone(Symbol("s")); out.sym = "cloned"; }
+            catch (e) { out.sym = e instanceof DOMException ? e.name : "TypeError:" + e.message; }
+            return JSON.stringify(out);
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["fn"], "DataCloneError", "functions must not clone");
+    assert_eq!(val["sym"], "DataCloneError", "symbols must not clone");
+}

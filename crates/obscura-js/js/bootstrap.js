@@ -5127,16 +5127,32 @@ globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
 // maps/sets, dates, errors, and plain objects recursively; CryptoKey and other
 // types that register a clone hook (see crypto.subtle below) are routed there.
 function _structuredClone(value, seen) {
+  // Functions and symbols are not structured-cloneable (HTML structured clone,
+  // DataCloneError). This must run before the primitive early-return below,
+  // which would otherwise pass them through by reference.
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new DOMException("Failed to execute 'structuredClone': value could not be cloned.", "DataCloneError");
+  }
   if (value === null || typeof value !== "object") return value;
-  if (typeof value === "function") throw new TypeError("Structured clone: functions are not cloneable");
-  // Typed arrays and DataView: copy the underlying buffer slice.
+  if (seen.has(value)) return seen.get(value);
+  // Typed arrays: copy the underlying buffer slice. DataView has no .slice(),
+  // so slice its buffer over the view's range and wrap a fresh view.
   if (ArrayBuffer.isView(value)) {
+    if (value instanceof DataView) {
+      const buf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      const copy = new DataView(buf);
+      seen.set(value, copy);
+      return copy;
+    }
     const Ctor = value.constructor;
     const copy = new Ctor(value.slice());
+    seen.set(value, copy);
     return copy;
   }
   if (value instanceof ArrayBuffer) {
-    return value.slice(0);
+    const copy = value.slice(0);
+    seen.set(value, copy);
+    return copy;
   }
   if (value instanceof SharedArrayBuffer) {
     return value; // transferable, not copyable
@@ -5170,8 +5186,6 @@ function _structuredClone(value, seen) {
     const hook = globalThis.__obscura_clone_hooks[value[Symbol.toStringTag]];
     if (typeof hook === "function") return hook(value, seen);
   }
-  // Cycles.
-  if (seen.has(value)) return seen.get(value);
   const out = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
   seen.set(value, out);
   for (const k in value) {
