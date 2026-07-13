@@ -573,7 +573,7 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
 // Using the full path scopes a session cookie to the exact URL that set it: a
 // cookie set on `/app/login` would then not match `/app/dashboard`, silently
 // logging the user out on the next navigation. Browsers store `/app` here.
-fn default_cookie_path(request_path: &str) -> String {
+pub fn default_cookie_path(request_path: &str) -> String {
     // "If the uri-path is empty or if the first character is not '/', output /."
     if !request_path.starts_with('/') {
         return "/".to_string();

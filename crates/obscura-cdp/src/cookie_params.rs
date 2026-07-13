@@ -31,7 +31,11 @@ pub fn parse_cdp_cookie(value: &Value) -> Option<CookieInfo> {
         .get("path")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| url_parsed.as_ref().map(|u| u.path().to_string()))
+        .or_else(|| {
+            url_parsed
+                .as_ref()
+                .map(|u| obscura_net::default_cookie_path(u.path()))
+        })
         .unwrap_or_else(|| DEFAULT_COOKIE_PATH.to_string());
 
     let secure = value.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -118,6 +122,10 @@ mod tests {
 
     #[test]
     fn parse_with_url_fallback_for_domain_and_path() {
+        // RFC 6265 5.1.4 default-path: a cookie set under /v1/things with no
+        // explicit Path is scoped to the directory /v1, not the full request
+        // path. Puppeteer's page.setCookie / Playwright's addCookies reach this
+        // path when the caller omits `path`.
         let v = json!({
             "name": "tok",
             "value": "xyz",
@@ -125,6 +133,19 @@ mod tests {
         });
         let c = parse_cdp_cookie(&v).unwrap();
         assert_eq!(c.domain, "api.example.com");
+        assert_eq!(c.path, "/v1");
+    }
+
+    #[test]
+    fn parse_explicit_path_overrides_default() {
+        // An explicit Path attribute wins over the RFC default-path.
+        let v = json!({
+            "name": "tok",
+            "value": "xyz",
+            "url": "https://api.example.com/v1/things",
+            "path": "/v1/things",
+        });
+        let c = parse_cdp_cookie(&v).unwrap();
         assert_eq!(c.path, "/v1/things");
     }
 
