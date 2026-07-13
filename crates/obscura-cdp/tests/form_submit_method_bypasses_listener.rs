@@ -138,3 +138,47 @@ async fn request_submit_is_vetoed_by_prevent_default_listener() {
         "requestSubmit() must be cancelable by a preventDefault() submit listener"
     );
 }
+
+// A synthetic CDP click on a submit button is a user-initiated submit, so the
+// cancelable `submit` event must fire and a preventDefault() listener must be
+// able to veto navigation. Before the input.rs fix this path called
+// `form.submit()` directly, bypassing the listener. Regression test for the
+// CDP automation surface (Puppeteer/Playwright elementHandle.click()).
+#[tokio::test(flavor = "current_thread")]
+async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_form().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-3";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    navigate(&mut ctx, &url, session_id).await;
+
+    // Point the CDP click resolver at the submit button explicitly so the test
+    // does not depend on layout coordinates.
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({"expression": "globalThis.__obscura_click_target = document.getElementById('b')"}),
+        session_id,
+    )
+    .await;
+
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mousePressed", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        session_id,
+    )
+    .await;
+
+    let page = ctx.get_page_mut(&page_id).unwrap();
+    assert_ne!(
+        page.url.as_ref().unwrap().path(),
+        "/submitted",
+        "a CDP click on a submit button must fire the cancelable submit event and be vetoable"
+    );
+}
