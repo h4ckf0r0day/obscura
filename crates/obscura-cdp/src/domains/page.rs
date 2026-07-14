@@ -73,12 +73,22 @@ pub fn emit_navigation_events(
         });
     }
 
+    // executionContextsCleared invalidates every prior context id, so a
+    // Runtime.evaluate / callFunctionOn targeting a pre-navigation context
+    // must be rejected (Chrome: "Cannot find context with specified id"). The
+    // default world (id 2) and isolated worlds are re-registered below as their
+    // executionContextCreated events are emitted. Issue #407: previously this
+    // set was insert-only, so stale ids kept validating and grew unbounded.
+    ctx.valid_context_ids.clear();
     let mut phase1 = vec![
         CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
         CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
         CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
     ];
+    // The default world is re-created as context id 2; re-register it. Isolated
+    // worlds register themselves via next_isolated_context in the loop below.
+    ctx.valid_context_ids.insert(2);
     let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
         vec!["__puppeteer_utility_world__24.40.0".to_string()]
     } else {
