@@ -213,6 +213,7 @@ function __maybeLoadDynamicStylesheet(link) {
   const href = link.getAttribute('href');
   if (!rel.includes('stylesheet') || !href) {
     __dynamicStylesheetLoads.delete(link);
+    try { Deno.core.ops.op_css('remove-owner', String(link._nid), '', ''); } catch(e) {}
     return;
   }
 
@@ -231,21 +232,24 @@ function __maybeLoadDynamicStylesheet(link) {
     Promise.resolve().then(() => link.dispatchEvent(new Event('error')));
     return;
   }
-  if (__dynamicStylesheetLoads.get(link) === fullUrl) return;
-  __dynamicStylesheetLoads.set(link, fullUrl);
+  const mediaText = link.getAttribute('media') || '';
+  const loadKey = fullUrl + '\n' + mediaText;
+  if (__dynamicStylesheetLoads.get(link) === loadKey) return;
+  __dynamicStylesheetLoads.set(link, loadKey);
 
   const pageOrigin = (() => { try { return new URL(docUrl).origin; } catch(e) { return ''; } })();
-  Promise.resolve(Deno.core.ops.op_fetch_url(
-    fullUrl, 'GET', '{"accept":"text/css,*/*;q=0.1"}', '', pageOrigin, 'no-cors'
+  const sheetOrigin = (() => { try { return new URL(fullUrl).origin; } catch(e) { return ''; } })();
+  Promise.resolve(Deno.core.ops.op_load_stylesheet(
+    fullUrl, link._nid, mediaText, pageOrigin === sheetOrigin
   )).then(raw => {
-    if (__dynamicStylesheetLoads.get(link) !== fullUrl) return;
+    if (__dynamicStylesheetLoads.get(link) !== loadKey) return;
     let response;
     try { response = typeof raw === 'string' ? JSON.parse(raw) : raw; }
     catch(e) { response = null; }
     const loaded = response && response.status >= 200 && response.status < 400 && !response.blocked;
     link.dispatchEvent(new Event(loaded ? 'load' : 'error'));
   }).catch(() => {
-    if (__dynamicStylesheetLoads.get(link) === fullUrl) {
+    if (__dynamicStylesheetLoads.get(link) === loadKey) {
       link.dispatchEvent(new Event('error'));
     }
   });
@@ -523,19 +527,39 @@ const _CSS_PROPERTY_NAMES = [
 const _CSS_PROP_SET = new Set(_CSS_PROPERTY_NAMES);
 
 class CSSStyleDeclaration {
-  constructor() {
+  constructor(owner, initialText) {
     // Non-enumerable so it never leaks through the proxy's own-key traps.
     Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(this, "_syncing", { value: false, writable: true, enumerable: false, configurable: true });
+    if (initialText) this._setFromAttribute(initialText);
+  }
+  _commit() {
+    if (!this._owner || this._syncing) return;
+    this._syncing = true;
+    try { this._owner.setAttribute("style", this.cssText); }
+    finally { this._syncing = false; }
+  }
+  _setFromAttribute(v) {
+    this._syncing = true;
+    try {
+      for (const k in this._props) delete this._props[k];
+      if (v) String(v).split(";").forEach((p) => {
+        const i = p.indexOf(":");
+        if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
+      });
+    } finally { this._syncing = false; }
   }
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
   setProperty(name, value) {
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) { delete this._props[k]; return; }
+    if (value === "" || value == null) { delete this._props[k]; this._commit(); return; }
     this._props[k] = String(value);
+    this._commit();
   }
-  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; return old || ""; }
+  removeProperty(name) { const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._commit(); return old || ""; }
   getPropertyValue(name) { return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() {
@@ -543,11 +567,8 @@ class CSSStyleDeclaration {
     return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
   }
   set cssText(v) {
-    for (const k in this._props) delete this._props[k];
-    if (v) String(v).split(";").forEach((p) => {
-      const i = p.indexOf(":");
-      if (i > 0) { const k = p.slice(0, i).trim(); const val = p.slice(i + 1).trim(); if (k && val) this._props[_cssCamelToKebab(k)] = val; }
-    });
+    this._setFromAttribute(v);
+    this._commit();
   }
   get length() { return Object.keys(this._props).length; }
   item(i) { return Object.keys(this._props)[i] || ""; }
@@ -561,6 +582,7 @@ const _styleProxy = (decl) => new Proxy(decl, {
   },
   set(t, p, v) {
     if (typeof p === "symbol") { t[p] = v; return true; }
+    if (typeof p === "string" && p.startsWith("_") && p in t) { t[p] = v; return true; }
     if (p === "cssText") { t.cssText = v; return true; }
     if (/^\d+$/.test(p) || p in Object.getPrototypeOf(t)) return true;
     t.setProperty(p, v);
@@ -649,6 +671,7 @@ class Node {
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
     }
+    if (this.tagName === 'STYLE') __syncInlineStyleSheet(this);
   }
   get nodeValue() {
     const t = this.nodeType;
@@ -741,11 +764,13 @@ class Node {
       }
     }
     __maybeLoadDynamicStylesheet(c);
+    if (c instanceof Element && c.tagName === 'STYLE') __syncInlineStyleSheet(c);
     return c;
   }
   removeChild(c) {
     if (!c) return c;
     _dom("remove_child", c._nid);
+    if (c instanceof Element && (c.tagName === 'STYLE' || c.tagName === 'LINK')) _cssOp("remove-owner", c._nid, "", "");
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
     return c;
   }
@@ -760,6 +785,7 @@ class Node {
     if (!ref) { this.appendChild(n); return n; }
     _dom("insert_before", n._nid, ref._nid);
     __maybeLoadDynamicStylesheet(n);
+    if (n instanceof Element && n.tagName === 'STYLE') __syncInlineStyleSheet(n);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -1160,7 +1186,7 @@ function _htmlAttrName(el, n) {
 class Element extends Node {
   constructor(nid) {
     super(nid);
-    this._style = _styleProxy(new CSSStyleDeclaration());
+    this._style = _styleProxy(new CSSStyleDeclaration(this, this.getAttribute("style") || ""));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -1293,6 +1319,10 @@ class Element extends Node {
   }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
+  get sheet() {
+    if (this.tagName !== "LINK" && this.tagName !== "STYLE") return undefined;
+    return globalThis.__obscuraSheetForOwner ? globalThis.__obscuraSheetForOwner(this._nid) : null;
+  }
   getAttribute(n) {
     // Fast path: HTML attributes are stored lowercase, so a direct hit needs no
     // case folding. Only on a miss do we lowercase (gated) and retry, so the hot
@@ -1305,12 +1335,15 @@ class Element extends Node {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
+    if (n === "style" && this._style && !this._style._syncing) this._style._setFromAttribute(String(v));
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
-    if (this.tagName === 'LINK' && (n === 'rel' || n === 'href')) __maybeLoadDynamicStylesheet(this);
+    if (this.tagName === 'LINK' && (n === 'rel' || n === 'href' || n === 'media')) __maybeLoadDynamicStylesheet(this);
+    if ((this.tagName === 'LINK' || this.tagName === 'STYLE') && n === 'disabled') { const sheet = this.sheet; if (sheet) sheet.disabled = true; }
+    if (this.tagName === 'STYLE' && n === 'media') __syncInlineStyleSheet(this);
   }
   setAttributeNS(ns, n, v) { _dom("set_attribute", this._nid, String(n) + "\0" + String(v)); } // exact name, no HTML folding
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); if (this.tagName === 'LINK' && (n === 'rel' || n === 'href')) __maybeLoadDynamicStylesheet(this); }
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style" && this._style && !this._style._syncing) this._style._setFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); if (this.tagName === 'LINK' && (n === 'rel' || n === 'href' || n === 'media')) __maybeLoadDynamicStylesheet(this); if ((this.tagName === 'LINK' || this.tagName === 'STYLE') && n === 'disabled') { const sheet = this.sheet; if (sheet) sheet.disabled = false; } }
   removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
@@ -2696,7 +2729,9 @@ class Document extends Node {
       hasFeature() { return true; },
     };
   }
-  get styleSheets() { return []; }
+  get styleSheets() {
+    return globalThis.__obscuraStyleSheetList ? globalThis.__obscuraStyleSheetList() : [];
+  }
   get forms() { return this.querySelectorAll("form"); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
@@ -3060,6 +3095,9 @@ class NetworkInformation {
   set onchange(v) {}
   get ontypechange() { return null; }
   set ontypechange(v) {}
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() { return true; }
 }
 _markNative(NetworkInformation);
 globalThis.NetworkInformation = NetworkInformation;
@@ -4096,7 +4134,23 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
 });
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
-  const style = el?.style || el?._style || new CSSStyleDeclaration();
+  let nativeValues = {};
+  try {
+    const environment = {
+      width: Number(globalThis.innerWidth || 1920),
+      height: Number(globalThis.innerHeight || 1000),
+      dark: !!globalThis.matchMedia?.('(prefers-color-scheme: dark)').matches,
+      reducedMotion: !!globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches,
+      hover: !!globalThis.matchMedia?.('(hover: hover)').matches,
+      pointerFine: !!globalThis.matchMedia?.('(pointer: fine)').matches,
+    };
+    nativeValues = JSON.parse(_cssOp("computed", el?._nid ?? 0, JSON.stringify(environment), "") || "{}");
+  } catch (e) {}
+  const computedDeclaration = new CSSStyleDeclaration();
+  computedDeclaration._props = Object.assign({}, nativeValues);
+  const style = Object.keys(nativeValues).length
+    ? _styleProxy(computedDeclaration)
+    : (el?.style || el?._style || _styleProxy(computedDeclaration));
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
   // The defaults table previously returned `auto` for width/height and
@@ -4150,6 +4204,7 @@ globalThis.getComputedStyle = (el) => {
     'will-change': 'auto', 'backface-visibility': 'visible',
   };
 
+  const target = style;
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
     // Inline value first.
@@ -4163,17 +4218,16 @@ globalThis.getComputedStyle = (el) => {
     return '';
   };
 
-  const target = style;
   return new Proxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
-      if (prop in target) return target[prop];
       if (prop === 'getPropertyValue') return (name) => lookup(name);
-      if (prop === 'getPropertyPriority') return () => '';
-      if (prop === 'item') return (i) => '';
-      if (prop === 'length') return 0;
-      if (prop === 'cssText') return '';
+      if (prop === 'getPropertyPriority') return (name) => target.getPropertyPriority(name);
+      if (prop === 'item') return (i) => target.item(i);
+      if (prop === 'length') return target.length;
+      if (prop === 'cssText') return target.cssText;
       if (prop === 'parentRule') return null;
+      if (prop in CSSStyleDeclaration.prototype) return target[prop];
       if (typeof prop === 'string') return lookup(prop);
       return undefined;
     },
@@ -4191,41 +4245,111 @@ globalThis.getSelection = _markNative(function getSelection() {
   return _selectionFor(globalThis.document);
 });
 
+const _cssOp = (command, arg1, arg2, arg3) =>
+  Deno.core.ops.op_css(command, String(arg1 ?? ""), String(arg2 ?? ""), String(arg3 ?? ""));
+const _sheetCache = new Map();
+
+class CSSRuleList extends Array {
+  item(index) { return this[index] || null; }
+}
+
+class StyleSheetList extends Array {
+  item(index) { return this[index] || null; }
+}
+
 globalThis.CSSStyleSheet = class CSSStyleSheet {
-  constructor(options) {
-    this.cssRules = [];
+  constructor(options, metadata) {
     this.ownerRule = null;
-    this.disabled = false;
-    this._rules = [];
+    this._id = metadata?.id || +_cssOp("construct", "", "", "");
+    this._ownerNodeId = metadata?.ownerNode ?? null;
+    this.href = metadata?.href ?? null;
+    this.media = { mediaText: metadata?.media || "", length: metadata?.media ? 1 : 0, item(i) { return i === 0 ? this.mediaText : null; }, toString() { return this.mediaText; } };
+    this._disabled = !!metadata?.disabled;
+    this._sameOrigin = metadata?.sameOrigin !== false;
   }
+  _update(metadata) {
+    this._ownerNodeId = metadata.ownerNode ?? null;
+    this.href = metadata.href ?? null;
+    this.media.mediaText = metadata.media || "";
+    this.media.length = this.media.mediaText ? 1 : 0;
+    this._disabled = !!metadata.disabled;
+    this._sameOrigin = metadata.sameOrigin !== false;
+    return this;
+  }
+  get ownerNode() { return this._ownerNodeId == null ? null : _wrap(this._ownerNodeId); }
+  get disabled() { return this._disabled; }
+  set disabled(value) { this._disabled = !!value; _cssOp("disable", this._id, this._disabled, ""); }
+  get cssRules() {
+    if (!this._sameOrigin) throw new DOMException("Cannot access rules", "SecurityError");
+    const raw = JSON.parse(_cssOp("rules", this._id, "", "") || "[]");
+    const list = new CSSRuleList();
+    for (const rule of raw) list.push({ cssText: rule.cssText, type: rule.ruleType, parentStyleSheet: this, parentRule: null });
+    return list;
+  }
+  get rules() { return this.cssRules; }
   insertRule(rule, index) {
-    const idx = index ?? this._rules.length;
-    this._rules.splice(idx, 0, { cssText: rule, type: 1 });
-    this.cssRules = this._rules;
-    return idx;
+    const idx = index === undefined ? this.cssRules.length : Number(index);
+    const result = JSON.parse(_cssOp("insert", this._id, idx, String(rule)) || "{}");
+    if (!result.ok) throw new DOMException(result.error || "Invalid rule", result.error || "SyntaxError");
+    _sheetCache.delete(this._id);
+    this._id = result.id;
+    _sheetCache.set(this._id, this);
+    return result.index;
   }
   deleteRule(index) {
-    this._rules.splice(index, 1);
-    this.cssRules = this._rules;
+    const result = JSON.parse(_cssOp("delete", this._id, Number(index), "") || "{}");
+    if (!result.ok) throw new DOMException(result.error || "Invalid index", result.error || "IndexSizeError");
+    _sheetCache.delete(this._id);
+    this._id = result.id;
+    _sheetCache.set(this._id, this);
   }
-  addRule(selector, style, index) {
-    return this.insertRule(selector + '{' + style + '}', index);
-  }
+  addRule(selector, style, index) { return this.insertRule(selector + "{" + style + "}", index); }
   removeRule(index) { this.deleteRule(index); }
-  replace(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
-    return Promise.resolve(this);
-  }
+  replace(text) { this.replaceSync(text); return Promise.resolve(this); }
   replaceSync(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
+    const result = JSON.parse(_cssOp("replace", this._id, "", String(text)) || "{}");
+    if (!result.ok) throw new DOMException(result.error || "Invalid stylesheet", "SyntaxError");
+    _sheetCache.delete(this._id);
+    this._id = result.id;
+    _sheetCache.set(this._id, this);
   }
 };
 
+function _sheetFromMetadata(metadata) {
+  let sheet = _sheetCache.get(metadata.id);
+  if (!sheet) {
+    sheet = new CSSStyleSheet(undefined, metadata);
+    _sheetCache.set(metadata.id, sheet);
+  }
+  return sheet._update(metadata);
+}
+
+globalThis.__obscuraStyleSheetList = function() {
+  const list = new StyleSheetList();
+  if (_cssOp("enabled", "", "", "") !== "true") return list;
+  const metadata = JSON.parse(_cssOp("sheets", "", "", "") || "[]");
+  for (const entry of metadata) if (entry.ownerNode != null) list.push(_sheetFromMetadata(entry));
+  return list;
+};
+
+globalThis.__obscuraSheetForOwner = function(nid) {
+  const list = globalThis.__obscuraStyleSheetList();
+  for (const sheet of list) if (sheet._ownerNodeId === Number(nid)) return sheet;
+  return null;
+};
+
+function __syncInlineStyleSheet(element) {
+  if (!element || element.tagName !== "STYLE" || !element.isConnected) return;
+  const metadata = JSON.stringify({ href: null, media: element.getAttribute("media") || "", sameOrigin: true });
+  _cssOp("register", element._nid, metadata, element.textContent || "");
+}
+
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
   get() { return this._adoptedStyleSheets || []; },
-  set(sheets) { this._adoptedStyleSheets = sheets; },
+  set(sheets) {
+    this._adoptedStyleSheets = Array.from(sheets || []);
+    _cssOp("adopt", JSON.stringify(this._adoptedStyleSheets.map(sheet => sheet && sheet._id).filter(Boolean)), "", "");
+  },
 });
 
 globalThis.__mutationObservers = [];

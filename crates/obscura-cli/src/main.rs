@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{BrowserContext, CssMode, Page};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
@@ -31,6 +31,11 @@ struct Args {
     /// Global: applies to fetch, serve, scrape, and mcp.
     #[arg(long, global = true)]
     stealth: bool,
+
+    /// Stylesheet handling: compute a lightweight cascade (default), or fetch
+    /// and discard stylesheet bodies for minimum overhead.
+    #[arg(long, global = true, default_value_t = CssMode::Compute)]
+    css_mode: CssMode,
 
     #[arg(long)]
     obey_robots: bool,
@@ -182,9 +187,7 @@ enum Command {
         #[arg(long)]
         user_agent: Option<String>,
     },
-
 }
-
 
 #[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
@@ -321,19 +324,38 @@ async fn main() -> anyhow::Result<()> {
         // SAFETY: set_var is unsafe in newer rustc; this runs before any
         // spawned thread inspects the env, so it's effectively single
         // threaded at this point.
-        unsafe { std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1"); }
+        unsafe {
+            std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        }
+    }
+    // All command surfaces, including worker and CDP child contexts, inherit
+    // the selected per-process CSS policy.
+    unsafe {
+        std::env::set_var("OBSCURA_CSS_MODE", args.css_mode.to_string());
     }
 
     let global_proxy = args.proxy.clone();
     let stealth = args.stealth;
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, workers, allow_file_access, storage_dir, quiet: _ }) => {
+        Some(Command::Serve {
+            port,
+            host,
+            proxy,
+            user_agent,
+            workers,
+            allow_file_access,
+            storage_dir,
+            quiet: _,
+        }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
             // putting credentials on the command line. The multi-worker load
             // balancer passes the proxy to each worker this way (issue #366).
-            let proxy = merge_proxy(global_proxy.clone(), proxy)
-                .or_else(|| std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty()));
+            let proxy = merge_proxy(global_proxy.clone(), proxy).or_else(|| {
+                std::env::var("OBSCURA_PROXY")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
             print_banner(port);
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
@@ -613,13 +635,23 @@ async fn run_fetch(
         let hard = Duration::from_secs(timeout_secs.saturating_add(wait_secs).saturating_add(10));
         std::thread::spawn(move || {
             std::thread::sleep(hard);
-            eprintln!("obscura: hard timeout exceeded ({}s); forcing exit", hard.as_secs());
+            eprintln!(
+                "obscura: hard timeout exceeded ({}s); forcing exit",
+                hard.as_secs()
+            );
             std::process::exit(124);
         });
     }
 
-    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
+    match timeout(
+        Duration::from_secs(timeout_secs),
+        page.navigate_with_wait(url_str, wait_condition),
+    )
+    .await
+    {
+        Ok(result) => {
+            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+        }
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
             url_str,
@@ -896,9 +928,9 @@ async fn write_or_print_bytes(
 async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
-        let found = page.with_dom(|dom| {
-            dom.query_selector(selector).ok().flatten().is_some()
-        }).unwrap_or(false);
+        let found = page
+            .with_dom(|dom| dom.query_selector(selector).ok().flatten().is_some())
+            .unwrap_or(false);
 
         if found {
             return true;
@@ -1132,44 +1164,10 @@ async fn run_parallel_scrape(
             };
             let mut reader = BufReader::new(stdout);
 
-            let worker_result: Result<serde_json::Value, String> = match timeout(worker_timeout, async {
-                let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
-                let mut line = serde_json::to_string(&nav_cmd).unwrap();
-                line.push('\n');
-                if stdin.write_all(line.as_bytes()).await.is_err() {
-                    return Err("Write failed".to_string());
-                }
-                if stdin.flush().await.is_err() {
-                    return Err("Write failed".to_string());
-                }
-
-                let mut resp_line = String::new();
-                match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
-                    Ok(Ok(bytes)) if bytes > 0 => {}
-                    Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
-                    Err(_) => return Err("timeout".to_string()),
-                };
-
-                let nav_resp: serde_json::Value =
-                    serde_json::from_str(resp_line.trim()).unwrap_or(serde_json::json!({"ok": false}));
-
-                if !nav_resp["ok"].as_bool().unwrap_or(false) {
-                    return Err(
-                        nav_resp["error"]
-                            .as_str()
-                            .unwrap_or("navigate failed")
-                            .to_string(),
-                    );
-                }
-
-                let title = nav_resp["result"]["title"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-
-                let eval_result = if let Some(ref expr) = *eval {
-                    let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
-                    let mut line = serde_json::to_string(&eval_cmd).unwrap();
+            let worker_result: Result<serde_json::Value, String> =
+                match timeout(worker_timeout, async {
+                    let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
+                    let mut line = serde_json::to_string(&nav_cmd).unwrap();
                     line.push('\n');
                     if stdin.write_all(line.as_bytes()).await.is_err() {
                         return Err("Write failed".to_string());
@@ -1180,38 +1178,72 @@ async fn run_parallel_scrape(
 
                     let mut resp_line = String::new();
                     match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
-                        Ok(Ok(bytes)) if bytes > 0 => {
-                            let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-                                .unwrap_or(serde_json::json!({"ok": false}));
-                            resp["result"].clone()
-                        }
+                        Ok(Ok(bytes)) if bytes > 0 => {}
                         Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
                         Err(_) => return Err("timeout".to_string()),
+                    };
+
+                    let nav_resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+                        .unwrap_or(serde_json::json!({"ok": false}));
+
+                    if !nav_resp["ok"].as_bool().unwrap_or(false) {
+                        return Err(nav_resp["error"]
+                            .as_str()
+                            .unwrap_or("navigate failed")
+                            .to_string());
                     }
-                } else {
-                    serde_json::Value::Null
+
+                    let title = nav_resp["result"]["title"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+
+                    let eval_result = if let Some(ref expr) = *eval {
+                        let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
+                        let mut line = serde_json::to_string(&eval_cmd).unwrap();
+                        line.push('\n');
+                        if stdin.write_all(line.as_bytes()).await.is_err() {
+                            return Err("Write failed".to_string());
+                        }
+                        if stdin.flush().await.is_err() {
+                            return Err("Write failed".to_string());
+                        }
+
+                        let mut resp_line = String::new();
+                        match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
+                            Ok(Ok(bytes)) if bytes > 0 => {
+                                let resp: serde_json::Value =
+                                    serde_json::from_str(resp_line.trim())
+                                        .unwrap_or(serde_json::json!({"ok": false}));
+                                resp["result"].clone()
+                            }
+                            Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
+                            Err(_) => return Err("timeout".to_string()),
+                        }
+                    } else {
+                        serde_json::Value::Null
+                    };
+
+                    let shutdown_cmd = serde_json::json!({"cmd": "shutdown"});
+                    let mut line = serde_json::to_string(&shutdown_cmd).unwrap();
+                    line.push('\n');
+                    let _ = stdin.write_all(line.as_bytes()).await;
+                    let _ = stdin.flush().await;
+                    let _ = timeout(shutdown_timeout, child.wait()).await;
+
+                    Ok(serde_json::json!({
+                        "url": url,
+                        "title": title,
+                        "eval": eval_result,
+                        "time_ms": task_start.elapsed().as_millis(),
+                        "worker": i,
+                    }))
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("timeout".to_string()),
                 };
-
-                let shutdown_cmd = serde_json::json!({"cmd": "shutdown"});
-                let mut line = serde_json::to_string(&shutdown_cmd).unwrap();
-                line.push('\n');
-                let _ = stdin.write_all(line.as_bytes()).await;
-                let _ = stdin.flush().await;
-                let _ = timeout(shutdown_timeout, child.wait()).await;
-
-                Ok(serde_json::json!({
-                    "url": url,
-                    "title": title,
-                    "eval": eval_result,
-                    "time_ms": task_start.elapsed().as_millis(),
-                    "worker": i,
-                }))
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err("timeout".to_string()),
-            };
 
             match worker_result {
                 Ok(result) => result,
@@ -1366,9 +1398,13 @@ fn extract_assets(dom: &obscura_dom::DomTree, base_url: Option<&url::Url>) -> St
     for (selector, attr, default_kind) in ASSET_SELECTORS {
         let nodes = dom.query_selector_all(selector).unwrap_or_default();
         for node_id in nodes {
-            let Some(node) = dom.get_node(node_id) else { continue };
+            let Some(node) = dom.get_node(node_id) else {
+                continue;
+            };
             let raw = node.get_attribute(attr).unwrap_or_default().to_string();
-            let Some(url) = resolve_asset_url(&raw, base_url) else { continue };
+            let Some(url) = resolve_asset_url(&raw, base_url) else {
+                continue;
+            };
 
             let kind = if *default_kind == "link" {
                 let rel = node.get_attribute("rel").unwrap_or_default().to_string();
@@ -1424,7 +1460,27 @@ mod tests {
         write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
+    use obscura_browser::CssMode;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn css_mode_is_global_and_defaults_to_compute() {
+        let default = Args::try_parse_from(["obscura", "fetch", "https://example.com"])
+            .expect("default CSS mode should parse");
+        assert_eq!(default.css_mode, CssMode::Compute);
+
+        let before = Args::try_parse_from([
+            "obscura", "--css-mode", "drop", "serve",
+        ])
+        .expect("global CSS mode should parse before a subcommand");
+        assert_eq!(before.css_mode, CssMode::Drop);
+
+        let after = Args::try_parse_from([
+            "obscura", "mcp", "--css-mode", "drop",
+        ])
+        .expect("global CSS mode should parse after a subcommand");
+        assert_eq!(after.css_mode, CssMode::Drop);
+    }
 
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.
@@ -2016,5 +2072,4 @@ mod tests {
         assert!(lines[0].contains("\"https://example.test/ok.html\""));
         assert!(lines[0].contains("\"iframe\""));
     }
-
 }

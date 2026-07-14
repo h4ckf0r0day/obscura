@@ -3,6 +3,71 @@ use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
+/// Controls how stylesheet responses are handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CssMode {
+    /// Parse stylesheets and expose a lightweight, non-rendering cascade.
+    #[default]
+    Compute,
+    /// Fetch top-level stylesheets for lifecycle fidelity, then discard them.
+    Drop,
+}
+
+impl std::str::FromStr for CssMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "compute" => Ok(Self::Compute),
+            "drop" => Ok(Self::Drop),
+            _ => Err(format!(
+                "invalid CSS mode '{value}' (expected compute or drop)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for CssMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Compute => "compute",
+            Self::Drop => "drop",
+        })
+    }
+}
+
+impl CssMode {
+    pub fn process_default() -> Self {
+        std::env::var("OBSCURA_CSS_MODE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(Self::Compute)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserContextOptions {
+    pub proxy_url: Option<String>,
+    pub stealth: bool,
+    pub user_agent: Option<String>,
+    pub storage_dir: Option<PathBuf>,
+    pub allow_private_network: bool,
+    pub css_mode: CssMode,
+}
+
+impl Default for BrowserContextOptions {
+    fn default() -> Self {
+        Self {
+            proxy_url: None,
+            stealth: false,
+            user_agent: None,
+            storage_dir: None,
+            allow_private_network: false,
+            css_mode: CssMode::process_default(),
+        }
+    }
+}
+
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
@@ -30,21 +95,25 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+    pub css_mode: CssMode,
 }
 
 impl BrowserContext {
     pub fn new(id: String) -> Self {
-        Self::_new_inner(id, None, false, None, None, false)
+        Self::with_config(id, BrowserContextOptions::default())
     }
 
     /// Create a BrowserContext with an optional storage directory.
     /// When `storage_dir` is set, cookies are automatically loaded from
     /// `{storage_dir}/cookies.json` on creation.
-    pub fn with_storage(
-        id: String,
-        storage_dir: Option<PathBuf>,
-    ) -> Self {
-        Self::_new_inner(id, None, false, None, storage_dir, false)
+    pub fn with_storage(id: String, storage_dir: Option<PathBuf>) -> Self {
+        Self::with_config(
+            id,
+            BrowserContextOptions {
+                storage_dir,
+                ..Default::default()
+            },
+        )
     }
 
     /// Create a BrowserContext with full options including storage_dir.
@@ -55,7 +124,16 @@ impl BrowserContext {
         user_agent: Option<String>,
         storage_dir: Option<PathBuf>,
     ) -> Self {
-        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir, false)
+        Self::with_config(
+            id,
+            BrowserContextOptions {
+                proxy_url,
+                stealth,
+                user_agent,
+                storage_dir,
+                ..Default::default()
+            },
+        )
     }
 
     /// Variant that also accepts the `allow_private_network` opt-in. All
@@ -69,7 +147,29 @@ impl BrowserContext {
         storage_dir: Option<PathBuf>,
         allow_private_network: bool,
     ) -> Self {
-        Self::_new_inner(id, proxy_url, stealth, user_agent, storage_dir, allow_private_network)
+        Self::with_config(
+            id,
+            BrowserContextOptions {
+                proxy_url,
+                stealth,
+                user_agent,
+                storage_dir,
+                allow_private_network,
+                css_mode: CssMode::process_default(),
+            },
+        )
+    }
+
+    pub fn with_config(id: String, options: BrowserContextOptions) -> Self {
+        Self::_new_inner(
+            id,
+            options.proxy_url,
+            options.stealth,
+            options.user_agent,
+            options.storage_dir,
+            options.allow_private_network,
+            options.css_mode,
+        )
     }
 
     fn _new_inner(
@@ -79,6 +179,7 @@ impl BrowserContext {
         user_agent: Option<String>,
         storage_dir: Option<PathBuf>,
         allow_private_network: bool,
+        css_mode: CssMode,
     ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
 
@@ -133,6 +234,7 @@ impl BrowserContext {
             allow_file_access: false,
             storage_dir,
             allow_private_network,
+            css_mode,
         }
     }
 
@@ -146,7 +248,15 @@ impl BrowserContext {
         stealth: bool,
         user_agent: Option<String>,
     ) -> Self {
-        Self::_new_inner(id, proxy_url, stealth, user_agent, None, false)
+        Self::with_config(
+            id,
+            BrowserContextOptions {
+                proxy_url,
+                stealth,
+                user_agent,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn with_proxy(id: String, proxy_url: Option<String>) -> Self {

@@ -3,10 +3,12 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
-use obscura_net::{ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
+use obscura_net::{
+    ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback,
+};
 use url::Url;
 
-use crate::context::BrowserContext;
+use crate::context::{BrowserContext, CssMode};
 use crate::lifecycle::LifecycleState;
 
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
@@ -108,38 +110,17 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
 /// Real Chrome allows data: subresources by default; Instagram and most
 /// Meta properties depend on this for their inline bootstrap scripts.
 fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
-    let Ok(target) = Url::parse(resource) else { return false };
+    let Ok(target) = Url::parse(resource) else {
+        return false;
+    };
     let scheme = target.scheme().to_ascii_lowercase();
     match scheme.as_str() {
         "http" | "https" | "data" => true,
-        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
+        "file" => page_url
+            .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+            .unwrap_or(false),
         _ => false,
     }
-}
-
-/// Escape a value for safe inclusion inside a JavaScript template
-/// literal. The previous implementation only escaped `\`, `` ` `` and
-/// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
-/// and other control characters as breakout vectors. Done at the
-/// callsite means future tweaks come back to one function.
-fn escape_for_js_template_literal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '`' => out.push_str("\\`"),
-            '$' => out.push_str("\\$"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            '\u{0000}' => out.push_str("\\0"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +254,83 @@ impl Page {
         }
         self.http_client.fetch(url).await
     }
+
+    fn fetch_css_import_tree<'a>(
+        &'a mut self,
+        base_url: Url,
+        css: String,
+        inherited_media: String,
+        depth: usize,
+        visited: &'a mut std::collections::HashSet<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Vec<(String, String, bool, String)>> + 'a>,
+    > {
+        Box::pin(async move {
+            if depth >= obscura_dom::style::MAX_IMPORT_DEPTH {
+                tracing::warn!(
+                    limit = obscura_dom::style::MAX_IMPORT_DEPTH,
+                    "CSS import depth limit reached"
+                );
+                return Vec::new();
+            }
+            let mut output = Vec::new();
+            for (href, import_media) in obscura_dom::extract_imports(&css) {
+                let Ok(import_url) = base_url.join(&href) else {
+                    continue;
+                };
+                let url_string = import_url.to_string();
+                if !visited.insert(url_string.clone())
+                    || !subresource_allowed(self.url.as_ref(), &url_string)
+                    || self.should_block_url(&url_string)
+                {
+                    continue;
+                }
+                let Ok(response) = self.do_fetch(&import_url).await else {
+                    continue;
+                };
+                self.record_network_event_with_body(
+                    &url_string,
+                    "GET",
+                    "Stylesheet",
+                    response.status,
+                    &response.headers,
+                    &response.body,
+                    false,
+                );
+                if !(200..400).contains(&response.status) {
+                    continue;
+                }
+                let child_css =
+                    obscura_net::decode_non_html(&response.body, response.content_type());
+                let media = match (
+                    inherited_media.trim().is_empty(),
+                    import_media.trim().is_empty(),
+                ) {
+                    (true, true) => String::new(),
+                    (true, false) => import_media,
+                    (false, true) => inherited_media.clone(),
+                    (false, false) => format!("{} and {}", inherited_media, import_media),
+                };
+                let nested = self
+                    .fetch_css_import_tree(
+                        import_url.clone(),
+                        child_css.clone(),
+                        media.clone(),
+                        depth + 1,
+                        visited,
+                    )
+                    .await;
+                output.extend(nested);
+                let same_origin = self
+                    .url
+                    .as_ref()
+                    .map(|page| page.origin() == import_url.origin())
+                    .unwrap_or(true);
+                output.push((url_string, media, same_origin, child_css));
+            }
+            output
+        })
+    }
     fn init_js(&mut self) {
         // Drop any existing runtime so the JS realm starts clean on
         // every navigation. The old code reused the V8 isolate and
@@ -296,6 +354,7 @@ impl Page {
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
+        rt.set_css_enabled(self.context.css_mode == CssMode::Compute);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
@@ -363,14 +422,13 @@ impl Page {
     fn resolve_base_url(&self) -> Option<url::Url> {
         let doc_url = self.url.as_ref()?;
         let base_href: Option<String> = self.js.as_ref().and_then(|js| {
-            js.with_dom(|dom| {
-                match dom.query_selector("base[href]") {
-                    Ok(Some(nid)) => {
-                        dom.get_node(nid).and_then(|n| n.get_attribute("href").map(|s| s.to_string()))
-                    }
-                    _ => None,
-                }
-            }).flatten()
+            js.with_dom(|dom| match dom.query_selector("base[href]") {
+                Ok(Some(nid)) => dom
+                    .get_node(nid)
+                    .and_then(|n| n.get_attribute("href").map(|s| s.to_string())),
+                _ => None,
+            })
+            .flatten()
         });
         match base_href {
             Some(href) => doc_url.join(&href).ok(),
@@ -424,8 +482,8 @@ impl Page {
         }
 
         let all_scripts = match &self.js {
-            Some(js) => {
-                js.with_dom(|dom| {
+            Some(js) => js
+                .with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
 
@@ -464,8 +522,8 @@ impl Page {
                         }
                     }
                     scripts
-                }).unwrap_or_default()
-            }
+                })
+                .unwrap_or_default(),
             None => return,
         };
 
@@ -1042,7 +1100,33 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
-        let stylesheet_urls: Vec<String> = dom
+        let stylesheet_nodes = dom.query_selector_all("link, style").unwrap_or_default();
+        let stylesheet_order: std::collections::HashMap<_, _> = stylesheet_nodes
+            .iter()
+            .enumerate()
+            .map(|(order, node)| (*node, order))
+            .collect();
+        let inline_css_sources: Vec<_> = stylesheet_nodes
+            .iter()
+            .filter_map(|&nid| {
+                dom.with_node(nid, |node| {
+                    (node
+                        .as_element()
+                        .map(|name| name.local.as_ref() == "style")
+                        .unwrap_or(false))
+                    .then(|| {
+                        (
+                            *stylesheet_order.get(&nid).unwrap_or(&usize::MAX),
+                            nid,
+                            node.get_attribute("media").unwrap_or("").to_string(),
+                            dom.text_content(nid),
+                        )
+                    })
+                })
+                .flatten()
+            })
+            .collect();
+        let stylesheet_links: Vec<(usize, obscura_dom::NodeId, String, String)> = dom
             .query_selector_all("link")
             .unwrap_or_default()
             .iter()
@@ -1055,18 +1139,27 @@ impl Page {
                     if !rel.eq_ignore_ascii_case("stylesheet") {
                         return None;
                     }
-                    node.get_attribute("href").map(|s| s.to_string())
+                    node.get_attribute("href").map(|href| {
+                        (
+                            *stylesheet_order.get(&nid).unwrap_or(&usize::MAX),
+                            nid,
+                            href.to_string(),
+                            node.get_attribute("media").unwrap_or("").to_string(),
+                        )
+                    })
                 })
                 .flatten()
             })
             .collect();
 
-        let mut css_fetch_urls: Vec<String> = Vec::new();
-        for href in &stylesheet_urls {
+        let mut css_fetches: Vec<(usize, obscura_dom::NodeId, String, String, bool)> = Vec::new();
+        for (order, owner, href, media) in &stylesheet_links {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else if let Some(base) = &self.url {
-                base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
+                base.join(href)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| href.clone())
             } else {
                 href.clone()
             };
@@ -1082,60 +1175,147 @@ impl Page {
                 tracing::info!("Blocked stylesheet by interception: {}", full_url);
                 continue;
             }
-            css_fetch_urls.push(full_url);
+            let same_origin = self
+                .url
+                .as_ref()
+                .and_then(|page| {
+                    Url::parse(&full_url)
+                        .ok()
+                        .map(|sheet| page.origin() == sheet.origin())
+                })
+                .unwrap_or(true);
+            css_fetches.push((*order, *owner, full_url, media.clone(), same_origin));
         }
 
         let client = self.http_client.clone();
-        let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
-            let client = client.clone();
-            let url_str = full_url.clone();
-            async move {
-                let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((url_str, resp)),
-                    Err(e) => {
-                        tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
-                        None
+        let css_futures: Vec<_> = css_fetches
+            .iter()
+            .map(|(order, owner, full_url, media, same_origin)| {
+                let client = client.clone();
+                let order = *order;
+                let owner = *owner;
+                let url_str = full_url.clone();
+                let media = media.clone();
+                let same_origin = *same_origin;
+                async move {
+                    let parsed =
+                        Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match client.fetch(&parsed).await {
+                        Ok(resp) => Some((order, owner, url_str, media, same_origin, resp)),
+                        Err(e) => {
+                            tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         // Same concurrency cap as script fetches.
         use futures::StreamExt as _;
-        let css_results: Vec<_> = futures::stream::iter(css_futures)
+        let mut css_results: Vec<_> = futures::stream::iter(css_futures)
             .buffer_unordered(16)
             .collect()
             .await;
+        css_results
+            .sort_by_key(|result| result.as_ref().map(|entry| entry.0).unwrap_or(usize::MAX));
         let mut css_sources = Vec::new();
         for result in css_results {
-            if let Some((url_str, resp)) = result {
-                // CSS bodies: honor the Content-Type charset; CSS @charset is
-                // out of scope for the current scrape-focused pipeline.
-                let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                self.record_network_event_with_body(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, &resp.body, false);
-                css_sources.push(css);
+            if let Some((_order, owner, url_str, media, same_origin, resp)) = result {
+                if self.context.css_mode == CssMode::Compute {
+                    // CSS bodies: honor the Content-Type charset; CSS @charset is
+                    // out of scope for the current scrape-focused pipeline.
+                    let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                    self.record_network_event_with_body(
+                        &url_str,
+                        "GET",
+                        "Stylesheet",
+                        resp.status,
+                        &resp.headers,
+                        &resp.body,
+                        false,
+                    );
+                    css_sources.push((owner, url_str, media, same_origin, css));
+                } else {
+                    // Explicit drop mode preserves the request/event metadata but
+                    // avoids UTF-8 conversion and response-body retention.
+                    self.record_network_event(
+                        &url_str,
+                        "GET",
+                        "Stylesheet",
+                        resp.status,
+                        &resp.headers,
+                        resp.body.len(),
+                    );
+                }
             }
+        }
+
+        let mut css_registrations: Vec<(
+            usize,
+            usize,
+            Option<obscura_dom::NodeId>,
+            Option<obscura_dom::NodeId>,
+            Option<String>,
+            String,
+            bool,
+            String,
+        )> = inline_css_sources
+            .into_iter()
+            .map(|(order, owner, media, css)| {
+                (order, 0, Some(owner), None, None, media, true, css)
+            })
+            .collect();
+        if self.context.css_mode == CssMode::Compute {
+            let mut visited = std::collections::HashSet::new();
+            for (owner, href, media, same_origin, css) in css_sources {
+                let order = *stylesheet_order.get(&owner).unwrap_or(&usize::MAX);
+                visited.insert(href.clone());
+                if let Ok(base) = Url::parse(&href) {
+                    for (sequence, (import_href, import_media, import_same_origin, import_css)) in self
+                        .fetch_css_import_tree(base, css.clone(), media.clone(), 0, &mut visited)
+                        .await
+                        .into_iter()
+                        .enumerate()
+                    {
+                        css_registrations.push((
+                            order,
+                            sequence,
+                            None,
+                            Some(owner),
+                            Some(import_href),
+                            import_media,
+                            import_same_origin,
+                            import_css,
+                        ));
+                    }
+                }
+                css_registrations.push((
+                    order,
+                    usize::MAX,
+                    Some(owner),
+                    None,
+                    Some(href),
+                    media,
+                    same_origin,
+                    css,
+                ));
+            }
+            css_registrations.sort_by_key(|entry| (entry.0, entry.1));
         }
 
         self.dom = Some(dom);
         self.init_js();
 
-        // Inject CSS as a global so getComputedStyle and any CSS-aware shim
-        // can read it. Has to happen before scripts run, regardless of
-        // waitUntil, so handlers that read window.__obscura_css see it.
-        if !css_sources.is_empty() {
-            if let Some(js) = &mut self.js {
-                let combined_css = css_sources.join("\n");
-                // Use the thorough template-literal escape that
-                // covers U+2028 / U+2029 and other control chars.
-                // The previous escaper only handled `, \, and ${,
-                // letting attacker-controlled CSS containing a raw
-                // U+2028 break out of the template literal and run
-                // arbitrary JS in the page's V8 realm.
-                let escaped = escape_for_js_template_literal(&combined_css);
-                let code = format!("globalThis.__obscura_css = `{}`;", escaped);
-                let _ = js.execute_script("<css>", &code);
+        if let Some(js) = &self.js {
+            if self.context.css_mode == CssMode::Compute {
+                for (_order, _sequence, owner, import_owner, href, media, same_origin, css) in css_registrations {
+                    if let (Some(import_owner), Some(href)) = (import_owner, href.clone()) {
+                        js.register_import_stylesheet(import_owner, href, media, same_origin, &css);
+                    } else {
+                        js.register_stylesheet(owner, href, media, same_origin, &css);
+                    }
+                }
             }
         }
         if let Some(js) = &mut self.js {
@@ -1488,12 +1668,13 @@ impl Page {
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
         self.response_bodies.get(request_id).cloned().or_else(|| {
-            self.js.as_ref()?.get_network_response_body(request_id).map(|body| {
-                StoredResponseBody {
+            self.js
+                .as_ref()?
+                .get_network_response_body(request_id)
+                .map(|body| StoredResponseBody {
                     body: body.body,
                     base64_encoded: body.base64_encoded,
-                }
-            })
+                })
         })
     }
 

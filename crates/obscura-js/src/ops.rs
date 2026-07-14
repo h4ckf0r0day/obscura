@@ -3,17 +3,21 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::op2;
-use deno_core::OpState;
-use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
+use deno_core::op2;
+use deno_core::Extension;
+use deno_core::OpState;
+use obscura_dom::{DomTree, MediaEnvironment, NodeData, NodeId, StyleEngine};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
+use obscura_net::{CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
 use tokio::sync::Mutex;
 
-pub type InterceptCallback = Arc<Mutex<Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>>>;
+pub type InterceptCallback = Arc<
+    Mutex<
+        Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>,
+    >,
+>;
 
 #[derive(Debug)]
 pub enum InterceptResolution {
@@ -77,6 +81,11 @@ pub struct ObscuraState {
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
     pub fetched_urls: Vec<String>,
+    /// Native author-style registry. External CSS is parsed here and never
+    /// interpolated into executable JavaScript.
+    pub style_engine: StyleEngine,
+    /// False for the explicit fetch-and-discard CSS mode.
+    pub css_enabled: bool,
 }
 
 impl ObscuraState {
@@ -100,6 +109,8 @@ impl ObscuraState {
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
+            style_engine: StyleEngine::new(),
+            css_enabled: true,
         }
     }
 }
@@ -122,20 +133,379 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 
 #[op2]
 #[string]
-fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[string] arg2: String) -> String {
+fn op_dom(
+    state: &OpState,
+    #[string] cmd: String,
+    #[string] arg1: String,
+    #[string] arg2: String,
+) -> String {
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
     // inconsistent tree node degrades to a null result for that single call.
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    let invalidates_style = matches!(
+        cmd.as_str(),
+        "append_child"
+            | "insert_before"
+            | "remove_child"
+            | "set_attribute"
+            | "remove_attribute"
+            | "set_inner_html"
+            | "set_text_content"
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         op_dom_inner(state, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
         "null".to_string()
+    });
+    if invalidates_style {
+        let gs = state.borrow::<SharedState>().clone();
+        gs.borrow_mut().style_engine.invalidate();
+    }
+    result
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetRegistration {
+    href: Option<String>,
+    #[serde(default)]
+    media: String,
+    #[serde(default = "default_true")]
+    same_origin: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone)]
+enum StylesheetFetchClient {
+    Regular(Arc<ObscuraHttpClient>),
+    #[cfg(feature = "stealth")]
+    Stealth(Arc<StealthHttpClient>),
+}
+
+impl StylesheetFetchClient {
+    async fn fetch(&self, url: &url::Url) -> Result<Response, String> {
+        match self {
+            Self::Regular(client) => client.fetch(url).await.map_err(|error| error.to_string()),
+            #[cfg(feature = "stealth")]
+            Self::Stealth(client) => client.fetch(url).await.map_err(|error| error.to_string()),
+        }
+    }
+}
+
+fn fetch_dynamic_css_imports<'a>(
+    client: &'a StylesheetFetchClient,
+    base_url: url::Url,
+    css: String,
+    inherited_media: String,
+    page_origin: Option<url::Origin>,
+    blocked_patterns: &'a [String],
+    depth: usize,
+    visited: &'a mut std::collections::HashSet<String>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Vec<(String, String, bool, String)>> + 'a>,
+> {
+    Box::pin(async move {
+        if depth >= obscura_dom::style::MAX_IMPORT_DEPTH {
+            tracing::warn!(
+                limit = obscura_dom::style::MAX_IMPORT_DEPTH,
+                "dynamic CSS import depth limit reached"
+            );
+            return Vec::new();
+        }
+        let mut output = Vec::new();
+        for (href, import_media) in obscura_dom::extract_imports(&css) {
+            let Ok(import_url) = base_url.join(&href) else { continue };
+            let import_href = import_url.to_string();
+            let blocked = blocked_patterns.iter().any(|pattern| {
+                pattern == "*" || import_href.contains(pattern) || glob_match(pattern, &import_href)
+            });
+            if !visited.insert(import_href.clone()) || validate_fetch_url(&import_url).is_err() || blocked {
+                continue;
+            }
+            let Ok(response) = client.fetch(&import_url).await else { continue };
+            if !(200..400).contains(&response.status) {
+                continue;
+            }
+            let child_css = obscura_net::decode_non_html(&response.body, response.content_type());
+            let media = match (
+                inherited_media.trim().is_empty(),
+                import_media.trim().is_empty(),
+            ) {
+                (true, true) => String::new(),
+                (true, false) => import_media,
+                (false, true) => inherited_media.clone(),
+                (false, false) => format!("{} and {}", inherited_media, import_media),
+            };
+            output.extend(
+                fetch_dynamic_css_imports(
+                    client,
+                    import_url.clone(),
+                    child_css.clone(),
+                    media.clone(),
+                    page_origin.clone(),
+                    blocked_patterns,
+                    depth + 1,
+                    visited,
+                )
+                .await,
+            );
+            let same_origin = page_origin
+                .as_ref()
+                .map(|origin| origin == &import_url.origin())
+                .unwrap_or(true);
+            output.push((import_href, media, same_origin, child_css));
+        }
+        output
     })
+}
+
+/// Synchronous CSSOM/computed-style bridge. Only small metadata and requested
+/// results cross the V8 boundary; whole external stylesheets remain native.
+#[op2]
+#[string]
+fn op_css(
+    state: &OpState,
+    #[string] command: String,
+    #[string] arg1: String,
+    #[string] arg2: String,
+    #[string] arg3: String,
+) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    match command.as_str() {
+        "enabled" => gs.css_enabled.to_string(),
+        "sheets" => {
+            serde_json::to_string(&gs.style_engine.sheet_infos()).unwrap_or_else(|_| "[]".into())
+        }
+        "rules" => {
+            let id = arg1.parse::<u32>().unwrap_or(0);
+            serde_json::to_string(&gs.style_engine.sheet_rules(id).unwrap_or_default())
+                .unwrap_or_else(|_| "[]".into())
+        }
+        "computed" => {
+            if !gs.css_enabled {
+                return "{}".to_string();
+            }
+            let node = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let environment: MediaEnvironment = serde_json::from_str(&arg2).unwrap_or_default();
+            let gs = &mut *gs;
+            let Some(dom) = gs.dom.as_ref() else {
+                return "{}".to_string();
+            };
+            let values = gs.style_engine.compute_style(dom, node, environment);
+            serde_json::to_string(&values).unwrap_or_else(|_| "{}".into())
+        }
+        "register" => {
+            if !gs.css_enabled {
+                return "0".to_string();
+            }
+            let owner = arg1.parse::<u32>().ok().map(NodeId::new);
+            let registration: SheetRegistration =
+                serde_json::from_str(&arg2).unwrap_or(SheetRegistration {
+                    href: None,
+                    media: String::new(),
+                    same_origin: true,
+                });
+            gs.style_engine
+                .replace_owner_stylesheet(
+                    owner.unwrap_or_else(|| NodeId::new(u32::MAX)),
+                    registration.href,
+                    registration.media,
+                    registration.same_origin,
+                    &arg3,
+                )
+                .unwrap_or(0)
+                .to_string()
+        }
+        "construct" => {
+            if !gs.css_enabled {
+                return "0".to_string();
+            }
+            gs.style_engine
+                .register_constructed(&arg3)
+                .unwrap_or(0)
+                .to_string()
+        }
+        "adopt" => {
+            let ids: Vec<u32> = serde_json::from_str(&arg1).unwrap_or_default();
+            gs.style_engine.set_adopted(&ids);
+            "true".to_string()
+        }
+        "remove-owner" => {
+            if let Ok(owner) = arg1.parse::<u32>() {
+                gs.style_engine.remove_owner(NodeId::new(owner));
+            }
+            "true".to_string()
+        }
+        "disable" => {
+            let id = arg1.parse::<u32>().unwrap_or(0);
+            gs.style_engine.set_disabled(id, arg2 == "true").to_string()
+        }
+        "insert" => {
+            let id = arg1.parse::<u32>().unwrap_or(0);
+            let index = arg2.parse::<usize>().unwrap_or(usize::MAX);
+            match gs.style_engine.insert_rule(id, &arg3, index) {
+                Ok((value, new_id)) => {
+                    serde_json::json!({"ok": true, "index": value, "id": new_id}).to_string()
+                }
+                Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+            }
+        }
+        "delete" => {
+            let id = arg1.parse::<u32>().unwrap_or(0);
+            let index = arg2.parse::<usize>().unwrap_or(usize::MAX);
+            match gs.style_engine.delete_rule(id, index) {
+                Ok(new_id) => serde_json::json!({"ok": true, "id": new_id}).to_string(),
+                Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+            }
+        }
+        "replace" => {
+            let id = arg1.parse::<u32>().unwrap_or(0);
+            match gs.style_engine.replace_sheet(id, &arg3) {
+                Ok(new_id) => serde_json::json!({"ok": true, "id": new_id}).to_string(),
+                Err(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+            }
+        }
+        _ => "null".to_string(),
+    }
+}
+
+/// Fetch and, in compute mode, register a dynamically inserted stylesheet.
+/// The response body is consumed entirely in Rust and never serialized through
+/// V8. Drop mode returns only lifecycle metadata after the body is drained.
+#[op2(async)]
+#[string]
+async fn op_load_stylesheet(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    owner_node: u32,
+    #[string] media: String,
+    same_origin: bool,
+) -> Result<String, deno_error::JsErrorBox> {
+    let parsed = url::Url::parse(&url)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    if let Err(error) = validate_fetch_url(&parsed) {
+        return Ok(
+            serde_json::json!({"status": 0, "url": url, "blocked": true, "error": error})
+                .to_string(),
+        );
+    }
+
+    let (http_client, css_enabled, blocked, blocked_patterns, page_origin) = {
+        let state_borrow = state.borrow();
+        let shared = state_borrow.borrow::<SharedState>().clone();
+        let mut gs = shared.borrow_mut();
+        let blocked = gs
+            .blocked_urls
+            .iter()
+            .any(|pattern| pattern == "*" || url.contains(pattern) || glob_match(pattern, &url));
+        gs.fetched_urls.push(url.clone());
+        (
+            gs.http_client.clone(),
+            gs.css_enabled,
+            blocked,
+            gs.blocked_urls.clone(),
+            url::Url::parse(&gs.url).ok().map(|page| page.origin()),
+        )
+    };
+    if blocked {
+        return Ok(serde_json::json!({"status": 0, "url": url, "blocked": true}).to_string());
+    }
+
+    #[cfg(feature = "stealth")]
+    let stylesheet_client = {
+        let stealth = {
+            let state_borrow = state.borrow();
+            let shared = state_borrow.borrow::<SharedState>().clone();
+            let client = shared.borrow().stealth_client.clone();
+            client
+        };
+        if let Some(client) = stealth {
+            StylesheetFetchClient::Stealth(client)
+        } else {
+            let client = http_client
+                .clone()
+                .ok_or_else(|| deno_error::JsErrorBox::generic("HTTP client unavailable"))?;
+            StylesheetFetchClient::Regular(client)
+        }
+    };
+    #[cfg(not(feature = "stealth"))]
+    let stylesheet_client = {
+        let client = http_client
+            .ok_or_else(|| deno_error::JsErrorBox::generic("HTTP client unavailable"))?;
+        StylesheetFetchClient::Regular(client)
+    };
+
+    let response = stylesheet_client.fetch(&parsed).await;
+
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(
+                serde_json::json!({"status": 0, "url": url, "error": error.to_string()})
+                    .to_string(),
+            )
+        }
+    };
+    let status = response.status;
+    let body_size = response.body.len();
+    let loaded = (200..400).contains(&status);
+    let mut sheet_id = 0;
+    if loaded && css_enabled {
+        let css = obscura_net::decode_non_html(&response.body, response.content_type());
+        let mut visited = std::collections::HashSet::from([url.clone()]);
+        let imports = fetch_dynamic_css_imports(
+            &stylesheet_client,
+            parsed,
+            css.clone(),
+            media.clone(),
+            page_origin,
+            &blocked_patterns,
+            0,
+            &mut visited,
+        )
+        .await;
+        let state_borrow = state.borrow();
+        let shared = state_borrow.borrow::<SharedState>().clone();
+        let mut gs = shared.borrow_mut();
+        let owner = NodeId::new(owner_node);
+        gs.style_engine.remove_owner(owner);
+        for (import_url, import_media, import_same_origin, import_css) in imports {
+            gs.fetched_urls.push(import_url.clone());
+            gs.style_engine.register_import_stylesheet(
+                owner,
+                import_url,
+                import_media,
+                import_same_origin,
+                &import_css,
+            );
+        }
+        sheet_id = gs
+            .style_engine
+            .register_stylesheet(
+                Some(owner),
+                Some(url.clone()),
+                media,
+                same_origin,
+                &css,
+            )
+            .unwrap_or(0);
+    }
+    Ok(serde_json::json!({
+        "status": status,
+        "url": response.url.to_string(),
+        "bodySize": body_size,
+        "sheetId": sheet_id,
+    })
+    .to_string())
 }
 
 fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
@@ -187,45 +557,74 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 Some(n) => n.index().to_string(),
                 None => {
                     // Fall back to full scan for the live document.
-                    let sel = format!("[id=\"{}\"]", arg1.replace('\\', "\\\\").replace('"', "\\\""));
-                    dom.query_selector(&sel).ok().flatten()
-                        .map(|id| id.index().to_string()).unwrap_or("-1".into())
+                    let sel = format!(
+                        "[id=\"{}\"]",
+                        arg1.replace('\\', "\\\\").replace('"', "\\\"")
+                    );
+                    dom.query_selector(&sel)
+                        .ok()
+                        .flatten()
+                        .map(|id| id.index().to_string())
+                        .unwrap_or("-1".into())
                 }
             }
         }
-        "query_selector" => {
-            dom.query_selector(&arg1).ok().flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
-        }
+        "query_selector" => dom
+            .query_selector(&arg1)
+            .ok()
+            .flatten()
+            .map(|id| id.index().to_string())
+            .unwrap_or("-1".into()),
         "query_selector_all" => {
-            let ids: Vec<i32> = dom.query_selector_all(&arg1).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            let ids: Vec<i32> = dom
+                .query_selector_all(&arg1)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
+                .unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "query_selector_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.query_selector_from(NodeId::new(root_nid), &arg2).ok().flatten()
-                .map(|id| id.index().to_string()).unwrap_or("-1".into())
+            dom.query_selector_from(NodeId::new(root_nid), &arg2)
+                .ok()
+                .flatten()
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into())
         }
         "query_selector_all_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.query_selector_all_from(NodeId::new(root_nid), &arg2).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            let ids: Vec<i32> = dom
+                .query_selector_all_from(NodeId::new(root_nid), &arg2)
+                .ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
+                .unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::Document => "9", NodeData::Element { .. } => "1", NodeData::Text { .. } => "3",
-                NodeData::Comment { .. } => "8", NodeData::Doctype { .. } => "10", NodeData::ProcessingInstruction { .. } => "7",
-            }).unwrap_or("0").into()
+                NodeData::Document => "9",
+                NodeData::Element { .. } => "1",
+                NodeData::Text { .. } => "3",
+                NodeData::Comment { .. } => "8",
+                NodeData::Doctype { .. } => "10",
+                NodeData::ProcessingInstruction { .. } => "7",
+            })
+            .unwrap_or("0")
+            .into()
         }
         "node_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name: String = dom.with_node(NodeId::new(nid), |n| match &n.data {
-                NodeData::Document => "#document".to_string(), NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
-                NodeData::Text { .. } => "#text".to_string(), NodeData::Comment { .. } => "#comment".to_string(),
-                NodeData::Doctype { name, .. } => name.clone(), NodeData::ProcessingInstruction { target, .. } => target.clone(),
-            }).unwrap_or_default();
+            let name: String = dom
+                .with_node(NodeId::new(nid), |n| match &n.data {
+                    NodeData::Document => "#document".to_string(),
+                    NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
+                    NodeData::Text { .. } => "#text".to_string(),
+                    NodeData::Comment { .. } => "#comment".to_string(),
+                    NodeData::Doctype { name, .. } => name.clone(),
+                    NodeData::ProcessingInstruction { target, .. } => target.clone(),
+                })
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "text_content" => {
@@ -235,24 +634,44 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match cmd.as_str() {
-                "parent_node" => n.parent, "first_child" => n.first_child,
-                "last_child" => n.last_child, "next_sibling" => n.next_sibling,
-                "prev_sibling" => n.prev_sibling, _ => None,
-            }).flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
+                "parent_node" => n.parent,
+                "first_child" => n.first_child,
+                "last_child" => n.last_child,
+                "next_sibling" => n.next_sibling,
+                "prev_sibling" => n.prev_sibling,
+                _ => None,
+            })
+            .flatten()
+            .map(|id| id.index().to_string())
+            .unwrap_or("-1".into())
         }
         "child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter().map(|id| id.index() as i32).collect();
+            let ids: Vec<i32> = dom
+                .children(NodeId::new(nid))
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom.with_node(NodeId::new(nid), |n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).flatten().unwrap_or_default();
+            let name = dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.as_element()
+                        .map(|name| name.local.as_ref().to_ascii_uppercase())
+                })
+                .flatten()
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.with_node(NodeId::new(nid), |n| n.get_attribute(&arg2).map(|s| s.to_string())).flatten();
+            let val = dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.get_attribute(&arg2).map(|s| s.to_string())
+                })
+                .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
         "attribute_names" => {
@@ -260,7 +679,11 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let names: Vec<String> = dom
                 .with_node(NodeId::new(nid), |n| {
                     n.attrs()
-                        .map(|a| a.iter().map(|x| x.name.local.as_ref().to_string()).collect())
+                        .map(|a| {
+                            a.iter()
+                                .map(|x| x.name.local.as_ref().to_string())
+                                .collect()
+                        })
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
@@ -338,37 +761,54 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
-                match &mut n.data {
-                    NodeData::Text { contents } => { *contents = arg2.clone(); }
-                    NodeData::Comment { contents } => { *contents = arg2.clone(); }
-                    NodeData::ProcessingInstruction { data, .. } => { *data = arg2.clone(); }
-                    _ => {}
+            dom.with_node_mut(NodeId::new(nid), |n| match &mut n.data {
+                NodeData::Text { contents } => {
+                    *contents = arg2.clone();
                 }
+                NodeData::Comment { contents } => {
+                    *contents = arg2.clone();
+                }
+                NodeData::ProcessingInstruction { data, .. } => {
+                    *data = arg2.clone();
+                }
+                _ => {}
             });
             "true".into()
         }
-        "create_document_fragment" => {
-            dom.new_node(NodeData::Document).index().to_string()
-        }
-        "create_element" => {
-            dom.new_node(NodeData::Element {
-                name: html5ever::QualName::new(None, html5ever::ns!(html), html5ever::LocalName::from(arg1.as_str())),
-                attrs: vec![], template_contents: None, mathml_annotation_xml_integration_point: false,
-            }).index().to_string()
-        }
-        "create_text_node" => {
-            dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
-        }
-        "create_comment_node" => {
-            dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
-        }
+        "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
+        "create_element" => dom
+            .new_node(NodeData::Element {
+                name: html5ever::QualName::new(
+                    None,
+                    html5ever::ns!(html),
+                    html5ever::LocalName::from(arg1.as_str()),
+                ),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+            .index()
+            .to_string(),
+        "create_text_node" => dom
+            .new_node(NodeData::Text {
+                contents: arg1.clone(),
+            })
+            .index()
+            .to_string(),
+        "create_comment_node" => dom
+            .new_node(NodeData::Comment {
+                contents: arg1.clone(),
+            })
+            .index()
+            .to_string(),
         "create_processing_instruction" => {
             // arg1 = target, arg2 = data
             dom.new_node(NodeData::ProcessingInstruction {
                 target: arg1.clone(),
                 data: arg2.clone(),
-            }).index().to_string()
+            })
+            .index()
+            .to_string()
         }
         "create_doctype" => {
             // arg1 = name, arg2 = public_id. system_id stored only in the
@@ -823,11 +1263,17 @@ async fn op_fetch_url(
             .header("Access-Control-Request-Method", method.as_str())
             .header(
                 "Access-Control-Request-Headers",
-                custom_headers.keys().cloned().collect::<Vec<_>>().join(", "),
+                custom_headers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )
             .send()
             .await
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+            .map_err(|e| {
+                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
+            })?;
 
         let allowed_origin = preflight
             .headers()
@@ -1458,7 +1904,9 @@ fn op_subtle_aes_gcm(
             } else {
                 cipher
                     .decrypt(nonce, Payload { msg: data, aad })
-                    .map_err(|_| crypto_err("AES-GCM decryption failed: authentication tag mismatch"))?
+                    .map_err(|_| {
+                        crypto_err("AES-GCM decryption failed: authentication tag mismatch")
+                    })?
             }
         }};
     }
@@ -1547,7 +1995,11 @@ fn op_subtle_aes_ctr(
         128 => by_key!(Ctr128BE),
         64 => by_key!(Ctr64BE),
         32 => by_key!(Ctr32BE),
-        _ => return Err(crypto_err("AES-CTR supports counter lengths of 32, 64, or 128 bits")),
+        _ => {
+            return Err(crypto_err(
+                "AES-CTR supports counter lengths of 32, 64, or 128 bits",
+            ))
+        }
     }
     Ok(buf)
 }
@@ -1826,6 +2278,8 @@ pub fn build_extension() -> Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(vec![
             op_dom(),
+            op_css(),
+            op_load_stylesheet(),
             op_console_msg(),
             op_fetch_url(),
             op_get_cookies(),

@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use obscura_browser::BrowserContext;
+use obscura_browser::{BrowserContext, BrowserContextOptions};
 use obscura_net::CookieJar;
 
 use crate::config::BrowserConfig;
@@ -22,27 +22,25 @@ impl Browser {
     }
 
     pub fn build(config: BrowserConfig) -> Result<Self, Error> {
-        let context = if let Some(ref dir) = config.storage_dir {
-            BrowserContext::with_storage_full(
-                "api".to_string(),
-                config.proxy,
-                config.stealth,
-                config.user_agent,
-                Some(dir.clone()),
-            )
-        } else {
-            BrowserContext::with_full_options(
-                "api".to_string(),
-                config.proxy,
-                config.stealth,
-                config.user_agent,
-            )
-        };
+        let context = BrowserContext::with_config(
+            "api".to_string(),
+            BrowserContextOptions {
+                proxy_url: config.proxy,
+                stealth: config.stealth,
+                user_agent: config.user_agent,
+                storage_dir: config.storage_dir,
+                allow_private_network: false,
+                css_mode: config.css_mode,
+            },
+        );
 
         let context = Arc::new(context);
         let cookie_jar = context.cookie_jar.clone();
 
-        Ok(Browser { context, cookie_jar })
+        Ok(Browser {
+            context,
+            cookie_jar,
+        })
     }
 
     pub fn builder() -> BrowserBuilder {
@@ -86,6 +84,10 @@ impl BrowserBuilder {
     }
     pub fn storage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.config.storage_dir = Some(dir.into());
+        self
+    }
+    pub fn css_mode(mut self, mode: obscura_browser::CssMode) -> Self {
+        self.config.css_mode = mode;
         self
     }
     pub fn build(self) -> Result<Browser, Error> {

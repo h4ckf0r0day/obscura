@@ -1,3 +1,4 @@
+use obscura_browser::CssMode;
 use std::path::PathBuf;
 
 /// Configuration for launching a Browser instance.
@@ -10,6 +11,8 @@ pub struct BrowserConfig {
     pub user_agent: Option<String>,
     /// Directory for persistent cookie storage
     pub storage_dir: Option<PathBuf>,
+    /// Stylesheet processing policy. Defaults to lightweight computation.
+    pub css_mode: CssMode,
 }
 
 impl Default for BrowserConfig {
@@ -19,6 +22,7 @@ impl Default for BrowserConfig {
             stealth: false,
             user_agent: None,
             storage_dir: None,
+            css_mode: CssMode::Compute,
         }
     }
 }
@@ -52,6 +56,11 @@ impl BrowserConfigBuilder {
 
     pub fn storage_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.storage_dir = Some(dir.into());
+        self
+    }
+
+    pub fn css_mode(mut self, mode: CssMode) -> Self {
+        self.config.css_mode = mode;
         self
     }
 

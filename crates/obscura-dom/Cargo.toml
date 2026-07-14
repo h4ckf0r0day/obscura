@@ -11,6 +11,7 @@ servo_arc = { workspace = true }
 cssparser = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
 precomputed-hash = "0.1"
 
 [dev-dependencies]

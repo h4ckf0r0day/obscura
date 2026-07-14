@@ -164,6 +164,96 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().dom = Some(dom);
     }
 
+    pub fn set_css_enabled(&self, enabled: bool) {
+        let mut state = self.state.borrow_mut();
+        state.css_enabled = enabled;
+        if !enabled {
+            state.style_engine.clear();
+        }
+    }
+
+    pub fn register_stylesheet(
+        &self,
+        owner_node: Option<obscura_dom::NodeId>,
+        href: Option<String>,
+        media: String,
+        same_origin: bool,
+        css: &str,
+    ) -> Option<u32> {
+        let mut state = self.state.borrow_mut();
+        if !state.css_enabled {
+            return None;
+        }
+        let disabled = owner_node
+            .and_then(|node| {
+                state.dom.as_ref().and_then(|dom| {
+                    dom.with_node(node, |entry| entry.get_attribute("disabled").is_some())
+                })
+            })
+            .unwrap_or(false);
+        let id = state
+            .style_engine
+            .register_stylesheet(owner_node, href, media, same_origin, css);
+        if disabled {
+            if let Some(id) = id {
+                state.style_engine.set_disabled(id, true);
+            }
+        }
+        id
+    }
+
+    pub fn register_import_stylesheet(
+        &self,
+        owner_node: obscura_dom::NodeId,
+        href: String,
+        media: String,
+        same_origin: bool,
+        css: &str,
+    ) -> Option<u32> {
+        let mut state = self.state.borrow_mut();
+        if !state.css_enabled {
+            return None;
+        }
+        state.style_engine.register_import_stylesheet(
+            owner_node,
+            href,
+            media,
+            same_origin,
+            css,
+        )
+    }
+
+    /// Register parser-created `<style>` elements before page scripts run.
+    pub fn register_inline_stylesheets(&self) {
+        let inline = {
+            let state = self.state.borrow();
+            let Some(dom) = state.dom.as_ref() else {
+                return;
+            };
+            dom.query_selector_all("style")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|node| {
+                    let media = dom
+                        .with_node(node, |entry| {
+                            entry.get_attribute("media").unwrap_or("").to_string()
+                        })
+                        .unwrap_or_default();
+                    (node, media, dom.text_content(node))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = self.state.borrow_mut();
+        if !state.css_enabled {
+            return;
+        }
+        for (node, media, css) in inline {
+            state
+                .style_engine
+                .register_stylesheet(Some(node), None, media, true, &css);
+        }
+    }
+
     pub fn set_url(&self, url: &str) {
         self.state.borrow_mut().url = url.to_string();
     }
@@ -346,13 +436,17 @@ impl ObscuraJsRuntime {
             let __t0 = std::time::Instant::now();
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             self.resolve_promises_until(
-                |rt| rt.runtime.execute_script("<done?>", sentinel.clone())
-                    .ok()
-                    .and_then(|v| rt.v8_to_json(v).ok())
-                    .and_then(|j| j.as_bool())
-                    .unwrap_or(false),
+                |rt| {
+                    rt.runtime
+                        .execute_script("<done?>", sentinel.clone())
+                        .ok()
+                        .and_then(|v| rt.v8_to_json(v).ok())
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
+                },
                 5000,
-            ).await;
+            )
+            .await;
             let __dt = __t0.elapsed();
             if __dt > std::time::Duration::from_secs(1) {
                 let preview: String = expression
@@ -450,13 +544,17 @@ impl ObscuraJsRuntime {
             let __t0 = std::time::Instant::now();
             let sentinel = format!("globalThis.__obscura_done_{done_counter} === true");
             self.resolve_promises_until(
-                |rt| rt.runtime.execute_script("<done?>", sentinel.clone())
-                    .ok()
-                    .and_then(|v| rt.v8_to_json(v).ok())
-                    .and_then(|j| j.as_bool())
-                    .unwrap_or(false),
+                |rt| {
+                    rt.runtime
+                        .execute_script("<done?>", sentinel.clone())
+                        .ok()
+                        .and_then(|v| rt.v8_to_json(v).ok())
+                        .and_then(|j| j.as_bool())
+                        .unwrap_or(false)
+                },
                 5000,
-            ).await;
+            )
+            .await;
             let __dt = __t0.elapsed();
             if __dt > std::time::Duration::from_secs(1) {
                 let preview: String = function_declaration
@@ -1275,10 +1373,11 @@ mod tests {
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
-        let rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
+        rt.run_page_init();
         rt
     }
 
@@ -1470,6 +1569,131 @@ mod tests {
         assert_eq!(p["getByDash"], "14px");
     }
 
+    #[test]
+    fn native_stylesheet_drives_computed_style_and_cssom() {
+        let mut rt = setup_runtime("<html><head><link rel='stylesheet' href='/app.css'></head><body><div id='target' class='card'>x</div></body></html>");
+        let owner = rt
+            .with_dom(|dom| dom.query_selector("link").unwrap().unwrap())
+            .unwrap();
+        rt.register_stylesheet(
+            Some(owner),
+            Some("http://example.com/app.css".to_string()),
+            String::new(),
+            true,
+            ":root { --brand: blue } .card { color: var(--brand); margin: 1px 2px; display: flex }",
+        );
+        let result = rt
+            .evaluate(
+                r#"JSON.stringify((() => {
+            const el = document.getElementById('target');
+            const style = getComputedStyle(el);
+            return {
+                color: style.color,
+                display: style.display,
+                marginLeft: style.marginLeft,
+                custom: style.getPropertyValue('--brand'),
+                sheets: document.styleSheets.length,
+                rules: document.styleSheets[0].cssRules.length,
+                owner: document.styleSheets[0].ownerNode === document.querySelector('link'),
+                linked: document.querySelector('link').sheet === document.styleSheets[0]
+            };
+        })())"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["color"], "rgb(0, 0, 255)");
+        assert_eq!(value["display"], "flex");
+        assert_eq!(value["marginLeft"], "2px");
+        assert_eq!(value["custom"], "blue");
+        assert_eq!(value["sheets"], 1);
+        assert_eq!(value["rules"], 2);
+        assert_eq!(value["owner"], true);
+        assert_eq!(value["linked"], true);
+    }
+
+    #[test]
+    fn cssom_mutations_constructed_sheets_and_invalidation_reach_native_engine() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='target' class='card'>x</div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"JSON.stringify((() => {
+            const el = document.getElementById('target');
+            const sheet = new CSSStyleSheet();
+            sheet.replaceSync('.card { display: grid; color: red }');
+            document.adoptedStyleSheets = [sheet];
+            const initial = getComputedStyle(el);
+            const before = { display: initial.display, color: initial.color };
+            const index = sheet.insertRule('.card { display: flex !important }', 1);
+            const inserted = getComputedStyle(el).display;
+            sheet.deleteRule(index);
+            const deleted = getComputedStyle(el).display;
+            el.className = 'other';
+            const classChanged = getComputedStyle(el).display;
+            return { before, inserted, deleted, classChanged, sheets: document.styleSheets.length,
+                     adopted: document.adoptedStyleSheets.length, rules: sheet.cssRules.length };
+        })())"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["before"]["display"], "grid");
+        assert_eq!(value["before"]["color"], "rgb(255, 0, 0)");
+        assert_eq!(value["inserted"], "flex");
+        assert_eq!(value["deleted"], "grid");
+        assert_eq!(value["classChanged"], "block");
+        assert_eq!(value["sheets"], 0);
+        assert_eq!(value["adopted"], 1);
+        assert_eq!(value["rules"], 1);
+    }
+
+    #[test]
+    fn cross_origin_css_rules_throw_security_error() {
+        let mut rt = setup_runtime(
+            "<html><head><link rel='stylesheet' href='https://cdn.example/app.css'></head><body></body></html>",
+        );
+        let owner = rt
+            .with_dom(|dom| dom.query_selector("link").unwrap().unwrap())
+            .unwrap();
+        rt.register_stylesheet(
+            Some(owner),
+            Some("https://cdn.example/app.css".to_string()),
+            String::new(),
+            false,
+            "body { color: red }",
+        );
+        let result = rt
+            .evaluate(
+                r#"JSON.stringify((() => { try { document.styleSheets[0].cssRules; return null; }
+                    catch (error) { return { name: error.name, message: error.message }; } })())"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["name"], "SecurityError");
+    }
+
+    #[test]
+    fn drop_mode_keeps_inline_style_but_exposes_no_sheets() {
+        let mut rt = setup_runtime("<html><head><style>.x { color: red }</style></head><body><div id='target' class='x' style='display: grid'></div></body></html>");
+        rt.set_css_enabled(false);
+        rt.register_inline_stylesheets();
+        let result = rt
+            .evaluate(
+                r#"JSON.stringify({
+            sheets: document.styleSheets.length,
+            sheet: document.querySelector('style').sheet,
+            color: getComputedStyle(document.getElementById('target')).color,
+            display: getComputedStyle(document.getElementById('target')).display
+        })"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["sheets"], 0);
+        assert!(value["sheet"].is_null());
+        assert_eq!(value["color"], "rgb(0, 0, 0)");
+        assert_eq!(value["display"], "grid");
+    }
+
     /// Regression for #105: `element.querySelector` and `querySelectorAll`
     /// must scope to the receiver's subtree, not the whole document.
     #[test]
@@ -1507,12 +1731,29 @@ mod tests {
     /// `document.forms` and crashes when it's empty for pages that have forms.
     #[test]
     fn document_forms_images_links_are_live() {
-        let mut rt = setup_runtime(
-            r#"<form></form><form></form><img><a href="x">l</a><a>no-href</a>"#,
+        let mut rt =
+            setup_runtime(r#"<form></form><form></form><img><a href="x">l</a><a>no-href</a>"#);
+        assert_eq!(
+            rt.evaluate("document.forms.length")
+                .unwrap()
+                .as_f64()
+                .unwrap() as i64,
+            2
         );
-        assert_eq!(rt.evaluate("document.forms.length").unwrap().as_f64().unwrap() as i64, 2);
-        assert_eq!(rt.evaluate("document.images.length").unwrap().as_f64().unwrap() as i64, 1);
-        assert_eq!(rt.evaluate("document.links.length").unwrap().as_f64().unwrap() as i64, 1);
+        assert_eq!(
+            rt.evaluate("document.images.length")
+                .unwrap()
+                .as_f64()
+                .unwrap() as i64,
+            1
+        );
+        assert_eq!(
+            rt.evaluate("document.links.length")
+                .unwrap()
+                .as_f64()
+                .unwrap() as i64,
+            1
+        );
     }
 
     /// Regression for #105: `HTMLFormElement` must expose `.elements` so
@@ -1864,7 +2105,10 @@ mod tests {
             rt1b.set_url("http://example.com");
             rt1b.set_title("Page1");
             let mut rt1b = rt1b;
-            let title1b = rt1b.evaluate("document.querySelector('h1').textContent").unwrap();
+            rt1b.run_page_init();
+            let title1b = rt1b
+                .evaluate("document.querySelector('h1').textContent")
+                .unwrap();
             assert_eq!(title1b, serde_json::json!("Page1"));
         }
     }
@@ -1980,24 +2224,29 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let obj = rt
             .call_function_on("() => ({ x: 42 })", None, &[], false)
-            .await.unwrap();
+            .await
+            .unwrap();
         let oid = obj.object_id.unwrap();
 
         let args = vec![serde_json::json!({"objectId": oid})];
         let result = rt
             .call_function_on("(obj) => obj.x * 2", None, &args, true)
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(result.value.unwrap().as_f64().unwrap() as i64, 84);
     }
 
-    fn setup_runtime_with_cookies(html: &str) -> (ObscuraJsRuntime, std::sync::Arc<obscura_net::CookieJar>) {
+    fn setup_runtime_with_cookies(
+        html: &str,
+    ) -> (ObscuraJsRuntime, std::sync::Arc<obscura_net::CookieJar>) {
         let dom = obscura_dom::parse_html(html);
         let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
-        let rt = ObscuraJsRuntime::new();
+        let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
         rt.set_url("http://example.com/test");
         rt.set_title("Test Page");
         rt.set_cookie_jar(jar.clone());
+        rt.run_page_init();
         (rt, jar)
     }
 
@@ -2179,19 +2428,16 @@ mod tests {
     async fn test_dynamic_stylesheet_fetches_and_fires_load_or_error() {
         let mut rt =
             setup_runtime("<html><head><meta charset=\"utf-8\"></head><body></body></html>");
-        rt.run_page_init();
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalLoadStylesheetOp = Deno.core.ops.op_load_stylesheet;
                 const calls = [];
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode) => {
-                        calls.push({ url, method, headers: JSON.parse(headers), body, origin, mode });
+                    Deno.core.ops.op_load_stylesheet = (url, ownerNode, media, sameOrigin) => {
+                        calls.push({ url, ownerNode, media, sameOrigin });
                         return JSON.stringify({
                             status: url.endsWith('/missing.css') ? 404 : 200,
-                            headers: { 'content-type': 'text/css' },
-                            body: 'body { color: green; }',
                             url,
                         });
                     };
@@ -2231,7 +2477,7 @@ mod tests {
                 } catch (error) {
                     return 'ERROR:' + String(error && (error.stack || error));
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    Deno.core.ops.op_load_stylesheet = originalLoadStylesheetOp;
                 }
             }"#,
                 None,
@@ -2254,35 +2500,27 @@ mod tests {
                 "calls": [
                     {
                         "url": "http://example.com/app.css",
-                        "method": "GET",
-                        "headers": { "accept": "text/css,*/*;q=0.1" },
-                        "body": "",
-                        "origin": "http://example.com",
-                        "mode": "no-cors",
+                        "ownerNode": 5,
+                        "media": "",
+                        "sameOrigin": true,
                     },
                     {
                         "url": "http://example.com/missing.css",
-                        "method": "GET",
-                        "headers": { "accept": "text/css,*/*;q=0.1" },
-                        "body": "",
-                        "origin": "http://example.com",
-                        "mode": "no-cors",
+                        "ownerNode": 6,
+                        "media": "",
+                        "sameOrigin": true,
                     },
                     {
                         "url": "http://example.com/late.css",
-                        "method": "GET",
-                        "headers": { "accept": "text/css,*/*;q=0.1" },
-                        "body": "",
-                        "origin": "http://example.com",
-                        "mode": "no-cors",
+                        "ownerNode": 7,
+                        "media": "",
+                        "sameOrigin": true,
                     },
                     {
                         "url": "https://cdn.example/assets/theme.css",
-                        "method": "GET",
-                        "headers": { "accept": "text/css,*/*;q=0.1" },
-                        "body": "",
-                        "origin": "http://example.com",
-                        "mode": "no-cors",
+                        "ownerNode": 9,
+                        "media": "",
+                        "sameOrigin": false,
                     },
                 ],
             })

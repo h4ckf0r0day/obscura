@@ -382,10 +382,9 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 node.attrs()
                     .map(|attrs| {
-                        attrs.iter().any(|a| {
-                            a.name.ns == html5ever::ns!()
-                                && a.name.local == local_name.0
-                        })
+                        attrs
+                            .iter()
+                            .any(|a| a.name.ns == html5ever::ns!() && a.name.local == local_name.0)
                     })
                     .unwrap_or(false)
             })
@@ -549,6 +548,40 @@ pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, S
         cache.insert(selector.to_string(), cached);
     });
     Ok(parsed)
+}
+
+/// Match a previously parsed selector list against one element.
+///
+/// Stylesheets parse selectors once and reuse the compiled representation for
+/// every `getComputedStyle()` query. Keeping this helper here ensures CSS and
+/// the DOM query APIs use exactly the same selector implementation without
+/// making the style engine reach into selectors' matching internals.
+pub fn matches_parsed_selector(
+    tree: &DomTree,
+    node_id: NodeId,
+    selector_list: &SelectorList<ObscuraSelector>,
+) -> bool {
+    let is_element = tree
+        .with_node(node_id, |node| node.is_element())
+        .unwrap_or(false);
+    if !is_element {
+        return false;
+    }
+
+    let mut caches = selectors::context::SelectorCaches::default();
+    let mut context = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        &mut caches,
+        QuirksMode::NoQuirks,
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    selectors::matching::matches_selector_list(
+        selector_list,
+        &DomElement::new(tree, node_id),
+        &mut context,
+    )
 }
 
 /// If `selector` is a bare ASCII id selector like `#main`, return the id (without
