@@ -1256,6 +1256,32 @@ impl Page {
         self.js.as_ref().map(|js| js.fetched_urls()).unwrap_or_default()
     }
 
+    /// Move network events recorded for script-initiated requests
+    /// (fetch/XHR/dynamic resource) from the JS runtime into this page's
+    /// network_events, so the CDP layer emits Network.requestWillBeSent /
+    /// responseReceived for them (issue #406). Idempotent: the runtime's queue
+    /// is drained, so calling this repeatedly does not duplicate events. The
+    /// fetch-{N} request id is preserved so Network.getResponseBody resolves.
+    pub fn sync_js_network_events(&mut self) {
+        let events = match self.js.as_ref() {
+            Some(js) => js.take_js_network_events(),
+            None => return,
+        };
+        for ev in events {
+            self.network_events.push(NetworkEvent {
+                request_id: ev.request_id,
+                url: ev.url,
+                method: ev.method,
+                resource_type: "Fetch".to_string(),
+                status: ev.status,
+                headers: std::collections::HashMap::new(),
+                response_headers: Arc::new(ev.response_headers),
+                body_size: ev.body_size,
+                timestamp: ev.timestamp,
+            });
+        }
+    }
+
     pub fn dom(&self) -> Option<&DomTree> {
         self.dom.as_ref()
     }

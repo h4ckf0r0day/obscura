@@ -988,6 +988,13 @@ impl ObscuraJsRuntime {
         self.state.borrow().fetched_urls.clone()
     }
 
+    /// Drain the network events recorded for script-initiated requests
+    /// (fetch/XHR/dynamic resource). The Page moves these into its own
+    /// network_events so the CDP layer emits Network events for them (#406).
+    pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
+        std::mem::take(&mut self.state.borrow_mut().js_network_events)
+    }
+
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
         let r = self.state.borrow();
         if r.dom.is_some() {
