@@ -2176,6 +2176,120 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_dynamic_stylesheet_fetches_and_fires_load_or_error() {
+        let mut rt =
+            setup_runtime("<html><head><meta charset=\"utf-8\"></head><body></body></html>");
+        rt.run_page_init();
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const calls = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url, method, headers, body, origin, mode) => {
+                        calls.push({ url, method, headers: JSON.parse(headers), body, origin, mode });
+                        return JSON.stringify({
+                            status: url.endsWith('/missing.css') ? 404 : 200,
+                            headers: { 'content-type': 'text/css' },
+                            body: 'body { color: green; }',
+                            url,
+                        });
+                    };
+
+                    const loaded = document.createElement('link');
+                    loaded.rel = 'stylesheet';
+                    loaded.href = '/app.css';
+                    const loadEvent = new Promise(resolve => loaded.onload = () => resolve('load'));
+                    document.head.appendChild(loaded);
+
+                    const missing = document.createElement('link');
+                    missing.rel = 'stylesheet';
+                    missing.href = '/missing.css';
+                    const errorEvent = new Promise(resolve => missing.addEventListener('error', () => resolve('error')));
+                    document.head.insertBefore(missing, document.head.firstChild);
+
+                    const late = document.createElement('link');
+                    const lateEvent = new Promise(resolve => late.addEventListener('load', () => resolve('load')));
+                    document.head.appendChild(late);
+                    late.rel = 'stylesheet';
+                    late.href = 'late.css';
+
+                    const base = document.createElement('base');
+                    base.href = 'https://cdn.example/assets/';
+                    document.head.appendChild(base);
+                    const based = document.createElement('link');
+                    based.rel = 'stylesheet';
+                    based.href = 'theme.css';
+                    const basedEvent = new Promise(resolve => based.onload = () => resolve('load'));
+                    document.head.appendChild(based);
+
+                    return JSON.stringify({
+                        events: await Promise.all([loadEvent, errorEvent, lateEvent, basedEvent]),
+                        reflectedRel: loaded.getAttribute('rel'),
+                        calls,
+                    });
+                } catch (error) {
+                    return 'ERROR:' + String(error && (error.stack || error));
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let raw = result.value.unwrap();
+        let raw = raw.as_str().unwrap();
+        assert!(!raw.starts_with("ERROR:"), "{}", raw);
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "events": ["load", "error", "load", "load"],
+                "reflectedRel": "stylesheet",
+                "calls": [
+                    {
+                        "url": "http://example.com/app.css",
+                        "method": "GET",
+                        "headers": { "accept": "text/css,*/*;q=0.1" },
+                        "body": "",
+                        "origin": "http://example.com",
+                        "mode": "no-cors",
+                    },
+                    {
+                        "url": "http://example.com/missing.css",
+                        "method": "GET",
+                        "headers": { "accept": "text/css,*/*;q=0.1" },
+                        "body": "",
+                        "origin": "http://example.com",
+                        "mode": "no-cors",
+                    },
+                    {
+                        "url": "http://example.com/late.css",
+                        "method": "GET",
+                        "headers": { "accept": "text/css,*/*;q=0.1" },
+                        "body": "",
+                        "origin": "http://example.com",
+                        "mode": "no-cors",
+                    },
+                    {
+                        "url": "https://cdn.example/assets/theme.css",
+                        "method": "GET",
+                        "headers": { "accept": "text/css,*/*;q=0.1" },
+                        "body": "",
+                        "origin": "http://example.com",
+                        "mode": "no-cors",
+                    },
+                ],
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_response_array_buffer_preserves_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.call_function_on_for_cdp(

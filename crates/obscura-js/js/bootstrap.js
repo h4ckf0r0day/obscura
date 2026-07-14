@@ -198,6 +198,59 @@ async function __processDynScriptQueue() {
     __dynScriptBusy = false;
   }
 }
+
+// Dynamic stylesheet loading. Vite's production preload helper appends
+// <link rel="stylesheet"> elements and waits for load/error before resolving a
+// lazy route import. Merely adding the node to the DOM leaves that promise
+// pending forever, so fetch the resource through the same guarded/proxied op as
+// fetch/XHR and deliver the element lifecycle event. Track the URL per element
+// so setting rel/href before insertion does not double-fetch, while changing
+// href after insertion still starts a new request.
+const __dynamicStylesheetLoads = new WeakMap();
+function __maybeLoadDynamicStylesheet(link) {
+  if (!link || link.tagName !== 'LINK' || !link.isConnected) return;
+  const rel = (link.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+  const href = link.getAttribute('href');
+  if (!rel.includes('stylesheet') || !href) {
+    __dynamicStylesheetLoads.delete(link);
+    return;
+  }
+
+  let baseHref;
+  try {
+    const baseEl = globalThis.document?.querySelector('base[href]');
+    baseHref = baseEl ? baseEl.getAttribute('href') : null;
+  } catch(e) { baseHref = null; }
+  const docUrl = globalThis.location?.href || 'http://localhost/';
+  let baseUrl;
+  try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
+  catch(e) { baseUrl = docUrl; }
+  let fullUrl;
+  try { fullUrl = new URL(href, baseUrl).href; }
+  catch(e) {
+    Promise.resolve().then(() => link.dispatchEvent(new Event('error')));
+    return;
+  }
+  if (__dynamicStylesheetLoads.get(link) === fullUrl) return;
+  __dynamicStylesheetLoads.set(link, fullUrl);
+
+  const pageOrigin = (() => { try { return new URL(docUrl).origin; } catch(e) { return ''; } })();
+  Promise.resolve(Deno.core.ops.op_fetch_url(
+    fullUrl, 'GET', '{"accept":"text/css,*/*;q=0.1"}', '', pageOrigin, 'no-cors'
+  )).then(raw => {
+    if (__dynamicStylesheetLoads.get(link) !== fullUrl) return;
+    let response;
+    try { response = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+    catch(e) { response = null; }
+    const loaded = response && response.status >= 200 && response.status < 400 && !response.blocked;
+    link.dispatchEvent(new Event(loaded ? 'load' : 'error'));
+  }).catch(() => {
+    if (__dynamicStylesheetLoads.get(link) === fullUrl) {
+      link.dispatchEvent(new Event('error'));
+    }
+  });
+}
+
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -687,6 +740,7 @@ class Node {
         }
       }
     }
+    __maybeLoadDynamicStylesheet(c);
     return c;
   }
   removeChild(c) {
@@ -705,6 +759,7 @@ class Node {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
     _dom("insert_before", n._nid, ref._nid);
+    __maybeLoadDynamicStylesheet(n);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -1252,9 +1307,10 @@ class Element extends Node {
     _dom("set_attribute", this._nid, n + "\0" + String(v));
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (this.tagName === 'LINK' && (n === 'rel' || n === 'href')) __maybeLoadDynamicStylesheet(this);
   }
   setAttributeNS(ns, n, v) { _dom("set_attribute", this._nid, String(n) + "\0" + String(v)); } // exact name, no HTML folding
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); if (this.tagName === 'LINK' && (n === 'rel' || n === 'href')) __maybeLoadDynamicStylesheet(this); }
   removeAttributeNS(ns, n) { _dom("remove_attribute", this._nid, String(n)); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
@@ -1772,6 +1828,8 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
+  get rel() { return this.getAttribute("rel") || ""; }
+  set rel(v) { this.setAttribute("rel", v); }
   // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
   // and what scrapers want). It uses op_url_resolve, which returns just the
   // resolved string, rather than the full-component op the decomposition
