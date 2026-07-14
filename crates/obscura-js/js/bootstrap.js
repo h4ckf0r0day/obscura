@@ -198,6 +198,51 @@ async function __processDynScriptQueue() {
     __dynScriptBusy = false;
   }
 }
+// Resolve a resource URL (script src / link href) against <base href> or the
+// document URL, the way the inline dynamic-script path does. Guarded so a bad
+// base or href never throws into appendChild.
+function _resolveResourceUrl(src) {
+  let baseHref = null;
+  try {
+    const baseEl = globalThis.document?.querySelector('base[href]');
+    baseHref = baseEl ? baseEl.getAttribute('href') : null;
+  } catch(e) { baseHref = null; }
+  const docUrl = globalThis.location?.href || 'http://localhost/';
+  let baseUrl;
+  try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
+  catch(e) { baseUrl = docUrl; }
+  try {
+    return src.startsWith('http') || src.startsWith('data:')
+      ? src
+      : new URL(src, baseUrl).href;
+  } catch(e) { return src; }
+}
+
+// A dynamically-inserted <link rel="stylesheet" href> must fetch and fire
+// load/error so frameworks awaiting the link's onload (Promise.all of lazy
+// CSS + JS, antd/bootstrap loaders, etc.) resolve instead of hanging forever.
+// There is no layout engine to apply the CSS, but the load-event contract
+// matches Chrome. Issue #409.
+async function _loadLinkedStylesheet(c) {
+  // obscura does not yet reflect the `rel` IDL attribute back to the content
+  // attribute, so `link.rel = "stylesheet"` leaves getAttribute('rel') null.
+  // Read both so the property-assignment form (the common framework pattern)
+  // and the parsed-from-HTML form are both recognized.
+  const rel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
+  if (!rel.split(/\s+/).includes('stylesheet')) return;
+  const href = c.getAttribute('href');
+  if (!href) return;
+  const fullUrl = _resolveResourceUrl(href);
+  let pageOrigin = "";
+  try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
+  try {
+    await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+    try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
+  } catch(e) {
+    try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
+  }
+}
+
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -686,6 +731,9 @@ class Node {
           }
         }
       }
+    }
+    if (c instanceof Element && c.tagName === 'LINK') {
+      _loadLinkedStylesheet(c);
     }
     return c;
   }
