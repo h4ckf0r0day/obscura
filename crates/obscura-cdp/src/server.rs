@@ -778,6 +778,10 @@ async fn process_with_interception(
 
     let mut page = page_back.expect("navigation task should return the page");
 
+    // Fold in network events for script-initiated requests (fetch/XHR/dynamic
+    // resource) so they emit as Network.requestWillBeSent / responseReceived
+    // alongside the static navigation subresources (#406).
+    page.sync_js_network_events();
     let network_events: Vec<_> = page.network_events.drain(..).collect();
     let page_url = page.url_string();
     let page_id_for_events = page.id.clone();

@@ -46,6 +46,24 @@ pub struct StoredNetworkResponseBody {
     pub base64_encoded: bool,
 }
 
+/// A network request made from page JS (fetch()/XHR/dynamic resource) recorded
+/// so the CDP layer can emit Network.requestWillBeSent / responseReceived for
+/// it. Static navigation subresources go through Page::record_network_event;
+/// this is the parallel channel for script-initiated requests, which run in the
+/// V8 op layer and would otherwise never surface as CDP Network events (#406).
+#[derive(Debug, Clone)]
+pub struct JsNetworkEvent {
+    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Network.getResponseBody resolves for the same request.
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    pub status: u16,
+    pub response_headers: HashMap<String, String>,
+    pub body_size: usize,
+    pub timestamp: f64,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -77,6 +95,10 @@ pub struct ObscuraState {
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
     pub fetched_urls: Vec<String>,
+    // Network events for script-initiated requests (fetch/XHR/dynamic resource),
+    // drained by the Page into its network_events so the CDP layer emits
+    // Network.requestWillBeSent / responseReceived for them (issue #406).
+    pub js_network_events: Vec<JsNetworkEvent>,
 }
 
 impl ObscuraState {
@@ -100,6 +122,7 @@ impl ObscuraState {
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
+            js_network_events: Vec::new(),
         }
     }
 }
@@ -1042,6 +1065,28 @@ async fn op_fetch_url(
                     gs.network_response_bodies.remove(&oldest);
                 }
             }
+        }
+        // Record a network event so the CDP layer emits requestWillBeSent /
+        // responseReceived for this script-initiated request (#406). Keyed by
+        // the same fetch-{N} id as the stored body so Network.getResponseBody
+        // resolves. Capped to keep a long-lived page from growing unbounded.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        gs.js_network_events.push(JsNetworkEvent {
+            request_id: request_id.clone(),
+            url: url.clone(),
+            method: method.clone(),
+            status,
+            response_headers: resp_headers.clone(),
+            body_size: resp_bytes.len(),
+            timestamp,
+        });
+        const MAX_JS_NETWORK_EVENTS: usize = 4096;
+        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+            gs.js_network_events.drain(0..overflow);
         }
         request_id
     };

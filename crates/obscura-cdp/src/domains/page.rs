@@ -263,6 +263,9 @@ async fn do_navigate(
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();
+        // Fold in script-initiated requests (fetch/XHR/dynamic resource) so they
+        // emit as Network events alongside static subresources (#406).
+        page.sync_js_network_events();
         let network_events: Vec<_> = page.network_events.drain(..).collect();
         let page_url = page.url_string();
         let page_id = page.id.clone();
