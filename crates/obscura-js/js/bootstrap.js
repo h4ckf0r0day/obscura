@@ -7398,21 +7398,28 @@ if (typeof Image === 'undefined') {
     // `.src` flips `complete` and fires `load` on a microtask-later tick. Lazy
     // loaders and preloaders that create `new Image()`, set `.src`, and wait for
     // `onload` (or addEventListener('load')) would hang forever otherwise.
-    Object.defineProperty(img, 'src', {
-      configurable: true, enumerable: true,
-      get() { return _imgSrcDesc.get.call(img); },
-      set(v) {
-        _imgSrcDesc.set.call(img, v);
-        if (!img.getAttribute('src')) return;
-        img.complete = false;
-        setTimeout(function () {
-          img.complete = true;
-          img.naturalWidth = img.naturalWidth || img.width || 0;
-          img.naturalHeight = img.naturalHeight || img.height || 0;
-          try { img.dispatchEvent(new Event('load')); } catch (e) {}
-        }, 0);
-      },
-    });
+    // Anti-bot scripts (Booking.com, issue #394) pre-define a non-configurable
+    // own `src` on <img> elements; redefining it throws "Cannot redefine
+    // property: src" and kills the constructor. Skip the load emulation then:
+    // a page that owns `src` is instrumenting loads itself.
+    const ownSrc = Object.getOwnPropertyDescriptor(img, 'src');
+    if (!ownSrc || ownSrc.configurable) {
+      Object.defineProperty(img, 'src', {
+        configurable: true, enumerable: true,
+        get() { return _imgSrcDesc.get.call(img); },
+        set(v) {
+          _imgSrcDesc.set.call(img, v);
+          if (!img.getAttribute('src')) return;
+          img.complete = false;
+          setTimeout(function () {
+            img.complete = true;
+            img.naturalWidth = img.naturalWidth || img.width || 0;
+            img.naturalHeight = img.naturalHeight || img.height || 0;
+            try { img.dispatchEvent(new Event('load')); } catch (e) {}
+          }, 0);
+        },
+      });
+    }
     return img;
   };
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
