@@ -153,6 +153,12 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().http_client = Some(client);
     }
 
+    /// Install the owning page's passive on_request/on_response callback
+    /// registry so scripted fetch()/XHR observation is page-scoped (issue #408).
+    pub fn set_callbacks(&self, callbacks: std::sync::Arc<obscura_net::CallbackRegistry>) {
+        self.state.borrow_mut().callbacks = Some(callbacks);
+    }
+
     /// Install the stealth (wreq) HTTP client so scripted fetch()/XHR is routed
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
@@ -631,9 +637,12 @@ impl ObscuraJsRuntime {
         // Fetch the module source. The old impl registered an empty string
         // and called it loaded, so every Vite / Next module bundle "loaded"
         // in 1ms with zero code and the SPA never mounted (issue #205).
-        let client = self.state.borrow().http_client.clone();
+        let (client, callbacks) = {
+            let st = self.state.borrow();
+            (st.http_client.clone(), st.callbacks.clone())
+        };
         let source_code = match client {
-            Some(c) => match c.fetch(&specifier).await {
+            Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
                 Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
                 Err(e) => {
                     tracing::warn!("Module fetch failed ({}): {}", url, e);

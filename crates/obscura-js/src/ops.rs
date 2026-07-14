@@ -8,7 +8,7 @@ use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
+use obscura_net::{CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use tokio::sync::Mutex;
@@ -75,6 +75,10 @@ pub struct ObscuraState {
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
+    /// The owning page's passive on_request/on_response callbacks (issue
+    /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
+    /// the page that registered it.
+    pub callbacks: Option<Arc<CallbackRegistry>>,
     /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
     /// client so the request carries the Chrome TLS fingerprint and client
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
@@ -111,6 +115,7 @@ impl ObscuraState {
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
+            callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
@@ -642,7 +647,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url, http_client) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -674,7 +679,7 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx, proxy_url, gs.http_client.clone())
+        (jar, in_flight, itx, proxy_url, gs.callbacks.clone())
     };
 
     // Slots the interception channel can override via Continue so a consumer
@@ -782,9 +787,8 @@ async fn op_fetch_url(
     // reaches the network (Fulfill/Fail from the interception channel short-
     // circuit earlier). on_request/on_response previously fired only for
     // navigation; this wires them for JS fetch()/XHR too.
-    if let Some(ref hc) = http_client {
-        let cbs = hc.on_request.read().await;
-        if !cbs.is_empty() {
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_request_callbacks().await {
             if let Ok(parsed) = url::Url::parse(&url) {
                 let info = RequestInfo {
                     url: parsed,
@@ -792,9 +796,7 @@ async fn op_fetch_url(
                     headers: custom_headers.clone(),
                     resource_type: ResourceType::Fetch,
                 };
-                for (_, cb) in cbs.iter() {
-                    cb(&info);
-                }
+                cbs.fire_request(&info).await;
             }
         }
     }
@@ -822,7 +824,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 is_cross_origin,
                 mode.clone(),
-                http_client.clone(),
+                callbacks.clone(),
             )
             .await;
         }
@@ -1028,9 +1030,8 @@ async fn op_fetch_url(
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref hc) = http_client {
-        let cbs = hc.on_response.read().await;
-        if !cbs.is_empty() {
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_response_callbacks().await {
             let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
             let info = RequestInfo {
                 url: resp.url.clone(),
@@ -1038,9 +1039,7 @@ async fn op_fetch_url(
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
-            for (_, cb) in cbs.iter() {
-                cb(&info, &resp);
-            }
+            cbs.fire_response(&info, &resp).await;
         }
     }
     let response_request_id = {
@@ -1133,7 +1132,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     is_cross_origin: bool,
     mode: String,
-    http_client: Option<Arc<ObscuraHttpClient>>,
+    callbacks: Option<Arc<CallbackRegistry>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -1221,9 +1220,8 @@ async fn stealth_fetch_all(
 
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
-    if let Some(ref hc) = http_client {
-        let cbs = hc.on_response.read().await;
-        if !cbs.is_empty() {
+    if let Some(ref cbs) = callbacks {
+        if cbs.has_response_callbacks().await {
             let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
             let info = RequestInfo {
                 url: resp.url.clone(),
@@ -1231,9 +1229,7 @@ async fn stealth_fetch_all(
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
-            for (_, cb) in cbs.iter() {
-                cb(&info, &resp);
-            }
+            cbs.fire_response(&info, &resp).await;
         }
     }
 

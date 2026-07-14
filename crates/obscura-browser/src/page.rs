@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
-use obscura_net::{ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
+use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
 use url::Url;
 
 use crate::context::BrowserContext;
@@ -194,6 +194,10 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// Passive on_request/on_response callbacks, scoped to this page (issue
+    /// #408): they fire only for requests this page drives and die with it.
+    /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
+    callbacks: Arc<CallbackRegistry>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -245,6 +249,7 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -271,7 +276,9 @@ impl Page {
         if let Some(ref stealth) = self.stealth_client {
             return stealth.fetch(url).await;
         }
-        self.http_client.fetch(url).await
+        self.http_client
+            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .await
     }
     fn init_js(&mut self) {
         // Drop any existing runtime so the JS realm starts clean on
@@ -333,6 +340,7 @@ impl Page {
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
+        rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
@@ -533,8 +541,10 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        let page_callbacks = self.callbacks.clone();
         let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
             let client = client.clone();
+            let cbs = page_callbacks.clone();
             let url = url.clone();
             let idx = *idx;
             async move {
@@ -563,7 +573,7 @@ impl Page {
                     };
                     return Some((idx, url, resp));
                 }
-                match client.fetch(&parsed).await {
+                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
                         tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -947,7 +957,11 @@ impl Page {
                 if self.context.robots_cache.is_allowed(domain, "/robots.txt") {
                     let robots_url = format!("{}://{}/robots.txt", url.scheme(), domain);
                     if let Ok(robots_url) = Url::parse(&robots_url) {
-                        if let Ok(resp) = self.http_client.fetch(&robots_url).await {
+                        if let Ok(resp) = self
+                            .http_client
+                            .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
+                            .await
+                        {
                             if resp.status == 200 {
                                 let body = String::from_utf8_lossy(&resp.body);
                                 self.context.robots_cache.parse_and_store(
@@ -1000,7 +1014,9 @@ impl Page {
             headers.insert("content-type".to_string(), content_type);
             Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
         } else if method == "POST" {
-            self.http_client.post_form(&url, body).await
+            self.http_client
+                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
+                .await
         } else {
             self.do_fetch(&url).await
         }.map_err(|e| {
@@ -1086,12 +1102,14 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        let page_callbacks = self.callbacks.clone();
         let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
             let client = client.clone();
+            let cbs = page_callbacks.clone();
             let url_str = full_url.clone();
             async move {
                 let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
+                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
                     Ok(resp) => Some((url_str, resp)),
                     Err(e) => {
                         tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
@@ -1650,34 +1668,34 @@ impl Page {
     }
 
     /// Register a passive callback fired for every JS `fetch()`/XHR (and
-    /// navigation) request, once the method/headers/body are known and before it
-    /// is sent. Non-blocking; use `enable_interception` to mutate or block.
-    /// Register a passive request observer, returning a stable id. Pass the id
-    /// to `off_request` to detach it (issue #408). Note the observer lives on
-    /// the context's shared http client, so it also sees requests from sibling
-    /// pages in the same context; detach it when the capturing phase ends.
+    /// navigation) request this page makes, once the method/headers/body are
+    /// known and before it is sent. Non-blocking; use `enable_interception` to
+    /// mutate or block. Returns a stable id; pass it to `off_request` to
+    /// detach (issue #408). Scoped to this page: it never sees sibling pages'
+    /// requests and dies with the page.
     pub fn on_request(&mut self, cb: RequestCallback) -> u64 {
-        self.http_client.register_on_request(cb)
+        self.callbacks.add_request(cb)
     }
 
     /// Register a passive callback fired with every JS `fetch()`/XHR (and
-    /// navigation) response, including its body. Non-blocking. Returns a stable
-    /// id for `off_response`. The main path for crawlers that need to capture
-    /// API response payloads. Shared across the context like `on_request`.
+    /// navigation) response this page receives, including its body.
+    /// Non-blocking. The main path for crawlers that need to capture API
+    /// response payloads. Returns a stable id for `off_response`. Page-scoped
+    /// like `on_request`.
     pub fn on_response(&mut self, cb: ResponseCallback) -> u64 {
-        self.http_client.register_on_response(cb)
+        self.callbacks.add_response(cb)
     }
 
     /// Detach a request observer registered with `on_request`. Returns true if
     /// one was removed.
     pub fn off_request(&mut self, id: u64) -> bool {
-        self.http_client.remove_on_request(id)
+        self.callbacks.remove_request(id)
     }
 
     /// Detach a response observer registered with `on_response`. Returns true if
     /// one was removed.
     pub fn off_response(&mut self, id: u64) -> bool {
-        self.http_client.remove_on_response(id)
+        self.callbacks.remove_response(id)
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {

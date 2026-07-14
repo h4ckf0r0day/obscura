@@ -108,6 +108,53 @@ async fn page_intercepts_and_observes_js_fetch() {
     );
 }
 
+/// Issue #408 follow-up: callbacks are page-scoped. A callback registered on
+/// page A must not fire for requests made by page B in the same browser
+/// context, and must not survive page A being dropped.
+#[tokio::test]
+async fn callbacks_do_not_bleed_across_pages() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_echo_server();
+
+    let browser = Browser::new().unwrap();
+    let mut page_a = browser.new_page().await.unwrap();
+    let mut page_b = browser.new_page().await.unwrap();
+
+    let a_hits = Arc::new(AtomicU32::new(0));
+    let a = a_hits.clone();
+    page_a.on_request(Arc::new(move |_info| {
+        a.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // Page B navigates (navigation + inline fetch('/api')); page A's callback
+    // must stay silent.
+    page_b.goto(&base).await.unwrap();
+    page_b.settle(500).await;
+    assert_eq!(
+        a_hits.load(Ordering::SeqCst),
+        0,
+        "page A's on_request fired for page B's requests"
+    );
+
+    // Page A navigates; its own callback fires.
+    page_a.goto(&base).await.unwrap();
+    assert!(
+        a_hits.load(Ordering::SeqCst) >= 1,
+        "page A's on_request did not fire for its own navigation"
+    );
+
+    // Dropping page A must not leave its callback firing for page B.
+    let before_drop = a_hits.load(Ordering::SeqCst);
+    drop(page_a);
+    page_b.goto(&base).await.unwrap();
+    page_b.settle(500).await;
+    assert_eq!(
+        a_hits.load(Ordering::SeqCst),
+        before_drop,
+        "dropped page A's on_request still fired for page B's requests"
+    );
+}
+
 #[tokio::test]
 async fn page_rewrites_request_url_via_interception() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");

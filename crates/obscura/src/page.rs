@@ -128,9 +128,9 @@ impl Page {
     }
 
     /// Detach a request callback previously registered with `on_request`.
-    /// Returns true if a callback with that id was removed. Callbacks live on
-    /// the context's shared HTTP client, so detach them when a page or capture
-    /// phase ends to avoid firing for sibling pages (issue #408).
+    /// Returns true if a callback with that id was removed. Callbacks are
+    /// scoped to this page — they never fire for sibling pages and are
+    /// dropped with the page (issue #408).
     pub fn off_request(&mut self, id: u64) -> bool {
         self.inner.off_request(id)
     }

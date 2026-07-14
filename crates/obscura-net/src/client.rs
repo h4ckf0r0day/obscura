@@ -75,6 +75,107 @@ pub enum ResourceType {
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
+/// Page-scoped store for the passive on_request/on_response callbacks (issue
+/// #408). Each `Page` owns one, so a callback never fires for another page's
+/// requests and dies with its page. The HTTP client itself stays
+/// callback-free; page-driven fetches pass the page's registry in. Ids keep
+/// the `u64` shape #416 established on `Page::on_request`/`on_response`.
+pub struct CallbackRegistry {
+    on_request: RwLock<Vec<(u64, RequestCallback)>>,
+    on_response: RwLock<Vec<(u64, ResponseCallback)>>,
+    id_counter: std::sync::atomic::AtomicU64,
+}
+
+impl CallbackRegistry {
+    pub fn new() -> Self {
+        CallbackRegistry {
+            on_request: RwLock::new(Vec::new()),
+            on_response: RwLock::new(Vec::new()),
+            id_counter: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Register a request callback; the returned id detaches it via
+    /// `remove_request`. Sync like the pre-registry push path: registration
+    /// happens from `Page` setup where no reader holds the lock, so
+    /// `try_write` cannot fail there.
+    pub fn add_request(&self, cb: RequestCallback) -> u64 {
+        let id = self.next_id();
+        if let Ok(mut v) = self.on_request.try_write() {
+            v.push((id, cb));
+        }
+        id
+    }
+
+    /// Register a response callback; see `add_request`.
+    pub fn add_response(&self, cb: ResponseCallback) -> u64 {
+        let id = self.next_id();
+        if let Ok(mut v) = self.on_response.try_write() {
+            v.push((id, cb));
+        }
+        id
+    }
+
+    /// Detach a request callback. Returns true when the id was found and
+    /// removed, so a double detach is a visible no-op.
+    pub fn remove_request(&self, id: u64) -> bool {
+        match self.on_request.try_write() {
+            Ok(mut v) => {
+                let before = v.len();
+                v.retain(|(cid, _)| *cid != id);
+                v.len() != before
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Detach a response callback; see `remove_request`.
+    pub fn remove_response(&self, id: u64) -> bool {
+        match self.on_response.try_write() {
+            Ok(mut v) => {
+                let before = v.len();
+                v.retain(|(cid, _)| *cid != id);
+                v.len() != before
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// True when at least one request callback is registered. Lets fire sites
+    /// skip building a `RequestInfo` when nobody listens.
+    pub async fn has_request_callbacks(&self) -> bool {
+        !self.on_request.read().await.is_empty()
+    }
+
+    /// True when at least one response callback is registered.
+    pub async fn has_response_callbacks(&self) -> bool {
+        !self.on_response.read().await.is_empty()
+    }
+
+    pub async fn fire_request(&self, info: &RequestInfo) {
+        for (_, cb) in self.on_request.read().await.iter() {
+            cb(info);
+        }
+    }
+
+    pub async fn fire_response(&self, info: &RequestInfo, resp: &Response) {
+        for (_, cb) in self.on_response.read().await.iter() {
+            cb(info, resp);
+        }
+    }
+}
+
+impl Default for CallbackRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Process-wide opt-in via env var. Older flow that issue #4 introduced. The
 /// new `--allow-private-network` CLI flag (issue #33) sets a per-client field
 /// that is OR'd with this so existing scripts and Docker setups that pin the
@@ -262,13 +363,6 @@ pub struct ObscuraHttpClient {
     pub user_agent: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
-    /// Passive request/response observers, each tagged with a stable id so a
-    /// specific one can be detached via `remove_on_request`/`remove_on_response`
-    /// (issue #408). Without ids the vecs were append-only: no detach, and
-    /// re-registering across navigations piled up duplicates.
-    pub on_request: RwLock<Vec<(u64, RequestCallback)>>,
-    pub on_response: RwLock<Vec<(u64, ResponseCallback)>>,
-    callback_id_counter: std::sync::atomic::AtomicU64,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
@@ -345,9 +439,6 @@ impl ObscuraHttpClient {
             ),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
-            on_request: RwLock::new(Vec::new()),
-            on_response: RwLock::new(Vec::new()),
-            callback_id_counter: std::sync::atomic::AtomicU64::new(1),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
@@ -384,55 +475,33 @@ impl ObscuraHttpClient {
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::GET, url, None).await
+        self.fetch_with_method(Method::GET, url, None, None).await
     }
 
-    /// Register a passive request observer, returning a stable id. Pass the id
-    /// to `remove_on_request` to detach it (issue #408).
-    pub fn register_on_request(&self, cb: RequestCallback) -> u64 {
-        let id = self
-            .callback_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut v) = self.on_request.try_write() {
-            v.push((id, cb));
-        }
-        id
-    }
-
-    /// Register a passive response observer, returning a stable id. Pass the id
-    /// to `remove_on_response` to detach it (issue #408).
-    pub fn register_on_response(&self, cb: ResponseCallback) -> u64 {
-        let id = self
-            .callback_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut v) = self.on_response.try_write() {
-            v.push((id, cb));
-        }
-        id
-    }
-
-    /// Detach a request observer by its id. Returns true if one was removed.
-    pub fn remove_on_request(&self, id: u64) -> bool {
-        if let Ok(mut v) = self.on_request.try_write() {
-            let before = v.len();
-            v.retain(|(cid, _)| *cid != id);
-            return v.len() != before;
-        }
-        false
-    }
-
-    /// Detach a response observer by its id. Returns true if one was removed.
-    pub fn remove_on_response(&self, id: u64) -> bool {
-        if let Ok(mut v) = self.on_response.try_write() {
-            let before = v.len();
-            v.retain(|(cid, _)| *cid != id);
-            return v.len() != before;
-        }
-        false
+    /// `fetch` that also fires the page's passive on_request/on_response
+    /// callbacks (issue #408: callbacks are page-scoped, so the page-driven
+    /// fetch paths pass their registry in).
+    pub async fn fetch_with_callbacks(
+        &self,
+        url: &Url,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method(Method::GET, url, None, callbacks).await
     }
 
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec())).await
+        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()), None).await
+    }
+
+    /// `post_form` variant of `fetch_with_callbacks`.
+    pub async fn post_form_with_callbacks(
+        &self,
+        url: &Url,
+        body: &str,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()), callbacks)
+            .await
     }
 
     pub async fn fetch_with_method(
@@ -440,6 +509,7 @@ impl ObscuraHttpClient {
         initial_method: Method,
         url: &Url,
         initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
 
@@ -492,8 +562,8 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for (_, cb) in self.on_request.read().await.iter() {
-                cb(&request_info);
+            if let Some(cbs) = callbacks {
+                cbs.fire_request(&request_info).await;
             }
 
             let ua = self.user_agent.read().await.clone();
@@ -638,8 +708,8 @@ impl ObscuraHttpClient {
                 redirected_from: redirects,
             };
 
-            for (_, cb) in self.on_response.read().await.iter() {
-                cb(&request_info, &response);
+            if let Some(cbs) = callbacks {
+                cbs.fire_response(&request_info, &response).await;
             }
 
             return Ok(response);
