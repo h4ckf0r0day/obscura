@@ -165,3 +165,49 @@ async fn page_rewrites_request_url_via_interception() {
         body
     );
 }
+
+// Issue #408: a callback registered with on_response must be detachable via the
+// returned id, so a crawler can stop capturing after a phase. Before the fix the
+// vecs were append-only and a callback fired for the client's whole lifetime.
+#[tokio::test]
+async fn on_response_callback_can_be_detached() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_echo_server();
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+
+    let hits = Arc::new(AtomicU32::new(0));
+    let h = hits.clone();
+    let id = page.on_response(Arc::new(move |info, _resp| {
+        if info.resource_type == ResourceType::Fetch {
+            h.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+
+    // First navigation: the callback fires for the JS fetch('/api').
+    page.goto(&base).await.unwrap();
+    for _ in 0..20 {
+        page.settle(200).await;
+        if hits.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+    }
+    let after_first = hits.load(Ordering::SeqCst);
+    assert!(after_first >= 1, "on_response should fire while attached");
+
+    // Detach it; off_response must report success and the id must be gone.
+    assert!(page.off_response(id), "off_response must remove the callback");
+    assert!(!page.off_response(id), "removing an already-removed id returns false");
+
+    // Second navigation: the detached callback must not fire again.
+    page.goto(&base).await.unwrap();
+    for _ in 0..10 {
+        page.settle(200).await;
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        after_first,
+        "detached on_response callback must not fire after off_response"
+    );
+}

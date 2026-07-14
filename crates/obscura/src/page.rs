@@ -114,16 +114,31 @@ impl Page {
     /// Register a passive callback fired for every request the page makes
     /// (navigation and JS `fetch()`/XHR), once its method/headers/body are known
     /// and before it is sent. Non-blocking; use `enable_interception` to mutate
-    /// or block.
-    pub fn on_request(&mut self, cb: RequestCallback) {
-        self.inner.on_request(cb);
+    /// or block. Returns a stable id; pass it to `off_request` to detach.
+    pub fn on_request(&mut self, cb: RequestCallback) -> u64 {
+        self.inner.on_request(cb)
     }
 
     /// Register a passive callback fired with every response the page receives
     /// (navigation and JS `fetch()`/XHR), including its body. Non-blocking. The
-    /// main path for capturing API response payloads from SPAs.
-    pub fn on_response(&mut self, cb: ResponseCallback) {
-        self.inner.on_response(cb);
+    /// main path for capturing API response payloads from SPAs. Returns a stable
+    /// id; pass it to `off_response` to detach.
+    pub fn on_response(&mut self, cb: ResponseCallback) -> u64 {
+        self.inner.on_response(cb)
+    }
+
+    /// Detach a request callback previously registered with `on_request`.
+    /// Returns true if a callback with that id was removed. Callbacks live on
+    /// the context's shared HTTP client, so detach them when a page or capture
+    /// phase ends to avoid firing for sibling pages (issue #408).
+    pub fn off_request(&mut self, id: u64) -> bool {
+        self.inner.off_request(id)
+    }
+
+    /// Detach a response callback previously registered with `on_response`.
+    /// Returns true if a callback with that id was removed.
+    pub fn off_response(&mut self, id: u64) -> bool {
+        self.inner.off_response(id)
     }
 }
 

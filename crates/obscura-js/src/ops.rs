@@ -769,7 +769,7 @@ async fn op_fetch_url(
                     headers: custom_headers.clone(),
                     resource_type: ResourceType::Fetch,
                 };
-                for cb in cbs.iter() {
+                for (_, cb) in cbs.iter() {
                     cb(&info);
                 }
             }
@@ -1015,7 +1015,7 @@ async fn op_fetch_url(
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
-            for cb in cbs.iter() {
+            for (_, cb) in cbs.iter() {
                 cb(&info, &resp);
             }
         }
@@ -1186,7 +1186,7 @@ async fn stealth_fetch_all(
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
-            for cb in cbs.iter() {
+            for (_, cb) in cbs.iter() {
                 cb(&info, &resp);
             }
         }

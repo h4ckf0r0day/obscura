@@ -1626,19 +1626,32 @@ impl Page {
     /// Register a passive callback fired for every JS `fetch()`/XHR (and
     /// navigation) request, once the method/headers/body are known and before it
     /// is sent. Non-blocking; use `enable_interception` to mutate or block.
-    pub fn on_request(&mut self, cb: RequestCallback) {
-        if let Ok(mut v) = self.http_client.on_request.try_write() {
-            v.push(cb);
-        }
+    /// Register a passive request observer, returning a stable id. Pass the id
+    /// to `off_request` to detach it (issue #408). Note the observer lives on
+    /// the context's shared http client, so it also sees requests from sibling
+    /// pages in the same context; detach it when the capturing phase ends.
+    pub fn on_request(&mut self, cb: RequestCallback) -> u64 {
+        self.http_client.register_on_request(cb)
     }
 
     /// Register a passive callback fired with every JS `fetch()`/XHR (and
-    /// navigation) response, including its body. Non-blocking. The main path for
-    /// crawlers that need to capture API response payloads.
-    pub fn on_response(&mut self, cb: ResponseCallback) {
-        if let Ok(mut v) = self.http_client.on_response.try_write() {
-            v.push(cb);
-        }
+    /// navigation) response, including its body. Non-blocking. Returns a stable
+    /// id for `off_response`. The main path for crawlers that need to capture
+    /// API response payloads. Shared across the context like `on_request`.
+    pub fn on_response(&mut self, cb: ResponseCallback) -> u64 {
+        self.http_client.register_on_response(cb)
+    }
+
+    /// Detach a request observer registered with `on_request`. Returns true if
+    /// one was removed.
+    pub fn off_request(&mut self, id: u64) -> bool {
+        self.http_client.remove_on_request(id)
+    }
+
+    /// Detach a response observer registered with `on_response`. Returns true if
+    /// one was removed.
+    pub fn off_response(&mut self, id: u64) -> bool {
+        self.http_client.remove_on_response(id)
     }
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {

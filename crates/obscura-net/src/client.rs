@@ -262,8 +262,13 @@ pub struct ObscuraHttpClient {
     pub user_agent: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
-    pub on_request: RwLock<Vec<RequestCallback>>,
-    pub on_response: RwLock<Vec<ResponseCallback>>,
+    /// Passive request/response observers, each tagged with a stable id so a
+    /// specific one can be detached via `remove_on_request`/`remove_on_response`
+    /// (issue #408). Without ids the vecs were append-only: no detach, and
+    /// re-registering across navigations piled up duplicates.
+    pub on_request: RwLock<Vec<(u64, RequestCallback)>>,
+    pub on_response: RwLock<Vec<(u64, ResponseCallback)>>,
+    callback_id_counter: std::sync::atomic::AtomicU64,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
@@ -342,6 +347,7 @@ impl ObscuraHttpClient {
             interceptor: RwLock::new(None),
             on_request: RwLock::new(Vec::new()),
             on_response: RwLock::new(Vec::new()),
+            callback_id_counter: std::sync::atomic::AtomicU64::new(1),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
@@ -379,6 +385,50 @@ impl ObscuraHttpClient {
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_method(Method::GET, url, None).await
+    }
+
+    /// Register a passive request observer, returning a stable id. Pass the id
+    /// to `remove_on_request` to detach it (issue #408).
+    pub fn register_on_request(&self, cb: RequestCallback) -> u64 {
+        let id = self
+            .callback_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut v) = self.on_request.try_write() {
+            v.push((id, cb));
+        }
+        id
+    }
+
+    /// Register a passive response observer, returning a stable id. Pass the id
+    /// to `remove_on_response` to detach it (issue #408).
+    pub fn register_on_response(&self, cb: ResponseCallback) -> u64 {
+        let id = self
+            .callback_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut v) = self.on_response.try_write() {
+            v.push((id, cb));
+        }
+        id
+    }
+
+    /// Detach a request observer by its id. Returns true if one was removed.
+    pub fn remove_on_request(&self, id: u64) -> bool {
+        if let Ok(mut v) = self.on_request.try_write() {
+            let before = v.len();
+            v.retain(|(cid, _)| *cid != id);
+            return v.len() != before;
+        }
+        false
+    }
+
+    /// Detach a response observer by its id. Returns true if one was removed.
+    pub fn remove_on_response(&self, id: u64) -> bool {
+        if let Ok(mut v) = self.on_response.try_write() {
+            let before = v.len();
+            v.retain(|(cid, _)| *cid != id);
+            return v.len() != before;
+        }
+        false
     }
 
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
@@ -442,7 +492,7 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for cb in self.on_request.read().await.iter() {
+            for (_, cb) in self.on_request.read().await.iter() {
                 cb(&request_info);
             }
 
@@ -588,7 +638,7 @@ impl ObscuraHttpClient {
                 redirected_from: redirects,
             };
 
-            for cb in self.on_response.read().await.iter() {
+            for (_, cb) in self.on_response.read().await.iter() {
                 cb(&request_info, &response);
             }
 
