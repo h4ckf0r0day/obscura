@@ -183,6 +183,72 @@ async fn structured_clone_preserves_dataview() {
     assert_eq!(val["independent"], true, "clone must own its buffer, not alias the source");
 }
 
+// A reference cycle through Error.cause must clone without crashing (issue
+// #419). The Error branch recursed into `cause` before recording itself in
+// `seen`, so a self-referential cause blew the stack. Chrome clones this and
+// preserves identity (clone.cause === clone).
+#[tokio::test(flavor = "current_thread")]
+async fn structured_clone_handles_circular_error_cause() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(async () => {
+            const e = new Error("boom");
+            e.cause = e;
+            const out = {};
+            try {
+                const clone = structuredClone(e);
+                out.ok = true;
+                out.message = clone.message;
+                out.selfCycle = clone.cause === clone;
+                out.isError = clone instanceof Error;
+            } catch (err) {
+                out.ok = false;
+                out.err = String(err && err.message || err);
+            }
+            return JSON.stringify(out);
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["ok"], true, "circular Error.cause crashed structuredClone: {:?}", val["err"]);
+    assert_eq!(val["message"], "boom");
+    assert_eq!(val["isError"], true, "clone must remain an Error");
+    assert_eq!(val["selfCycle"], true, "cyclic cause must resolve to the clone, not a duplicate");
+}
+
+// An own enumerable `__proto__` data property (what JSON.parse('{"__proto__":…}')
+// produces) must clone as an own data property, not be routed through the
+// inherited __proto__ setter (issue #420). Plain objects must also clone onto
+// Object.prototype, matching Chrome, rather than inheriting the source proto.
+#[tokio::test(flavor = "current_thread")]
+async fn structured_clone_reproduces_own_proto_property() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(async () => {
+            const src = JSON.parse('{"__proto__":{"polluted":true},"a":1}');
+            const clone = structuredClone(src);
+            return JSON.stringify({
+                hasOwnProto: Object.prototype.hasOwnProperty.call(clone, "__proto__"),
+                plainProto: Object.getPrototypeOf(clone) === Object.prototype,
+                polluted: clone.polluted === true,
+                a: clone.a,
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["hasOwnProto"], true, "own __proto__ data property was lost");
+    assert_eq!(val["plainProto"], true, "plain object must clone onto Object.prototype");
+    assert_eq!(val["polluted"], false, "clone prototype was reparented via the __proto__ setter");
+    assert_eq!(val["a"], 1);
+}
+
 // Functions and symbols are not structured-cloneable. The original early
 // `typeof !== "object"` return passed them through by reference instead of
 // throwing DataCloneError, so this guards both the throw and the name.

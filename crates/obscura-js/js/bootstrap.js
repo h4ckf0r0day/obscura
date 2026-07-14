@@ -5266,6 +5266,9 @@ function _structuredClone(value, seen) {
   if (value instanceof Error) {
     const Ctor = value.constructor || Error;
     const e = new Ctor(value.message);
+    // Record the clone before recursing into `cause`, otherwise a cycle
+    // through the error (e.cause === e) recurses until the stack overflows.
+    seen.set(value, e);
     if (value.name) e.name = value.name;
     if (value.stack) e.stack = value.stack;
     if (value.cause !== undefined) e.cause = _structuredClone(value.cause, seen);
@@ -5278,11 +5281,21 @@ function _structuredClone(value, seen) {
     const hook = globalThis.__obscura_clone_hooks[value[Symbol.toStringTag]];
     if (typeof hook === "function") return hook(value, seen);
   }
-  const out = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  // Plain objects clone onto Object.prototype (like Chrome), not the source's
+  // prototype. Define each property instead of assigning it: a source with an
+  // own enumerable `__proto__` data prop (what JSON.parse('{"__proto__":…}')
+  // yields) would otherwise hit the inherited __proto__ setter and reparent
+  // the clone instead of copying the property.
+  const out = Array.isArray(value) ? [] : {};
   seen.set(value, out);
   for (const k in value) {
     if (Object.prototype.hasOwnProperty.call(value, k)) {
-      out[k] = _structuredClone(value[k], seen);
+      Object.defineProperty(out, k, {
+        value: _structuredClone(value[k], seen),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     }
   }
   // Symbols are not enumerable via for-in; copy own symbol-keyed properties.
