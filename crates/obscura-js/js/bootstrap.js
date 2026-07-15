@@ -7094,8 +7094,13 @@ if (!globalThis.crypto.subtle) {
   // _structuredClone via Symbol.toStringTag ("CryptoKey"); registered lazily
   // because structuredClone is defined before this block (issue #389).
   globalThis.__obscura_clone_hooks = globalThis.__obscura_clone_hooks || {};
-  globalThis.__obscura_clone_hooks["CryptoKey"] = function (src) {
+  // `seen` is the clone memo _structuredClone hands every hook. Populate it so
+  // one key reached twice in a graph clones to one shared object (and its key
+  // material is registered once), matching structuredClone's identity rules.
+  globalThis.__obscura_clone_hooks["CryptoKey"] = function (src, seen) {
+    if (seen && seen.has(src)) return seen.get(src);
     const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    if (seen) seen.set(src, copy);
     return copy;
   };
 

@@ -207,3 +207,38 @@ async fn structured_clone_rejects_functions_and_symbols() {
     assert_eq!(val["fn"], "DataCloneError", "functions must not clone");
     assert_eq!(val["sym"], "DataCloneError", "symbols must not clone");
 }
+
+// structuredClone preserves reference identity within one graph, including for
+// platform objects cloned through a hook (issue #423). The CryptoKey hook
+// ignored the `seen` map _structuredClone hands it, so one key referenced twice
+// came back as two distinct objects.
+#[tokio::test(flavor = "current_thread")]
+async fn structured_clone_preserves_cryptokey_identity() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(async () => {
+            const key = await crypto.subtle.importKey(
+                "raw", new Uint8Array(32),
+                { name: "HMAC", hash: "SHA-256" }, true, ["sign"]
+            );
+            const clone = structuredClone({ a: key, b: key });
+            // The shared clone must still be usable by crypto.subtle.
+            const sig = await crypto.subtle.sign("HMAC", clone.a, new TextEncoder().encode("abc"));
+            return JSON.stringify({
+                shared: clone.a === clone.b,
+                distinctFromSource: clone.a !== key,
+                tag: clone.a[Symbol.toStringTag],
+                sigLen: new Uint8Array(sig).length,
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["shared"], true, "one CryptoKey reached twice must clone to one shared object");
+    assert_eq!(val["distinctFromSource"], true, "clone must not alias the source key");
+    assert_eq!(val["tag"], "CryptoKey");
+    assert_eq!(val["sigLen"], 32, "the shared clone must remain usable by crypto.subtle");
+}
