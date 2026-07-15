@@ -1150,6 +1150,17 @@ function _htmlAttrName(el, n) {
   return n;
 }
 
+// A submit button per the HTML spec: a <button> whose type is submit — the
+// default, including when the type attribute is missing or invalid — or an
+// <input> of type submit/image. Used to validate requestSubmit's submitter.
+function _isSubmitButton(el) {
+  if (!el || typeof el.localName !== "string") return false;
+  const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
+  if (el.localName === "button") return type !== "reset" && type !== "button";
+  if (el.localName === "input") return type === "submit" || type === "image";
+  return false;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1501,8 +1512,11 @@ class Element extends Node {
           return;
         }
       }
-      const type = (this.getAttribute('type') || '').toLowerCase();
-      if (type === 'submit' || (this.localName === 'button' && type !== 'button' && type !== 'reset')) {
+      // Same predicate requestSubmit validates against, so an internal click
+      // can never hand it a submitter it would reject. Also matches the CDP
+      // click path in input.rs, which already treats <input type=image> as a
+      // submit button.
+      if (_isSubmitButton(this)) {
         const form = this.closest ? this.closest('form') : null;
         // A real submit-button click fires the cancelable submit event, so use
         // requestSubmit() (not the plain submit() method, which now bypasses it).
@@ -1975,6 +1989,22 @@ class Element extends Node {
     this._navigateSubmit(submitter);
   }
   requestSubmit(submitter) {
+    // Per spec, a given submitter must be a submit button owned by this form;
+    // both checks run before the submit event fires. A missing/null submitter
+    // means "submit from the form itself".
+    if (submitter !== undefined && submitter !== null) {
+      if (!_isSubmitButton(submitter)) {
+        throw new TypeError(
+          "Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not a submit button."
+        );
+      }
+      if (submitter.form !== this) {
+        throw new DOMException(
+          "Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not owned by this form element.",
+          'NotFoundError'
+        );
+      }
+    }
     const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     if (cancelled) return;
     this._navigateSubmit(submitter);

@@ -182,3 +182,71 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
         "a CDP click on a submit button must fire the cancelable submit event and be vetoable"
     );
 }
+
+// requestSubmit(submitter) must validate its argument before doing anything
+// else (issue #424): a TypeError if the submitter is not a submit button, and a
+// NotFoundError DOMException if it is not owned by the form. obscura accepted
+// anything and silently submitted. The form under test preventDefault()s its
+// own submit event so the valid-submitter case cannot navigate away.
+#[tokio::test(flavor = "current_thread")]
+async fn request_submit_validates_its_submitter_argument() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_form().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-4";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    navigate(&mut ctx, &url, session_id).await;
+
+    let v = cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(() => {
+                document.body.innerHTML =
+                  '<form id="vf">' +
+                    '<div id="d"></div>' +
+                    '<button id="ok" type="submit">go</button>' +
+                    '<button id="plain" type="button">x</button>' +
+                    '<input id="inp" type="text">' +
+                  '</form>' +
+                  '<button id="outside" type="submit">y</button>';
+                const f = document.getElementById('vf');
+                f.addEventListener('submit', (e) => e.preventDefault());
+                const probe = (fn) => {
+                    try { fn(); return "no-throw"; }
+                    catch (e) {
+                        return (e instanceof DOMException) ? "DOMException:" + e.name
+                                                           : (e && e.constructor && e.constructor.name) || String(e);
+                    }
+                };
+                return JSON.stringify({
+                    div:      probe(() => f.requestSubmit(document.getElementById('d'))),
+                    plain:    probe(() => f.requestSubmit(document.getElementById('plain'))),
+                    text:     probe(() => f.requestSubmit(document.getElementById('inp'))),
+                    outside:  probe(() => f.requestSubmit(document.getElementById('outside'))),
+                    valid:    probe(() => f.requestSubmit(document.getElementById('ok'))),
+                    noArg:    probe(() => f.requestSubmit()),
+                    nullArg:  probe(() => f.requestSubmit(null)),
+                });
+            })()"#,
+            "returnByValue": true
+        }),
+        session_id,
+    )
+    .await;
+
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["div"], "TypeError", "a non-button submitter must throw TypeError");
+    assert_eq!(val["plain"], "TypeError", "type=button is not a submit button");
+    assert_eq!(val["text"], "TypeError", "input type=text is not a submit button");
+    assert_eq!(
+        val["outside"], "DOMException:NotFoundError",
+        "a submit button not owned by the form must throw NotFoundError"
+    );
+    assert_eq!(val["valid"], "no-throw", "the form's own submit button must be accepted");
+    assert_eq!(val["noArg"], "no-throw", "requestSubmit() with no submitter is valid");
+    assert_eq!(val["nullArg"], "no-throw", "requestSubmit(null) means submit from the form itself");
+}
