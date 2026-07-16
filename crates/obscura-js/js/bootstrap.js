@@ -5290,12 +5290,20 @@ function _structuredClone(value, seen) {
   seen.set(value, out);
   for (const k in value) {
     if (Object.prototype.hasOwnProperty.call(value, k)) {
-      Object.defineProperty(out, k, {
-        value: _structuredClone(value[k], seen),
-        writable: true,
-        enumerable: true,
-        configurable: true,
-      });
+      const cloned = _structuredClone(value[k], seen);
+      // Only `__proto__` needs defineProperty: plain assignment would hit the
+      // inherited prototype setter and reparent the clone instead of adding an
+      // own data property. Every other key takes the fast assignment path.
+      if (k === "__proto__") {
+        Object.defineProperty(out, k, {
+          value: cloned,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      } else {
+        out[k] = cloned;
+      }
     }
   }
   // Symbols are not enumerable via for-in; copy own symbol-keyed properties.
