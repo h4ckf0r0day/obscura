@@ -2094,8 +2094,13 @@ class Element extends Node {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
   }
-  get scrollTop() { return 0; } set scrollTop(v) {}
-  get scrollLeft() { return 0; } set scrollLeft(v) {}
+  // No layout engine, so there is no real overflow to scroll. We still track a
+  // scroll offset so scrollTop/scrollLeft round-trip and the scroll methods
+  // below can report a position, which is what infinite-scroll code reads back.
+  get scrollTop() { return this._scrollTop || 0; }
+  set scrollTop(v) { v = +v; this._scrollTop = Number.isFinite(v) && v > 0 ? v : 0; }
+  get scrollLeft() { return this._scrollLeft || 0; }
+  set scrollLeft(v) { v = +v; this._scrollLeft = Number.isFinite(v) && v > 0 ? v : 0; }
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
     // documentElement and body span the full viewport. Without this every
@@ -2153,6 +2158,31 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView() { globalThis.__obscura_click_target = this; }
+  // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
+  // Without layout the offset cannot be clamped to a real max, but updating it
+  // and firing a scroll event lets scroll-driven lazy loaders advance instead
+  // of throwing "scrollBy is not a function".
+  scrollTo(x, y) {
+    let left, top;
+    if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
+    else { left = x; top = y; }
+    if (left !== undefined) this.scrollLeft = +left || 0;
+    if (top !== undefined) this.scrollTop = +top || 0;
+    this._fireScroll();
+  }
+  scroll(x, y) { this.scrollTo(x, y); }
+  scrollBy(x, y) {
+    let dl, dt;
+    if (x !== null && typeof x === 'object') { dl = x.left; dt = x.top; }
+    else { dl = x; dt = y; }
+    this.scrollLeft = (this.scrollLeft || 0) + (+dl || 0);
+    this.scrollTop = (this.scrollTop || 0) + (+dt || 0);
+    this._fireScroll();
+  }
+  _fireScroll() {
+    const self = this;
+    setTimeout(() => { try { self.dispatchEvent(new Event('scroll', { bubbles: false })); } catch (e) {} }, 0);
+  }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
     return {
@@ -5933,6 +5963,7 @@ _markNative(globalThis.Selection);
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.insertAdjacentText,
   Element.prototype.insertAdjacentElement, Element.prototype.scrollIntoView,
+  Element.prototype.scrollTo, Element.prototype.scrollBy, Element.prototype.scroll,
   Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,
