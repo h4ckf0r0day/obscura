@@ -151,8 +151,12 @@ pub async fn handle(
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'{key}',code:'{code}'}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
-                            key = key.replace('\'', "\\'"),
-                            code = code.replace('\'', "\\'"),
+                            // Escape backslash BEFORE single-quote (as the text
+                            // path below does) so a key like "\" — Chrome's
+                            // backslash key — doesn't escape the closing quote
+                            // and produce a syntax error that drops the event.
+                            key = key.replace('\\', "\\\\").replace('\'', "\\'"),
+                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
                         page.evaluate(&js);
 
@@ -194,8 +198,8 @@ pub async fn handle(
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:'{key}',code:'{code}'}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
-                            key = key.replace('\'', "\\'"),
-                            code = code.replace('\'', "\\'"),
+                            key = key.replace('\\', "\\\\").replace('\'', "\\'"),
+                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
                         page.evaluate(&js);
                     }
