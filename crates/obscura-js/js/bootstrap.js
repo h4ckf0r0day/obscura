@@ -2581,20 +2581,27 @@ class Document extends Node {
         return true;
       },
       nextNode() {
+        // Walk document order from currentNode until a node is accepted or the
+        // subtree rooted at `root` is exhausted. The old impl seeded from
+        // `currentNode.firstChild` and only walked that subtree, so once
+        // currentNode was a leaf it returned null and iteration died mid-tree.
         let node = this.currentNode;
-        let child = node.firstChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          if (child.firstChild) { child = child.firstChild; continue; }
-          if (child.nextSibling) { child = child.nextSibling; continue; }
-          let parent = child.parentNode;
-          while (parent && parent !== this.root) {
-            if (parent.nextSibling) { child = parent.nextSibling; break; }
-            parent = parent.parentNode;
+        for (;;) {
+          if (node.firstChild) {
+            node = node.firstChild;
+          } else {
+            // No child: follow the next sibling, climbing ancestors until one
+            // has a next sibling — without stepping outside `root`.
+            while (node && node !== this.root && !node.nextSibling) {
+              node = node.parentNode;
+            }
+            if (!node || node === this.root) return null;
+            node = node.nextSibling;
           }
-          if (!parent || parent === this.root) return null;
+          // Not accepted is treated as SKIP: keep traversing (its descendants
+          // stay eligible), matching the prior non-accepted-node behavior.
+          if (this._accept(node)) { this.currentNode = node; return node; }
         }
-        return null;
       },
       previousNode() {
         let node = this.currentNode;
