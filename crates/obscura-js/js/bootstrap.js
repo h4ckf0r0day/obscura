@@ -4455,7 +4455,28 @@ globalThis.ElementInternals = class ElementInternals {
   get shadowRoot() { return (this._el && this._el._shadowRoot) || null; }
   get states() { return this._states; }
 };
-globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
+// Full standard constant set (issue #439). The partial version here lacked
+// FILTER_ACCEPT/REJECT/SKIP and most SHOW_* values, so the canonical
+// `acceptNode() { return NodeFilter.FILTER_ACCEPT; }` filter idiom returned
+// undefined and TreeWalker/NodeIterator rejected every node.
+globalThis.NodeFilter = {
+  SHOW_ALL: 0xFFFFFFFF,
+  SHOW_ELEMENT: 0x1,
+  SHOW_ATTRIBUTE: 0x2,
+  SHOW_TEXT: 0x4,
+  SHOW_CDATA_SECTION: 0x8,
+  SHOW_ENTITY_REFERENCE: 0x10,
+  SHOW_ENTITY: 0x20,
+  SHOW_PROCESSING_INSTRUCTION: 0x40,
+  SHOW_COMMENT: 0x80,
+  SHOW_DOCUMENT: 0x100,
+  SHOW_DOCUMENT_TYPE: 0x200,
+  SHOW_DOCUMENT_FRAGMENT: 0x400,
+  SHOW_NOTATION: 0x800,
+  FILTER_ACCEPT: 1,
+  FILTER_REJECT: 2,
+  FILTER_SKIP: 3,
+};
 // ResizeObserver is defined earlier with real per-target firing; the stub
 // that previously lived here was a no-op that clobbered the real class.
 //
@@ -7689,11 +7710,6 @@ if (typeof Selection === 'undefined') {
     getRangeAt(){return null;} collapse(){} extend(){} selectAllChildren(){} deleteFromDocument(){}
     addRange(){} removeRange(){} removeAllRanges(){} toString(){return '';}
   };
-}
-
-if (typeof NodeFilter === 'undefined') {
-  globalThis.NodeFilter = { SHOW_ALL:0xFFFFFFFF, SHOW_ELEMENT:1, SHOW_TEXT:4, SHOW_COMMENT:128,
-    FILTER_ACCEPT:1, FILTER_REJECT:2, FILTER_SKIP:3 };
 }
 
 if (typeof TreeWalker === 'undefined') {
