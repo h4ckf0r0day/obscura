@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use deno_core::{JsRuntime, RuntimeOptions};
+use deno_core::{v8, JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
@@ -1145,7 +1145,12 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
+        let context = self.runtime.main_context();
+        v8::scope_with_context!(
+            scope,
+            self.runtime.v8_isolate(),
+            context,
+        );
         let local = deno_core::v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
