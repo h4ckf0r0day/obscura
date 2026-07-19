@@ -134,6 +134,12 @@ pub async fn handle(
             ctx.pending_events.extend(phase1);
 
             for net_event in &network_events {
+                crate::dispatch::cache_response_body(
+                    &ctx.network_response_bodies,
+                    net_event.request_id.clone(),
+                    net_event.body.clone(),
+                )
+                .await;
                 ctx.pending_events.push(CdpEvent {
                     method: "Network.requestWillBeSent".into(),
                     params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),

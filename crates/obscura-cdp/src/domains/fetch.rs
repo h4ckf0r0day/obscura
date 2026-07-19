@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -18,12 +19,12 @@ pub enum FetchResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        post_data: Option<String>,
+        post_data: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
         headers: Vec<(String, String)>,
-        body: String,
+        body: Vec<u8>,
     },
     Fail {
         reason: String,
@@ -33,6 +34,7 @@ pub enum FetchResolution {
 pub struct FetchInterceptState {
     pub enabled: bool,
     pub patterns: Vec<String>,
+    pub session_id: Option<String>,
     pub paused: HashMap<String, PausedRequest>,
     request_counter: u64,
 }
@@ -42,6 +44,7 @@ impl FetchInterceptState {
         FetchInterceptState {
             enabled: false,
             patterns: Vec::new(),
+            session_id: None,
             paused: HashMap::new(),
             request_counter: 0,
         }
@@ -126,6 +129,7 @@ pub async fn handle(
 
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.clone();
+            ctx.fetch_intercept.session_id = session_id.clone();
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_enabled = true;
@@ -141,6 +145,7 @@ pub async fn handle(
         "disable" => {
             ctx.fetch_intercept.enabled = false;
             ctx.fetch_intercept.patterns.clear();
+            ctx.fetch_intercept.session_id = None;
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_enabled = false;
                 page.intercept_patterns.clear();
@@ -163,6 +168,7 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
+            let post_data = decode_optional_base64(params.get("postData"))?;
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
                     url: params
@@ -174,10 +180,7 @@ pub async fn handle(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     headers: parse_cdp_headers(params.get("headers")),
-                    post_data: params
-                        .get("postData")
-                        .and_then(|v| v.as_str())
-                        .map(decode_cdp_post_data),
+                    post_data,
                 });
             }
             Ok(json!({}))
@@ -205,11 +208,8 @@ pub async fn handle(
                         .collect()
                 })
                 .unwrap_or_default();
-            let body = params
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let body =
+                decode_base64_body(params.get("body").and_then(|v| v.as_str()).unwrap_or(""))?;
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Fulfill {
@@ -242,14 +242,16 @@ pub async fn handle(
                 .get("requestId")
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
-            let bodies = ctx.network_response_bodies.lock().await;
-            let body = bodies.get(request_id).ok_or_else(|| {
-                format!("No resource with given identifier found: {}", request_id)
-            })?;
-            Ok(json!({
-                "body": body.body.clone(),
-                "base64Encoded": body.base64_encoded,
-            }))
+            let body = ctx
+                .network_response_bodies
+                .lock()
+                .await
+                .get(request_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("No resource with given identifier found: {}", request_id)
+                })?;
+            Ok(body.cdp_value())
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
     }
@@ -281,56 +283,17 @@ fn parse_cdp_headers(value: Option<&Value>) -> Option<HashMap<String, String>> {
     })
 }
 
-fn decode_cdp_post_data(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
+pub(crate) fn decode_base64_body(input: &str) -> Result<Vec<u8>, String> {
+    BASE64
+        .decode(input)
+        .map_err(|error| format!("Invalid base64 body: {}", error))
+}
 
-    let looks_base64 = input.len() % 4 == 0
-        && input
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
-    if !looks_base64 {
-        return input.to_string();
-    }
-
-    let bytes: Vec<u8> = input
-        .bytes()
-        .filter_map(|c| match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' | b'-' => Some(62),
-            b'/' | b'_' => Some(63),
-            _ => None,
-        })
-        .collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 {
-            out.push((b[1] << 4) | (b[2] >> 2));
-        }
-        if chunk.len() > 3 {
-            out.push((b[2] << 6) | b[3]);
-        }
-    }
-
-    let decoded = String::from_utf8_lossy(&out).to_string();
-    let printable = decoded
-        .bytes()
-        .all(|b| matches!(b, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(&b));
-    if printable {
-        decoded
-    } else {
-        input.to_string()
-    }
+pub(crate) fn decode_optional_base64(value: Option<&Value>) -> Result<Option<Vec<u8>>, String> {
+    value
+        .and_then(Value::as_str)
+        .map(decode_base64_body)
+        .transpose()
 }
 
 #[cfg(test)]
@@ -371,5 +334,44 @@ mod tests {
 
         state.enabled = false;
         assert!(!state.should_pause_url("https://www.instagram.com/anything"));
+    }
+
+    #[test]
+    fn cdp_bodies_use_strict_standard_base64_and_preserve_binary() {
+        assert_eq!(
+            decode_base64_body("AP8BgA==").unwrap(),
+            vec![0, 255, 1, 128]
+        );
+        assert!(decode_base64_body("not base64!").is_err());
+        assert!(decode_base64_body("_-8=").is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_continue_body_does_not_consume_paused_request() {
+        let mut ctx = CdpContext::new();
+        let (resolver, _receiver) = tokio::sync::oneshot::channel();
+        ctx.fetch_intercept.paused.insert(
+            "request-1".to_string(),
+            PausedRequest {
+                request_id: "request-1".to_string(),
+                url: "https://example.com/upload".to_string(),
+                method: "POST".to_string(),
+                headers: HashMap::new(),
+                resource_type: "Fetch".to_string(),
+                resolver,
+            },
+        );
+
+        let error = handle(
+            "continueRequest",
+            &json!({"requestId":"request-1","postData":"%%%"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("malformed base64 must be rejected");
+
+        assert!(error.contains("Invalid base64 body"));
+        assert!(ctx.fetch_intercept.paused.contains_key("request-1"));
     }
 }

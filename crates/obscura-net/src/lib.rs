@@ -12,7 +12,7 @@ pub use client::{
     DEFAULT_SEC_CH_UA_FULL_VERSION_LIST, DEFAULT_SEC_CH_UA_PLATFORM,
     DEFAULT_SEC_CH_UA_PLATFORM_VERSION, DEFAULT_USER_AGENT,
 };
-pub use cookies::{CookieInfo, CookieJar};
+pub use cookies::{is_schemeful_same_site, CookieInfo, CookieJar};
 pub use robots::RobotsCache;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{StealthHttpClient, STEALTH_USER_AGENT};

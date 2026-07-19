@@ -190,6 +190,17 @@ fn handle_fetch_resolution(
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
+        if method == "Fetch.disable" {
+            for (_, resolver) in intercepted_paused.drain() {
+                let _ = resolver.send(obscura_js::ops::InterceptResolution::Continue {
+                    url: None,
+                    method: None,
+                    headers: None,
+                    body: None,
+                });
+            }
+            return false;
+        }
         if !matches!(
             method,
             "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"
@@ -208,10 +219,12 @@ fn handle_fetch_resolution(
             intercepted_paused.len()
         );
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
-            tracing::info!("INTERCEPTION resolved: {}", request_id);
+        if intercepted_paused.contains_key(request_id) {
             let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
+                "Fetch.continueRequest" => crate::domains::fetch::decode_optional_base64(
+                    req.params.get("postData"),
+                )
+                .map(|body| obscura_js::ops::InterceptResolution::Continue {
                     url: req
                         .params
                         .get("url")
@@ -223,12 +236,8 @@ fn handle_fetch_resolution(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                     headers: parse_cdp_headers(req.params.get("headers")),
-                    body: req
-                        .params
-                        .get("postData")
-                        .and_then(|v| v.as_str())
-                        .map(decode_cdp_post_data),
-                },
+                    body,
+                }),
                 "Fetch.fulfillRequest" => {
                     let status = req
                         .params
@@ -240,40 +249,55 @@ fn handle_fetch_resolution(
                         .get("body")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let body = decode_base64(raw_body);
-                    let headers = req
-                        .params
-                        .get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|h| {
-                                    Some((
-                                        h.get("name")?.as_str()?.to_string(),
-                                        h.get("value")?.as_str()?.to_string(),
-                                    ))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill {
-                        status,
-                        headers,
-                        body,
-                    }
+                    crate::domains::fetch::decode_base64_body(raw_body).map(|body| {
+                        let headers = req
+                            .params
+                            .get("responseHeaders")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|h| {
+                                        Some((
+                                            h.get("name")?.as_str()?.to_string(),
+                                            h.get("value")?.as_str()?.to_string(),
+                                        ))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        obscura_js::ops::InterceptResolution::Fulfill {
+                            status,
+                            headers,
+                            body,
+                        }
+                    })
                 }
-                "Fetch.failRequest" => {
-                    let reason = req
+                "Fetch.failRequest" => Ok(obscura_js::ops::InterceptResolution::Fail {
+                    reason: req
                         .params
                         .get("errorReason")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Failed")
-                        .to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
-                }
+                        .to_string(),
+                }),
                 _ => return false,
             };
-            let _ = resolver.send(resolution);
+
+            let resolution = match resolution {
+                Ok(resolution) => resolution,
+                Err(message) => {
+                    let response =
+                        crate::types::CdpResponse::error(req.id, -32602, message, req.session_id);
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let _ = reply_tx.send(json);
+                    }
+                    return true;
+                }
+            };
+            if let Some(resolver) = intercepted_paused.remove(request_id) {
+                tracing::info!("INTERCEPTION resolved: {}", request_id);
+                let _ = resolver.send(resolution);
+            }
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
@@ -447,13 +471,8 @@ fn spawn_intercepted_response_events(
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
 
-        response_bodies.lock().await.insert(
-            request_id.clone(),
-            dispatch::NetworkResponseBody {
-                body: response.body.clone(),
-                base64_encoded: response.base64_encoded,
-            },
-        );
+        dispatch::cache_response_body(&response_bodies, request_id.clone(), response.body.clone())
+            .await;
 
         let response_event = json!({
             "method": "Network.responseReceived",
@@ -504,11 +523,13 @@ fn intercepted_request_payload(
         "referrerPolicy": "strict-origin-when-cross-origin",
     });
     if !intercepted.body.is_empty() {
-        request["postData"] = json!(intercepted.body);
         request["hasPostData"] = json!(true);
         request["postDataEntries"] = json!([{
-            "bytes": BASE64.encode(intercepted.body.as_bytes()),
+            "bytes": BASE64.encode(&intercepted.body),
         }]);
+        if let Ok(text) = std::str::from_utf8(&intercepted.body) {
+            request["postData"] = json!(text);
+        }
     }
     request
 }
@@ -518,6 +539,18 @@ fn current_intercept_target(
     source_page_id: Option<&str>,
     source_url: &str,
 ) -> Option<(String, String, String)> {
+    if let Some(session_id) = ctx.fetch_intercept.session_id.as_ref() {
+        if let Some(page_id) = ctx.sessions.get(session_id) {
+            let page = ctx.get_page(page_id)?;
+            let matches_source = source_page_id.is_none_or(|source| source == page_id)
+                && (source_url.is_empty()
+                    || source_url == "about:blank"
+                    || page.url_string() == source_url);
+            if matches_source {
+                return Some((session_id.clone(), page.frame_id.clone(), page.url_string()));
+            }
+        }
+    }
     if let Some(source_page_id) = source_page_id {
         if let Some((session_id, page_id)) = ctx
             .sessions
@@ -699,6 +732,30 @@ async fn maybe_pause_navigation_request(
     }
 }
 
+fn apply_navigation_continue_overrides(
+    nav_url: &mut String,
+    nav_method: &mut String,
+    nav_headers: &mut HashMap<String, String>,
+    nav_body: &mut Vec<u8>,
+    url: Option<String>,
+    method: Option<String>,
+    headers: Option<HashMap<String, String>>,
+    body: Option<Vec<u8>>,
+) {
+    if let Some(url) = url {
+        *nav_url = url;
+    }
+    if let Some(method) = method {
+        *nav_method = method;
+    }
+    if let Some(headers) = headers {
+        *nav_headers = headers;
+    }
+    if let Some(body) = body {
+        *nav_body = body;
+    }
+}
+
 async fn process_with_interception(
     text: &str,
     ctx: &mut CdpContext,
@@ -782,7 +839,8 @@ async fn process_with_interception(
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
     let mut nav_url = url.to_string();
     let mut nav_method = "GET".to_string();
-    let mut nav_body = String::new();
+    let mut nav_headers = HashMap::new();
+    let mut nav_body = Vec::new();
 
     if let Some(resolution) = maybe_pause_navigation_request(
         ctx,
@@ -801,18 +859,20 @@ async fn process_with_interception(
     {
         match resolution {
             obscura_js::ops::InterceptResolution::Continue {
-                url, method, body, ..
-            } => {
-                if let Some(url) = url {
-                    nav_url = url;
-                }
-                if let Some(method) = method {
-                    nav_method = method;
-                }
-                if let Some(body) = body {
-                    nav_body = body;
-                }
-            }
+                url,
+                method,
+                headers,
+                body,
+            } => apply_navigation_continue_overrides(
+                &mut nav_url,
+                &mut nav_method,
+                &mut nav_headers,
+                &mut nav_body,
+                url,
+                method,
+                headers,
+                body,
+            ),
             obscura_js::ops::InterceptResolution::Fail { reason } => {
                 let response = crate::types::CdpResponse::error(
                     req.id,
@@ -851,16 +911,24 @@ async fn process_with_interception(
         mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
     let url_owned = nav_url.clone();
     let method_owned = nav_method.clone();
+    let headers_owned = nav_headers.clone();
     let body_owned = nav_body.clone();
 
     tokio::task::spawn_local(async move {
-        let result = if method_owned == "POST" && !body_owned.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &method_owned, &body_owned)
+        let result =
+            if method_owned != "GET" || !body_owned.is_empty() || !headers_owned.is_empty() {
+                page.navigate_with_wait_request(
+                    &url_owned,
+                    wait_until,
+                    &method_owned,
+                    &body_owned,
+                    headers_owned,
+                )
                 .await
-        } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
-        }
-        .map_err(|e| e.to_string());
+            } else {
+                page.navigate_with_wait(&url_owned, wait_until).await
+            }
+            .map_err(|e| e.to_string());
         for source in &preload_scripts {
             if let Err(e) = page.execute_preload_script(source) {
                 tracing::debug!("Preload script error: {}", e);
@@ -1062,6 +1130,12 @@ async fn process_with_interception(
     }
 
     for net_event in &network_events {
+        dispatch::cache_response_body(
+            &ctx.network_response_bodies,
+            net_event.request_id.clone(),
+            net_event.body.clone(),
+        )
+        .await;
         for event in [
             crate::types::CdpEvent {
                 method: "Network.requestWillBeSent".into(),
@@ -1278,61 +1352,6 @@ async fn process_cdp_message(
                 let _ = reply_tx.send(json);
             }
         }
-    }
-}
-
-fn decode_base64(input: &str) -> String {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 {
-            out.push((b[1] << 4) | (b[2] >> 2));
-        }
-        if chunk.len() > 3 {
-            out.push((b[2] << 6) | b[3]);
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn decode_cdp_post_data(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-
-    let looks_base64 = input.len() % 4 == 0
-        && input
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
-    if !looks_base64 {
-        return input.to_string();
-    }
-
-    let decoded = decode_base64(input);
-    let printable = decoded
-        .bytes()
-        .all(|b| matches!(b, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(&b));
-    if printable {
-        decoded
-    } else {
-        input.to_string()
     }
 }
 
@@ -1557,6 +1576,25 @@ mod tests {
     }
 
     #[test]
+    fn current_intercept_target_prefers_fetch_enabling_session() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions
+            .insert("page-session".to_string(), page_id.clone());
+        ctx.sessions
+            .insert("gate-session".to_string(), page_id.clone());
+        ctx.fetch_intercept.session_id = Some("gate-session".to_string());
+        ctx.get_page_mut(&page_id).unwrap().url =
+            Some(Url::parse("https://www.instagram.com/").unwrap());
+
+        let (session_id, _, _) =
+            current_intercept_target(&ctx, Some(&page_id), "https://www.instagram.com/")
+                .expect("fetch session should resolve");
+
+        assert_eq!(session_id, "gate-session");
+    }
+
+    #[test]
     fn current_intercept_target_can_match_source_url() {
         let mut ctx = CdpContext::new();
         let first_page = ctx.create_page();
@@ -1627,13 +1665,123 @@ mod tests {
                     Some("application/json")
                 );
                 assert_eq!(headers.get("x-injected").map(String::as_str), Some("1"));
-                assert_eq!(body.as_deref(), Some("{\"cursor\":\"injected\"}"));
+                assert_eq!(
+                    body.as_deref(),
+                    Some(b"{\"cursor\":\"injected\"}".as_slice())
+                );
             }
             other => panic!("expected Continue resolution, got {other:?}"),
         }
 
         let response = reply_rx.try_recv().expect("CDP response should be sent");
         assert!(response.contains("\"id\":9"));
+    }
+
+    #[test]
+    fn navigation_continue_overrides_preserve_headers_and_binary_body() {
+        let mut url = "https://example.com/original".to_string();
+        let mut method = "GET".to_string();
+        let mut headers = HashMap::new();
+        let mut body = Vec::new();
+
+        apply_navigation_continue_overrides(
+            &mut url,
+            &mut method,
+            &mut headers,
+            &mut body,
+            Some("https://example.com/continued".to_string()),
+            Some("POST".to_string()),
+            Some(HashMap::from([(
+                "x-navigation-override".to_string(),
+                "kept".to_string(),
+            )])),
+            Some(vec![0, 255]),
+        );
+
+        assert_eq!(url, "https://example.com/continued");
+        assert_eq!(method, "POST");
+        assert_eq!(
+            headers.get("x-navigation-override").map(String::as_str),
+            Some("kept")
+        );
+        assert_eq!(body, vec![0, 255]);
+    }
+
+    #[test]
+    fn handle_fetch_resolution_decodes_binary_fulfill_body() {
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("req-1".to_string(), resolution_tx)]);
+
+        assert!(handle_fetch_resolution(
+            &json!({
+                "id": 10,
+                "method": "Fetch.fulfillRequest",
+                "params": {
+                    "requestId": "req-1",
+                    "responseCode": 201,
+                    "body": "AP8BgA=="
+                }
+            })
+            .to_string(),
+            &reply_tx,
+            &mut paused,
+        ));
+
+        match resolution_rx.try_recv().unwrap() {
+            obscura_js::ops::InterceptResolution::Fulfill { status, body, .. } => {
+                assert_eq!(status, 201);
+                assert_eq!(body, vec![0, 255, 1, 128]);
+            }
+            other => panic!("expected fulfill resolution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_disable_releases_live_paused_requests() {
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("req-1".to_string(), resolution_tx)]);
+
+        assert!(!handle_fetch_resolution(
+            &json!({"id": 10, "method": "Fetch.disable", "params": {}}).to_string(),
+            &reply_tx,
+            &mut paused,
+        ));
+
+        assert!(paused.is_empty());
+        assert!(matches!(
+            resolution_rx.try_recv().unwrap(),
+            obscura_js::ops::InterceptResolution::Continue { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_fetch_resolution_returns_protocol_error_without_consuming_request() {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("req-1".to_string(), resolution_tx)]);
+
+        let handled = handle_fetch_resolution(
+            &json!({
+                "id": 10,
+                "method": "Fetch.continueRequest",
+                "params": {"requestId": "req-1", "postData": "%%%"}
+            })
+            .to_string(),
+            &reply_tx,
+            &mut paused,
+        );
+
+        assert!(handled);
+        assert!(paused.contains_key("req-1"));
+        assert!(matches!(
+            resolution_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let response = reply_rx.try_recv().expect("protocol error should be sent");
+        assert!(response.contains("Invalid base64 body"));
+        assert!(response.contains("-32602"));
     }
 
     #[tokio::test]
@@ -1736,8 +1884,7 @@ mod tests {
         ctx.network_response_bodies.lock().await.insert(
             "request-1".to_string(),
             dispatch::NetworkResponseBody {
-                body: "large response".to_string(),
-                base64_encoded: false,
+                body: b"large response".to_vec(),
             },
         );
 
@@ -1755,14 +1902,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_cdp_post_data_preserves_non_base64_bodies() {
-        assert_eq!(
-            decode_cdp_post_data("{\"cursor\":\"already-plain\"}"),
-            "{\"cursor\":\"already-plain\"}"
-        );
-    }
-
-    #[test]
     fn intercepted_request_payload_includes_chromium_post_data_entries() {
         let (resolver, _resolution_rx) = tokio::sync::oneshot::channel();
         let (_response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1773,7 +1912,7 @@ mod tests {
             url: "https://www.instagram.com/graphql/query".to_string(),
             method: "POST".to_string(),
             headers: HashMap::new(),
-            body: "variables=%7B%22after%22%3A%22cursor-a%22%7D".to_string(),
+            body: b"variables=%7B%22after%22%3A%22cursor-a%22%7D".to_vec(),
             resource_type: "Fetch".to_string(),
             pause: true,
             resolver,
@@ -1793,5 +1932,30 @@ mod tests {
                 "bytes": BASE64.encode("variables=%7B%22after%22%3A%22cursor-a%22%7D")
             }])
         );
+    }
+
+    #[test]
+    fn intercepted_binary_request_has_only_base64_post_data_entries() {
+        let (resolver, _resolution_rx) = tokio::sync::oneshot::channel();
+        let (_response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = obscura_js::ops::InterceptedRequest {
+            page_id: Some("page-1".to_string()),
+            page_url: "https://example.com/".to_string(),
+            request_id: "request-binary".to_string(),
+            url: "https://example.com/upload".to_string(),
+            method: "POST".to_string(),
+            headers: HashMap::new(),
+            body: vec![0, 255, 1, 128],
+            resource_type: "Fetch".to_string(),
+            pause: true,
+            resolver,
+            response_rx,
+        };
+
+        let payload = intercepted_request_payload(&request);
+
+        assert_eq!(payload["hasPostData"], json!(true));
+        assert!(payload.get("postData").is_none());
+        assert_eq!(payload["postDataEntries"], json!([{"bytes": "AP8BgA=="}]));
     }
 }

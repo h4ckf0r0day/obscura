@@ -1,14 +1,16 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::op2;
 use deno_core::Extension;
+use deno_core::JsBuffer;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
-use obscura_net::{CookieJar, ObscuraHttpClient};
+use obscura_net::{CookieJar, ObscuraHttpClient, ResourceType};
+use reqwest::Method;
 use tokio::sync::Mutex;
 
 pub type InterceptCallback = Arc<
@@ -23,12 +25,12 @@ pub enum InterceptResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
-        body: String,
+        body: Vec<u8>,
     },
     Fail {
         reason: String,
@@ -42,7 +44,7 @@ pub struct InterceptedRequest {
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
-    pub body: String,
+    pub body: Vec<u8>,
     pub resource_type: String,
     pub pause: bool,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
@@ -53,8 +55,7 @@ pub struct InterceptedResponse {
     pub url: String,
     pub status: u16,
     pub headers: HashMap<String, String>,
-    pub body: String,
-    pub base64_encoded: bool,
+    pub body: Vec<u8>,
     pub encoded_data_length: usize,
 }
 
@@ -382,14 +383,35 @@ fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     }
 }
 
-static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialsMode {
+    Include,
+    SameOrigin,
+    Omit,
+}
 
-fn get_shared_client() -> &'static reqwest::Client {
-    SHARED_HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .build()
-            .expect("failed to build shared reqwest::Client")
-    })
+impl CredentialsMode {
+    fn parse(value: &str) -> Result<Self, deno_error::JsErrorBox> {
+        match value {
+            "include" => Ok(Self::Include),
+            "same-origin" => Ok(Self::SameOrigin),
+            "omit" => Ok(Self::Omit),
+            _ => Err(deno_error::JsErrorBox::type_error(format!(
+                "Invalid credentials mode: {}",
+                value
+            ))),
+        }
+    }
+
+    fn allows(self, request_url: &url::Url, page_origin: Option<&url::Url>) -> bool {
+        match self {
+            Self::Include => true,
+            Self::Omit => false,
+            Self::SameOrigin => page_origin
+                .map(|page| page.origin() == request_url.origin())
+                .unwrap_or(false),
+        }
+    }
 }
 
 #[op2(async)]
@@ -399,28 +421,33 @@ async fn op_fetch_url(
     #[string] url: String,
     #[string] method: String,
     #[string] headers_json: String,
-    #[string] body: String,
+    #[buffer] body: JsBuffer,
     #[string] origin: String,
     #[string] mode: String,
+    #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
         url
     );
+    let credentials = CredentialsMode::parse(&credentials)?;
+    let initial_method: Method = method.parse().map_err(|error| {
+        deno_error::JsErrorBox::type_error(format!("Invalid HTTP method: {}", error))
+    })?;
+    let mut initial_author_headers =
+        normalize_header_names(serde_json::from_str(&headers_json).unwrap_or_default());
+    strip_browser_managed_headers(&mut initial_author_headers);
+    validate_no_cors_request(&mode, &initial_method, &initial_author_headers)?;
 
     if let Some((body, content_type)) = decode_data_url(&url) {
-        let body_text = String::from_utf8_lossy(&body).to_string();
-        return Ok(serde_json::json!({
-            "status": 200,
-            "body": body_text,
-            "bodyBase64": BASE64.encode(&body),
-            "url": url,
-            "headers": {
-                "content-type": content_type,
-            },
-        })
-        .to_string());
+        return Ok(fetch_response_json(
+            200,
+            &url,
+            HashMap::from([("content-type".to_string(), content_type)]),
+            &body,
+            false,
+        ));
     }
 
     if let Ok(parsed_url) = url::Url::parse(&url) {
@@ -437,7 +464,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, http_client, page_url, page_id) = {
+    let (cookie_jar, intercept_tx, http_client, page_url, page_id) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -454,7 +481,6 @@ async fn op_fetch_url(
             }
         }
         let jar = gs.cookie_jar.clone();
-        let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         let http_client = gs.http_client.clone();
         let page_url = gs.url.clone();
         let page_id = gs.page_id.clone();
@@ -481,21 +507,34 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx, http_client, page_url, page_id)
+        (jar, itx, http_client, page_url, page_id)
     };
 
+    let page_origin_url = url::Url::parse(&origin)
+        .ok()
+        .or_else(|| url::Url::parse(&page_url).ok());
     let mut request_url = url;
     let mut request_method = method;
-    let mut request_body = body;
-    let mut custom_headers: HashMap<String, String> =
-        serde_json::from_str(&headers_json).unwrap_or_default();
-    apply_browser_fetch_headers(
-        &mut custom_headers,
-        &request_url,
-        &page_url,
-        http_client.as_ref(),
-    )
-    .await;
+    let mut request_body = body.to_vec();
+    let mut custom_headers = initial_author_headers;
+    if let (Ok(parsed_url), Ok(parsed_method)) = (
+        url::Url::parse(&request_url),
+        request_method.parse::<Method>(),
+    ) {
+        validate_no_cors_request(&mode, &parsed_method, &custom_headers)?;
+        apply_browser_fetch_headers(
+            &mut custom_headers,
+            &parsed_url,
+            &page_url,
+            page_origin_url.as_ref(),
+            &parsed_method,
+            &mode,
+            credentials,
+            cookie_jar.as_ref(),
+            http_client.as_ref(),
+        )
+        .await;
+    }
 
     let mut response_tx = None;
     if let Some((tx, request_id, should_pause)) = intercept_tx {
@@ -556,7 +595,7 @@ async fn op_fetch_url(
                         request_method = method;
                     }
                     if let Some(headers) = headers {
-                        custom_headers = headers;
+                        custom_headers = normalize_header_names(headers);
                     }
                     if let Some(body) = body {
                         request_body = body;
@@ -576,178 +615,210 @@ async fn op_fetch_url(
                 }
                 Some(InterceptResolution::Fulfill {
                     status,
-                    headers: h,
-                    body: b,
+                    headers: resp_headers,
+                    body,
                 }) => {
-                    let resp_headers: HashMap<String, String> = h;
-                    return Ok(serde_json::json!({
-                        "status": status,
-                        "body": b,
-                        "url": request_url,
-                        "headers": resp_headers,
-                    })
-                    .to_string());
+                    if let Some(tx) = response_tx.take() {
+                        let _ = tx.send(InterceptedResponse {
+                            url: request_url.clone(),
+                            status,
+                            headers: resp_headers.clone(),
+                            encoded_data_length: body.len(),
+                            body: body.clone(),
+                        });
+                    }
+                    return Ok(fetch_response_json(
+                        status,
+                        &request_url,
+                        resp_headers,
+                        &body,
+                        false,
+                    ));
                 }
                 None => {}
             }
         }
     }
 
-    let client = get_shared_client();
+    strip_browser_managed_headers(&mut custom_headers);
+    let http_client = http_client.unwrap_or_else(|| Arc::new(ObscuraHttpClient::new()));
+    let mut current_url = url::Url::parse(&request_url)
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+    let mut current_method: Method = request_method.parse().map_err(|error| {
+        deno_error::JsErrorBox::type_error(format!("Invalid HTTP method: {}", error))
+    })?;
+    validate_no_cors_request(&mode, &current_method, &custom_headers)?;
+    let mut redirected = false;
+    let mut final_response = None;
 
-    let request_origin = url::Url::parse(&request_url)
-        .ok()
-        .map(|u| {
-            let host = u.host_str().unwrap_or("");
-            match u.port() {
-                Some(p) => format!("{}://{}:{}", u.scheme(), host, p),
-                None => format!("{}://{}", u.scheme(), host),
+    for _ in 0..20 {
+        validate_fetch_url(&current_url).map_err(deno_error::JsErrorBox::generic)?;
+        let is_cross_origin = page_origin_url
+            .as_ref()
+            .map(|page| page.origin() != current_url.origin())
+            .unwrap_or(false);
+        let mut headers = custom_headers.clone();
+        apply_browser_fetch_headers(
+            &mut headers,
+            &current_url,
+            &page_url,
+            page_origin_url.as_ref(),
+            &current_method,
+            &mode,
+            credentials,
+            cookie_jar.as_ref(),
+            Some(&http_client),
+        )
+        .await;
+
+        let needs_preflight = is_cross_origin
+            && mode == "cors"
+            && (current_method != Method::GET
+                && current_method != Method::HEAD
+                && current_method != Method::POST
+                || custom_headers
+                    .iter()
+                    .any(|(name, value)| !is_cors_safelisted_or_browser_header(name, value)));
+        if needs_preflight {
+            let mut preflight_headers = HashMap::new();
+            if let Some(page) = page_origin_url.as_ref() {
+                preflight_headers.insert("origin".to_string(), page.origin().ascii_serialization());
             }
-        })
-        .unwrap_or_default();
-    let page_origin = if origin.is_empty() {
-        request_origin.clone()
-    } else {
-        origin.clone()
-    };
-    let is_cross_origin = !page_origin.is_empty() && request_origin != page_origin;
-
-    let req_method: reqwest::Method = request_method.parse().unwrap_or(reqwest::Method::GET);
-
-    let needs_preflight = is_cross_origin
-        && mode == "cors"
-        && (req_method != reqwest::Method::GET
-            && req_method != reqwest::Method::HEAD
-            && req_method != reqwest::Method::POST
-            || custom_headers
-                .keys()
-                .any(|k| !is_cors_safelisted_or_browser_header(k)));
-
-    if needs_preflight {
-        let preflight = client
-            .request(reqwest::Method::OPTIONS, &request_url)
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", request_method.as_str())
-            .header(
-                "Access-Control-Request-Headers",
+            preflight_headers.insert(
+                "access-control-request-method".to_string(),
+                current_method.as_str().to_string(),
+            );
+            preflight_headers.insert(
+                "access-control-request-headers".to_string(),
                 custom_headers
                     .keys()
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", "),
+            );
+            let preflight = http_client
+                .request_bytes_once(
+                    Method::OPTIONS,
+                    &current_url,
+                    preflight_headers,
+                    None,
+                    ResourceType::Fetch,
+                )
+                .await
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+            if !(200..300).contains(&preflight.status) {
+                return Err(deno_error::JsErrorBox::generic(format!(
+                    "CORS preflight failed with HTTP {}",
+                    preflight.status
+                )));
+            }
+            validate_cors_response(
+                &preflight.headers,
+                page_origin_url.as_ref(),
+                credentials,
+                "CORS preflight",
+            )?;
+            validate_preflight_permissions(
+                &preflight.headers,
+                &current_method,
+                custom_headers.iter(),
+                credentials,
+            )?;
+        }
+
+        let response = http_client
+            .request_bytes_once(
+                current_method.clone(),
+                &current_url,
+                headers,
+                Some(request_body.clone()),
+                ResourceType::Fetch,
             )
-            .send()
             .await
-            .map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
 
-        let allowed_origin = preflight
-            .headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if allowed_origin != "*" && allowed_origin != page_origin {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
-                page_origin, allowed_origin
-            )));
-        }
-    }
-
-    let mut req = client.request(req_method, &request_url);
-
-    if is_cross_origin {
-        req = req.header("Origin", &page_origin);
-    }
-
-    if !is_cross_origin {
-        if let Some(ref jar) = cookie_jar {
-            if let Ok(parsed_url) = url::Url::parse(&request_url) {
-                let cookie_header = jar.get_cookie_header(&parsed_url);
-                if !cookie_header.is_empty() {
-                    req = req.header("Cookie", &cookie_header);
+        if credentials.allows(&current_url, page_origin_url.as_ref()) {
+            if let Some(jar) = cookie_jar.as_ref() {
+                for set_cookie in &response.set_cookie_headers {
+                    jar.set_cookie(set_cookie, &current_url);
                 }
             }
         }
-    }
-
-    for (k, v) in &custom_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-
-    if !request_body.is_empty() {
-        req = req.body(request_body.clone());
-    }
-
-    if let Some(ref counter) = in_flight {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        if let Some(ref counter) = in_flight {
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if is_cross_origin && mode == "cors" {
+            validate_cors_response(
+                &response.headers,
+                page_origin_url.as_ref(),
+                credentials,
+                "CORS response",
+            )?;
         }
-        deno_error::JsErrorBox::generic(e.to_string())
+
+        if let Some(location) = response.header("location") {
+            if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+                let next_url = current_url.join(location).map_err(|error| {
+                    deno_error::JsErrorBox::generic(format!("Invalid redirect URL: {}", error))
+                })?;
+                validate_fetch_redirect(&current_url, &next_url)
+                    .map_err(deno_error::JsErrorBox::generic)?;
+                if current_url.origin() != next_url.origin() {
+                    strip_cross_origin_sensitive_headers(&mut custom_headers);
+                }
+                if apply_fetch_redirect(response.status, &mut current_method, &mut request_body) {
+                    custom_headers.retain(|name, _| {
+                        !matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "content-type" | "content-encoding" | "content-language"
+                        )
+                    });
+                }
+                current_url = next_url;
+                redirected = true;
+                continue;
+            }
+        }
+
+        final_response = Some(response);
+        break;
+    }
+
+    let response = final_response.ok_or_else(|| {
+        deno_error::JsErrorBox::generic(format!("Too many redirects: {}", current_url))
     })?;
+    let status = response.status;
+    let resp_headers = response.headers;
+    let resp_bytes = response.body;
+    request_url = current_url.to_string();
 
-    if let Some(ref counter) = in_flight {
-        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    let status = response.status().as_u16();
-
-    if let Some(ref jar) = cookie_jar {
-        if let Ok(parsed_url) = url::Url::parse(&request_url) {
-            for val in response.headers().get_all(reqwest::header::SET_COOKIE) {
-                if let Ok(s) = val.to_str() {
-                    jar.set_cookie(s, &parsed_url);
-                }
-            }
-        }
-    }
-
-    let resp_headers: std::collections::HashMap<String, String> = response
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
-
-    if is_cross_origin && mode == "cors" {
-        let allowed = resp_headers
-            .get("access-control-allow-origin")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        if allowed != "*" && allowed != page_origin {
+    if page_origin_url
+        .as_ref()
+        .map(|page| page.origin() != current_url.origin())
+        .unwrap_or(false)
+        && mode == "cors"
+    {
+        if let Err(error) = validate_cors_response(
+            &resp_headers,
+            page_origin_url.as_ref(),
+            credentials,
+            "CORS response",
+        ) {
             return Ok(serde_json::json!({
                 "status": 0,
-                "body": "",
                 "url": request_url,
                 "headers": {},
                 "corsBlocked": true,
-                "corsError": format!("CORS error: Origin '{}' not in Access-Control-Allow-Origin '{}'", page_origin, allowed),
+                "corsError": error.to_string(),
             })
             .to_string());
         }
     }
-
-    let resp_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
-    let resp_body_base64 = BASE64.encode(&resp_bytes);
 
     if let Some(tx) = response_tx {
         let _ = tx.send(InterceptedResponse {
             url: request_url.clone(),
             status,
             headers: resp_headers.clone(),
-            body: resp_body.clone(),
-            base64_encoded: false,
             encoded_data_length: resp_bytes.len(),
+            body: resp_bytes.clone(),
         });
     }
 
@@ -755,23 +826,27 @@ async fn op_fetch_url(
         "op_fetch_url completed: {} {} ({} bytes)",
         request_method,
         request_url,
-        resp_body.len()
+        resp_bytes.len()
     );
 
-    Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
-        "url": request_url,
-        "headers": resp_headers,
-    })
-    .to_string())
+    Ok(fetch_response_json(
+        status,
+        &request_url,
+        resp_headers,
+        &resp_bytes,
+        redirected,
+    ))
 }
 
 async fn apply_browser_fetch_headers(
     headers: &mut HashMap<String, String>,
-    request_url: &str,
+    request_url: &url::Url,
     page_url: &str,
+    page_origin: Option<&url::Url>,
+    method: &Method,
+    mode: &str,
+    credentials: CredentialsMode,
+    cookie_jar: Option<&Arc<CookieJar>>,
     http_client: Option<&Arc<ObscuraHttpClient>>,
 ) {
     let (ua, extra_headers) = if let Some(client) = http_client {
@@ -782,6 +857,15 @@ async fn apply_browser_fetch_headers(
     } else {
         (obscura_net::DEFAULT_USER_AGENT.to_string(), HashMap::new())
     };
+    for (name, value) in &extra_headers {
+        if !is_browser_managed_header(name)
+            && !headers
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+        {
+            headers.insert(name.to_ascii_lowercase(), value.clone());
+        }
+    }
     let accept_language = header_value_case_insensitive(&extra_headers, "accept-language")
         .unwrap_or_else(|| "en-US,en;q=0.9".to_string());
     let sec_ch_platform = header_value_case_insensitive(&extra_headers, "sec-ch-ua-platform")
@@ -790,36 +874,62 @@ async fn apply_browser_fetch_headers(
         header_value_case_insensitive(&extra_headers, "sec-ch-ua-platform-version")
             .unwrap_or_else(|| obscura_net::DEFAULT_SEC_CH_UA_PLATFORM_VERSION.to_string());
 
-    insert_header_if_absent(headers, "user-agent", ua);
-    insert_header_if_absent(headers, "accept", "*/*");
-    insert_header_if_absent(headers, "accept-language", accept_language);
-    insert_header_if_absent(headers, "sec-ch-ua", obscura_net::DEFAULT_SEC_CH_UA);
-    insert_header_if_absent(
-        headers,
-        "sec-ch-ua-full-version-list",
-        obscura_net::DEFAULT_SEC_CH_UA_FULL_VERSION_LIST,
+    headers.insert("user-agent".to_string(), ua);
+    headers
+        .entry("accept".to_string())
+        .or_insert_with(|| "*/*".to_string());
+    headers.insert("accept-language".to_string(), accept_language);
+    headers.insert(
+        "sec-ch-ua".to_string(),
+        obscura_net::DEFAULT_SEC_CH_UA.to_string(),
     );
-    insert_header_if_absent(headers, "sec-ch-ua-model", "\"\"");
-    insert_header_if_absent(headers, "sec-ch-ua-mobile", "?0");
-    insert_header_if_absent(headers, "sec-ch-ua-platform", sec_ch_platform);
-    insert_header_if_absent(
-        headers,
-        "sec-ch-ua-platform-version",
+    headers.insert(
+        "sec-ch-ua-full-version-list".to_string(),
+        obscura_net::DEFAULT_SEC_CH_UA_FULL_VERSION_LIST.to_string(),
+    );
+    headers.insert("sec-ch-ua-model".to_string(), "\"\"".to_string());
+    headers.insert("sec-ch-ua-mobile".to_string(), "?0".to_string());
+    headers.insert("sec-ch-ua-platform".to_string(), sec_ch_platform);
+    headers.insert(
+        "sec-ch-ua-platform-version".to_string(),
         sec_ch_platform_version,
     );
-    insert_header_if_absent(headers, "sec-ch-prefers-color-scheme", "dark");
-    insert_header_if_absent(headers, "sec-fetch-dest", "empty");
-    insert_header_if_absent(headers, "sec-fetch-mode", "cors");
+    headers.insert(
+        "sec-ch-prefers-color-scheme".to_string(),
+        "dark".to_string(),
+    );
+    headers.insert("sec-fetch-dest".to_string(), "empty".to_string());
+    headers.insert("sec-fetch-mode".to_string(), mode.to_string());
 
-    if page_url.starts_with("http://") || page_url.starts_with("https://") {
-        insert_header_if_absent(headers, "referer", page_url);
-        let fetch_site = match (url::Url::parse(request_url), url::Url::parse(page_url)) {
-            (Ok(request), Ok(page)) if request.origin() == page.origin() => "same-origin",
-            (Ok(request), Ok(page)) if request.domain() == page.domain() => "same-site",
-            (Ok(_), Ok(_)) => "cross-site",
-            _ => "none",
-        };
-        insert_header_if_absent(headers, "sec-fetch-site", fetch_site);
+    let fetch_site = match page_origin {
+        Some(page) if page.origin() == request_url.origin() => "same-origin",
+        Some(page) if obscura_net::is_schemeful_same_site(page, request_url) => "same-site",
+        Some(_) => "cross-site",
+        None => "none",
+    };
+    headers.insert("sec-fetch-site".to_string(), fetch_site.to_string());
+
+    if let Ok(mut referer) = url::Url::parse(page_url) {
+        if matches!(referer.scheme(), "http" | "https") {
+            referer.set_fragment(None);
+            headers.insert("referer".to_string(), referer.to_string());
+        }
+    }
+    if let Some(page) = page_origin {
+        if *method != Method::GET && *method != Method::HEAD
+            || page.origin() != request_url.origin()
+        {
+            headers.insert("origin".to_string(), page.origin().ascii_serialization());
+        }
+    }
+    if credentials.allows(request_url, page_origin) {
+        if let Some(jar) = cookie_jar {
+            let cookie =
+                jar.get_cookie_header_for_request(request_url, page_origin, false, method.as_str());
+            if !cookie.is_empty() {
+                headers.insert("cookie".to_string(), cookie);
+            }
+        }
     }
 }
 
@@ -830,17 +940,151 @@ fn header_value_case_insensitive(headers: &HashMap<String, String>, key: &str) -
         .map(|(_, value)| value.clone())
 }
 
-fn insert_header_if_absent(
-    headers: &mut HashMap<String, String>,
-    key: &str,
-    value: impl Into<String>,
-) {
-    if !headers
-        .keys()
-        .any(|existing| existing.eq_ignore_ascii_case(key))
-    {
-        headers.insert(key.to_string(), value.into());
+fn normalize_header_names(headers: HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .into_iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value))
+        .collect()
+}
+
+fn strip_browser_managed_headers(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !is_browser_managed_header(name));
+}
+
+fn is_browser_managed_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "cookie"
+            | "content-length"
+            | "host"
+            | "origin"
+            | "referer"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "user-agent"
+            | "accept-language"
+    ) || name.starts_with("sec-")
+        || name.starts_with("proxy-")
+}
+
+fn strip_cross_origin_sensitive_headers(headers: &mut HashMap<String, String>) {
+    headers.remove("authorization");
+    headers.remove("proxy-authorization");
+}
+
+fn apply_fetch_redirect(status: u16, method: &mut Method, body: &mut Vec<u8>) -> bool {
+    let switch_to_get = status == 303 && *method != Method::HEAD
+        || matches!(status, 301 | 302) && *method == Method::POST;
+    if switch_to_get {
+        *method = Method::GET;
+        body.clear();
     }
+    switch_to_get
+}
+
+fn validate_cors_response(
+    headers: &HashMap<String, String>,
+    page_origin: Option<&url::Url>,
+    credentials: CredentialsMode,
+    context: &str,
+) -> Result<(), deno_error::JsErrorBox> {
+    let Some(page_origin) = page_origin else {
+        return Ok(());
+    };
+    let expected = page_origin.origin().ascii_serialization();
+    let allowed =
+        header_value_case_insensitive(headers, "access-control-allow-origin").unwrap_or_default();
+    let origin_allowed =
+        allowed == expected || allowed == "*" && credentials != CredentialsMode::Include;
+    if !origin_allowed {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "{}: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
+            context, expected, allowed
+        )));
+    }
+    if credentials == CredentialsMode::Include
+        && !header_value_case_insensitive(headers, "access-control-allow-credentials")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "{}: credentialed response did not allow credentials",
+            context
+        )));
+    }
+    Ok(())
+}
+
+fn validate_preflight_permissions<'a>(
+    headers: &HashMap<String, String>,
+    method: &Method,
+    requested_headers: impl Iterator<Item = (&'a String, &'a String)>,
+    credentials: CredentialsMode,
+) -> Result<(), deno_error::JsErrorBox> {
+    let allowed_methods =
+        header_value_case_insensitive(headers, "access-control-allow-methods").unwrap_or_default();
+    let wildcard_allowed = credentials != CredentialsMode::Include;
+    if !allowed_methods.split(',').map(str::trim).any(|allowed| {
+        allowed.eq_ignore_ascii_case(method.as_str()) || wildcard_allowed && allowed == "*"
+    }) {
+        return Err(deno_error::JsErrorBox::generic(format!(
+            "CORS preflight did not allow method {}",
+            method
+        )));
+    }
+    let allowed_headers =
+        header_value_case_insensitive(headers, "access-control-allow-headers").unwrap_or_default();
+    let allowed_headers = allowed_headers
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for (requested, value) in requested_headers {
+        if is_cors_safelisted_or_browser_header(requested, value) {
+            continue;
+        }
+        let wildcard_matches = wildcard_allowed
+            && !requested.eq_ignore_ascii_case("authorization")
+            && allowed_headers.iter().any(|allowed| allowed == "*");
+        if !wildcard_matches
+            && !allowed_headers
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(requested))
+        {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight did not allow header {}",
+                requested
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn fetch_response_json(
+    status: u16,
+    url: &str,
+    headers: HashMap<String, String>,
+    body: &[u8],
+    redirected: bool,
+) -> String {
+    let mut response = serde_json::json!({
+        "status": status,
+        "bodyBase64": BASE64.encode(body),
+        "bodyByteLength": body.len(),
+        "url": url,
+        "headers": headers,
+        "redirected": redirected,
+    });
+    if let Ok(text) = std::str::from_utf8(body) {
+        response["body"] = serde_json::Value::String(text.to_string());
+    }
+    response.to_string()
 }
 
 fn decode_data_url(url: &str) -> Option<(Vec<u8>, String)> {
@@ -879,10 +1123,6 @@ fn percent_decode(input: &str) -> Vec<u8> {
                 i += 3;
                 continue;
             }
-        } else if bytes[i] == b'+' {
-            decoded.push(b' ');
-            i += 1;
-            continue;
         }
 
         decoded.push(bytes[i]);
@@ -901,13 +1141,48 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn is_cors_safelisted_or_browser_header(key: &str) -> bool {
+fn validate_no_cors_request(
+    mode: &str,
+    method: &Method,
+    headers: &HashMap<String, String>,
+) -> Result<(), deno_error::JsErrorBox> {
+    if mode != "no-cors" {
+        return Ok(());
+    }
+    if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
+        return Err(deno_error::JsErrorBox::type_error(format!(
+            "Request method {} is not allowed in no-cors mode",
+            method
+        )));
+    }
+    if let Some((name, _)) = headers
+        .iter()
+        .find(|(name, value)| !is_cors_safelisted_or_browser_header(name, value))
+    {
+        return Err(deno_error::JsErrorBox::type_error(format!(
+            "Request header {} is not allowed in no-cors mode",
+            name
+        )));
+    }
+    Ok(())
+}
+
+fn is_cors_safelisted_or_browser_header(key: &str, value: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    lower == "accept"
-        || lower == "accept-language"
-        || lower == "content-language"
-        || lower == "content-type"
-        || lower == "user-agent"
+    if matches!(
+        lower.as_str(),
+        "accept" | "accept-language" | "content-language"
+    ) {
+        return true;
+    }
+    if lower == "content-type" {
+        let mime = value.split(';').next().unwrap_or("").trim();
+        return matches!(
+            mime.to_ascii_lowercase().as_str(),
+            "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+        );
+    }
+    lower == "user-agent"
         || lower == "referer"
         || lower == "origin"
         || lower.starts_with("sec-fetch-")
@@ -956,6 +1231,17 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     }
 
     p == pattern.len()
+}
+
+fn validate_fetch_redirect(current: &url::Url, next: &url::Url) -> Result<(), String> {
+    validate_fetch_url(next)?;
+    if matches!(current.scheme(), "http" | "https") && !matches!(next.scheme(), "http" | "https") {
+        return Err(format!(
+            "HTTP redirect to forbidden scheme '{}'",
+            next.scheme()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
@@ -1099,5 +1385,198 @@ mod tests {
     #[test]
     fn fetch_intercept_resolution_timeout_preserves_route_handler_window() {
         assert!(FETCH_INTERCEPT_RESOLUTION_TIMEOUT >= std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn credentials_modes_use_exact_origin_equality() {
+        let page = url::Url::parse("https://example.com/page").unwrap();
+        let same = url::Url::parse("https://example.com:443/api").unwrap();
+        let cross = url::Url::parse("https://api.example.com/api").unwrap();
+
+        assert!(CredentialsMode::Include.allows(&cross, Some(&page)));
+        assert!(CredentialsMode::SameOrigin.allows(&same, Some(&page)));
+        assert!(!CredentialsMode::SameOrigin.allows(&cross, Some(&page)));
+        assert!(!CredentialsMode::Omit.allows(&same, Some(&page)));
+    }
+
+    #[tokio::test]
+    async fn browser_managed_headers_and_cookies_are_recomputed() {
+        let page = url::Url::parse("https://www.example.com/page").unwrap();
+        let request = url::Url::parse("https://api.example.com/upload").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("session=abc; Domain=example.com; Path=/; Secure", &request);
+        let client = Arc::new(ObscuraHttpClient::new());
+        let mut headers = HashMap::from([
+            ("Cookie".to_string(), "attacker=1".to_string()),
+            ("Content-Length".to_string(), "999".to_string()),
+            ("Host".to_string(), "evil.example".to_string()),
+            ("Origin".to_string(), "https://evil.example".to_string()),
+            ("Referer".to_string(), "https://evil.example/".to_string()),
+            ("Sec-Fetch-Site".to_string(), "none".to_string()),
+            ("x-author".to_string(), "kept".to_string()),
+        ]);
+        strip_browser_managed_headers(&mut headers);
+        apply_browser_fetch_headers(
+            &mut headers,
+            &request,
+            page.as_str(),
+            Some(&page),
+            &Method::POST,
+            "cors",
+            CredentialsMode::Include,
+            Some(&jar),
+            Some(&client),
+        )
+        .await;
+
+        assert_eq!(headers.get("x-author").map(String::as_str), Some("kept"));
+        assert_eq!(
+            headers.get("cookie").map(String::as_str),
+            Some("session=abc")
+        );
+        assert_eq!(
+            headers.get("origin").map(String::as_str),
+            Some("https://www.example.com")
+        );
+        assert_eq!(
+            headers.get("referer").map(String::as_str),
+            Some("https://www.example.com/page")
+        );
+        assert_eq!(
+            headers.get("sec-fetch-site").map(String::as_str),
+            Some("same-site")
+        );
+        assert!(!headers.keys().any(|name| name.eq_ignore_ascii_case("host")));
+        assert!(!headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")));
+
+        strip_browser_managed_headers(&mut headers);
+        apply_browser_fetch_headers(
+            &mut headers,
+            &request,
+            page.as_str(),
+            Some(&page),
+            &Method::GET,
+            "cors",
+            CredentialsMode::SameOrigin,
+            Some(&jar),
+            Some(&client),
+        )
+        .await;
+        assert!(!headers.contains_key("cookie"));
+    }
+
+    #[test]
+    fn cors_safelist_checks_content_type_values_and_preflight_permissions() {
+        assert!(is_cors_safelisted_or_browser_header(
+            "content-type",
+            "text/plain;charset=UTF-8"
+        ));
+        assert!(!is_cors_safelisted_or_browser_header(
+            "content-type",
+            "application/json"
+        ));
+        let allowed = HashMap::from([
+            (
+                "access-control-allow-methods".to_string(),
+                "POST, PUT".to_string(),
+            ),
+            (
+                "access-control-allow-headers".to_string(),
+                "content-type, x-upload-id".to_string(),
+            ),
+        ]);
+        let requested = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-upload-id".to_string(), "1".to_string()),
+        ]);
+        assert!(validate_preflight_permissions(
+            &allowed,
+            &Method::POST,
+            requested.iter(),
+            CredentialsMode::Omit,
+        )
+        .is_ok());
+        assert!(validate_preflight_permissions(
+            &allowed,
+            &Method::DELETE,
+            requested.iter(),
+            CredentialsMode::Omit,
+        )
+        .is_err());
+
+        let wildcard = HashMap::from([
+            ("access-control-allow-methods".to_string(), "*".to_string()),
+            ("access-control-allow-headers".to_string(), "*".to_string()),
+        ]);
+        let authorization =
+            HashMap::from([("authorization".to_string(), "Bearer secret".to_string())]);
+        assert!(validate_preflight_permissions(
+            &wildcard,
+            &Method::PUT,
+            authorization.iter(),
+            CredentialsMode::Omit,
+        )
+        .is_err());
+        assert!(validate_preflight_permissions(
+            &wildcard,
+            &Method::PUT,
+            requested.iter(),
+            CredentialsMode::Include,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn no_cors_rejects_non_simple_methods_and_headers() {
+        assert!(validate_no_cors_request(
+            "no-cors",
+            &Method::POST,
+            &HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        )
+        .is_ok());
+        assert!(validate_no_cors_request("no-cors", &Method::PUT, &HashMap::new(),).is_err());
+        assert!(validate_no_cors_request(
+            "no-cors",
+            &Method::POST,
+            &HashMap::from([("x-custom".to_string(), "1".to_string())]),
+        )
+        .is_err());
+        assert!(validate_no_cors_request(
+            "no-cors",
+            &Method::POST,
+            &HashMap::from([("content-type".to_string(), "application/json".to_string(),)]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn http_redirects_cannot_escape_to_local_schemes() {
+        let current = url::Url::parse("https://example.com/start").unwrap();
+        let file = url::Url::parse("file:///tmp/secret").unwrap();
+        assert!(validate_fetch_redirect(&current, &file).is_err());
+    }
+
+    #[test]
+    fn redirects_preserve_or_rewrite_method_and_bytes_like_fetch() {
+        let mut headers = HashMap::from([
+            ("authorization".to_string(), "Bearer secret".to_string()),
+            ("x-safe".to_string(), "kept".to_string()),
+        ]);
+        strip_cross_origin_sensitive_headers(&mut headers);
+        assert!(!headers.contains_key("authorization"));
+        assert_eq!(headers.get("x-safe").map(String::as_str), Some("kept"));
+
+        let original = vec![0, 255, 7];
+        let mut method = Method::POST;
+        let mut body = original.clone();
+        assert!(!apply_fetch_redirect(307, &mut method, &mut body));
+        assert_eq!(method, Method::POST);
+        assert_eq!(body, original);
+
+        assert!(apply_fetch_redirect(302, &mut method, &mut body));
+        assert_eq!(method, Method::GET);
+        assert!(body.is_empty());
     }
 }

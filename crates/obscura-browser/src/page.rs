@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{ObscuraHttpClient, ObscuraNetError, Response};
+use reqwest::Method;
 use url::Url;
 
 use crate::context::BrowserContext;
@@ -21,6 +23,7 @@ pub struct NetworkEvent {
     pub status: u16,
     pub headers: std::collections::HashMap<String, String>,
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
+    pub body: Vec<u8>,
     pub body_size: usize,
     pub timestamp: f64,
 }
@@ -392,7 +395,7 @@ impl Page {
                         "Script",
                         resp.status,
                         &resp.headers,
-                        resp.body.len(),
+                        &resp.body,
                     );
                     if let Some(js) = &mut self.js {
                         js.set_current_script(script.node_id);
@@ -476,7 +479,7 @@ impl Page {
                         "Script",
                         200,
                         &std::collections::HashMap::new(),
-                        0,
+                        &[],
                     );
                 }
                 self.pump_event_loop_for(tokio::time::Duration::from_millis(300))
@@ -576,12 +579,42 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        self.navigate_with_wait_bytes(url_str, wait_until, method, body.as_bytes())
+            .await
+    }
+
+    pub async fn navigate_with_wait_bytes(
+        &mut self,
+        url_str: &str,
+        wait_until: crate::lifecycle::WaitUntil,
+        method: &str,
+        body: &[u8],
+    ) -> Result<(), PageError> {
+        self.navigate_with_wait_request(url_str, wait_until, method, body, HashMap::new())
+            .await
+    }
+
+    pub async fn navigate_with_wait_request(
+        &mut self,
+        url_str: &str,
+        wait_until: crate::lifecycle::WaitUntil,
+        method: &str,
+        body: &[u8],
+        headers: HashMap<String, String>,
+    ) -> Result<(), PageError> {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
-        let mut current_body = body.to_string();
+        let mut current_body = body.to_vec();
+        let mut current_headers = headers;
         for _chain in 0..10 {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body)
-                .await?;
+            self.navigate_single(
+                &current_url,
+                wait_until,
+                &current_method,
+                &current_body,
+                &current_headers,
+            )
+            .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
                 tracing::info!(
                     "JS-triggered navigation chain: {} {} -> {}",
@@ -591,7 +624,8 @@ impl Page {
                 );
                 current_url = next_url;
                 current_method = next_method;
-                current_body = next_body;
+                current_body = next_body.into_bytes();
+                current_headers.clear();
                 continue;
             }
             break;
@@ -604,7 +638,8 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
-        body: &str,
+        body: &[u8],
+        headers: &HashMap<String, String>,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
@@ -640,10 +675,18 @@ impl Page {
             }
         }
 
-        let response = if method == "POST" {
-            self.http_client.post_form(&url, body).await
-        } else {
+        let parsed_method = method.parse::<Method>().unwrap_or(Method::GET);
+        let response = if parsed_method == Method::GET && body.is_empty() && headers.is_empty() {
             self.do_fetch(&url).await
+        } else {
+            self.http_client
+                .fetch_with_method_and_headers(
+                    parsed_method.clone(),
+                    &url,
+                    (!body.is_empty()).then(|| body.to_vec()),
+                    headers.clone(),
+                )
+                .await
         }
         .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
@@ -652,11 +695,11 @@ impl Page {
 
         self.record_network_event(
             url.as_str(),
-            "GET",
+            parsed_method.as_str(),
             "Document",
             response.status,
             &response.headers,
-            response.body.len(),
+            &response.body,
         );
 
         if !response.redirected_from.is_empty() {
@@ -736,7 +779,7 @@ impl Page {
                     "Stylesheet",
                     resp.status,
                     &resp.headers,
-                    resp.body.len(),
+                    &resp.body,
                 );
                 css_sources.push(css);
             }
@@ -1014,7 +1057,7 @@ impl Page {
         resource_type: &str,
         status: u16,
         response_headers: &std::collections::HashMap<String, String>,
-        body_size: usize,
+        body: &[u8],
     ) {
         self.network_event_counter += 1;
         let timestamp = std::time::SystemTime::now()
@@ -1029,7 +1072,8 @@ impl Page {
             status,
             headers: std::collections::HashMap::new(),
             response_headers: Arc::new(response_headers.clone()),
-            body_size,
+            body: body.to_vec(),
+            body_size: body.len(),
             timestamp,
         });
     }

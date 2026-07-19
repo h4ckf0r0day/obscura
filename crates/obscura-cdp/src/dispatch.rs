@@ -12,8 +12,46 @@ use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
 #[derive(Clone, Debug)]
 pub struct NetworkResponseBody {
-    pub body: String,
-    pub base64_encoded: bool,
+    pub body: Vec<u8>,
+}
+
+impl NetworkResponseBody {
+    pub fn cdp_value(&self) -> serde_json::Value {
+        match std::str::from_utf8(&self.body) {
+            Ok(text) => json!({"body": text, "base64Encoded": false}),
+            Err(_) => json!({
+                "body": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &self.body,
+                ),
+                "base64Encoded": true,
+            }),
+        }
+    }
+}
+
+const MAX_CACHED_RESPONSE_BODIES: usize = 128;
+const MAX_CACHED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+pub async fn cache_response_body(
+    cache: &Arc<Mutex<HashMap<String, NetworkResponseBody>>>,
+    request_id: String,
+    body: Vec<u8>,
+) {
+    let mut cache = cache.lock().await;
+    let mut total_bytes = cache.values().map(|entry| entry.body.len()).sum::<usize>();
+    while !cache.is_empty()
+        && (cache.len() >= MAX_CACHED_RESPONSE_BODIES
+            || total_bytes.saturating_add(body.len()) > MAX_CACHED_RESPONSE_BYTES)
+    {
+        let Some(oldest_key) = cache.keys().next().cloned() else {
+            break;
+        };
+        if let Some(removed) = cache.remove(&oldest_key) {
+            total_bytes = total_bytes.saturating_sub(removed.body.len());
+        }
+    }
+    cache.insert(request_id, NetworkResponseBody { body });
 }
 
 pub struct CdpContext {
@@ -22,6 +60,7 @@ pub struct CdpContext {
     pub pending_events: Vec<CdpEvent>,
     pub default_context: Arc<BrowserContext>,
     page_counter: u32,
+    session_counter: u32,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
     // World names registered via Page.createIsolatedWorld. After every
@@ -68,6 +107,7 @@ impl CdpContext {
             pending_events: Vec::new(),
             default_context,
             page_counter: 0,
+            session_counter: 0,
             preload_scripts: Vec::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
@@ -88,6 +128,14 @@ impl CdpContext {
         page.navigate_blank();
         self.pages.push(page);
         page_id
+    }
+
+    pub fn create_session(&mut self, target_id: &str) -> String {
+        self.session_counter += 1;
+        let session_id = format!("{}-session-{}", target_id, self.session_counter);
+        self.sessions
+            .insert(session_id.clone(), target_id.to_string());
+        session_id
     }
 
     pub fn get_page(&self, id: &str) -> Option<&Page> {

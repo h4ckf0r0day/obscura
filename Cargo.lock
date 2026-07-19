@@ -1595,6 +1595,7 @@ dependencies = [
  "obscura-dom",
  "obscura-js",
  "obscura-net",
+ "reqwest",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1682,6 +1683,7 @@ version = "0.2.12"
 dependencies = [
  "async-trait",
  "base64",
+ "psl",
  "reqwest",
  "serde",
  "serde_json",
@@ -1953,6 +1955,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psl"
+version = "2.1.219"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c29b88c3f8002851c2571f798b898d257cec88d40246523af0afc7e6b30b3640"
+dependencies = [
+ "psl-types",
 ]
 
 [[package]]

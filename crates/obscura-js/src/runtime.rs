@@ -2073,8 +2073,8 @@ mod tests {
                 r#"async () => {
                 const originalFetchOp = Deno.core.ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method, headersJson, body) => {
-                        globalThis.__capturedFetch = { url, method, headers: JSON.parse(headersJson), body };
+                    Deno.core.ops.op_fetch_url = (url, method, headersJson, body, origin, mode, credentials) => {
+                        globalThis.__capturedFetch = { url, method, headers: JSON.parse(headersJson), body: Array.from(body), credentials };
                         return JSON.stringify({
                             status: 200,
                             headers: { "content-type": "application/json" },
@@ -2113,7 +2113,8 @@ mod tests {
                     "content-type": "application/x-www-form-urlencoded",
                     "x-fb-friendly-name": "PolarisProfilePostsQuery",
                 },
-                "body": "variables=%7B%22after%22%3A%22cursor-a%22%7D",
+                "body": [118, 97, 114, 105, 97, 98, 108, 101, 115, 61, 37, 55, 66, 37, 50, 50, 97, 102, 116, 101, 114, 37, 50, 50, 37, 51, 65, 37, 50, 50, 99, 117, 114, 115, 111, 114, 45, 97, 37, 50, 50, 37, 55, 68],
+                "credentials": "same-origin",
             })
         );
     }
@@ -2126,8 +2127,8 @@ mod tests {
                 r#"async () => {
                 const originalFetchOp = Deno.core.ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method, headersJson, body) => {
-                        globalThis.__capturedFetch = { url, method, headers: JSON.parse(headersJson), body };
+                    Deno.core.ops.op_fetch_url = (url, method, headersJson, body, origin, mode, credentials) => {
+                        globalThis.__capturedFetch = { url, method, headers: JSON.parse(headersJson), body: Array.from(body), credentials };
                         return JSON.stringify({
                             status: 200,
                             headers: { "content-type": "application/json" },
@@ -2166,7 +2167,218 @@ mod tests {
                     "content-type": "application/x-www-form-urlencoded",
                     "x-fb-friendly-name": "PolarisProfilePageContentQuery",
                 },
-                "body": "variables=%7B%22after%22%3A%22cursor-b%22%7D",
+                "body": [118, 97, 114, 105, 97, 98, 108, 101, 115, 61, 37, 55, 66, 37, 50, 50, 97, 102, 116, 101, 114, 37, 50, 50, 37, 51, 65, 37, 50, 50, 99, 117, 114, 115, 111, 114, 45, 98, 37, 50, 50, 37, 55, 68],
+                "credentials": "same-origin",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fetch_preserves_body_bytes_credentials_and_request_clones() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url = (url, method, headersJson, body, origin, mode, credentials) => {
+                            calls.push({
+                                url, method, headers: JSON.parse(headersJson),
+                                body: Array.from(body), credentials,
+                            });
+                            return JSON.stringify({
+                                status: 200, headers: {}, bodyBase64: "AP8=", bodyByteLength: 2, url,
+                            });
+                        };
+                        const source = new Uint8Array([9, 0, 255, 7]);
+                        const arrayBuffer = new Uint8Array([0, 255, 1]).buffer;
+                        const dataViewBuffer = new Uint8Array([8, 0, 255, 9]).buffer;
+                        const request = new Request("http://example.com/request", {
+                            method: "POST", body: source.subarray(1, 3), credentials: "include",
+                        });
+                        const cloneBytes = Array.from(new Uint8Array(await request.clone().arrayBuffer()));
+                        await fetch("http://example.com/string", { method: "POST", body: "hé" });
+                        await fetch("http://example.com/params", { method: "POST", body: new URLSearchParams({ a: "x y" }) });
+                        await fetch("http://example.com/buffer", { method: "POST", body: arrayBuffer });
+                        await fetch("http://example.com/view", { method: "POST", body: new DataView(dataViewBuffer, 1, 2) });
+                        await fetch("http://example.com/blob", { method: "POST", body: new Blob([new Uint8Array([0, 255])], { type: "application/octet-stream" }) });
+                        await fetch(request);
+                        const requestBodyUsed = request.bodyUsed;
+                        let secondUseRejected = false;
+                        try { await fetch(request); } catch (error) { secondUseRejected = error instanceof TypeError; }
+                        const nestedBlobBytes = Array.from(new Uint8Array(await new Blob([new Blob([new Uint8Array([0, 255])])]).arrayBuffer()));
+                        let unsupported = false;
+                        try { await fetch("http://example.com/object", { method: "POST", body: { no: "coercion" } }); }
+                        catch (error) { unsupported = error instanceof TypeError; }
+                        return { calls, cloneBytes, requestBodyUsed, secondUseRejected, nestedBlobBytes, unsupported };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "calls": [
+                    {"url":"http://example.com/string","method":"POST","headers":{"content-type":"text/plain;charset=UTF-8"},"body":[104,195,169],"credentials":"same-origin"},
+                    {"url":"http://example.com/params","method":"POST","headers":{"content-type":"application/x-www-form-urlencoded;charset=UTF-8"},"body":[97,61,120,43,121],"credentials":"same-origin"},
+                    {"url":"http://example.com/buffer","method":"POST","headers":{},"body":[0,255,1],"credentials":"same-origin"},
+                    {"url":"http://example.com/view","method":"POST","headers":{},"body":[0,255],"credentials":"same-origin"},
+                    {"url":"http://example.com/blob","method":"POST","headers":{"content-type":"application/octet-stream"},"body":[0,255],"credentials":"same-origin"},
+                    {"url":"http://example.com/request","method":"POST","headers":{},"body":[0,255],"credentials":"include"}
+                ],
+                "cloneBytes": [0,255],
+                "requestBodyUsed": true,
+                "secondUseRejected": true,
+                "nestedBlobBytes": [0,255],
+                "unsupported": true,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fetch_serializes_form_data_multipart_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url, method, headersJson, body) => {
+                            globalThis.__formCapture = {
+                                headers: JSON.parse(headersJson),
+                                body: Array.from(body),
+                            };
+                            return JSON.stringify({status:200,headers:{},bodyBase64:"",bodyByteLength:0,url});
+                        };
+                        const form = new FormData();
+                        form.append("caption", "hello");
+                        form.append(
+                            "media",
+                            new Blob([new Uint8Array([0, 255])], {type:"application/octet-stream"}),
+                            "clip.bin",
+                        );
+                        await fetch("http://example.com/upload", {method:"POST", body:form});
+                        return globalThis.__formCapture;
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let boundary = "----ObscuraFormBoundary0000000000000001";
+        let mut expected = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\nhello\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"media\"; filename=\"clip.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        expected.extend_from_slice(&[0, 255]);
+        expected.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "headers": {"content-type": format!("multipart/form-data; boundary={boundary}")},
+                "body": expected,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cross_origin_no_cors_response_is_opaque() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = url => JSON.stringify({
+                            status: 200, headers: {"x-secret":"visible"},
+                            bodyBase64: "c2VjcmV0", bodyByteLength: 6, url,
+                        });
+                        const response = await fetch("http://other.example/secret", {mode:"no-cors"});
+                        return {
+                            status: response.status, type: response.type, url: response.url,
+                            headers: Array.from(response.headers.entries()),
+                            bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "status":0,"type":"opaque","url":"","headers":[],"bytes":[]
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_xhr_with_credentials_and_arraybuffer_preserve_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    try {
+                        Deno.core.ops.op_fetch_url = (url, method, headersJson, body, origin, mode, credentials) => {
+                            globalThis.__xhrCapture = { body: Array.from(body), credentials };
+                            return JSON.stringify({
+                                status: 200, headers: {"content-type":"application/octet-stream"},
+                                bodyBase64: "AP8BgA==", bodyByteLength: 4, url,
+                            });
+                        };
+                        return await new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("POST", "http://example.com/upload");
+                            xhr.withCredentials = true;
+                            xhr.responseType = "arraybuffer";
+                            xhr.onload = () => resolve({
+                                capture: globalThis.__xhrCapture,
+                                response: Array.from(new Uint8Array(xhr.response)),
+                            });
+                            xhr.onerror = reject;
+                            xhr.send(new Uint8Array([0, 255]));
+                        });
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "capture": {"body":[0,255],"credentials":"include"},
+                "response": [0,255,1,128],
             })
         );
     }

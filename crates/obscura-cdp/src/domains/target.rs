@@ -61,7 +61,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank");
             let page_id = ctx.create_page();
-            let session_id = format!("{}-session", page_id);
+            let session_id = ctx.create_session(&page_id);
 
             if let Some(page) = ctx.get_page_mut(&page_id) {
                 if url == "about:blank" || url.is_empty() {
@@ -70,8 +70,6 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                     let _ = page.navigate(url).await;
                 }
             }
-
-            ctx.sessions.insert(session_id.clone(), page_id.clone());
 
             if let Some(page) = ctx.get_page(&page_id) {
                 ctx.pending_events.push(CdpEvent::new(
@@ -140,27 +138,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let session_id = format!("{}-session", target_id);
-            ctx.sessions
-                .insert(session_id.clone(), target_id.to_string());
-
-            if let Some(page) = ctx.get_page(target_id) {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.attachedToTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetInfo": {
-                            "targetId": target_id,
-                            "type": "page",
-                            "title": page.title,
-                            "url": page.url_string(),
-                            "attached": true,
-                            "browserContextId": page.context.id,
-                        },
-                        "waitingForDebugger": false,
-                    }),
-                ));
-            }
+            let session_id = ctx.create_session(target_id);
 
             Ok(json!({ "sessionId": session_id }))
         }
@@ -169,15 +147,23 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let session_id = format!("{}-session", target_id);
-
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.detachedFromTarget",
-                json!({
-                    "sessionId": session_id,
-                    "targetId": target_id,
-                }),
-            ));
+            let session_ids = ctx
+                .sessions
+                .iter()
+                .filter_map(|(session_id, attached_target)| {
+                    (attached_target == target_id).then_some(session_id.clone())
+                })
+                .collect::<Vec<_>>();
+            for session_id in session_ids {
+                ctx.sessions.remove(&session_id);
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.detachedFromTarget",
+                    json!({
+                        "sessionId": session_id,
+                        "targetId": target_id,
+                    }),
+                ));
+            }
             ctx.pending_events.push(CdpEvent::new(
                 "Target.targetDestroyed",
                 json!({ "targetId": target_id }),
@@ -329,6 +315,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_target_attachments_receive_distinct_session_ids() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let first = handle("attachToTarget", &json!({"targetId": page_id}), &mut ctx)
+            .await
+            .expect("first attachment should succeed");
+        let second = handle("attachToTarget", &json!({"targetId": page_id}), &mut ctx)
+            .await
+            .expect("second attachment should succeed");
+
+        assert_ne!(first["sessionId"], second["sessionId"]);
+        assert_eq!(ctx.sessions.len(), 2);
+    }
+
+    #[tokio::test]
     async fn dispose_browser_context_removes_pages_sessions_and_cached_bodies() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
@@ -339,8 +340,7 @@ mod tests {
         ctx.network_response_bodies.lock().await.insert(
             "request-1".to_string(),
             crate::dispatch::NetworkResponseBody {
-                body: "large response".to_string(),
-                base64_encoded: false,
+                body: b"large response".to_vec(),
             },
         );
 

@@ -95,14 +95,16 @@ pub async fn handle(
                 .get("requestId")
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
-            let bodies = ctx.network_response_bodies.lock().await;
-            let body = bodies.get(request_id).ok_or_else(|| {
-                format!("No resource with given identifier found: {}", request_id)
-            })?;
-            Ok(json!({
-                "body": body.body.clone(),
-                "base64Encoded": body.base64_encoded,
-            }))
+            let body = ctx
+                .network_response_bodies
+                .lock()
+                .await
+                .get(request_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("No resource with given identifier found: {}", request_id)
+                })?;
+            Ok(body.cdp_value())
         }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
@@ -219,8 +221,7 @@ mod tests {
         ctx.network_response_bodies.lock().await.insert(
             "request-1".to_string(),
             crate::dispatch::NetworkResponseBody {
-                body: "{\"ok\":true}".to_string(),
-                base64_encoded: false,
+                body: b"{\"ok\":true}".to_vec(),
             },
         );
 
@@ -240,6 +241,28 @@ mod tests {
                 "base64Encoded": false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn get_response_body_base64_encodes_binary_bytes() {
+        let mut ctx = CdpContext::new();
+        ctx.network_response_bodies.lock().await.insert(
+            "request-binary".to_string(),
+            crate::dispatch::NetworkResponseBody {
+                body: vec![0, 255, 1, 128],
+            },
+        );
+
+        let result = handle(
+            "getResponseBody",
+            &json!({"requestId": "request-binary"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, json!({"body":"AP8BgA==","base64Encoded":true}));
     }
 
     #[tokio::test]

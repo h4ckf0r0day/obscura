@@ -144,6 +144,7 @@ impl StealthHttpClient {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
+                set_cookie_headers: Vec::new(),
                 body,
                 redirected_from: redirects,
             });

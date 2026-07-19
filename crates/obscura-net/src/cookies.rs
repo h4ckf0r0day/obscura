@@ -46,7 +46,12 @@ impl CookieJar {
                 if let Some((key, val)) = attr.split_once('=') {
                     match key.trim().to_lowercase().as_str() {
                         "domain" => {
-                            domain = val.trim().trim_start_matches('.').to_lowercase();
+                            let candidate = val.trim().trim_start_matches('.').to_lowercase();
+                            let origin_host = url.host_str().unwrap_or("");
+                            if !valid_cookie_domain(origin_host, &candidate) {
+                                return;
+                            }
+                            domain = candidate;
                         }
                         "path" => {
                             path = val.trim().to_string();
@@ -117,23 +122,48 @@ impl CookieJar {
     }
 
     pub fn get_cookie_header(&self, url: &Url) -> String {
+        self.cookie_header_matching(url, |_| true)
+    }
+
+    pub fn get_cookie_header_for_request(
+        &self,
+        url: &Url,
+        site_for_cookies: Option<&Url>,
+        is_top_level_navigation: bool,
+        method: &str,
+    ) -> String {
+        let same_site = site_for_cookies
+            .map(|site| schemeful_site(site) == schemeful_site(url))
+            .unwrap_or(false);
+        let safe_method = matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE");
+        self.cookie_header_matching(url, |entry| {
+            match entry.same_site.to_ascii_lowercase().as_str() {
+                "none" => true,
+                "strict" => same_site,
+                _ => same_site || is_top_level_navigation && safe_method,
+            }
+        })
+    }
+
+    fn cookie_header_matching(&self, url: &Url, include: impl Fn(&CookieEntry) -> bool) -> String {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
         let is_secure = url.scheme() == "https";
         let cookies = self.cookies.read().unwrap();
-
-        let mut matching: Vec<String> = Vec::new();
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let mut matching = Vec::new();
 
         for (domain, domain_cookies) in cookies.iter() {
             if !domain_matches(host, domain) {
                 continue;
             }
             for entry in domain_cookies.values() {
+                if !include(entry) {
+                    continue;
+                }
                 if let Some(exp) = entry.expires {
                     if exp < now {
                         continue;
@@ -248,7 +278,12 @@ impl CookieJar {
                 if let Some((key, val)) = attr.split_once('=') {
                     match key.trim().to_lowercase().as_str() {
                         "domain" => {
-                            domain = val.trim().trim_start_matches('.').to_lowercase();
+                            let candidate = val.trim().trim_start_matches('.').to_lowercase();
+                            let origin_host = url.host_str().unwrap_or("");
+                            if !valid_cookie_domain(origin_host, &candidate) {
+                                return;
+                            }
+                            domain = candidate;
                         }
                         "path" => {
                             path = val.trim().to_string();
@@ -402,6 +437,38 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     Ok(days_total * 86400 + hour * 3600 + minute * 60 + second)
 }
 
+pub fn is_schemeful_same_site(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && registrable_domain(left.host_str()) == registrable_domain(right.host_str())
+}
+
+fn schemeful_site(url: &Url) -> Option<(String, String)> {
+    Some((
+        url.scheme().to_string(),
+        registrable_domain(url.host_str())?,
+    ))
+}
+
+fn registrable_domain(host: Option<&str>) -> Option<String> {
+    let host = host?.trim_end_matches('.').to_ascii_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Some(host);
+    }
+    psl::domain(host.as_bytes())
+        .and_then(|domain| std::str::from_utf8(domain.as_bytes()).ok())
+        .map(str::to_string)
+        .or(Some(host))
+}
+
+fn valid_cookie_domain(origin_host: &str, candidate: &str) -> bool {
+    if candidate.is_empty() || !domain_matches(origin_host, candidate) {
+        return false;
+    }
+    !psl::suffix(candidate.as_bytes())
+        .map(|suffix| suffix.as_bytes().eq_ignore_ascii_case(candidate.as_bytes()))
+        .unwrap_or(false)
+}
+
 fn domain_matches(host: &str, domain: &str) -> bool {
     let host = host.to_lowercase();
     let domain = domain.trim_start_matches('.').to_lowercase();
@@ -438,6 +505,20 @@ mod tests {
         let other_url = Url::parse("https://other.com/").unwrap();
         let header3 = jar.get_cookie_header(&other_url);
         assert!(header3.is_empty());
+    }
+
+    #[test]
+    fn test_set_cookie_rejects_unrelated_and_public_suffix_domains() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://www.example.com/path").unwrap();
+
+        jar.set_cookie("unrelated=1; Domain=attacker.com; Path=/", &url);
+        jar.set_cookie("public=1; Domain=com; Path=/", &url);
+
+        assert!(jar.get_cookie_header(&url).is_empty());
+        assert!(jar
+            .get_cookie_header(&Url::parse("https://attacker.com/").unwrap())
+            .is_empty());
     }
 
     #[test]
@@ -509,6 +590,43 @@ mod tests {
         let url = Url::parse("https://example.com/").unwrap();
         jar.set_cookie("strict_cookie=val; SameSite=Strict", &url);
         assert!(jar.get_cookie_header(&url).contains("strict_cookie=val"));
+    }
+
+    #[test]
+    fn test_samesite_filters_cross_site_subresource_requests() {
+        let jar = CookieJar::new();
+        let target = Url::parse("https://bank.example/action").unwrap();
+        jar.set_cookie("strict=1; Path=/; Secure; SameSite=Strict", &target);
+        jar.set_cookie("lax=1; Path=/; Secure; SameSite=Lax", &target);
+        jar.set_cookie("none=1; Path=/; Secure; SameSite=None", &target);
+        let cross_site = Url::parse("https://evil.example/page").unwrap();
+
+        let header = jar.get_cookie_header_for_request(&target, Some(&cross_site), false, "POST");
+
+        assert!(!header.contains("strict=1"));
+        assert!(!header.contains("lax=1"));
+        assert!(header.contains("none=1"));
+    }
+
+    #[test]
+    fn test_schemeful_site_handles_common_multi_label_suffixes() {
+        let shop = Url::parse("https://shop.example.co.uk/").unwrap();
+        let api = Url::parse("https://api.example.co.uk/").unwrap();
+        let attacker = Url::parse("https://attacker.co.uk/").unwrap();
+
+        assert!(is_schemeful_same_site(&shop, &api));
+        assert!(!is_schemeful_same_site(&shop, &attacker));
+    }
+
+    #[test]
+    fn test_schemeful_site_uses_private_public_suffix_rules() {
+        let alice = Url::parse("https://alice.github.io/").unwrap();
+        let bob = Url::parse("https://bob.github.io/").unwrap();
+        let app = Url::parse("https://a.project.github.io/").unwrap();
+        let api = Url::parse("https://b.project.github.io/").unwrap();
+
+        assert!(!is_schemeful_same_site(&alice, &bob));
+        assert!(is_schemeful_same_site(&app, &api));
     }
 
     #[test]
