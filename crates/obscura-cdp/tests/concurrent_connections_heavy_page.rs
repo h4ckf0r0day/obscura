@@ -20,6 +20,8 @@
 //! Run with `cargo test -p obscura-cdp --test concurrent_connections_heavy_page
 //! -- --nocapture`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -41,7 +43,12 @@ async fn pick_port() -> u16 {
 /// delay (keeping the navigation settle loop pumping) and an inline
 /// `setInterval` that keeps the event loop non-idle. Serves every connection it
 /// accepts until the test ends.
-async fn serve_heavy_fixture(listener: TcpListener) {
+///
+/// `served` counts the requests it answers. The test asserts on it: without
+/// that, pointing `page_url` at a dead port still passes (verified), because
+/// nothing else here checks the heavy page ever loaded -- and a test whose
+/// fixture silently drops out stops reproducing #430 while staying green.
+async fn serve_heavy_fixture(listener: TcpListener, served: Arc<AtomicUsize>) {
     let body = "<!DOCTYPE html><html><head>\
         <script src=\"/slow.js\"></script>\
         </head><body><h1>heavy</h1><img src=\"/slow.png\">\
@@ -52,12 +59,14 @@ async fn serve_heavy_fixture(listener: TcpListener) {
             Ok(s) => s,
             Err(_) => return,
         };
+        let served = served.clone();
         tokio::task::spawn_local(async move {
             let mut buf = [0u8; 2048];
             let n = sock.read(&mut buf).await.unwrap_or(0);
             if n == 0 {
                 return;
             }
+            served.fetch_add(1, Ordering::Relaxed);
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req
                 .split_whitespace()
@@ -198,7 +207,8 @@ async fn concurrent_connections_heavy_page_do_not_abort_v8() {
     local
         .run_until(async {
             // Fixture HTTP server.
-            tokio::task::spawn_local(serve_heavy_fixture(fixture));
+            let served = Arc::new(AtomicUsize::new(0));
+            tokio::task::spawn_local(serve_heavy_fixture(fixture, served.clone()));
 
             // CDP server. allow_private_network so it may fetch 127.0.0.1.
             tokio::task::spawn_local(async move {
@@ -240,6 +250,23 @@ async fn concurrent_connections_heavy_page_do_not_abort_v8() {
                 errors
             );
             assert_eq!(ok as u64, CLIENTS, "every concurrent client must complete");
+
+            // The fixture must actually have served each client the page and
+            // its slow script -- that is what keeps the settle loop pumping and
+            // makes this a #430 repro at all. Without this assertion, pointing
+            // `page_url` at a dead port still passes (verified), and the test
+            // silently degrades into the `data:`-URL one it was written to
+            // replace. Two per client, not three: the engine does not fetch the
+            // `<img>`, so only the document and /slow.js are requested.
+            let hits = served.load(Ordering::Relaxed);
+            assert!(
+                hits >= CLIENTS as usize * 2,
+                "fixture served {} requests, expected at least {} ({} clients x document \
+                 + /slow.js): the heavy page never loaded, so this run proves nothing",
+                hits,
+                CLIENTS as usize * 2,
+                CLIENTS
+            );
         })
         .await;
 }
