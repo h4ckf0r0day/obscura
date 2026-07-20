@@ -637,7 +637,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
 /// Matches reqwest's default policy of 10.
 const FETCH_REDIRECT_LIMIT: usize = 10;
 
-#[op2(async(lazy), fast)]
+#[op2]
 #[string]
 async fn op_fetch_url(
     state: Rc<RefCell<OpState>>,
@@ -1404,7 +1404,7 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
-#[op2(async(lazy), fast)]
+#[op2]
 async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
