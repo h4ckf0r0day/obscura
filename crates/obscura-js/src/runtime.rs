@@ -332,7 +332,7 @@ impl ObscuraJsRuntime {
             runtime
                 .execute_script(
                     "<obscura:init>",
-                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; if (typeof _installWasmStreamingFallback === 'function') _installWasmStreamingFallback();".to_string(),
                 )
                 .expect("init should not fail");
 
