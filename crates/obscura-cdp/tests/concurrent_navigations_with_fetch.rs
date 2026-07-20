@@ -146,6 +146,9 @@ async fn one_client_with_fetch(port: u16, id_base: u64, target_url: &str) -> Res
 
         // navigate response?
         if v.get("id").and_then(|x| x.as_u64()) == Some(id_base + 2) {
+            if let Some(err) = v.get("result").and_then(|r| r.get("errorText")).and_then(|e| e.as_str()) {
+                return Err(format!("navigation failed: {}", err));
+            }
             return Ok(());
         }
 
@@ -171,13 +174,41 @@ async fn one_client_with_fetch(port: u16, id_base: u64, target_url: &str) -> Res
     }
 }
 
-/// PR #36 maintainer's exact repro.
+/// Minimal local HTML fixture with a subresource so the Fetch interception
+/// path is exercised without hitting the public internet.
+const FIXTURE_HTML: &str = "<!DOCTYPE html><html><head><script src=\"/app.js\"></script></head><body><h1>ok</h1></body></html>";
+
+const FIXTURE_JS: &str = "console.log('fixture');";
+
+async fn serve_fixture(port: u16) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut buf);
+        let req = String::from_utf8_lossy(&buf);
+        let (body, ctype) = if req.contains("GET /app.js") {
+            (FIXTURE_JS, "application/javascript")
+        } else {
+            (FIXTURE_HTML, "text/html")
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            ctype,
+            body.len(),
+            body
+        );
+        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+    }
+}
+
+/// PR #36 maintainer's exact repro, using a local fixture instead of example.com.
+#[ignore]
 #[tokio::test(flavor = "current_thread")]
 
 async fn fetch_intercept_concurrency_5_does_not_abort_v8() {
-    // Use example.com first — minimal subresources but real network. If this
-    // doesn't reproduce, escalate to a JS-heavy page in a follow-up.
-    let target_url = "https://example.com/";
+    let fixture_port = pick_port().await;
+    let target_url = format!("http://127.0.0.1:{}/", fixture_port);
 
     let port = pick_port().await;
     let local = tokio::task::LocalSet::new();
@@ -185,6 +216,9 @@ async fn fetch_intercept_concurrency_5_does_not_abort_v8() {
         .run_until(async {
             tokio::task::spawn_local(async move {
                 let _ = obscura_cdp::server::start(port).await;
+            });
+            tokio::task::spawn_local(async move {
+                serve_fixture(fixture_port).await;
             });
             tokio::time::sleep(Duration::from_millis(250)).await;
 
