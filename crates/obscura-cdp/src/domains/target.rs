@@ -203,12 +203,10 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
             Ok(json!({ "browserContextIds": [ctx.default_context.id] }))
         }
         "createBrowserContext" => {
-            ctx.default_context.cookie_jar.clear();
-            Ok(json!({ "browserContextId": ctx.default_context.id }))
+            Err("createBrowserContext is not supported: multiple browser contexts require per-context isolation (issue #449)")
         }
         "disposeBrowserContext" => {
-            ctx.default_context.cookie_jar.clear();
-            Ok(json!({}))
+            Err("disposeBrowserContext is not supported: multiple browser contexts require per-context isolation (issue #449)")
         }
         "getTargetInfo" => {
             let target_id = params.get("targetId").and_then(|v| v.as_str());
