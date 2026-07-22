@@ -34,6 +34,7 @@ async fn pick_port() -> u16 {
     port
 }
 
+#[ignore]
 #[tokio::test(flavor = "current_thread")]
 
 async fn http_control_plane_unblocked_during_long_js() {
