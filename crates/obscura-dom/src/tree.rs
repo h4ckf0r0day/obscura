@@ -579,6 +579,41 @@ impl DomTree {
         Self::climb_to_next_sibling(&inner, root, current)
     }
 
+    /// Returns the node before `current` in document order, without leaving the
+    /// subtree rooted at `root`. `root` has no predecessor within its own
+    /// subtree, but it is itself reachable as one — a NodeIterator can return
+    /// its root, unlike a TreeWalker.
+    ///
+    /// A NodeIterator applies no subtree pruning (DOM 6.2: FILTER_REJECT
+    /// behaves as FILTER_SKIP), so unlike the TreeWalker's backward walk the
+    /// whole step fits here instead of being interleaved with filter calls.
+    pub fn prev_in_subtree(&self, root: NodeId, current: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        if current == root {
+            return None;
+        }
+        let current_node = inner.nodes.get(current.index())?.as_ref()?;
+
+        let Some(prev) = current_node.prev_sibling else {
+            // No previous sibling: the parent immediately precedes `current`.
+            return current_node.parent;
+        };
+
+        // Otherwise it is the previous sibling's deepest last descendant.
+        let mut node_id = prev;
+        for _ in 0..=inner.nodes.len() {
+            let node = inner.nodes.get(node_id.index())?.as_ref()?;
+            match node.last_child {
+                Some(child) => node_id = child,
+                None => return Some(node_id),
+            }
+        }
+
+        // Same defense in depth as the forward walk: a malformed tree must not
+        // spin here.
+        None
+    }
+
     /// Follow `current`'s next sibling, climbing ancestors until one has a next
     /// sibling — without stepping outside `root`.
     fn climb_to_next_sibling(
@@ -1069,6 +1104,29 @@ mod tests {
         assert_eq!(tree.next_after_subtree(root, second), None);
         // Rejecting the root itself exhausts the walk rather than escaping it.
         assert_eq!(tree.next_after_subtree(root, root), None);
+    }
+
+    #[test]
+    fn test_prev_in_subtree_reverses_document_order() {
+        // root > [first > nested, second]; document order is root, first,
+        // nested, second, so the reverse walk must retrace it exactly.
+        let tree = DomTree::new();
+        let root = tree.new_node(NodeData::Text { contents: "root".into() });
+        let first = tree.new_node(NodeData::Text { contents: "first".into() });
+        let nested = tree.new_node(NodeData::Text { contents: "nested".into() });
+        let second = tree.new_node(NodeData::Text { contents: "second".into() });
+        tree.append_child(tree.document(), root);
+        tree.append_child(root, first);
+        tree.append_child(first, nested);
+        tree.append_child(root, second);
+
+        // Previous sibling's deepest last descendant, not the sibling itself.
+        assert_eq!(tree.prev_in_subtree(root, second), Some(nested));
+        assert_eq!(tree.prev_in_subtree(root, nested), Some(first));
+        // No previous sibling: the parent precedes it, and root is returnable.
+        assert_eq!(tree.prev_in_subtree(root, first), Some(root));
+        // Root has no predecessor inside its own subtree.
+        assert_eq!(tree.prev_in_subtree(root, root), None);
     }
 
     // Builds a chain of `depth` nested <div> elements under the document and

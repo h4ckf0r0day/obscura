@@ -1538,7 +1538,106 @@ mod tests {
                 "#,
             )
             .unwrap();
-        assert_eq!(result, serde_json::json!(["P", "A"]));
+        // The rejected <section> is skipped but not pruned, so <p> still shows.
+        // The leading root is #467: an iterator yields the node it is rooted at.
+        assert_eq!(result, serde_json::json!(["DIV", "P", "A"]));
+    }
+
+    /// Issue #467: a NodeIterator starts *before* its root, so the first
+    /// nextNode() returns the root itself. Aliasing createTreeWalker silently
+    /// dropped exactly the element the iterator was rooted at.
+    #[test]
+    fn node_iterator_yields_the_root_node_first() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                const seen = [];
+                let node;
+                while ((node = it.nextNode())) seen.push(node.tagName);
+                return seen;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["DIV", "A"]));
+    }
+
+    /// Issue #467: the NodeIterator interface surface, and that TreeWalker-only
+    /// members are not exposed on it.
+    #[test]
+    fn node_iterator_exposes_its_own_interface() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                const before = [it.referenceNode === root, it.pointerBeforeReferenceNode];
+                it.nextNode();
+                return [
+                    before,
+                    typeof it.detach,
+                    it.detach() === undefined,
+                    typeof it.previousNode,
+                    it.root === root,
+                    it.whatToShow,
+                    // TreeWalker-only members must not leak onto a NodeIterator.
+                    typeof it.currentNode,
+                    typeof it.firstChild,
+                    typeof it.parentNode,
+                    // The pointer advanced past the root it just returned.
+                    [it.referenceNode.tagName, it.pointerBeforeReferenceNode],
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true],
+                "function",
+                true,
+                "function",
+                true,
+                1,
+                "undefined",
+                "undefined",
+                "undefined",
+                ["DIV", false]
+            ])
+        );
+    }
+
+    /// Issue #467: previousNode() retraces the iterator, and the root is the
+    /// last node it yields going backwards.
+    #[test]
+    fn node_iterator_previous_node_retraces_the_walk() {
+        let mut rt = setup_runtime(r#"<div id="root"><a><b></b></a><c></c></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                const forward = [];
+                let node;
+                while ((node = it.nextNode())) forward.push(node.tagName);
+                const backward = [];
+                while ((node = it.previousNode())) backward.push(node.tagName);
+                return [forward, backward];
+                "#,
+            )
+            .unwrap();
+        // Forward ends on <c>; going back re-yields <c> (the pointer sits after
+        // it), then the rest in reverse, root included.
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["DIV", "A", "B", "C"],
+                ["C", "B", "A", "DIV"]
+            ])
+        );
     }
 
     #[test]

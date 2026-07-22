@@ -2637,11 +2637,8 @@ class Document extends Node {
           const verdict = this._filter(node);
           if (verdict === 1) { this.currentNode = node; return node; }
           // FILTER_REJECT skips the node AND its subtree; FILTER_SKIP (and any
-          // other non-accept value) skips only the node. NodeIterator has no
-          // pruning at all, so `_rejectIsSkip` keeps it on the plain step.
-          const step = (verdict === 2 && !this._rejectIsSkip)
-            ? "next_after_subtree"
-            : "next_in_subtree";
+          // other non-accept value) skips only the node.
+          const step = verdict === 2 ? "next_after_subtree" : "next_in_subtree";
           node = _wrap(+_dom(step, this.root._nid, node._nid));
         }
         return null;
@@ -2724,12 +2721,62 @@ class Document extends Node {
     };
     return walker;
   }
+  // A real NodeIterator (DOM 6.2), not a TreeWalker in disguise (issue #467).
+  // The two differ in more than naming: an iterator's pointer starts *before*
+  // its root, so the first nextNode() returns the root itself, and it exposes
+  // referenceNode/pointerBeforeReferenceNode/detach rather than a TreeWalker's
+  // currentNode and child/sibling movers.
   createNodeIterator(root, whatToShow, filter) {
-    // Shares the TreeWalker implementation, but DOM 6.2 gives NodeIterator no
-    // subtree pruning: FILTER_REJECT behaves exactly as FILTER_SKIP there.
-    const iterator = this.createTreeWalker(root, whatToShow, filter);
-    iterator._rejectIsSkip = true;
-    return iterator;
+    // whatToShow is unsigned long; default SHOW_ALL only when the arg is
+    // omitted. An explicit 0 (show nothing) must stay 0, not become SHOW_ALL.
+    whatToShow = (whatToShow === undefined) ? 0xFFFFFFFF : (whatToShow >>> 0);
+    return {
+      root: root,
+      referenceNode: root,
+      pointerBeforeReferenceNode: true,
+      whatToShow: whatToShow,
+      filter: filter || null,
+      // NodeIterator prunes nothing: FILTER_REJECT behaves as FILTER_SKIP, so
+      // unlike the TreeWalker only "accepted or not" matters here.
+      _accept(node) {
+        if (!((whatToShow >> (node.nodeType - 1)) & 1)) return false;
+        if (this.filter) {
+          if (typeof this.filter === 'function') return this.filter(node) === 1;
+          if (this.filter.acceptNode) return this.filter.acceptNode(node) === 1;
+        }
+        return true;
+      },
+      // DOM 6.2 "traverse". The pointer sits either before or after
+      // referenceNode, which is why reversing direction re-yields the current
+      // node instead of stepping over it.
+      _traverse(forward) {
+        let node = this.referenceNode;
+        let before = this.pointerBeforeReferenceNode;
+        for (;;) {
+          if (forward === before) {
+            // Consume the pointer's side without moving: it flips to the other
+            // side of the node it already references.
+            before = !before;
+          } else {
+            const step = forward ? "next_in_subtree" : "prev_in_subtree";
+            const next = _wrap(+_dom(step, this.root._nid, node._nid));
+            // A failed traversal leaves referenceNode and the pointer
+            // untouched, so the iterator can be resumed in either direction.
+            if (!next) return null;
+            node = next;
+          }
+          if (this._accept(node)) break;
+        }
+        this.referenceNode = node;
+        this.pointerBeforeReferenceNode = before;
+        return node;
+      },
+      nextNode() { return this._traverse(true); },
+      previousNode() { return this._traverse(false); },
+      // Legacy no-op since DOM4, but older library code still calls it and
+      // used to hit "detach is not a function".
+      detach() {},
+    };
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
   get activeElement() { return globalThis.__obscura_focused || this.body; }
