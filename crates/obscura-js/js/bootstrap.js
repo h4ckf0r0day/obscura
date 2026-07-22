@@ -68,7 +68,23 @@ globalThis.dispatchEvent = function(event) {
   return !event.defaultPrevented;
 };
 
-const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+// Commands that change the tree. Element's synthetic scroll box is derived from
+// a subtree walk, which is far too costly to redo on every read; bumping an
+// epoch here lets that value be memoized and invalidated exactly when the shape
+// it measures actually changed, in the one place every mutation goes through.
+const _domStructuralCmds = new Set([
+  "append_child",
+  "insert_before",
+  "remove_child",
+  "set_inner_html",
+  "set_text_content",
+]);
+globalThis.__domEpoch = 0;
+
+const _dom = (cmd, a1, a2) => {
+  if (_domStructuralCmds.has(cmd)) globalThis.__domEpoch++;
+  return Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+};
 
 const _nativeFns = new Set();
 // Exact toString override for members whose native form is not just
@@ -1177,6 +1193,12 @@ function _isSubmitButton(el) {
   return false;
 }
 
+// Synthetic scroll-box constants for non-viewport elements. There is no layout
+// engine, so these stand in for a measured box; they are fixed values on purpose
+// (see the scrollHeight getter for why they must not track the viewport).
+const SYNTHETIC_CLIENT_HEIGHT = 800;
+const SYNTHETIC_ROW_HEIGHT = 40;
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -2103,9 +2125,35 @@ class Element extends Node {
   // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
   // returning 100x20 there made every element appear off-screen and broke .click().
   get clientWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : SYNTHETIC_CLIENT_HEIGHT; }
   get scrollWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get scrollHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  // Scroll-driven lazy loaders page while `scrollTop + clientHeight < scrollHeight`.
+  // With a 20px stub box that predicate is false immediately, so a virtualized
+  // feed stops after its first batch. Report a box sized from the subtree so the
+  // predicate keeps holding as content arrives.
+  //
+  // Both numbers are deliberately CONSTANTS rather than `innerHeight`: the
+  // stealth layer randomises the viewport per session, and a scroll box derived
+  // from it paginates or stalls depending on the draw. This is reporting only --
+  // `scrollTop` below stays unclamped, because clamping to a synthetic max is
+  // what deadlocks a loader that has not yet been given content to scroll over.
+  get scrollHeight() {
+    if (this._isViewportRoot()) return globalThis.innerHeight || 720;
+    return Math.max(SYNTHETIC_CLIENT_HEIGHT, this._syntheticContentHeight());
+  }
+  // `querySelectorAll('*')` walks the subtree, and a loader reads scrollHeight
+  // several times per scroll operation. Memoize against the DOM epoch: repeat
+  // reads are free, and the first read after any insertion or removal walks
+  // again, so a feed that just appended rows measures them immediately.
+  _syntheticContentHeight() {
+    const epoch = globalThis.__domEpoch;
+    if (this._scrollBoxEpoch === epoch) return this._scrollBox;
+    let descendants = 0;
+    try { descendants = this.querySelectorAll('*').length; } catch (e) { /* detached subtree */ }
+    this._scrollBox = descendants * SYNTHETIC_ROW_HEIGHT;
+    this._scrollBoxEpoch = epoch;
+    return this._scrollBox;
+  }
   _isViewportRoot() {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
