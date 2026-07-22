@@ -46,6 +46,10 @@ COPY --from=builder /build/target/release/obscura-worker /obscura-worker
 
 EXPOSE 9222
 
+# The glibc malloc arena cap that used to live here as MALLOC_ARENA_MAX=2 is now
+# done by the binary itself: `serve` calls mallopt(M_ARENA_MAX, 2) at startup
+# (upstream crates/obscura-cdp/src/server.rs, merged with #435). No ENV needed.
+
 # Bind to 0.0.0.0 so the port is reachable via `docker run -p 9222:9222`.
 # Native binary still defaults to 127.0.0.1 (loopback only) — this override
 # is just for the container.
