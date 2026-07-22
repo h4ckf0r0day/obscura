@@ -26,20 +26,33 @@ Everything this fork adds on top of `upstream/main`. Two buckets:
 | Change | Bucket | Upstream | Files |
 |---|---|---|---|
 | Fire a `scroll` event when `scrollTop` / `scrollLeft` are assigned directly (upstream only fires from `scrollTo`/`scrollBy`), so scroll-driven lazy loaders advance | in-flight | issue [#459](https://github.com/h4ckf0r0day/obscura/issues/459), PR [#458](https://github.com/h4ckf0r0day/obscura/pull/458). Verified against real Chrome: assigning `scrollTop` fires exactly one `scroll` event there, zero on upstream obscura, one with this patch. Measured impact: a scroll-listener loader runs 0 times instead of 2, collecting 2 rows instead of 12 — silently, with no error. | `crates/obscura-js/js/bootstrap.js`, `crates/obscura-cdp/tests/scroll_event_on_assignment.rs` |
+| Report a content-sized scroll box on non-viewport elements (`clientHeight` = a constant instead of `20`, `scrollHeight` = `max(that, descendants * 40)`), so `scrollTop = scrollHeight` keeps *moving* across passes and a virtualized feed pages past its first batch | in-flight | issue [#441](https://github.com/h4ckf0r0day/obscura/issues/441). Reporting only: `scrollTop` stays unclamped, and neither number tracks `innerHeight` — see below for why both matter. Measured on live Google Maps search: **31 → 110** unique results for `plombier marseille`, **36 → 108** for `restaurant lyon`. | `crates/obscura-js/js/bootstrap.js`, `crates/obscura-cdp/tests/scroll_box_geometry.rs` |
 | GHCR image publish workflow (upstream publishes to Docker Hub with secrets we do not carry) | **fork-only** | n/a | `.github/workflows/docker-ghcr.yml`, `Dockerfile` |
 | This manifest + the sync script | **fork-only** | n/a | `FORK.md`, `scripts/sync-upstream.sh` |
 
-The virtualized **scroll geometry** heuristic (synthetic `scrollHeight` from
-`querySelectorAll('*').length * 40`, viewport-sized `clientHeight` on every
-element, and a `scrollTop` clamped to that box) was dropped rather than carried.
-It made pagination *worse*, and non-deterministically so: the clamp resolves to
-`max(0, descendants * 40 - innerHeight)`, and obscura's stealth layer randomises
-`innerHeight` per session (measured 640 / 640 / 688 / 970 across four runs). So
-whether a feed paginated or froze at its first batch depended on the viewport
-draw — same page, same code, different outcome per run. Measured on a
-progress-gated feed fixture: 20/120 items on an unlucky draw, 120/120 without
-the heuristic. What survives is the scroll-event dispatch above, which is the
-part that was actually load-bearing.
+The **scroll geometry** carry above is the second attempt. The first one bundled
+three things and was dropped for the two that were wrong:
+
+- a `scrollTop` **clamped** to the synthetic box — the harmful half. Clamping to
+  a made-up maximum pins the offset on a loader that has not been handed content
+  to scroll over yet, and it deadlocks: no scroll, no content, no scroll.
+  Re-measured on live Maps while reintroducing only this: the feed freezes at 20
+  results. `scrollTop` therefore stays unclamped.
+- a `clientHeight` derived from **`innerHeight`** — the non-deterministic half.
+  The stealth layer randomises the viewport per session (measured 640 / 640 /
+  688 / 970 across four runs), so the same page paginated or stalled depending on
+  the draw: 20/120 items on an unlucky one. Both numbers are now constants.
+- the **reporting** itself, which was the load-bearing part and is what the row
+  above carries. With a 20px box, `scrollTop = scrollHeight` lands on the same
+  offset every pass; an unchanged offset is not a scroll, so the loader is never
+  reached again and the feed plateaus after its first batch.
+
+`crates/obscura-cdp/tests/scroll_box_geometry.rs` locks all three in: the box
+grows with the subtree, it does not move when `innerHeight` does, and a
+virtualized feed pages to its last row. The subtree walk behind `scrollHeight` is
+memoized against a DOM epoch bumped by the structural `op_dom` commands, so
+repeat reads inside one scroll operation are free while the first read after an
+insertion measures the new rows.
 
 The thread-per-connection V8 isolate confinement and the `--max-connections` /
 glibc-arena caps that used to be carried here landed upstream via
