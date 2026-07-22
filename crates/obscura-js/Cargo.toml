@@ -41,3 +41,6 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
+
+[dev-dependencies]
+deno_core = { version = "0.350", features = ["obscura_regression_test"] }

@@ -10,6 +10,7 @@ members = [
     "crates/obscura-cli",
     "crates/obscura",
 ]
+exclude = ["vendor/deno_core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -54,3 +55,10 @@ base64 = "0.22"
 # would turn every catchable op panic into a hard crash.
 [profile.release]
 panic = "unwind"
+
+[patch.crates-io]
+# deno_core 0.350 holds its async-op queue's RefCell borrow while polling a
+# child future. If that completion synchronously submits another op, the nested
+# queue push panics inside V8's non-unwinding callback. Keep the dependency at
+# 0.350 and carry the narrow re-entrancy fix locally until it lands upstream.
+deno_core = { path = "vendor/deno_core" }
