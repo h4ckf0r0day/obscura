@@ -25,7 +25,7 @@ Everything this fork adds on top of `upstream/main`. Two buckets:
 
 | Change | Bucket | Upstream | Files |
 |---|---|---|---|
-| Fire a `scroll` event when `scrollTop` / `scrollLeft` are assigned directly (upstream only fires from `scrollTo`/`scrollBy`), so scroll-driven lazy loaders advance | in-flight | Verified against real Chrome: assigning `scrollTop` fires exactly one `scroll` event there, zero on upstream obscura, one with this patch. PR to open. | `crates/obscura-js/js/bootstrap.js` |
+| Fire a `scroll` event when `scrollTop` / `scrollLeft` are assigned directly (upstream only fires from `scrollTo`/`scrollBy`), so scroll-driven lazy loaders advance | in-flight | issue [#459](https://github.com/h4ckf0r0day/obscura/issues/459), PR [#458](https://github.com/h4ckf0r0day/obscura/pull/458). Verified against real Chrome: assigning `scrollTop` fires exactly one `scroll` event there, zero on upstream obscura, one with this patch. Measured impact: a scroll-listener loader runs 0 times instead of 2, collecting 2 rows instead of 12 — silently, with no error. | `crates/obscura-js/js/bootstrap.js`, `crates/obscura-cdp/tests/scroll_event_on_assignment.rs` |
 | GHCR image publish workflow (upstream publishes to Docker Hub with secrets we do not carry) | **fork-only** | n/a | `.github/workflows/docker-ghcr.yml`, `Dockerfile` |
 | This manifest + the sync script | **fork-only** | n/a | `FORK.md`, `scripts/sync-upstream.sh` |
 
