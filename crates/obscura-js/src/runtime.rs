@@ -1847,6 +1847,79 @@ mod tests {
         );
     }
 
+    /// Issue #468: window.scrollTo/scrollBy/scroll were no-op stubs, so the
+    /// dominant infinite-scroll idiom never advanced the page offset.
+    #[test]
+    fn window_scroll_methods_move_the_page_offset() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const scrolled = window.scrollTo(0, 500);
+                const afterTo = [window.scrollX, window.scrollY];
+                window.scrollBy(0, 200);
+                const afterBy = [window.pageXOffset, window.pageYOffset];
+                window.scrollTo({ left: 10, top: 40 });
+                const afterOptions = [window.scrollX, window.scrollY];
+                window.scroll(5, 5);
+                const afterScroll = [window.scrollX, window.scrollY];
+                // Negative offsets clamp to 0, as they do for elements.
+                window.scrollTo(0, -100);
+                return [afterTo, afterBy, afterOptions, afterScroll, window.scrollY];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[0, 500], [0, 700], [10, 40], [5, 5], 0])
+        );
+    }
+
+    /// Issue #468: the page offset is one value, readable and writable through
+    /// either `window.scrollY` or `document.scrollingElement.scrollTop`.
+    #[test]
+    fn window_scroll_offset_is_shared_with_the_scrolling_element() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const isDocEl = document.scrollingElement === document.documentElement;
+                window.scrollTo(0, 300);
+                // Written through the window, read through the element...
+                const viaElement = document.scrollingElement.scrollTop;
+                // ...and the reverse.
+                document.scrollingElement.scrollTop = 90;
+                return [isDocEl, viaElement, window.scrollY, window.pageYOffset];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, 300, 90, 90]));
+    }
+
+    /// Issue #468: a scroll event must reach listeners on both the window and
+    /// the document — that is the signal lazy loaders wait for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_scroll_fires_a_scroll_event() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let win = 0, doc = 0;
+                    window.addEventListener('scroll', () => win++);
+                    document.addEventListener('scroll', () => doc++);
+                    window.scrollBy(0, 400);
+                    setTimeout(() => resolve([win, doc, window.scrollY]), 5);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([1, 1, 400]));
+    }
+
     #[test]
     fn append_child_flattens_document_fragment() {
         let mut rt = setup_runtime(r#"<main id="host"></main>"#);

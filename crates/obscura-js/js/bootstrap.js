@@ -2818,6 +2818,10 @@ class Document extends Node {
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
   get activeElement() { return globalThis.__obscura_focused || this.body; }
+  // The element that scrolls the viewport, and where the page offset lives
+  // (issue #468). Standards mode, so documentElement — quirks mode would be
+  // body, but we never parse in quirks mode.
+  get scrollingElement() { return this.documentElement; }
   get implementation() {
     const ownerDoc = this;
     return {
@@ -7240,9 +7244,63 @@ URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
 };
 
-globalThis.scrollTo = function(x, y) {};
-globalThis.scrollBy = function(x, y) {};
-globalThis.scroll = function(x, y) {};
+// Window-level scrolling (issue #468). #431 gave elements functional
+// scrollTop/scrollLeft plus scroll methods, but left these three as no-ops, so
+// the dominant infinite-scroll idiom -- window.scrollTo(0, body.scrollHeight),
+// window.scrollBy(0, 500), then a window 'scroll' listener -- did nothing at
+// all: the offset never moved and no event ever fired.
+//
+// The page offset is stored on the scrolling element rather than in separate
+// window state, so window.scrollY and document.scrollingElement.scrollTop are
+// two views of one value, which is what pages assume. As with #431 there is no
+// layout, so the offset still cannot be clamped to a real maximum.
+function _scrollRoot() {
+  const doc = globalThis.document;
+  return (doc && doc.scrollingElement) || null;
+}
+function _windowScroll(x, y, relative) {
+  const root = _scrollRoot();
+  if (!root) return;
+  let left, top;
+  if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
+  else { left = x; top = y; }
+  if (left !== undefined) {
+    root.scrollLeft = (relative ? (root.scrollLeft || 0) : 0) + (+left || 0);
+  }
+  if (top !== undefined) {
+    root.scrollTop = (relative ? (root.scrollTop || 0) : 0) + (+top || 0);
+  }
+  // Async, matching the element path #431 added. Dispatched at the document
+  // AND the window: a page scroll event reaches both in Chrome, but
+  // Document.dispatchEvent here runs only its own listeners and does not
+  // propagate, so firing once would strand half the listeners.
+  setTimeout(() => {
+    try {
+      const doc = globalThis.document;
+      if (doc) doc.dispatchEvent(new Event('scroll', { bubbles: false }));
+      globalThis.dispatchEvent(new Event('scroll', { bubbles: false }));
+    } catch (e) {}
+  }, 0);
+}
+globalThis.scrollTo = function(x, y) { _windowScroll(x, y, false); };
+globalThis.scrollBy = function(x, y) { _windowScroll(x, y, true); };
+globalThis.scroll = function(x, y) { _windowScroll(x, y, false); };
+_markNative(globalThis.scrollTo);
+_markNative(globalThis.scrollBy);
+_markNative(globalThis.scroll);
+// Read-only accessors, as on a real Window: assigning window.scrollY does not
+// scroll the page. These replace the hard-coded 0 data properties defined
+// earlier, so they must stay after them.
+for (const [name, offset] of [
+  ['scrollX', 'scrollLeft'], ['pageXOffset', 'scrollLeft'],
+  ['scrollY', 'scrollTop'], ['pageYOffset', 'scrollTop'],
+]) {
+  Object.defineProperty(globalThis, name, {
+    configurable: true,
+    enumerable: true,
+    get() { const root = _scrollRoot(); return root ? (root[offset] || 0) : 0; },
+  });
+}
 globalThis.focus = function() {}; _markNative(globalThis.focus);
 globalThis.blur = function() {}; _markNative(globalThis.blur);
 globalThis.print = function() {}; _markNative(globalThis.print);
