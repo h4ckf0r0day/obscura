@@ -1513,6 +1513,75 @@ mod tests {
 
     /// Issue #461: NodeIterator has no subtree pruning — DOM 6.2 says
     /// FILTER_REJECT behaves as FILTER_SKIP there. The shared walker must not
+    /// Issue #475: parentNode() must never surface a node above `root`. With
+    /// currentNode at root, the old guard stepped to root's own parent and
+    /// returned it — escaping the walker's subtree entirely.
+    #[test]
+    fn tree_walker_parent_node_does_not_escape_above_root() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                const escaped = w.parentNode();
+                return [escaped, w.currentNode.id];
+                "#,
+            )
+            .unwrap();
+        // No parent within the subtree, and currentNode stays put at root.
+        assert_eq!(result, serde_json::json!([null, "root"]));
+    }
+
+    /// Issue #475: when the accepted ancestor is `root` itself, parentNode()
+    /// returns it and moves currentNode there — the old `parent !== root` guard
+    /// wrongly excluded it.
+    #[test]
+    fn tree_walker_parent_node_can_return_the_root() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                w.currentNode = root.querySelector('a');
+                const p = w.parentNode();
+                return [p ? p.id : null, w.currentNode === root];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["root", true]));
+    }
+
+    /// Issue #475: parentNode() climbs past a skipped ancestor to the first
+    /// accepted one, instead of stopping at the immediate parent.
+    #[test]
+    fn tree_walker_parent_node_climbs_past_skipped_ancestors() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><main id="m"><section><a></a></section></main></div>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode(n) {
+                        return n.tagName === 'SECTION'
+                            ? NodeFilter.FILTER_SKIP
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                w.currentNode = root.querySelector('a');
+                const p = w.parentNode();
+                return p ? p.id : null;
+                "#,
+            )
+            .unwrap();
+        // <a>'s parent <section> is skipped, so <main> is the first accepted
+        // ancestor — not null, and not the immediate <section>.
+        assert_eq!(result, serde_json::json!("m"));
+    }
+
     /// leak TreeWalker's pruning into it.
     #[test]
     fn node_iterator_treats_filter_reject_as_skip() {

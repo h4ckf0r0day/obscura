@@ -2713,11 +2713,17 @@ class Document extends Node {
         }
         return null;
       },
+      // DOM 6.1 "parentNode" (issue #475). The old version looked only at the
+      // immediate parent, so it couldn't climb past a skipped ancestor; it also
+      // excluded `root` as a result yet stepped to root's own parent when
+      // currentNode was root — returning a node OUTSIDE the walker's subtree.
+      // The loop's `node !== this.root` guard is what keeps the walk inside
+      // root while still allowing root itself to be returned.
       parentNode() {
-        let parent = this.currentNode.parentNode;
-        if (parent && parent !== this.root && this._accept(parent)) {
-          this.currentNode = parent;
-          return parent;
+        let node = this.currentNode;
+        while (node && node !== this.root) {
+          node = node.parentNode;
+          if (node && this._accept(node)) { this.currentNode = node; return node; }
         }
         return null;
       },
