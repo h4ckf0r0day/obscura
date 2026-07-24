@@ -1216,6 +1216,8 @@ class Element extends Node {
     if (this.localName === "svg") return "http://www.w3.org/2000/svg";
     return "http://www.w3.org/1999/xhtml";
   }
+  // `inner_html` resolves a <template> to its contents document on the Rust
+  // side (issue #463), so this needs no template special case.
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
     if (this.localName === 'template') {
@@ -1254,6 +1256,18 @@ class Element extends Node {
     // infinite retry loop (issue #210).
     const tag = this.localName;
     if (tag === 'template') {
+      // Back the fragment with the node's real template contents (issue #463).
+      // The parser stores template children in a separate contents document
+      // instead of under the element, so without this the getter handed back a
+      // fabricated empty fragment and the parsed markup was unreachable.
+      // `template_contents` allocates one on demand for created templates.
+      const nid = +_dom("template_contents", this._nid);
+      if (nid >= 0) {
+        // Cache by node id so `.content` keeps a stable identity across reads —
+        // frameworks stash the fragment and compare it later.
+        if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
+        return _cache.get(nid);
+      }
       if (!this._templateContent) this._templateContent = document.createDocumentFragment();
       return this._templateContent;
     }
@@ -1929,17 +1943,15 @@ class Element extends Node {
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
 
-      if (typeof el.onload === 'function') {
-        try { el.onload(); } catch(e) {}
-      } else {
-        var onloadAttr = el.getAttribute('onload');
-        if (onloadAttr) try { (0, eval)(onloadAttr); } catch(e) {}
-      }
+      // Dispatch through the element so the onload property/attribute and any
+      // addEventListener('load', ...) listeners all run. Calling el.onload()
+      // directly bypasses listeners registered via addEventListener.
+      el.dispatchEvent(new Event('load'));
     }).catch(() => {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
-      if (typeof el.onload === 'function') try { el.onload(); } catch(e) {}
+      el.dispatchEvent(new Event('load'));
     });
   }
   get contentDocument() {
@@ -2110,13 +2122,29 @@ class Element extends Node {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
   }
-  // No layout engine, so there is no real overflow to scroll. We still track a
-  // scroll offset so scrollTop/scrollLeft round-trip and the scroll methods
-  // below can report a position, which is what infinite-scroll code reads back.
+  // No layout engine, so there is no real overflow to scroll and the offset is
+  // deliberately NOT clamped: without real geometry any synthetic max is a
+  // guess, and a max derived from a stub scroll box pins scrollTop at 0, which
+  // deadlocks scroll-driven lazy loaders (no scroll -> no content -> no scroll).
+  // We track the offset so scrollTop/scrollLeft round-trip, and fire a scroll
+  // event on direct assignment -- lazy loaders that set `el.scrollTop = N` rely
+  // on that event, and scrollTo/scrollBy below would otherwise be its only source.
   get scrollTop() { return this._scrollTop || 0; }
-  set scrollTop(v) { v = +v; this._scrollTop = Number.isFinite(v) && v > 0 ? v : 0; }
+  set scrollTop(v) {
+    v = +v;
+    const nv = Number.isFinite(v) && v > 0 ? v : 0;
+    const changed = nv !== (this._scrollTop || 0);
+    this._scrollTop = nv;
+    if (changed && !this._scrollSuppress) this._fireScroll();
+  }
   get scrollLeft() { return this._scrollLeft || 0; }
-  set scrollLeft(v) { v = +v; this._scrollLeft = Number.isFinite(v) && v > 0 ? v : 0; }
+  set scrollLeft(v) {
+    v = +v;
+    const nv = Number.isFinite(v) && v > 0 ? v : 0;
+    const changed = nv !== (this._scrollLeft || 0);
+    this._scrollLeft = nv;
+    if (changed && !this._scrollSuppress) this._fireScroll();
+  }
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
     // documentElement and body span the full viewport. Without this every
@@ -2175,15 +2203,17 @@ class Element extends Node {
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView() { globalThis.__obscura_click_target = this; }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
-  // Without layout the offset cannot be clamped to a real max, but updating it
-  // and firing a scroll event lets scroll-driven lazy loaders advance instead
-  // of throwing "scrollBy is not a function".
+  // The setters fire a scroll event of their own, so suppress the per-axis ones
+  // here and emit a single event for the whole movement, the way a real browser
+  // coalesces one scroll per scroll operation rather than one per axis.
   scrollTo(x, y) {
     let left, top;
     if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
     else { left = x; top = y; }
+    this._scrollSuppress = true;
     if (left !== undefined) this.scrollLeft = +left || 0;
     if (top !== undefined) this.scrollTop = +top || 0;
+    this._scrollSuppress = false;
     this._fireScroll();
   }
   scroll(x, y) { this.scrollTo(x, y); }
@@ -2191,8 +2221,10 @@ class Element extends Node {
     let dl, dt;
     if (x !== null && typeof x === 'object') { dl = x.left; dt = x.top; }
     else { dl = x; dt = y; }
+    this._scrollSuppress = true;
     this.scrollLeft = (this.scrollLeft || 0) + (+dl || 0);
     this.scrollTop = (this.scrollTop || 0) + (+dt || 0);
+    this._scrollSuppress = false;
     this._fireScroll();
   }
   _fireScroll() {
@@ -2637,11 +2669,8 @@ class Document extends Node {
           const verdict = this._filter(node);
           if (verdict === 1) { this.currentNode = node; return node; }
           // FILTER_REJECT skips the node AND its subtree; FILTER_SKIP (and any
-          // other non-accept value) skips only the node. NodeIterator has no
-          // pruning at all, so `_rejectIsSkip` keeps it on the plain step.
-          const step = (verdict === 2 && !this._rejectIsSkip)
-            ? "next_after_subtree"
-            : "next_in_subtree";
+          // other non-accept value) skips only the node.
+          const step = verdict === 2 ? "next_after_subtree" : "next_in_subtree";
           node = _wrap(+_dom(step, this.root._nid, node._nid));
         }
         return null;
@@ -2734,26 +2763,86 @@ class Document extends Node {
       lastChild() { return this._traverseChildren('lastChild', 'previousSibling'); },
       nextSibling() { return this._traverseSiblings('firstChild', 'nextSibling'); },
       previousSibling() { return this._traverseSiblings('lastChild', 'previousSibling'); },
+      // DOM 6.1 "parentNode" (issue #475). The old version looked only at the
+      // immediate parent, so it couldn't climb past a skipped ancestor; it also
+      // excluded `root` as a result yet stepped to root's own parent when
+      // currentNode was root, returning a node OUTSIDE the walker's subtree.
+      // The loop's `node !== this.root` guard is what keeps the walk inside
+      // root while still allowing root itself to be returned.
       parentNode() {
-        let parent = this.currentNode.parentNode;
-        if (parent && parent !== this.root && this._accept(parent)) {
-          this.currentNode = parent;
-          return parent;
+        let node = this.currentNode;
+        while (node && node !== this.root) {
+          node = node.parentNode;
+          if (node && this._accept(node)) { this.currentNode = node; return node; }
         }
         return null;
       },
     };
     return walker;
   }
+  // A real NodeIterator (DOM 6.2), not a TreeWalker in disguise (issue #467).
+  // The two differ in more than naming: an iterator's pointer starts *before*
+  // its root, so the first nextNode() returns the root itself, and it exposes
+  // referenceNode/pointerBeforeReferenceNode/detach rather than a TreeWalker's
+  // currentNode and child/sibling movers.
   createNodeIterator(root, whatToShow, filter) {
-    // Shares the TreeWalker implementation, but DOM 6.2 gives NodeIterator no
-    // subtree pruning: FILTER_REJECT behaves exactly as FILTER_SKIP there.
-    const iterator = this.createTreeWalker(root, whatToShow, filter);
-    iterator._rejectIsSkip = true;
-    return iterator;
+    // whatToShow is unsigned long; default SHOW_ALL only when the arg is
+    // omitted. An explicit 0 (show nothing) must stay 0, not become SHOW_ALL.
+    whatToShow = (whatToShow === undefined) ? 0xFFFFFFFF : (whatToShow >>> 0);
+    return {
+      root: root,
+      referenceNode: root,
+      pointerBeforeReferenceNode: true,
+      whatToShow: whatToShow,
+      filter: filter || null,
+      // NodeIterator prunes nothing: FILTER_REJECT behaves as FILTER_SKIP, so
+      // unlike the TreeWalker only "accepted or not" matters here.
+      _accept(node) {
+        if (!((whatToShow >> (node.nodeType - 1)) & 1)) return false;
+        if (this.filter) {
+          if (typeof this.filter === 'function') return this.filter(node) === 1;
+          if (this.filter.acceptNode) return this.filter.acceptNode(node) === 1;
+        }
+        return true;
+      },
+      // DOM 6.2 "traverse". The pointer sits either before or after
+      // referenceNode, which is why reversing direction re-yields the current
+      // node instead of stepping over it.
+      _traverse(forward) {
+        let node = this.referenceNode;
+        let before = this.pointerBeforeReferenceNode;
+        for (;;) {
+          if (forward === before) {
+            // Consume the pointer's side without moving: it flips to the other
+            // side of the node it already references.
+            before = !before;
+          } else {
+            const step = forward ? "next_in_subtree" : "prev_in_subtree";
+            const next = _wrap(+_dom(step, this.root._nid, node._nid));
+            // A failed traversal leaves referenceNode and the pointer
+            // untouched, so the iterator can be resumed in either direction.
+            if (!next) return null;
+            node = next;
+          }
+          if (this._accept(node)) break;
+        }
+        this.referenceNode = node;
+        this.pointerBeforeReferenceNode = before;
+        return node;
+      },
+      nextNode() { return this._traverse(true); },
+      previousNode() { return this._traverse(false); },
+      // Legacy no-op since DOM4, but older library code still calls it and
+      // used to hit "detach is not a function".
+      detach() {},
+    };
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
   get activeElement() { return globalThis.__obscura_focused || this.body; }
+  // The element that scrolls the viewport, and where the page offset lives
+  // (issue #468). Standards mode, so documentElement — quirks mode would be
+  // body, but we never parse in quirks mode.
+  get scrollingElement() { return this.documentElement; }
   get implementation() {
     const ownerDoc = this;
     return {
@@ -6152,9 +6241,33 @@ class _IframeDocument {
   get implementation() { return document.implementation; }
   get styleSheets() { return []; }
 
-  addEventListener() {}
-  removeEventListener() {}
-  dispatchEvent() { return true; }
+  addEventListener(type, listener) {
+    if (typeof listener !== 'function') return;
+    if (!this._listeners) this._listeners = Object.create(null);
+    const list = this._listeners[type] || (this._listeners[type] = []);
+    if (!list.includes(listener)) list.push(listener);
+  }
+  removeEventListener(type, listener) {
+    const list = this._listeners && this._listeners[type];
+    if (!list) return;
+    const index = list.indexOf(listener);
+    if (index !== -1) list.splice(index, 1);
+  }
+  dispatchEvent(event) {
+    const type = event && event.type;
+    if (!type) return true;
+    const list = this._listeners && this._listeners[type];
+    if (list) {
+      for (const listener of list.slice()) {
+        try { listener.call(this, event); } catch (error) { console.error(error); }
+      }
+    }
+    const handler = this['on' + type];
+    if (typeof handler === 'function') {
+      try { handler.call(this, event); } catch (error) { console.error(error); }
+    }
+    return !event.defaultPrevented;
+  }
 
   write(html) {
     if (this._body) this._body.innerHTML += html;
@@ -7152,9 +7265,63 @@ URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
 };
 
-globalThis.scrollTo = function(x, y) {};
-globalThis.scrollBy = function(x, y) {};
-globalThis.scroll = function(x, y) {};
+// Window-level scrolling (issue #468). #431 gave elements functional
+// scrollTop/scrollLeft plus scroll methods, but left these three as no-ops, so
+// the dominant infinite-scroll idiom -- window.scrollTo(0, body.scrollHeight),
+// window.scrollBy(0, 500), then a window 'scroll' listener -- did nothing at
+// all: the offset never moved and no event ever fired.
+//
+// The page offset is stored on the scrolling element rather than in separate
+// window state, so window.scrollY and document.scrollingElement.scrollTop are
+// two views of one value, which is what pages assume. As with #431 there is no
+// layout, so the offset still cannot be clamped to a real maximum.
+function _scrollRoot() {
+  const doc = globalThis.document;
+  return (doc && doc.scrollingElement) || null;
+}
+function _windowScroll(x, y, relative) {
+  const root = _scrollRoot();
+  if (!root) return;
+  let left, top;
+  if (x !== null && typeof x === 'object') { left = x.left; top = x.top; }
+  else { left = x; top = y; }
+  if (left !== undefined) {
+    root.scrollLeft = (relative ? (root.scrollLeft || 0) : 0) + (+left || 0);
+  }
+  if (top !== undefined) {
+    root.scrollTop = (relative ? (root.scrollTop || 0) : 0) + (+top || 0);
+  }
+  // Async, matching the element path #431 added. Dispatched at the document
+  // AND the window: a page scroll event reaches both in Chrome, but
+  // Document.dispatchEvent here runs only its own listeners and does not
+  // propagate, so firing once would strand half the listeners.
+  setTimeout(() => {
+    try {
+      const doc = globalThis.document;
+      if (doc) doc.dispatchEvent(new Event('scroll', { bubbles: false }));
+      globalThis.dispatchEvent(new Event('scroll', { bubbles: false }));
+    } catch (e) {}
+  }, 0);
+}
+globalThis.scrollTo = function(x, y) { _windowScroll(x, y, false); };
+globalThis.scrollBy = function(x, y) { _windowScroll(x, y, true); };
+globalThis.scroll = function(x, y) { _windowScroll(x, y, false); };
+_markNative(globalThis.scrollTo);
+_markNative(globalThis.scrollBy);
+_markNative(globalThis.scroll);
+// Read-only accessors, as on a real Window: assigning window.scrollY does not
+// scroll the page. These replace the hard-coded 0 data properties defined
+// earlier, so they must stay after them.
+for (const [name, offset] of [
+  ['scrollX', 'scrollLeft'], ['pageXOffset', 'scrollLeft'],
+  ['scrollY', 'scrollTop'], ['pageYOffset', 'scrollTop'],
+]) {
+  Object.defineProperty(globalThis, name, {
+    configurable: true,
+    enumerable: true,
+    get() { const root = _scrollRoot(); return root ? (root[offset] || 0) : 0; },
+  });
+}
 globalThis.focus = function() {}; _markNative(globalThis.focus);
 globalThis.blur = function() {}; _markNative(globalThis.blur);
 globalThis.print = function() {}; _markNative(globalThis.print);

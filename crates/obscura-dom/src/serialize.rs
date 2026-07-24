@@ -21,8 +21,19 @@ impl DomTree {
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_worklist(self.child_work(node_id), &mut buf);
+        self.serialize_worklist(self.child_work(self.content_source(node_id)), &mut buf);
         buf
+    }
+
+    // The node whose children represent `node_id`'s markup. For a <template>
+    // that is its contents document, since the parser puts template children
+    // there rather than under the element (issue #463); for everything else it
+    // is the node itself.
+    fn content_source(&self, node_id: NodeId) -> NodeId {
+        match self.get_node(node_id).map(|n| n.data) {
+            Some(NodeData::Element { template_contents: Some(contents), .. }) => contents,
+            _ => node_id,
+        }
     }
 
     // Children as work items in document order (top of the LIFO stack first).
@@ -101,7 +112,9 @@ impl DomTree {
                         if include_self {
                             stack.push(SerializeWork::CloseTag(tag.to_string()));
                         }
-                        for w in self.child_work(node_id) {
+                        // A <template> serializes its contents document, not its
+                        // own (always empty) children — issue #463.
+                        for w in self.child_work(self.content_source(node_id)) {
                             stack.push(w);
                         }
                     }

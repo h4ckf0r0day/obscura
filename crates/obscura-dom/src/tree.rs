@@ -579,6 +579,41 @@ impl DomTree {
         Self::climb_to_next_sibling(&inner, root, current)
     }
 
+    /// Returns the node before `current` in document order, without leaving the
+    /// subtree rooted at `root`. `root` has no predecessor within its own
+    /// subtree, but it is itself reachable as one — a NodeIterator can return
+    /// its root, unlike a TreeWalker.
+    ///
+    /// A NodeIterator applies no subtree pruning (DOM 6.2: FILTER_REJECT
+    /// behaves as FILTER_SKIP), so unlike the TreeWalker's backward walk the
+    /// whole step fits here instead of being interleaved with filter calls.
+    pub fn prev_in_subtree(&self, root: NodeId, current: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        if current == root {
+            return None;
+        }
+        let current_node = inner.nodes.get(current.index())?.as_ref()?;
+
+        let Some(prev) = current_node.prev_sibling else {
+            // No previous sibling: the parent immediately precedes `current`.
+            return current_node.parent;
+        };
+
+        // Otherwise it is the previous sibling's deepest last descendant.
+        let mut node_id = prev;
+        for _ in 0..=inner.nodes.len() {
+            let node = inner.nodes.get(node_id.index())?.as_ref()?;
+            match node.last_child {
+                Some(child) => node_id = child,
+                None => return Some(node_id),
+            }
+        }
+
+        // Same defense in depth as the forward walk: a malformed tree must not
+        // spin here.
+        None
+    }
+
     /// Follow `current`'s next sibling, climbing ancestors until one has a next
     /// sibling — without stepping outside `root`.
     fn climb_to_next_sibling(
@@ -600,6 +635,41 @@ impl DomTree {
 
         // Parent cycles are prevented by the mutation APIs. Keep a hard bound
         // here as defense in depth for a malformed tree.
+        None
+    }
+
+    /// The node holding a `<template>` element's contents.
+    ///
+    /// The parser puts template children in a separate contents document rather
+    /// than under the element (HTML spec), so this is the only way to reach
+    /// them. Templates built with `createElement` have no contents node yet, so
+    /// one is allocated on demand — `.content` must be usable either way.
+    ///
+    /// Returns `None` for a non-element node.
+    pub fn template_contents(&self, node_id: NodeId) -> Option<NodeId> {
+        {
+            let inner = self.inner.borrow();
+            let node = inner.nodes.get(node_id.index())?.as_ref()?;
+            match &node.data {
+                NodeData::Element { template_contents, .. } => {
+                    if let Some(existing) = *template_contents {
+                        return Some(existing);
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        // Borrow released above: `new_node` takes its own mutable borrow.
+        // Matches what the tree sink allocates for a parsed template.
+        let contents = self.new_node(NodeData::Document);
+        let mut inner = self.inner.borrow_mut();
+        if let Some(Some(node)) = inner.nodes.get_mut(node_id.index()) {
+            if let NodeData::Element { template_contents, .. } = &mut node.data {
+                *template_contents = Some(contents);
+                return Some(contents);
+            }
+        }
         None
     }
 
@@ -726,6 +796,38 @@ impl DomTree {
 
             let new_id = self.new_node(node_data);
             self.append_child(dest_parent, new_id);
+
+            // A <template>'s children hang off a separate contents document, so
+            // the child walk below never reaches them. Worse, the cloned data
+            // carries the *source* tree's contents NodeId, which here indexes
+            // whatever unrelated node occupies that slot. Allocate a real
+            // contents node and queue the source contents' children into it, so
+            // the reference is remapped rather than left dangling (issue #463).
+            let src_contents = {
+                let inner = self.inner.borrow();
+                match inner.nodes.get(new_id.index()).and_then(|n| n.as_ref()) {
+                    Some(node) => match &node.data {
+                        NodeData::Element { template_contents, .. } => *template_contents,
+                        _ => None,
+                    },
+                    None => None,
+                }
+            };
+            if let Some(src_contents) = src_contents {
+                let dest_contents = self.new_node(NodeData::Document);
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    if let Some(Some(node)) = inner.nodes.get_mut(new_id.index()) {
+                        if let NodeData::Element { template_contents, .. } = &mut node.data {
+                            *template_contents = Some(dest_contents);
+                        }
+                    }
+                }
+                // Onto the same stack, so nested templates stay iterative.
+                for child_id in source.children(src_contents).into_iter().rev() {
+                    stack.push((dest_contents, child_id));
+                }
+            }
 
             for child_id in source.children(src_id).into_iter().rev() {
                 stack.push((new_id, child_id));
@@ -1069,6 +1171,29 @@ mod tests {
         assert_eq!(tree.next_after_subtree(root, second), None);
         // Rejecting the root itself exhausts the walk rather than escaping it.
         assert_eq!(tree.next_after_subtree(root, root), None);
+    }
+
+    #[test]
+    fn test_prev_in_subtree_reverses_document_order() {
+        // root > [first > nested, second]; document order is root, first,
+        // nested, second, so the reverse walk must retrace it exactly.
+        let tree = DomTree::new();
+        let root = tree.new_node(NodeData::Text { contents: "root".into() });
+        let first = tree.new_node(NodeData::Text { contents: "first".into() });
+        let nested = tree.new_node(NodeData::Text { contents: "nested".into() });
+        let second = tree.new_node(NodeData::Text { contents: "second".into() });
+        tree.append_child(tree.document(), root);
+        tree.append_child(root, first);
+        tree.append_child(first, nested);
+        tree.append_child(root, second);
+
+        // Previous sibling's deepest last descendant, not the sibling itself.
+        assert_eq!(tree.prev_in_subtree(root, second), Some(nested));
+        assert_eq!(tree.prev_in_subtree(root, nested), Some(first));
+        // No previous sibling: the parent precedes it, and root is returnable.
+        assert_eq!(tree.prev_in_subtree(root, first), Some(root));
+        // Root has no predecessor inside its own subtree.
+        assert_eq!(tree.prev_in_subtree(root, root), None);
     }
 
     // Builds a chain of `depth` nested <div> elements under the document and

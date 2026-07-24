@@ -859,6 +859,18 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Event loop error: {}", e))
     }
 
+    /// Whether the serialized dynamic-script queue is still fetching or
+    /// evaluating a script. The queue variables are global lexicals rather
+    /// than window properties, so page code cannot overwrite this state.
+    pub fn has_pending_dynamic_scripts(&mut self) -> bool {
+        self.evaluate(
+            "typeof __dynScriptBusy !== 'undefined' && (__dynScriptBusy || __dynScriptQueue.length > 0)",
+        )
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    }
+
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
@@ -1513,6 +1525,75 @@ mod tests {
 
     /// Issue #461: NodeIterator has no subtree pruning — DOM 6.2 says
     /// FILTER_REJECT behaves as FILTER_SKIP there. The shared walker must not
+    /// Issue #475: parentNode() must never surface a node above `root`. With
+    /// currentNode at root, the old guard stepped to root's own parent and
+    /// returned it — escaping the walker's subtree entirely.
+    #[test]
+    fn tree_walker_parent_node_does_not_escape_above_root() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                const escaped = w.parentNode();
+                return [escaped, w.currentNode.id];
+                "#,
+            )
+            .unwrap();
+        // No parent within the subtree, and currentNode stays put at root.
+        assert_eq!(result, serde_json::json!([null, "root"]));
+    }
+
+    /// Issue #475: when the accepted ancestor is `root` itself, parentNode()
+    /// returns it and moves currentNode there — the old `parent !== root` guard
+    /// wrongly excluded it.
+    #[test]
+    fn tree_walker_parent_node_can_return_the_root() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                w.currentNode = root.querySelector('a');
+                const p = w.parentNode();
+                return [p ? p.id : null, w.currentNode === root];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["root", true]));
+    }
+
+    /// Issue #475: parentNode() climbs past a skipped ancestor to the first
+    /// accepted one, instead of stopping at the immediate parent.
+    #[test]
+    fn tree_walker_parent_node_climbs_past_skipped_ancestors() {
+        let mut rt = setup_runtime(
+            r#"<div id="root"><main id="m"><section><a></a></section></main></div>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode(n) {
+                        return n.tagName === 'SECTION'
+                            ? NodeFilter.FILTER_SKIP
+                            : NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                w.currentNode = root.querySelector('a');
+                const p = w.parentNode();
+                return p ? p.id : null;
+                "#,
+            )
+            .unwrap();
+        // <a>'s parent <section> is skipped, so <main> is the first accepted
+        // ancestor — not null, and not the immediate <section>.
+        assert_eq!(result, serde_json::json!("m"));
+    }
+
     /// leak TreeWalker's pruning into it.
     #[test]
     fn node_iterator_treats_filter_reject_as_skip() {
@@ -1538,7 +1619,305 @@ mod tests {
                 "#,
             )
             .unwrap();
-        assert_eq!(result, serde_json::json!(["P", "A"]));
+        // The rejected <section> is skipped but not pruned, so <p> still shows.
+        // The leading root is #467: an iterator yields the node it is rooted at.
+        assert_eq!(result, serde_json::json!(["DIV", "P", "A"]));
+    }
+
+    /// Issue #467: a NodeIterator starts *before* its root, so the first
+    /// nextNode() returns the root itself. Aliasing createTreeWalker silently
+    /// dropped exactly the element the iterator was rooted at.
+    #[test]
+    fn node_iterator_yields_the_root_node_first() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                const seen = [];
+                let node;
+                while ((node = it.nextNode())) seen.push(node.tagName);
+                return seen;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["DIV", "A"]));
+    }
+
+    /// Issue #467: the NodeIterator interface surface, and that TreeWalker-only
+    /// members are not exposed on it.
+    #[test]
+    fn node_iterator_exposes_its_own_interface() {
+        let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                const before = [it.referenceNode === root, it.pointerBeforeReferenceNode];
+                it.nextNode();
+                return [
+                    before,
+                    typeof it.detach,
+                    it.detach() === undefined,
+                    typeof it.previousNode,
+                    it.root === root,
+                    it.whatToShow,
+                    // TreeWalker-only members must not leak onto a NodeIterator.
+                    typeof it.currentNode,
+                    typeof it.firstChild,
+                    typeof it.parentNode,
+                    // The pointer advanced past the root it just returned.
+                    [it.referenceNode.tagName, it.pointerBeforeReferenceNode],
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true],
+                "function",
+                true,
+                "function",
+                true,
+                1,
+                "undefined",
+                "undefined",
+                "undefined",
+                ["DIV", false]
+            ])
+        );
+    }
+
+    /// Issue #467: previousNode() retraces the iterator, and the root is the
+    /// last node it yields going backwards.
+    #[test]
+    fn node_iterator_previous_node_retraces_the_walk() {
+        let mut rt = setup_runtime(r#"<div id="root"><a><b></b></a><c></c></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const root = document.getElementById('root');
+                const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                const forward = [];
+                let node;
+                while ((node = it.nextNode())) forward.push(node.tagName);
+                const backward = [];
+                while ((node = it.previousNode())) backward.push(node.tagName);
+                return [forward, backward];
+                "#,
+            )
+            .unwrap();
+        // Forward ends on <c>; going back re-yields <c> (the pointer sits after
+        // it), then the rest in reverse, root included.
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["DIV", "A", "B", "C"],
+                ["C", "B", "A", "DIV"]
+            ])
+        );
+    }
+
+    /// Issue #463: `<template>` contents are parsed into the node's
+    /// `template_contents` document, but no op exposed it, so `.content` handed
+    /// back a fabricated empty fragment and the parsed markup was unreachable.
+    #[test]
+    fn template_content_exposes_parsed_markup() {
+        let mut rt = setup_runtime(
+            r#"<body><template id="t"><p class="row">a</p><p class="row">b</p></template></body>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.getElementById('t');
+                return [
+                    t.content.childNodes.length,
+                    t.content.querySelectorAll('.row').length,
+                    t.content.firstElementChild.textContent,
+                    t.innerHTML,
+                    t.content.nodeType,
+                    t.content instanceof DocumentFragment,
+                    // Identity is stable: frameworks stash `.content` and reuse it.
+                    t.content === t.content,
+                    // The children stay off the element itself, per the HTML spec.
+                    t.childNodes.length,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                2,
+                2,
+                "a",
+                r#"<p class="row">a</p><p class="row">b</p>"#,
+                11,
+                true,
+                true,
+                0
+            ])
+        );
+    }
+
+    /// Issue #463: the same must hold for a template that arrives via innerHTML
+    /// rather than the initial document parse — that is how most frameworks
+    /// inject templates.
+    #[test]
+    fn template_content_works_for_templates_added_via_inner_html() {
+        let mut rt = setup_runtime(r#"<body><div id="host"></div></body>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                host.innerHTML = '<template id="t2"><li class="item">x</li></template>';
+                const t = document.getElementById('t2');
+                const stamped = t.content.cloneNode(true);
+                host.appendChild(stamped);
+                return [
+                    t.content.childNodes.length,
+                    t.content.querySelector('.item').textContent,
+                    host.querySelectorAll('li.item').length,
+                ];
+                "#,
+            )
+            .unwrap();
+        // cloneNode(true) of the content is the canonical stamping idiom.
+        assert_eq!(result, serde_json::json!([1, "x", 1]));
+    }
+
+    /// Issue #463: a template built with createElement has no parsed contents,
+    /// so `.content` must allocate a backing fragment on demand and round-trip
+    /// through innerHTML.
+    #[test]
+    fn template_content_round_trips_for_created_templates() {
+        let mut rt = setup_runtime(r#"<body></body>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.createElement('template');
+                t.innerHTML = '<span class="s">hi</span>';
+                return [
+                    t.content.childNodes.length,
+                    t.content.querySelector('.s').textContent,
+                    t.innerHTML,
+                    t.childNodes.length,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([1, "hi", r#"<span class="s">hi</span>"#, 0])
+        );
+    }
+
+    /// Issue #463: serializing a `<template>` must emit its contents, or the
+    /// markup silently disappears from outerHTML/innerHTML round-trips — and
+    /// `cloneNode(true)`, which round-trips through outer_html, yields an empty
+    /// template.
+    #[test]
+    fn template_contents_survive_serialization_and_clone() {
+        let mut rt = setup_runtime(
+            r#"<body><template id="t"><li class="item">x</li></template></body>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const t = document.getElementById('t');
+                const clone = t.cloneNode(true);
+                return [
+                    t.outerHTML,
+                    document.body.innerHTML,
+                    clone.content.childNodes.length,
+                    clone.content.querySelector('.item').textContent,
+                    // The clone's contents are its own, not shared with the original.
+                    (clone.content.firstElementChild === t.content.firstElementChild),
+                ];
+                "#,
+            )
+            .unwrap();
+        let expected = r#"<template id="t"><li class="item">x</li></template>"#;
+        assert_eq!(
+            result,
+            serde_json::json!([expected, expected, 1, "x", false])
+        );
+    }
+
+    /// Issue #468: window.scrollTo/scrollBy/scroll were no-op stubs, so the
+    /// dominant infinite-scroll idiom never advanced the page offset.
+    #[test]
+    fn window_scroll_methods_move_the_page_offset() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const scrolled = window.scrollTo(0, 500);
+                const afterTo = [window.scrollX, window.scrollY];
+                window.scrollBy(0, 200);
+                const afterBy = [window.pageXOffset, window.pageYOffset];
+                window.scrollTo({ left: 10, top: 40 });
+                const afterOptions = [window.scrollX, window.scrollY];
+                window.scroll(5, 5);
+                const afterScroll = [window.scrollX, window.scrollY];
+                // Negative offsets clamp to 0, as they do for elements.
+                window.scrollTo(0, -100);
+                return [afterTo, afterBy, afterOptions, afterScroll, window.scrollY];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[0, 500], [0, 700], [10, 40], [5, 5], 0])
+        );
+    }
+
+    /// Issue #468: the page offset is one value, readable and writable through
+    /// either `window.scrollY` or `document.scrollingElement.scrollTop`.
+    #[test]
+    fn window_scroll_offset_is_shared_with_the_scrolling_element() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const isDocEl = document.scrollingElement === document.documentElement;
+                window.scrollTo(0, 300);
+                // Written through the window, read through the element...
+                const viaElement = document.scrollingElement.scrollTop;
+                // ...and the reverse.
+                document.scrollingElement.scrollTop = 90;
+                return [isDocEl, viaElement, window.scrollY, window.pageYOffset];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, 300, 90, 90]));
+    }
+
+    /// Issue #468: a scroll event must reach listeners on both the window and
+    /// the document — that is the signal lazy loaders wait for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_scroll_fires_a_scroll_event() {
+        let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let win = 0, doc = 0;
+                    window.addEventListener('scroll', () => win++);
+                    document.addEventListener('scroll', () => doc++);
+                    window.scrollBy(0, 400);
+                    setTimeout(() => resolve([win, doc, window.scrollY]), 5);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([1, 1, 400]));
     }
 
     /// Issue #469: FILTER_SKIP leaves a skipped node's children eligible, so
