@@ -744,6 +744,11 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
+            let dynamic_settle_ms = std::env::var("OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3_000)
+                .max(500);
             // Bound the post-script settle loop by wall clock, not just by the
             // 10ms-tick branch. The old code only consulted `deadline` inside
             // the `Err(_)` arm (when the inner tick timed out), so a steady
@@ -753,14 +758,22 @@ impl Page {
             // On busy sites this could keep the V8 lock held for tens of
             // seconds, wedging the entire CDP dispatcher (see triage for
             // issue series around the 40-site compat sweep).
+            // A dynamic external script may still be in flight at 500ms. Keep
+            // pumping only while that queue is pending, up to a separate bounded
+            // budget, so normal pages and unrelated fetches retain the fast path.
             // A single run_event_loop poll that pins the thread inside V8 makes
             // the per-poll tokio timeouts below useless, so guard the whole loop
-            // with a watchdog that fires ~250ms past its 500ms deadline.
-            let settle_wd = js.arm_watchdog(std::time::Duration::from_millis(750));
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+            // with a watchdog that fires 250ms past the longest deadline.
+            let settle_wd = js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250));
+            let started = tokio::time::Instant::now();
+            let deadline = started + tokio::time::Duration::from_millis(500);
+            let dynamic_deadline = started + tokio::time::Duration::from_millis(dynamic_settle_ms);
             let mut idle_count = 0u32;
             loop {
-                if tokio::time::Instant::now() >= deadline {
+                let now = tokio::time::Instant::now();
+                if now >= deadline
+                    && (now >= dynamic_deadline || !js.has_pending_dynamic_scripts())
+                {
                     break;
                 }
                 let result = tokio::time::timeout(

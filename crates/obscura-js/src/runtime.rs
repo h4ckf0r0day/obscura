@@ -859,6 +859,18 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Event loop error: {}", e))
     }
 
+    /// Whether the serialized dynamic-script queue is still fetching or
+    /// evaluating a script. The queue variables are global lexicals rather
+    /// than window properties, so page code cannot overwrite this state.
+    pub fn has_pending_dynamic_scripts(&mut self) -> bool {
+        self.evaluate(
+            "typeof __dynScriptBusy !== 'undefined' && (__dynScriptBusy || __dynScriptQueue.length > 0)",
+        )
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    }
+
     /// Arm a hard wall-clock backstop on synchronous V8 work. A page stuck in a
     /// synchronous loop or a microtask storm pins the OS thread inside V8, so
     /// `tokio::time::timeout` (which can only cancel at await points) never
