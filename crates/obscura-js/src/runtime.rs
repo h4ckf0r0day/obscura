@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use deno_core::{JsRuntime, RuntimeOptions};
+use deno_core::{v8, JsRuntime, RuntimeOptions};
 use obscura_dom::DomTree;
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
@@ -145,11 +145,10 @@ impl ObscuraJsRuntime {
             });
 
             runtime.op_state().borrow_mut().put(state_clone);
-
             runtime
                 .execute_script(
                     "<obscura:init>",
-                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; if (typeof _installWasmStreamingFallback === 'function') _installWasmStreamingFallback();".to_string(),
                 )
                 .expect("init should not fail");
 
@@ -1145,7 +1144,12 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
+        let context = self.runtime.main_context();
+        v8::scope_with_context!(
+            scope,
+            self.runtime.v8_isolate(),
+            context,
+        );
         let local = deno_core::v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
