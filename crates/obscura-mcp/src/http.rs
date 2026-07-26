@@ -12,6 +12,20 @@ use crate::{dispatch, BrowserState};
 /// is far above any real JSON-RPC tool call.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Per-request read deadline. Without one, a client that opens a connection and
+/// then sends its request line/headers/body slowly (or not at all) holds the
+/// connection open forever; because connections are served sequentially, that
+/// stalls every other MCP client (slowloris). Configurable via
+/// `OBSCURA_MCP_READ_TIMEOUT_MS` (default 30s, floored at 50ms).
+fn read_timeout() -> tokio::time::Duration {
+    let ms = std::env::var("OBSCURA_MCP_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000)
+        .max(50);
+    tokio::time::Duration::from_millis(ms)
+}
+
 /// Origin allowlist for browser callers, read from `OBSCURA_MCP_ALLOWED_ORIGINS`
 /// (comma-separated). Unset/empty → permissive (unchanged `*`) so hosted
 /// dashboards keep working (issue #175).
@@ -87,9 +101,21 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
 
     loop {
+        // Bound the whole request read (line + headers + body) by a single
+        // deadline so a slow/stalled client cannot pin the connection — and thus
+        // the sequential accept loop — indefinitely.
+        let read_deadline = tokio::time::Instant::now() + read_timeout();
+
         // ── request line ─────────────────────────────────────────────────────
         let mut request_line = String::new();
-        if reader.read_line(&mut request_line).await? == 0 {
+        let n = match tokio::time::timeout_at(read_deadline, reader.read_line(&mut request_line)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                let _ = respond(&mut writer, 408, b"{\"error\":\"request timeout\"}").await;
+                break;
+            }
+        };
+        if n == 0 {
             break;
         }
         let request_line = request_line.trim().to_string();
@@ -112,7 +138,13 @@ async fn handle_connection(
 
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            match tokio::time::timeout_at(read_deadline, reader.read_line(&mut line)).await {
+                Ok(r) => { r?; }
+                Err(_) => {
+                    let _ = respond(&mut writer, 408, b"{\"error\":\"request timeout\"}").await;
+                    return Ok(());
+                }
+            }
             let trimmed = line.trim_end_matches("\r\n").trim_end_matches('\n');
             if trimmed.is_empty() {
                 break;
@@ -207,7 +239,13 @@ async fn handle_connection(
                 }
 
                 let mut body = vec![0u8; len];
-                reader.read_exact(&mut body).await?;
+                match tokio::time::timeout_at(read_deadline, reader.read_exact(&mut body)).await {
+                    Ok(r) => { r?; }
+                    Err(_) => {
+                        let _ = respond(&mut writer, 408, b"{\"error\":\"request timeout\"}").await;
+                        break;
+                    }
+                }
 
                 let response = process_body(&body, state).await;
                 let bytes = serde_json::to_vec(&response)?;
