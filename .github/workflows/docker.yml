@@ -35,6 +35,8 @@ jobs:
         with:
           context: .
           push: true
+          provenance: mode=max
+          sbom: true
           build-args: |
             OBSCURA_VERSION=${{ steps.version.outputs.version }}
           tags: |
