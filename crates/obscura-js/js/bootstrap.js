@@ -18,7 +18,7 @@
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
-    '__processDynScriptQueue', '_markNative', '_fpRand', '_fpNoise',
+    '__processDynScriptQueue', '_decodeDataScriptSource', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -163,6 +163,52 @@ let _fpSeed = 0;
 // when SPAs dynamically insert multiple <script module> tags at once.
 let __dynScriptQueue = [];
 let __dynScriptBusy = false;
+
+function _decodeDataScriptSource(url) {
+  const comma = url.indexOf(',');
+  if (!url.startsWith('data:') || comma < 5) {
+    throw new TypeError('Invalid data URL');
+  }
+
+  const meta = url.slice(5, comma);
+  const payload = url.slice(comma + 1);
+  if (meta.split(';').some(part => part.toLowerCase() === 'base64')) {
+    let encoded = payload.replace(/[\r\n\t\f ]/g, '');
+    const remainder = encoded.length % 4;
+    if (remainder === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || /=/.test(encoded.slice(0, -2))) {
+      throw new TypeError('Invalid base64 data URL');
+    }
+    if (remainder > 0) encoded += '='.repeat(4 - remainder);
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+      throw new TypeError('Invalid base64 data URL');
+    }
+    return new TextDecoder().decode(_base64ToUint8Array(encoded));
+  }
+
+  const bytes = [];
+  for (let i = 0; i < payload.length; i++) {
+    const code = payload.charCodeAt(i);
+    if (code === 0x25 && i + 2 < payload.length) {
+      const hi = _hexv(payload.charCodeAt(i + 1));
+      const lo = _hexv(payload.charCodeAt(i + 2));
+      if (hi >= 0 && lo >= 0) {
+        bytes.push(hi * 16 + lo);
+        i += 2;
+        continue;
+      }
+    }
+    if (code < 0x80) {
+      bytes.push(code);
+    } else {
+      const character = String.fromCodePoint(payload.codePointAt(i));
+      if (character.length === 2) i++;
+      const encoded = new TextEncoder().encode(character);
+      for (let j = 0; j < encoded.length; j++) bytes.push(encoded[j]);
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
   __dynScriptBusy = true;
@@ -176,11 +222,23 @@ async function __processDynScriptQueue() {
         if (task.isModule) {
           await import(task.url);
         } else {
-          const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
-          const parsed = JSON.parse(raw);
-          if (parsed.body) {
+          let source;
+          if (task.url.startsWith('data:')) {
+            // Dynamic scripts are async by default. Keep an async boundary even
+            // though data: URLs are decoded locally without a network fetch.
+            await Promise.resolve();
+            source = _decodeDataScriptSource(task.url);
+          } else {
+            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+            const parsed = JSON.parse(raw);
+            if (parsed.blocked || parsed.status === 0 || parsed.status >= 400) {
+              throw new Error(parsed.error || 'Script request failed with status ' + parsed.status);
+            }
+            source = parsed.body || '';
+          }
+          if (source) {
             globalThis.__currentScriptNid = task.nid;
-            try { (0, eval)(parsed.body); }
+            try { (0, eval)(source); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
           }
