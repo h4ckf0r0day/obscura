@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -146,7 +147,11 @@ async fn one_client_with_fetch(port: u16, id_base: u64, target_url: &str) -> Res
 
         // navigate response?
         if v.get("id").and_then(|x| x.as_u64()) == Some(id_base + 2) {
-            if let Some(err) = v.get("result").and_then(|r| r.get("errorText")).and_then(|e| e.as_str()) {
+            if let Some(err) = v
+                .get("result")
+                .and_then(|r| r.get("errorText"))
+                .and_then(|e| e.as_str())
+            {
                 return Err(format!("navigation failed: {}", err));
             }
             return Ok(());
@@ -180,13 +185,12 @@ const FIXTURE_HTML: &str = "<!DOCTYPE html><html><head><script src=\"/app.js\"><
 
 const FIXTURE_JS: &str = "console.log('fixture');";
 
-async fn serve_fixture(port: u16) {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+async fn serve_fixture(listener: TcpListener) {
     loop {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 4096];
-        let _ = std::io::Read::read(&mut stream, &mut buf);
-        let req = String::from_utf8_lossy(&buf);
+        let read = stream.read(&mut buf).await.unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..read]);
         let (body, ctype) = if req.contains("GET /app.js") {
             (FIXTURE_JS, "application/javascript")
         } else {
@@ -198,7 +202,7 @@ async fn serve_fixture(port: u16) {
             body.len(),
             body
         );
-        let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        let _ = stream.write_all(resp.as_bytes()).await;
     }
 }
 
@@ -207,7 +211,8 @@ async fn serve_fixture(port: u16) {
 #[tokio::test(flavor = "current_thread")]
 
 async fn fetch_intercept_concurrency_5_does_not_abort_v8() {
-    let fixture_port = pick_port().await;
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_port = fixture.local_addr().unwrap().port();
     let target_url = format!("http://127.0.0.1:{}/", fixture_port);
 
     let port = pick_port().await;
@@ -218,7 +223,7 @@ async fn fetch_intercept_concurrency_5_does_not_abort_v8() {
                 let _ = obscura_cdp::server::start(port).await;
             });
             tokio::task::spawn_local(async move {
-                serve_fixture(fixture_port).await;
+                serve_fixture(fixture).await;
             });
             tokio::time::sleep(Duration::from_millis(250)).await;
 
