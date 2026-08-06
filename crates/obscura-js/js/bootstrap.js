@@ -17,7 +17,7 @@
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted',
     '__obscura_hw', '__obscura_mem',
-    '__documentReadyState__', '__currentUrl',
+    '__documentReadyState__', '__currentUrl', '__documentReferrer__',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
@@ -2699,6 +2699,13 @@ class Document extends Node {
   set title(v) {}
   get URL() { return _domParse("document_url") ?? ""; }
   get documentURI() { return this.URL; }
+  // Chrome always exposes document.referrer as a string: the referring URL, or
+  // "" when there is none (the usual case for a CDP-driven top-level goto with
+  // no referrer). Returning undefined here regresses anti-fraud sensors that do
+  // `new URL(document.referrer)` unguarded (e.g. BGSensors) -> "Invalid URL".
+  // page.rs may set __documentReferrer__ from the navigation's Referer header;
+  // absent that, "" is the spec-correct value. HTML: Document/referrer -> USVString.
+  get referrer() { return globalThis.__documentReferrer__ ?? ""; }
   get location() { return globalThis.location; }
   set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
@@ -5613,7 +5620,36 @@ globalThis.performance = globalThis.performance || {
   })(),
   mark(){}, measure(){},
   clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
+  // Chrome always has one PerformanceNavigationTiming whose `.name` is the
+  // document URL. Sensors read getEntriesByType('navigation')[0].name and feed
+  // it to `new URL(...)`; returning [] made that undefined -> "Invalid URL".
+  // We synthesize a single navigation entry (timing fields zeroed — sensors
+  // that only want the URL don't care) so the shape matches a real browser.
+  getEntriesByType(type){
+    if (type !== 'navigation') return [];
+    var _u = (globalThis.location && globalThis.location.href) || 'about:blank';
+    var e = {
+      name: _u, entryType: 'navigation', startTime: 0, duration: 0,
+      initiatorType: 'navigation', deliveryType: '', nextHopProtocol: 'h2',
+      workerStart: 0, redirectStart: 0, redirectEnd: 0, fetchStart: 0,
+      domainLookupStart: 0, domainLookupEnd: 0, connectStart: 0, connectEnd: 0,
+      secureConnectionStart: 0, requestStart: 0, responseStart: 0,
+      firstInterimResponseStart: 0, finalResponseHeadersStart: 0, responseEnd: 0,
+      transferSize: 0, encodedBodySize: 0, decodedBodySize: 0, responseStatus: 200,
+      serverTiming: [], unloadEventStart: 0, unloadEventEnd: 0, domInteractive: 0,
+      domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0,
+      loadEventStart: 0, loadEventEnd: 0, type: 'navigate', redirectCount: 0,
+      activationStart: 0, criticalCHRestart: 0,
+    };
+    e.toJSON = function(){ var o = {}; for (var k in this) { if (typeof this[k] !== 'function') o[k] = this[k]; } return o; };
+    return [e];
+  },
+  getEntries(){ return globalThis.performance.getEntriesByType('navigation'); },
+  getEntriesByName(name, type){
+    if (type && type !== 'navigation') return [];
+    var _u = (globalThis.location && globalThis.location.href) || 'about:blank';
+    return name === _u ? globalThis.performance.getEntriesByType('navigation') : [];
+  },
   setResourceTimingBufferSize(){},
   timeOrigin: 0,
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
