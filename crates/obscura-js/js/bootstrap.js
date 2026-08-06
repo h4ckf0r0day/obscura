@@ -5457,6 +5457,61 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   [Symbol.iterator](){ return this.entries(); }
 };
 
+// Conservative XML well-formedness check for DOMParser. Only detects clear
+// errors (tag balance / single root); defaults to well-formed when unsure so
+// valid XML is never falsely flagged.
+const _checkXmlWellFormed = (html) => {
+  // Strip comments, CDATA sections, processing instructions, and DOCTYPE
+  // declarations — they may contain angle brackets.
+  const s = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!DOCTYPE\s[^>]*?>/gi, '');
+
+  const stack = [];
+  // Match open / close / self-closing tags.
+  // Group 1: tag name.  Group 2: optional '/' before '>'.
+  const tagRe = /<\/?([a-zA-Z_][\w.\-:]*)(?:\s[^>]*?)?(\/)?>/g;
+  let rootFound = false;
+  let match;
+
+  while ((match = tagRe.exec(s)) !== null) {
+    const fullTag = match[0];
+    const tagName = match[1];
+    const isClosing = fullTag.startsWith('</');
+    const isSelfClosing = match[2] === '/';
+
+    if (isClosing) {
+      if (stack.length === 0) {
+        return { wellFormed: false, error: 'error on line 1: extra closing tag </' + tagName + '>' };
+      }
+      const open = stack.pop();
+      if (open !== tagName) {
+        return { wellFormed: false, error: 'error on line 1: opening and ending tag mismatch: ' + open + ' and ' + tagName };
+      }
+      if (stack.length === 0) rootFound = true;
+    } else {
+      // Opening or self-closing tag. Check for extra content after root.
+      if (stack.length === 0 && rootFound) {
+        return { wellFormed: false, error: 'error on line 1: extra content after root element' };
+      }
+      if (isSelfClosing) {
+        // Self-closing: complete element, mark rootFound if at root level.
+        if (stack.length === 0) rootFound = true;
+      } else {
+        stack.push(tagName);
+      }
+    }
+  }
+
+  if (stack.length > 0) {
+    return { wellFormed: false, error: 'error on line 1: unclosed tag <' + stack[stack.length - 1] + '>' };
+  }
+
+  return { wellFormed: true };
+};
+
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
 // then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
@@ -5469,11 +5524,22 @@ globalThis.DOMParser = class DOMParser {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
-    // innerHTML parses children via html5ever fragment-parsing rules. Most
-    // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-    // fragment parser strips the outer `<html>` and emits its head+body
-    // children, which is what callers want.
-    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+
+    // For XML mime types, check well-formedness first (conservative: only
+    // clear errors like tag mismatch / extra root are flagged).  If the
+    // check fires, build a <parsererror> root so callers doing
+    // doc.querySelector('parsererror') get the same signal as in Chrome.
+    const xmlError = isXml ? _checkXmlWellFormed(html) : null;
+    const isParserError = xmlError && !xmlError.wellFormed;
+    if (isParserError) {
+      root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
+    } else {
+      // innerHTML parses children via html5ever fragment-parsing rules. Most
+      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
+      // fragment parser strips the outer `<html>` and emits its head+body
+      // children, which is what callers want.
+      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+    }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -5494,7 +5560,12 @@ globalThis.DOMParser = class DOMParser {
       nodeName: "#document",
       nodeType: 9,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
-      get documentElement() { return root; },
+      get documentElement() {
+        // For XML parsererror docs, return the <parsererror> child, not the
+        // <html> wrapper — matches Chrome's behavior.
+        if (isParserError) return root.firstElementChild;
+        return root;
+      },
       get body() { return findByTagName("BODY"); },
       get head() { return findByTagName("HEAD"); },
       get title() {
@@ -5520,7 +5591,11 @@ globalThis.DOMParser = class DOMParser {
       get ownerDocument() { return null; },
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
-      querySelector(s) { return root.querySelector(s); },
+      querySelector(s) {
+        // For XML parsererror docs, check the root element as well —
+        // the <parsererror> is the documentElement, not a descendant.
+        return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
+      },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
