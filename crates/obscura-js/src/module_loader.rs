@@ -1,18 +1,17 @@
 use std::pin::Pin;
 
 use deno_core::error::ModuleLoaderError;
+use deno_core::ModuleLoadOptions;
+use deno_core::ModuleLoadReferrer;
 use deno_core::ModuleLoadResponse;
 use deno_core::ModuleLoader;
 use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
-use deno_core::RequestedModuleType;
+use deno_error::JsErrorBox;
 
 pub struct ObscuraModuleLoader {
     pub base_url: String,
-    /// Proxy URL threaded through to every dynamic ES-module fetch (#139).
-    /// `None` keeps the pre-#139 direct-connection behaviour for callers
-    /// that haven't been updated.
     pub proxy_url: Option<String>,
 }
 
@@ -30,7 +29,7 @@ impl ObscuraModuleLoader {
 }
 
 fn io_err(msg: String) -> ModuleLoaderError {
-    std::io::Error::new(std::io::ErrorKind::Other, msg).into()
+    JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
 impl ModuleLoader for ObscuraModuleLoader {
@@ -50,29 +49,19 @@ impl ModuleLoader for ObscuraModuleLoader {
             referrer
         };
 
-        deno_core::resolve_import(specifier, base).map_err(|e| e.into())
+        deno_core::resolve_import(specifier, base).map_err(JsErrorBox::from_err)
     }
 
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<&ModuleSpecifier>,
-        _is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        _maybe_referrer: Option<&ModuleLoadReferrer>,
+        _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
-        // Capture the loader's proxy here so the async closure below owns a
-        // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            // Reuse the process-wide cached client (same one op_fetch_url
-            // uses). Modern SPAs dynamic-import 20-50 chunks per page; the
-            // old code built a fresh reqwest::Client per import, each with
-            // its own empty connection pool, no reuse, fresh TLS init for
-            // every chunk. The cache means the first import on a given
-            // proxy pays the build cost once and every chunk after reuses
-            // the same warm pool.
             let client = crate::ops::cached_request_client(proxy_url.as_deref())
                 .map_err(io_err)?;
 
