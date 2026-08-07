@@ -14,6 +14,24 @@ use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+/// Hard cap on a page's V8 heap. Without an explicit limit V8 grows to its
+/// platform default (multiple GB) and, once that is exhausted, calls
+/// `FatalProcessOutOfMemory` → `abort()`, killing the whole embedding process
+/// and every other page with it. With the cap, the near-heap-limit callback
+/// installed in [`ObscuraJsRuntime::with_base_url_and_proxy`] terminates the
+/// offending script instead — an OOM page fails like a timed-out page does.
+const MAX_HEAP_BYTES: usize = 512 * 1024 * 1024;
+
+/// Headroom granted to V8 when the near-heap-limit callback fires, so the
+/// termination request can propagate and the stack unwind before the limit is
+/// hit again. Without the bump V8 re-enters the callback immediately and
+/// eventually aborts anyway. The original cap is restored once the OOM is
+/// observed (see `take_oom`).
+const OOM_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+
+/// Error returned to callers whose script was killed by the heap cap.
+const OOM_ERROR: &str = "JS heap out of memory: script terminated";
+
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
 /// thread already warms up V8 once before any connection thread starts (see the
@@ -45,6 +63,11 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Set by the near-heap-limit callback when it terminates a script that
+    /// exhausted [`MAX_HEAP_BYTES`]. Read-and-cleared by `take_oom` so error
+    /// paths can tell an OOM termination apart from a watchdog timeout (both
+    /// surface as V8's "execution terminated").
+    oom_fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
@@ -112,6 +135,30 @@ impl WatchdogToken {
     }
 }
 
+/// Install the near-heap-limit callback that turns V8's fatal OOM abort into
+/// a recoverable script termination: flag the OOM, terminate the running
+/// script, and grant temporary headroom so V8 can unwind instead of calling
+/// `FatalProcessOutOfMemory`. deno_core owns the closure and drops it with the
+/// isolate. `take_oom` re-installs the guard after restoring the heap cap,
+/// which is why this is a free function rather than constructor-inline code.
+fn install_heap_limit_guard(
+    runtime: &mut JsRuntime,
+    handle: &IsolateHandle,
+    oom_fired: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let handle = handle.clone();
+    let oom_fired = oom_fired.clone();
+    runtime.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        tracing::warn!(
+            "V8 near heap limit ({} MB): terminating script",
+            current_limit / (1024 * 1024)
+        );
+        oom_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.terminate_execution();
+        current_limit + OOM_HEADROOM_BYTES
+    });
+}
+
 impl ObscuraJsRuntime {
     pub fn new() -> Self {
         Self::with_base_url("about:blank")
@@ -132,6 +179,7 @@ impl ObscuraJsRuntime {
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
+        let oom_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (runtime, isolate_handle) = {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
@@ -141,6 +189,9 @@ impl ObscuraJsRuntime {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
                 startup_snapshot: Some(SNAPSHOT),
+                create_params: Some(
+                    deno_core::v8::CreateParams::default().heap_limits(0, MAX_HEAP_BYTES),
+                ),
                 ..Default::default()
             });
 
@@ -154,6 +205,7 @@ impl ObscuraJsRuntime {
                 .expect("init should not fail");
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            install_heap_limit_guard(&mut runtime, &isolate_handle, &oom_fired);
             (runtime, isolate_handle)
         };
 
@@ -163,6 +215,7 @@ impl ObscuraJsRuntime {
             object_store: HashMap::new(),
             object_counter: 0,
             isolate_handle,
+            oom_fired,
         }
     }
 
@@ -295,10 +348,14 @@ impl ObscuraJsRuntime {
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         let wrapped = Self::wrap_expression(expression);
-        let result = self
-            .runtime
-            .execute_script("<eval>", wrapped)
-            .map_err(|e| format!("JS error: {}", e))?;
+        let result = match self.runtime.execute_script("<eval>", wrapped) {
+            Ok(v) => v,
+            Err(e) if self.take_oom() => {
+                tracing::warn!("eval killed by heap cap: {}", e);
+                return Err(OOM_ERROR.to_string());
+            }
+            Err(e) => return Err(format!("JS error: {}", e)),
+        };
         self.v8_to_json(result)
     }
 
@@ -364,10 +421,14 @@ impl ObscuraJsRuntime {
             )
         };
 
-        let result = self
-            .runtime
-            .execute_script("<eval-remote>", meta_code)
-            .map_err(|e| format!("JS error: {}", e))?;
+        let result = match self.runtime.execute_script("<eval-remote>", meta_code) {
+            Ok(v) => v,
+            Err(e) if self.take_oom() => {
+                tracing::warn!("eval killed by heap cap: {}", e);
+                return Err(OOM_ERROR.to_string());
+            }
+            Err(e) => return Err(format!("JS error: {}", e)),
+        };
 
         let meta_str = if await_promise {
             let __t0 = std::time::Instant::now();
@@ -380,6 +441,9 @@ impl ObscuraJsRuntime {
                     .unwrap_or(false),
                 5000,
             ).await;
+            if self.take_oom() {
+                return Err(OOM_ERROR.to_string());
+            }
             let __dt = __t0.elapsed();
             if __dt > std::time::Duration::from_secs(1) {
                 let preview: String = expression
@@ -484,6 +548,9 @@ impl ObscuraJsRuntime {
                     .unwrap_or(false),
                 5000,
             ).await;
+            if self.take_oom() {
+                return Err(OOM_ERROR.to_string());
+            }
             let __dt = __t0.elapsed();
             if __dt > std::time::Duration::from_secs(1) {
                 let preview: String = function_declaration
@@ -771,10 +838,14 @@ impl ObscuraJsRuntime {
     }
 
     pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {
-        self.runtime
-            .execute_script("<script>", source.to_string())
-            .map_err(|e| format!("JS error: {}", e))?;
-        Ok(())
+        match self.runtime.execute_script("<script>", source.to_string()) {
+            Ok(_) => Ok(()),
+            Err(e) if self.take_oom() => {
+                tracing::warn!("script killed by heap cap: {}", e);
+                Err(OOM_ERROR.to_string())
+            }
+            Err(e) => Err(format!("JS error: {}", e)),
+        }
     }
 
     pub fn execute_script_guarded(&mut self, _name: &str, source: &str) -> Result<(), String> {
@@ -791,10 +862,7 @@ impl ObscuraJsRuntime {
         timeout: std::time::Duration,
     ) -> Result<(), String> {
         if timeout.is_zero() {
-            self.runtime
-                .execute_script("<script>", source.to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
-            return Ok(());
+            return self.execute_script("<script>", source);
         }
 
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -839,6 +907,10 @@ impl ObscuraJsRuntime {
 
         match result {
             Ok(_) => Ok(()),
+            Err(e) if self.take_oom() => {
+                tracing::warn!("script killed by heap cap: {}", e);
+                Err(OOM_ERROR.to_string())
+            }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("Uncaught Error: execution terminated") {
@@ -853,10 +925,18 @@ impl ObscuraJsRuntime {
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
-        self.runtime
+        match self
+            .runtime
             .run_event_loop(deno_core::PollEventLoopOptions::default())
             .await
-            .map_err(|e| format!("Event loop error: {}", e))
+        {
+            Ok(()) => Ok(()),
+            Err(e) if self.take_oom() => {
+                tracing::warn!("event loop task killed by heap cap: {}", e);
+                Err(OOM_ERROR.to_string())
+            }
+            Err(e) => Err(format!("Event loop error: {}", e)),
+        }
     }
 
     /// Whether the serialized dynamic-script queue is still fetching or
@@ -906,6 +986,26 @@ impl ObscuraJsRuntime {
         self.runtime.v8_isolate().cancel_terminate_execution();
     }
 
+    /// If the last termination came from the heap-limit guard (not a
+    /// watchdog), clear the flag and V8's termination state, restore the
+    /// original heap cap (the guard bumped it for unwind headroom), and
+    /// return true. The isolate survives; only the offending script died.
+    /// Error paths call this BEFORE interpreting "execution terminated" as a
+    /// timeout, since both kinds of termination produce that same message.
+    fn take_oom(&mut self) -> bool {
+        if !self.oom_fired.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        self.runtime.v8_isolate().cancel_terminate_execution();
+        // Removing the callback with a non-zero limit restores the cap as the
+        // headroom bump is no longer needed; then re-arm for the next script.
+        self.runtime.remove_near_heap_limit_callback(MAX_HEAP_BYTES);
+        let handle = self.isolate_handle.clone();
+        let oom_fired = self.oom_fired.clone();
+        install_heap_limit_guard(&mut self.runtime, &handle, &oom_fired);
+        true
+    }
+
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
     /// idle (tokio timeout) and synchronous hangs (V8 watchdog). A microtask
     /// storm that pins the thread is terminated ~500ms past the budget; a
@@ -945,6 +1045,10 @@ impl ObscuraJsRuntime {
         match result {
             Ok(v) if !fired => self.v8_to_json(v),
             Ok(_) => Err("eval timed out".to_string()),
+            Err(e) if self.take_oom() => {
+                tracing::warn!("eval killed by heap cap: {}", e);
+                Err(OOM_ERROR.to_string())
+            }
             Err(e) => {
                 let msg = e.to_string();
                 if fired || msg.contains("execution terminated") {
@@ -994,6 +1098,15 @@ impl ObscuraJsRuntime {
                 tokio::time::Duration::from_millis(tick_ms),
                 self.runtime.run_event_loop(deno_core::PollEventLoopOptions::default()),
             ).await;
+            // The heap-limit guard killed a script: whatever would have set
+            // the done sentinel is dead, and with termination pending every
+            // further pump/check errors out instantly, so the loop would
+            // hot-spin until the deadline. Bail; the caller observes the OOM
+            // via take_oom. (Peek, don't consume — the flag must survive
+            // until an error path can report it.)
+            if self.oom_fired.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
             // worst case we miss the result by <50ms.
             if tick_ms < 50 { tick_ms = (tick_ms * 2).min(50); }
@@ -3847,6 +3960,30 @@ mod tests {
         assert_eq!(nan, serde_json::Value::Null);
         let inf = rt.evaluate("document.elementFromPoint(Infinity, 10)").unwrap();
         assert_eq!(inf, serde_json::Value::Null);
+    }
+
+    // A page whose scripts exhaust the V8 heap must fail like a timed-out
+    // page — pre-fix, V8's default OOM response was abort(), taking the whole
+    // embedding process (and every other page) down with it.
+    #[test]
+    fn heap_oom_kills_script_not_process() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // Each iteration retains ~8 MB, so the 512 MB cap is reached in a few
+        // dozen iterations, well before the packed-array path deoptimizes.
+        let err = rt
+            .execute_script(
+                "<oom>",
+                "globalThis.hog = []; for (;;) { hog.push(new Array(1024 * 1024).fill(0)); }",
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("heap out of memory"),
+            "expected OOM error, got: {err}"
+        );
+        // The isolate survived, cleared its termination state, and is usable.
+        rt.execute_script("<cleanup>", "globalThis.hog = null;").unwrap();
+        let v = rt.evaluate("1 + 1").unwrap();
+        assert_eq!(v.as_f64().unwrap() as i64, 2);
     }
 
     // Issue #139 — proxy_url must thread through to both the ES-module
