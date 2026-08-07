@@ -443,6 +443,14 @@ Obscura caps the page's script-execution phase so one slow or hung page cannot s
 OBSCURA_SCRIPT_DEADLINE_MS=60000 obscura serve --port 9222
 ```
 
+Modules that enhance an already-rendered page have a separate 3s per-module budget so one non-essential module cannot hold navigation open. Raise it for legitimate long-running modules such as a Vite HMR client:
+
+```bash
+OBSCURA_MODULE_BUDGET_MS=10000 obscura serve --port 9222
+```
+
+An unmounted SPA shell already gives its app modules the full `OBSCURA_SCRIPT_DEADLINE_MS` budget. `OBSCURA_FETCH_TIMEOUT_MS` controls the module's network request, not its evaluation time. See [Environment variables](docs/Environment-variables.md) for the complete timeout model.
+
 ### `obscura serve`
 
 Start a CDP WebSocket server.
