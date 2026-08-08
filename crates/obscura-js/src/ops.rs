@@ -2765,6 +2765,40 @@ mod tests {
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
+    use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
+    // caps, a huge iteration count pins the single-threaded runtime and a huge
+    // output length forces an unbounded allocation. The derivation must reject
+    // both above the fixed maximums, and still work for ordinary inputs.
+
+    #[test]
+    fn pbkdf2_rejects_excessive_iterations() {
+        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", PBKDF2_MAX_ITERATIONS + 1, 32)
+            .expect_err("iteration count above the cap must be rejected");
+        assert!(
+            err.to_string().contains("iteration"),
+            "error should name the iteration cap: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_rejects_excessive_output_length() {
+        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", 1_000, PBKDF2_MAX_OUTPUT_BYTES + 1)
+            .expect_err("output length above the cap must be rejected");
+        assert!(
+            err.to_string().contains("length"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_derives_within_limits() {
+        let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
+            .expect("ordinary parameters must derive successfully");
+        assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
         assert!(glob_match(
@@ -3527,16 +3561,34 @@ fn op_subtle_aes_ctr(
     Ok(buf)
 }
 
-/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
-#[op2]
-#[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+/// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
+/// page JS drives this op on the single-threaded runtime: an unbounded
+/// iteration count pins the V8 isolate (blocking every other CDP command on the
+/// connection) and a huge output length forces an unbounded `vec![0u8; length]`
+/// allocation. Both caps sit far above any legitimate use — OWASP recommends
+/// ~600k iterations and derived keys are tens of bytes.
+const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
+const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+
+/// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
+/// are unit-testable without the `#[op2]` wrapper.
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if iterations > PBKDF2_MAX_ITERATIONS {
+        return Err(crypto_err(format!(
+            "PBKDF2 iteration count {iterations} exceeds the supported maximum of {PBKDF2_MAX_ITERATIONS}"
+        )));
+    }
+    if length > PBKDF2_MAX_OUTPUT_BYTES {
+        return Err(crypto_err(format!(
+            "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
+        )));
+    }
     use pbkdf2::pbkdf2_hmac;
     let mut dk = vec![0u8; length as usize];
     match hash {
@@ -3547,6 +3599,19 @@ fn op_subtle_pbkdf2(
         _ => return Err(crypto_err("unsupported PBKDF2 hash")),
     }
     Ok(dk)
+}
+
+/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+#[op2]
+#[buffer]
+fn op_subtle_pbkdf2(
+    #[string] hash: &str,
+    #[buffer] password: &[u8],
+    #[buffer] salt: &[u8],
+    iterations: u32,
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    pbkdf2_derive(hash, password, salt, iterations, length)
 }
 
 /// HKDF key derivation. `length` is the output length in bytes. An empty salt
