@@ -262,6 +262,14 @@ pub async fn handle(
             // builds real File objects and fires input+change like a real
             // selection so page code can read/upload them.
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            // setFileInputFiles reads local files and hands their bytes to page
+            // JS. Anyone who can reach the CDP port (default localhost, but
+            // Docker images bind 0.0.0.0) could otherwise read any file the
+            // process can read — the same threat as Page.navigate to file://, so
+            // it honours the same opt-in and is off by default.
+            if !page.context.allow_file_access {
+                return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
+            }
             let node_id = resolve_node_id(page, params)?;
             let paths: Vec<String> = params
                 .get("files")
@@ -687,6 +695,49 @@ mod tests {
         assert!(
             levels < depth,
             "nesting must be bounded below the tree's true depth, got {levels}"
+        );
+    }
+
+    /// SEC-003 / #579 — DOM.setFileInputFiles reads local files and hands
+    /// their bytes to page JS. Without a gate, any CDP client (e.g. against a
+    /// Docker image that binds the port to 0.0.0.0) gets an arbitrary
+    /// file-read primitive. It must honour the same `allow_file_access` opt-in
+    /// as Page.navigate to `file://`, which defaults to off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_file_input_files_refuses_without_allow_file_access() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<input type=file id=f>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let qs = handle("querySelector", &json!({ "selector": "input" }), &mut ctx, &session)
+            .await
+            .expect("querySelector should succeed");
+        let nid = qs["nodeId"].as_u64().expect("input nodeId");
+
+        // A real, readable file. Without the gate the handler slurps it and
+        // returns Ok; with the gate it must refuse before touching the disk.
+        let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        let err = handle(
+            "setFileInputFiles",
+            &json!({ "nodeId": nid, "files": [existing] }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("setFileInputFiles must be gated behind --allow-file-access");
+        assert!(
+            err.contains("allow-file-access"),
+            "error must point at the allow-file-access flag: {err}"
         );
     }
 }
