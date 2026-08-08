@@ -976,6 +976,13 @@ impl DomTree {
             .and_then(|n| n.first_child);
         while let Some(child_id) = current {
             result.push(child_id);
+            // Defense in depth: a valid sibling chain is at most nodes.len()
+            // long. Exceeding that means next_sibling forms a cycle (which the
+            // append_child / insert_before guards prevent); stop rather than
+            // loop forever. On a valid tree this bound is never reached.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
             current = inner.nodes.get(child_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.next_sibling);
@@ -1287,6 +1294,12 @@ impl DomTree {
             .and_then(|n| n.parent);
         while let Some(parent_id) = current {
             result.push(parent_id);
+            // Defense in depth: a valid parent chain is at most nodes.len()
+            // long. Exceeding that means parent forms a cycle (which the
+            // reparenting guards prevent); stop rather than loop forever.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
             current = inner.nodes.get(parent_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.parent);
@@ -2242,5 +2255,76 @@ mod tests {
         dest.import_children_from(dest_doc, &source, source.document());
 
         assert!(dest.len() >= 100_000);
+    }
+
+    /// SEC-008 / #582 — children() must terminate on a corrupted cyclic sibling
+    /// chain, the same way descendants() already does. The public mutation API
+    /// cannot create such a cycle, so we forge one by writing the node arena
+    /// directly, then assert the walk stays bounded instead of hanging forever.
+    #[test]
+    fn children_walk_is_bounded_on_corrupted_sibling_cycle() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk("root");
+        let a = mk("a");
+        let b = mk("b");
+        tree.append_child(doc, root);
+        tree.append_child(root, a);
+        tree.append_child(root, b);
+
+        // Forge a sibling cycle a -> a that append_child never produces.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.nodes[a.index()].as_mut().unwrap().next_sibling = Some(a);
+        }
+
+        let node_count = tree.inner.borrow().nodes.len();
+        let kids = tree.children(root);
+        assert!(
+            kids.len() <= node_count + 1,
+            "children() must stay bounded on a cyclic sibling chain, got {}",
+            kids.len()
+        );
+    }
+
+    /// SEC-008 / #582 — ancestors() companion to the children() cycle test.
+    #[test]
+    fn ancestors_walk_is_bounded_on_corrupted_parent_cycle() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk("root");
+        let child = mk("child");
+        tree.append_child(doc, root);
+        tree.append_child(root, child);
+
+        // Forge a parent cycle child -> child.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.nodes[child.index()].as_mut().unwrap().parent = Some(child);
+        }
+
+        let node_count = tree.inner.borrow().nodes.len();
+        let ancestors = tree.ancestors(child);
+        assert!(
+            ancestors.len() <= node_count + 1,
+            "ancestors() must stay bounded on a cyclic parent chain, got {}",
+            ancestors.len()
+        );
     }
 }
