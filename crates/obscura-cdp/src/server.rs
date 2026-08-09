@@ -842,9 +842,19 @@ async fn cdp_processor(
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
+                // Issue #543: a browser-level client that connects and immediately
+                // calls Target.getTargets must see the existing page targets (the
+                // CDP spec makes targets globally visible). Without this, a fresh
+                // connection's CdpContext has an empty `pages` registry and
+                // getTargets returns [], which breaks puppeteer/playwright-style
+                // clients before they can call Target.createTarget/attachToTarget.
+                // Mirror the interception path below, which already creates a
+                // page + session per new connection.
+                let pid = ctx.create_page();
+                let sid = format!("{pid}-session");
+                ctx.sessions.insert(sid.clone(), pid.clone());
                 let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
+                    json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string(),
                 );
             }
             ServerMessage::Cdp(cdp_msg) => {
@@ -1726,6 +1736,76 @@ mod tests {
                     .unwrap();
                     if value["id"] == 3 {
                         assert_eq!(value["result"]["result"]["value"], "yes");
+                        break;
+                    }
+                }
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    // Issue #543: a browser-level client that connects and immediately calls
+    // Target.getTargets must see the existing page targets. A fresh connection
+    // used to start with an empty pages registry (pages only appeared after a
+    // session-scoped event like Target.createTarget), so getTargets returned
+    // [] and puppeteer/playwright-style clients broke before driving any page.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_connection_sees_page_targets_in_get_targets() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init = reply_rx.recv().await.expect("processor init");
+                assert!(init.contains("__init"));
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({"id": 1, "method": "Target.getTargets", "params": {}}));
+
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("getTargets response timeout")
+                        .expect("getTargets response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        let targets = value["result"]["targetInfos"]
+                            .as_array()
+                            .expect("targetInfos must be an array");
+                        assert!(
+                            !targets.is_empty(),
+                            "getTargets must list the connection's page target"
+                        );
+                        assert_eq!(targets[0]["type"], "page");
                         break;
                     }
                 }
