@@ -34,6 +34,7 @@ class ObscuraCore {
 
   documentElementHtml() {
     this.#assertOpen();
+    if (this.source.includes("data-document-error")) throw new RangeError("document serializer failed");
     return this.source.replace(/^\s*<!doctype[^>]*>\s*/i, "");
   }
 

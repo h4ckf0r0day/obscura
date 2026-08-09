@@ -25,6 +25,92 @@ const QUERY_TEXT_NAMES = ["query_text", "queryText"];
 const QUERY_HTML_NAMES = ["query_html", "queryHtml"];
 const DOCUMENT_ELEMENT_HTML_NAMES = ["document_element_html", "documentElementHtml"];
 const MAX_VM_TIMEOUT_MS = 4_294_967_295;
+const QUERY_BINDING = "__obscuraHostQueryElement__";
+const DOCUMENT_HTML_BINDING = "__obscuraHostDocumentHtml__";
+const installDocumentFacadeScript = new vm.Script(
+  `(() => {
+    "use strict";
+    const hostQueryElement = globalThis.${QUERY_BINDING};
+    const hostDocumentHtml = globalThis.${DOCUMENT_HTML_BINDING};
+    const safeApply = Reflect.apply;
+    const ContextError = Error;
+    const ContextTypeError = TypeError;
+    const ContextRangeError = RangeError;
+    const ContextSyntaxError = SyntaxError;
+    const ContextReferenceError = ReferenceError;
+    const ContextEvalError = EvalError;
+    const ContextURIError = URIError;
+
+    const translatedError = (record) => {
+      const name = typeof record?.name === "string" ? record.name : "Error";
+      const message = typeof record?.message === "string" ? record.message : "Obscura bridge operation failed";
+      const ErrorConstructor =
+        name === "TypeError" ? ContextTypeError :
+        name === "RangeError" ? ContextRangeError :
+        name === "SyntaxError" ? ContextSyntaxError :
+        name === "ReferenceError" ? ContextReferenceError :
+        name === "EvalError" ? ContextEvalError :
+        name === "URIError" ? ContextURIError : ContextError;
+      const error = new ErrorConstructor(message);
+      if (ErrorConstructor === ContextError && name !== "Error") error.name = name;
+      return error;
+    };
+
+    const callHost = (callback, args) => {
+      let response;
+      try {
+        response = safeApply(callback, undefined, args);
+      } catch {
+        throw new ContextError("Obscura bridge callback failed");
+      }
+      if (response === null || typeof response !== "object") {
+        throw new ContextTypeError("Obscura bridge callback returned an invalid response");
+      }
+      if (response.ok === true) return response.value;
+      if (response.ok === false) throw translatedError(response.error);
+      throw new ContextTypeError("Obscura bridge callback returned an invalid response");
+    };
+
+    const querySelector = function querySelector(selector) {
+      return callHost(hostQueryElement, [selector]);
+    };
+    Object.freeze(querySelector);
+
+    const getDocumentOuterHtml = function getDocumentOuterHtml() {
+      return callHost(hostDocumentHtml, []);
+    };
+    Object.freeze(getDocumentOuterHtml);
+
+    const documentElement = Object.create(null);
+    Object.defineProperty(documentElement, "outerHTML", {
+      enumerable: true,
+      get: getDocumentOuterHtml,
+    });
+    Object.freeze(documentElement);
+
+    const document = Object.create(null);
+    Object.defineProperties(document, {
+      querySelector: {
+        enumerable: true,
+        value: querySelector,
+        writable: false,
+      },
+      documentElement: {
+        enumerable: true,
+        value: documentElement,
+        writable: false,
+      },
+    });
+    Object.freeze(document);
+    Object.defineProperty(globalThis, "document", {
+      enumerable: true,
+      value: document,
+      writable: false,
+      configurable: false,
+    });
+  })()`,
+  { filename: "obscura-document-facade.js" },
+);
 
 let target;
 let metadata;
@@ -259,37 +345,70 @@ function documentOuterHtml() {
   return value;
 }
 
+function bridgeErrorRecord(error) {
+  let name = "Error";
+  let message = "Obscura bridge operation failed";
+  try {
+    if (typeof error?.name === "string") name = error.name;
+  } catch {
+    // Keep the context-independent fallback.
+  }
+  try {
+    if (typeof error?.message === "string") message = error.message;
+    else if (error != null) message = String(error);
+  } catch {
+    // Keep the context-independent fallback.
+  }
+  const record = Object.create(null);
+  Object.defineProperties(record, {
+    name: { enumerable: true, value: name },
+    message: { enumerable: true, value: message },
+  });
+  return Object.freeze(record);
+}
+
+function bridgeResponse(generation, call) {
+  const response = Object.create(null);
+  try {
+    if (!bridgeCore || generation !== bridgeGeneration) {
+      throw new Error("Stale Obscura document bridge");
+    }
+    Object.defineProperties(response, {
+      ok: { enumerable: true, value: true },
+      value: { enumerable: true, value: call() },
+    });
+  } catch (error) {
+    Object.defineProperties(response, {
+      ok: { enumerable: true, value: false },
+      error: { enumerable: true, value: bridgeErrorRecord(error) },
+    });
+  }
+  return Object.freeze(response);
+}
+
 function installDocumentFacade() {
   const context = getHostContext();
   if (Object.hasOwn(context, "document")) return;
-
-  const documentElement = Object.create(null);
-  Object.defineProperty(documentElement, "outerHTML", {
-    enumerable: true,
-    get: documentOuterHtml,
-  });
-  Object.freeze(documentElement);
-
-  const document = Object.create(null);
-  Object.defineProperties(document, {
-    querySelector: {
-      enumerable: true,
-      value: queryElement,
-      writable: false,
+  const generation = bridgeGeneration;
+  Object.defineProperties(context, {
+    [QUERY_BINDING]: {
+      value: (selector) => bridgeResponse(generation, () => queryElement(selector)),
+      configurable: true,
     },
-    documentElement: {
-      enumerable: true,
-      value: documentElement,
-      writable: false,
+    [DOCUMENT_HTML_BINDING]: {
+      value: () => bridgeResponse(generation, documentOuterHtml),
+      configurable: true,
     },
   });
-  Object.freeze(document);
-  Object.defineProperty(context, "document", {
-    enumerable: true,
-    value: document,
-    writable: false,
-    configurable: false,
-  });
+  try {
+    installDocumentFacadeScript.runInContext(context, { timeout: 1_000 });
+  } catch (error) {
+    hostContext = null;
+    throw error;
+  } finally {
+    Reflect.deleteProperty(context, QUERY_BINDING);
+    Reflect.deleteProperty(context, DOCUMENT_HTML_BINDING);
+  }
 }
 
 async function disposeBridgeCore() {

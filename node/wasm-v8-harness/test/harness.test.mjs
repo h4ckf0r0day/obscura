@@ -165,6 +165,108 @@ test("serializes concurrent bridge replacements in request order", async () => {
   }
 });
 
+test("document facade callbacks cannot expose the Worker realm", async () => {
+  const worker = await WasmV8Worker.launch(mockObscuraCore);
+  try {
+    const html = "<html><body><h1>isolated</h1></body></html>";
+    assert.deepEqual(
+      await worker.bridgeEvaluate(
+        `(() => {
+          const globalTypes = (FunctionConstructor) => FunctionConstructor(
+            "return [typeof process, typeof require, typeof Buffer, typeof global]"
+          )();
+          const element = document.querySelector("h1");
+          const queryDescriptor = Object.getOwnPropertyDescriptor(document, "querySelector");
+          const htmlDescriptor = Object.getOwnPropertyDescriptor(document.documentElement, "outerHTML");
+          return {
+            ordinary: [typeof process, typeof require, typeof Buffer, typeof global],
+            queryCallback: globalTypes(document.querySelector.constructor),
+            callbackPrototype: globalTypes(Object.getPrototypeOf(document.querySelector).constructor),
+            queryDescriptor: globalTypes(queryDescriptor.value.constructor),
+            getterCallback: globalTypes(htmlDescriptor.get.constructor),
+            descriptorObject: globalTypes(queryDescriptor.constructor.constructor),
+            returnedString: globalTypes(element.outerHTML.constructor.constructor),
+            nullPrototypeElement: Object.getPrototypeOf(element) === null,
+            noElementConstructor: typeof element.constructor,
+            frozenCallback: Object.isFrozen(document.querySelector),
+            temporaryBindings: [
+              typeof globalThis.__obscuraHostQueryElement__,
+              typeof globalThis.__obscuraHostDocumentHtml__,
+            ],
+          };
+        })()`,
+        { html },
+      ),
+      {
+        ordinary: ["undefined", "undefined", "undefined", "undefined"],
+        queryCallback: ["undefined", "undefined", "undefined", "undefined"],
+        callbackPrototype: ["undefined", "undefined", "undefined", "undefined"],
+        queryDescriptor: ["undefined", "undefined", "undefined", "undefined"],
+        getterCallback: ["undefined", "undefined", "undefined", "undefined"],
+        descriptorObject: ["undefined", "undefined", "undefined", "undefined"],
+        returnedString: ["undefined", "undefined", "undefined", "undefined"],
+        nullPrototypeElement: true,
+        noElementConstructor: "undefined",
+        frozenCallback: true,
+        temporaryBindings: ["undefined", "undefined"],
+      },
+    );
+
+    assert.deepEqual(
+      await worker.bridgeEvaluate(`(() => {
+        try {
+          document.querySelector("async-result");
+          return null;
+        } catch (error) {
+          return [
+            error instanceof TypeError,
+            error.constructor === TypeError,
+            Object.getPrototypeOf(error) === TypeError.prototype,
+            error.constructor.constructor(
+              "return [typeof process, typeof require, typeof Buffer, typeof global]"
+            )(),
+            error.message.constructor.constructor(
+              "return [typeof process, typeof require, typeof Buffer, typeof global]"
+            )(),
+            error.message,
+          ];
+        }
+      })()`),
+      [
+        true,
+        true,
+        true,
+        ["undefined", "undefined", "undefined", "undefined"],
+        ["undefined", "undefined", "undefined", "undefined"],
+        "query_html returned a Promise; this operation requires a synchronous result",
+      ],
+    );
+
+    assert.deepEqual(
+      await worker.bridgeEvaluate(
+        `(() => {
+          try {
+            return document.documentElement.outerHTML;
+          } catch (error) {
+            return [
+              error instanceof RangeError,
+              error.constructor === RangeError,
+              error.constructor.constructor(
+                "return [typeof process, typeof require, typeof Buffer, typeof global]"
+              )(),
+              error.message,
+            ];
+          }
+        })()`,
+        { html: "<html data-document-error><body></body></html>" },
+      ),
+      [true, true, ["undefined", "undefined", "undefined", "undefined"], "document serializer failed"],
+    );
+  } finally {
+    await worker.close();
+  }
+});
+
 test("rejects asynchronous host results instead of escaping the VM deadline", async () => {
   const worker = await WasmV8Worker.launch(mockModule);
   try {
