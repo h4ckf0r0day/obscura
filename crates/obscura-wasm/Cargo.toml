@@ -1,0 +1,15 @@
+[package]
+name = "obscura-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable Obscura core for JavaScript-hosted WebAssembly runtimes."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+obscura-dom = { workspace = true }
+wasm-bindgen = "0.2"

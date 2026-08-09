@@ -48,5 +48,14 @@ ctr = "0.9"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
-getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native builds use the operating-system backend.
+getrandom = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# JS-hosted WASM obtains CSPRNG bytes from the host Web Crypto implementation.
+# This only removes the randomness blocker; deno_core/V8 and native networking
+# still prevent the complete obscura-js crate from targeting wasm32.
+getrandom = { version = "0.2", features = ["js"] }

@@ -1,0 +1,20 @@
+{
+  "name": "@obscura/wasm-v8-harness",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "description": "Feasibility harness for running an Obscura WASM core with Node's V8 in a persistent Worker",
+  "exports": "./src/client.mjs",
+  "bin": {
+    "obscura-wasm-v8-harness": "./bin/run.mjs"
+  },
+  "scripts": {
+    "smoke": "node ./bin/run.mjs --mode smoke",
+    "stress": "node ./bin/run.mjs --mode stress",
+    "test": "node --test ./test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0"
+}

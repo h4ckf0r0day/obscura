@@ -9,6 +9,8 @@ members = [
     "crates/obscura-mcp",
     "crates/obscura-render",
     "crates/obscura-cli",
+    "crates/obscura-node",
+    "crates/obscura-wasm",
     "crates/obscura",
 ]
 
