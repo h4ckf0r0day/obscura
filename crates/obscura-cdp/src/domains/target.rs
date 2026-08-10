@@ -45,18 +45,29 @@ pub async fn handle(
             Ok(json!({}))
         }
         "getTargets" => {
+            // Refresh this connection's own pages first: the shared registry
+            // is a mirror, and the live Page objects are the freshest source
+            // for url/title after any navigation (issue #544).
+            ctx.sync_registry();
             let targets: Vec<Value> = ctx
-                .pages
-                .iter()
-                .map(|page| {
+                .registry
+                .all()
+                .into_iter()
+                .map(|target| {
+                    // attached means this caller can route a session to the
+                    // target (it owns the page and has a session for it).
+                    let attached = ctx
+                        .sessions
+                        .values()
+                        .any(|page_id| *page_id == target.target_id);
                     json!({
-                        "targetId": page.id,
+                        "targetId": target.target_id,
                         "type": "page",
-                        "title": page.title,
-                        "url": page.url_string(),
-                        "attached": true,
+                        "title": target.title,
+                        "url": target.url,
+                        "attached": attached,
                         "canAccessOpener": false,
-                        "browserContextId": page.context.id,
+                        "browserContextId": target.browser_context_id,
                     })
                 })
                 .collect();
@@ -95,6 +106,9 @@ pub async fn handle(
                     let _ = page.navigate(url).await;
                 }
             }
+            // createTarget may have navigated the page: refresh its global
+            // target entry so getTargets and /json/list report the real url.
+            ctx.sync_registry();
 
             ctx.sessions.insert(session_id.clone(), page_id.clone());
 
@@ -168,37 +182,62 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            if ctx.get_page(target_id).is_none() {
-                return Err("Target not found".to_string());
-            }
+            // Issue #544 makes targets globally visible: Target.getTargets
+            // lists every live page in the process, so attachToTarget must
+            // accept any target the caller can see, not only pages this
+            // connection owns. A page created by another connection used to
+            // be listed but rejected here with "Target not found" (Hermes
+            // repro). Resolve through the shared registry; the session stays
+            // per-connection (sessions are connection-local), only the lookup
+            // is global.
+            ctx.sync_registry();
+            let registry_target = ctx
+                .registry
+                .all()
+                .into_iter()
+                .find(|t| t.target_id == target_id)
+                .ok_or_else(|| "Target not found".to_string())?;
             let session_id = ctx.next_target_session(target_id);
             ctx.sessions
                 .insert(session_id.clone(), target_id.to_string());
 
-            if let Some(page) = ctx.get_page(target_id) {
-                let params = json!({
-                    "sessionId": session_id,
-                    "targetInfo": {
-                        "targetId": target_id,
-                        "type": "page",
-                        "title": page.title,
-                        "url": page.url_string(),
-                        "attached": true,
-                        "canAccessOpener": false,
-                        "browserContextId": page.context.id,
-                    },
-                    "waitingForDebugger": false,
-                });
-                let event = match parent_session_id {
-                    Some(parent_session_id) => CdpEvent::with_session(
-                        "Target.attachedToTarget",
-                        params,
-                        parent_session_id.clone(),
-                    ),
-                    None => CdpEvent::new("Target.attachedToTarget", params),
-                };
-                ctx.pending_events.push(event);
-            }
+            // Prefer the live Page when this connection owns it (freshest
+            // url/title); for a remote target fall back to the registry
+            // mirror, which the owning connection keeps current.
+            let (title, url, browser_context_id) = match ctx.get_page(target_id) {
+                Some(page) => (
+                    page.title.clone(),
+                    page.url_string(),
+                    page.context.id.clone(),
+                ),
+                None => (
+                    registry_target.title,
+                    registry_target.url,
+                    registry_target.browser_context_id,
+                ),
+            };
+            let params = json!({
+                "sessionId": session_id,
+                "targetInfo": {
+                    "targetId": target_id,
+                    "type": "page",
+                    "title": title,
+                    "url": url,
+                    "attached": true,
+                    "canAccessOpener": false,
+                    "browserContextId": browser_context_id,
+                },
+                "waitingForDebugger": false,
+            });
+            let event = match parent_session_id {
+                Some(parent_session_id) => CdpEvent::with_session(
+                    "Target.attachedToTarget",
+                    params,
+                    parent_session_id.clone(),
+                ),
+                None => CdpEvent::new("Target.attachedToTarget", params),
+            };
+            ctx.pending_events.push(event);
 
             Ok(json!({ "sessionId": session_id }))
         }
@@ -207,6 +246,27 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
+            // Like attachToTarget, closeTarget is browser-global in Chrome:
+            // any connection may close any target listed by getTargets,
+            // owned by this connection or not. Resolve through the shared
+            // registry first so unknown targets surface a protocol error
+            // instead of emitting destroy events for phantom pages. The
+            // registry removal happens in `remove_page`, which already
+            // removes the global entry regardless of ownership. Known
+            // limitation: a remote-owned page's live `Page` lives on its
+            // owner's thread (thread-per-connection #430), so it cannot be
+            // torn down from here; if the owner later syncs the registry
+            // (getTargets, navigation) the entry returns. Fully closing a
+            // remote page needs registry tombstones or cross-connection
+            // teardown, both out of scope for this fix.
+            if !ctx
+                .registry
+                .all()
+                .iter()
+                .any(|t| t.target_id == target_id)
+            {
+                return Err("Target not found".to_string());
+            }
             let session_id = format!("{}-session", target_id);
 
             ctx.pending_events.push(CdpEvent::new(
@@ -362,6 +422,232 @@ mod tests {
         assert!(ctx.get_page(&isolated_page).is_none());
         assert!(ctx.get_page(&default_page).is_some());
         assert!(ctx.browser_contexts.is_empty());
+    }
+
+    /// Issue #544: targets are globally visible. A page created (and
+    /// navigated) by one connection must show up in another connection's
+    /// Target.getTargets with its current url, and a freshly created page
+    /// must not stay shadowed by a stale about:blank entry.
+    #[tokio::test]
+    async fn get_targets_lists_pages_from_other_connections() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut observer = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry,
+        );
+
+        let page_id = owner.create_page();
+        // createTarget wires a managed session for the new page; mirror that
+        // here so the owner connection lists the page as attached.
+        let session_id = format!("{page_id}-session");
+        owner.sessions.insert(session_id, page_id.clone());
+        // Simulate a completed navigation without touching the network: the
+        // shared registry must pick up the new url/title on the next
+        // getTargets, not keep reporting the initial about:blank.
+        {
+            let page = owner.get_page_mut(&page_id).unwrap();
+            page.url = Some(url::Url::parse("https://example.com/").unwrap());
+            page.title = "Example".into();
+        }
+
+        // The owner connection lists the page as attached (it holds the
+        // session); the observer lists it as a remote, unattached target.
+        let owner_targets = handle("getTargets", &json!({}), &mut owner, &None)
+            .await
+            .unwrap();
+        assert_eq!(owner_targets["targetInfos"][0]["targetId"], page_id);
+        assert_eq!(owner_targets["targetInfos"][0]["attached"], true);
+        assert_eq!(
+            owner_targets["targetInfos"][0]["url"],
+            "https://example.com/",
+            "getTargets must report the navigated url, not about:blank"
+        );
+
+        let observer_targets = handle("getTargets", &json!({}), &mut observer, &None)
+            .await
+            .expect("observer getTargets should succeed");
+        assert_eq!(observer_targets["targetInfos"][0]["targetId"], page_id);
+        assert_eq!(
+            observer_targets["targetInfos"][0]["url"],
+            "https://example.com/",
+            "observer must see the navigated url, not a stale about:blank"
+        );
+        assert_eq!(observer_targets["targetInfos"][0]["attached"], false);
+        assert_eq!(
+            observer_targets["targetInfos"][0]["type"],
+            "page",
+            "every listed target must carry type page"
+        );
+    }
+
+    /// Issue #544: when the owning connection goes away its pages must leave
+    /// the shared registry, so they stop shadowing live targets elsewhere.
+    #[tokio::test]
+    async fn dropped_connection_unregisters_its_pages() {
+        let registry = crate::registry::TargetRegistry::default();
+        let page_id = {
+            let mut owner = CdpContext::new_with_shared_context_and_registry(
+                CdpContext::new().default_context.clone(),
+                registry.clone(),
+            );
+            let created = handle(
+                "createTarget",
+                &json!({"url": "about:blank"}),
+                &mut owner,
+                &None,
+            )
+            .await
+            .expect("createTarget should succeed");
+            created["targetId"].as_str().unwrap().to_string()
+        };
+        // `owner` dropped at end of block → its page must be gone globally.
+        assert!(
+            registry.all().is_empty(),
+            "dropped connection must unregister its pages, got: {:?}",
+            registry.all()
+        );
+        let _ = page_id;
+    }
+
+    /// Issue #544 follow-up: any target listed by getTargets must be
+    /// attachable. A page created (and owned) by connection A must accept
+    /// attachToTarget from a second connection with a fresh session id,
+    /// instead of the old per-connection "Target not found" (Hermes repro).
+    #[tokio::test]
+    async fn attach_to_target_accepts_targets_from_other_connections() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut observer = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry,
+        );
+
+        // Connection A creates a page via the real createTarget path, which
+        // also wires its managed session, mirroring the repro.
+        let created = handle(
+            "createTarget",
+            &json!({"url": "about:blank"}),
+            &mut owner,
+            &None,
+        )
+        .await
+        .expect("createTarget should succeed");
+        let page_id = created["targetId"].as_str().unwrap().to_string();
+
+        // Connection B sees the page globally…
+        let targets = handle("getTargets", &json!({}), &mut observer, &None)
+            .await
+            .expect("observer getTargets should succeed");
+        assert_eq!(targets["targetInfos"][0]["targetId"], page_id);
+
+        // …and must be able to attach to it, not fail with Target not found.
+        let attached = handle(
+            "attachToTarget",
+            &json!({"targetId": page_id, "flatten": true}),
+            &mut observer,
+            &None,
+        )
+        .await
+        .expect("attachToTarget must accept targets listed by getTargets");
+        let session_id = attached["sessionId"].as_str().unwrap();
+        assert!(!session_id.is_empty());
+        assert_eq!(
+            observer.sessions.get(session_id).map(String::as_str),
+            Some(page_id.as_str()),
+            "the attaching connection must hold its own session route"
+        );
+
+        // The attachedToTarget event carries the page metadata from the
+        // registry mirror, since the observer does not own the page.
+        let evt = observer
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.attachedToTarget")
+            .expect("attachedToTarget event must be emitted");
+        assert_eq!(evt.params["targetInfo"]["targetId"], page_id);
+        assert_eq!(evt.params["targetInfo"]["url"], "about:blank");
+        assert_eq!(evt.params["targetInfo"]["type"], "page");
+    }
+
+    /// A target that is not registered anywhere must still be rejected, so
+    /// attachToTarget does not hand out sessions for phantom ids.
+    #[tokio::test]
+    async fn attach_to_target_unknown_target_still_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "attachToTarget",
+            &json!({"targetId": "page-999"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("unknown targets must still error");
+        assert_eq!(err, "Target not found");
+    }
+
+    /// Issue #544 follow-up: closeTarget is browser-global in Chrome, so a
+    /// connection may close a page owned by another connection. The target
+    /// must leave the shared registry (its global entry), matching what any
+    /// other connection's getTargets would report.
+    #[tokio::test]
+    async fn close_target_removes_targets_owned_by_other_connections() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut observer = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+
+        let created = handle(
+            "createTarget",
+            &json!({"url": "about:blank"}),
+            &mut owner,
+            &None,
+        )
+        .await
+        .expect("createTarget should succeed");
+        let page_id = created["targetId"].as_str().unwrap().to_string();
+
+        // Connection B closes connection A's page: allowed, matching Chrome.
+        let closed = handle(
+            "closeTarget",
+            &json!({"targetId": page_id}),
+            &mut observer,
+            &None,
+        )
+        .await
+        .expect("closing another connection's target should succeed");
+        assert_eq!(closed["success"], true);
+        assert!(
+            !registry.all().iter().any(|t| t.target_id == page_id),
+            "closed target must leave the global registry"
+        );
+    }
+
+    /// Closing a target that was never registered must surface a protocol
+    /// error instead of acking and emitting destroy events for a phantom.
+    #[tokio::test]
+    async fn close_target_unknown_target_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "closeTarget",
+            &json!({"targetId": "page-999"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect_err("unknown targets must error");
+        assert_eq!(err, "Target not found");
     }
 
     #[tokio::test]
