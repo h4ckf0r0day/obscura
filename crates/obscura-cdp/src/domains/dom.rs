@@ -180,7 +180,7 @@ pub async fn handle(
                     if (globalThis._cache && globalThis._cache.has(nid)) {{\
                         node = globalThis._cache.get(nid);\
                     }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '');\
+                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
                         if (t === 1) node = new Element(nid);\
                         else if (t === 9) node = globalThis.document;\
                         else node = new Node(nid);\

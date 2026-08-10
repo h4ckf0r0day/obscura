@@ -590,6 +590,109 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// The origin of the document this runtime is running, or `"null"` for a
+    /// scheme that has no tuple origin.
+    pub(crate) fn page_origin(&self) -> String {
+        let url = self.state.borrow().url.clone();
+        match url::Url::parse(&url) {
+            Ok(parsed) if parsed.origin().is_tuple() => parsed.origin().ascii_serialization(),
+            _ => "null".to_string(),
+        }
+    }
+
+    /// Gives a same-origin frame realm the page's security token.
+    ///
+    /// V8 access-checks property reads across contexts and answers `undefined`
+    /// unless the two carry the same token, which is how a browser keeps one
+    /// origin out of another's window. Two contexts of one origin must share a
+    /// token, or the page reads its own frame's globals as undefined. Only
+    /// ever called after an origin comparison; a cross-origin frame keeps its
+    /// own token and stays opaque.
+    pub(crate) fn share_security_token_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let main = v8::Local::new(scope, main);
+        let realm = v8::Local::new(scope, realm);
+        let token = main.get_security_token(scope);
+        realm.set_security_token(token);
+    }
+
+    /// Publishes a frame realm's own `window` and `document` objects into the
+    /// page realm, under `__obscura_frameObjects[frameId]`.
+    ///
+    /// This is what the single isolate buys. Objects cannot cross isolates, so
+    /// a parent could only ever be handed a copy or a shim; within one isolate
+    /// it can hold the frame's real globals, which is what a browser gives it
+    /// for a same-origin frame. `contentWindow.someGlobal` is then a plain
+    /// property read of the frame's own object, and `contentDocument` is the
+    /// document the frame's scripts actually mutated.
+    pub(crate) fn publish_realm_objects(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+    ) -> bool {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        // Read the frame's globals first, then install them in the page realm.
+        // Both contexts belong to this isolate, so the handles stay valid
+        // across the switch.
+        let realm_context = v8::Local::new(scope, realm);
+        let (frame_window, frame_document) = {
+            let scope = &mut v8::ContextScope::new(scope, realm_context);
+            let global = realm_context.global(scope);
+            let Some(key) = v8::String::new(scope, "document") else {
+                return false;
+            };
+            let document = global.get(scope, key.into());
+            (
+                v8::Global::new(scope, global),
+                document.map(|value| v8::Global::new(scope, value)),
+            )
+        };
+
+        let main_context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, main_context);
+        let global = main_context.global(scope);
+        let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
+            return false;
+        };
+        let registry = match global
+            .get(scope, registry_key.into())
+            .and_then(|value| value.to_object(scope))
+        {
+            Some(registry) if !registry.is_null_or_undefined() => registry,
+            _ => {
+                let fresh = v8::Object::new(scope);
+                global.set(scope, registry_key.into(), fresh.into());
+                fresh
+            }
+        };
+
+        let entry = v8::Object::new(scope);
+        let window = v8::Local::new(scope, frame_window);
+        if let Some(key) = v8::String::new(scope, "window") {
+            entry.set(scope, key.into(), window.into());
+        }
+        if let (Some(key), Some(document)) = (
+            v8::String::new(scope, "document"),
+            frame_document.map(|document| v8::Local::new(scope, document)),
+        ) {
+            entry.set(scope, key.into(), document);
+        }
+        let index = v8::Integer::new_from_unsigned(scope, frame_id);
+        registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+    }
+
     /// The table ops consult to find the calling realm's document.
     pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
         self.runtime

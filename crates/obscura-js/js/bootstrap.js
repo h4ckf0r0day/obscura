@@ -16,7 +16,9 @@
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
-    '__obscura_frameId', '__obscura_parentFrameId',
+    '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
+    '__obscura_frameObjects', '__obscura_deliverMessage',
+    '__obscura_frameElements', '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
@@ -110,8 +112,15 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
 ]);
+// Which realm this bootstrap closure belongs to. Every wrapper's methods come
+// from its own realm's prototypes, so a DOM call names the document it belongs
+// to instead of letting the host guess from whoever is calling. That is what
+// makes `iframe.contentDocument.title` read the frame's document rather than
+// the caller's. Set by __obscura_init; 0 is the page.
+let _realmFrameId = 0;
+
 const _dom = (cmd, a1, a2) => {
-  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
     // Resize observation is tied to rendering-invalidating DOM work. The
@@ -3850,6 +3859,9 @@ class Element extends Node {
         // message coming back out arrive with this window as its `source`.
         el._iframeWin._frameId = el._frameId;
         globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
+        // Remember the element, so "is this frame still in the page?" can be
+        // asked of the element itself. See __obscura_liveFrameIds.
+        globalThis.__obscura_frameElements[el._frameId] = el;
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -3868,6 +3880,8 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    const real = _frameObjectsFor(this);
+    if (real?.document) return real.document;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
@@ -3884,6 +3898,10 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_frameObjectsFor(this)) {
+      const win = _frameWindowFor(this._frameId);
+      if (win) return win;
+    }
     if (!this._iframeWin) {
       if (this.parentNode === null) return null;
       this.contentDocument;
@@ -11630,6 +11648,38 @@ const _iframeWindowProxyHandler = {
 globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
 globalThis.__obscura_parentFrameId = 0;
 globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+// frame id -> that frame's real window and document, filled by the host.
+// Declared here rather than created by the host at runtime: the hide list is
+// computed from this global at snapshot time, so a property the host adds later
+// would stay enumerable on `window` and be visible to any script that walks it.
+globalThis.__obscura_frameObjects = Object.create(null);
+// frame id -> the iframe element that owns it. Holds the element until the
+// frame is forgotten, which is bounded by the host's live-frame cap.
+globalThis.__obscura_frameElements = Object.create(null);
+
+// The frames of this realm whose element is still in the document.
+//
+// Liveness is asked of the element, not of a document query: an iframe inside
+// a shadow root is absent from `document.querySelectorAll('iframe')` — the
+// shape a challenge widget uses — while `isConnected` reports it correctly.
+// Treating it as gone would tear down a frame that is still in the page.
+globalThis.__obscura_liveFrameIds = function () {
+  const live = [];
+  for (const id in globalThis.__obscura_frameElements) {
+    const element = globalThis.__obscura_frameElements[id];
+    if (element && element.isConnected) live.push(id >>> 0);
+  }
+  return live;
+};
+
+// Drop everything this realm holds for a frame the host has discarded. One
+// place, so a registry added later cannot be missed by the discard path: any
+// surviving reference keeps the frame's context and DOM tree alive.
+globalThis.__obscura_forgetFrame = function (frameId) {
+  delete globalThis.__obscura_frameElements[frameId];
+  delete globalThis.__obscura_frameObjects[frameId];
+  delete globalThis.__obscura_frameWindows[frameId];
+};
 
 function _realmOrigin() {
   try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
@@ -11650,6 +11700,54 @@ function _sendRealmMessage(targetFrameId, data) {
     targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
 }
 
+// The frame's own window and document, when this page is allowed to touch
+// them. Same isolate, so these are the frame's real objects rather than a copy:
+// `contentWindow.someGlobal` reads the frame's global and `contentDocument` is
+// the document the frame's own scripts mutated.
+//
+// A free function, not a getter on Element.prototype: every own property of a
+// public interface is visible to anything that walks it, and real Chrome has no
+// such member.
+function _frameObjectsFor(element) {
+  const frameId = element._frameId;
+  if (!frameId) return null;
+  const entry = globalThis.__obscura_frameObjects[frameId];
+  return entry || null;
+}
+
+// The window object this realm uses to stand for frame `frameId`, built once
+// and reused so `event.source === iframe.contentWindow` holds.
+//
+// Once the host has published the frame's real global, that is the object,
+// wrapped only to keep `postMessage` meaning "send *into* the frame from
+// here". Calling the frame's own postMessage would make the frame both sender
+// and receiver, losing the sender's origin and source.
+function _frameWindowFor(frameId) {
+  if (!frameId) return null;
+  const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
+  const existing = globalThis.__obscura_frameWindows[frameId];
+  if (!real) return existing || null;
+  if (existing && existing.__obscura_wrapsRealm) return existing;
+
+  const post = _markNative(function (data, _targetOrigin, _transfer) {
+    _sendRealmMessage(frameId, data);
+  });
+  const win = new Proxy(real, {
+    get(target, prop) {
+      if (prop === 'postMessage') return post;
+      if (prop === '__obscura_wrapsRealm') return true;
+      // Not `receiver`: an accessor on a real global must run with the global
+      // itself as `this`, not with this proxy.
+      return Reflect.get(target, prop);
+    },
+    has(target, prop) {
+      return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
+    },
+  });
+  globalThis.__obscura_frameWindows[frameId] = win;
+  return win;
+}
+
 // The host calls this inside the target realm.
 globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
   let data = null;
@@ -11658,7 +11756,7 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) 
   const source = (globalThis.__obscura_frameId !== 0
                   && sourceFrameId === globalThis.__obscura_parentFrameId)
     ? globalThis.parent
-    : (globalThis.__obscura_frameWindows[sourceFrameId] || null);
+    : _frameWindowFor(sourceFrameId);
   try {
     // Trusted, because the user agent delivers this event: the sender called
     // postMessage, it did not dispatch this. Real embedders check the flag and
@@ -14167,6 +14265,8 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 }
 
 globalThis.__obscura_init = function() {
+  // The host sets __obscura_frameId on a frame realm before calling this.
+  _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any

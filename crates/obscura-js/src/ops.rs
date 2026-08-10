@@ -459,16 +459,48 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 /// writes to the *parent's* DOM.
 #[derive(Default)]
 pub struct RealmStates {
-    entries: Vec<(v8::Global<v8::Context>, SharedState)>,
+    entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
 }
 
 impl RealmStates {
-    pub fn register(&mut self, context: v8::Global<v8::Context>, state: SharedState) {
-        self.entries.push((context, state));
+    pub fn register(
+        &mut self,
+        context: v8::Global<v8::Context>,
+        frame_id: u32,
+        state: SharedState,
+    ) {
+        self.entries.push((context, frame_id, state));
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
-        self.entries.retain(|(known, _)| known != context);
+        self.entries.retain(|(known, _, _)| known != context);
+    }
+
+    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+        self.entries
+            .iter()
+            .find(|(_, id, _)| *id == frame_id)
+            .map(|(_, _, state)| state.clone())
+    }
+}
+
+/// The document of the realm a DOM call came from, named rather than inferred.
+///
+/// A wrapper's methods live on its own realm's prototypes, so the code running
+/// for `parentPage.frameDoc.title` is the *frame's* getter even though the
+/// caller is the page. Inferring the realm from the running context therefore
+/// answers the wrong question for any cross-realm access, and would silently
+/// read the page's document. Each realm's bootstrap closure knows its own frame
+/// id and passes it, which is both correct here and cheaper than asking V8:
+/// a page with no frames resolves on `frame_id == 0` alone.
+pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    if frame_id == 0 {
+        return page();
+    }
+    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
+        None => page(),
     }
 }
 
@@ -494,8 +526,8 @@ pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedSta
     registry
         .entries
         .iter()
-        .find(|(context, _)| *context == current)
-        .map(|(_, state)| state.clone())
+        .find(|(context, _, _)| *context == current)
+        .map(|(_, _, state)| state.clone())
         .unwrap_or_else(page)
 }
 
@@ -1036,13 +1068,13 @@ fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
 #[op2]
 #[string]
 fn op_dom(
-    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] cmd: String,
     #[string] arg1: String,
     #[string] arg2: String,
+    frame_id: u32,
 ) -> String {
-    let shared = realm_state(scope, state);
+    let shared = frame_state(state, frame_id);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or

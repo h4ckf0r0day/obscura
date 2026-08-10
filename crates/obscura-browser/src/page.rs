@@ -298,6 +298,18 @@ const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 
+/// How many child frame realms one document may hold at once.
+///
+/// Real pages use a handful; the cap exists so a page that creates iframes in a
+/// loop cannot make the engine hold an unbounded number of contexts and DOM
+/// trees. Frames are released when the document is replaced.
+fn max_live_frames() -> usize {
+    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
@@ -973,6 +985,21 @@ impl Page {
         }
 
         for frame in pending {
+            // A realm is a live v8::Context plus a DOM tree, and the page realm
+            // holds its window and document, so nothing here can be collected
+            // while the document lives. Frames are released when the document
+            // is replaced, so a page that churns iframes would otherwise grow
+            // the process without bound. Refuse past the cap rather than let a
+            // page decide how much memory to take.
+            let cap = max_live_frames();
+            if self.frames.len() >= cap {
+                tracing::warn!(
+                    "refusing a realm for frame {}: already at the {} live frame cap",
+                    frame.url,
+                    cap,
+                );
+                continue;
+            }
             let realm = match self.js.as_mut().and_then(|js| {
                 FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
             }) {
@@ -1089,6 +1116,81 @@ impl Page {
         true
     }
 
+    /// Discards the realms whose iframe element has left the document.
+    ///
+    /// A browser discards a child browsing context when its element is
+    /// removed: the document and its context are torn down. Nothing here can
+    /// be collected on its own, because the page realm holds each frame's
+    /// window and document so that `contentWindow` can be the frame's real
+    /// object, so a page that replaces an iframe repeatedly would otherwise
+    /// accumulate contexts and DOM trees for the life of the document.
+    ///
+    /// A frame nested inside a discarded frame is reached on a later pass,
+    /// once its own parent is gone.
+    fn release_detached_frames(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        // Each realm reports its own frames whose element is still connected.
+        // Liveness is asked of the element rather than of a document query,
+        // because an iframe inside a shadow root is absent from
+        // `document.querySelectorAll('iframe')` — the shape a challenge widget
+        // uses — and treating it as detached tears down a live frame.
+        const LIVE_FRAME_IDS: &str = "__obscura_liveFrameIds()";
+
+        let mut live: Vec<u32> = Vec::new();
+        let Some(js) = self.js.as_mut() else { return };
+        match js.evaluate(LIVE_FRAME_IDS) {
+            Ok(value) => live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default()),
+            // A query that did not run says nothing about which frames are
+            // gone, and an empty answer here reads as "all of them". Holding
+            // them is bounded by the live-frame cap; discarding a live frame
+            // is not recoverable, so leave the tree alone.
+            Err(error) => {
+                tracing::debug!("could not list the page's live frames: {error}");
+                return;
+            }
+        }
+        // A frame's own children are in that frame's document, not the page's.
+        for index in 0..self.frames.len() {
+            let Some(js) = self.js.as_mut() else { return };
+            match self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
+                Ok(value) => {
+                    live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default())
+                }
+                Err(error) => {
+                    tracing::debug!("could not list a frame's live frames: {error}");
+                    return;
+                }
+            }
+        }
+
+        let discarded: Vec<u32> = self
+            .frames
+            .iter()
+            .map(|frame| frame.frame_id())
+            .filter(|id| !live.contains(id))
+            .collect();
+        if discarded.is_empty() {
+            return;
+        }
+
+        self.frames.retain(|frame| live.contains(&frame.frame_id()));
+        // Dropping the realm is not enough: the page realm still names the
+        // frame's window and document, which would keep the whole context
+        // reachable.
+        let script: String = discarded
+            .iter()
+            .map(|id| format!("__obscura_forgetFrame({id});"))
+            .collect();
+        if let Some(js) = self.js.as_mut() {
+            if let Err(error) = js.execute_script("<frame-detach>", &script) {
+                tracing::debug!("releasing detached frames failed: {error}");
+            }
+        }
+        tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
+    }
+
     /// Moves the frame tree forward by one step: give any fetched frame
     /// document a realm, then hand on any message waiting for a realm.
     ///
@@ -1098,6 +1200,7 @@ impl Page {
     async fn advance_frames(&mut self) -> bool {
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
+        self.release_detached_frames();
         attached || delivered
     }
 
@@ -4704,6 +4807,118 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the
+    /// same iframe straight in the document, and `/child.html` is the frame.
+    async fn spawn_shadow_frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.starts_with("GET /child.html ") {
+                        "<html><body><script>window.__ran = 'YES';</script></body></html>"
+                    } else if request.starts_with("GET /plain.html ") {
+                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    } else {
+                        "<html><body><div id=\"host\"></div><script>\
+                         var r = document.getElementById('host').attachShadow({mode:'closed'});\
+                         var f = document.createElement('iframe');\
+                         f.src = '/child.html';\
+                         r.appendChild(f);\
+                         </script></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    fn frame_page(name: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        super::Page::new(name.to_string(), context)
+    }
+
+    /// An iframe inside a shadow root is absent from
+    /// `document.querySelectorAll('iframe')` — real Chrome reports 0 for it too
+    /// — so a liveness check built on that query reads a live frame as detached
+    /// and tears it down. That is the shape a challenge widget uses, so the
+    /// frame it depends on would be discarded moments after it loaded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_inside_a_shadow_root_survives_the_detach_sweep() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("shadow-frame-survives");
+        page.navigate(&base).await.unwrap();
+        page.settle(1_000).await;
+
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "the shadow-root frame was discarded as detached: {:?}",
+            page.frame_urls()
+        );
+        // The realm is not merely alive; the page can still reach into it.
+        let published = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
+            .unwrap();
+        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+    }
+
+    /// The sweep still does its job: an iframe removed from the document has
+    /// its realm and every reference the page realm holds to it released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_an_iframe_releases_its_realm() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("detached-frame-released");
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        page.settle(1_000).await;
+        assert_eq!(page.frames.len(), 1, "no frame to remove");
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+
+        assert!(page.frames.is_empty(), "the detached realm was kept");
+        let left = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "Object.keys(globalThis.__obscura_frameObjects).length\
+                 + Object.keys(globalThis.__obscura_frameWindows).length\
+                 + Object.keys(globalThis.__obscura_frameElements).length",
+            )
+            .unwrap();
+        assert_eq!(
+            left.as_f64(),
+            Some(0.0),
+            "a reference to the discarded frame survived, so its context cannot be collected"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

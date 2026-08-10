@@ -66,6 +66,16 @@ impl FrameRealm {
         }
         parent.copy_identity_to_realm(&context);
 
+        // Only a same-origin frame is reachable from the page. Cross-origin
+        // keeps its own security token, so V8 answers `undefined` for any
+        // property the page tries to read out of it, and nothing about it is
+        // published below.
+        let origin = origin_of(url);
+        let same_origin = origin != "null" && origin == parent.page_origin();
+        if same_origin {
+            parent.share_security_token_with_realm(&context);
+        }
+
         let mut state = ObscuraState::new();
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
@@ -73,9 +83,11 @@ impl FrameRealm {
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
-        realms
-            .borrow_mut()
-            .register(context.clone(), Rc::new(std::cell::RefCell::new(state)));
+        realms.borrow_mut().register(
+            context.clone(),
+            frame_id,
+            Rc::new(std::cell::RefCell::new(state)),
+        );
 
         let realm = FrameRealm {
             context,
@@ -83,7 +95,7 @@ impl FrameRealm {
             frame_id,
             parent_frame_id,
             url: url.to_string(),
-            origin: origin_of(url),
+            origin,
         };
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
@@ -98,6 +110,11 @@ impl FrameRealm {
                 ),
             )
             .ok()?;
+        // Only after init, so the document the page reaches through
+        // `contentDocument` is the initialized one.
+        if same_origin {
+            parent.publish_realm_objects(&realm.context, frame_id);
+        }
         Some(realm)
     }
 
@@ -580,7 +597,9 @@ mod tests {
             .map(|index| {
                 FrameRealm::new(
                     &mut parent,
-                    index,
+                    // Frame ids start at 1: 0 names the page itself, which is
+                    // what a DOM call from an unframed realm reports.
+                    index + 1,
                     0,
                     &format!("https://f{index}.example/"),
                     &format!("<html><body><h1>{index}</h1></body></html>"),
@@ -838,6 +857,139 @@ mod tests {
         // that matters.
         assert_eq!(queued[0].data_json, r#"{"v":0}"#);
         std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
+    }
+
+    /// The page realm holds the frame's window and document, so a discarded
+    /// frame leaves the page naming objects from a context the host no longer
+    /// holds. Reading one must be safe. A regression here is an access
+    /// violation that takes the process down, not a failed assertion.
+    ///
+    /// It must also not read as anything: V8 severs a global proxy when its
+    /// context goes, which is the same thing a browser does to a WindowProxy
+    /// when it discards a browsing context.
+    #[test]
+    fn a_discarded_realm_leaves_the_page_safe_to_run() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        {
+            let frame = FrameRealm::new(
+                &mut parent,
+                1,
+                0,
+                "https://parent.example/child",
+                "<html><body><h1>Child</h1></body></html>",
+            )
+            .expect("frame realm");
+            frame
+                .execute_script(&mut parent, "globalThis.marker = 'child';")
+                .unwrap();
+            // Reachable from the page while the frame is alive.
+            assert_eq!(
+                parent
+                    .evaluate("globalThis.__obscura_frameObjects[1].window.marker")
+                    .unwrap(),
+                serde_json::json!("child"),
+            );
+        }
+
+        // Dropping the realm does not free it, and must not make touching it
+        // unsafe: the page still names its window, so V8 keeps the context
+        // alive and the read still answers. This is exactly why a discarded
+        // frame has to have its entry removed rather than merely dropped, and
+        // what `Page::release_detached_frames` is for.
+        assert_eq!(
+            parent
+                .evaluate("globalThis.__obscura_frameObjects[1].window.marker")
+                .unwrap(),
+            serde_json::json!("child"),
+        );
+        // The page's own DOM work still resolves against the page.
+        assert_eq!(
+            parent.evaluate("document.body.innerHTML").unwrap(),
+            serde_json::json!(""),
+        );
+        // Dropping the page's reference is what lets the frame be collected.
+        parent
+            .execute_script("p", "delete globalThis.__obscura_frameObjects[1];")
+            .unwrap();
+        assert_eq!(
+            parent
+                .evaluate("globalThis.__obscura_frameObjects[1] === undefined")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    /// A DOM call names the realm it belongs to, so the page reading the
+    /// frame's document gets the frame's document. Resolving from the running
+    /// context instead would silently answer with the page's own.
+    #[test]
+    fn the_page_reads_the_frames_document_through_its_own_object() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><head><title>parent</title></head><body></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><head><title>BEFORE</title></head><body><p>child</p></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(&mut parent, "document.title = 'RAN-IN-CHILD';")
+            .unwrap();
+
+        // Read the frame's document from the *page's* realm.
+        assert_eq!(
+            parent
+                .evaluate("globalThis.__obscura_frameObjects[1].document.title")
+                .unwrap(),
+            serde_json::json!("RAN-IN-CHILD"),
+        );
+        assert_eq!(
+            parent
+                .evaluate("globalThis.__obscura_frameObjects[1].document.querySelector('p').textContent")
+                .unwrap(),
+            serde_json::json!("child"),
+        );
+        // The page's own title is untouched by any of that.
+        assert_eq!(
+            parent.evaluate("document.title").unwrap(),
+            serde_json::json!("parent"),
+        );
+    }
+
+    /// A cross-origin frame must stay opaque. Nothing about it is published to
+    /// the page, and V8's own access check answers `undefined` for anything the
+    /// page reaches for, because the two realms keep different security tokens.
+    #[test]
+    fn a_cross_origin_frame_is_not_reachable_from_the_page() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://other.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(&mut parent, "globalThis.secret = 'do-not-leak';")
+            .unwrap();
+
+        assert_eq!(
+            parent
+                .evaluate("globalThis.__obscura_frameObjects[1] === undefined")
+                .unwrap(),
+            serde_json::json!(true),
+            "a cross-origin frame was published to the page"
+        );
+        // The frame still works on its own side.
+        assert_eq!(
+            frame.evaluate(&mut parent, "globalThis.secret").unwrap(),
+            serde_json::json!("do-not-leak"),
+        );
     }
 
     #[test]
