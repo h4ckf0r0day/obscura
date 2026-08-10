@@ -4603,6 +4603,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_external_module_scripts_evaluate_once() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let path = String::from_utf8_lossy(&request[..length])
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            assert_eq!(path, "/app/shared.js");
+            let body = "globalThis.__duplicate_module_runs = \
+                (globalThis.__duplicate_module_runs || 0) + 1;";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut page = import_map_test_page(
+            "duplicate-external-module",
+            &base,
+            r#"<html><head>
+                <script type="module" src="./shared.js"></script>
+                <script type="module" src="./shared.js"></script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__duplicate_module_runs")
+                .unwrap(),
+            serde_json::json!(1.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
 

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use deno_core::{JsRuntime, RuntimeOptions};
@@ -85,6 +85,7 @@ pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     object_counter: u64,
+    started_module_evaluations: HashSet<deno_core::ModuleId>,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
     /// intentionally separate from page fetch/XHR activity so analytics does
@@ -257,6 +258,7 @@ impl ObscuraJsRuntime {
             state,
             object_store: HashMap::new(),
             object_counter: 0,
+            started_module_evaluations: HashSet::new(),
             import_map,
             module_load_activity,
             isolate_handle,
@@ -1548,6 +1550,12 @@ impl ObscuraJsRuntime {
             module_id,
             description,
         } = prepared;
+        // The module map returns the same id when multiple external script
+        // elements resolve to one module. V8 caches both successful and failed
+        // evaluation, and deno_core panics if mod_evaluate is called again.
+        if !self.started_module_evaluations.insert(module_id) {
+            return Ok(());
+        }
         // Tokio timeouts cannot run while synchronous top-level module work
         // pins the runtime thread in V8. Pair the async timeout with a hard V8
         // watchdog so this budget is a real wall-clock ceiling for both forms
