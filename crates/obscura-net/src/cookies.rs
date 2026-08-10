@@ -516,7 +516,17 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     let day: u64 = parts[1].parse().map_err(|_| ())?;
     let month = months.iter().position(|m| parts[2].to_lowercase().starts_with(m))
         .ok_or(())? as u64 + 1;
-    let year: u64 = parts[3].parse().map_err(|_| ())?;
+    let raw_year: u64 = parts[3].parse().map_err(|_| ())?;
+    // Cookie dates accept legacy two-digit years: 70..99 map to 1970..1999,
+    // while 00..69 map to 2000..2069.
+    let year = match raw_year {
+        70..=99 => 1900 + raw_year,
+        0..=69 => 2000 + raw_year,
+        _ => raw_year,
+    };
+    if year < 1601 {
+        return Err(());
+    }
 
     let time_parts: Vec<&str> = parts[4].split(':').collect();
     let hour: u64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -770,6 +780,22 @@ mod tests {
         let url = Url::parse("https://example.com/").unwrap();
         jar.set_cookie("old=gone; Expires=Thu, 01 Jan 2020 00:00:00 GMT", &url);
         assert!(jar.get_cookie_header(&url).is_empty());
+    }
+
+    #[test]
+    fn two_digit_cookie_years_follow_cookie_date_rules() {
+        let cases = [
+            ("00", "2000"),
+            ("69", "2069"),
+            ("70", "1970"),
+            ("99", "1999"),
+        ];
+        for (short, full) in cases {
+            let short_date = format!("Thu, 05 Aug {short} 19:13:19 GMT");
+            let full_date = format!("Thu, 05 Aug {full} 19:13:19 GMT");
+            assert_eq!(parse_http_date(&short_date), parse_http_date(&full_date));
+        }
+        assert!(parse_http_date("Thu, 05 Aug 1600 19:13:19 GMT").is_err());
     }
 
     #[test]
