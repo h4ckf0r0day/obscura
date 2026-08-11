@@ -259,7 +259,29 @@ impl CdpContext {
     /// Refresh this context's pages' metadata in the shared registry. The
     /// registry mirrors live `Page` fields, so after any navigation (or just
     /// before `Target.getTargets`) this keeps the shared view current.
+    ///
+    /// Pages tombstoned by a remote `closeTarget` are dropped for real here:
+    /// the remote close could not reach them (thread-per-connection #430),
+    /// but once the owner syncs, the target is closed everywhere, matching
+    /// Chrome semantics. Dropping reclaims the Page (and its V8 isolate) and
+    /// clears the tombstone, so dead pages and tombstones are bounded by
+    /// connection activity instead of living for the whole connection.
+    ///
+    /// This runs from the V8-free path (Target.getTargets /
+    /// setDiscoverTargets take no V8 lock), so dropping Pages here must stay
+    /// isolate-safe: it is, because the page's isolate is owned by this
+    /// connection's thread and `remove_page` is already exercised from
+    /// closeTarget and disposeBrowserContext.
     pub fn sync_registry(&mut self) {
+        let closed: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|p| self.registry.is_closed(&p.id))
+            .map(|p| p.id.clone())
+            .collect();
+        for page_id in closed {
+            self.remove_page(&page_id);
+        }
         for page in &self.pages {
             self.registry.upsert(TargetInfo {
                 target_id: page.id.clone(),
