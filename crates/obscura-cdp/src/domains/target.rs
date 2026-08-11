@@ -12,6 +12,13 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "setDiscoverTargets" => {
+            // Chrome floods every current target on setDiscoverTargets, and
+            // Puppeteer's TargetManager populates its view purely from these
+            // targetCreated events (it does not re-poll getTargets). With
+            // issue #544's global registry, the flood must cover every live
+            // page in the process (not just this connection's), or a second
+            // client would never learn about pages another connection owns.
+            ctx.sync_registry();
             ctx.pending_events.push(CdpEvent::new(
                 "Target.targetCreated",
                 json!({
@@ -26,18 +33,22 @@ pub async fn handle(
                     }
                 }),
             ));
-            for page in &ctx.pages {
+            for target in ctx.registry.all() {
+                let attached = ctx
+                    .sessions
+                    .values()
+                    .any(|page_id| *page_id == target.target_id);
                 ctx.pending_events.push(CdpEvent::new(
                     "Target.targetCreated",
                     json!({
                         "targetInfo": {
-                            "targetId": page.id,
+                            "targetId": target.target_id,
                             "type": "page",
-                            "title": page.title,
-                            "url": page.url_string(),
-                            "attached": false,
+                            "title": target.title,
+                            "url": target.url,
+                            "attached": attached,
                             "canAccessOpener": false,
-                            "browserContextId": page.context.id,
+                            "browserContextId": target.browser_context_id,
                         }
                     }),
                 ));
@@ -182,6 +193,32 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
+            // Puppeteer's browser-target createCDPSession attaches the
+            // implicit "browser" target via Target.attachToTarget (not
+            // attachToBrowserTarget). Chrome accepts targetId "browser"; the
+            // registry only knows pages, so special-case it exactly like
+            // attachToBrowserTarget.
+            if target_id == "browser" {
+                let session_id = "browser-session".to_string();
+                ctx.sessions.insert(session_id.clone(), "browser".to_string());
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.attachedToTarget",
+                    json!({
+                        "sessionId": session_id,
+                        "targetInfo": {
+                            "targetId": "browser",
+                            "type": "browser",
+                            "title": "",
+                            "url": "",
+                            "attached": true,
+                            "canAccessOpener": false,
+                            "browserContextId": "",
+                        },
+                        "waitingForDebugger": false,
+                    }),
+                ));
+                return Ok(json!({ "sessionId": session_id }));
+            }
             // Issue #544 makes targets globally visible: Target.getTargets
             // lists every live page in the process, so attachToTarget must
             // accept any target the caller can see, not only pages this
@@ -250,15 +287,8 @@ pub async fn handle(
             // any connection may close any target listed by getTargets,
             // owned by this connection or not. Resolve through the shared
             // registry first so unknown targets surface a protocol error
-            // instead of emitting destroy events for phantom pages. The
-            // registry removal happens in `remove_page`, which already
-            // removes the global entry regardless of ownership. Known
-            // limitation: a remote-owned page's live `Page` lives on its
-            // owner's thread (thread-per-connection #430), so it cannot be
-            // torn down from here; if the owner later syncs the registry
-            // (getTargets, navigation) the entry returns. Fully closing a
-            // remote page needs registry tombstones or cross-connection
-            // teardown, both out of scope for this fix.
+            // instead of emitting destroy events for phantom pages.
+            ctx.sync_registry();
             if !ctx
                 .registry
                 .all()
@@ -281,10 +311,92 @@ pub async fn handle(
                 json!({ "targetId": target_id }),
             ));
 
-            ctx.remove_page(target_id);
+            if ctx.get_page(target_id).is_some() {
+                // Owned by this connection: full local teardown. `remove_page`
+                // drops the live Page, its registry entry, and this
+                // connection's session routes to it.
+                ctx.remove_page(target_id);
+            } else {
+                // Remote-owned page: the live `Page` lives on its owner's
+                // thread (thread-per-connection #430) and cannot be torn down
+                // from here. Tombstone the id so the owner's next
+                // sync_registry (getTargets, navigation, createTarget) cannot
+                // resurrect the closed target. Also drop this connection's
+                // own session routes to it.
+                let removed_sessions: Vec<String> = ctx
+                    .sessions
+                    .iter()
+                    .filter(|(_, page_id)| page_id.as_str() == target_id)
+                    .map(|(session_id, _)| session_id.clone())
+                    .collect();
+                for session_id in &removed_sessions {
+                    ctx.sessions.remove(session_id);
+                    #[cfg(feature = "render")]
+                    ctx.screencasts.remove(session_id);
+                }
+                ctx.registry.mark_closed(&[target_id.to_string()]);
+            }
             Ok(json!({ "success": true }))
         }
-        "setAutoAttach" => Ok(json!({})),
+        "setAutoAttach" => {
+            // The BROWSER-level call (no parent session) auto-attaches the
+            // current targets (flatten: true). Puppeteer's ChromeTargetManager
+            // only surfaces targets that arrive with a session
+            // (#attachedTargetsByTargetId feeds browser.pages()), so a
+            // connection whose own pages are never announced cannot list or
+            // drive them. Attach THIS connection's own pages, reusing the
+            // managed session where one exists.
+            //
+            // Remote pages are deliberately NOT auto-attached: their live
+            // `Page` lives on the owner's thread (thread-per-connection #430),
+            // so a phantom session would fail the first time the client tried
+            // to initialize the Page (Page.getFrameTree etc.). They remain
+            // visible via Target.getTargets and /json/list and stay attachable
+            // through an explicit attachToTarget (metadata-only, as documented
+            // there).
+            //
+            // A SESSION-scoped call (parent session set) auto-attaches only
+            // child targets of that session's page. Obscura has none (one
+            // page per session; frames are not separate CDP targets), so emit
+            // nothing, and crucially do NOT re-flood: puppeteer answers every
+            // attachedToTarget with a session-scoped setAutoAttach, and a
+            // re-flood would answer each with more attachedToTarget events, an
+            // unbounded event storm.
+            if parent_session_id.is_none()
+                && params.get("autoAttach").and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                let own_pages: Vec<String> = ctx.pages.iter().map(|p| p.id.clone()).collect();
+                for page_id in own_pages {
+                    let existing: Option<String> = ctx
+                        .sessions
+                        .iter()
+                        .find(|(_, pid)| pid.as_str() == page_id)
+                        .map(|(sid, _)| sid.clone());
+                    let session_id =
+                        existing.unwrap_or_else(|| ctx.next_target_session(&page_id));
+                    ctx.sessions.insert(session_id.clone(), page_id.clone());
+                    if let Some(page) = ctx.get_page(&page_id) {
+                        ctx.pending_events.push(CdpEvent::new(
+                            "Target.attachedToTarget",
+                            json!({
+                                "sessionId": session_id,
+                                "targetInfo": {
+                                    "targetId": page_id,
+                                    "type": "page",
+                                    "title": page.title,
+                                    "url": page.url_string(),
+                                    "attached": true,
+                                    "canAccessOpener": false,
+                                    "browserContextId": page.context.id,
+                                },
+                                "waitingForDebugger": false,
+                            }),
+                        ));
+                    }
+                }
+            }
+            Ok(json!({}))
+        }
         // No multi-target lifecycle to manage: obscura runs one page per session.
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
@@ -484,6 +596,166 @@ mod tests {
         );
     }
 
+    /// Issue #544: setDiscoverTargets floods every live target, not just this
+    /// connection's own pages. Puppeteer's TargetManager builds its view
+    /// from these targetCreated events and never re-polls getTargets.
+    #[tokio::test]
+    async fn set_discover_targets_floods_remote_targets() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut observer = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry,
+        );
+
+        let page_id = owner.create_page();
+        let session_id = format!("{page_id}-session");
+        owner.sessions.insert(session_id, page_id.clone());
+        {
+            let page = owner.get_page_mut(&page_id).unwrap();
+            page.title = "Discovered".into();
+        }
+        // The owner pushes its page's metadata into the shared registry.
+        owner.sync_registry();
+
+        handle("setDiscoverTargets", &json!({}), &mut observer, &None)
+            .await
+            .expect("setDiscoverTargets should succeed");
+
+        let created: Vec<&crate::types::CdpEvent> = observer
+            .pending_events
+            .iter()
+            .filter(|e| e.method == "Target.targetCreated")
+            .collect();
+        let page_event = created
+            .iter()
+            .find(|e| e.params["targetInfo"]["targetId"] == page_id)
+            .expect("observer must be flooded with the remote page's targetCreated");
+        assert_eq!(page_event.params["targetInfo"]["title"], "Discovered");
+        assert_eq!(page_event.params["targetInfo"]["attached"], false);
+        assert_eq!(page_event.params["targetInfo"]["type"], "page");
+
+        // The owner's own flood marks its page attached.
+        owner.pending_events.clear();
+        handle("setDiscoverTargets", &json!({}), &mut owner, &None)
+            .await
+            .expect("owner setDiscoverTargets should succeed");
+        let owner_event = owner
+            .pending_events
+            .iter()
+            .find(|e| {
+                e.method == "Target.targetCreated"
+                    && e.params["targetInfo"]["targetId"] == page_id
+            })
+            .expect("owner must be flooded with its own page");
+        assert_eq!(owner_event.params["targetInfo"]["attached"], true);
+    }
+
+    /// Issue #544: setAutoAttach (browser level) announces this connection's
+    /// OWN pages with a session. Puppeteer's browser.pages() only surfaces
+    /// session-bearing targets. Remote pages stay discoverable via getTargets
+    /// and attachable via explicit attachToTarget, but are NOT auto-attached:
+    /// their live Page lives on the owner's thread (#430), and a phantom
+    /// session would fail when puppeteer initializes the Page.
+    #[tokio::test]
+    async fn set_auto_attach_attaches_own_pages_only() {
+        let registry = crate::registry::TargetRegistry::default();
+        let mut owner = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry.clone(),
+        );
+        let mut observer = CdpContext::new_with_shared_context_and_registry(
+            CdpContext::new().default_context.clone(),
+            registry,
+        );
+
+        let page_id = owner.create_page();
+        let session_id = format!("{page_id}-session");
+        owner.sessions.insert(session_id, page_id.clone());
+        owner.sync_registry();
+
+        // Owner: its own page is announced, reusing the managed session
+        // instead of minting a duplicate for the same page.
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut owner,
+            &None,
+        )
+        .await
+        .expect("owner setAutoAttach should succeed");
+        let owner_attached = owner
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.attachedToTarget")
+            .expect("owner must receive attachedToTarget for its page");
+        assert_eq!(
+            owner_attached.params["sessionId"],
+            format!("{page_id}-session"),
+            "owner's auto-attach must reuse the managed session"
+        );
+        assert_eq!(owner_attached.params["waitingForDebugger"], false);
+        assert_eq!(owner_attached.params["targetInfo"]["attached"], true);
+
+        // autoAttach:false must not announce anything (Chrome semantics).
+        owner.pending_events.clear();
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": false, "flatten": true }),
+            &mut owner,
+            &None,
+        )
+        .await
+        .expect("setAutoAttach with autoAttach:false should succeed");
+        assert!(
+            owner.pending_events.is_empty(),
+            "autoAttach:false must not flood attachedToTarget, got: {:?}",
+            owner.pending_events
+        );
+
+        // Observer: the remote page must NOT be auto-attached (no phantom
+        // session that would fail on first drive attempt).
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut observer,
+            &None,
+        )
+        .await
+        .expect("observer setAutoAttach should succeed");
+        assert!(
+            observer.pending_events.is_empty(),
+            "remote pages must not be auto-attached, got: {:?}",
+            observer.pending_events
+        );
+        assert!(
+            !observer.sessions.values().any(|pid| pid == &page_id),
+            "no phantom session may route to the remote page"
+        );
+
+        // A SESSION-scoped setAutoAttach (puppeteer sends one for every
+        // attachedToTarget it receives) auto-attaches only child targets;
+        // obscura has none, so it must not re-flood the registry: that
+        // would answer each flood with more attachedToTarget events forever.
+        observer.pending_events.clear();
+        handle(
+            "setAutoAttach",
+            &json!({ "autoAttach": true, "flatten": true }),
+            &mut observer,
+            &Some("page-9-session".to_string()),
+        )
+        .await
+        .expect("session-scoped setAutoAttach should succeed");
+        assert!(
+            observer.pending_events.is_empty(),
+            "session-scoped setAutoAttach must not re-flood, got: {:?}",
+            observer.pending_events
+        );
+    }
+
     /// Issue #544: when the owning connection goes away its pages must leave
     /// the shared registry, so they stop shadowing live targets elsewhere.
     #[tokio::test]
@@ -632,6 +904,47 @@ mod tests {
             !registry.all().iter().any(|t| t.target_id == page_id),
             "closed target must leave the global registry"
         );
+
+        // The owner still holds the live Page, so its next sync (getTargets)
+        // must NOT resurrect the tombstoned target: it has to stay closed for
+        // every connection until the owner really drops it.
+        let owner_targets = handle("getTargets", &json!({}), &mut owner, &None)
+            .await
+            .expect("owner getTargets should succeed");
+        let owner_listed = owner_targets["targetInfos"]
+            .as_array()
+            .expect("targetInfos must be an array");
+        assert!(
+            !owner_listed.iter().any(|t| t["targetId"] == page_id),
+            "owner's sync must not resurrect the remotely closed target, got: {owner_targets}"
+        );
+        // The owner's sync also drops the closed page for real, reclaiming
+        // the Page (and its isolate) and clearing the tombstone instead of
+        // holding both for the life of the connection.
+        assert!(
+            owner.get_page(&page_id).is_none(),
+            "owner must drop the remotely closed page from its own pages"
+        );
+        assert!(
+            !registry.is_closed(&page_id),
+            "dropping the closed page must clear its tombstone"
+        );
+
+        // …but a page the owner creates afterwards is unaffected.
+        let second = handle(
+            "createTarget",
+            &json!({"url": "about:blank"}),
+            &mut owner,
+            &None,
+        )
+        .await
+        .expect("owner createTarget after remote close should succeed");
+        let second_id = second["targetId"].as_str().unwrap().to_string();
+        assert_ne!(second_id, page_id);
+        assert!(
+            registry.all().iter().any(|t| t.target_id == second_id),
+            "a new page created by the owner must still register globally"
+        );
     }
 
     /// Closing a target that was never registered must surface a protocol
@@ -648,6 +961,35 @@ mod tests {
         .await
         .expect_err("unknown targets must error");
         assert_eq!(err, "Target not found");
+    }
+
+    /// Puppeteer's browser-target createCDPSession sends
+    /// Target.attachToTarget {targetId: "browser"} (not
+    /// attachToBrowserTarget). Chrome accepts it; the registry only knows
+    /// pages, so the browser target must be special-cased.
+    #[tokio::test]
+    async fn attach_to_target_accepts_browser_target_id() {
+        let mut ctx = CdpContext::new();
+        let result = handle(
+            "attachToTarget",
+            &json!({ "targetId": "browser", "flatten": true }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("attachToTarget on the browser target should succeed");
+
+        assert_eq!(result["sessionId"], "browser-session");
+        assert_eq!(
+            ctx.sessions.get("browser-session").map(String::as_str),
+            Some("browser")
+        );
+        let evt = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.attachedToTarget")
+            .expect("attachedToTarget event must be emitted");
+        assert_eq!(evt.params["targetInfo"]["type"], "browser");
     }
 
     #[tokio::test]
