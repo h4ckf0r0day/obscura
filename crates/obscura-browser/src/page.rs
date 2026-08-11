@@ -934,20 +934,52 @@ impl Page {
             .unwrap_or_else(default_navigation_timeout)
     }
 
+    /// Only `Network.setBlockedURLs` patterns block outright. Fetch
+    /// interception patterns are pause-and-ask patterns: the client decides
+    /// per request via `Fetch.requestPaused`, so matching one must never be
+    /// treated as a block here — that conflation killed every subresource
+    /// whenever a CDP client enabled interception (puppeteer's
+    /// setRequestInterception defaults to pattern `*`), so a client blocking
+    /// only stylesheets silently lost every script too. Matched requests go
+    /// through `subresource_intercept_plan` instead.
     fn should_block_url(&self, url: &str) -> bool {
         for pattern in &self.blocked_url_patterns {
             if url_matches_cdp_pattern(pattern, url) {
                 return true;
             }
         }
-        if self.intercept_enabled {
-            for pattern in &self.intercept_block_patterns {
-                if url_matches_cdp_pattern(pattern, url) {
-                    return true;
-                }
-            }
-        }
         false
+    }
+
+    /// When Fetch interception is on and `url` matches its patterns, the
+    /// request must be paused and the client asked. Returns the channel and
+    /// request id to do that with, or None when the request may proceed
+    /// unasked.
+    fn subresource_intercept_plan(
+        &self,
+        url: &str,
+    ) -> Option<(
+        tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+        String,
+    )> {
+        if !self.intercept_enabled || !url.starts_with("http") {
+            return None;
+        }
+        let tx = self.intercept_tx.as_ref()?;
+        // No patterns means intercept everything — Fetch.enable's default,
+        // and what the library's enable_interception() sets up.
+        let matched = self.intercept_block_patterns.is_empty()
+            || self
+                .intercept_block_patterns
+                .iter()
+                .any(|pattern| url_matches_cdp_pattern(pattern, url));
+        if !matched {
+            return None;
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SUBRESOURCE_INTERCEPT_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SUBRESOURCE_INTERCEPT_SEQ.fetch_add(1, Ordering::Relaxed);
+        Some((tx.clone(), format!("intercept-sub-{seq}")))
     }
 
     /// Update the page's CSS viewport. Calling this before navigation makes
@@ -1228,13 +1260,14 @@ impl Page {
                 continue;
             }
             if self.should_block_url(resolved.as_str()) {
-                tracing::info!("Blocked stylesheet by interception: {}", resolved);
+                tracing::info!("Blocked stylesheet by Network.setBlockedURLs: {}", resolved);
                 continue;
             }
             roots.push((AuthorStylesheetTarget::Linked(link_index), key.clone(), None));
             if scheduled.insert(key.clone()) {
                 if scheduled.len() <= MAX_STYLESHEET_RESOURCES {
-                    pending.push((key, resolved, 0u8));
+                    let intercept = self.subresource_intercept_plan(resolved.as_str());
+                    pending.push((key, resolved, 0u8, intercept));
                 }
             }
         }
@@ -1255,7 +1288,8 @@ impl Page {
                 import.media,
             ));
             if scheduled.insert(key.clone()) && scheduled.len() <= MAX_STYLESHEET_RESOURCES {
-                pending.push((key, resolved, 1u8));
+                let intercept = self.subresource_intercept_plan(resolved.as_str());
+                pending.push((key, resolved, 1u8, intercept));
             }
         }
 
@@ -1270,13 +1304,56 @@ impl Page {
             let initiator = document_url.clone();
             use futures::StreamExt as _;
             let results: Vec<_> =
-                futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth)| {
+                futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth, intercept)| {
                     let client = client.clone();
                     #[cfg(feature = "stealth")]
                     let stealth_client = stealth_client.clone();
                     let callbacks = callbacks.clone();
                     let initiator = initiator.clone();
                     async move {
+                        let mut requested_url = requested_url;
+                        if let Some((tx, request_id)) = intercept {
+                            match resolve_subresource_interception(
+                                tx,
+                                request_id,
+                                requested_url.to_string(),
+                                "Stylesheet",
+                            )
+                            .await
+                            {
+                                SubresourceResolution::Skip => {
+                                    tracing::info!(
+                                        "Interception client blocked stylesheet: {}",
+                                        requested_url
+                                    );
+                                    return (
+                                        key,
+                                        requested_url,
+                                        depth,
+                                        Err(ObscuraNetError::Blocked(
+                                            "blocked by interception client".to_string(),
+                                        )),
+                                    );
+                                }
+                                SubresourceResolution::Fulfilled { status, headers, body } => {
+                                    let resp = obscura_net::Response {
+                                        url: requested_url.clone(),
+                                        status,
+                                        headers,
+                                        body: body.into_bytes(),
+                                        redirected_from: Vec::new(),
+                                    };
+                                    return (key, requested_url, depth, Ok(resp));
+                                }
+                                SubresourceResolution::Proceed { url_override } => {
+                                    if let Some(overridden) =
+                                        url_override.and_then(|u| Url::parse(&u).ok())
+                                    {
+                                        requested_url = overridden;
+                                    }
+                                }
+                            }
+                        }
                         let request =
                             ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
                         #[cfg(feature = "stealth")]
@@ -1379,7 +1456,8 @@ impl Page {
                         continue;
                     }
                     scheduled.insert(import_key.clone());
-                    pending.push((import_key, import_url, depth + 1));
+                    let intercept = self.subresource_intercept_plan(import_url.as_str());
+                    pending.push((import_key, import_url, depth + 1, intercept));
                 }
             }
         }
@@ -1610,7 +1688,11 @@ impl Page {
         }
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
-        let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
+        type InterceptPlan = Option<(
+            tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+            String,
+        )>;
+        let mut fetch_tasks: Vec<(usize, String, InterceptPlan)> = Vec::new();
 
         for (i, script) in all_scripts.iter().enumerate() {
             if !matches!(script.kind, ScriptKind::Classic) {
@@ -1642,10 +1724,11 @@ impl Page {
                     continue;
                 }
                 if self.should_block_url(&full_url) {
-                    tracing::info!("Blocked script by interception: {}", full_url);
+                    tracing::info!("Blocked script by Network.setBlockedURLs: {}", full_url);
                     continue;
                 }
-                fetch_tasks.push((i, full_url));
+                let intercept = self.subresource_intercept_plan(&full_url);
+                fetch_tasks.push((i, full_url, intercept));
             }
         }
 
@@ -1657,13 +1740,41 @@ impl Page {
             .unwrap_or_else(|| Url::parse("about:blank").unwrap());
         let fetch_futures: Vec<_> = fetch_tasks
             .iter()
-            .map(|(idx, url)| {
+            .map(|(idx, url, intercept)| {
                 let client = client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
-                let url = url.clone();
+                let mut url = url.clone();
                 let idx = *idx;
+                let intercept = intercept.clone();
                 async move {
+                    if let Some((tx, request_id)) = intercept {
+                        match resolve_subresource_interception(tx, request_id, url.clone(), "Script")
+                            .await
+                        {
+                            SubresourceResolution::Skip => {
+                                tracing::info!("Interception client blocked script: {}", url);
+                                return None;
+                            }
+                            SubresourceResolution::Fulfilled { status, headers, body } => {
+                                let parsed = Url::parse(&url)
+                                    .unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                                let resp = obscura_net::Response {
+                                    url: parsed,
+                                    status,
+                                    headers,
+                                    body: body.into_bytes(),
+                                    redirected_from: Vec::new(),
+                                };
+                                return Some((idx, url, resp));
+                            }
+                            SubresourceResolution::Proceed { url_override } => {
+                                if let Some(overridden) = url_override {
+                                    url = overridden;
+                                }
+                            }
+                        }
+                    }
                     let parsed =
                         Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
                     if parsed.scheme() == "data" {
@@ -3708,6 +3819,48 @@ fn script_response_is_executable(status: u16) -> bool {
     (200..=299).contains(&status)
 }
 
+/// The interception client's verdict on a paused subresource request.
+enum SubresourceResolution {
+    Proceed { url_override: Option<String> },
+    Skip,
+    Fulfilled { status: u16, headers: std::collections::HashMap<String, String>, body: String },
+}
+
+/// Pause a subresource request on the interception channel and wait for the
+/// client's verdict (CDP Fetch semantics). Fail-open on a closed channel or a
+/// client that never answers within the deadline: interception clients crash
+/// and disconnect, and a page must still render without them.
+async fn resolve_subresource_interception(
+    tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    request_id: String,
+    url: String,
+    resource_type: &'static str,
+) -> SubresourceResolution {
+    use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+    let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
+    let sent = tx.send(InterceptedRequest {
+        request_id,
+        url,
+        method: "GET".to_string(),
+        headers: std::collections::HashMap::new(),
+        resource_type: resource_type.to_string(),
+        resolver: resolve_tx,
+    });
+    if sent.is_err() {
+        return SubresourceResolution::Proceed { url_override: None };
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), resolve_rx).await {
+        Ok(Ok(InterceptResolution::Fail { .. })) => SubresourceResolution::Skip,
+        Ok(Ok(InterceptResolution::Fulfill { status, headers, body })) => {
+            SubresourceResolution::Fulfilled { status, headers, body }
+        }
+        Ok(Ok(InterceptResolution::Continue { url, .. })) => {
+            SubresourceResolution::Proceed { url_override: url }
+        }
+        _ => SubresourceResolution::Proceed { url_override: None },
+    }
+}
+
 fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -4004,8 +4157,18 @@ mod tests {
         ));
         let mut page = super::Page::new("stylesheet-graph".to_string(), context);
         page.set_blocked_urls(vec!["*blocked.css".to_string()]);
+        // Interception is pause-and-ask: the matched request reaches the
+        // client, which refuses it. Only its verdict removes the resource —
+        // the pattern match alone must not.
         page.intercept_block_patterns = vec!["*intercepted.css".to_string()];
-        page.enable_intercept(true);
+        let mut intercepted = page.enable_interception();
+        tokio::spawn(async move {
+            while let Some(request) = intercepted.recv().await {
+                let _ = request.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+                    reason: "BlockedByClient".to_string(),
+                });
+            }
+        });
 
         let request_count = std::sync::Arc::new(AtomicUsize::new(0));
         let response_count = std::sync::Arc::new(AtomicUsize::new(0));
