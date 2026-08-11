@@ -13,7 +13,9 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, OriginStorage, StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -394,6 +396,10 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {

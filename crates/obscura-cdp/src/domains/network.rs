@@ -94,6 +94,10 @@ pub async fn handle(
             cookie_jar_for(ctx, session_id).clear();
             Ok(json!({}))
         }
+        // Playwright clears the browser cache while applying storageState.
+        // Obscura has no disk HTTP cache for this CDP call, so succeed without
+        // changing the context state.
+        "clearBrowserCache" => Ok(json!({})),
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
         "setBlockedURLs" => {

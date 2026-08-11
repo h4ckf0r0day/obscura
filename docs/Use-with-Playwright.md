@@ -70,6 +70,27 @@ await context.addCookies([{
 const cookies = await context.cookies();
 ```
 
+## Save and restore login state
+
+Playwright `storageState` supports cookies and origin-scoped `localStorage`.
+Save the JSON after login and load it into a later context or process:
+
+```js
+import { readFile } from 'node:fs/promises';
+
+const context = await browser.newContext({ storageState: 'state.json' });
+const page = await context.newPage();
+
+// ...log in when state.json does not exist...
+
+await context.storageState({ path: 'state.json' });
+await context.setStorageState(JSON.parse(await readFile('state.json', 'utf8')));
+```
+
+`sessionStorage` is page-local and is not part of Playwright's standard
+`storageState` file. Use `--storage-dir` when the whole Obscura server should
+share persistent cookies and localStorage automatically.
+
 ## Intercept requests
 
 ```js
@@ -151,9 +172,9 @@ await browser.close();  // closes the CDP connection, leaves obscura serve runni
 
 - Playwright `page.video()` and tracing artifacts that require desktop capture
   are not implemented. Use the raw CDP flow above for page frames.
-- `BrowserContext` storage-state save/restore remains limited; use
-  `--storage-dir` on `obscura serve`, as described in
-  [Persist cookies and storage](Persist-cookies-and-storage.md).
+- `BrowserContext` `storageState` does not include `sessionStorage`. Use
+  `--storage-dir` when the whole Obscura server should share persistent state,
+  as described in [Persist cookies and storage](Persist-cookies-and-storage.md).
 - Service workers, native media, some Web APIs, long-tail CSS, and compositor
   behavior remain incomplete relative to Chromium.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.

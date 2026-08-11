@@ -40,6 +40,10 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
+        "clearCookies" => {
+            cookie_jar_for(ctx, params, session_id)?.clear();
+            Ok(json!({}))
+        }
         "deleteCookies" => {
             if let Some(filter) = parse_delete_cookies_params(params) {
                 cookie_jar_for(ctx, params, session_id)?.delete_cookies_filtered(
