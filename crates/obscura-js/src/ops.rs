@@ -151,6 +151,10 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    /// Memoized document base URL. Computing it walks the tree and runs the selector engine,
+    /// and the JS layer asks for it on every relative URL it resolves, including the `<a>`
+    /// URL-decomposition getters. Interior mutability so the read path keeps its shared borrow.
+    pub base_url_cache: RefCell<Option<BaseUrlCache>>,
     /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
@@ -255,6 +259,7 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
             prepared_render: None,
             #[cfg(feature = "render")]
@@ -1160,9 +1165,15 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
         // The base for relative URLs. Differs from document_url exactly when the page carries
         // <base href>, which is the whole point: HTML resolves against the base, not the document.
         "document_base_url" => serde_json::to_string(
-            &document_base_url(&gs).unwrap_or_else(|| gs.url.clone()),
+            &document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone()),
         )
         .unwrap_or("\"\"".into()),
+        // The unresolved attribute. Only JS knows the URL after history.pushState, so only JS
+        // can resolve a relative base against it.
+        "document_base_href" => {
+            serde_json::to_string(&document_base_href_memoized(&gs).unwrap_or_default())
+                .unwrap_or("\"\"".into())
+        }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
@@ -4251,9 +4262,72 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
             })
     });
     match base_href {
-        Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // A data: or javascript: base falls back to the document URL. Honouring it would make
+        // every later relative resolution fail instead.
+        Some(href) => match document_url.join(&href) {
+            Ok(base) if base.scheme() != "data" && base.scheme() != "javascript" => {
+                Some(base.to_string())
+            }
+            _ => Some(document_url.to_string()),
+        },
         None => Some(document_url.to_string()),
     }
+}
+
+/// The raw `href` attribute of the first `<base href>`, unresolved. The JS layer needs it after
+/// `history.pushState`: the document URL moved, only JS knows the new one, so only JS can resolve
+/// a relative base against it.
+fn document_base_href(state: &ObscuraState) -> Option<String> {
+    state.dom.as_ref().and_then(|dom| {
+        dom.query_selector("base[href]")
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                dom.get_node(id)
+                    .and_then(|node| node.get_attribute("href").map(str::to_string))
+            })
+    })
+}
+
+/// What the cached values were computed from. Any of the three moving, and they are recomputed.
+pub struct BaseUrlCache {
+    activity_generation: u64,
+    document_generation: u64,
+    url: String,
+    resolved: Option<String>,
+    raw_href: Option<String>,
+}
+
+/// Both base values behind one memo. Uncached, each walks the tree and runs the selector engine,
+/// which turned `a.href` into an O(nodes) read.
+fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>) {
+    if let Some(cached) = state.base_url_cache.borrow().as_ref() {
+        if cached.activity_generation == state.activity_generation
+            && cached.document_generation == state.document_generation
+            && cached.url == state.url
+        {
+            return (cached.resolved.clone(), cached.raw_href.clone());
+        }
+    }
+    let resolved = document_base_url(state);
+    let raw_href = document_base_href(state);
+    *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
+        activity_generation: state.activity_generation,
+        document_generation: state.document_generation,
+        url: state.url.clone(),
+        resolved: resolved.clone(),
+        raw_href: raw_href.clone(),
+    });
+    (resolved, raw_href)
+}
+
+pub(crate) fn document_base_url_memoized(state: &ObscuraState) -> Option<String> {
+    base_values_memoized(state).0
+}
+
+pub(crate) fn document_base_href_memoized(state: &ObscuraState) -> Option<String> {
+    base_values_memoized(state).1
 }
 
 #[cfg(feature = "render")]

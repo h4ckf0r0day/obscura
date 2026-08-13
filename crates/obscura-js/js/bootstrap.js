@@ -2401,6 +2401,14 @@ function _applyDocQueryEncoding(u) {
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
 // Returns "" without a document, so each caller keeps its own fallback.
 function _documentBase() {
+  // history.pushState moves the document URL without telling the Rust side. The base then has to
+  // be built here, or every relative URL resolves against the pre-routing address.
+  const virtual = globalThis.__virtualUrl;
+  if (virtual) {
+    const raw = _domParse("document_base_href");
+    if (!raw) return virtual;
+    try { return new URL(raw, virtual).href; } catch (e) { return virtual; }
+  }
   return _domParse("document_base_url") || _domParse("document_url") || "";
 }
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).

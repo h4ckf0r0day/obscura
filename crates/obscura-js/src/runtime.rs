@@ -13561,6 +13561,125 @@ mod tests {
         assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
     }
 
+    #[test]
+    fn base_href_rejects_a_data_url_base() {
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // Honouring it would make every later relative resolution fail instead of falling back.
+        let mut rt = setup_runtime_with_base_href(
+            r#"<html><head><base href="data:text/html,x"></head><body>
+                <a id="link" href="data/x.json"></a>
+            </body></html>"#,
+        );
+
+        let base_uri = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(base_uri.as_str().unwrap(), "http://example.com/deep/page");
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
+    }
+
+    #[test]
+    fn base_resolution_follows_the_url_set_by_push_state() {
+        // pushState changes the document's URL, and without <base> that URL is the base.
+        let mut rt = setup_runtime_with_base_href(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/x.json");
+    }
+
+    #[test]
+    fn a_relative_base_href_resolves_against_the_push_state_url() {
+        let mut rt = setup_runtime_with_base_href(
+            r#"<html><head><base href="assets/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/assets/x.json");
+    }
+
+    /// Guards the memo in `document_base_url_memoized`. Without it every one of these reads walked
+    /// the tree and ran the selector engine, and `a.href` went from a field read to O(nodes).
+    /// The budget is loose on purpose: it must catch the regression, not police the allocator.
+    #[test]
+    fn anchor_href_reads_do_not_scale_with_document_size() {
+        let mut body = String::from(r#"<html><head></head><body><a id="link" href="x.json"></a>"#);
+        for i in 0..4000 {
+            body.push_str(&format!("<div id=\"n{i}\"><span>text</span></div>"));
+        }
+        body.push_str("</body></html>");
+        let mut rt = setup_runtime_with_base_href(&body);
+
+        let elapsed = rt
+            .evaluate(
+                r#"
+                const link = document.getElementById('link');
+                const started = Date.now();
+                for (let i = 0; i < 2000; i++) { link.href; }
+                return Date.now() - started;
+                "#,
+            )
+            .unwrap();
+        let ms = elapsed.as_f64().expect("elapsed ms");
+        assert!(
+            ms < 500.0,
+            "2000 reads of a.href on a 12000-node document took {ms} ms, the base lookup is not memoized"
+        );
+    }
+
+    #[test]
+    fn the_base_memo_still_sees_a_base_element_added_later() {
+        let mut rt = setup_runtime_with_base_href(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/deep/x.json");
+
+        rt.evaluate(
+            r#"
+            const base = document.createElement('base');
+            base.setAttribute('href', '/');
+            document.head.appendChild(base);
+            "#,
+        )
+        .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/x.json");
+    }
+
+    #[test]
+    fn the_base_memo_notices_a_changed_href_attribute() {
+        let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/data/x.json");
+
+        rt.evaluate("document.querySelector('base').setAttribute('href', '/other/')")
+            .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/other/data/x.json");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn base_href_governs_fetch_and_xhr_targets() {
         let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
