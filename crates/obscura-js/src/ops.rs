@@ -1157,6 +1157,12 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        // The base for relative URLs. Differs from document_url exactly when the page carries
+        // <base href>, which is the whole point: HTML resolves against the base, not the document.
+        "document_base_url" => serde_json::to_string(
+            &document_base_url(&gs).unwrap_or_else(|| gs.url.clone()),
+        )
+        .unwrap_or("\"\"".into()),
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
@@ -4231,7 +4237,8 @@ fn op_waapi_control(
     changed
 }
 
-#[cfg(feature = "render")]
+// Not gated on `render`: the JS layer resolves every relative URL through this, and it does so
+// in all build variants.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     let document_url = url::Url::parse(&state.url).ok()?;
     let base_href = state.dom.as_ref().and_then(|dom| {

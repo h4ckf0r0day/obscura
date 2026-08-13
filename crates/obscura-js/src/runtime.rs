@@ -13515,6 +13515,89 @@ mod tests {
         );
     }
 
+    /// The document URL is two levels deep, so resolving against it instead of the base lands
+    /// under /deep/ and the assertions separate the two.
+    fn setup_runtime_with_base_href(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/deep/page");
+        rt.run_page_init();
+        rt
+    }
+
+    const BASE_HREF_PAGE: &str = r#"<html><head><base href="/"></head><body>
+            <a id="link" href="data/x.json"></a>
+            <form id="form" action="submit"></form>
+        </body></html>"#;
+
+    #[test]
+    fn base_href_governs_dom_url_reflection() {
+        let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
+
+        let base_uri = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(base_uri.as_str().unwrap(), "http://example.com/");
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/data/x.json");
+
+        let action = rt
+            .evaluate("document.getElementById('form').action")
+            .unwrap();
+        assert_eq!(action.as_str().unwrap(), "http://example.com/submit");
+    }
+
+    #[test]
+    fn without_base_href_resolution_stays_on_the_document_url() {
+        let mut rt = setup_runtime_with_base_href(
+            r#"<html><head></head><body><a id="link" href="data/x.json"></a></body></html>"#,
+        );
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_href_governs_fetch_and_xhr_targets() {
+        let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const seen = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url) => {
+                        seen.push(url);
+                        return JSON.stringify({ status: 200, headers: {}, body: "{}", url });
+                    };
+                    await fetch("data/x.json");
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "data/y.json");
+                    xhr.send();
+                    await new Promise((r) => setTimeout(r, 0));
+                    return seen;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.expect("captured URLs");
+        let seen = value.as_array().expect("captured URLs");
+        assert_eq!(seen[0].as_str().unwrap(), "http://example.com/data/x.json");
+        assert_eq!(seen[1].as_str().unwrap(), "http://example.com/data/y.json");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
