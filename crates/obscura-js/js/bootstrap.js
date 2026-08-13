@@ -3749,6 +3749,15 @@ class Element extends Node {
       const r = _urlResolveOp(raw, _anchorBase());
       return r !== null ? r : raw;
     }
+    if (ln === 'base') {
+      // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+      // Against the fallback base URL, not the document base URL: a base element is not affected
+      // by other base elements or by itself. Apps read this to compute their own base.
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const r = _urlResolveOp(raw, _domParse("document_url") || "about:blank");
+      return r !== null ? r : raw;
+    }
     return this.getAttribute("href") || "";
   }
   set href(v) { this.setAttribute("href", v); }

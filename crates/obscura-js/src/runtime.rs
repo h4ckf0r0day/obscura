@@ -13515,9 +13515,12 @@ mod tests {
         );
     }
 
-    /// The document URL is two levels deep, so resolving against it instead of the base lands
-    /// under /deep/ and the assertions separate the two.
-    fn setup_runtime_with_base_href(html: &str) -> ObscuraJsRuntime {
+    /// Document URL two levels deep, base one level deep and on neither. The three candidate
+    /// bases therefore land on three different paths, and an assertion tells them apart:
+    ///   document base URL  ->  /app/data/x.json   (the spec)
+    ///   document URL       ->  /deep/data/x.json  (the defect)
+    ///   origin root        ->  /data/x.json       (a base of "/" would hide this one)
+    fn setup_runtime_at_deep_url(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -13526,46 +13529,150 @@ mod tests {
         rt
     }
 
-    const BASE_HREF_PAGE: &str = r#"<html><head><base href="/"></head><body>
+    const BASE_HREF_PAGE: &str = r#"<html><head><base href="/app/"></head><body>
             <a id="link" href="data/x.json"></a>
             <form id="form" action="submit"></form>
+            <script id="script" src="chunk.js"></script>
         </body></html>"#;
 
     #[test]
     fn base_href_governs_dom_url_reflection() {
-        let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
 
-        let base_uri = rt.evaluate("document.baseURI").unwrap();
-        assert_eq!(base_uri.as_str().unwrap(), "http://example.com/");
-
-        let link = rt
-            .evaluate("document.getElementById('link').href")
+        // One evaluate, one assertion: a bundle of assert_eq! stops at the first failure and
+        // reports one broken path while hiding the others.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
             .unwrap();
-        assert_eq!(link.as_str().unwrap(), "http://example.com/data/x.json");
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/app/"),
+                serde_json::json!("http://example.com/app/data/x.json"),
+                serde_json::json!("http://example.com/app/submit"),
+                serde_json::json!("http://example.com/app/chunk.js"),
+            ]
+        );
+    }
 
-        let action = rt
-            .evaluate("document.getElementById('form').action")
-            .unwrap();
-        assert_eq!(action.as_str().unwrap(), "http://example.com/submit");
+    #[test]
+    fn a_relative_location_assignment_follows_the_base() {
+        // _resolveUrl feeds location.href=, assign, replace and window.location=. It carries the
+        // widest blast radius of the six call sites, so it gets its own test.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        rt.evaluate("location.href = 'users/42'").unwrap();
+
+        let landed = rt.evaluate("location.href").unwrap();
+        assert_eq!(landed.as_str().unwrap(), "http://example.com/app/users/42");
     }
 
     #[test]
     fn without_base_href_resolution_stays_on_the_document_url() {
-        let mut rt = setup_runtime_with_base_href(
-            r#"<html><head></head><body><a id="link" href="data/x.json"></a></body></html>"#,
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body>
+                <a id="link" href="data/x.json"></a>
+                <form id="form" action="submit"></form>
+                <script id="script" src="chunk.js"></script>
+            </body></html>"#,
         );
 
+        // Every call site, not just the anchor: a site that resolves to the origin root instead
+        // of the document URL passes a base-less page only if nobody looks.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/deep/page"),
+                serde_json::json!("http://example.com/deep/data/x.json"),
+                serde_json::json!("http://example.com/deep/submit"),
+                serde_json::json!("http://example.com/deep/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_element_href_reflects_the_resolved_url() {
+        // Resolved against the fallback base URL, so the document URL and not /app/.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let href = rt.evaluate("document.querySelector('base').href").unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/app/");
+
+        let mut relative = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body></body></html>"#,
+        );
+        let href = relative
+            .evaluate("document.querySelector('base').href")
+            .unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/deep/assets/");
+    }
+
+    #[test]
+    fn the_first_base_with_an_href_wins() {
+        // Tree order, and a <base> without href does not count.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base><base href="/a/"><base href="/b/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
         let link = rt
             .evaluate("document.getElementById('link').href")
             .unwrap();
-        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
+        assert_eq!(link.as_str().unwrap(), "http://example.com/a/x.json");
+    }
+
+    #[test]
+    fn an_empty_base_href_resolves_to_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href=""></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/x.json");
+    }
+
+    #[test]
+    fn a_cross_origin_base_moves_the_target_but_not_the_page_origin() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="https://cdn.example.net/v2/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let seen = rt
+            .evaluate("return [document.getElementById('link').href, location.origin]")
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("https://cdn.example.net/v2/x.json"),
+                serde_json::json!("http://example.com"),
+            ]
+        );
     }
 
     #[test]
     fn base_href_rejects_a_data_url_base() {
         // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
         // Honouring it would make every later relative resolution fail instead of falling back.
-        let mut rt = setup_runtime_with_base_href(
+        let mut rt = setup_runtime_at_deep_url(
             r#"<html><head><base href="data:text/html,x"></head><body>
                 <a id="link" href="data/x.json"></a>
             </body></html>"#,
@@ -13583,7 +13690,7 @@ mod tests {
     #[test]
     fn base_resolution_follows_the_url_set_by_push_state() {
         // pushState changes the document's URL, and without <base> that URL is the base.
-        let mut rt = setup_runtime_with_base_href(
+        let mut rt = setup_runtime_at_deep_url(
             r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
         );
         rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
@@ -13596,7 +13703,7 @@ mod tests {
 
     #[test]
     fn a_relative_base_href_resolves_against_the_push_state_url() {
-        let mut rt = setup_runtime_with_base_href(
+        let mut rt = setup_runtime_at_deep_url(
             r#"<html><head><base href="assets/"></head><body>
                 <a id="link" href="x.json"></a>
             </body></html>"#,
@@ -13619,7 +13726,7 @@ mod tests {
             body.push_str(&format!("<div id=\"n{i}\"><span>text</span></div>"));
         }
         body.push_str("</body></html>");
-        let mut rt = setup_runtime_with_base_href(&body);
+        let mut rt = setup_runtime_at_deep_url(&body);
 
         let elapsed = rt
             .evaluate(
@@ -13640,7 +13747,7 @@ mod tests {
 
     #[test]
     fn the_base_memo_still_sees_a_base_element_added_later() {
-        let mut rt = setup_runtime_with_base_href(
+        let mut rt = setup_runtime_at_deep_url(
             r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
         );
         let before = rt
@@ -13665,11 +13772,11 @@ mod tests {
 
     #[test]
     fn the_base_memo_notices_a_changed_href_attribute() {
-        let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
         let before = rt
             .evaluate("document.getElementById('link').href")
             .unwrap();
-        assert_eq!(before.as_str().unwrap(), "http://example.com/data/x.json");
+        assert_eq!(before.as_str().unwrap(), "http://example.com/app/data/x.json");
 
         rt.evaluate("document.querySelector('base').setAttribute('href', '/other/')")
             .unwrap();
@@ -13682,7 +13789,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn base_href_governs_fetch_and_xhr_targets() {
-        let mut rt = setup_runtime_with_base_href(BASE_HREF_PAGE);
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
@@ -13713,8 +13820,12 @@ mod tests {
 
         let value = result.value.expect("captured URLs");
         let seen = value.as_array().expect("captured URLs");
-        assert_eq!(seen[0].as_str().unwrap(), "http://example.com/data/x.json");
-        assert_eq!(seen[1].as_str().unwrap(), "http://example.com/data/y.json");
+        // The XHR entry cannot isolate its own layer: send() hands the already absolute URL
+        // to fetch, so dropping the resolution in send leaves fetch to do it and the assertion
+        // still passes. It pins the outcome, not the layer.
+        assert_eq!(seen.len(), 2, "one fetch, one XHR");
+        assert_eq!(seen[0].as_str().unwrap(), "http://example.com/app/data/x.json");
+        assert_eq!(seen[1].as_str().unwrap(), "http://example.com/app/data/y.json");
     }
 
     #[tokio::test(flavor = "current_thread")]
