@@ -22,6 +22,16 @@ Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Pag
 OBSCURA_NAV_TIMEOUT_MS=60000 obscura serve
 ```
 
+### `OBSCURA_NAV_CHAIN_LIMIT`
+
+How many documents a navigation chain may load, the first navigation included. Default 10, which allows the requested document and nine navigations the page itself triggers via `location` assignments or form submissions. Raise the value for an endpoint that chains longer for good reasons, such as an SSO handover across several providers. The low default is what stops a page that resets `location` on every load.
+
+Values below 1 are raised to 1. That loads the requested document and does not chain further.
+
+```bash
+OBSCURA_NAV_CHAIN_LIMIT=20 obscura serve
+```
+
 ### `OBSCURA_CDP_COMMAND_TIMEOUT_MS`
 
 Per-command deadline for the CDP server. A hung page (a runaway `Runtime.evaluate`, a synchronous DOM op) is terminated after this budget so one bad session cannot hold the shared V8 lock and stall the others. Default 60000 (60 seconds); `0` disables it. Navigation self-bounds via `OBSCURA_NAV_TIMEOUT_MS` well under this.
