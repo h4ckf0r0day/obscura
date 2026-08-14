@@ -2396,12 +2396,12 @@ function _applyDocQueryEncoding(u) {
   return u;
 }
 
-// The base for relative URLs. <base href> overrides the document URL, so a sub-path SPA that
-// resolves against the document URL asks for "chunk-A.js" under its current route and gets 404.
+// The base for relative URLs. <base href> overrides the document URL, so an app in a sub-path
+// requests "chunk-A.js" under its current route and gets 404.
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
-// Returns "" without a document, so each caller keeps its own fallback.
+// Returns "" when there is no document, so each call site keeps its own fallback.
 function _documentBase() {
-  // history.pushState moves the document URL without telling the Rust side. The base then has to
+  // history.pushState moves the document URL without reaching the Rust side. Then the base must
   // be built here, or every relative URL resolves against the pre-routing address.
   const virtual = globalThis.__virtualUrl;
   if (virtual) {
@@ -3752,7 +3752,7 @@ class Element extends Node {
     if (ln === 'base') {
       // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
       // Against the fallback base URL, not the document base URL: a base element is not affected
-      // by other base elements or by itself. Apps read this to compute their own base.
+      // by other base elements or itself. Applications read this to determine their own base.
       const raw = this.getAttribute('href');
       if (raw === null) return '';
       const r = _urlResolveOp(raw, _domParse("document_url") || "about:blank");

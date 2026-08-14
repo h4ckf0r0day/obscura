@@ -151,9 +151,9 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
-    /// Memoized document base URL. Computing it walks the tree and runs the selector engine,
-    /// and the JS layer asks for it on every relative URL it resolves, including the `<a>`
-    /// URL-decomposition getters. Interior mutability so the read path keeps its shared borrow.
+    /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
+    /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
+    /// Interior mutability so the read path keeps its shared borrow.
     pub base_url_cache: RefCell<Option<BaseUrlCache>>,
     /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
     /// DOM/style/viewport changes clear this value but retain resource bytes.
@@ -1162,13 +1162,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
-        // The base for relative URLs. Differs from document_url exactly when the page carries
-        // <base href>, which is the whole point: HTML resolves against the base, not the document.
+        // The base for relative URLs. It differs from document_url exactly when the page carries
+        // a <base href>, and that is the point: HTML resolves against the base, not the document.
         "document_base_url" => serde_json::to_string(
             &document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone()),
         )
         .unwrap_or("\"\"".into()),
-        // The unresolved attribute. Only JS knows the URL after history.pushState, so only JS
+        // The unresolved attribute. After history.pushState only JS knows the URL, so only JS
         // can resolve a relative base against it.
         "document_base_href" => {
             serde_json::to_string(&document_base_href_memoized(&gs).unwrap_or_default())
@@ -4248,8 +4248,8 @@ fn op_waapi_control(
     changed
 }
 
-// Not gated on `render`: the JS layer resolves every relative URL through this, and it does so
-// in all build variants.
+// Not tied to `render`: the JS layer resolves every relative URL through here, in all build
+// variants.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     let document_url = url::Url::parse(&state.url).ok()?;
     let base_href = state.dom.as_ref().and_then(|dom| {
@@ -4263,8 +4263,8 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     });
     match base_href {
         // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
-        // A data: or javascript: base falls back to the document URL. Honouring it would make
-        // every later relative resolution fail instead.
+        // A data: or javascript: base falls back to the document URL. Accepting it would instead
+        // make every later relative resolution fail.
         Some(href) => match document_url.join(&href) {
             Ok(base) if base.scheme() != "data" && base.scheme() != "javascript" => {
                 Some(base.to_string())
@@ -4276,8 +4276,8 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
 }
 
 /// The raw `href` attribute of the first `<base href>`, unresolved. The JS layer needs it after
-/// `history.pushState`: the document URL moved, only JS knows the new one, so only JS can resolve
-/// a relative base against it.
+/// `history.pushState`: the document URL has moved, only JS knows the new one, so only JS can
+/// resolve a relative base against it.
 fn document_base_href(state: &ObscuraState) -> Option<String> {
     state.dom.as_ref().and_then(|dom| {
         dom.query_selector("base[href]")
@@ -4290,7 +4290,7 @@ fn document_base_href(state: &ObscuraState) -> Option<String> {
     })
 }
 
-/// What the cached values were computed from. Any of the three moving, and they are recomputed.
+/// What the cached values were computed from. If any of the three changes, they are recomputed.
 pub struct BaseUrlCache {
     activity_generation: u64,
     document_generation: u64,
@@ -4299,8 +4299,8 @@ pub struct BaseUrlCache {
     raw_href: Option<String>,
 }
 
-/// Both base values behind one memo. Uncached, each walks the tree and runs the selector engine,
-/// which turned `a.href` into an O(nodes) read.
+/// Both base values behind a cache. Uncached, each one walks the tree and runs the selector
+/// engine, which would make `a.href` an O(nodes) read.
 fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>) {
     if let Some(cached) = state.base_url_cache.borrow().as_ref() {
         if cached.activity_generation == state.activity_generation

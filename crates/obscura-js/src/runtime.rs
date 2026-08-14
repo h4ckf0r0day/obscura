@@ -13515,11 +13515,12 @@ mod tests {
         );
     }
 
-    /// Document URL two levels deep, base one level deep and on neither. The three candidate
-    /// bases therefore land on three different paths, and an assertion tells them apart:
+    /// Document URL two levels deep, base one level deep and the origin root on neither of the
+    /// two. The three possible bases land on three different paths, and one assert keeps them
+    /// apart:
     ///   document base URL  ->  /app/data/x.json   (the spec)
-    ///   document URL       ->  /deep/data/x.json  (the defect)
-    ///   origin root        ->  /data/x.json       (a base of "/" would hide this one)
+    ///   document URL       ->  /deep/data/x.json  (the bug)
+    ///   origin root        ->  /data/x.json       (a base "/" would hide this one)
     fn setup_runtime_at_deep_url(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
         let mut rt = ObscuraJsRuntime::new();
@@ -13539,7 +13540,7 @@ mod tests {
     fn base_href_governs_dom_url_reflection() {
         let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
 
-        // One evaluate, one assertion: a bundle of assert_eq! stops at the first failure and
+        // One evaluate, one assert: a bundle of assert_eq! aborts at the first failure and
         // reports one broken path while hiding the others.
         let seen = rt
             .evaluate(
@@ -13564,8 +13565,8 @@ mod tests {
 
     #[test]
     fn a_relative_location_assignment_follows_the_base() {
-        // _resolveUrl feeds location.href=, assign, replace and window.location=. It carries the
-        // widest blast radius of the six call sites, so it gets its own test.
+        // _resolveUrl serves location.href=, assign, replace and window.location=. Of the six
+        // call sites it has the largest external effect, so it gets its own test.
         let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
         rt.evaluate("location.href = 'users/42'").unwrap();
 
@@ -13584,7 +13585,7 @@ mod tests {
         );
 
         // Every call site, not just the anchor: a site that resolves to the origin root instead
-        // of the document URL passes a base-less page only if nobody looks.
+        // of the document URL slips through on a page without a base only when nobody is looking.
         let seen = rt
             .evaluate(
                 r#"return [
@@ -13608,7 +13609,7 @@ mod tests {
 
     #[test]
     fn base_element_href_reflects_the_resolved_url() {
-        // Resolved against the fallback base URL, so the document URL and not /app/.
+        // Resolved against the fallback base URL, i.e. the document URL and not /app/.
         let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
         let href = rt.evaluate("document.querySelector('base').href").unwrap();
         assert_eq!(href.as_str().unwrap(), "http://example.com/app/");
@@ -13671,7 +13672,7 @@ mod tests {
     #[test]
     fn base_href_rejects_a_data_url_base() {
         // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
-        // Honouring it would make every later relative resolution fail instead of falling back.
+        // Accepting it would make every later relative resolution fail instead of falling back.
         let mut rt = setup_runtime_at_deep_url(
             r#"<html><head><base href="data:text/html,x"></head><body>
                 <a id="link" href="data/x.json"></a>
@@ -13689,7 +13690,7 @@ mod tests {
 
     #[test]
     fn base_resolution_follows_the_url_set_by_push_state() {
-        // pushState changes the document's URL, and without <base> that URL is the base.
+        // pushState changes the document URL, and without <base> that very URL is the base.
         let mut rt = setup_runtime_at_deep_url(
             r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
         );
@@ -13716,9 +13717,9 @@ mod tests {
         assert_eq!(link.as_str().unwrap(), "http://example.com/other/assets/x.json");
     }
 
-    /// Guards the memo in `document_base_url_memoized`. Without it every one of these reads walked
+    /// Guards the cache in `document_base_url_memoized`. Without it, each of these reads walked
     /// the tree and ran the selector engine, and `a.href` went from a field read to O(nodes).
-    /// The budget is loose on purpose: it must catch the regression, not police the allocator.
+    /// The bound is deliberately loose: it should catch the regression, not watch the allocator.
     #[test]
     fn anchor_href_reads_do_not_scale_with_document_size() {
         let mut body = String::from(r#"<html><head></head><body><a id="link" href="x.json"></a>"#);
@@ -13741,7 +13742,7 @@ mod tests {
         let ms = elapsed.as_f64().expect("elapsed ms");
         assert!(
             ms < 500.0,
-            "2000 reads of a.href on a 12000-node document took {ms} ms, the base lookup is not memoized"
+            "2000 a.href reads on a document with 12000 nodes took {ms} ms, the base query is not cached"
         );
     }
 
@@ -13820,9 +13821,9 @@ mod tests {
 
         let value = result.value.expect("captured URLs");
         let seen = value.as_array().expect("captured URLs");
-        // The XHR entry cannot isolate its own layer: send() hands the already absolute URL
-        // to fetch, so dropping the resolution in send leaves fetch to do it and the assertion
-        // still passes. It pins the outcome, not the layer.
+        // The XHR entry cannot isolate its own layer: send() passes the already absolute URL on
+        // to fetch, so fetch takes over the resolution if it is removed from send, and the assert
+        // still holds. It pins the result, not the layer.
         assert_eq!(seen.len(), 2, "one fetch, one XHR");
         assert_eq!(seen[0].as_str().unwrap(), "http://example.com/app/data/x.json");
         assert_eq!(seen[1].as_str().unwrap(), "http://example.com/app/data/y.json");
