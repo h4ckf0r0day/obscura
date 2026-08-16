@@ -517,7 +517,7 @@ pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
 ///
 /// A page with no frames pays only an `is_empty` check: looking up the current
 /// context is not free, and `op_dom` is the hottest op in the system.
-pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+pub fn realm_state(scope: &mut v8::PinScope, op_state: &OpState) -> SharedState {
     let page = || op_state.borrow::<SharedState>().clone();
     let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
         Some(registry) => registry.clone(),
@@ -2153,7 +2153,7 @@ fn cors_response_allows(
     }
 }
 
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_fetch_url(
     state: Rc<RefCell<OpState>>,
@@ -3471,7 +3471,7 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
@@ -3486,7 +3486,7 @@ fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+fn op_set_cookie(scope: &mut v8::PinScope, state: &OpState, #[string] cookie_str: &str) {
     let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
@@ -3504,7 +3504,7 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
 // navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
 fn op_navigate(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] method: &str,
@@ -3580,7 +3580,7 @@ fn op_post_frame_message(
 /// and a snapshot-restored realm has none. This resolves an ordinary promise
 /// instead, and V8 reports the frame as the microtask context, so the ops a
 /// timer callback makes still find the frame's own document.
-#[op2(async)]
+#[op2]
 async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
@@ -3593,7 +3593,7 @@ const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 // id means the bounded native queue refused the document.
 #[op2(fast)]
 fn op_frame_document_ready(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] html: &str,
@@ -3651,7 +3651,7 @@ fn op_async_runtime_available() -> bool {
 /// turn, while avoiding the roughly one-millisecond floor of a zero-duration
 /// timer. The bootstrap owns task priority, FIFO order, and one-at-a-time
 /// delivery; this op supplies only the event-loop wake boundary.
-#[op2(async)]
+#[op2]
 async fn op_posted_task() {
     tokio::task::yield_now().await;
 }
@@ -5012,7 +5012,7 @@ fn finish_async_image_metadata(
 /// navigation/URL/profile share one fetch, and completion revalidates both the
 /// document identity and responsive candidate before exposing lifecycle state.
 #[cfg(feature = "render")]
-#[op2(async)]
+#[op2]
 #[string]
 async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
     let shared = {
