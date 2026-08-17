@@ -264,6 +264,11 @@ pub struct Page {
     /// 50-second navigation is not silently cut off by the process default.
     /// Pages without an override retain the environment-configurable default.
     navigation_timeout: Option<std::time::Duration>,
+    /// Optional per-page cap on how many documents a navigation chain may
+    /// load. Automation frontends raise it for an endpoint they know
+    /// chains longer than the default allows. Pages without their own
+    /// value keep the default, which is adjustable via the environment.
+    navigation_chain_limit: Option<usize>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -310,6 +315,15 @@ fn max_live_frames() -> usize {
         .unwrap_or(64)
 }
 
+/// How many documents a navigation chain may load, the first navigation
+/// included. So the default of 10 allows the requested document and nine
+/// client-initiated navigations on top.
+///
+/// The low default is deliberate. It is what stops a page that resets
+/// `location` on every load. Raise it only for a known endpoint that
+/// chains longer for good reasons, such as an SSO handover.
+const DEFAULT_NAVIGATION_CHAIN_LIMIT: usize = 10;
+
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
@@ -319,6 +333,24 @@ fn navigation_timeout_from_env_value(value: Option<&str>) -> std::time::Duration
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS);
     std::time::Duration::from_millis(milliseconds)
+}
+
+fn default_navigation_chain_limit() -> usize {
+    navigation_chain_limit_from_env_value(std::env::var("OBSCURA_NAV_CHAIN_LIMIT").ok().as_deref())
+}
+
+fn navigation_chain_limit_from_env_value(value: Option<&str>) -> usize {
+    // A number from the environment is honoured, raised to the smallest
+    // usable limit. A zero would let the loop run without a single
+    // iteration, the page would report success and have loaded nothing.
+    // That is the one failure mode a caller does not see. Only an
+    // unreadable value falls back to the default. `OBSCURA_NAV_CHAIN_LIMIT=0`
+    // and `set_navigation_chain_limit(0)` therefore mean the same: load the
+    // first document and do not chain further.
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|limit| limit.max(1))
+        .unwrap_or(DEFAULT_NAVIGATION_CHAIN_LIMIT)
 }
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
@@ -921,6 +953,7 @@ impl Page {
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timeout: None,
+            navigation_chain_limit: None,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -950,6 +983,23 @@ impl Page {
     pub fn navigation_timeout(&self) -> std::time::Duration {
         self.navigation_timeout
             .unwrap_or_else(default_navigation_timeout)
+    }
+
+    /// Sets for this page how many documents a navigation chain may load,
+    /// the first navigation included. This per-page value takes precedence
+    /// over `OBSCURA_NAV_CHAIN_LIMIT`. Callers that do not set it keep the
+    /// default of 10, which is adjustable via the environment.
+    ///
+    /// A limit of 0 is raised to 1. Otherwise it would skip the first
+    /// navigation and report success without having loaded anything.
+    pub fn set_navigation_chain_limit(&mut self, limit: usize) {
+        self.navigation_chain_limit = Some(limit.max(1));
+    }
+
+    /// Returns the navigation chain limit in effect for this page.
+    pub fn navigation_chain_limit(&self) -> usize {
+        self.navigation_chain_limit
+            .unwrap_or_else(default_navigation_chain_limit)
     }
 
     fn should_block_url(&self, url: &str) -> bool {
@@ -2732,8 +2782,8 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
-        const REDIRECT_LIMIT: usize = 10;
-        for chain in 0..REDIRECT_LIMIT {
+        let chain_limit = self.navigation_chain_limit();
+        for chain in 0..chain_limit {
             self.navigate_single(
                 &current_url,
                 wait_until,
@@ -2775,12 +2825,12 @@ impl Page {
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
-                if chain + 1 == REDIRECT_LIMIT {
+                if chain + 1 == chain_limit {
                     // Hit the cap and the page still wants to keep
                     // chaining. Surface that as an error instead of
                     // returning Ok(()) so callers can distinguish a
-                    // successful load from a redirect storm.
-                    return Err(PageError::TooManyRedirects(REDIRECT_LIMIT));
+                    // successful load from a navigation storm.
+                    return Err(PageError::TooManyClientNavigations(chain_limit));
                 }
                 continue;
             }
@@ -4141,9 +4191,11 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
-        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
-        truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        materialize_stylesheet_graph, navigation_chain_limit_from_env_value, navigation_referrer,
+        navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
+        script_response_is_executable, split_css_imports, truncate_on_char_boundary,
+        url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -4168,6 +4220,30 @@ mod tests {
             navigation_timeout_from_env_value(Some("42000")),
             std::time::Duration::from_secs(42)
         );
+    }
+
+    #[test]
+    fn navigation_chain_limit_environment_default_remains_ten() {
+        assert_eq!(navigation_chain_limit_from_env_value(None), 10);
+        assert_eq!(
+            navigation_chain_limit_from_env_value(Some("not-a-limit")),
+            10
+        );
+    }
+
+    #[test]
+    fn navigation_chain_limit_environment_override_remains_available() {
+        assert_eq!(navigation_chain_limit_from_env_value(Some("25")), 25);
+    }
+
+    /// A zero would let the navigation loop skip the first navigation and
+    /// report success without having loaded anything. It is raised to the
+    /// smallest usable limit, the same value `set_navigation_chain_limit(0)`
+    /// yields. The two ways of setting the limit thereby agree on what 0
+    /// means.
+    #[test]
+    fn navigation_chain_limit_raises_a_zero_that_would_load_nothing() {
+        assert_eq!(navigation_chain_limit_from_env_value(Some("0")), 1);
     }
 
     #[test]
@@ -4389,6 +4465,141 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+    }
+
+    /// Serves a chain of client-initiated navigations: `/hop/N` is an
+    /// HTML document whose script sets `location.href = "/hop/N-1"`,
+    /// `/hop/0` is the target. To an unreadable path the fixture replies
+    /// with 404. A broken fixture thereby fails the test instead of
+    /// silently ending the chain.
+    fn client_navigation_chain_address(name: &str, connections: usize) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let length = stream.read(&mut buffer).unwrap_or(0);
+                let hop = String::from_utf8_lossy(&buffer[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .and_then(|path| path.strip_prefix("/hop/"))
+                    .and_then(|hop| hop.parse::<usize>().ok());
+                let response = match hop {
+                    Some(0) => {
+                        let body = format!("<!doctype html><title>{name}</title>");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    Some(hop) => {
+                        let body = format!("<script>location.href='/hop/{}'</script>", hop - 1);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        address
+    }
+
+    /// The limit is always set explicitly, never inherited. Otherwise the
+    /// page would read `OBSCURA_NAV_CHAIN_LIMIT` from the process
+    /// environment, and anyone running the suite with exactly the switch
+    /// this module introduces would see these tests fail through no fault
+    /// of the code.
+    fn chain_page(name: &str, limit: usize) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new(name.to_string(), context);
+        page.set_navigation_chain_limit(limit);
+        page
+    }
+
+    /// The default allows the requested document and nine client-initiated
+    /// navigations. `/hop/9` is exactly that chain and must arrive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_default_allows_nine_client_navigations() {
+        let address = client_navigation_chain_address("arrived", 10);
+        let mut page = chain_page("chain-within-default", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        page.navigate(&format!("http://{address}/hop/9"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
+    }
+
+    /// One document more than the default, and the page still wants to
+    /// chain on. This must surface as an error, not as a successful load.
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_beyond_the_default_reports_client_navigations() {
+        let address = client_navigation_chain_address("arrived", 10);
+        let mut page = chain_page("chain-beyond-default", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        let error = page
+            .navigate(&format!("http://{address}/hop/10"))
+            .await
+            .expect_err("a chain past the limit must not report success");
+
+        assert!(
+            matches!(error, super::PageError::TooManyClientNavigations(10)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Too many client-initiated navigations, the chain reached its limit of 10 documents"
+        );
+    }
+
+    /// The same chain that fails at the default succeeds as soon as the
+    /// caller raises the per-page limit. Without a way to raise it, an
+    /// endpoint that chains longer for good reasons remains simply
+    /// unreachable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn raised_navigation_chain_limit_reaches_a_longer_chain() {
+        let address = client_navigation_chain_address("arrived", 12);
+        let mut page = chain_page("chain-raised", 12);
+
+        page.navigate(&format!("http://{address}/hop/11"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
+    }
+
+    /// A limit of 0 would let the loop run without a single iteration. The
+    /// page must still load its first document.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_navigation_chain_limit_still_loads_the_initial_document() {
+        let address = client_navigation_chain_address("arrived", 1);
+        let mut page = chain_page("chain-zero", 0);
+
+        page.navigate(&format!("http://{address}/hop/0"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6719,8 +6930,14 @@ pub enum PageError {
     #[error("Parse error: {0}")]
     ParseError(String),
 
-    #[error("Too many redirects (limit {0})")]
-    TooManyRedirects(usize),
+    /// A page kept triggering its own navigations after each load until
+    /// the chain's limit was exhausted. These are client-initiated
+    /// navigations in the sense of CDP's `Page.ClientNavigationReason`,
+    /// that is, `location` assignments and form submissions. HTTP 3xx
+    /// redirects are followed one layer down, in obscura-net, and report
+    /// `ObscuraNetError::TooManyRedirects`.
+    #[error("Too many client-initiated navigations, the chain reached its limit of {0} documents")]
+    TooManyClientNavigations(usize),
 }
 
 impl From<ObscuraNetError> for PageError {
