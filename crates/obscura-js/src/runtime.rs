@@ -14478,12 +14478,42 @@ mod tests {
     }
 
     #[test]
-    fn test_create_event_unknown_type_returns_event() {
+    fn test_create_event_unknown_type_throws_not_supported() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let kind = rt
-            .evaluate("document.createEvent('NotARealType') instanceof Event")
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        document.createEvent('NotARealType');
+                        return null;
+                    } catch (error) {
+                        return [error.name, error instanceof DOMException];
+                    }
+                })()"#,
+            )
             .unwrap();
-        assert_eq!(kind, serde_json::json!(true));
+        assert_eq!(
+            result,
+            serde_json::json!(["NotSupportedError", true])
+        );
+    }
+
+    #[test]
+    fn test_create_event_legacy_aliases_return_event() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    return [
+                        document.createEvent('Event') instanceof Event,
+                        document.createEvent('Events') instanceof Event,
+                        document.createEvent('HTMLEvents') instanceof Event,
+                        document.createEvent('SVGEvents') instanceof Event
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, true, true]));
     }
 
     #[test]

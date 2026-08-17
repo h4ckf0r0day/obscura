@@ -5004,15 +5004,11 @@ class Document extends Node {
   // Legacy DOM Level 2 event factory. Spec returns an event of the requested
   // class with an empty type until init*Event() is called. We previously
   // returned a generic Event for every type, which broke libraries that call
-  // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
+  // createEvent('CustomEvent').initCustomEvent(...), see issue #41. The four
+  // legacy aliases Event/Events/HTMLEvents/SVGEvents map to a plain Event;
+  // unknown names throw NotSupportedError (issue #610).
   createEvent(type) {
     const normalized = String(type || '').toLowerCase();
-    if (normalized === 'promiserejectionevent') {
-      throw new DOMException(
-        "The provided event type ('PromiseRejectionEvent') is invalid",
-        'NotSupportedError'
-      );
-    }
     const map = {
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
@@ -5028,8 +5024,16 @@ class Document extends Node {
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
       'storageevent': StorageEvent,
+      'event': Event, 'events': Event,
+      'htmlevents': Event, 'svgevents': Event,
     };
-    const Cls = map[normalized] || Event;
+    const Cls = map[normalized];
+    if (!Cls) {
+      throw new DOMException(
+        `The provided event type ('${type}') is invalid`,
+        'NotSupportedError'
+      );
+    }
     return new Cls('');
   }
   createRange() { return new Range(); }
