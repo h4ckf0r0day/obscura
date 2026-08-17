@@ -19,10 +19,43 @@ use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, cors_required, fetch_file_url, redirect_taints_origin,
-    request_fetch_site, request_referrer, response_too_large, serialized_request_origin,
-    validate_cors_response, validate_request_mode, validate_url,
+    ResourceRequest, Response, SsrfGuardResolver, cors_required, env_allows_private_network,
+    fetch_file_url, is_forbidden_ip, redirect_taints_origin, request_fetch_site,
+    request_referrer, response_too_large, serialized_request_origin, validate_cors_response,
+    validate_request_mode, validate_url,
 };
+
+/// The wreq half of [`SsrfGuardResolver`]. `validate_url` only inspects the
+/// host *string*, so on its own it lets a public name that resolves inward
+/// straight through — the reqwest client closes that with a `dns_resolver`, and
+/// until this impl existed the stealth client did not, which made `--stealth` a
+/// downgrade in protection rather than only a change of fingerprint. The
+/// deny-set is shared, so the two transports cannot drift apart.
+#[cfg(feature = "stealth")]
+impl wreq::dns::Resolve for SsrfGuardResolver {
+    fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
+        let allow = self.allow_private || env_allows_private_network();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if !allow {
+                if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
+                    return Err(format!(
+                        "SSRF blocked: '{}' resolves to forbidden address {}",
+                        host,
+                        bad.ip()
+                    )
+                    .into());
+                }
+            }
+            let iter: wreq::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
@@ -160,6 +193,10 @@ impl StealthHttpClient {
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
             .timeout(Duration::from_secs(30))
+            // SSRF guard: reject hostnames that resolve to a private/loopback IP.
+            // `false` mirrors the `validate_url(url, false)` calls below; the
+            // resolver still honours OBSCURA_ALLOW_PRIVATE_NETWORK on its own.
+            .dns_resolver(Arc::new(SsrfGuardResolver::new(false)))
             .redirect(wreq::redirect::Policy::none());
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
@@ -487,8 +524,32 @@ mod tests {
     use url::Url;
 
     use super::{StealthHttpClient, send_get_with_connection_reset_retry};
-    use crate::client::ObscuraNetError;
+    use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
+    use wreq::dns::{Name, Resolve};
+
+    // Mirrors client::ssrf_tests::resolver_blocks_hostname_that_resolves_to_loopback.
+    // Both transports must agree: a host-string check alone cannot see that a
+    // public name points inward, so the stealth client needs the same resolver.
+    #[tokio::test]
+    async fn stealth_resolver_blocks_hostname_that_resolves_to_loopback() {
+        let resolver = SsrfGuardResolver::new(false);
+        let res = resolver.resolve(Name::from("localtest.me")).await;
+        assert!(res.is_err(), "localtest.me -> 127.0.0.1 must be blocked");
+    }
+
+    #[tokio::test]
+    async fn stealth_resolver_does_not_block_public_host() {
+        // Tolerate a no-network sandbox: only an actual SSRF rejection fails.
+        let resolver = SsrfGuardResolver::new(false);
+        match resolver.resolve(Name::from("example.com")).await {
+            Ok(_) => {}
+            Err(e) => assert!(
+                !e.to_string().contains("SSRF blocked"),
+                "example.com wrongly SSRF-blocked: {e}"
+            ),
+        }
+    }
 
     const PLAIN_BODY: &str = "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
 
