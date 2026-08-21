@@ -1920,20 +1920,7 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
-    try {
-      const doc = globalThis.document;
-      const docUrl = (doc && doc.URL) || "";
-      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
-      if (baseEl) {
-        const href = baseEl.getAttribute("href");
-        if (href) {
-          return docUrl ? new URL(href, docUrl).href : href;
-        }
-      }
-      return docUrl;
-    } catch (e) {
-      return "";
-    }
+    try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
@@ -2492,10 +2479,25 @@ function _applyDocQueryEncoding(u) {
   return u;
 }
 
+// The base for relative URLs. <base href> overrides the document URL, so an app in a sub-path
+// requests "chunk-A.js" under its current route and gets 404.
+// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
+// Returns "" when there is no document, so each call site keeps its own fallback.
+function _documentBase() {
+  // history.pushState moves the document URL without reaching the Rust side. Then the base must
+  // be built here, or every relative URL resolves against the pre-routing address.
+  const virtual = globalThis.__virtualUrl;
+  if (virtual) {
+    const raw = _domParse("document_base_href");
+    if (!raw) return virtual;
+    try { return new URL(raw, virtual).href; } catch (e) { return virtual; }
+  }
+  return _domParse("document_base_url") || _domParse("document_url") || "";
+}
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
-function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+function _anchorBase() { return _documentBase() || "about:blank"; }
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
@@ -3834,6 +3836,15 @@ class Element extends Node {
       const r = _urlResolveOp(raw, _anchorBase());
       return r !== null ? r : raw;
     }
+    if (ln === 'base') {
+      // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+      // Against the fallback base URL, not the document base URL: a base element is not affected
+      // by other base elements or itself. Applications read this to determine their own base.
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const r = _urlResolveOp(raw, _domParse("document_url") || "about:blank");
+      return r !== null ? r : raw;
+    }
     return this.getAttribute("href") || "";
   }
   set href(v) { this.setAttribute("href", v); }
@@ -3881,7 +3892,7 @@ class Element extends Node {
     // value (issue #255). getAttribute("src") still returns the literal.
     const v = this.getAttribute("src");
     if (!v) return "";
-    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
+    try { return new URL(v, _documentBase() || "about:blank").href; }
     catch (e) { return v; }
   }
   set src(v) {
@@ -3980,8 +3991,9 @@ class Element extends Node {
     return this._iframeWin;
   }
   get action() {
+    // A missing action falls back to the document URL, a present one resolves against the base.
     const action = this.getAttribute("action") || _domParse("document_url") || "";
-    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+    try { return new URL(action, _documentBase() || "about:blank").href; } catch(e) { return action; }
   }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
@@ -6106,7 +6118,7 @@ function _resolveUrl(url) {
   url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  try { return new URL(url, _documentBase() || "about:blank").href; } catch(e) { return url; }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -6741,8 +6753,7 @@ globalThis.fetch = async (input, init = {}) => {
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
     try {
-      const base = _domParse("document_url") || "about:blank";
-      url = new URL(url, base).href;
+      url = new URL(url, _documentBase() || "about:blank").href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
   const method = init.method || (input instanceof Request ? input.method : "GET");
@@ -6916,8 +6927,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     let url = this._url;
     if (url && !url.includes('://')) {
       try {
-        const base = _domParse("document_url") || "about:blank";
-        url = new URL(url, base).href;
+        url = new URL(url, _documentBase() || "about:blank").href;
       } catch(e) {}
     }
 
