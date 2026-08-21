@@ -329,7 +329,7 @@ pub async fn handle(
             let (quad, w, h) = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                 if nums.len() >= 10 {
-                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(n)).collect();
+                    let q: Vec<Value> = nums[..8].iter().map(|n| coord_value(*n)).collect();
                     (q, nums[8], nums[9])
                 } else {
                     (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
@@ -343,7 +343,7 @@ pub async fn handle(
                     "padding": quad.clone(),
                     "border": quad.clone(),
                     "margin": quad,
-                    "width": w, "height": h,
+                    "width": coord_value(w), "height": coord_value(h),
                 }
             }))
         }
@@ -365,7 +365,7 @@ pub async fn handle(
             let val = page.evaluate(&code);
             let quad = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| json!(n)).collect::<Vec<_>>() }
+                if nums.len() == 8 { nums.iter().map(|n| coord_value(*n)).collect::<Vec<_>>() }
                 else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
             } else {
                 vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
@@ -373,6 +373,23 @@ pub async fn handle(
             Ok(json!({ "quads": [quad] }))
         }
         _ => Err(format!("Unknown DOM method: {}", method)),
+    }
+}
+
+/// Serialize a CDP box-model coordinate the way Chrome does: an integral double
+/// (e.g. `256.0`) becomes a JSON integer (`256`), while a genuinely fractional
+/// value (`206.0390625`) stays a float. serde_json always writes an `f64` with a
+/// decimal point, so `json!(256.0)` yields `256.0` — which strict CDP clients
+/// (Hermes Agent) deserialize as `i64` and reject, breaking every click-by-
+/// coordinate flow. Chrome only widens fractional coordinates, so mirroring that
+/// keeps those clients working. (issue #576)
+fn coord_value(n: f64) -> Value {
+    // Collapse to an integer only when the value is exactly integral and fits an
+    // i64 losslessly; NaN/inf and out-of-range doubles fall through unchanged.
+    if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        json!(n as i64)
+    } else {
+        json!(n)
     }
 }
 
@@ -760,6 +777,30 @@ mod tests {
         assert!(
             err.contains("allow-file-access"),
             "error must point at the allow-file-access flag: {err}"
+        );
+    }
+
+    // issue #576: DOM.getBoxModel / getContentQuads build their quad from f64
+    // pixel values, so serde_json emits integral coordinates as `256.0`. Strict
+    // CDP clients (Hermes Agent) deserialize the quad as i64 and reject the
+    // float. coord_value must serialize integral coordinates as integers, the way
+    // Chrome does, while leaving genuinely fractional ones as floats.
+    #[test]
+    fn box_model_integral_coordinates_serialize_as_integers() {
+        assert_eq!(serde_json::to_string(&coord_value(256.0)).unwrap(), "256");
+        assert_eq!(serde_json::to_string(&coord_value(0.0)).unwrap(), "0");
+        // fractional coordinates stay floats
+        assert_eq!(serde_json::to_string(&coord_value(206.0390625)).unwrap(), "206.0390625");
+        // a full quad mixes both, exactly as DOM.getBoxModel returns it
+        let quad: Vec<Value> = [
+            256.0, 206.0390625, 347.25, 206.0390625, 347.25, 225.0390625, 256.0, 225.0390625,
+        ]
+        .iter()
+        .map(|n| coord_value(*n))
+        .collect();
+        assert_eq!(
+            serde_json::to_string(&quad).unwrap(),
+            "[256,206.0390625,347.25,206.0390625,347.25,225.0390625,256,225.0390625]"
         );
     }
 }
