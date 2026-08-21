@@ -84,6 +84,120 @@ pub struct JsNetworkEvent {
     pub timestamp: f64,
 }
 
+const LOCAL_STORAGE_ORIGIN_LIMIT: usize = 5 * 1024 * 1024;
+const LOCAL_STORAGE_TOTAL_LIMIT: usize = 32 * 1024 * 1024;
+const LOCAL_STORAGE_ORIGIN_COUNT_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct OriginStorageInner {
+    origins: HashMap<String, Vec<(String, String)>>,
+    bytes: usize,
+}
+
+/// BrowserContext-scoped localStorage. Each origin has its own ordered store,
+/// while pages in the same context share the backing data.
+#[derive(Default)]
+pub struct OriginStorage {
+    inner: std::sync::Mutex<OriginStorageInner>,
+}
+
+impl OriginStorage {
+    fn snapshot(&self, origin: &str) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .origins
+            .get(origin)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get(&self, origin: &str, key: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .origins
+            .get(origin)
+            .and_then(|items| items.iter().find(|(name, _)| name == key))
+            .map(|(_, value)| value.clone())
+    }
+
+    fn set(&self, origin: &str, key: String, value: String) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !inner.origins.contains_key(origin)
+            && inner.origins.len() >= LOCAL_STORAGE_ORIGIN_COUNT_LIMIT
+        {
+            return false;
+        }
+
+        let items = inner.origins.get(origin);
+        let previous = items
+            .and_then(|items| items.iter().find(|(name, _)| name == &key))
+            .map(|(name, value)| name.len() + value.len())
+            .unwrap_or(0);
+        let origin_bytes = items
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let new_bytes = key.len() + value.len();
+        let next_origin_bytes = origin_bytes - previous + new_bytes;
+        let next_total_bytes = inner.bytes - previous + new_bytes;
+        if next_origin_bytes > LOCAL_STORAGE_ORIGIN_LIMIT
+            || next_total_bytes > LOCAL_STORAGE_TOTAL_LIMIT
+        {
+            return false;
+        }
+
+        let items = inner.origins.entry(origin.to_string()).or_default();
+        if let Some((_, old_value)) = items.iter_mut().find(|(name, _)| name == &key) {
+            *old_value = value;
+        } else {
+            items.push((key, value));
+        }
+        inner.bytes = next_total_bytes;
+        true
+    }
+
+    fn remove(&self, origin: &str, key: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = inner.origins.get_mut(origin).and_then(|items| {
+            items
+                .iter()
+                .position(|(name, _)| name == key)
+                .map(|index| items.remove(index))
+        });
+        if let Some((name, value)) = removed {
+            inner.bytes -= name.len() + value.len();
+        }
+        if inner.origins.get(origin).is_some_and(Vec::is_empty) {
+            inner.origins.remove(origin);
+        }
+    }
+
+    fn clear(&self, origin: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(items) = inner.origins.remove(origin) {
+            inner.bytes -= items
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>();
+        }
+    }
+}
+
 #[cfg(feature = "render")]
 pub use obscura_render::ImageRequestProfile;
 
@@ -112,6 +226,11 @@ pub struct ObscuraState {
     pub referrer: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    pub local_storage: Option<Arc<OriginStorage>>,
+    /// Browsing-context-scoped session storage. Per page, keyed by origin,
+    /// so an entry survives realm teardown on same-origin navigation but
+    /// never leaves the tab (issue #678).
+    pub session_storage: Option<Arc<OriginStorage>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -288,6 +407,8 @@ impl ObscuraState {
             referrer: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            local_storage: Some(Arc::new(OriginStorage::default())),
+            session_storage: Some(Arc::new(OriginStorage::default())),
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -3500,6 +3621,84 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+fn storage_origin(raw_url: &str) -> String {
+    url::Url::parse(raw_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "null".to_string())
+}
+
+fn origin_storage_command(
+    storage: &Option<Arc<OriginStorage>>,
+    origin: &str,
+    command: &str,
+    key: &str,
+    value: &str,
+) -> String {
+    let Some(storage) = storage else {
+        return "null".to_string();
+    };
+
+    match command {
+        "snapshot" => serde_json::to_string(&storage.snapshot(origin))
+            .unwrap_or_else(|_| "[]".to_string()),
+        "get" => serde_json::to_string(&storage.get(origin, key))
+            .unwrap_or_else(|_| "null".to_string()),
+        "set" => storage.set(origin, key.to_string(), value.to_string()).to_string(),
+        "remove" => {
+            storage.remove(origin, key);
+            "true".to_string()
+        }
+        "clear" => {
+            storage.clear(origin);
+            "true".to_string()
+        }
+        _ => "null".to_string(),
+    }
+}
+
+#[op2]
+#[string]
+fn op_local_storage(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] command: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> String {
+    // Per-realm on purpose: a cross-origin frame must land in its own
+    // origin's bucket, not the top document's. Same-origin frames resolve
+    // to the shared page Arcs, so sharing there is unchanged.
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    origin_storage_command(
+        &gs.local_storage,
+        &storage_origin(&gs.url),
+        command,
+        key,
+        value,
+    )
+}
+
+#[op2]
+#[string]
+fn op_session_storage(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] command: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    origin_storage_command(
+        &gs.session_storage,
+        &storage_origin(&gs.url),
+        command,
+        key,
+        value,
+    )
+}
+
 // A frame that navigates itself must not move the top document. Recording the
 // navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
@@ -4387,6 +4586,8 @@ pub fn build_extension() -> Extension {
         op_fetch_url(),
         op_get_cookies(),
         op_set_cookie(),
+        op_local_storage(),
+        op_session_storage(),
         op_navigate(),
         op_frame_document_ready(),
         op_post_frame_message(),

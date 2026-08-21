@@ -13,7 +13,9 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, OriginStorage, StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -574,10 +576,15 @@ impl ObscuraJsRuntime {
 
     /// Gives a frame's state the resources the page owns: cookie jar, HTTP
     /// client, callbacks and the stealth transport. A frame shares these with
-    /// its page, exactly as it shares them in a browser.
+    /// its page, exactly as it shares them in a browser. The storage Arcs
+    /// belong to the context and the page, so a frame writes to the same
+    /// origin-keyed stores the browser writes to; cross-origin frames land
+    /// in their own origin bucket because the ops key by the frame's URL.
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let parent = self.state.borrow();
         frame.cookie_jar = parent.cookie_jar.clone();
+        frame.local_storage = parent.local_storage.clone();
+        frame.session_storage = parent.session_storage.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
         frame.encoding = parent.encoding.clone();
@@ -780,6 +787,17 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
+    }
+
+    /// Install the page-owned session store. The Arc is held by the Page, so
+    /// the data survives realm teardown on navigation and CDP target
+    /// switching while staying inside the tab (issue #678).
+    pub fn set_session_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().session_storage = Some(storage);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
