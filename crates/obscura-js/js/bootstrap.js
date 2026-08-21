@@ -14520,7 +14520,9 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
+  // A navigation start precedes the wall clock, so skew into the past only: an
+  // origin ahead of it makes performance.now() and the rAF timestamp negative.
+  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);

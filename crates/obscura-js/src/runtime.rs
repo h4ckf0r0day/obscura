@@ -3896,6 +3896,24 @@ mod tests {
     }
 
     #[test]
+    fn time_origin_never_lands_in_the_future() {
+        // __obscura_init deletes itself, so a realm yields one draw of the
+        // origin jitter. Build a fresh runtime per draw, do not hoist this out.
+        for _ in 0..40 {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            let skew = rt
+                .evaluate("performance.timeOrigin - Date.now()")
+                .unwrap()
+                .as_f64()
+                .unwrap();
+            assert!(
+                skew <= 0.0,
+                "performance.timeOrigin is {skew} ms ahead of Date.now()"
+            );
+        }
+    }
+
+    #[test]
     fn childnode_helpers_coerce_non_string_primitives_to_text() {
         let mut rt =
             setup_runtime(r#"<html><body><div id="p"><span id="t">x</span></div></body></html>"#);
