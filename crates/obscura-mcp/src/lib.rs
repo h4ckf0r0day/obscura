@@ -145,6 +145,30 @@ impl BrowserState {
         self.tabs.remove(tab_id).is_some()
     }
 
+    fn has_active_page_runtime(&self) -> bool {
+        self.active_tab
+            .as_ref()
+            .and_then(|tab_id| self.tabs.get(tab_id))
+            .is_some_and(Page::has_js)
+    }
+
+    /// Advance the active page by one wake-driven browser task and immediately
+    /// consume any navigation that task queued. MCP owns its pages continuously,
+    /// so leaving either half for the next tool call strands timers, fetches,
+    /// and location/form/click navigations while the transport waits on stdin.
+    async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
+        let page = self.page_mut();
+        let reached_idle = page.run_autonomous_event_loop_turn().await?;
+        let navigated = page
+            .process_pending_navigation()
+            .await
+            .map_err(|error| error.to_string())?;
+        if navigated {
+            self.interactive_refs.clear();
+        }
+        Ok(reached_idle && !navigated)
+    }
+
     /// Resolve `ref=eN` to a CSS selector that uniquely targets the
     /// element. Snapshot writes `data-obscura-ref="eN"` onto every
     /// interactable, so the attribute survives across calls as long as
@@ -179,11 +203,32 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     let mut writer = stdout;
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut runtime_pump_armed = false;
 
     loop {
         // MCP stdio transport: newline-delimited JSON (one message per line)
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = if runtime_pump_armed {
+            tokio::select! {
+                biased;
+                read = reader.read_line(&mut line) => Some(read?),
+                pump_result = state.advance_active_page_tasks() => {
+                    match pump_result {
+                        Ok(reached_idle) => runtime_pump_armed = !reached_idle,
+                        Err(error) => {
+                            runtime_pump_armed = false;
+                            eprintln!("MCP page task failed: {error}");
+                        }
+                    }
+                    None
+                }
+            }
+        } else {
+            Some(reader.read_line(&mut line).await?)
+        };
+        let Some(n) = n else {
+            continue;
+        };
         if n == 0 {
             return Ok(());
         }
@@ -205,6 +250,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
 
         let id = msg.id.clone().unwrap_or(Value::Null);
         let response = dispatch(&msg.method, id, &msg.params, &mut state).await;
+        runtime_pump_armed = state.has_active_page_runtime();
 
         let mut body = serde_json::to_string(&response)?;
         body.push('\n');
@@ -1062,7 +1108,13 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
             return Err(format!("Timeout waiting for '{selector}'"));
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
+        let tick = tokio::time::Duration::from_millis(tick_ms);
+        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {}
+        }
         if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
@@ -1366,7 +1418,13 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("Timeout waiting for text {needle:?}"));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(tick_ms)).await;
+        let tick = tokio::time::Duration::from_millis(tick_ms);
+        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {}
+        }
         if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
