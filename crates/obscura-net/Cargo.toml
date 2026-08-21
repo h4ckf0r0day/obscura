@@ -26,7 +26,7 @@ futures-util = { version = "0.3", optional = true }
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
 # newer, incompatible rc and broke `cargo build --features stealth` (issue #234).
 # Pin exact versions so the build always resolves to the API wreq_client.rs targets.
-wreq-util = { version = "=3.0.0-rc.12", optional = true }
+wreq-util = { version = "=3.0.0-rc.12", optional = true, features = ["emulation-compression"] }
 
 [dev-dependencies]
 socket2 = "0.6"
