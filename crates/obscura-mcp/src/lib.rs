@@ -1300,7 +1300,7 @@ fn tool_get_cookies(args: &Value, state: &BrowserState) -> Result<String, String
     let domain_filter = args.get("domain").and_then(Value::as_str);
     let cookies = state.context.cookie_jar.get_all_cookies();
     let lines: Vec<String> = cookies.iter()
-        .filter(|c| domain_filter.is_none_or(|d| c.domain == d || c.domain.trim_start_matches('.') == d))
+        .filter(|c| domain_filter.is_none_or(|d| c.domain == obscura_net::canonical_domain(d)))
         .map(|c| serde_json::to_string(&json!({
             "name": c.name,
             "value": c.value,
