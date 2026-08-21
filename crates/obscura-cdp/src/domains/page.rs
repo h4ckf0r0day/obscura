@@ -1194,6 +1194,11 @@ async fn do_navigate(
         reached_network_idle,
     );
 
+    // The page now points at a new document: refresh its global target entry
+    // so every connection's Target.getTargets and /json/list report the new
+    // url/title instead of the pre-navigation about:blank (issue #544).
+    ctx.sync_registry();
+
     Ok(json!({
         "frameId": frame_id,
         "loaderId": loader_id,
@@ -1447,6 +1452,7 @@ pub async fn handle(
                     WaitUntil::DomContentLoaded,
                     reached_idle,
                 );
+                ctx.sync_registry();
             }
             Ok(json!({}))
         }

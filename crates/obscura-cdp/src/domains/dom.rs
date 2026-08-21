@@ -98,6 +98,15 @@ fn guess_mime(path: &str) -> &'static str {
     }
 }
 
+// The CDP BoxModel protocol types its coordinates as integers (Quad is an
+// array of 8 integer pairs; x/y/width/height are integers too).
+// getBoundingClientRect returns CSS floats, and Hermes refuses to deserialize
+// them ("invalid type: floating point 32.0, expected i64"), so round every
+// emitted coordinate to the nearest whole pixel.
+fn round_px(v: f64) -> i64 {
+    v.round() as i64
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -329,13 +338,13 @@ pub async fn handle(
             let (quad, w, h) = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                 if nums.len() >= 10 {
-                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(n)).collect();
-                    (q, nums[8], nums[9])
+                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(round_px(*n))).collect();
+                    (q, round_px(nums[8]), round_px(nums[9]))
                 } else {
-                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100, 20)
                 }
             } else {
-                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100, 20)
             };
             Ok(json!({
                 "model": {
@@ -365,7 +374,7 @@ pub async fn handle(
             let val = page.evaluate(&code);
             let quad = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| json!(n)).collect::<Vec<_>>() }
+                if nums.len() == 8 { nums.iter().map(|n| json!(round_px(*n))).collect::<Vec<_>>() }
                 else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
             } else {
                 vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
@@ -572,6 +581,57 @@ mod tests {
             active,
             json!("INPUT"),
             "DOM.focus must set document.activeElement to the focused input"
+        );
+    }
+
+    // Hermes deserializes DOM.getBoxModel coordinates as i64 and fails on the
+    // float pixels getBoundingClientRect returns ("invalid type: floating
+    // point 32.0, expected i64"). Every coordinate in the model must be an
+    // integer.
+    #[tokio::test]
+    async fn get_box_model_returns_integer_coordinates() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<div id=b style='position:absolute;left:10.5px;top:20.25px;width:100px;height:50px'>x</div>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let qs = handle("querySelector", &json!({ "selector": "#b" }), &mut ctx, &session)
+            .await
+            .expect("querySelector should succeed");
+        let nid = qs["nodeId"].as_u64().expect("div nodeId");
+
+        let model = handle("getBoxModel", &json!({ "nodeId": nid }), &mut ctx, &session)
+            .await
+            .expect("getBoxModel should succeed");
+
+        for quad in ["content", "padding", "border", "margin"] {
+            let coords = model["model"][quad].as_array().expect("quad array");
+            assert_eq!(coords.len(), 8, "{quad} quad must have 8 coordinates");
+            for c in coords {
+                assert!(
+                    c.as_i64().is_some(),
+                    "{quad} coordinate must be an integer, got {c}"
+                );
+            }
+        }
+        assert!(
+            model["model"]["width"].as_i64().is_some(),
+            "width must be an integer, got {}",
+            model["model"]["width"]
+        );
+        assert!(
+            model["model"]["height"].as_i64().is_some(),
+            "height must be an integer, got {}",
+            model["model"]["height"]
         );
     }
 
