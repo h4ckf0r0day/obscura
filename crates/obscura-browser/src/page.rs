@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::ops::OriginStorage;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -227,6 +228,11 @@ pub struct Page {
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
+    /// Browsing-context-scoped session storage, keyed by origin. Owned by the
+    /// Page rather than the realm: the V8 realm is torn down on every
+    /// navigation and on CDP target switching, but sessionStorage must survive
+    /// both while never leaving the tab (issue #678).
+    session_storage: Arc<OriginStorage>,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
     /// separate from `url`: direct automation navigations have no referrer,
@@ -910,6 +916,7 @@ impl Page {
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
+            session_storage: Arc::new(OriginStorage::default()),
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
@@ -1459,6 +1466,7 @@ impl Page {
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_local_storage(self.context.local_storage.clone());
+        rt.set_session_storage(self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());

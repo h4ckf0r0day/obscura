@@ -227,6 +227,10 @@ pub struct ObscuraState {
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub local_storage: Option<Arc<OriginStorage>>,
+    /// Browsing-context-scoped session storage. Per page, keyed by origin,
+    /// so an entry survives realm teardown on same-origin navigation but
+    /// never leaves the tab (issue #678).
+    pub session_storage: Option<Arc<OriginStorage>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -404,6 +408,7 @@ impl ObscuraState {
             blocked_urls: Vec::new(),
             cookie_jar: None,
             local_storage: Some(Arc::new(OriginStorage::default())),
+            session_storage: Some(Arc::new(OriginStorage::default())),
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -3616,10 +3621,39 @@ fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
-fn local_storage_origin(raw_url: &str) -> String {
+fn storage_origin(raw_url: &str) -> String {
     url::Url::parse(raw_url)
         .map(|url| url.origin().ascii_serialization())
         .unwrap_or_else(|_| "null".to_string())
+}
+
+fn origin_storage_command(
+    storage: &Option<Arc<OriginStorage>>,
+    origin: &str,
+    command: &str,
+    key: &str,
+    value: &str,
+) -> String {
+    let Some(storage) = storage else {
+        return "null".to_string();
+    };
+
+    match command {
+        "snapshot" => serde_json::to_string(&storage.snapshot(origin))
+            .unwrap_or_else(|_| "[]".to_string()),
+        "get" => serde_json::to_string(&storage.get(origin, key))
+            .unwrap_or_else(|_| "null".to_string()),
+        "set" => storage.set(origin, key.to_string(), value.to_string()).to_string(),
+        "remove" => {
+            storage.remove(origin, key);
+            "true".to_string()
+        }
+        "clear" => {
+            storage.clear(origin);
+            "true".to_string()
+        }
+        _ => "null".to_string(),
+    }
 }
 
 #[op2]
@@ -3631,30 +3665,33 @@ fn op_local_storage(
     #[string] value: &str,
 ) -> String {
     let gs = state.borrow::<SharedState>().clone();
-    let (storage, origin) = {
-        let gs = gs.borrow();
-        (gs.local_storage.clone(), local_storage_origin(&gs.url))
-    };
-    let Some(storage) = storage else {
-        return "null".to_string();
-    };
+    let gs = gs.borrow();
+    origin_storage_command(
+        &gs.local_storage,
+        &storage_origin(&gs.url),
+        command,
+        key,
+        value,
+    )
+}
 
-    match command {
-        "snapshot" => serde_json::to_string(&storage.snapshot(&origin))
-            .unwrap_or_else(|_| "[]".to_string()),
-        "get" => serde_json::to_string(&storage.get(&origin, key))
-            .unwrap_or_else(|_| "null".to_string()),
-        "set" => storage.set(&origin, key.to_string(), value.to_string()).to_string(),
-        "remove" => {
-            storage.remove(&origin, key);
-            "true".to_string()
-        }
-        "clear" => {
-            storage.clear(&origin);
-            "true".to_string()
-        }
-        _ => "null".to_string(),
-    }
+#[op2]
+#[string]
+fn op_session_storage(
+    state: &OpState,
+    #[string] command: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> String {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    origin_storage_command(
+        &gs.session_storage,
+        &storage_origin(&gs.url),
+        command,
+        key,
+        value,
+    )
 }
 
 // A frame that navigates itself must not move the top document. Recording the
@@ -4545,6 +4582,7 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_local_storage(),
+        op_session_storage(),
         op_navigate(),
         op_frame_document_ready(),
         op_post_frame_message(),

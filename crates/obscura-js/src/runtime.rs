@@ -788,6 +788,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().local_storage = Some(storage);
     }
 
+    /// Install the page-owned session store. The Arc is held by the Page, so
+    /// the data survives realm teardown on navigation and CDP target
+    /// switching while staying inside the tab (issue #678).
+    pub fn set_session_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().session_storage = Some(storage);
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
     }
