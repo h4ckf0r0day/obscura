@@ -2,30 +2,39 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
-// Insert `escaped_text` at the caret, replacing any non-collapsed selection
-// the way a real browser does when you type over selected text (for example
-// after a triple-click select-all). selectionStart is null during ordinary
-// typing, so the legacy append path is kept when no selection is tracked.
-fn insert_text_js(escaped_text: &str) -> String {
+// Insert `text` at the caret, replacing any non-collapsed selection the way a
+// real browser does when you type over selected text (for example after a
+// triple-click select-all). selectionStart is null during ordinary typing, so
+// the legacy append path is kept when no selection is tracked.
+//
+// The text is embedded as a JSON string literal rather than escaped by hand
+// into single quotes. JSON string syntax is a subset of JavaScript's, so this
+// covers the quote and the backslash of issue #433 and the control characters
+// they left out: a newline inside a single-quoted literal is a syntax error,
+// so the whole snippet was dropped and nothing was inserted. obscura-mcp
+// already builds its typing snippet this way.
+fn insert_text_js(text: &str) -> String {
+    let literal = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            var ins = {text};\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
             if (s == null) {{\
-                globalThis.__obscura_setFieldValue(t, 'value', v + '{text}');\
+                globalThis.__obscura_setFieldValue(t, 'value', v + ins);\
             }} else {{\
                 s = Math.max(0, Math.min(s, v.length));\
                 e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
                 var lo = Math.min(s, e), hi = Math.max(s, e);\
-                globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + '{text}' + v.slice(hi));\
-                var caret = lo + ('{text}').length;\
+                globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
+                var caret = lo + ins.length;\
                 t.setSelectionRange(caret, caret);\
             }}\
             t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
         }})()",
-        text = escaped_text,
+        text = literal,
     )
 }
 
@@ -312,10 +321,7 @@ pub async fn handle(
                         page.evaluate(&js);
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
-                            // Need to escape backslash BEFORE single-quote so the new
-                            // backslashes from quote escaping don't get double-escaped.
-                            let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            page.evaluate(&insert_text_js(&escaped_text));
+                            page.evaluate(&insert_text_js(text));
                         }
 
                         if key == "Enter" {
@@ -356,8 +362,7 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
-                            let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            page.evaluate(&insert_text_js(&escaped_text));
+                            page.evaluate(&insert_text_js(text));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }
