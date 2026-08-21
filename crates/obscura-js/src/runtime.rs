@@ -576,10 +576,15 @@ impl ObscuraJsRuntime {
 
     /// Gives a frame's state the resources the page owns: cookie jar, HTTP
     /// client, callbacks and the stealth transport. A frame shares these with
-    /// its page, exactly as it shares them in a browser.
+    /// its page, exactly as it shares them in a browser. The storage Arcs
+    /// belong to the context and the page, so a frame writes to the same
+    /// origin-keyed stores the browser writes to; cross-origin frames land
+    /// in their own origin bucket because the ops key by the frame's URL.
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let parent = self.state.borrow();
         frame.cookie_jar = parent.cookie_jar.clone();
+        frame.local_storage = parent.local_storage.clone();
+        frame.session_storage = parent.session_storage.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
         frame.encoding = parent.encoding.clone();

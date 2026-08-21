@@ -3659,12 +3659,16 @@ fn origin_storage_command(
 #[op2]
 #[string]
 fn op_local_storage(
+    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] command: &str,
     #[string] key: &str,
     #[string] value: &str,
 ) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+    // Per-realm on purpose: a cross-origin frame must land in its own
+    // origin's bucket, not the top document's. Same-origin frames resolve
+    // to the shared page Arcs, so sharing there is unchanged.
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     origin_storage_command(
         &gs.local_storage,
@@ -3678,12 +3682,13 @@ fn op_local_storage(
 #[op2]
 #[string]
 fn op_session_storage(
+    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] command: &str,
     #[string] key: &str,
     #[string] value: &str,
 ) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     origin_storage_command(
         &gs.session_storage,
