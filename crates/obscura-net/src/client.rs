@@ -599,15 +599,19 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// reqwest DNS resolver that performs the lookup and then rejects the whole
-/// request if ANY resolved address is in the SSRF deny-set. This closes the
-/// DNS-rebinding bypass a host-string check alone cannot: a public name that
-/// resolves to 127.0.0.1 / 169.254.169.254 / an RFC1918 address is blocked at
-/// connect time, using the very addresses reqwest will dial. When private
-/// access is permitted (`--allow-private-network` or
-/// `OBSCURA_ALLOW_PRIVATE_NETWORK`) the lookup passes through unfiltered.
+/// DNS resolver that performs the lookup and then rejects the whole request if
+/// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
+/// bypass a host-string check alone cannot: a public name that resolves to
+/// 127.0.0.1 / 169.254.169.254 / an RFC1918 address is blocked at connect time,
+/// using the very addresses the client will dial. When private access is
+/// permitted (`--allow-private-network` or `OBSCURA_ALLOW_PRIVATE_NETWORK`) the
+/// lookup passes through unfiltered.
+///
+/// Implemented for both transports: `reqwest::dns::Resolve` just below, and
+/// `wreq::dns::Resolve` in `wreq_client.rs`, so `--stealth` never trades the
+/// guard away for a better TLS fingerprint.
 pub struct SsrfGuardResolver {
-    allow_private: bool,
+    pub(crate) allow_private: bool,
 }
 
 impl SsrfGuardResolver {
