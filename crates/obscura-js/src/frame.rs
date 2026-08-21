@@ -375,7 +375,17 @@ mod tests {
     use std::cell::RefCell;
 
     fn page(url: &str, html: &str) -> ObscuraJsRuntime {
-        let mut runtime = ObscuraJsRuntime::new();
+        let mut runtime = if tokio::runtime::Handle::try_current().is_ok() {
+            ObscuraJsRuntime::new()
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test tokio runtime");
+            let rt = Box::leak(Box::new(rt));
+            let _guard = rt.enter();
+            ObscuraJsRuntime::new()
+        };
         runtime.set_dom(parse_html(html));
         runtime.set_url(url);
         runtime.run_page_init();
@@ -439,8 +449,8 @@ mod tests {
         assert!(frame.is_same_origin_as("https://child.example"));
     }
 
-    #[test]
-    fn frame_uses_its_embedding_viewport() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_uses_its_embedding_viewport() {
         let mut parent = page(
             "https://parent.example/page",
             "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
@@ -468,8 +478,8 @@ mod tests {
 
     /// A frame must not look like a different browser than its parent. Anti-bot
     /// code fingerprints inside the frame and compares it with the top document.
-    #[test]
-    fn frame_inherits_the_parent_browser_identity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_inherits_the_parent_browser_identity() {
         let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestAgent/150.0.0.0";
         let mut parent = ObscuraJsRuntime::new();
         parent.set_user_agent(user_agent);
@@ -590,8 +600,8 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("module")), "{problems:?}");
     }
 
-    #[test]
-    fn many_frames_can_be_alive_at_once() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_frames_can_be_alive_at_once() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frames: Vec<FrameRealm> = (0..4)
             .map(|index| {
