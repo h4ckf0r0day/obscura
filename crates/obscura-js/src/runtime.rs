@@ -147,6 +147,21 @@ pub struct ObscuraJsRuntime {
     /// those URLs so a dependency later encountered as a top-level script is a
     /// browser-style no-op instead of a second deno_core `mod_evaluate` call.
     evaluated_module_specifiers: HashMap<String, Result<(), String>>,
+    /// The bound op table, taken from bootstrap at construction and removed from
+    /// the global in the same step. Child frame realms are handed this object so
+    /// their shims can call ops; nothing else can reach it, including page
+    /// script.
+    ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+}
+
+/// Renders a caught V8 exception as a message for realm evaluation errors.
+fn exception_text(
+    scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
+) -> String {
+    match scope.exception() {
+        Some(exception) => exception.to_rust_string_lossy(scope),
+        None => "unknown error".to_string(),
+    }
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -299,7 +314,14 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
 
-            runtime.op_state().borrow_mut().put(state_clone);
+            {
+                let op_state = runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                op_state.put(state_clone);
+                // Empty until a frame realm exists, which is what keeps the
+                // lookup free for pages that have no frames.
+                op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+            }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
             let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
@@ -319,7 +341,7 @@ impl ObscuraJsRuntime {
             (runtime, isolate_handle, heap_limit_state)
         };
 
-        ObscuraJsRuntime {
+        let mut instance = ObscuraJsRuntime {
             runtime,
             state,
             object_store: HashMap::new(),
@@ -331,7 +353,371 @@ impl ObscuraJsRuntime {
             module_evaluations: HashMap::new(),
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
+            ops_handoff: None,
+        };
+        // Take the op table before any page script can run, and drop the global
+        // that exposed it in the same step.
+        instance.ops_handoff = instance.take_ops_handoff();
+        instance
+    }
+
+    /// Creates an additional realm in this isolate: a second `v8::Context`.
+    ///
+    /// The startup snapshot already contains the whole bootstrap (see
+    /// `build.rs`), so a context restored from it arrives with every DOM class
+    /// and shim installed. Building a realm is therefore a context restore, not
+    /// a re-parse of the whole bootstrap.
+    ///
+    /// The new context has no ops: deno_core binds those into the main context
+    /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
+    /// object, which is legal because native function objects are shareable
+    /// between contexts of one isolate.
+    pub(crate) fn create_realm_context(
+        &mut self,
+    ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let context = {
+            let isolate = self.runtime.v8_isolate();
+            let scope = &mut deno_core::v8::HandleScope::new(isolate);
+            let context = deno_core::v8::Context::from_snapshot(
+                scope,
+                1,
+                deno_core::v8::ContextOptions::default(),
+            )
+            .or_else(|| {
+                deno_core::v8::Context::from_snapshot(
+                    scope,
+                    0,
+                    deno_core::v8::ContextOptions::default(),
+                )
+            })?;
+            deno_core::v8::Global::new(scope, context)
+        };
+        Some(context)
+    }
+
+    /// Takes the ops object bootstrap handed out, and removes the handoff from
+    /// the global so page script can never reach `Deno.core.ops`.
+    ///
+    /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
+    /// reference in a private const, so this handoff is the only way for the
+    /// host to reach the bound op functions and pass them to a child realm.
+    fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let ops_key = v8::String::new(scope, "ops")?;
+        let global = context.global(scope);
+
+        let core = global.get(scope, handoff_key.into())?;
+        let core = core.to_object(scope)?;
+        let ops = core.get(scope, ops_key.into())?;
+        if !ops.is_object() {
+            return None;
         }
+        let ops = v8::Global::new(scope, ops);
+        global.delete(scope, handoff_key.into());
+        Some(ops)
+    }
+
+    /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
+    ///
+    /// A realm restored from the snapshot has its own `Deno.core` with an empty
+    /// ops table, and its bootstrap captured that exact object, so filling the
+    /// `ops` table on it is enough to give every shim in that realm a working
+    /// op surface. The functions are shared, not copied: same isolate.
+    pub(crate) fn share_ops_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) -> bool {
+        use deno_core::v8;
+
+        let Some(ops) = self.ops_handoff.clone() else {
+            return false;
+        };
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
+            return false;
+        };
+        let Some(ops_key) = v8::String::new(scope, "ops") else {
+            return false;
+        };
+        let global = context.global(scope);
+        let Some(core) = global.get(scope, handoff_key.into()) else {
+            return false;
+        };
+        let Some(core) = core.to_object(scope) else {
+            return false;
+        };
+        // `Deno.core.ops` is non-writable and non-configurable, so the table
+        // cannot be swapped wholesale: V8 reports success and changes nothing.
+        // Copy the bound op functions into the realm's existing table instead.
+        let Some(target) = core
+            .get(scope, ops_key.into())
+            .and_then(|value| value.to_object(scope))
+        else {
+            return false;
+        };
+        let source = v8::Local::new(scope, ops);
+        let Some(source) = source.to_object(scope) else {
+            return false;
+        };
+        let Some(names) = source.get_own_property_names(scope, Default::default()) else {
+            return false;
+        };
+        let mut copied = 0;
+        for index in 0..names.length() {
+            let Some(key) = names.get_index(scope, index) else {
+                continue;
+            };
+            let Some(value) = source.get(scope, key) else {
+                continue;
+            };
+            if target.set(scope, key, value).unwrap_or(false) {
+                copied += 1;
+            }
+        }
+        // The child realm must not expose the handoff to frame script either.
+        global.delete(scope, handoff_key.into());
+        copied > 0
+    }
+
+    /// Runs `source` inside `realm` and returns its value as a string. Errors
+    /// come back as `Err(message)`.
+    pub(crate) fn eval_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+    ) -> Result<String, String> {
+        use deno_core::v8;
+
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let code = v8::String::new(scope, source).ok_or("source too large")?;
+        let script = match v8::Script::compile(scope, code, None) {
+            Some(script) => script,
+            None => return Err(exception_text(scope)),
+        };
+        match script.run(scope) {
+            Some(value) => Ok(value.to_rust_string_lossy(scope)),
+            None => Err(exception_text(scope)),
+        }
+    }
+
+    /// Copies the browser-identity globals from the main realm into `realm`.
+    ///
+    /// A frame must present the same identity as its parent: anti-bot code
+    /// fingerprints inside the frame and compares it with the top document.
+    /// Copying the values the parent already has makes that true by
+    /// construction, instead of relying on a caller to reapply the same
+    /// settings to both.
+    pub(crate) fn copy_identity_to_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        const IDENTITY_GLOBALS: [&str; 7] = [
+            "__obscura_ua",
+            "__obscura_platform",
+            "__obscura_ua_platform",
+            "__obscura_ua_platform_version",
+            "__obscura_stealth",
+            "__obscura_geo_lat",
+            "__obscura_geo_lon",
+        ];
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        let main_context = v8::Local::new(scope, main);
+        let mut carried = Vec::new();
+        {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let global = main_context.global(scope);
+            for name in IDENTITY_GLOBALS {
+                let Some(key) = v8::String::new(scope, name) else {
+                    continue;
+                };
+                match global.get(scope, key.into()) {
+                    Some(value) if !value.is_undefined() => {
+                        carried.push((name, v8::Global::new(scope, value)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let realm_context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, realm_context);
+        let global = realm_context.global(scope);
+        for (name, value) in carried {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            let value = v8::Local::new(scope, value);
+            global.set(scope, key.into(), value);
+        }
+    }
+
+    /// Gives a frame's state the resources the page owns: cookie jar, HTTP
+    /// client, callbacks and the stealth transport. A frame shares these with
+    /// its page, exactly as it shares them in a browser.
+    pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
+        let parent = self.state.borrow();
+        frame.cookie_jar = parent.cookie_jar.clone();
+        frame.http_client = parent.http_client.clone();
+        frame.callbacks = parent.callbacks.clone();
+        frame.encoding = parent.encoding.clone();
+        frame.blocked_urls = parent.blocked_urls.clone();
+        frame.intercept_enabled = parent.intercept_enabled;
+        frame.page_in_flight = parent.page_in_flight.clone();
+        #[cfg(feature = "stealth")]
+        {
+            frame.stealth_client = parent.stealth_client.clone();
+        }
+    }
+
+    /// The origin of the document this runtime is running, or `"null"` for a
+    /// scheme that has no tuple origin.
+    pub(crate) fn page_origin(&self) -> String {
+        let url = self.state.borrow().url.clone();
+        match url::Url::parse(&url) {
+            Ok(parsed) if parsed.origin().is_tuple() => parsed.origin().ascii_serialization(),
+            _ => "null".to_string(),
+        }
+    }
+
+    /// Gives a same-origin frame realm the page's security token.
+    ///
+    /// V8 access-checks property reads across contexts and answers `undefined`
+    /// unless the two carry the same token, which is how a browser keeps one
+    /// origin out of another's window. Two contexts of one origin must share a
+    /// token, or the page reads its own frame's globals as undefined. Only
+    /// ever called after an origin comparison; a cross-origin frame keeps its
+    /// own token and stays opaque.
+    pub(crate) fn share_security_token_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let main = v8::Local::new(scope, main);
+        let realm = v8::Local::new(scope, realm);
+        let token = main.get_security_token(scope);
+        realm.set_security_token(token);
+    }
+
+    /// Publishes a frame realm's own `window` and `document` objects into the
+    /// page realm, under `__obscura_frameObjects[frameId]`.
+    ///
+    /// This is what the single isolate buys. Objects cannot cross isolates, so
+    /// a parent could only ever be handed a copy or a shim; within one isolate
+    /// it can hold the frame's real globals, which is what a browser gives it
+    /// for a same-origin frame. `contentWindow.someGlobal` is then a plain
+    /// property read of the frame's own object, and `contentDocument` is the
+    /// document the frame's scripts actually mutated.
+    pub(crate) fn publish_realm_objects(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+    ) -> bool {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        // Read the frame's globals first, then install them in the page realm.
+        // Both contexts belong to this isolate, so the handles stay valid
+        // across the switch.
+        let realm_context = v8::Local::new(scope, realm);
+        let (frame_window, frame_document) = {
+            let scope = &mut v8::ContextScope::new(scope, realm_context);
+            let global = realm_context.global(scope);
+            let Some(key) = v8::String::new(scope, "document") else {
+                return false;
+            };
+            let document = global.get(scope, key.into());
+            (
+                v8::Global::new(scope, global),
+                document.map(|value| v8::Global::new(scope, value)),
+            )
+        };
+
+        let main_context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, main_context);
+        let global = main_context.global(scope);
+        let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
+            return false;
+        };
+        let registry = match global
+            .get(scope, registry_key.into())
+            .and_then(|value| value.to_object(scope))
+        {
+            Some(registry) if !registry.is_null_or_undefined() => registry,
+            _ => {
+                let fresh = v8::Object::new(scope);
+                global.set(scope, registry_key.into(), fresh.into());
+                fresh
+            }
+        };
+
+        let entry = v8::Object::new(scope);
+        let window = v8::Local::new(scope, frame_window);
+        if let Some(key) = v8::String::new(scope, "window") {
+            entry.set(scope, key.into(), window.into());
+        }
+        if let (Some(key), Some(document)) = (
+            v8::String::new(scope, "document"),
+            frame_document.map(|document| v8::Local::new(scope, document)),
+        ) {
+            entry.set(scope, key.into(), document);
+        }
+        let index = v8::Integer::new_from_unsigned(scope, frame_id);
+        registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+    }
+
+    /// The table ops consult to find the calling realm's document.
+    pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
+        self.runtime
+            .op_state()
+            .borrow()
+            .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
+            .clone()
+    }
+
+    /// Frame documents fetched by any realm that still need one of their own.
+    /// The op queues onto the page's state whichever frame asked, so a frame
+    /// nested inside a frame is drained here too.
+    pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
+        let mut state = self.state.borrow_mut();
+        state.pending_frame_bytes = 0;
+        std::mem::take(&mut state.pending_frames)
+    }
+
+    /// postMessage traffic waiting to be delivered to another realm.
+    pub fn take_pending_frame_messages(&self) -> Vec<crate::ops::PendingFrameMessage> {
+        let mut state = self.state.borrow_mut();
+        state.pending_frame_message_bytes = 0;
+        std::mem::take(&mut state.pending_frame_messages)
     }
 
     /// Restore the configured V8 heap limit after the emergency headroom has
@@ -2741,6 +3127,40 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn function_to_string_has_native_function_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const fn = Function.prototype.toString;
+                    let constructible = true;
+                    try {
+                        Reflect.construct(function () {}, [], fn);
+                    } catch (error) {
+                        constructible = false;
+                    }
+                    return {
+                        source: fn.toString(),
+                        name: fn.name,
+                        length: fn.length,
+                        hasOwnPrototype: Object.prototype.hasOwnProperty.call(fn, "prototype"),
+                        constructible,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "source": "function toString() { [native code] }",
+                "name": "toString",
+                "length": 0,
+                "hasOwnPrototype": false,
+                "constructible": false,
+            })
+        );
     }
 
     #[test]
@@ -11406,6 +11826,49 @@ mod tests {
     }
 
     #[test]
+    fn dom_string_map_is_exposed_and_backs_dataset() {
+        let mut rt = setup_runtime(r#"<div id="x" data-foo="bar"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const dataset = document.getElementById("x").dataset;
+                    const interface = window.DOMStringMap;
+                    const descriptor = Object.getOwnPropertyDescriptor(window, "DOMStringMap");
+                    let illegalConstructor = false;
+                    if (interface) {
+                        try { new interface(); }
+                        catch (error) { illegalConstructor = error instanceof TypeError; }
+                    }
+                    return JSON.stringify({
+                        type: typeof interface,
+                        instance: !!interface && dataset instanceof interface,
+                        prototype: !!interface && Object.getPrototypeOf(dataset) === interface.prototype,
+                        constructor: !!interface && dataset.constructor === interface,
+                        tag: Object.prototype.toString.call(dataset),
+                        enumerable: descriptor ? descriptor.enumerable : "missing",
+                        illegalConstructor,
+                        value: dataset.foo,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "function",
+                "instance": true,
+                "prototype": true,
+                "constructor": true,
+                "tag": "[object DOMStringMap]",
+                "enumerable": false,
+                "illegalConstructor": true,
+                "value": "bar",
+            })
+        );
+    }
+
+    #[test]
     fn style_declaration_reflects_and_removes_parsed_attributes() {
         let mut rt = setup_runtime(
             "<html><body><div id='icon' style='font-size: 0px; color: red'></div></body></html>",
@@ -12646,6 +13109,39 @@ mod tests {
     }
 
     #[test]
+    fn test_location_navigation_coerces_url_objects() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let hrefs = rt
+            .evaluate(
+                r#"(() => {
+                    location.href = new URL('/from-href', location.href);
+                    const href = location.href;
+                    location.assign(new URL('/from-assign', location.href));
+                    const assigned = location.href;
+                    location.replace(new URL('/from-replace', location.href));
+                    return [href, assigned, location.href];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            hrefs,
+            serde_json::json!([
+                "http://example.com/from-href",
+                "http://example.com/from-assign",
+                "http://example.com/from-replace"
+            ])
+        );
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/from-replace".to_string(),
+                "GET".to_string(),
+                "".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
         let mut rt =
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
@@ -13569,6 +14065,114 @@ mod tests {
             })
         );
     }
+    /// Serves a redirect chain across `connections` consecutive
+    /// requests: `/hop/N` replies with 302 to `/hop/N-1`, `/hop/0` is the
+    /// target. To a path the fixture cannot read it replies with 400
+    /// instead of the target. A broken fixture thereby fails the test
+    /// instead of letting it pass.
+    fn redirect_chain_runtime(connections: usize) -> ObscuraJsRuntime {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let hop = String::from_utf8_lossy(&buffer[..read])
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.strip_prefix("/hop/"))
+                    .and_then(|hop| hop.parse::<usize>().ok());
+                let response = match hop {
+                    Some(0) => {
+                        let body = "arrived";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    Some(hop) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /hop/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        hop - 1,
+                    ),
+                    None => {
+                        let body = "unparsed";
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let origin = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt
+    }
+
+    /// HTTP-redirect fetch returns a network error as soon as the
+    /// redirect count *reaches* 20, and only increments it afterwards. So
+    /// the twentieth hop must still succeed:
+    /// https://fetch.spec.whatwg.org/#http-redirect-fetch
+    /// WPT covers the same pair in `fetch/api/redirect/redirect-count.any.js`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_follows_the_twentieth_redirect() {
+        let mut rt = redirect_chain_runtime(21);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => (await fetch("/hop/20")).text()"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+    }
+
+    /// The other end of the same pair: the twenty-first redirect must
+    /// fail. `fetch` reports a rejected result as a `TypeError`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_rejects_the_twenty_first_redirect() {
+        let mut rt = redirect_chain_runtime(21);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    try {
+                        const response = await fetch("/hop/21");
+                        return "resolved " + (await response.text());
+                    } catch (error) {
+                        return error instanceof TypeError ? "rejected" : "other";
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("rejected"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn dynamic_linked_stylesheet_enters_the_live_dom_with_imports_rebased() {
@@ -13906,6 +14510,14 @@ mod tests {
             .evaluate("document.createEvent('KeyboardEvent') instanceof KeyboardEvent")
             .unwrap();
         assert_eq!(kb, serde_json::json!(true));
+        let hash_change = rt
+            .evaluate("document.createEvent('HashChangeEvent') instanceof HashChangeEvent")
+            .unwrap();
+        assert_eq!(hash_change, serde_json::json!(true));
+        let message = rt
+            .evaluate("document.createEvent('MessageEvent') instanceof MessageEvent")
+            .unwrap();
+        assert_eq!(message, serde_json::json!(true));
     }
 
     #[test]
@@ -13923,12 +14535,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_event_unknown_type_returns_event() {
+    fn test_create_event_rejects_unknown_interface() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let kind = rt
-            .evaluate("document.createEvent('NotARealType') instanceof Event")
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        document.createEvent('NotAnEventInterface');
+                        return null;
+                    } catch (error) {
+                        return [error.name, error instanceof DOMException];
+                    }
+                })()"#,
+            )
             .unwrap();
-        assert_eq!(kind, serde_json::json!(true));
+        assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
     }
 
     #[test]
@@ -14004,6 +14625,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
+    }
+
+    #[test]
+    fn test_create_event_supports_legacy_event_aliases() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"['Event', 'Events', 'HTMLEvents', 'SVGEvents'].map(name => {
+                    const event = document.createEvent(name);
+                    return [event instanceof Event, event.constructor === Event, event.type];
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""]
+            ])
+        );
     }
 
     #[test]
@@ -15542,5 +16185,260 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["range", "write"]));
+    }
+
+    // One stream per document. The tokenizer carries its state across the calls.
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
+    #[test]
+    fn document_write_joins_an_element_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<di');
+                document.write('v id="split">');
+                document.write('content</div>');
+                const el = document.getElementById('split');
+                return el ? el.textContent : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("content"));
+    }
+
+    #[test]
+    fn document_write_joins_a_tag_name_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<spa');
+                document.write('n id="half">x</span>');
+                const el = document.getElementById('half');
+                return el ? el.tagName : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // The shape the UI5 cachebuster writes: "<script", one per attribute, then ">".
+    #[test]
+    fn document_write_runs_a_script_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__splitScriptRan = false;
+                document.write('<scr' + 'ipt');
+                document.write(' id="split-script"');
+                document.write('>');
+                document.write('globalThis.__splitScriptRan = true;');
+                document.write('<\/scr' + 'ipt>');
+                return [!!document.getElementById('split-script'), globalThis.__splitScriptRan];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    // A script in the <head> inserts behind itself, so that what it writes runs before what
+    // the parser saw after it.
+    #[test]
+    fn document_write_inserts_at_the_writing_scripts_position() {
+        let mut rt = setup_runtime(
+            r#"<html><head><script id="writer"></script></head><body><p id="existing">x</p></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                // What the production path sets while a script runs; bootstrap.js
+                // assigns __currentScriptNid around every script it prepares.
+                globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+                document.write('<span id="written"></span>');
+                return JSON.stringify({
+                  head: Array.from(document.head.children).map(e => e.id || e.tagName),
+                  body: Array.from(document.body.children).map(e => e.id || e.tagName),
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"head":["writer","written"],"body":["existing"]}"#)
+        );
+    }
+
+    // Holding back until the close would lose everything written after it. It belongs inside.
+    #[test]
+    fn document_write_shows_an_element_that_is_never_closed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<div id="unclosed">hello');
+                const el = document.getElementById('unclosed');
+                return el ? el.textContent : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn document_write_grows_an_open_element_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<div id="wrap">');
+                document.write('<span id="inner">y</span>');
+                const inner = document.getElementById('inner');
+                return JSON.stringify({
+                  wrap: !!document.getElementById('wrap'),
+                  inner: !!inner,
+                  nested: !!(inner && inner.parentElement && inner.parentElement.id === 'wrap'),
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"wrap":true,"inner":true,"nested":true}"#)
+        );
+    }
+
+    // Writing goes through the same insertion steps as any other insertion.
+    #[test]
+    fn document_write_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__seen = [];
+                const observer = new MutationObserver((records) => {
+                  for (const record of records) {
+                    for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
+                  }
+                });
+                observer.observe(document.body, { childList: true });
+                document.write('<span id="watched">z</span>');
+                observer.takeRecords().forEach((record) => {
+                  for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
+                });
+                return globalThis.__seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // before(), after() and replaceWith() all go through parent.insertBefore. replaceChild
+    // also goes there in the fragment branch. AGENTS.md requires whoever touches insertBefore
+    // to check them: the order of reference node versus parent nid is easy to break. The test
+    // also pins that every insertion is reported exactly once, not twice.
+    #[test]
+    fn child_node_methods_place_nodes_and_report_once() {
+        let mut rt = setup_runtime(r#"<html><body><p id="a"></p><p id="b"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const ids = () => Array.from(document.body.children).map((e) => e.id).join(',');
+                const make = (id) => { const e = document.createElement('span'); e.id = id; return e; };
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                const steps = {};
+
+                document.getElementById('b').before(make('x'));
+                steps.before = ids();
+                document.getElementById('b').after(make('y'));
+                steps.after = ids();
+                document.getElementById('y').replaceWith(make('z'));
+                steps.replaceWith = ids();
+                document.body.replaceChild(make('w'), document.getElementById('z'));
+                steps.replaceChild = ids();
+
+                const added = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.id));
+                observer.disconnect();
+                steps.added = added.join(',');
+                return JSON.stringify(steps);
+                "#,
+            )
+            .unwrap();
+        let steps: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("steps json");
+        assert_eq!(steps["before"], "a,x,b");
+        assert_eq!(steps["after"], "a,x,b,y");
+        assert_eq!(steps["replaceWith"], "a,x,b,z");
+        assert_eq!(steps["replaceChild"], "a,x,b,w");
+        // Every inserted node exactly once, in the order of insertion.
+        assert_eq!(steps["added"], "x,y,z,w");
+    }
+
+    // insertBefore reported no mutation at all, appendChild did.
+    #[test]
+    fn insert_before_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body><p id=\"ref\"></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                document.body.insertBefore(
+                  document.createElement('span'),
+                  document.getElementById('ref'),
+                );
+                const seen = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.nodeName));
+                observer.disconnect();
+                return seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    #[test]
+    fn document_write_registers_window_named_access() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<img name="namedImage" src="x.png">');
+                return typeof window.namedImage;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("object"));
+    }
+
+    #[test]
+    fn document_write_keeps_call_order_at_the_insertion_point() {
+        let mut rt = setup_runtime(
+            r#"<html><head><script id="writer"></script></head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+                document.write('<span id="one"></span>');
+                document.write('<span id="two"></span>');
+                return Array.from(document.head.children).map(e => e.id).join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("writer,one,two"));
     }
 }

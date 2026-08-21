@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en" style="margin:0">
+<head>
+  <meta charset="utf-8">
+  <title>Outset box-shadow clipping</title>
+  <style>
+    body { margin: 0; padding: 40px; background: #f1f3f5; color: #212529; font: 20px sans-serif; }
+    .row { display: flex; gap: 60px; }
+    .box { width: 280px; padding: 28px; border: 2px solid #343a40; border-radius: 16px; box-shadow: 10px 10px 18px rgba(33, 37, 41, .75); }
+    .opaque { background: white; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <div class="box">Transparent background</div>
+    <div class="box opaque">Opaque background</div>
+  </div>
+</body>
+</html>

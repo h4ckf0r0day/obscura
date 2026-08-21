@@ -4,6 +4,17 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// Escape a client-supplied objectId for interpolation into a single-quoted JS
+/// string literal (`__obscura_objects['<here>']`). Backslashes must be escaped
+/// before single quotes, otherwise an id ending in `\` turns the closing quote
+/// into `\'` and produces a syntax error. All three objectId lookup sites route
+/// through this so they cannot diverge; not an injection vector (every `'` stays
+/// escaped, so the worst case is an unterminated string -> clean resolution
+/// failure), but a robustness fix.
+fn escape_object_id(oid: &str) -> String {
+    oid.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 /// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
 /// and `objectId` in that order. Playwright commonly passes only `objectId`
 /// (returned by a prior `DOM.resolveNode`); without this fallback those
@@ -19,7 +30,7 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
         let code = format!(
             "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
              return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-            oid.replace('\'', "\\'")
+            escape_object_id(oid)
         );
         let result = page.evaluate(&code);
         let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
@@ -140,7 +151,7 @@ pub async fn handle(
             {
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
+                let escaped_oid = escape_object_id(oid);
                 let code = format!(
                     "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
                     escaped_oid
@@ -165,7 +176,7 @@ pub async fn handle(
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let code = format!(
                     "(function() {{ var o = globalThis.__obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    oid
+                    escape_object_id(oid)
                 );
                 let result = page.evaluate(&code);
                 result.as_f64().map(|n| n as u64).unwrap_or(0)
@@ -180,7 +191,7 @@ pub async fn handle(
                     if (globalThis._cache && globalThis._cache.has(nid)) {{\
                         node = globalThis._cache.get(nid);\
                     }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '');\
+                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
                         if (t === 1) node = new Element(nid);\
                         else if (t === 9) node = globalThis.document;\
                         else node = new Node(nid);\
@@ -262,6 +273,14 @@ pub async fn handle(
             // builds real File objects and fires input+change like a real
             // selection so page code can read/upload them.
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            // setFileInputFiles reads local files and hands their bytes to page
+            // JS. Anyone who can reach the CDP port (default localhost, but
+            // Docker images bind 0.0.0.0) could otherwise read any file the
+            // process can read — the same threat as Page.navigate to file://, so
+            // it honours the same opt-in and is off by default.
+            if !page.context.allow_file_access {
+                return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
+            }
             let node_id = resolve_node_id(page, params)?;
             let paths: Vec<String> = params
                 .get("files")
@@ -505,6 +524,17 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
+    #[test]
+    fn escape_object_id_escapes_backslash_before_quote() {
+        // A trailing backslash must be doubled so it cannot escape the closing
+        // quote of __obscura_objects['...']; the old resolve_node_id path escaped
+        // only the quote, producing ['x\'] (syntax error) for the id `x\`.
+        assert_eq!(escape_object_id(r"x\"), r"x\\");
+        assert_eq!(escape_object_id("a'b"), r"a\'b");
+        assert_eq!(escape_object_id(r"a\'b"), r"a\\\'b");
+        assert_eq!(escape_object_id("plain"), "plain");
+    }
+
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
         // CDP clients (browser-use) focus an input via DOM.focus before typing;
@@ -687,6 +717,49 @@ mod tests {
         assert!(
             levels < depth,
             "nesting must be bounded below the tree's true depth, got {levels}"
+        );
+    }
+
+    /// SEC-003 / #579 — DOM.setFileInputFiles reads local files and hands
+    /// their bytes to page JS. Without a gate, any CDP client (e.g. against a
+    /// Docker image that binds the port to 0.0.0.0) gets an arbitrary
+    /// file-read primitive. It must honour the same `allow_file_access` opt-in
+    /// as Page.navigate to `file://`, which defaults to off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_file_input_files_refuses_without_allow_file_access() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<input type=file id=f>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let qs = handle("querySelector", &json!({ "selector": "input" }), &mut ctx, &session)
+            .await
+            .expect("querySelector should succeed");
+        let nid = qs["nodeId"].as_u64().expect("input nodeId");
+
+        // A real, readable file. Without the gate the handler slurps it and
+        // returns Ok; with the gate it must refuse before touching the disk.
+        let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        let err = handle(
+            "setFileInputFiles",
+            &json!({ "nodeId": nid, "files": [existing] }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("setFileInputFiles must be gated behind --allow-file-access");
+        assert!(
+            err.contains("allow-file-access"),
+            "error must point at the allow-file-access flag: {err}"
         );
     }
 }

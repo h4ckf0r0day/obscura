@@ -22,6 +22,24 @@ Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Pag
 OBSCURA_NAV_TIMEOUT_MS=60000 obscura serve
 ```
 
+### `OBSCURA_SCRIPT_DEADLINE_MS`
+
+Soft deadline for the complete page script-execution phase, including classic scripts and ES modules. Default 30000 (30 seconds). Raise it for a heavy SPA whose initial module is responsible for mounting an otherwise empty document. The engine also uses this value as a hard V8 watchdog budget, with a one-second grace period, so a synchronous script cannot run forever.
+
+```bash
+OBSCURA_SCRIPT_DEADLINE_MS=60000 obscura serve
+```
+
+### `OBSCURA_MODULE_BUDGET_MS`
+
+Per-module graph-loading and evaluation budget for modules that enhance an already-rendered page. Default 3000 (3 seconds). Raise it when a module such as the Vite HMR client legitimately needs longer to evaluate:
+
+```bash
+OBSCURA_MODULE_BUDGET_MS=10000 obscura serve
+```
+
+This shorter budget applies when the document body already contains more than 50 descendant nodes, where modules are normally progressive enhancement and should not delay navigation indefinitely. For an unmounted SPA shell, Obscura instead gives each module the full `OBSCURA_SCRIPT_DEADLINE_MS` budget so the app has time to mount. Module network requests remain independently bounded by `OBSCURA_FETCH_TIMEOUT_MS`.
+
 ### `OBSCURA_CDP_COMMAND_TIMEOUT_MS`
 
 Per-command deadline for the CDP server. A hung page (a runaway `Runtime.evaluate`, a synchronous DOM op) is terminated after this budget so one bad session cannot hold the shared V8 lock and stall the others. Default 60000 (60 seconds); `0` disables it. Navigation self-bounds via `OBSCURA_NAV_TIMEOUT_MS` well under this.

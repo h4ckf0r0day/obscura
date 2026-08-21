@@ -5994,10 +5994,10 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
 /// tiny-skia has no gaussian blur, so the blur is approximated by nested
 /// rounded rects from a solid core out to the blur radius, each at a fraction of
 /// the shadow alpha so source-over accumulation ramps the coverage from full at
-/// the core to near-zero at the outer edge. `inset` shadows are parsed but not
-/// painted (an inner shadow needs a hole-punched fill this box model does not
-/// build). `clip`, when set, is the ancestor `overflow: hidden` region and is
-/// applied as a mask so the shadow is clipped like the element itself.
+/// the core to near-zero at the outer edge. A shared mask removes the element's
+/// original border box from every outset layer. `inset` shadows are parsed but
+/// not painted. `clip`, when set, is the ancestor `overflow: hidden` region and
+/// is intersected with the shadow mask.
 fn paint_box_shadow(
     pixmap: &mut Pixmap,
     shadow: &crate::BoxShadow,
@@ -6016,7 +6016,8 @@ fn paint_box_shadow(
     if w0 <= 0.0 || h0 <= 0.0 {
         return;
     }
-    let radius = border_radius.resolve(rect.width, rect.height).top_left;
+    let border_radii = border_radius.resolve(rect.width, rect.height);
+    let radius = border_radii.top_left;
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
@@ -6031,41 +6032,86 @@ fn paint_box_shadow(
     if !rect_intersects_paint_surface(&shadow_bounds, pixmap, 1.0) {
         return;
     }
-    // Ancestor overflow clip is already the complete rect/rounded chain.
-    let mask = ancestor_clip;
+    let left = shadow_bounds.x.floor().max(0.0) as i32;
+    let top = shadow_bounds.y.floor().max(0.0) as i32;
+    let right = (shadow_bounds.x + shadow_bounds.width)
+        .ceil()
+        .min(pixmap.width() as f32) as i32;
+    let bottom = (shadow_bounds.y + shadow_bounds.height)
+        .ceil()
+        .min(pixmap.height() as f32) as i32;
+    let Some(mut shadow_pixmap) = Pixmap::new((right - left) as u32, (bottom - top) as u32)
+    else {
+        return;
+    };
+    let local_rect = crate::Rect {
+        x: rect.x - left as f32,
+        y: rect.y - top as f32,
+        ..*rect
+    };
+    let Some(mut shadow_mask) =
+        rounded_box_clip_mask_radii(
+            shadow_pixmap.width(),
+            shadow_pixmap.height(),
+            &local_rect,
+            border_radii,
+        )
+    else {
+        return;
+    };
+    shadow_mask.invert();
     let color = shadow.color;
     if blur < 0.5 {
         // No blur: a single crisp, offset (and spread) rounded rect.
-        fill_shadow_rect(pixmap, x0, y0, w0, h0, rx0, ry0, color, mask);
-        return;
-    }
-    let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
-    // Per-layer alpha chosen so `steps` source-over composites reach the target
-    // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
-    let a_frac = color[3] as f32 / 255.0;
-    let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
-    let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
-    let layer_color = [color[0], color[1], color[2], layer_alpha];
-    for j in 0..steps {
-        // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
-        // radius. Larger rects paint first, smaller (more-covered) ones on top.
-        let e = blur * (j as f32) / ((steps - 1) as f32);
         fill_shadow_rect(
-            pixmap,
-            x0 - e,
-            y0 - e,
-            w0 + 2.0 * e,
-            h0 + 2.0 * e,
-            rx0 + e,
-            ry0 + e,
-            layer_color,
-            mask,
+            &mut shadow_pixmap,
+            x0 - left as f32,
+            y0 - top as f32,
+            w0,
+            h0,
+            rx0,
+            ry0,
+            color,
+            Some(&shadow_mask),
         );
+    } else {
+        let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
+        // Per-layer alpha chosen so `steps` source-over composites reach the target
+        // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
+        let a_frac = color[3] as f32 / 255.0;
+        let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
+        let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
+        let layer_color = [color[0], color[1], color[2], layer_alpha];
+        for j in 0..steps {
+            // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
+            // radius. Larger rects paint first, smaller (more-covered) ones on top.
+            let e = blur * (j as f32) / ((steps - 1) as f32);
+            fill_shadow_rect(
+                &mut shadow_pixmap,
+                x0 - e - left as f32,
+                y0 - e - top as f32,
+                w0 + 2.0 * e,
+                h0 + 2.0 * e,
+                rx0 + e,
+                ry0 + e,
+                layer_color,
+                Some(&shadow_mask),
+            );
+        }
     }
+    // Ancestor overflow clip is already the complete rect/rounded chain.
+    pixmap.draw_pixmap(
+        left,
+        top,
+        shadow_pixmap.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        ancestor_clip,
+    );
 }
 
 /// Fill one (possibly rounded) shadow rectangle with a flat color, optionally
-/// masked to an ancestor clip region. A helper for `paint_box_shadow`'s layers.
+/// constrained by an alpha mask. A helper for `paint_box_shadow`'s layers.
 fn fill_shadow_rect(
     pixmap: &mut Pixmap,
     x: f32,
@@ -11244,6 +11290,76 @@ mod tests {
         assert!(blue.blue() > 240 && blue.red() < 20 && blue.green() < 20);
         assert!(red.red() > 240 && red.green() < 20 && red.blue() < 20);
         assert!(yellow.red() > 240 && yellow.green() > 240 && yellow.blue() < 20);
+    }
+
+    #[test]
+    fn outset_box_shadow_stays_outside_transparent_and_opaque_border_boxes() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <div style="position:absolute;left:20px;top:20px;width:40px;height:30px;
+                            box-shadow:4px 4px 0 black"></div>
+                <div style="position:absolute;left:100px;top:20px;width:40px;height:30px;
+                            background:rgb(0,255,0);box-shadow:4px 4px 0 black"></div>
+                <div style="position:absolute;left:20px;top:70px;width:40px;height:30px;
+                            border-radius:12px;box-shadow:0 0 0 4px black"></div>
+                <div style="position:absolute;left:100px;top:70px;width:40px;height:30px;
+                            box-shadow:2px 2px 3px rgb(51,51,51)"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (160.0, 120.0), None).expect("box shadow paint");
+
+        let transparent_center = pixmap.pixel(35, 35).expect("transparent center");
+        assert_eq!(
+            (
+                transparent_center.red(),
+                transparent_center.green(),
+                transparent_center.blue(),
+            ),
+            (255, 255, 255),
+            "an outset shadow must not cover a transparent border box"
+        );
+        let offset_gap = pixmap.pixel(21, 35).expect("offset gap");
+        assert_eq!(
+            (offset_gap.red(), offset_gap.green(), offset_gap.blue()),
+            (255, 255, 255),
+            "the clip must not turn the shadow and border-box paths into a symmetric difference"
+        );
+        let shadow_edge = pixmap.pixel(62, 35).expect("shadow edge");
+        assert!(
+            shadow_edge.red() < 10 && shadow_edge.green() < 10 && shadow_edge.blue() < 10,
+            "shadow ink must remain outside the border box: {shadow_edge:?}"
+        );
+        let opaque_center = pixmap.pixel(115, 35).expect("opaque center");
+        assert!(
+            opaque_center.green() > 245
+                && opaque_center.red() < 10
+                && opaque_center.blue() < 10,
+            "opaque backgrounds must continue to cover the shadow: {opaque_center:?}"
+        );
+        let rounded_corner = pixmap.pixel(21, 71).expect("rounded corner shadow");
+        assert!(
+            rounded_corner.red() < 10
+                && rounded_corner.green() < 10
+                && rounded_corner.blue() < 10,
+            "the hole must follow the rounded border box rather than its rectangular bounds: {rounded_corner:?}"
+        );
+        let blurred_center = pixmap.pixel(115, 85).expect("blurred center");
+        assert_eq!(
+            (
+                blurred_center.red(),
+                blurred_center.green(),
+                blurred_center.blue(),
+            ),
+            (255, 255, 255),
+            "blurred outset shadows must keep the border-box interior transparent"
+        );
+        let blurred_edge = pixmap.pixel(142, 85).expect("blurred edge");
+        assert!(
+            blurred_edge.red() < 240
+                && blurred_edge.green() < 240
+                && blurred_edge.blue() < 240,
+            "the issue's 2px 2px 3px shadow must retain ink outside the box: {blurred_edge:?}"
+        );
     }
 
     #[test]

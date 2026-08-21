@@ -8,6 +8,7 @@ use deno_core::op2;
 use deno_core::Extension;
 #[cfg(feature = "render")]
 use deno_core::JsBuffer;
+use deno_core::v8;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
@@ -24,6 +25,7 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 
 use crate::import_map::ImportMap;
+use crate::write_stream::DocumentWriteStream;
 
 pub type InterceptCallback = Arc<
     Mutex<
@@ -254,6 +256,25 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    // Frame documents that have been fetched and are waiting for a realm.
+    // Building one needs the whole runtime, which an op cannot reach, so
+    // `op_frame_document_ready` queues here and the Page drains it between
+    // event loop turns. Same shape as `pending_binding_calls`.
+    pub pending_frames: Vec<PendingFrame>,
+    /// Total URL and HTML bytes held by `pending_frames`.
+    pub pending_frame_bytes: usize,
+    pub frame_id_counter: u32,
+    /// Which frame this state belongs to; 0 is the page's own realm.
+    pub frame_id: u32,
+    // postMessage traffic between realms, waiting to be delivered. A realm
+    // cannot reach another realm's context on its own, so the message is queued
+    // here and the Page dispatches it, the same way frames themselves are
+    // built. Queued on the *page's* state whichever realm sent it, so one drain
+    // sees the traffic of the whole tree.
+    pub pending_frame_messages: Vec<PendingFrameMessage>,
+    /// Bytes of payload currently queued above, tracked rather than summed so
+    /// the cap costs nothing per message.
+    pub pending_frame_message_bytes: usize,
     /// Requests initiated by this runtime only. Browser contexts share their
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
@@ -341,6 +362,35 @@ pub struct ObscuraState {
     /// rather than wrapper state, because it must survive moves and clones and
     /// because fragment parsing can create nodes before a JS wrapper exists.
     pub(crate) already_started_scripts: RefCell<HashSet<NodeId>>,
+    /// The document's input stream for `document.write()`, created on the first call.
+    /// Why the calls share one parser is in `write_stream`.
+    pub(crate) write_stream: RefCell<Option<crate::write_stream::DocumentWriteStream>>,
+}
+
+/// A frame document waiting to be given a realm.
+pub struct PendingFrame {
+    pub frame_id: u32,
+    pub url: String,
+    pub html: String,
+    pub viewport_width: u64,
+    pub viewport_height: u64,
+    /// The frame that holds this one; 0 when the page does.
+    pub parent_frame_id: u32,
+}
+
+/// One `postMessage` in flight between two realms.
+pub struct PendingFrameMessage {
+    /// Where it is going. 0 is the page's realm.
+    pub target_frame_id: u32,
+    /// Where it came from, so the receiver can reply through `event.source`.
+    pub source_frame_id: u32,
+    /// The sender's origin, for `event.origin`.
+    pub origin: String,
+    /// The payload, JSON encoded. Structured clone is not available across
+    /// realms here, and JSON covers what postMessage is used for in practice:
+    /// a widget reporting a result. Anything it cannot encode is rejected by
+    /// the sender rather than silently arriving as null.
+    pub data_json: String,
 }
 
 impl ObscuraState {
@@ -368,6 +418,12 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            pending_frames: Vec::new(),
+            pending_frame_bytes: 0,
+            frame_id_counter: 0,
+            frame_id: 0,
+            pending_frame_messages: Vec::new(),
+            pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
@@ -409,6 +465,7 @@ impl ObscuraState {
             resolved_scroll: None,
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
+            write_stream: RefCell::new(None),
         }
     }
 }
@@ -515,6 +572,88 @@ fn response_body_byte_limit() -> usize {
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+/// Which document belongs to which realm.
+///
+/// An op has to read the state of the realm that *called* it. Making a realm
+/// "current" around the host's own calls into it is not enough: a frame's
+/// deferred work, a timer firing or a promise settling, re-enters JavaScript
+/// from the event loop, where nothing had the chance to swap anything. Without
+/// this a frame's `setTimeout` callback runs with the frame's globals but
+/// writes to the *parent's* DOM.
+#[derive(Default)]
+pub struct RealmStates {
+    entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+}
+
+impl RealmStates {
+    pub fn register(
+        &mut self,
+        context: v8::Global<v8::Context>,
+        frame_id: u32,
+        state: SharedState,
+    ) {
+        self.entries.push((context, frame_id, state));
+    }
+
+    pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        self.entries.retain(|(known, _, _)| known != context);
+    }
+
+    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+        self.entries
+            .iter()
+            .find(|(_, id, _)| *id == frame_id)
+            .map(|(_, _, state)| state.clone())
+    }
+}
+
+/// The document of the realm a DOM call came from, named rather than inferred.
+///
+/// A wrapper's methods live on its own realm's prototypes, so the code running
+/// for `parentPage.frameDoc.title` is the *frame's* getter even though the
+/// caller is the page. Inferring the realm from the running context therefore
+/// answers the wrong question for any cross-realm access, and would silently
+/// read the page's document. Each realm's bootstrap closure knows its own frame
+/// id and passes it, which is both correct here and cheaper than asking V8:
+/// a page with no frames resolves on `frame_id == 0` alone.
+pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    if frame_id == 0 {
+        return page();
+    }
+    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
+        None => page(),
+    }
+}
+
+/// The state of the realm running right now, or the page's when the caller is
+/// the page itself.
+///
+/// A page with no frames pays only an `is_empty` check: looking up the current
+/// context is not free, and `op_dom` is the hottest op in the system.
+pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.clone(),
+        None => return page(),
+    };
+    let registry = registry.borrow();
+    if registry.entries.is_empty() {
+        return page();
+    }
+    // Not `get_current_context`: an op is a native function bound in the page
+    // realm, so V8 reports that realm as current no matter who called it. This
+    // one answers "whose code is running", which is the question.
+    let current = scope.get_entered_or_microtask_context();
+    registry
+        .entries
+        .iter()
+        .find(|(context, _, _)| *context == current)
+        .map(|(_, _, state)| state.clone())
+        .unwrap_or_else(page)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct RenderMutationImpact {
@@ -1057,7 +1196,9 @@ fn op_dom(
     #[string] cmd: String,
     #[string] arg1: String,
     #[string] arg2: String,
+    frame_id: u32,
 ) -> String {
+    let shared = frame_state(state, frame_id);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -1065,7 +1206,7 @@ fn op_dom(
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        op_dom_inner(state, cmd, arg1, arg2)
+        op_dom_inner(shared, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
@@ -1073,8 +1214,7 @@ fn op_dom(
     })
 }
 
-fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
@@ -1712,6 +1852,33 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             }
             "true".into()
         }
+        // document.write() feeds the document's input stream, so the calls
+        // share one parser and one tokenizer state. Returns the nodes that
+        // became complete with this call, for the caller to run scripts among.
+        // Returns [[parent, node], …], parents before children. A `parent` of 0 means the node
+        // belongs at the insertion point, which the caller knows. Nothing is inserted here:
+        // that must go through Node.appendChild on the JS side, because that call also reports
+        // the mutation, registers window named access, and loads a written stylesheet.
+        "document_write" => {
+            let mut slot = gs.write_stream.borrow_mut();
+            let stream = slot.get_or_insert_with(DocumentWriteStream::new);
+            let pairs: Vec<[i32; 2]> = stream
+                .write(&arg2, dom)
+                .iter()
+                .map(|placement| {
+                    [
+                        placement.parent.map_or(0, |id| id.index() as i32),
+                        placement.node.index() as i32,
+                    ]
+                })
+                .collect();
+            serde_json::to_string(&pairs).unwrap_or("[]".into())
+        }
+        // document.open() discards what the input stream holds and starts over.
+        "document_write_reset" => {
+            *gs.write_stream.borrow_mut() = None;
+            "true".into()
+        }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| match &mut n.data {
@@ -2044,8 +2211,17 @@ fn fetch_timeout() -> std::time::Duration {
 }
 
 /// Cap on the number of redirect hops op_fetch_url will follow.
-/// Matches reqwest's default policy of 10.
-const FETCH_REDIRECT_LIMIT: usize = 10;
+///
+/// The Fetch standard fixes the number at 20. HTTP-redirect fetch returns
+/// a network error as soon as a request's redirect count *reaches* 20,
+/// and only increments it afterwards. So the twentieth hop must still
+/// succeed and the twenty-first must fail:
+/// https://fetch.spec.whatwg.org/#http-redirect-fetch
+///
+/// The reqwest default of 10 does not apply here. The redirects are
+/// followed by hand in this file, one hop per loop iteration, so that
+/// each hop can be checked against the SSRF rules again.
+const FETCH_REDIRECT_LIMIT: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FetchCredentials {
@@ -2881,6 +3057,40 @@ mod tests {
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
+    use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
+    // caps, a huge iteration count pins the single-threaded runtime and a huge
+    // output length forces an unbounded allocation. The derivation must reject
+    // both above the fixed maximums, and still work for ordinary inputs.
+
+    #[test]
+    fn pbkdf2_rejects_excessive_iterations() {
+        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", PBKDF2_MAX_ITERATIONS + 1, 32)
+            .expect_err("iteration count above the cap must be rejected");
+        assert!(
+            err.to_string().contains("iteration"),
+            "error should name the iteration cap: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_rejects_excessive_output_length() {
+        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", 1_000, PBKDF2_MAX_OUTPUT_BYTES + 1)
+            .expect_err("output length above the cap must be rejected");
+        assert!(
+            err.to_string().contains("length"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_derives_within_limits() {
+        let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
+            .expect("ordinary parameters must derive successfully");
+        assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
         assert!(glob_match(
@@ -3377,8 +3587,8 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(state: &OpState) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -3392,8 +3602,8 @@ fn op_get_cookies(state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -3447,12 +3657,138 @@ fn op_local_storage(
     }
 }
 
+// A frame that navigates itself must not move the top document. Recording the
+// navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
-fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_navigate(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+fn frame_message_queue_entry_limit() -> usize {
+    std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+}
+
+fn frame_message_queue_byte_limit() -> usize {
+    std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+// Queues one postMessage for another realm. Always on the page's state, never
+// the caller's: the Page drains a single queue, and a message sent by a nested
+// frame would otherwise sit in that frame's own state and never be looked at.
+//
+// The queue is capped. Script can post in a synchronous loop while the host
+// only drains between event loop turns, and this buffer lives on the process
+// heap rather than V8's, so an unbounded queue would let a page grow memory
+// without bound in the one place the heap-limit guard cannot see. Over the cap
+// the newest message is dropped, keeping the earlier traffic that a widget
+// handshake actually depends on.
+#[op2(fast)]
+fn op_post_frame_message(
+    state: &OpState,
+    target_frame_id: u32,
+    source_frame_id: u32,
+    #[string] origin: &str,
+    #[string] data_json: &str,
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
+    let over_bytes = gs
+        .pending_frame_message_bytes
+        .saturating_add(data_json.len())
+        > frame_message_queue_byte_limit();
+    if over_entries || over_bytes {
+        tracing::warn!(
+            "dropping a postMessage for frame {}: {} already queued, {} bytes",
+            target_frame_id,
+            gs.pending_frame_messages.len(),
+            gs.pending_frame_message_bytes,
+        );
+        return;
+    }
+    gs.pending_frame_message_bytes = gs.pending_frame_message_bytes.saturating_add(data_json.len());
+    gs.pending_frame_messages.push(PendingFrameMessage {
+        target_frame_id,
+        source_frame_id,
+        origin: origin.to_string(),
+        data_json: data_json.to_string(),
+    });
+}
+
+/// Resolves after `millis`, as the timer source for child frame realms.
+///
+/// deno_core's own timer queue is not usable from a frame: `op_timer_queue`
+/// resolves per-context state that only a deno_core-created context carries,
+/// and a snapshot-restored realm has none. This resolves an ordinary promise
+/// instead, and V8 reports the frame as the microtask context, so the ops a
+/// timer callback makes still find the frame's own document.
+#[op2(async)]
+async fn op_sleep(#[number] millis: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
+const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
+const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+// Hands a fetched frame document to the host and returns the id the frame will
+// have. The realm itself is built later, by whoever owns the runtime. A zero
+// id means the bounded native queue refused the document.
+#[op2(fast)]
+fn op_frame_document_ready(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] html: &str,
+    #[number] viewport_width: u64,
+    #[number] viewport_height: u64,
+) -> u32 {
+    // Whoever called this is the new frame's parent, which is how a frame
+    // nested two deep gets `parent` pointing at the frame above it rather than
+    // at the page.
+    let parent_frame_id = realm_state(scope, state).borrow().frame_id;
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let bytes = url.len().saturating_add(html.len());
+    if gs.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+        || gs.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
+    {
+        tracing::warn!(
+            "dropping frame document: {} pending documents, {} bytes",
+            gs.pending_frames.len(),
+            gs.pending_frame_bytes,
+        );
+        return 0;
+    }
+    let Some(frame_id) = gs.frame_id_counter.checked_add(1) else {
+        tracing::warn!("frame id space exhausted");
+        return 0;
+    };
+    gs.frame_id_counter = frame_id;
+    gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
+    gs.pending_frames.push(PendingFrame {
+        frame_id,
+        url: url.to_string(),
+        html: html.to_string(),
+        viewport_width,
+        viewport_height,
+        parent_frame_id,
+    });
+    frame_id
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -3684,16 +4020,34 @@ fn op_subtle_aes_ctr(
     Ok(buf)
 }
 
-/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
-#[op2]
-#[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+/// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
+/// page JS drives this op on the single-threaded runtime: an unbounded
+/// iteration count pins the V8 isolate (blocking every other CDP command on the
+/// connection) and a huge output length forces an unbounded `vec![0u8; length]`
+/// allocation. Both caps sit far above any legitimate use — OWASP recommends
+/// ~600k iterations and derived keys are tens of bytes.
+const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
+const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+
+/// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
+/// are unit-testable without the `#[op2]` wrapper.
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if iterations > PBKDF2_MAX_ITERATIONS {
+        return Err(crypto_err(format!(
+            "PBKDF2 iteration count {iterations} exceeds the supported maximum of {PBKDF2_MAX_ITERATIONS}"
+        )));
+    }
+    if length > PBKDF2_MAX_OUTPUT_BYTES {
+        return Err(crypto_err(format!(
+            "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
+        )));
+    }
     use pbkdf2::pbkdf2_hmac;
     let mut dk = vec![0u8; length as usize];
     match hash {
@@ -3704,6 +4058,19 @@ fn op_subtle_pbkdf2(
         _ => return Err(crypto_err("unsupported PBKDF2 hash")),
     }
     Ok(dk)
+}
+
+/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+#[op2]
+#[buffer]
+fn op_subtle_pbkdf2(
+    #[string] hash: &str,
+    #[buffer] password: &[u8],
+    #[buffer] salt: &[u8],
+    iterations: u32,
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    pbkdf2_derive(hash, password, salt, iterations, length)
 }
 
 /// HKDF key derivation. `length` is the output length in bytes. An empty salt
@@ -4179,6 +4546,9 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_local_storage(),
         op_navigate(),
+        op_frame_document_ready(),
+        op_post_frame_message(),
+        op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),
         op_binding_called(),

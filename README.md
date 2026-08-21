@@ -8,6 +8,7 @@
 <p align="center">
   <a href="https://docs.obscura.sh"><img src="https://img.shields.io/badge/Docs-1a1a1a?style=for-the-badge&logo=gitbook&logoColor=white" alt="Documentation" /></a>
   <a href="https://obscura.sh"><img src="https://img.shields.io/badge/Website-1a1a1a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjE5MCAxNzAgNDIwIDQyMCI+PHBhdGggZmlsbD0iI0ZGRkZGRiIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNDA2LDE3NS4wMDA0MTIgQzQ0MC40OTg5MzIsMTc1LjAwMDM1MSA0NzQuNDk4MTA4LDE3NS4wODA5OTQgNTA4LjQ5NjczNSwxNzQuOTc1NjYyIEM1MzcuNzMzNjQzLDE3NC44ODUwODYgNTYxLjI3MDY5MSwxODcuMjIwNTUxIDU3OS45Mzk2MzYsMjA4Ljc4NjYyMSBDNTkwLjg0MTA2NCwyMjEuMzc5Nzc2IDU5Ny44ODM1NDUsMjM2LjM1MjY2MSA1OTkuOTgxODczLDI1My4yMjAzNjcgQzYwMC40NDU1NTcsMjU2Ljk0NzU0MCA2MDAuOTUxMTExLDI2MC43MDQ0MzcgNjAwLjk1NjYwNCwyNjQuNDQ4MzY0IEM2MDEuMDIyNjQ0LDMwOS42MTM1MjUgNjAxLjA3NTgwNiwzNTQuNzc5MDIyIDYwMC45NTE3ODIsMzk5Ljk0MzkzOSBDNjAwLjkxMzE0Nyw0MTQuMDMyMzQ5IDYwMC42NjMyNjksNDI4LjE0MDEwNiA1OTkuNzgyMjg4LDQ0Mi4xOTMzNTkgQzU5OS41NDEwMTYsNDQ2LjA0MDg5NCA1OTcuNTYwNzkxLDQ1MC42MTU2MDEgNTk0Ljg1MzIxMCw0NTMuMzQxMzA5IEM1NzEuMTc3NTUxLDQ3Ny4xNzUzMjMgNTQ3LjE4MDcyNSw1MDAuNjkwNzk2IDUyMy4yMjc5NjYsNTI0LjI0ODc3OSBDNTA2Ljc5OTgzNSw1NDAuNDA2MTI4IDQ5MC4yMDk5OTEsNTU2LjM5OTkwMiA0NzMuODY0NTYzLDU3Mi42NDAxMzcgQzQ2OC44MDA4NDIsNTc3LjY3MTIwNCA0NjMuMDgyODg2LDU4MC4wNTQxOTkgNDU1Ljk3MDYxMiw1ODAuMDQzODIzIEM0MDAuOTcyNDQzLDU3OS45NjM1MDEgMzQ1Ljk3MzY2Myw1ODAuMTMyMDE5IDI5MC45NzYwNDQsNTc5LjkzNjc2OCBDMjY3LjU4MDQxNCw1NzkuODUzNjk5IDI0Ni41NTEyMDgsNTcyLjA0MzU3OSAyMjguOTM5NzQzLDU1Ni44Mjc1MTUgQzIxMi44NDk2MjUsNTQyLjkyNTg0MiAyMDIuNzUxOTY4LDUyNC45MDIxMDAgMTk4LjE1NjE1OCw1MDQuMDM5NjczIEMxOTcuMjgyMTk2LDUwMC4wNzIyOTYgMTk3LjA1MjQxNCw0OTUuODk1Mzg2IDE5Ny4wNDczMzMsNDkxLjgxNDQ4NCBDMTk2Ljk3ODE0OSw0MzYuMTQ5NjU4IDE5Ny4wNTA3MjAsMzgwLjQ4NDYxOSAxOTYuOTMyNjE3LDMyNC44MTk5NDYgQzE5Ni45MTkxNDQsMzE4LjQ3MDkxNyAxOTkuMTg0ODQ1LDMxMy40MTYxOTkgMjAzLjQ5NTU3NSwzMDkuMTAwNTI1IEMyNDAuNTg3OTk3LDI3MS45NjU0MjQgMjc3LjY4MjQ5NSwyMzQuODMyMzA2IDMxNC44MzQ1NjQsMTk3Ljc1Njk1OCBDMzIwLjk1NjQyMSwxOTEuNjQ3Nzk3IDMyNy4yNjQ0MzUsMTg1LjcxNTI1NiAzMzMuNjczOTIwLDE3OS45MDgwODEgQzMzNy4zNzYwMzgsMTc2LjU1MzgzMyAzNDEuNzIxNDY2LDE3NC44NTMzMTcgMzQ3LjAwNTc5OCwxNzQuOTEyODcyIEMzNjYuNTAxNzA5LDE3NS4xMzI2MTQgMzg2LjAwMTYxNywxNzUuMDAwMzIwIDQwNiwxNzUuMDAwNDEyIFogTTUwMy4zNDQ2NjYsMjczLjg0MDE0OSBDNTA0LjEwMjcyMiwyNzYuMTY3NTcyIDUwNC45NDA5NDgsMjc4LjIxMTA5MCA1MDQuOTQzMjY4LDI4MC4yNTU1MjQgQzUwNS4wMTI4NDgsMzQxLjc0MjI0OSA1MDQuOTY5MTQ3LDQwMy4yMjkwNjUgNTA1LjAzMDc5Miw0NjQuNzE1NzkwIEM1MDUuMDQwODAyLDQ3NC42ODY0OTMgNDk2LjExNzQ2Miw0ODMuOTUzMTg2IDQ4NS43Nzc5MjQsNDgzLjk2NTI3MSBDNDI0LjYyNDQ1MSw0ODQuMDM2ODk2IDM2My40NzA5MTcsNDg0LjAwMzIzNSAzMDIuMzE3MzgzLDQ4My45OTY3MzUgQzI5NS41ODc3NjksNDgzLjk5NjAzMyAyOTMuMDAxMjUxLDQ4MS4zMDE2MDUgMjkzLjAwMDkxNiw0NzQuMzM4NTYyIEMyOTIuOTk3ODY0LDQxMy4zNTE2NTQgMjkzLjIwOTYyNSwzNTIuMzYzMzEyIDI5Mi43ODA3MDEsMjkxLjM3OTM5NSBDMjkyLjcxMzUzMSwyODEuODI4MDk0IDMwMy4yMTMwNDMsMjcwLjgyNDE1OCAzMTMuNDc4MjcxLDI3MC44OTQzMTggQzM1MS45NjgyMDEsMjcxLjE1NzQ0MCAzOTAuNDYwOTk5LDI3MC45OTk3ODYgNDI4Ljk1MjcyOCwyNzAuOTk5Nzg2IEM0NTEuMTE0NjI0LDI3MC45OTk3ODYgNDczLjI3NzI4MywyNzAuOTE3NDgwIDQ5NS40Mzc0NjksMjcxLjExMjE1MiBDNDk3Ljk3NzAyMCwyNzEuMTM0NDkxIDUwMC41MDI5MzAsMjcyLjcwNDM3NiA1MDMuMzQ0NjY2LDI3My44NDAxNDkgWiI+PC9wYXRoPjwvc3ZnPgo=&logoColor=white" alt="Website" /></a>
+  <a href="https://x.com/obscura_sh" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/TWITTER%20%2F%20X-1a1a1a?style=for-the-badge&logo=x&logoColor=white" alt="Obscura on Twitter/X" /></a>
   <a href="https://cal.com/obscura/quick-chat"><img src="https://img.shields.io/badge/Book_a_Demo-1a1a1a?style=for-the-badge&logo=googlecalendar&logoColor=white" alt="Book a demo" /></a>
   <a href="https://github.com/h4ckf0r0day/obscura/releases"><img src="https://img.shields.io/badge/Releases-1a1a1a?style=for-the-badge&logo=github&logoColor=white" alt="Releases" /></a>
 </p>
@@ -25,8 +26,6 @@
 Obscura is a headless browser engine written in Rust, built for web scraping and AI agent automation. It runs real JavaScript via V8, supports the Chrome DevTools Protocol, and acts as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
 
 ### Why Obscura over headless Chrome?
-
-Designed for automation at scale, not desktop browsing.
 
 | Metric       | Obscura      | Headless Chrome |
 |--------------|--------------|------------------|
@@ -50,7 +49,7 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 
 ## Sponsors
 
-**Obscura** is supported by sponsors who help keep development independent. 
+**Obscura** is supported by organizations helping us build independent open-source browser infrastructure.
 
 Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
@@ -116,6 +115,17 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       ⚡ Stable HTTP(S) connections<br><br>
       🎁 Use code <b>obscura</b> for <b>10% off</b>.<br><br></b>
       Get started with a 3-day free trial and test Thordata with your own workflow.
+    </td>
+  </tr>
+ <tr>
+    <td width="200" align="center" valign="middle">
+      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
+        <img alt="NiuProxy" src="assets/sponsors/niuproxlogo.png" width="180"/>
+      </a>
+    </td>
+    <td valign="middle">
+      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura"><b>NiuProxy</b></a> Rotating Residential Proxies — Special Offer: 10TB at $0.35/GB | 1TB at $0.50/GB.<br><br>
+      🎁 Use code <b>PAY2</b> for <b>10% off</b> your recharge.
     </td>
   </tr>
 </table>
@@ -420,6 +430,14 @@ Obscura caps the page's script-execution phase so one slow or hung page cannot s
 ```bash
 OBSCURA_SCRIPT_DEADLINE_MS=60000 obscura serve --port 9222
 ```
+
+Modules that enhance an already-rendered page have a separate 3s per-module budget so one non-essential module cannot hold navigation open. Raise it for legitimate long-running modules such as a Vite HMR client:
+
+```bash
+OBSCURA_MODULE_BUDGET_MS=10000 obscura serve --port 9222
+```
+
+An unmounted SPA shell already gives its app modules the full `OBSCURA_SCRIPT_DEADLINE_MS` budget. `OBSCURA_FETCH_TIMEOUT_MS` controls the module's network request, not its evaluation time. See [Environment variables](docs/Environment-variables.md) for the complete timeout model.
 
 ### `obscura serve`
 

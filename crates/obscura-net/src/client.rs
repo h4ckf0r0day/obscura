@@ -835,6 +835,7 @@ pub struct ObscuraHttpClient {
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
+    pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
     pub timeout: Duration,
@@ -1048,6 +1049,7 @@ impl ObscuraHttpClient {
             user_agent: RwLock::new(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
             ),
+            accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1474,10 +1476,12 @@ impl ObscuraHttpClient {
                 }
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-            headers.insert(
-                reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_static("en-US,en;q=0.9"),
-            );
+            let accept_language = self.accept_language.read().await.clone();
+            if let Ok(value) = HeaderValue::from_str(&accept_language) {
+                if !accept_language.is_empty() {
+                    headers.insert(reqwest::header::ACCEPT_LANGUAGE, value);
+                }
+            }
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
                 self.cookie_jar.get_cookie_header(&current_url)
@@ -1625,6 +1629,10 @@ impl ObscuraHttpClient {
 
     pub async fn set_user_agent(&self, ua: &str) {
         *self.user_agent.write().await = ua.to_string();
+    }
+
+    pub async fn set_accept_language(&self, accept_language: &str) {
+        *self.accept_language.write().await = accept_language.to_string();
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
@@ -1965,6 +1973,27 @@ mod ssrf_tests {
         let request = received.recv().await.unwrap().to_ascii_lowercase();
         assert!(!request.contains("origin:"));
         assert!(request.contains("cookie: same=1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn accept_language_override_reaches_the_wire() {
+        let (target, mut received) = http_fixture(vec![ok_response("", "ok")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client.set_accept_language("de-DE,de;q=0.9").await;
+
+        client.fetch(&target).await.unwrap();
+
+        let request = received.recv().await.unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("accept-language: de-DE,de;q=0.9")),
+            "request did not contain the configured Accept-Language header: {request}"
+        );
     }
 
     #[tokio::test]

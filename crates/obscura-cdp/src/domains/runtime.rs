@@ -4,6 +4,19 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// Whether a binding name is a plain JS identifier and therefore safe to
+/// interpolate into the generated shim / teardown scripts. Chromium bindings
+/// are identifiers; anything else (quotes, brackets, spaces, operators) could
+/// break out of the surrounding string literal and inject arbitrary JS into the
+/// page. `Runtime.addBinding` always enforced this, but `Runtime.removeBinding`
+/// did not, so a crafted name escaped `delete globalThis['{name}']` and ran in
+/// the page context. Both handlers now share this guard.
+fn is_valid_binding_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        && !name.chars().next().unwrap_or('0').is_ascii_digit()
+}
+
 /// Drain pending JS-initiated navigation (form.submit, location.assign, etc),
 /// then emit the same CDP nav-event sequence Page.navigate emits so
 /// Puppeteer's waitForNavigation / Playwright's wait_for_url resolves.
@@ -337,10 +350,7 @@ pub async fn handle(
         }
         "addBinding" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if !name.is_empty()
-                && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-                && !name.chars().next().unwrap_or('0').is_ascii_digit()
-            {
+            if is_valid_binding_name(name) {
                 // The shim forwards every call back to Rust through
                 // op_binding_called; the CDP dispatcher then drains the
                 // queue and emits Runtime.bindingCalled events the same
@@ -365,6 +375,18 @@ pub async fn handle(
                 let key = format!("__obscura_binding__{}", name);
                 ctx.preload_scripts.retain(|(k, _)| k != &key);
                 ctx.preload_scripts.push((key, shim.clone()));
+                // Remember who subscribed, so the call goes back to this
+                // session rather than to whichever session of the page a
+                // HashMap happens to yield first. A client discards an event
+                // addressed to a session it does not hold, and the session
+                // Target.createTarget leaves behind is not the one a client
+                // ends up using.
+                if let Some(session_id) = session_id {
+                    let owners = ctx.binding_sessions.entry(name.to_string()).or_default();
+                    if !owners.contains(session_id) {
+                        owners.push(session_id.clone());
+                    }
+                }
                 // Install on the current page so the binding is usable
                 // immediately, without waiting for the next navigation.
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
@@ -375,9 +397,17 @@ pub async fn handle(
         }
         "removeBinding" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if !name.is_empty() {
+            if is_valid_binding_name(name) {
                 let key = format!("__obscura_binding__{}", name);
                 ctx.preload_scripts.retain(|(k, _)| k != &key);
+                if let Some(session_id) = session_id {
+                    if let Some(owners) = ctx.binding_sessions.get_mut(name) {
+                        owners.retain(|owner| owner != session_id);
+                        if owners.is_empty() {
+                            ctx.binding_sessions.remove(name);
+                        }
+                    }
+                }
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     page.evaluate(&format!("delete globalThis['{}'];", name));
                 }
@@ -586,5 +616,56 @@ mod tests {
             .await
             .expect("Runtime.enable must succeed even with no session");
         assert_eq!(result, json!({}));
+    }
+
+    /// SEC-002 / #578 — Runtime.removeBinding must validate the binding name the
+    /// same way addBinding does. Before the fix the name was interpolated
+    /// straight into `delete globalThis['{name}']`, so a CDP client could break
+    /// out of the string delimiter and run arbitrary JS in the page. This drives
+    /// the real handler against a live page and asserts the injected statement
+    /// never executes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_binding_rejects_injection_in_name() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        // Canary the injection would flip from 0 to 1.
+        ctx.get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("globalThis.__pwned = 0");
+
+        // The generated code is `delete globalThis['{name}']`, which the runtime
+        // wraps as `return ( ... )`. A comma-expression payload stays a single
+        // valid expression through that wrapper and runs the assignment:
+        //   delete globalThis['x'] , (globalThis.__pwned = 1) , globalThis['y']
+        handle(
+            "removeBinding",
+            &json!({ "name": "x'] , (globalThis.__pwned = 1) , globalThis['y" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("removeBinding must return Ok regardless of the name");
+
+        let pwned = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("globalThis.__pwned");
+        assert_ne!(
+            pwned.as_f64(),
+            Some(1.0),
+            "removeBinding must not execute JS injected via the binding name (got {pwned:?})"
+        );
     }
 }

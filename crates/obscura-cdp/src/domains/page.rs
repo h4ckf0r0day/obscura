@@ -10,6 +10,82 @@ use crate::dispatch::{ScreencastFormat, ScreencastState};
 
 #[cfg(feature = "render")]
 const DEFAULT_SCREENSHOT_QUALITY: i64 = 80;
+
+/// CDP frame ids are strings, while a realm is identified by number, so a
+/// child's protocol id is derived from its page's. It stays stable for the
+/// life of the frame, which is what lets a client match an attach event to the
+/// frame it later sees in the tree.
+fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
+    format!("{page_frame_id}-frame-{frame_id}")
+}
+
+fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm) -> Value {
+    let id = child_frame_id(page_frame_id, frame.frame_id());
+    let parent_id = if frame.parent_frame_id() == 0 {
+        page_frame_id.to_string()
+    } else {
+        child_frame_id(page_frame_id, frame.parent_frame_id())
+    };
+    json!({
+        "id": id,
+        "parentId": parent_id,
+        "loaderId": format!("{id}-loader"),
+        "url": frame.url(),
+        "domainAndRegistry": "",
+        "securityOrigin": frame.origin(),
+        "mimeType": "text/html",
+        "adFrameStatus": { "adFrameType": "none" },
+    })
+}
+
+/// The page's child frames, flattened with each parent ahead of its children
+/// so an attach event never names a parent the client has not seen yet.
+pub fn child_frame_values(page: &obscura_browser::Page) -> Vec<Value> {
+    fn walk(page: &obscura_browser::Page, parent_frame_id: u32, out: &mut Vec<Value>) {
+        for frame in page
+            .frames
+            .iter()
+            .filter(|frame| frame.parent_frame_id() == parent_frame_id)
+        {
+            out.push(child_frame_value(&page.frame_id, frame));
+            walk(page, frame.frame_id(), out);
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(page, 0, &mut out);
+    out
+}
+
+/// The page's live frame hierarchy. `childFrames` used to be hardcoded empty,
+/// so a client was told the page had no frames however many it had built.
+fn frame_tree(page: &obscura_browser::Page) -> Value {
+    fn children(page: &obscura_browser::Page, parent_frame_id: u32) -> Vec<Value> {
+        page.frames
+            .iter()
+            .filter(|frame| frame.parent_frame_id() == parent_frame_id)
+            .map(|frame| {
+                json!({
+                    "frame": child_frame_value(&page.frame_id, frame),
+                    "childFrames": children(page, frame.frame_id()),
+                })
+            })
+            .collect()
+    }
+
+    json!({
+        "frame": {
+            "id": page.frame_id,
+            "loaderId": "initial-loader",
+            "url": page.url_string(),
+            "domainAndRegistry": "",
+            "securityOrigin": page.url_string(),
+            "mimeType": "text/html",
+            "adFrameStatus": { "adFrameType": "none" },
+        },
+        "childFrames": children(page, 0),
+    })
+}
 #[cfg(feature = "render")]
 const MAX_SCREENCAST_FRAMES_IN_FLIGHT: u8 = 2;
 #[cfg(feature = "render")]
@@ -1153,20 +1229,7 @@ pub async fn handle(
             let page = ctx
                 .get_session_page(session_id)
                 .ok_or("No page for session")?;
-            Ok(json!({
-                "frameTree": {
-                    "frame": {
-                        "id": page.frame_id,
-                        "loaderId": "initial-loader",
-                        "url": page.url_string(),
-                        "domainAndRegistry": "",
-                        "securityOrigin": page.url_string(),
-                        "mimeType": "text/html",
-                        "adFrameStatus": { "adFrameType": "none" },
-                    },
-                    "childFrames": [],
-                }
-            }))
+            Ok(json!({ "frameTree": frame_tree(page) }))
         }
         "createIsolatedWorld" => {
             let (frame_id_param, world_name, page_url, page_id) = {

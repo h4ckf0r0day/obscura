@@ -44,6 +44,9 @@ pub struct CdpContext {
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
+    /// Child frame ids already reported to the client, per page, so each frame
+    /// is announced once and a frame that goes away can be retracted.
+    pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -56,6 +59,12 @@ pub struct CdpContext {
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
+    // Which sessions asked for each `Runtime.addBinding` name. A binding is a
+    // session-scoped subscription in CDP, and a client discards any event whose
+    // sessionId is not one it holds, so the call has to go back to the session
+    // that registered the name rather than to whichever session of the page
+    // happens to come first out of a HashMap.
+    pub binding_sessions: HashMap<String, Vec<String>>, // binding name -> session ids
     // World names registered via Page.createIsolatedWorld. After every
     // navigation Obscura clears execution contexts (via
     // Runtime.executionContextsCleared) and must re-emit a
@@ -155,6 +164,7 @@ impl CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
+            announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -166,6 +176,7 @@ impl CdpContext {
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
+            binding_sessions: HashMap::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -286,6 +297,7 @@ impl CdpContext {
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
             let removed: Vec<String> = self
@@ -537,6 +549,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     }
 
     drain_binding_calls(ctx);
+    drain_frame_events(ctx);
 
     match result {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
@@ -554,12 +567,21 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 // in the queue while V8 is running inside a CDP handler, so there is no
 // window in which they could pile up without a draining opportunity.
 pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
-    // page_id -> session_id (any one session that holds this page).
-    let page_to_session: HashMap<String, String> = ctx
-        .sessions
-        .iter()
-        .map(|(sid, pid)| (pid.clone(), sid.clone()))
-        .collect();
+    // page_id -> every session on that page. A page commonly has more than one:
+    // Target.createTarget opens a session and the Target.attachToTarget that
+    // follows opens another, so a client that reaches a page the ordinary way
+    // holds two and uses the second.
+    let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (session_id, page_id) in &ctx.sessions {
+        page_to_sessions
+            .entry(page_id.as_str())
+            .or_default()
+            .push(session_id.as_str());
+    }
+    // ctx.sessions is a HashMap, so fix an order the events can be asserted in.
+    for sessions in page_to_sessions.values_mut() {
+        sessions.sort_unstable();
+    }
 
     let mut events: Vec<CdpEvent> = Vec::new();
     for page in &mut ctx.pages {
@@ -567,27 +589,136 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
         if calls.is_empty() {
             continue;
         }
-        let Some(session_id) = page_to_session.get(&page.id).cloned() else {
+        let Some(page_sessions) = page_to_sessions.get(page.id.as_str()) else {
             // No session attached — drop the calls; there is no client to
             // deliver them to.
             continue;
         };
         for (name, payload) in calls {
-            events.push(CdpEvent {
-                method: "Runtime.bindingCalled".into(),
-                // Use executionContextId=2: the default main-frame context
-                // emitted post-navigation (see domains/page.rs phase1).
-                // Puppeteer matches on session_id + binding name and
-                // tolerates any registered context id.
-                params: json!({
-                    "name": name,
-                    "payload": payload,
-                    "executionContextId": 2,
-                }),
-                session_id: Some(session_id.clone()),
-            });
+            // The sessions that asked for this binding, narrowed to the page the
+            // call came from. Falling back to every session of the page keeps a
+            // binding that was installed without a session (a preload, or a
+            // direct embedder) deliverable rather than silently dropped.
+            let registered = ctx.binding_sessions.get(&name);
+            let targets: Vec<&str> = page_sessions
+                .iter()
+                .copied()
+                .filter(|session| {
+                    registered.is_none_or(|owners| owners.iter().any(|owner| owner == session))
+                })
+                .collect();
+            let targets = if targets.is_empty() {
+                page_sessions.clone()
+            } else {
+                targets
+            };
+            for session_id in targets {
+                events.push(CdpEvent {
+                    method: "Runtime.bindingCalled".into(),
+                    // Use executionContextId=2: the default main-frame context
+                    // emitted post-navigation (see domains/page.rs phase1).
+                    // Puppeteer matches on session_id + binding name and
+                    // tolerates any registered context id.
+                    params: json!({
+                        "name": name,
+                        "payload": payload,
+                        "executionContextId": 2,
+                    }),
+                    session_id: Some(session_id.to_string()),
+                });
+            }
         }
     }
+    ctx.pending_events.extend(events);
+}
+
+// Announce child frames the client has not been told about yet, and retract
+// the ones that are gone.
+//
+// A frame is built when the page settles, which is not necessarily during the
+// navigation that created it: script can add an iframe at any time, and the
+// settle that gives it a realm may belong to a later command. Diffing here,
+// after every dispatch, reports a frame whenever it actually appears instead
+// of only at navigation, and is the same drain point binding calls use.
+pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
+    // Every session on the page, not just one: a client that reaches a page the
+    // ordinary way holds two of them, because Target.createTarget opens a
+    // session and the Target.attachToTarget that follows opens another. A
+    // client drops any event whose sessionId is not the one it attached with,
+    // so announcing to an arbitrary session is the same as not announcing.
+    let mut page_to_sessions: HashMap<String, Vec<String>> = HashMap::new();
+    for (session_id, page_id) in &ctx.sessions {
+        page_to_sessions
+            .entry(page_id.clone())
+            .or_default()
+            .push(session_id.clone());
+    }
+    // ctx.sessions is a HashMap, so fix an order the events can be asserted in.
+    for sessions in page_to_sessions.values_mut() {
+        sessions.sort();
+    }
+
+    let mut events: Vec<CdpEvent> = Vec::new();
+    let mut announced: HashMap<String, Vec<String>> = HashMap::new();
+    for page in &ctx.pages {
+        let Some(session_ids) = page_to_sessions.get(&page.id) else {
+            continue;
+        };
+        let live = crate::domains::page::child_frame_values(page);
+        let known = ctx.announced_frames.get(&page.id);
+        let live_ids: Vec<String> = live
+            .iter()
+            .map(|frame| frame["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+
+        for frame in &live {
+            let id = frame["id"].as_str().unwrap_or_default();
+            if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
+                continue;
+            }
+            for session_id in session_ids {
+                // Attach before navigate: a client builds its frame from the
+                // attach event and treats a navigation of a frame it has never
+                // seen as a protocol error.
+                events.push(CdpEvent {
+                    method: "Page.frameAttached".into(),
+                    params: json!({
+                        "frameId": id,
+                        "parentFrameId": frame["parentId"].as_str().unwrap_or_default(),
+                    }),
+                    session_id: Some(session_id.clone()),
+                });
+                events.push(CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    params: json!({ "frame": frame, "type": "Navigation" }),
+                    session_id: Some(session_id.clone()),
+                });
+                // The frame's document scripts have already run by the time it
+                // is in this list, so it is not still loading.
+                events.push(CdpEvent {
+                    method: "Page.frameStoppedLoading".into(),
+                    params: json!({ "frameId": id }),
+                    session_id: Some(session_id.clone()),
+                });
+            }
+        }
+
+        if let Some(known) = known {
+            for id in known {
+                if !live_ids.contains(id) {
+                    for session_id in session_ids {
+                        events.push(CdpEvent {
+                            method: "Page.frameDetached".into(),
+                            params: json!({ "frameId": id, "reason": "remove" }),
+                            session_id: Some(session_id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        announced.insert(page.id.clone(), live_ids);
+    }
+    ctx.announced_frames.extend(announced);
     ctx.pending_events.extend(events);
 }
 

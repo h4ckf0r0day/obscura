@@ -120,6 +120,24 @@ async fn read_wreq_body_limited(
 }
 
 #[cfg(feature = "stealth")]
+async fn send_get_with_connection_reset_retry(
+    request: wreq::RequestBuilder,
+    url: &Url,
+) -> Result<wreq::Response, wreq::Error> {
+    let retry = request.try_clone();
+    match request.send().await {
+        Err(error) if error.is_connection_reset() => {
+            let Some(retry) = retry else {
+                return Err(error);
+            };
+            tracing::debug!(%url, "retrying GET after connection reset");
+            retry.send().await
+        }
+        result => result,
+    }
+}
+
+#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
     pub cookie_jar: Arc<CookieJar>,
@@ -299,9 +317,16 @@ impl StealthHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
-            })?;
+            let resp = send_get_with_connection_reset_retry(req, &current_url)
+                .await
+                .map_err(|e| {
+                    ObscuraNetError::Network(format!(
+                        "{}: {} (source: {:?})",
+                        current_url,
+                        e,
+                        e.source()
+                    ))
+                })?;
 
             let status = resp.status();
             validate_wreq_cors_response(
@@ -454,12 +479,15 @@ impl StealthHttpClient {
 
 #[cfg(all(test, feature = "stealth"))]
 mod tests {
+    use std::io::{Read, Write};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
 
-    use super::StealthHttpClient;
+    use super::{StealthHttpClient, send_get_with_connection_reset_retry};
+    use crate::client::ObscuraNetError;
     use crate::cookies::CookieJar;
 
     const PLAIN_BODY: &str = "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
@@ -475,6 +503,83 @@ mod tests {
         0x69, 0x7d, 0xb0, 0x5a, 0x00, 0x80, 0x3d, 0x1c, 0x5f, 0x41, 0x00, 0x00,
         0x00,
     ];
+
+    fn reset_fixture(respond_after_reset: bool) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let attempts = if respond_after_reset { 2 } else { 1 };
+            for attempt in 0..attempts {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+
+                if attempt == 0 {
+                    let socket = socket2::Socket::from(stream);
+                    socket.set_linger(Some(Duration::ZERO)).unwrap();
+                    drop(socket);
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+            attempts
+        });
+        (port, server)
+    }
+
+    #[tokio::test]
+    async fn stealth_get_recovers_from_connection_reset() {
+        let (port, server) = reset_fixture(true);
+        let client = wreq::Client::builder().no_proxy().build().unwrap();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let response = send_get_with_connection_reset_retry(client.get(url.as_str()), &url)
+            .await
+            .expect("an idempotent GET should recover from one connection reset");
+
+        assert_eq!(response.status(), wreq::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+        assert_eq!(server.join().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn stealth_post_does_not_retry_connection_reset() {
+        let (port, server) = reset_fixture(false);
+        let client = StealthHttpClient {
+            client: wreq::Client::builder().no_proxy().build().unwrap(),
+            cookie_jar: Arc::new(CookieJar::new()),
+            extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let error = client
+            .send_single(
+                "POST",
+                &url,
+                &std::collections::HashMap::new(),
+                "payload",
+                false,
+                false,
+            )
+            .await
+            .expect_err("POST must not be retried after a connection reset");
+
+        assert!(matches!(error, ObscuraNetError::Network(_)));
+        assert_eq!(server.join().unwrap(), 1);
+    }
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.
     async fn gzip_fixture() -> u16 {

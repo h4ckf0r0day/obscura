@@ -32,7 +32,9 @@ struct Args {
     #[arg(long, global = true)]
     stealth: bool,
 
-    #[arg(long)]
+    /// Respect robots.txt before navigating to an HTTP(S) URL.
+    /// Global: applies to fetch and scrape.
+    #[arg(long, global = true)]
     obey_robots: bool,
 
     #[arg(long)]
@@ -353,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
 
     let global_proxy = args.proxy.clone();
     let stealth = args.stealth;
+    let obey_robots = args.obey_robots;
 
     match args.command {
         Some(Command::Serve {
@@ -451,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     output,
                     quiet,
+                    stealth
                 )
                 .await?;
             } else {
@@ -476,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     storage_dir,
                     args.allow_private_network,
+                    obey_robots,
                     screenshot,
                 )
                 .await?;
@@ -498,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
                 quiet,
                 global_proxy,
                 stealth,
+                obey_robots,
             )
             .await?;
         }
@@ -686,6 +692,7 @@ async fn run_fetch(
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
     allow_private_network: bool,
+    obey_robots: bool,
     screenshot: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // Whether the user explicitly passed --dump. With --eval also present this
@@ -699,19 +706,28 @@ async fn run_fetch(
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
     // body through the DOM/JS layer would corrupt or discard data.
     if dump == DumpFormat::Original {
-        let bytes = fetch_original_bytes(url_str, proxy, user_agent.clone(), timeout_secs).await?;
+        let bytes = fetch_original_bytes(
+            url_str,
+            proxy,
+            user_agent.clone(),
+            timeout_secs,
+            stealth,
+        )
+        .await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
         return Ok(());
     }
 
-    let context = Arc::new(BrowserContext::with_storage_and_network(
+    let mut context = BrowserContext::with_storage_and_network(
         "fetch".to_string(),
         proxy,
         stealth,
         user_agent.clone(),
         storage_dir.clone(),
         allow_private_network,
-    ));
+    );
+    context.obey_robots = obey_robots;
+    let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
     // request deadline. Previously Page retained its independent 30s default,
@@ -1078,9 +1094,33 @@ async fn fetch_original_response(
     proxy: Option<String>,
     user_agent: Option<String>,
     timeout_secs: u64,
+    stealth: bool,
 ) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
+
+    // `--dump original` short-circuits the browser stack (see run_fetch) and
+    // builds its own client here instead of going through BrowserContext /
+    // Page::do_fetch, which is where --stealth is normally applied. Without
+    // this, the request stays on plain HTTP/1.1 with no TLS impersonation
+    // regardless of --stealth (issue #482). file:// has no TLS handshake to
+    // impersonate and the wreq client only speaks http(s), so it is excluded
+    // here the same way ObscuraHttpClient::fetch_with_method excludes it
+    // internally.
+    if stealth && url.scheme() != "file" {
+        #[cfg(feature = "stealth")]
+        {
+            let client = obscura_net::StealthHttpClient::with_proxy(
+                Arc::new(obscura_net::CookieJar::new()),
+                proxy.as_deref(),
+            );
+            return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+                Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
+            };
+        }
+    }
 
     let client = obscura_net::ObscuraHttpClient::with_options(
         Arc::new(obscura_net::CookieJar::new()),
@@ -1102,9 +1142,10 @@ async fn fetch_original_bytes(
     proxy: Option<String>,
     user_agent: Option<String>,
     timeout_secs: u64,
+    stealth: bool,
 ) -> anyhow::Result<Vec<u8>> {
     Ok(
-        fetch_original_response(url_str, proxy, user_agent, timeout_secs)
+        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth)
             .await?
             .body,
     )
@@ -1146,6 +1187,7 @@ async fn run_batch_fetch(
     proxy: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
+    stealth: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     if total == 0 {
@@ -1178,6 +1220,7 @@ async fn run_batch_fetch(
                 (*proxy).clone(),
                 (*user_agent).clone(),
                 timeout_secs,
+                stealth,
             )
             .await;
             let elapsed_ms = task_start.elapsed().as_millis();
@@ -1480,6 +1523,7 @@ async fn run_parallel_scrape(
     quiet: bool,
     proxy: Option<String>,
     stealth: bool,
+    obey_robots: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1537,6 +1581,7 @@ async fn run_parallel_scrape(
                 .stderr(std::process::Stdio::null())
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
+                .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
                 .spawn()
             {
                 Ok(c) => c,
@@ -1996,7 +2041,7 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5)
+        let bytes = fetch_original_bytes(&file_url, None, None, 5, false)
             .await
             .expect("fetch_original_bytes should round-trip the file body");
 
@@ -2006,6 +2051,39 @@ mod tests {
             bytes, PNG_BYTES,
             "raw response body must match the file byte-for-byte"
         );
+    }
+
+    // A stealth-enabled build routes `--dump original` through
+    // StealthHttpClient (wreq), which only speaks http(s). file:// must keep
+    // working the same as without --stealth instead of being handed to wreq
+    // (issue #482).
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_original_bytes_file_url_ignores_stealth_flag() {
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let path = std::env::temp_dir().join(format!(
+            "obscura-fetch-original-stealth-test-{}.png",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&path).await;
+        tokio::fs::write(&path, PNG_BYTES)
+            .await
+            .expect("seed temp PNG fixture");
+
+        let file_url = format!("file://{}", path.display());
+        let bytes = fetch_original_bytes(&file_url, None, None, 5, true)
+            .await
+            .expect("fetch_original_bytes should still round-trip file:// with stealth=true");
+
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert_eq!(bytes, PNG_BYTES, "stealth=true must not change file:// handling");
     }
 
     #[tokio::test(flavor = "current_thread")]

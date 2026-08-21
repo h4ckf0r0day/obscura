@@ -117,18 +117,15 @@ impl CookieJar {
         };
 
         if let Some(exp) = expires {
-            if exp == 0 {
-                let mut cookies = self.cookies.write().unwrap();
-                if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&(name.clone(), path.clone()));
-                }
-                return;
-            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if exp < now {
+            if exp <= now {
+                let mut cookies = self.cookies.write().unwrap();
+                if let Some(domain_cookies) = cookies.get_mut(&domain) {
+                    domain_cookies.remove(&(name.clone(), path.clone()));
+                }
                 return;
             }
         }
@@ -171,7 +168,7 @@ impl CookieJar {
                     continue;
                 }
                 if let Some(exp) = entry.expires {
-                    if exp < now {
+                    if exp <= now {
                         continue;
                     }
                 }
@@ -190,9 +187,16 @@ impl CookieJar {
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
         let cookies = self.cookies.read().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut result = Vec::new();
         for domain_cookies in cookies.values() {
             for entry in domain_cookies.values() {
+                if entry.expires.is_some_and(|expires| expires <= now) {
+                    continue;
+                }
                 result.push(CookieInfo {
                     name: entry.name.clone(),
                     value: entry.value.clone(),
@@ -210,7 +214,28 @@ impl CookieJar {
 
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
         let mut jar = self.cookies.write().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         for cookie in cookies {
+            if cookie.expires.is_some_and(|expires| {
+                expires == 0 || (expires > 0 && expires <= now)
+            }) {
+                let domains_to_try = [
+                    cookie.domain.clone(),
+                    format!(".{}", cookie.domain.trim_start_matches('.')),
+                    cookie.domain.trim_start_matches('.').to_string(),
+                ];
+                for domain in &domains_to_try {
+                    if let Some(domain_cookies) = jar.get_mut(domain) {
+                        domain_cookies.retain(|_key, entry| {
+                            entry.name != cookie.name || entry.path != cookie.path
+                        });
+                    }
+                }
+                continue;
+            }
             let same_site = if cookie.same_site.is_empty() {
                 DEFAULT_SAME_SITE.to_string()
             } else {
@@ -259,7 +284,7 @@ impl CookieJar {
                     continue;
                 }
                 if let Some(exp) = entry.expires {
-                    if exp < now {
+                    if exp <= now {
                         continue;
                     }
                 }
@@ -340,18 +365,15 @@ impl CookieJar {
         };
 
         if let Some(exp) = expires {
-            if exp == 0 {
-                let mut cookies = self.cookies.write().unwrap();
-                if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&(name.clone(), path.clone()));
-                }
-                return;
-            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if exp < now {
+            if exp <= now {
+                let mut cookies = self.cookies.write().unwrap();
+                if let Some(domain_cookies) = cookies.get_mut(&domain) {
+                    domain_cookies.remove(&(name.clone(), path.clone()));
+                }
                 return;
             }
         }
@@ -435,7 +457,7 @@ impl CookieJar {
         for domain_cookies in cookies.values() {
             for entry in domain_cookies.values() {
                 if let Some(exp) = entry.expires {
-                    if exp < now {
+                    if exp <= now {
                         continue;
                     }
                 }
@@ -768,8 +790,22 @@ mod tests {
     fn test_expired_cookie_not_sent() {
         let jar = CookieJar::new();
         let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("old=current", &url);
         jar.set_cookie("old=gone; Expires=Thu, 01 Jan 2020 00:00:00 GMT", &url);
         assert!(jar.get_cookie_header(&url).is_empty());
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
+    fn test_expired_js_cookie_deletes_existing_cookie() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie_from_js("old=current", &url);
+        jar.set_cookie_from_js(
+            "old=gone; Expires=Thu, 01 Jan 2020 00:00:00 GMT",
+            &url,
+        );
+        assert!(jar.get_all_cookies().is_empty());
     }
 
     #[test]
@@ -835,6 +871,50 @@ mod tests {
     }
 
     #[test]
+    fn test_set_cookies_from_cdp_minus_one_is_a_session_cookie() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "n".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: Some(-1),
+        }]);
+        let cookies = jar.get_all_cookies();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].expires, None);
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_zero_expiry_deletes_matching_cookie() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "current".to_string(),
+            domain: ".example.com".to_string(),
+            path: "/account".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: String::new(),
+            domain: "example.com".to_string(),
+            path: "/account".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: Some(0),
+        }]);
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
     fn test_delete_cookies_filtered_path_mismatch_preserves_cookie() {
         let jar = CookieJar::new();
         jar.set_cookies_from_cdp(vec![CookieInfo {
@@ -874,6 +954,16 @@ mod tests {
     #[test]
     fn test_set_cookies_from_cdp_expired_does_not_persist() {
         let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "old".to_string(),
+            value: "current".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -888,8 +978,7 @@ mod tests {
             same_site: String::new(),
             expires: Some(now - 1),
         }]);
-        let url = Url::parse("https://example.com/").unwrap();
-        assert!(jar.get_cookie_header(&url).is_empty());
+        assert!(jar.get_all_cookies().is_empty());
     }
     #[test]
     fn test_save_load_roundtrip() {

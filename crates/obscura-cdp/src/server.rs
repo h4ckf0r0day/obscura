@@ -569,12 +569,31 @@ fn merge_cookie_delta(
 /// Best-effort: the socket is going away either way, so a failed write just
 /// means the client sees a reset instead of the 503.
 fn refuse_connection(stream: std::net::TcpStream) {
-    use std::io::Write;
+    use std::io::{Read, Write};
     let mut stream = stream;
     let _ = stream.set_nonblocking(false);
+
+    // The accept thread only peeked at the WebSocket handshake. Consume its
+    // bounded HTTP header before closing: Windows resets a socket closed with
+    // unread receive data, which can discard the queued 503 response.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+    let mut request = [0u8; HTTP_PEEK_BUF];
+    let mut received = 0;
+    while received < request.len() {
+        match stream.read(&mut request[received..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                received += n;
+                if request[..received].windows(4).any(|end| end == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
     let _ = stream.write_all(CONNECTION_LIMIT_RESPONSE.as_bytes());
     let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
@@ -772,6 +791,7 @@ async fn cdp_processor(
                     }
                     sync_live_page_network_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
+                    dispatch::drain_frame_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     if let (Some(reply_tx), Some((session_id, url, method, body))) = (
                         connection_reply_tx.as_ref(),

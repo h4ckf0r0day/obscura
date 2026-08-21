@@ -23,6 +23,10 @@ impl RobotsCache {
         self.cache.write().unwrap().insert(domain.to_string(), rules);
     }
 
+    pub fn contains(&self, origin: &str) -> bool {
+        self.cache.read().unwrap().contains_key(origin)
+    }
+
     pub fn is_allowed(&self, domain: &str, path: &str) -> bool {
         let cache = self.cache.read().unwrap();
         let rules = match cache.get(domain) {
@@ -149,6 +153,11 @@ mod tests {
     #[test]
     fn test_no_rules_means_allowed() {
         let cache = RobotsCache::new();
+        assert!(cache.is_allowed("unknown.com", "/anything"));
+        assert!(!cache.contains("unknown.com"));
+
+        cache.parse_and_store("unknown.com", "", "Obscura");
+        assert!(cache.contains("unknown.com"));
         assert!(cache.is_allowed("unknown.com", "/anything"));
     }
 

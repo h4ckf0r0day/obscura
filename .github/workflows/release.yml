@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -44,9 +44,11 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -179,10 +181,11 @@ jobs:
           cd ../no-render-stealth
           7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
 
-      - name: Upload
-        uses: softprops/action-gh-release@v2
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          files: |
+          name: release-${{ matrix.name }}
+          path: |
             ${{ matrix.name }}.tar.gz
             ${{ matrix.name }}-stealth.tar.gz
             ${{ matrix.name }}-no-render.tar.gz
@@ -191,3 +194,25 @@ jobs:
             ${{ matrix.name }}-stealth.zip
             ${{ matrix.name }}-no-render.zip
             ${{ matrix.name }}-no-render-stealth.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      # This job never checks out or executes repository code. The write token is
+      # available only while collecting and publishing the completed artifacts.
+      - name: Download packaged binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*

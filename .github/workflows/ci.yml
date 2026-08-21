@@ -1,0 +1,303 @@
+name: PR checks
+
+on:
+  pull_request:
+
+# Pull requests execute contributor-controlled build scripts, proc macros,
+# tests, and binaries. They must never receive a write token or repository
+# secrets. Publishing remains isolated in the tag-only release workflows.
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  OPENSSL_NO_VENDOR: "1"
+
+jobs:
+  policy:
+    name: PR / Policy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      base-sha: ${{ steps.base.outputs.sha }}
+      runtime: ${{ steps.changes.outputs.runtime }}
+      audit: ${{ steps.changes.outputs.audit }}
+    steps:
+      - name: Checkout merge result
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve trusted base revision
+        id: base
+        shell: bash
+        env:
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          base_sha="$EVENT_BASE_SHA"
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$base_sha" == "0000000000000000000000000000000000000000" ]]; then
+            echo "GitHub did not provide a valid base revision" >&2
+            exit 1
+          fi
+          git cat-file -e "${base_sha}^{commit}"
+
+          policy_root="$RUNNER_TEMP/obscura-policy"
+          mkdir -p "$policy_root"
+          git show "$base_sha:scripts/ci/pr_policy.py" > "$policy_root/pr_policy.py"
+          git show "$base_sha:deny.toml" > "$policy_root/deny.toml"
+
+          # Container actions can only read paths mounted below the workspace.
+          # Replace any PR-supplied file before exposing the trusted config.
+          trusted_deny="$GITHUB_WORKSPACE/.github/.trusted-deny.toml"
+          rm -f -- "$trusted_deny"
+          install -m 0644 "$policy_root/deny.toml" "$trusted_deny"
+          printf 'sha=%s\n' "$base_sha" >> "$GITHUB_OUTPUT"
+          printf 'policy=%s\n' "$policy_root/pr_policy.py" >> "$GITHUB_OUTPUT"
+
+      - name: Classify change scope
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          runtime=false
+          audit=false
+
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              Cargo.toml|Cargo.lock|deny.toml|*/Cargo.toml|*/Cargo.lock|.cargo/config|.cargo/config.toml)
+                runtime=true
+                audit=true
+                ;;
+              .github/workflows/ci.yml)
+                audit=true
+                ;;
+              scripts/ci/*)
+                ;;
+              *.md|README*|LICENSE*|docs/*|.github/ISSUE_TEMPLATE/*|.github/PULL_REQUEST_TEMPLATE*|.github/CODEOWNERS|.gitignore|.gitattributes|.editorconfig)
+                ;;
+              *)
+                runtime=true
+                ;;
+            esac
+          # Disable rename detection so both sides of a rename are classified.
+          # Otherwise moving runtime code to a documentation-looking path could
+          # incorrectly skip the runtime checks.
+          done < <(git diff --no-ext-diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA")
+
+          printf 'runtime=%s\n' "$runtime" >> "$GITHUB_OUTPUT"
+          printf 'audit=%s\n' "$audit" >> "$GITHUB_OUTPUT"
+          printf 'Change scope: runtime=%s audit=%s\n' "$runtime" "$audit"
+
+      - name: Check PR policy
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: python3 "${{ steps.base.outputs.policy }}" --base "$BASE_SHA" --head "$GITHUB_SHA"
+
+      - name: Check dependency advisories, licenses, bans, and sources
+        if: steps.changes.outputs.audit == 'true'
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          arguments: --all-features --config .github/.trusted-deny.toml
+          command: check advisories bans licenses sources
+
+  core:
+    name: PR / Core
+    needs: policy
+    if: needs.policy.outputs.runtime == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout merge result
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev llvm-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
+        with:
+          tool: nextest
+          fallback: none
+
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # PR caches are restored but never saved. A contributor therefore
+          # cannot poison a cache later consumed by a release.
+          save-if: false
+
+      - name: Build render release
+        run: cargo build --release -p obscura-cli --bins --features render
+
+      - name: Test render configuration
+        run: cargo nextest run --release --features render --no-fail-fast
+
+      - name: Stage candidate binary for comparison
+        run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
+
+      - name: Build render and stealth release
+        run: cargo build --release -p obscura-cli --bins --features render,stealth
+
+      - name: Test the stealth transport
+        run: |
+          # The gzip fixture binds loopback. Keep the ordinary suite under the
+          # default SSRF policy, then opt in only for that single focused test.
+          cargo nextest run --release -p obscura-net --features stealth \
+            --no-fail-fast -- --skip stealth_client_decodes_gzip_response
+          OBSCURA_ALLOW_PRIVATE_NETWORK=1 cargo nextest run --release \
+            -p obscura-net --features stealth \
+            stealth_client_decodes_gzip_response --no-fail-fast
+
+      - name: Build no-render release
+        run: cargo build --release -p obscura-cli --bins --no-default-features
+
+      - name: Test no-render configuration
+        run: |
+          # `obscura` uses its default `api` feature for the public library; an
+          # empty feature set is not a supported crate configuration. Test that
+          # no-render API normally and every non-render crate with defaults
+          # disabled. `obscura-render` has paint-only test fixtures, so verify
+          # its feature-minimal library separately without compiling those
+          # fixtures.
+          cargo nextest run --release -p obscura --no-fail-fast
+          cargo nextest run --release --workspace --exclude obscura \
+            --exclude obscura-render \
+            --no-default-features --no-fail-fast
+          cargo check --release -p obscura-render --no-default-features
+
+      - name: Build no-render and stealth release
+        run: cargo build --release -p obscura-cli --bins --no-default-features --features stealth
+
+      - name: Upload candidate binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: obscura-pr-${{ github.run_id }}
+          path: ${{ runner.temp }}/obscura-ci/obscura-pr
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  performance:
+    name: PR / Performance
+    if: needs.policy.outputs.runtime == 'true'
+    needs: [policy, core]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout merge result
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout pinned obstacle course
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: h4ckf0r0day/obscura-benchmark
+          ref: 6ebac8293d7477f59e837768bfd4e74173f04f1c
+          path: obscura-benchmark
+          persist-credentials: false
+
+      - name: Download candidate binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: obscura-pr-${{ github.run_id }}
+          path: ${{ runner.temp }}/obscura-ci
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libssl-dev llvm-dev pkg-config time
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: false
+
+      - name: Build base revision
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.policy.outputs.base-sha }}
+        run: |
+          set -euo pipefail
+          base_root="$RUNNER_TEMP/obscura-base"
+          script_root="$RUNNER_TEMP/obscura-ci-scripts"
+          git worktree add --detach "$base_root" "$BASE_SHA"
+          mkdir -p "$script_root"
+          git show "$BASE_SHA:scripts/ci/perf_smoke.py" > "$script_root/perf_smoke.py"
+          git show "$BASE_SHA:scripts/ci/compare_obstacle.py" > "$script_root/compare_obstacle.py"
+          # Run from the trusted worktree so a PR-supplied .cargo/config.toml in
+          # the merge checkout cannot alter the compiler or wrapper for the base.
+          (
+            cd "$base_root"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/obscura-base-target" \
+              cargo build --release -p obscura-cli --bins --features render
+          )
+          install -D -m 0755 \
+            "$RUNNER_TEMP/obscura-base-target/release/obscura" \
+            "$RUNNER_TEMP/obscura-ci/obscura-base"
+          chmod 0755 "$RUNNER_TEMP/obscura-ci/obscura-pr"
+
+      - name: Run base and candidate obstacle courses
+        shell: bash
+        run: |
+          set -euo pipefail
+          results_root="$RUNNER_TEMP/obscura-ci-results"
+          mkdir -p "$results_root"
+          set +e
+          OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-base" \
+            python3 obscura-benchmark/obstacle-course/run.py \
+              --json --runs 3 --warmup 1 > "$results_root/obstacle-base.json"
+          base_status=$?
+          OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-pr" \
+            python3 obscura-benchmark/obstacle-course/run.py \
+              --json --runs 3 --warmup 1 > "$results_root/obstacle-pr.json"
+          pr_status=$?
+          set -e
+          printf 'Obstacle commands exited base=%s candidate=%s\n' "$base_status" "$pr_status"
+          python3 -m json.tool "$results_root/obstacle-base.json" >/dev/null
+          python3 -m json.tool "$results_root/obstacle-pr.json" >/dev/null
+
+      - name: Run interleaved latency and RSS smoke benchmark
+        run: |
+          python3 "$RUNNER_TEMP/obscura-ci-scripts/perf_smoke.py" \
+            --base "$RUNNER_TEMP/obscura-ci/obscura-base" \
+            --candidate "$RUNNER_TEMP/obscura-ci/obscura-pr" \
+            --output "$RUNNER_TEMP/obscura-ci-results/perf-smoke.json"
+
+      - name: Compare obstacle correctness and latency
+        run: |
+          python3 "$RUNNER_TEMP/obscura-ci-scripts/compare_obstacle.py" \
+            --base "$RUNNER_TEMP/obscura-ci-results/obstacle-base.json" \
+            --candidate "$RUNNER_TEMP/obscura-ci-results/obstacle-pr.json"
+
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/obscura-ci-results
+          if-no-files-found: warn
+          retention-days: 7
