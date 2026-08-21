@@ -455,6 +455,50 @@ fn response_body_byte_limit() -> usize {
         .unwrap_or(2 * 1024 * 1024)
 }
 
+/// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
+/// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
+/// copy of it, so an unbounded body OOMs the process. This bounds the initial
+/// read; it is far larger than `response_body_byte_limit()` (which only decides
+/// whether a body is *cached*) because real page fetches can be large.
+/// Configurable via `OBSCURA_FETCH_MAX_BODY_BYTES`.
+fn fetch_max_body_bytes() -> usize {
+    std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100 * 1024 * 1024)
+}
+
+/// Read a response body into memory, refusing bodies larger than `max` bytes —
+/// both when the server advertises an oversized `Content-Length` and when the
+/// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
+/// a multi-GB response from ever being fully allocated.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if let Some(len) = response.content_length() {
+        if len > max as u64 {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "response body of {len} bytes exceeds the maximum of {max}"
+            )));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "response body exceeds the maximum of {max} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 pub type SharedState = Rc<RefCell<ObscuraState>>;
 
 /// Which document belongs to which realm.
@@ -2646,10 +2690,7 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
@@ -2941,6 +2982,7 @@ mod tests {
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
+    use super::read_body_capped;
     use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
@@ -2973,6 +3015,69 @@ mod tests {
         let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+
+    // SEC-005 / #581 — op_fetch_url must not buffer an unbounded response body.
+    // read_body_capped streams the body and refuses anything larger than the
+    // cap, covering a server that just keeps sending with no Content-Length.
+
+    async fn serve_body_once(body_len: usize, with_content_length: bool) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            if with_content_length {
+                header.push_str(&format!("Content-Length: {body_len}\r\n"));
+            }
+            header.push_str("\r\n");
+            let _ = sock.write_all(header.as_bytes()).await;
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut sent = 0;
+            while sent < body_len {
+                let n = std::cmp::min(chunk.len(), body_len - sent);
+                if sock.write_all(&chunk[..n]).await.is_err() {
+                    break;
+                }
+                sent += n;
+            }
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversized_streamed_body() {
+        // No Content-Length forces the streaming-cap branch (lying/chunked server).
+        let addr = serve_body_once(4 * 1024 * 1024, false).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request should reach the local server");
+        let err = read_body_capped(resp, 1024 * 1024)
+            .await
+            .expect_err("a body larger than the cap must be rejected");
+        assert!(
+            err.to_string().contains("maximum"),
+            "error should mention the cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_reads_body_within_cap() {
+        let addr = serve_body_once(1024, true).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request should reach the local server");
+        let body = read_body_capped(resp, 1024 * 1024)
+            .await
+            .expect("a small body must be read successfully");
+        assert_eq!(body.len(), 1024, "should read the whole small body");
     }
 
     #[test]
