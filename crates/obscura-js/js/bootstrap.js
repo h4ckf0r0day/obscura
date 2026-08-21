@@ -6739,12 +6739,10 @@ globalThis.fetch = async (input, init = {}) => {
     : (input instanceof Request
       ? input.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
-  if (url && !url.includes('://')) {
-    try {
-      const base = _domParse("document_url") || "about:blank";
-      url = new URL(url, base).href;
-    } catch(e) { /* keep as-is if URL resolution fails */ }
-  }
+  // Always resolve: the URL parser, not a "://" substring search, decides
+  // whether the input is absolute. _resolveUrl leaves absolute URLs
+  // unchanged and keeps unparseable input as-is.
+  url = _resolveUrl(url);
   const method = init.method || (input instanceof Request ? input.method : "GET");
   let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
   const body = _serializeBody(init.body, _h);
@@ -6913,13 +6911,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     const xhr = this;
     this._fireEvent('loadstart');
 
-    let url = this._url;
-    if (url && !url.includes('://')) {
-      try {
-        const base = _domParse("document_url") || "about:blank";
-        url = new URL(url, base).href;
-      } catch(e) {}
-    }
+    // Same rule as fetch: always resolve through the URL parser.
+    let url = _resolveUrl(this._url);
 
     fetch(url, {
       method: this._method,
