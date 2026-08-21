@@ -196,7 +196,10 @@ pub async fn start_with_serve_options_and_limit(
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
 
-    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+    // Each handed-off connection carries the page-scoped id if the client
+    // connected to a `/devtools/page/{id}` URL (else None for browser-scoped).
+    let (ws_tx, mut ws_rx) =
+        mpsc::channel::<(std::net::TcpStream, Option<String>)>(MAX_PENDING_WS_HANDOFFS);
 
     // Ctrl-C / graceful shutdown coordination.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -308,12 +311,12 @@ pub async fn start_with_serve_options_and_limit(
     // Accept loop: hand each WebSocket connection to its own OS thread so its
     // pages' isolates live on a dedicated thread.
     loop {
-        let stream = tokio::select! {
-            stream = ws_rx.recv() => stream,
+        let handoff = tokio::select! {
+            s = ws_rx.recv() => s,
             _ = shutdown_notify.notified() => None,
         };
-        let stream = match stream {
-            Some(s) => s,
+        let (stream, page_scoped) = match handoff {
+            Some((stream, page_scoped)) => (stream, page_scoped),
             None => break,
         };
         // Nagle off + nonblocking on the std socket before it moves to the
@@ -346,6 +349,7 @@ pub async fn start_with_serve_options_and_limit(
         }
         run_connection(
             stream,
+            page_scoped,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
@@ -434,6 +438,7 @@ fn cap_malloc_arenas() {
 /// plumbing is needed.
 fn run_connection(
     std_stream: std::net::TcpStream,
+    page_scoped: Option<String>,
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
@@ -485,6 +490,7 @@ fn run_connection(
                     msg_rx,
                     default_context,
                     shutdown_notify,
+                    page_scoped,
                 ));
                 if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
                     error!("WebSocket connection error: {}", e);
@@ -609,11 +615,14 @@ const WS_PEEK_BUF: usize = 4;
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
-    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    ws_tx: &mpsc::Sender<(std::net::TcpStream, Option<String>)>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
     let n = stream.peek(&mut buf)?;
 
+    // Page-scoped target id if the client connected to a `/devtools/page/{id}`
+    // WebSocket; None for browser-scoped (`/devtools/browser`) connections.
+    let mut page_scoped: Option<String> = None;
     if n >= 4 && &buf == b"GET " {
         let mut peek_buf = [0u8; HTTP_PEEK_BUF];
         let n = stream.peek(&mut peek_buf)?;
@@ -632,9 +641,10 @@ fn accept_dispatch(
         if let Some(ep) = endpoint {
             return handle_http_json_blocking(stream, port, ep);
         }
-        // Fall through: GET request that isn't a /json endpoint → treat as
-        // WebSocket upgrade (Chromium DevTools clients issue GET with
-        // Upgrade: websocket).
+        // A GET that isn't a /json endpoint is a WebSocket upgrade. If the
+        // client connected to a page-scoped URL, capture the target id so the
+        // processor can bind a page for its sessionId-less commands.
+        page_scoped = parse_page_scoped_target(&line);
     }
 
     // Try to hand off the WS stream to the LocalSet. If the bounded channel
@@ -644,7 +654,7 @@ fn accept_dispatch(
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
     ws_tx
-        .try_send(stream)
+        .try_send((stream, page_scoped))
         .map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
@@ -652,6 +662,25 @@ fn accept_dispatch(
             }
             mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
         })
+}
+
+/// Extract the `{id}` from a `/devtools/page/{id}` WebSocket request line, e.g.
+/// `"GET /devtools/page/page-1 HTTP/1.1"` → `"page-1"`. Returns None for the
+/// browser-scoped path (`/devtools/browser`) and any other route, so those
+/// connections keep the current browser-level behavior.
+fn parse_page_scoped_target(request_line: &str) -> Option<String> {
+    let path = request_line
+        .split_whitespace()
+        .nth(1)?
+        .split('?')
+        .next()?;
+    let rest = path.strip_prefix("/devtools/page/")?;
+    let id = rest.trim_end_matches('/');
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
 }
 
 /// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
@@ -709,6 +738,10 @@ async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
+    // Page-scoped connections (a client that connected straight to
+    // `/devtools/page/{id}`) pass the target id here; None for browser-scoped.
+    // Consumed once on NewConnection (via `.take()`), so it is mutable.
+    mut page_scoped: Option<String>,
 ) {
     let mut ctx = CdpContext::new_with_shared_context(default_context);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
@@ -861,6 +894,13 @@ async fn cdp_processor(
 
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
+                // A client that connects straight to `/devtools/page/{id}` (the
+                // URL `/json` advertises) has no sessionId to send. Bind this
+                // connection to a fresh page so its bare commands route there
+                // instead of failing with "No page" (#680).
+                if let Some(page_id) = page_scoped.take() {
+                    ctx.attach_scoped_page(&page_id);
+                }
                 connection_reply_tx = Some(reply_tx.clone());
                 let _ = reply_tx.send(
                     json!({"__init": true})
@@ -1615,6 +1655,7 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        parse_page_scoped_target,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
@@ -1647,6 +1688,7 @@ mod tests {
                     server_rx,
                     default_context,
                     shutdown,
+                    None,
                 ));
 
                 server_tx
@@ -1757,6 +1799,113 @@ mod tests {
                     .expect("processor task");
             })
             .await;
+    }
+
+    // Issue #680 end-to-end: a client that connects to the page-scoped URL that
+    // `/json` advertises sends `Runtime.evaluate` with no sessionId. The
+    // processor must bind that connection to a page so the bare command
+    // resolves instead of coming back as
+    // {"error":{"code":-32601,"message":"No page"}}.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_scoped_connection_evaluate_without_session_id() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                    Some("page-1".to_string()),
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init = reply_rx.recv().await.expect("processor init");
+                assert!(init.contains("__init"));
+
+                // The decisive repro step: a bare `Runtime.evaluate` with no
+                // sessionId, exactly as a raw client sending the URL from
+                // `/json` would.
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": "document.title",
+                        "returnByValue": true,
+                    },
+                }));
+
+                let response = loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("evaluate response timeout")
+                        .expect("evaluate response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        break value;
+                    }
+                };
+
+                assert!(
+                    response.get("error").is_none(),
+                    "a bare Runtime.evaluate on a page-scoped connection must not \
+                     error (got: {response})"
+                );
+                assert!(
+                    response.get("result").is_some(),
+                    "a bare Runtime.evaluate must return a result (got: {response})"
+                );
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    #[test]
+    fn parse_page_scoped_target_extracts_page_id() {
+        assert_eq!(
+            parse_page_scoped_target("GET /devtools/page/page-1 HTTP/1.1"),
+            Some("page-1".to_string()),
+        );
+        // Trailing slashes and query strings are tolerated.
+        assert_eq!(
+            parse_page_scoped_target("GET /devtools/page/page-2/?a=1 HTTP/1.1"),
+            Some("page-2".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_page_scoped_target_rejects_non_page_paths() {
+        // The browser-scoped path and an empty page path must stay
+        // browser-scoped so they keep the current behavior.
+        assert_eq!(
+            parse_page_scoped_target("GET /devtools/browser HTTP/1.1"),
+            None,
+        );
+        assert_eq!(parse_page_scoped_target("GET /devtools/page/ HTTP/1.1"), None);
     }
 
     #[test]
