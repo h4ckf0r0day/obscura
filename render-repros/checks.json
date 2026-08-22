@@ -105,7 +105,9 @@
     {"name": "standards author dimensions use content box", "color": "#e8590c", "x": 808, "y": 0, "width": 20, "height": 30},
     {"name": "checkbox uses native intrinsic border box and margins", "color": "#7048e8", "x": 20, "y": 100, "width": 20, "height": 13},
     {"name": "range uses native intrinsic border box and margins", "color": "#c2255c", "x": 333, "y": 100, "width": 20, "height": 16},
-    {"name": "hidden input consumes no flex geometry", "color": "#2b8a3e", "x": 500, "y": 100, "width": 20, "height": 20}
+    {"name": "hidden input consumes no flex geometry", "color": "#2b8a3e", "x": 500, "y": 100, "width": 20, "height": 20},
+    {"name": "textarea intrinsic box comes from rows and cols", "color": "#f08c00", "x": 168, "y": 200, "width": 20, "height": 36},
+    {"name": "rows attribute scales the textarea intrinsic height", "color": "#e64980", "x": 518, "y": 200, "width": 20, "height": 126}
   ],
   "form-control-quirks": [
     {"name": "quirks form keeps legacy one-em bottom margin", "color": "#087f5b", "x": 0, "y": 37, "width": 100, "height": 20},

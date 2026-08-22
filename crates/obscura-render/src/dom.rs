@@ -5780,7 +5780,7 @@ fn layout_dom_once(
             .filter_map(|(&id, style)| {
                 let node = tree.get_node(id)?;
                 let element = node.as_element()?;
-                matches!(element.local.as_ref(), "input" | "select").then(|| {
+                matches!(element.local.as_ref(), "input" | "select" | "textarea").then(|| {
                     (
                         id,
                         (
@@ -5914,26 +5914,54 @@ fn layout_dom_once(
                 let intrinsic_width = label_width + horizontal_edges;
                 let intrinsic_height =
                     crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
-                let (stretch_inline, stretch_block) = native_control_grid_stretch
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_default();
-                if style.width == crate::Dimension::Auto && !stretch_inline {
-                    style.width =
-                        crate::Dimension::Px(if style.box_sizing == crate::BoxSizing::ContentBox {
-                            label_width
-                        } else {
-                            intrinsic_width
-                        });
-                }
-                if style.height == crate::Dimension::Auto && !stretch_block {
-                    style.height =
-                        crate::Dimension::Px(if style.box_sizing == crate::BoxSizing::ContentBox {
-                            (intrinsic_height - vertical_edges).max(0.0)
-                        } else {
-                            intrinsic_height
-                        });
-                }
+                assign_native_control_size(
+                    style,
+                    native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
+                    intrinsic_width,
+                    intrinsic_height,
+                    horizontal_edges,
+                    vertical_edges,
+                );
+                continue;
+            }
+            if element.local.as_ref() == "textarea" {
+                // A native textarea's intrinsic border box comes from the
+                // rows/cols content attributes (HTML defaults 2 and 20), not
+                // from its text content: an empty textarea is still a
+                // visible, clickable control (Chromium cols=20 rows=2 ->
+                // 168x36, rows=8 -> 126 tall). Per-column width is the
+                // fixed-pitch average advance calibrated to Chromium's
+                // control metrics; per-row height is the normal line height.
+                let rows = node
+                    .get_attribute("rows")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .filter(|&value| value > 0)
+                    .unwrap_or(2) as f32;
+                let cols = node
+                    .get_attribute("cols")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .filter(|&value| value > 0)
+                    .unwrap_or(20) as f32;
+                let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+                let horizontal_edges = style.padding.left
+                    + style.padding.right
+                    + style.border.left
+                    + style.border.right;
+                let vertical_edges = style.padding.top
+                    + style.padding.bottom
+                    + style.border.top
+                    + style.border.bottom;
+                let intrinsic_width = cols * font_size * 0.6075 + horizontal_edges;
+                let intrinsic_height =
+                    crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
+                assign_native_control_size(
+                    style,
+                    native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
+                    intrinsic_width,
+                    intrinsic_height,
+                    horizontal_edges,
+                    vertical_edges,
+                );
                 continue;
             }
             if element.local.as_ref() != "input" {
@@ -5950,10 +5978,6 @@ fn layout_dom_once(
             }
 
             let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
-            let (stretch_inline, stretch_block) = native_control_grid_stretch
-                .get(&id)
-                .copied()
-                .unwrap_or_default();
             let horizontal_edges =
                 style.padding.left + style.padding.right + style.border.left + style.border.right;
             let vertical_edges =
@@ -5993,22 +6017,14 @@ fn layout_dom_once(
                     )
                 }
             };
-            if style.width == crate::Dimension::Auto && !stretch_inline {
-                let declared_width = if style.box_sizing == crate::BoxSizing::ContentBox {
-                    (intrinsic_width - horizontal_edges).max(0.0)
-                } else {
-                    intrinsic_width
-                };
-                style.width = crate::Dimension::Px(declared_width);
-            }
-            if style.height == crate::Dimension::Auto && !stretch_block {
-                let declared_height = if style.box_sizing == crate::BoxSizing::ContentBox {
-                    (intrinsic_height - vertical_edges).max(0.0)
-                } else {
-                    intrinsic_height
-                };
-                style.height = crate::Dimension::Px(declared_height);
-            }
+            assign_native_control_size(
+                style,
+                native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
+                intrinsic_width,
+                intrinsic_height,
+                horizontal_edges,
+                vertical_edges,
+            );
         }
 
         resolve_grid_areas(tree, root_id, &mut styles);
@@ -11394,6 +11410,39 @@ enum ContainerAutoInlineSize {
 enum ContainerAutoBlockSize {
     Intrinsic,
     StretchedGridItem,
+}
+
+/// Assign a native control's intrinsic border-box size to its auto axes.
+/// The intrinsic figures are border boxes (Chromium's control metrics), so
+/// a content-box control receives the content part. An authored width or
+/// height keeps winning, as does a grid axis that stretches the item:
+/// only an untouched auto axis adopts the intrinsic value.
+fn assign_native_control_size(
+    style: &mut crate::LayoutStyle,
+    stretched_grid_item: (bool, bool),
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+    horizontal_edges: f32,
+    vertical_edges: f32,
+) {
+    let (stretch_inline, stretch_block) = stretched_grid_item;
+    let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    if style.width == crate::Dimension::Auto && !stretch_inline {
+        let declared = if content_box {
+            (intrinsic_width - horizontal_edges).max(0.0)
+        } else {
+            intrinsic_width
+        };
+        style.width = crate::Dimension::Px(declared);
+    }
+    if style.height == crate::Dimension::Auto && !stretch_block {
+        let declared = if content_box {
+            (intrinsic_height - vertical_edges).max(0.0)
+        } else {
+            intrinsic_height
+        };
+        style.height = crate::Dimension::Px(declared);
+    }
 }
 
 /// Classify how an auto inline-size is resolved. Stretched grid items need
@@ -20279,5 +20328,48 @@ mod tests {
         let width = |id| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
 
         assert!(width("keep") > width("normal"));
+    }
+
+    #[test]
+    fn textarea_intrinsic_box_comes_from_rows_and_cols() {
+        // #685: an empty textarea must keep a real control box instead of
+        // laying out as a plain block. Chromium calibrates cols=20/rows=2 to
+        // a 168x36 border box with one 15px control line per row.
+        let tree = parse_html(
+            r#"<style>html, body { margin: 0 }</style>
+            <div><textarea id="plain"></textarea></div>
+            <div><textarea id="rows8" rows="8"></textarea></div>
+            <div><textarea id="cssheight" style="height: 36px"></textarea></div>
+            <div><textarea id="invalid-rows" rows="0"></textarea></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+
+        let plain = rect("plain");
+        assert!((plain.width - 168.0).abs() < 0.5, "{}", plain.width);
+        assert!((plain.height - 36.0).abs() < 0.5, "{}", plain.height);
+
+        let rows8 = rect("rows8");
+        assert!((rows8.width - 168.0).abs() < 0.5);
+        assert!((rows8.height - 126.0).abs() < 0.5, "{}", rows8.height);
+
+        // Author height wins over the rows-derived intrinsic height, and the
+        // control is border-box, so 36px stays the border-box height.
+        let cssheight = rect("cssheight");
+        assert!(
+            (cssheight.height - 36.0).abs() < 0.5,
+            "{}",
+            cssheight.height
+        );
+
+        // rows/cols are limited to positive numbers; anything else falls
+        // back to the HTML defaults (rows=2).
+        let invalid = rect("invalid-rows");
+        assert!((invalid.height - 36.0).abs() < 0.5, "{}", invalid.height);
+
+        // The control is an atomic inline-block, not a stretched block.
+        let style = &laid.styles[&tree.get_element_by_id("plain").unwrap()];
+        assert_eq!(style.display, crate::Display::Inline);
+        assert!(style.is_inline_block);
     }
 }

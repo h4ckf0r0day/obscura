@@ -6049,6 +6049,7 @@ function _elementClassFor(nid) {
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -6068,6 +6069,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -11019,7 +11021,23 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
 };
 globalThis.HTMLSelectElement = Element;
-globalThis.HTMLTextAreaElement = Element;
+globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
+  // `rows`/`cols` reflect the content attributes and drive the control's
+  // intrinsic box (the renderer sizes a textarea from them). The attributes
+  // are limited to positive non-zero numbers; anything else falls back to the
+  // HTML defaults (rows=2, cols=20), which is what an unsized <textarea>
+  // measures against. (#685)
+  get rows() {
+    const v = parseInt(this.getAttribute('rows'), 10);
+    return Number.isFinite(v) && v > 0 ? v : 2;
+  }
+  set rows(v) { this.setAttribute('rows', String(v)); }
+  get cols() {
+    const v = parseInt(this.getAttribute('cols'), 10);
+    return Number.isFinite(v) && v > 0 ? v : 20;
+  }
+  set cols(v) { this.setAttribute('cols', String(v)); }
+};
 globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
