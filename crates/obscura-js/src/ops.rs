@@ -1,3 +1,7 @@
+/// Maximum number of fetched URLs retained in `ObscuraState.fetched_urls` (#705).
+/// Prevents unbounded memory growth on pages performing repeated `fetch()`/XHR calls.
+pub const MAX_FETCHED_URLS: usize = 16384;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -352,6 +356,15 @@ impl ObscuraState {
             write_stream: RefCell::new(None),
         }
     }
+
+    pub fn record_fetched_url(&mut self, url: String) {
+        if self.fetched_urls.len() >= MAX_FETCHED_URLS {
+            let overflow = self.fetched_urls.len() + 1 - MAX_FETCHED_URLS;
+            self.fetched_urls.drain(0..overflow);
+        }
+        self.fetched_urls.push(url);
+    }
+
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -2190,7 +2203,8 @@ async fn op_fetch_url(
         // Record the resource the page pulled in via fetch()/XHR so `--dump
         // assets` can list it (issue #301). URL is already absolute here, since
         // reqwest needs an absolute URL to send the request.
-        gs.fetched_urls.push(url.clone());
+        // Bound capacity to avoid unbounded native-heap growth on repeated fetch() (#705).
+        gs.record_fetched_url(url.clone());
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         // #139: thread the configured proxy through to the per-request
@@ -2928,6 +2942,21 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fetched_urls_capacity_is_bounded() {
+        use super::{ObscuraState, MAX_FETCHED_URLS};
+        let mut state = ObscuraState::new();
+        for i in 0..(MAX_FETCHED_URLS + 50) {
+            state.record_fetched_url(format!("http://example.com/asset_{i}"));
+        }
+        assert_eq!(state.fetched_urls.len(), MAX_FETCHED_URLS);
+        assert_eq!(state.fetched_urls.first().unwrap(), "http://example.com/asset_50");
+        assert_eq!(
+            state.fetched_urls.last().unwrap(),
+            &format!("http://example.com/asset_{}", MAX_FETCHED_URLS + 49)
+        );
+    }
+
     use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
