@@ -40,6 +40,14 @@ pub(crate) struct ScreencastState {
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
+    /// The page this connection is bound to, set only for a page-scoped
+    /// connection (a client that connects straight to `/devtools/page/{id}` and
+    /// sends commands WITHOUT a `sessionId`, the way the `webSocketDebuggerUrl`
+    /// advertised by `/json` implies). `get_session_page(None)` falls back to
+    /// this id. None for browser-scoped connections, so `None`-session
+    /// commands keep routing to nothing there (the browser flow always carries
+    /// an explicit session id from `Target.createTarget`/`attachToTarget`).
+    pub default_page_id: Option<String>,
     /// Current document loader per page. Navigation events and later
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
@@ -109,6 +117,19 @@ pub struct CdpContext {
     pub v8_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Whether a `page/{id}` path segment is a safe target id to use verbatim.
+/// Obscura's own ids look like `page-1`; accept that shape plus a short
+/// alphanumeric/dash id so a client that connects to `/devtools/page/page-1`
+/// maps onto the right page rather than a counter surprise. Anything odd
+/// (slashes, spaces, control chars) is treated as opaque and the context's
+/// counter id is used instead.
+fn is_plausible_page_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 impl CdpContext {
     pub fn new() -> Self {
         Self::new_with_options(None, false)
@@ -163,6 +184,7 @@ impl CdpContext {
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
+            default_page_id: None,
             current_loader_ids: HashMap::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
@@ -311,6 +333,40 @@ impl CdpContext {
             }
         }
         self.sessions.retain(|_, v| v != id);
+        if self.default_page_id.as_deref() == Some(id) {
+            self.default_page_id = None;
+        }
+    }
+
+    /// Bind a page-scoped connection to a fresh page so that commands sent
+    /// without a `sessionId` route to it. `page-scoped` is the id from the
+    /// `/devtools/page/{id}` path; it is used as the page id when it is a
+    /// plausible target name, otherwise the context's counter id is kept.
+    pub fn attach_scoped_page(&mut self, page_scoped: &str) -> String {
+        let page_id = if is_plausible_page_id(page_scoped) {
+            self.claim_scoped_page_id(page_scoped)
+        } else {
+            self.create_page()
+        };
+        self.default_page_id = Some(page_id.clone());
+        page_id
+    }
+
+    fn claim_scoped_page_id(&mut self, id: &str) -> String {
+        // Reserve the counter past the claimed id so later `create_page`
+        // calls on this connection do not collide with it.
+        let numeric = id
+            .strip_prefix("page-")
+            .and_then(|n| n.parse::<u32>().ok());
+        if let Some(n) = numeric {
+            self.page_counter = self.page_counter.max(n);
+        }
+        let mut page = Page::new(id.to_string(), self.default_context.clone());
+        page.navigate_blank();
+        self.pages.push(page);
+        self.current_loader_ids
+            .insert(id.to_string(), format!("loader-blank-{id}"));
+        id.to_string()
     }
 
     #[cfg(feature = "render")]
@@ -320,16 +376,23 @@ impl CdpContext {
         self.next_screencast_session_id
     }
 
+    /// Resolve the page a command routes to. Commands on a browser-scoped
+    /// connection carry an explicit session id; commands on a page-scoped
+    /// connection carry none and route to the page the connection is bound to.
+    fn resolve_page_id(&self, session_id: &Option<String>) -> Option<String> {
+        if let Some(sid) = session_id {
+            return self.sessions.get(sid).cloned();
+        }
+        self.default_page_id.clone()
+    }
+
     pub fn get_session_page(&self, session_id: &Option<String>) -> Option<&Page> {
-        let page_id = session_id.as_ref().and_then(|sid| self.sessions.get(sid))?;
-        self.get_page(page_id)
+        self.resolve_page_id(session_id)
+            .and_then(|page_id| self.get_page(&page_id))
     }
 
     pub fn get_session_page_mut(&mut self, session_id: &Option<String>) -> Option<&mut Page> {
-        let page_id = session_id
-            .as_ref()
-            .and_then(|sid| self.sessions.get(sid))
-            .cloned()?;
+        let page_id = self.resolve_page_id(session_id)?;
 
         let target_has_js = self.pages.iter().any(|p| p.id == page_id && p.has_js());
 
@@ -877,5 +940,75 @@ mod tests {
         let resp = dispatch(&outer, &mut ctx).await;
         let err = resp.error.expect("malformed inner messages must error");
         assert_eq!(err.code, -32700);
+    }
+
+    // Issue #680: a client that connects straight to the page-scoped URL that
+    // `/json` advertises (`/devtools/page/page-1`) sends CDP commands WITHOUT a
+    // sessionId. The processor binds such a connection to a fresh page via
+    // attach_scoped_page so those bare commands route there instead of failing
+    // with "No page".
+    #[tokio::test]
+    async fn attach_scoped_page_routes_none_session_commands() {
+        let mut ctx = CdpContext::new();
+        let none: Option<String> = None;
+
+        // Before the binding, a None-session command resolves to no page.
+        assert!(ctx.get_session_page(&none).is_none());
+
+        let page_id = ctx.attach_scoped_page("page-1");
+        assert_eq!(page_id, "page-1");
+
+        // A None-session command now routes to the bound page, mutably too.
+        let page = ctx
+            .get_session_page(&none)
+            .expect("scoped connection must resolve a page for bare commands");
+        assert_eq!(page.id, "page-1");
+        assert!(
+            ctx.get_session_page_mut(&none).is_some(),
+            "mutable resolution must agree with the immutable one"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_scoped_page_claims_a_matching_target_id() {
+        // The advertised URL id is used verbatim so Target.getTargets and any
+        // id-referencing client see the page the client connected to, and the
+        // counter is advanced so a later create_page does not collide with it.
+        let mut ctx = CdpContext::new();
+        ctx.attach_scoped_page("page-1");
+        assert_eq!(ctx.create_page(), "page-2");
+    }
+
+    #[tokio::test]
+    async fn attach_scoped_page_falls_back_to_counter_for_opaque_id() {
+        // A path segment that is not a clean target id is treated as opaque:
+        // the context's counter id is used and the scoped page still binds.
+        let mut ctx = CdpContext::new();
+        let none: Option<String> = None;
+        let page_id = ctx.attach_scoped_page("not a clean id");
+        assert_eq!(page_id, "page-1");
+        assert!(ctx.get_session_page(&none).is_some());
+    }
+
+    #[tokio::test]
+    async fn browser_scoped_context_keeps_none_session_unrouted() {
+        // A browser-scoped connection never calls attach_scoped_page; its
+        // None-session commands must keep resolving to nothing so that
+        // browser-level handlers are unaffected by the scoped-page fallback.
+        let mut ctx = CdpContext::new();
+        let none: Option<String> = None;
+        let _ = ctx.create_page();
+        assert!(ctx.get_session_page(&none).is_none());
+        assert!(ctx.get_session_page_mut(&none).is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_scoped_page_clears_default_binding() {
+        let mut ctx = CdpContext::new();
+        let none: Option<String> = None;
+        let page_id = ctx.attach_scoped_page("page-1");
+        assert!(ctx.get_session_page(&none).is_some());
+        ctx.remove_page(&page_id);
+        assert!(ctx.get_session_page(&none).is_none());
     }
 }
