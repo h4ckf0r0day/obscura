@@ -1,5 +1,6 @@
 pub mod server;
 pub mod dispatch;
+pub mod registry;
 pub mod types;
 pub mod domains;
 pub mod cookie_params;

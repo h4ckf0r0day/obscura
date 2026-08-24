@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
+use crate::registry::{TargetInfo, TargetRegistry};
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
 #[cfg(feature = "render")]
@@ -54,7 +55,14 @@ pub struct CdpContext {
     next_screencast_session_id: i64,
     pub default_context: Arc<BrowserContext>,
     pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
-    page_counter: u32,
+    /// Process-wide page target registry (issue #544). `pages` below holds the
+    /// live `Page` objects this connection owns (thread-confined V8 isolates),
+    /// while the shared registry mirrors their metadata so `Target.getTargets`
+    /// on ANY connection and `/json/list` on the accept thread see every live
+    /// page with its current url/title. The registry is also the source of
+    /// globally-unique page ids: per-connection counters used to collide on
+    /// "page-1" across connections, which broke any shared target view.
+    pub registry: TargetRegistry,
     browser_context_counter: u32,
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
@@ -149,9 +157,20 @@ impl CdpContext {
     }
 
     /// Build a CDP context around an already-constructed default browser
-    /// context. The server passes a fresh isolated context per WebSocket; tests
-    /// and embedders may construct their own.
+    /// context, backed by its own private target registry. The server passes a
+    /// fresh isolated context per WebSocket; tests and embedders may construct
+    /// their own.
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
+        Self::new_with_shared_context_and_registry(default_context, TargetRegistry::default())
+    }
+
+    /// As `new_with_shared_context`, but joined to a process-wide target
+    /// registry shared with every other connection (and the HTTP accept
+    /// thread). Pages this context creates become globally visible targets.
+    pub fn new_with_shared_context_and_registry(
+        default_context: Arc<BrowserContext>,
+        registry: TargetRegistry,
+    ) -> Self {
         // Pre-seed with the default-frame execution context ids that
         // `Runtime.enable` (1) and post-navigation re-emission (2) advertise via
         // Runtime.executionContextCreated. Anything else has to be registered
@@ -172,7 +191,7 @@ impl CdpContext {
             next_screencast_session_id: 0,
             default_context,
             browser_contexts: HashMap::new(),
-            page_counter: 0,
+            registry,
             browser_context_counter: 0,
             target_session_counter: 0,
             preload_scripts: Vec::new(),
@@ -230,14 +249,58 @@ impl CdpContext {
                 .ok_or_else(|| format!("Browser context not found: {}", id))?,
             None => self.default_context.clone(),
         };
-        self.page_counter += 1;
-        let page_id = format!("page-{}", self.page_counter);
+        let page_id = format!("page-{}", self.registry.next_page_id());
         let mut page = Page::new(page_id.clone(), context);
         page.navigate_blank();
+        let browser_context_id = page.context.id.clone();
         self.pages.push(page);
         self.current_loader_ids
             .insert(page_id.clone(), format!("loader-blank-{page_id}"));
+        // The new page is a live target: register it so every connection's
+        // Target.getTargets and the HTTP /json/list control plane see it.
+        self.registry.upsert(TargetInfo {
+            target_id: page_id.clone(),
+            title: String::new(),
+            url: "about:blank".into(),
+            browser_context_id,
+        });
         Ok(page_id)
+    }
+
+    /// Refresh this context's pages' metadata in the shared registry. The
+    /// registry mirrors live `Page` fields, so after any navigation (or just
+    /// before `Target.getTargets`) this keeps the shared view current.
+    ///
+    /// Pages tombstoned by a remote `closeTarget` are dropped for real here:
+    /// the remote close could not reach them (thread-per-connection #430),
+    /// but once the owner syncs, the target is closed everywhere, matching
+    /// Chrome semantics. Dropping reclaims the Page (and its V8 isolate) and
+    /// clears the tombstone, so dead pages and tombstones are bounded by
+    /// connection activity instead of living for the whole connection.
+    ///
+    /// This runs from the V8-free path (Target.getTargets /
+    /// setDiscoverTargets take no V8 lock), so dropping Pages here must stay
+    /// isolate-safe: it is, because the page's isolate is owned by this
+    /// connection's thread and `remove_page` is already exercised from
+    /// closeTarget and disposeBrowserContext.
+    pub fn sync_registry(&mut self) {
+        let closed: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|p| self.registry.is_closed(&p.id))
+            .map(|p| p.id.clone())
+            .collect();
+        for page_id in closed {
+            self.remove_page(&page_id);
+        }
+        for page in &self.pages {
+            self.registry.upsert(TargetInfo {
+                target_id: page.id.clone(),
+                title: page.title.clone(),
+                url: page.url_string(),
+                browser_context_id: page.context.id.clone(),
+            });
+        }
     }
 
     pub fn browser_context(&self, id: &str) -> Option<&Arc<BrowserContext>> {
@@ -296,6 +359,7 @@ impl CdpContext {
 
     pub fn remove_page(&mut self, id: &str) {
         self.pages.retain(|p| p.id != id);
+        self.registry.remove_pages(&[id.to_string()]);
         self.current_loader_ids.remove(id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
@@ -346,6 +410,19 @@ impl CdpContext {
         }
 
         self.get_page_mut(&page_id)
+    }
+}
+
+impl Drop for CdpContext {
+    fn drop(&mut self) {
+        // When this connection goes away — clean close, task abort, or panic —
+        // its pages die with it, so their global target entries must too.
+        // Otherwise a closed connection's stale page would keep shadowing
+        // live pages in other connections' Target.getTargets and /json/list.
+        let page_ids: Vec<String> = self.pages.iter().map(|p| p.id.clone()).collect();
+        if !page_ids.is_empty() {
+            self.registry.remove_pages(&page_ids);
+        }
     }
 }
 
