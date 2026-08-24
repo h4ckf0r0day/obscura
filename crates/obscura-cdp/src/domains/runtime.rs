@@ -17,6 +17,16 @@ fn is_valid_binding_name(name: &str) -> bool {
         && !name.chars().next().unwrap_or('0').is_ascii_digit()
 }
 
+/// Render a CDP objectId as a self-contained JS string literal, safe to
+/// interpolate into generated code (e.g. `__obscura_objects[<here>]`). Escapes
+/// every character that could terminate or break the literal — including
+/// control characters like newline — which a plain `\\`/`'` replacement misses.
+fn object_id_js_literal(oid: &str) -> String {
+    // serde_json produces a double-quoted JS/JSON string literal with every
+    // control character escaped, so the id can never terminate the literal.
+    serde_json::to_string(oid).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Drain pending JS-initiated navigation (form.submit, location.assign, etc),
 /// then emit the same CDP nav-event sequence Page.navigate emits so
 /// Puppeteer's waitForNavigation / Playwright's wait_for_url resolves.
@@ -239,10 +249,10 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page")?;
-                let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
+                let oid_literal = object_id_js_literal(oid);
                 let code = format!(
                     "(function() {{\
-                        var obj = globalThis.__obscura_objects['{oid}'];\
+                        var obj = globalThis.__obscura_objects[{oid}];\
                         if (!obj || typeof obj !== 'object') return [];\
                         var keys = Object.keys(obj);\
                         return keys.map(function(k) {{\
@@ -251,7 +261,7 @@ pub async fn handle(
                             var item = {{ name: k, type: t }};\
                             if (v === null) {{ item.value = null; return item; }}\
                             if (t !== 'object' && t !== 'function') {{ item.value = v; return item; }}\
-                            var childOid = '{oid}::' + k;\
+                            var childOid = {oid} + '::' + k;\
                             globalThis.__obscura_objects[childOid] = v;\
                             item.childOid = childOid;\
                             if (typeof v.nodeType === 'number') {{\
@@ -269,7 +279,7 @@ pub async fn handle(
                             return item;\
                         }});\
                     }})()",
-                    oid = escaped_oid,
+                    oid = oid_literal,
                 );
                 let result = page.evaluate(&code);
                 if let serde_json::Value::Array(props) = result {
@@ -490,6 +500,22 @@ mod tests {
     //   - Without the prod fix, `valid_context_ids` does not exist on
     //     CdpContext → these tests fail to compile.
     //   - With the prod fix, all four tests pass.
+
+    // SEC-004 / #709 — an objectId embedded into generated JS must have its
+    // control characters escaped, not just backslash and quote, so a newline in
+    // the id can never break the string literal.
+    #[test]
+    fn object_id_js_literal_escapes_control_characters() {
+        let lit = super::object_id_js_literal("a\nb\r\t'c\\d\"e");
+        assert!(
+            !lit.contains('\n') && !lit.contains('\r') && !lit.contains('\t'),
+            "control characters must be escaped, not left raw: {lit:?}"
+        );
+        // The result must be a valid JS/JSON string literal that round-trips.
+        let decoded: String =
+            serde_json::from_str(&lit).expect("the literal must be valid JSON");
+        assert_eq!(decoded, "a\nb\r\t'c\\d\"e");
+    }
 
     #[tokio::test]
     async fn evaluate_rejects_unknown_context_id() {
