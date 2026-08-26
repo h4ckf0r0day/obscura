@@ -7088,6 +7088,8 @@ fn layout_dom_once(
         }
     }
 
+    synthesize_flattened_inline_rects(tree, &mut rects, &text_runs, &styles, &mut inline_fragments);
+
     let generated_boxes = ifc_items
         .generated
         .iter()
@@ -7125,6 +7127,158 @@ fn layout_dom_once(
         query_stats,
         cascade_time,
     )
+}
+
+/// Flattened inline wrappers (see `is_flattenable_inline`) own no Taffy box,
+/// so layout records no rect for them. Synthesize their geometry from their
+/// rendered descendants, one fragment per line, so `getBoundingClientRect`,
+/// `getClientRects`, and hit-testing see the wrapper where its content
+/// actually is. Runs after all other geometry is final.
+fn synthesize_flattened_inline_rects(
+    tree: &DomTree,
+    rects: &mut HashMap<NodeId, Rect>,
+    text_runs: &HashMap<NodeId, Vec<(Rect, String)>>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    inline_fragments: &mut HashMap<NodeId, Vec<Rect>>,
+) {
+    // Iterative so that deeply nested inline wrappers, which a recursive walk
+    // would have to bound by depth, are limited only by a node budget the way
+    // descendants() in tree.rs is.
+    fn gather(
+        tree: &DomTree,
+        id: NodeId,
+        rects: &HashMap<NodeId, Rect>,
+        text_runs: &HashMap<NodeId, Vec<(Rect, String)>>,
+        styles: &HashMap<NodeId, crate::LayoutStyle>,
+        fragments: &HashMap<NodeId, Vec<Rect>>,
+        pieces: &mut Vec<Rect>,
+    ) -> bool {
+        const MAX_VISITED: usize = 100_000;
+        let mut stack = vec![id];
+        let mut visited = 0usize;
+        while let Some(current) = stack.pop() {
+            visited += 1;
+            if visited > MAX_VISITED {
+                return false;
+            }
+            for child in rendered_children(tree, current).into_iter().rev() {
+                let Some(node) = tree.get_node(child) else {
+                    continue;
+                };
+                if matches!(node.data, obscura_dom::tree::NodeData::Text { .. }) {
+                    if let Some(runs) = text_runs.get(&child) {
+                        pieces.extend(runs.iter().map(|(rect, _)| *rect));
+                    }
+                    continue;
+                }
+                // An out-of-flow or floated descendant is not part of the
+                // inline box: including one drags the wrapper's rect out to
+                // wherever the descendant was placed.
+                if let Some(style) = styles.get(&child) {
+                    if style.display == crate::Display::None
+                        || style.float.is_some()
+                        || matches!(style.position, Some(taffy::Position::Absolute))
+                    {
+                        continue;
+                    }
+                }
+                // A wrapper synthesized earlier in this pass contributes its
+                // own line fragments, not the single union rect, so an outer
+                // wrapper spanning several lines keeps them separate.
+                match (fragments.get(&child), rects.get(&child)) {
+                    (Some(child_fragments), _) => pieces.extend(child_fragments.iter().copied()),
+                    (None, Some(rect)) => pieces.push(*rect),
+                    (None, None) => stack.push(child),
+                }
+            }
+        }
+        true
+    }
+
+    // One fragment per line, not per word: getClientRects() exposes these, and
+    // a multi-line inline has one rect per line box.
+    fn merge_into_line_fragments(mut pieces: Vec<Rect>) -> Vec<Rect> {
+        pieces.sort_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
+        let mut lines: Vec<Rect> = Vec::new();
+        for piece in pieces {
+            match lines.last_mut() {
+                // Word boxes on one line share a baseline but can differ in
+                // height, so overlap is the test, not equality.
+                Some(line)
+                    if piece.y < line.y + line.height && piece.y + piece.height > line.y =>
+                {
+                    let left = line.x.min(piece.x);
+                    let top = line.y.min(piece.y);
+                    let right = (line.x + line.width).max(piece.x + piece.width);
+                    let bottom = (line.y + line.height).max(piece.y + piece.height);
+                    *line = Rect {
+                        x: left,
+                        y: top,
+                        width: (right - left).max(0.0),
+                        height: (bottom - top).max(0.0),
+                    };
+                }
+                _ => lines.push(piece),
+            }
+        }
+        lines
+    }
+    let mut missing: Vec<NodeId> = styles
+        .iter()
+        .filter(|(id, style)| {
+            // A positioned inline is a containing block for absolute
+            // descendants; installing a synthesized rect would change how
+            // those resolve. Leave its geometry to the existing paths.
+            style.ignores_used_box_sizes()
+                && style.position.is_none()
+                && !rects.contains_key(id)
+        })
+        .map(|(&id, _)| id)
+        .collect();
+    // Deepest first, so a nested wrapper is resolved before the wrapper that
+    // contains it and each subtree is walked once. Node ids do not track
+    // ancestry once script has created or reparented nodes, so depth is
+    // measured from the tree. The id is a tie-break to keep the fragment maps
+    // identical across runs (the incremental layout tests compare them).
+    let depth_of = |mut id: NodeId| {
+        let mut depth = 0u32;
+        while let Some(parent) = rendered_parent(tree, id) {
+            depth += 1;
+            if depth > 10_000 {
+                break;
+            }
+            id = parent;
+        }
+        depth
+    };
+    missing.sort_unstable_by_key(|id| (std::cmp::Reverse(depth_of(*id)), id.raw()));
+    for id in missing {
+        let mut pieces = Vec::new();
+        // A walk that ran out of budget has only part of the subtree, and
+        // partial geometry is worse than none.
+        if !gather(tree, id, rects, text_runs, styles, inline_fragments, &mut pieces) {
+            continue;
+        }
+        if pieces.is_empty() {
+            continue;
+        }
+        let pieces = merge_into_line_fragments(pieces);
+        let mut union = pieces[0];
+        for rect in &pieces[1..] {
+            let left = union.x.min(rect.x);
+            let top = union.y.min(rect.y);
+            let right = (union.x + union.width).max(rect.x + rect.width);
+            let bottom = (union.y + union.height).max(rect.y + rect.height);
+            union = Rect {
+                x: left,
+                y: top,
+                width: (right - left).max(0.0),
+                height: (bottom - top).max(0.0),
+            };
+        }
+        rects.insert(id, union);
+        inline_fragments.entry(id).or_insert(pieces);
+    }
 }
 
 /// Convert Taffy's ordinary-inline line surrogate into the element's actual
@@ -9579,6 +9733,7 @@ fn is_flattenable_inline(
         && style.background_image.is_none()
         && style.mask_image.is_none()
         && style.border == crate::Edges::default()
+        && style.padding == crate::Edges::default()
         && style.position.is_none()
         && !style.overflow_hidden
         && style.float.is_none()
