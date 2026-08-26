@@ -13087,6 +13087,36 @@ mod tests {
     }
 
     #[test]
+    fn test_click_suppresses_reentrant_dispatch() {
+        // The HTML click in progress flag is per element: a handler clicking
+        // its own element is suppressed, a cycle between two elements stops at
+        // the second, and ordinary sequential clicks are untouched.
+        let mut rt = setup_runtime(r#"<button id="a">a</button><button id="b">b</button>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const a = document.getElementById('a');
+            const b = document.getElementById('b');
+            let self = 0;
+            a.onclick = () => { self++; if (self < 5000) { a.click(); } };
+            a.click();
+            let cycle = 0;
+            a.onclick = () => { cycle++; if (cycle < 5000) { b.click(); } };
+            b.onclick = () => { cycle++; if (cycle < 5000) { a.click(); } };
+            a.click();
+            let plain = 0;
+            a.onclick = () => { plain++; };
+            a.click();
+            a.click();
+            a.click();
+            return [self, cycle, plain];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
     fn test_dispatch_mouse_event_runs_listener() {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt

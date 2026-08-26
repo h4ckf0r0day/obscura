@@ -2576,6 +2576,10 @@ function _htmlAttrName(el, n) {
 // A submit button per the HTML spec: a <button> whose type is submit — the
 // default, including when the type attribute is missing or invalid — or an
 // <input> of type submit/image. Used to validate requestSubmit's submitter.
+// Elements with a click currently dispatching, so a handler cannot re-enter
+// click() on its own element.
+const _clickInProgress = new WeakSet();
+
 function _isSubmitButton(el) {
   if (!el || typeof el.localName !== "string") return false;
   const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
@@ -3436,30 +3440,42 @@ class Element extends Node {
     return cache[name];
   }
   click() {
-    const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
-    if (!cancelled) {
-      const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
-      if (link) {
-        const href = link.getAttribute('href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-          location.assign(href);
-          return;
+    // The HTML click in progress flag. Without it a handler that clicks its own
+    // element re-enters until the stack is exhausted, and dispatchEvent catches
+    // and logs the resulting RangeError rather than propagating it, so the
+    // overflow surfaces only as a console trace.
+    if (_clickInProgress.has(this)) {
+      return;
+    }
+    _clickInProgress.add(this);
+    try {
+      const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+      if (!cancelled) {
+        const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
+        if (link) {
+          const href = link.getAttribute('href');
+          if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+            location.assign(href);
+            return;
+          }
+        }
+        // Same predicate requestSubmit validates against, so an internal click
+        // can never hand it a submitter it would reject. Also matches the CDP
+        // click path in input.rs, which already treats <input type=image> as a
+        // submit button.
+        if (_isSubmitButton(this)) {
+          const form = this.closest ? this.closest('form') : null;
+          // A real submit-button click fires the cancelable submit event, so use
+          // requestSubmit() (not the plain submit() method, which now bypasses it).
+          if (form && typeof form.requestSubmit === 'function') {
+            form.requestSubmit(this);
+          } else if (form && typeof form.submit === 'function') {
+            form.submit(this);
+          }
         }
       }
-      // Same predicate requestSubmit validates against, so an internal click
-      // can never hand it a submitter it would reject. Also matches the CDP
-      // click path in input.rs, which already treats <input type=image> as a
-      // submit button.
-      if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
-        // A real submit-button click fires the cancelable submit event, so use
-        // requestSubmit() (not the plain submit() method, which now bypasses it).
-        if (form && typeof form.requestSubmit === 'function') {
-          form.requestSubmit(this);
-        } else if (form && typeof form.submit === 'function') {
-          form.submit(this);
-        }
-      }
+    } finally {
+      _clickInProgress.delete(this);
     }
   }
   focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
