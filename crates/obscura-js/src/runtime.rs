@@ -50,6 +50,32 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The locale every locale-bearing surface reports.
+///
+/// Kept equal to the `navigator.language` and `navigator.languages` values in
+/// `js/bootstrap.js` and to the `Accept-Language` default in `obscura-net`.
+/// Those two were already pinned; `Intl` was not, so it reported whatever
+/// locale the V8 build happened to carry (#734 measured `en-AU` against a
+/// `navigator.language` of `en-US` on a Windows release build). A page that
+/// reads two of the three surfaces sees a browser disagreeing with itself,
+/// which is exactly the kind of inconsistency identity checks look for.
+const DEFAULT_LOCALE: &str = "en-US";
+
+static ICU_LOCALE_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Pin ICU's default locale once, before the first isolate exists.
+///
+/// `Intl` resolves its default through ICU, not through anything the engine
+/// hands it, so leaving this unset makes the value a property of the build
+/// host rather than of the browser identity Obscura presents. Called under
+/// [`ISOLATE_CREATE_LOCK`] so the write cannot race an isolate being built on
+/// another connection thread.
+fn pin_default_locale() {
+    ICU_LOCALE_INIT.call_once(|| {
+        deno_core::v8::icu::set_default_locale(DEFAULT_LOCALE);
+    });
+}
+
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
 
@@ -304,6 +330,11 @@ impl ObscuraJsRuntime {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // Before the isolate, not after: ICU is consulted when a page
+            // first constructs an Intl object, and an isolate built ahead of
+            // this call would answer from the host default.
+            pin_default_locale();
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -3147,6 +3178,43 @@ impl Default for ObscuraJsRuntime {
 mod tests {
     use super::*;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn test_intl_default_locale_is_pinned_not_inherited_from_the_host() {
+        // Every locale surface a page can read has to name the same locale.
+        // `Intl` resolves its default through ICU, which nothing in the engine
+        // set, so it reported whatever locale the build carried while
+        // `navigator.language` and the `Accept-Language` header both said
+        // en-US. A page reading two of the three sees a browser disagreeing
+        // with itself.
+        //
+        // The reported host default was en-AU on a Windows build, and a host
+        // default is not reproducible across machines: on a Linux CI runner
+        // ICU already answers en-US, so asserting agreement alone would pass
+        // here whether or not the engine pins anything. Forcing a different
+        // default first is what makes this a regression test rather than a
+        // coincidence, and it is safe because nextest runs each test in its
+        // own process, so this global never reaches a sibling.
+        deno_core::v8::icu::set_default_locale("fr-FR");
+        let mut rt = setup_runtime("<html><body>x</body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+            return [
+                Intl.DateTimeFormat().resolvedOptions().locale,
+                Intl.NumberFormat().resolvedOptions().locale,
+                Intl.Collator().resolvedOptions().locale,
+                navigator.language,
+                navigator.languages[0],
+            ];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["en-US", "en-US", "en-US", "en-US", "en-US"])
+        );
+    }
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
