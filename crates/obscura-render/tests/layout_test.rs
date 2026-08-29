@@ -4471,3 +4471,108 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
 }
+
+#[test]
+fn flattened_inline_wrappers_keep_dom_geometry_next_to_replaced_siblings() {
+    // An inline run holding a replaced sibling takes the mixed-run path, where
+    // the wrapper is spliced into its parent's children and owns no box. It
+    // still needs a rect: automation clicks labels and spans by coordinate.
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:16px/17px monospace }
+        </style>
+        <div><label id="with-input">toggle</label><input type="checkbox"></div>
+        <div><span id="with-image">caption</span><img src="x.png" width="10" height="10"></div>
+        <div><span id="plain">alone</span></div>
+        <div style="position:relative">
+          <span id="positioned" style="position:absolute">absolute</span>
+          <input type="checkbox">
+        </div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    for id in ["with-input", "with-image"] {
+        let flattened = rect(id);
+        let plain = rect("plain");
+        assert!(
+            flattened.width > 0.0 && flattened.height > 0.0,
+            "{id} must report its content geometry, got {flattened:?}"
+        );
+        // Within a pixel of an ordinary inline: the synthesized union is
+        // derived from text-run boxes, the unflattened rect from the font box.
+        assert!(
+            (flattened.height - plain.height).abs() <= 1.0,
+            "{id} must be one line tall like an ordinary inline: {flattened:?} vs {plain:?}"
+        );
+    }
+
+    // A positioned inline is a containing block for absolute descendants, so
+    // its geometry stays with the paths that resolve those insets.
+    let positioned = rect("positioned");
+    assert!(
+        positioned.width > 0.0,
+        "positioned inline keeps its own layout box: {positioned:?}"
+    );
+}
+
+#[test]
+fn flattened_inline_geometry_excludes_out_of_flow_and_merges_lines() {
+    // The synthesized union must describe the inline box itself: an absolutely
+    // positioned descendant is not part of it, and a wrapped inline exposes one
+    // fragment per line rather than one per word.
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:16px/18px monospace }
+        </style>
+        <div style="position:relative">
+          <span id="host">text <span style="position:absolute;left:900px">far</span></span>
+          <input type="checkbox">
+        </div>
+        <div style="width:80px"><span id="wrapped">aaa bbb ccc ddd</span><input type="checkbox"></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 300.0));
+    let host = layout.rects[&tree.get_element_by_id("host").unwrap()];
+    assert!(
+        host.width < 200.0,
+        "an absolute descendant must not stretch the inline box: {host:?}"
+    );
+
+    let wrapped_id = tree.get_element_by_id("wrapped").unwrap();
+    let fragments = &layout.inline_fragments[&wrapped_id];
+    assert!(
+        fragments.len() > 1 && fragments.len() <= 4,
+        "wrapped inline exposes one fragment per line, got {}: {fragments:?}",
+        fragments.len()
+    );
+    for pair in fragments.windows(2) {
+        assert!(
+            pair[1].y >= pair[0].y + pair[0].height - 0.5,
+            "fragments must be one per line, not per word: {fragments:?}"
+        );
+    }
+}
+
+#[test]
+fn deeply_nested_flattened_inline_wrappers_all_keep_geometry() {
+    // The walk is bounded by a node budget rather than by depth, so nesting
+    // far past any plausible recursion limit still resolves every wrapper.
+    let open: String = (0..70).map(|i| format!("<span id=\"d{i}\">")).collect();
+    let close = "</span>".repeat(70);
+    let tree = parse_html(&format!(
+        r#"<style>html, body {{ margin:0; font:16px/18px monospace }}</style>
+        <div>{open}deep{close}<input type="checkbox"></div>"#
+    ));
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    for id in ["d0", "d35", "d69"] {
+        let rect = layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!(
+            rect.width > 0.0 && rect.height > 0.0,
+            "{id} must keep geometry at any nesting depth, got {rect:?}"
+        );
+    }
+}
