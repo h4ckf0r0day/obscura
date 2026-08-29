@@ -4471,3 +4471,56 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
 }
+
+#[test]
+fn overflowing_inline_block_list_wraps_inside_its_container() {
+    // Wikipedia `.cslist`: an inline-block <ul> of inline-block <li>s. The
+    // shrink-fit `NoWrap` approximation must not let the list run as one
+    // long line past its containing block; in an infobox cell that line
+    // becomes the table's min-content floor and pushes a `width:22em` table
+    // to ~640px.
+    let items: String = [
+        "Alef",
+        "BETA",
+        "CLU",
+        "Cyclone",
+        "Elm",
+        "Erlang",
+        "Haskell",
+        "Hermes",
+        "Limbo",
+        "Newsqueak",
+        "OCaml",
+        "Ruby",
+        "Scheme",
+        "Standard-ML",
+        "Swift",
+        "Idris",
+        "PHP",
+    ]
+    .iter()
+    .map(|w| format!("<li>{w}</li>"))
+    .collect();
+    let tree = parse_html(&format!(
+        r#"
+        <body style="margin:0;width:1000px">
+          <style>
+            ul{{display:inline-block;margin:0;padding:0;list-style:none}}
+            li{{display:inline-block;padding:0 .25em 0 0}}
+            li:after{{content:", "}}
+          </style>
+          <div style="width:352px"><ul id="list">{items}</ul></div>
+        </body>
+        "#
+    ));
+    let layout = layout_dom(&tree, (1280.0, 900.0));
+    let list = layout.rects[&tree.get_element_by_id("list").unwrap()];
+    assert!(
+        list.width <= 352.0 + 0.01,
+        "inline-block list must wrap inside its 352px container: {list:?}"
+    );
+    assert!(
+        list.height > 30.0,
+        "list should occupy several lines: {list:?}"
+    );
+}

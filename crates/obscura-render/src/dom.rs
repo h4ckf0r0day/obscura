@@ -6366,7 +6366,19 @@ fn layout_dom_once(
                         if matches!(width_style, crate::Dimension::Percent(_)) {
                             continue;
                         }
+                        // A shrink-fit inline-block is a `NoWrap` row only as an
+                        // approximation of its max-content line; its min-content
+                        // contribution to the table must still break between
+                        // items, or an inline list of `<li>`s widens the table to
+                        // one long line.
+                        let inline_block_rows =
+                            nowrap_inline_block_rows(&taffy_tree, &id_map, &styles);
                         let min_c = {
+                            set_flex_wrap(
+                                &mut taffy_tree,
+                                &inline_block_rows,
+                                taffy::FlexWrap::Wrap,
+                            );
                             let _ = taffy_tree.compute_layout_with_measure(
                                 tnode,
                                 taffy::Size {
@@ -6374,6 +6386,11 @@ fn layout_dom_once(
                                     height: taffy::AvailableSpace::MaxContent,
                                 },
                                 &mut measure,
+                            );
+                            set_flex_wrap(
+                                &mut taffy_tree,
+                                &inline_block_rows,
+                                taffy::FlexWrap::NoWrap,
                             );
                             taffy_tree
                                 .layout(tnode)
@@ -6477,7 +6494,14 @@ fn layout_dom_once(
                             // as a plain box here).
                             let mut measured: Vec<(usize, usize, f32, f32)> =
                                 Vec::with_capacity(cells.len());
+                            let inline_block_rows =
+                                nowrap_inline_block_rows(&taffy_tree, &id_map, &styles);
                             for (cell, col, span) in &cells {
+                                set_flex_wrap(
+                                    &mut taffy_tree,
+                                    &inline_block_rows,
+                                    taffy::FlexWrap::Wrap,
+                                );
                                 let _ = taffy_tree.compute_layout_with_measure(
                                     *cell,
                                     taffy::Size {
@@ -6485,6 +6509,11 @@ fn layout_dom_once(
                                         height: taffy::AvailableSpace::MaxContent,
                                     },
                                     &mut measure,
+                                );
+                                set_flex_wrap(
+                                    &mut taffy_tree,
+                                    &inline_block_rows,
+                                    taffy::FlexWrap::NoWrap,
                                 );
                                 let cmin = taffy_tree
                                     .layout(*cell)
@@ -6665,6 +6694,10 @@ fn layout_dom_once(
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
+                if wrap_overflowing_inline_blocks(&mut taffy_tree, &id_map, &styles) {
+                    let _ =
+                        taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
+                }
                 let _ = resolve_deferred_flex_inline_sizes(
                     tree,
                     &mut taffy_tree,
@@ -6800,6 +6833,9 @@ fn layout_dom_once(
                 }
                 if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
                 {
+                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                }
+                if wrap_overflowing_inline_blocks(&mut taffy_tree, &id_map, &styles) {
                     let _ = taffy_tree.compute_layout(taffy_root, available);
                 }
                 let _ = resolve_deferred_flex_inline_sizes(
@@ -8917,6 +8953,84 @@ fn apply_table_cell_block_alignment(
 /// Repair Taffy 0.12's intrinsic main-size calculation for column flexboxes
 /// containing a negative main-axis margin.
 ///
+/// The auto-width inline-blocks the node builder emitted as `NoWrap` flex rows
+/// (its max-content shrink-fit approximation). These are the boxes whose
+/// min-content width must still allow internal line breaks.
+fn nowrap_inline_block_rows(
+    taffy_tree: &TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Vec<taffy::NodeId> {
+    id_map
+        .iter()
+        .filter_map(|(&node, &dom_id)| {
+            let style = styles.get(&dom_id)?;
+            if !style.is_inline_block
+                || style.width != crate::Dimension::Auto
+                || style.float.is_some()
+                || matches!(style.position, Some(taffy::Position::Absolute))
+            {
+                return None;
+            }
+            let taffy_style = taffy_tree.style(node).ok()?;
+            (taffy_style.display == taffy::style::Display::Flex
+                && taffy_style.flex_wrap == taffy::FlexWrap::NoWrap)
+                .then_some(node)
+        })
+        .collect()
+}
+
+fn set_flex_wrap(
+    taffy_tree: &mut TaffyTree<usize>,
+    nodes: &[taffy::NodeId],
+    wrap: taffy::FlexWrap,
+) {
+    for node in nodes {
+        if let Ok(current) = taffy_tree.style(*node) {
+            if current.flex_wrap != wrap {
+                let mut updated = current.clone();
+                updated.flex_wrap = wrap;
+                let _ = taffy_tree.set_style(*node, updated);
+            }
+        }
+    }
+}
+
+/// An auto-width inline-block without block children is built as a `NoWrap`
+/// flex row so that a short control shrink-fits to one max-content line (see
+/// the inline-block branch of the node builder). CSS shrink-to-fit is
+/// `min(max-content, available)` though: when that max-content line is wider
+/// than the containing block the inline-block must wrap internally instead of
+/// overflowing — an `<ul>` of inline-block `<li>`s (Wikipedia's `.cslist`)
+/// otherwise runs as one 1000px line and, inside a table, drags the table's
+/// min-content floor far past its specified width. Detect the overflow from the
+/// preliminary layout and switch those rows to `Wrap`; the caller re-runs Taffy.
+fn wrap_overflowing_inline_blocks(
+    taffy_tree: &mut TaffyTree<usize>,
+    id_map: &HashMap<taffy::NodeId, NodeId>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    let repairs: Vec<taffy::NodeId> = nowrap_inline_block_rows(taffy_tree, id_map, styles)
+        .into_iter()
+        .filter(|&node| {
+            let (Some(parent), Ok(layout)) = (taffy_tree.parent(node), taffy_tree.layout(node))
+            else {
+                return false;
+            };
+            let Ok(parent_layout) = taffy_tree.layout(parent) else {
+                return false;
+            };
+            let available = parent_layout.content_box_width();
+            if !available.is_finite() || available <= 0.0 {
+                return false;
+            }
+            layout.size.width + layout.margin.left + layout.margin.right > available + 0.5
+        })
+        .collect();
+    set_flex_wrap(taffy_tree, &repairs, taffy::FlexWrap::Wrap);
+    !repairs.is_empty()
+}
+
 /// In the max-content path Taffy feeds the margin-adjusted contribution into
 /// its flex-fraction calculation. A negative margin on a shrink-disabled item
 /// can therefore subtract the item's entire flex basis (or many multiples of
