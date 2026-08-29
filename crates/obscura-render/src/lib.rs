@@ -1280,6 +1280,12 @@ pub struct LayoutStyle {
     /// is the default. Fixed-basis sidebars/columns (`flex: 0 0 260px`)
     /// collapse to content width without it.
     pub flex_basis: Dimension,
+    /// A functional `flex-basis` (`calc(100% - 314px)`) kept unresolved until
+    /// layout knows the containing block, exactly as `size_expressions` does
+    /// for width. Evaluating it context-free at parse time turns the `100%`
+    /// into 0, yielding a negative-then-clamped basis that pins the item to
+    /// its min-content width and makes a specified `width` look ignored.
+    pub flex_basis_expression: Option<String>,
 
     // CSS Grid. Tracks are stored as taffy sizing functions; `grid_areas` is the
     // parsed `grid-template-areas` matrix (one Vec per row, `.` for a null cell),

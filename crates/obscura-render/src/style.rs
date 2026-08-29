@@ -1332,6 +1332,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "flex-basis" => {
             style.flex_basis = dimension_value(value.trim());
+            style.flex_basis_expression = deferred_length_expression(value);
         }
         "flex" => parse_flex_shorthand(style, value),
         "position" => match value {
@@ -8157,28 +8158,27 @@ fn parse_url(value: &str) -> Option<String> {
 /// the shorthand form almost all real-world flexbox CSS actually uses (far
 /// more often than the flex-grow/flex-shrink longhands); leaving it
 /// unhandled silently drops grow/shrink from every rule written this way.
-/// flex-basis is not modeled as a distinct field from width, so a basis
-/// length in the shorthand is parsed (to keep the number-only forms working)
-/// but otherwise not separately applied; auto is a reasonable approximation
-/// for the common case where basis is 0 or unspecified.
 fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
     match value.trim() {
         "none" => {
             style.flex_grow = Some(0.0);
             style.flex_shrink = Some(0.0);
             style.flex_basis = crate::Dimension::Auto;
+            style.flex_basis_expression = None;
             return;
         }
         "auto" => {
             style.flex_grow = Some(1.0);
             style.flex_shrink = Some(1.0);
             style.flex_basis = crate::Dimension::Auto;
+            style.flex_basis_expression = None;
             return;
         }
         "initial" => {
             style.flex_grow = Some(0.0);
             style.flex_shrink = Some(1.0);
             style.flex_basis = crate::Dimension::Auto;
+            style.flex_basis_expression = None;
             return;
         }
         _ => {}
@@ -8188,15 +8188,24 @@ fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
     // (e.g. `flex: 0 0 260px`, the fixed-width sidebar idiom).
     let mut numbers: Vec<f32> = Vec::new();
     let mut basis: Option<crate::Dimension> = None;
-    for tok in value.split_whitespace() {
+    let mut basis_token: Option<String> = None;
+    // Split at paren-depth 0 so a functional basis such as
+    // `flex: 0 0 calc(100% - 314px)` stays one token.
+    for tok in split_top_level(value, ' ')
+        .into_iter()
+        .map(str::trim)
+        .filter(|tok| !tok.is_empty())
+    {
         if let Ok(n) = tok.parse::<f32>() {
             if numbers.len() < 2 {
                 numbers.push(n);
             } else {
                 basis = Some(dimension_value(tok));
+                basis_token = Some(tok.to_string());
             }
         } else {
             basis = Some(dimension_value(tok));
+            basis_token = Some(tok.to_string());
         }
     }
     match numbers.as_slice() {
@@ -8212,6 +8221,10 @@ fn parse_flex_shorthand(style: &mut LayoutStyle, value: &str) {
     }
     // Explicit basis wins; otherwise numbers-only shorthand implies basis 0
     // (per spec `flex: 1` == `1 1 0%`), while a bare basis keeps grow/shrink 1.
+    style.flex_basis_expression = match &basis {
+        Some(_) => basis_token.as_deref().and_then(deferred_length_expression),
+        None => None,
+    };
     style.flex_basis = match basis {
         Some(b) => b,
         None if !numbers.is_empty() => crate::Dimension::Px(0.0),

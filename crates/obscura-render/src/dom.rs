@@ -5194,6 +5194,13 @@ fn layout_dom_once(
                 style.max_width = style.max_width.resolve(em_px, root_fs, vw, vh);
                 style.max_height = style.max_height.resolve(em_px, root_fs, vw, vh);
                 style.flex_basis = style.flex_basis.resolve(em_px, root_fs, vw, vh);
+                if let Some(expression) = style.flex_basis_expression.as_deref() {
+                    if let Some(px) = crate::style::resolve_contextual_length(
+                        expression, em_px, root_fs, vw, vh, cb_w,
+                    ) {
+                        style.flex_basis = crate::Dimension::Px(px);
+                    }
+                }
                 if matches!(style.height, crate::Dimension::Percent(_))
                     && !inh.cb_height_definite
                     && !matches!(style.position, Some(taffy::Position::Absolute))

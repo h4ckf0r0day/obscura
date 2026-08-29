@@ -4471,3 +4471,37 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
 }
+
+#[test]
+fn functional_flex_basis_resolves_against_the_containing_block() {
+    // readymembership.com: `.main-nav-holder{flex-basis:calc(100% - 314px)}`.
+    // Evaluating the calc() context-free at parse time turned the 100% into
+    // 0, producing a negative basis that clamped to the item's min-content
+    // width and made the nav stack vertically.
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="display:flex;width:1200px">
+            <div style="flex:0 0 300px">a</div>
+            <div id="longhand" style="flex-basis:calc(100% - 314px)">nav</div>
+          </div>
+          <div style="display:flex;width:1200px">
+            <div style="flex:0 0 300px">a</div>
+            <div id="shorthand" style="flex:0 0 calc(100% - 314px)">nav</div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1400.0, 900.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    assert!(
+        (rect("longhand").width - 886.0).abs() < 0.01,
+        "longhand: {:?}",
+        rect("longhand")
+    );
+    assert!(
+        (rect("shorthand").width - 886.0).abs() < 0.01,
+        "shorthand: {:?}",
+        rect("shorthand")
+    );
+}
