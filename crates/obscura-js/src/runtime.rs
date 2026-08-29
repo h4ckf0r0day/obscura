@@ -3214,6 +3214,29 @@ mod tests {
             result,
             serde_json::json!(["en-US", "en-US", "en-US", "en-US", "en-US"])
         );
+
+        // The isolate has now used `Intl`, which is the state that matters:
+        // V8 resolves the default locale once per isolate and caches it, so a
+        // pin that lands after a page has formatted anything silently does
+        // nothing. That is why `pin_default_locale` runs before
+        // `JsRuntime::new` rather than anywhere later. Move the host default a
+        // second time, underneath the warmed isolate, and it must still be
+        // reading its own locale rather than picking the new one up.
+        deno_core::v8::icu::set_default_locale("de-DE");
+        let after_warmup = rt
+            .evaluate(
+                r#"
+            return [
+                Intl.DateTimeFormat().resolvedOptions().locale,
+                Intl.NumberFormat().format(1234.5),
+            ];
+        "#,
+            )
+            .unwrap();
+        // 1,234.5 is en-US grouping. de-DE would say 1.234,5 and fr-FR
+        // 1 234,5, so this asserts formatting behaviour and not just the name
+        // the locale reports for itself.
+        assert_eq!(after_warmup, serde_json::json!(["en-US", "1,234.5"]));
     }
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
