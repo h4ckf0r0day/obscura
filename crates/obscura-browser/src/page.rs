@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::ops::OriginStorage;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -227,6 +228,11 @@ pub struct Page {
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
+    /// Browsing-context-scoped session storage, keyed by origin. Owned by the
+    /// Page rather than the realm: the V8 realm is torn down on every
+    /// navigation and on CDP target switching, but sessionStorage must survive
+    /// both while never leaving the tab (issue #678).
+    session_storage: Arc<OriginStorage>,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
     /// separate from `url`: direct automation navigations have no referrer,
@@ -910,6 +916,7 @@ impl Page {
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
+            session_storage: Arc::new(OriginStorage::default()),
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
@@ -1458,6 +1465,8 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_local_storage(self.context.local_storage.clone());
+        rt.set_session_storage(self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -4973,6 +4982,220 @@ mod tests {
         page.resume_js();
         page.navigate(&format!("{base}plain.html")).await.unwrap();
         assert_eq!(page.frame_urls().len(), 1);
+    }
+
+        /// Storage test fixture: two origins (two ports). The first serves the
+        /// parent pages (root embeds a same-origin frame, /top-cross.html a
+        /// cross-origin one) and a /child.html; the second serves only
+        /// /child.html. The parent seeds s_parent/l_parent; the child writes
+        /// s_frame/l_frame.
+    async fn spawn_storage_frame_server() -> (String, String) {
+        let child = "<html><body><script>\n\
+                     sessionStorage.setItem('s_frame', 'sess-from-frame');\n\
+                     localStorage.setItem('l_frame', 'local-from-frame');\n\
+                     </script></body></html>";
+        fn top(child_src: &str) -> String {
+            format!(
+                "<html><body><script>\n\
+                 sessionStorage.setItem('s_parent', 'sess-from-parent');\n\
+                 localStorage.setItem('l_parent', 'local-from-parent');\n\
+                 </script><iframe src=\"{child_src}\"></iframe></body></html>"
+            )
+        }
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let base1 = format!("http://{addr1}/");
+        let base2 = format!("http://{addr2}/");
+        let same_top = top(&format!("{base1}child.html"));
+        let cross_top = top(&format!("{base2}child.html"));
+        let child1 = child.to_string();
+        let same_top1 = same_top.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener1.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let body = if request.starts_with("GET /child.html ") {
+                    child1.clone()
+                } else if request.starts_with("GET /top-cross.html ") {
+                    cross_top.clone()
+                } else {
+                    same_top1.clone()
+                };
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                tokio::spawn(async move {
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener2.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let body = if request.starts_with("GET /child.html ") {
+                    child.to_string()
+                } else {
+                    same_top.clone()
+                };
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                tokio::spawn(async move {
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (base1, base2)
+    }
+
+    #[tokio::test]
+    async fn same_origin_frames_share_the_page_stores() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, _) = spawn_storage_frame_server().await;
+        let mut page = frame_page("storage-frames");
+        page.navigate(&format!("{base}")).await.unwrap();
+
+        // Poll until the frame's own writes are visible from the parent. That
+        // also proves the frame document's script has run.
+        let mut result = serde_json::Value::Null;
+        for _ in 0..100 {
+            result = page.evaluate(
+                r#"({
+                    parentSession: sessionStorage.getItem('s_parent'),
+                    parentLocal: localStorage.getItem('l_parent'),
+                    frameSession: sessionStorage.getItem('s_frame'),
+                    frameLocal: localStorage.getItem('l_frame')
+                })"#,
+            );
+            if result.get("frameSession").is_some() && !result["frameSession"].is_null() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            result.get("parentSession").and_then(|v| v.as_str()),
+            Some("sess-from-parent"),
+            "the parent's own session entry must survive: {result:?}"
+        );
+        assert_eq!(
+            result.get("parentLocal").and_then(|v| v.as_str()),
+            Some("local-from-parent"),
+            "the parent's own local entry must survive: {result:?}"
+        );
+        assert_eq!(
+            result.get("frameSession").and_then(|v| v.as_str()),
+            Some("sess-from-frame"),
+            "the parent must read the frame's session write: {result:?}"
+        );
+        assert_eq!(
+            result.get("frameLocal").and_then(|v| v.as_str()),
+            Some("local-from-frame"),
+            "the parent must read the frame's local write: {result:?}"
+        );
+
+        // Read direction: the frame realm must see the parent's entries. Before
+        // the fix the frame read from its own throwaway realm store, so both
+        // of these were null.
+        let frame_view = page
+            .evaluate_in_frame(
+                0,
+                r#"({
+                    session: sessionStorage.getItem('s_parent'),
+                    local: localStorage.getItem('l_parent')
+                })"#,
+            )
+            .unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            frame_view.get("session").and_then(|v| v.as_str()),
+            Some("sess-from-parent"),
+            "the frame realm must read the parent's session entry: {frame_view:?}"
+        );
+        assert_eq!(
+            frame_view.get("local").and_then(|v| v.as_str()),
+            Some("local-from-parent"),
+            "the frame realm must read the parent's local entry: {frame_view:?}"
+        );
+    }
+
+    /// A cross-origin iframe must land in its own origin's buckets: its
+    /// writes stay invisible to the top document's origin, and it cannot read
+    /// the top document's entries. Before the storage ops resolved the
+    /// calling realm (realm_state), every frame wrote into the top
+    /// document's origin bucket, leaking both stores across the origin
+    /// boundary.
+    #[tokio::test]
+    async fn cross_origin_frames_get_their_own_storage_buckets() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, _) = spawn_storage_frame_server().await;
+        let mut page = frame_page("storage-frames-cross");
+        page.navigate(&format!("{base}top-cross.html")).await.unwrap();
+
+        // The frame's writes are only observable from inside the frame realm,
+        // so poll there until its script has run.
+        let mut frame_view = serde_json::Value::Null;
+        for _ in 0..100 {
+            if page.frame_urls().len() == 1 {
+                frame_view = page
+                    .evaluate_in_frame(
+                        0,
+                        r#"({
+                            own: sessionStorage.getItem('s_frame'),
+                            ownLocal: localStorage.getItem('l_frame'),
+                            top: sessionStorage.getItem('s_parent'),
+                            topLocal: localStorage.getItem('l_parent')
+                        })"#,
+                    )
+                    .unwrap_or(serde_json::Value::Null);
+                if !frame_view["own"].is_null() {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            frame_view.get("own").and_then(|v| v.as_str()),
+            Some("sess-from-frame"),
+            "the frame realm must read its own session write: {frame_view:?}"
+        );
+        assert_eq!(
+            frame_view.get("ownLocal").and_then(|v| v.as_str()),
+            Some("local-from-frame"),
+            "the frame realm must read its own local write: {frame_view:?}"
+        );
+        assert!(
+            frame_view["top"].is_null() && frame_view["topLocal"].is_null(),
+            "the frame realm must not read the top document's origin entries: {frame_view:?}"
+        );
+
+        // And the top document's origin must not see the frame's writes.
+        let top = page
+            .evaluate(
+                r#"({
+                    own: sessionStorage.getItem('s_parent'),
+                    ownLocal: localStorage.getItem('l_parent'),
+                    frame: sessionStorage.getItem('s_frame'),
+                    frameLocal: localStorage.getItem('l_frame')
+                })"#,
+            );
+        assert_eq!(
+            top.get("own").and_then(|v| v.as_str()),
+            Some("sess-from-parent"),
+            "the parent's own session entry must survive: {top:?}"
+        );
+        assert_eq!(
+            top.get("ownLocal").and_then(|v| v.as_str()),
+            Some("local-from-parent"),
+            "the parent's own local entry must survive: {top:?}"
+        );
+        assert!(
+            top["frame"].is_null() && top["frameLocal"].is_null(),
+            "the top document's origin must not see the frame's writes: {top:?}"
+        );
     }
 
     fn frame_page(name: &str) -> super::Page {

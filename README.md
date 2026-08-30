@@ -441,7 +441,7 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
 | **Fetch** | enable, continueRequest, fulfillRequest, failRequest (live interception), takeResponseBodyAsStream |
 | **IO** | read, close (stream a large response body in chunks) |
-| **Storage** | getCookies, setCookies, deleteCookies |
+| **Storage** | getCookies, setCookies, deleteCookies, clearCookies |
 | **Input** | dispatchMouseEvent, dispatchKeyEvent |
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
 
