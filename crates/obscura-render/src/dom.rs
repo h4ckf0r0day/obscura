@@ -13769,7 +13769,17 @@ fn can_use_native_float_band(
     // distinct taffy-side representation, so they are not an escape signal.
     let parent_is_native_bfc =
         parent_style.overflow_scroll_container && !parent_style.overflow_propagated_to_viewport;
-    saw_float && (saw_flow_after_floats || saw_clear_after_floats || parent_is_native_bfc)
+    // Reaching here with `saw_float` and nothing else means the children are
+    // floats only (anything in flow before a float already returned false).
+    // Such a block has no line box, so its auto height is zero and the floats
+    // overflow it. Taffy's native band models that because floats are out of
+    // flow there; the legacy zone fallback makes them ordinary children and
+    // grows the parent to the float's height instead. A parent that does
+    // establish a BFC must still contain them, and only the scroll-container
+    // form has a native representation, so leave the rest on the fallback.
+    let float_only = !establishes_block_formatting_context(parent_style);
+    saw_float
+        && (saw_flow_after_floats || saw_clear_after_floats || parent_is_native_bfc || float_only)
 }
 
 fn set_native_float_clear(
@@ -15868,10 +15878,15 @@ mod tests {
                 "{id}: {rect:?}"
             );
         }
+        // `#container` is an ordinary block whose only children are floats, so
+        // it has no line box and its auto height is zero; the floats overflow
+        // it until something clears them or it establishes a BFC. Chromium 147
+        // agrees: container 780x0 with the four cells at y=0, exactly the
+        // per-float geometry asserted above.
         let container = laid.rects[&tree.get_element_by_id("container").unwrap()];
         assert!(
-            (container.height - 150.0).abs() < 0.01,
-            "one float band must be as tall as its tallest float: {container:?}"
+            container.height.abs() < 0.01,
+            "a block containing only floats has no auto height: {container:?}"
         );
     }
 
