@@ -16058,12 +16058,16 @@ mod tests {
         let logo = rect("logo");
 
         assert_eq!((logo.width, logo.height), (70.0, 70.0));
+        // Chromium 147 gives exactly 215: the 70px logo plus 2x15px padding
+        // plus a 115px `porkbun` at 34.5px in the UA default (serif) face.
+        // The old `> 220` threshold was calibrated against our sans default.
         assert!(
-            brand.width > 220.0,
+            (brand.width - 215.0).abs() < 1.0,
             "the nested float must aggregate the image and label on its max-content line: {brand:?}"
         );
+        // Chromium 147 gives exactly 248 here (215 + the 33px margin below).
         assert!(
-            header.width > 255.0 && header.width < 259.0,
+            (header.width - 248.0).abs() < 1.0,
             "the hidden 22px toggle icon must not cap the outer shrink-to-fit width: {header:?}"
         );
         assert!(

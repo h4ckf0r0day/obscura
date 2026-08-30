@@ -98,7 +98,12 @@ pub(crate) fn text_may_need_emoji_font(text: &str) -> bool {
 /// DejaVu Sans, while `sans-serif`/Arial/Helvetica resolve to Liberation Sans.
 /// The first recognizable family wins, matching CSS fallback order.
 fn resolve_font_family(fam: Option<&str>) -> &'static str {
-    let Some(f) = fam else { return FAMILY };
+    // The initial `font-family` is the UA default, and every major engine uses
+    // a serif there (Chrome/Firefox/Safari all report and render Times). We
+    // returned the sans face, so unstyled text measured ~8% wider than the
+    // `font-family` we report for it, and a shrink-to-fit box built from it
+    // disagreed with Chromium.
+    let Some(f) = fam else { return SERIF_FAMILY };
     for tok in f.split(',') {
         if let Some(family) = bundled_family_for_css_token(tok) {
             return family;
