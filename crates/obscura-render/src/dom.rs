@@ -6156,6 +6156,20 @@ fn layout_dom_once(
 
         let deferred_cyclic_inline_sizes =
             defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
+        // A percentage inline size inside a flex item is cyclic, so it is
+        // neutralized to `0px` for the intrinsic measuring pass and restored
+        // once the item's used size is known. The table used-width pass runs
+        // between those two points and must read the pending percentage
+        // rather than the `0px` placeholder, or a `width:100%` table sizes its
+        // columns to max-content and keeps them after the box is stretched.
+        let deferred_percent_widths: HashMap<NodeId, f32> = deferred_cyclic_inline_sizes
+            .iter()
+            .filter(|entry| entry.slot == 0)
+            .filter_map(|entry| match entry.source {
+                DeferredCyclicInlineSource::Percent(percent) => Some((entry.node, percent)),
+                DeferredCyclicInlineSource::Expression(_) => None,
+            })
+            .collect();
 
         if let Some(taffy_root) = build(
             tree,
@@ -6247,9 +6261,16 @@ fn layout_dom_once(
                     }
                     let group = &tables[table_index..group_end];
                     let mut available_widths: HashMap<taffy::NodeId, f32> = HashMap::new();
+                    let effective_width = |dom: &NodeId, style: &crate::LayoutStyle| {
+                        deferred_percent_widths
+                            .get(dom)
+                            .map(|percent| crate::Dimension::Percent(*percent))
+                            .unwrap_or(style.width)
+                    };
                     let needs_layout_snapshot = group.iter().any(|(_, dom, _)| {
                         styles.get(dom).is_some_and(|style| {
-                            (style.width == crate::Dimension::Auto
+                            let style_width = effective_width(dom, style);
+                            (style_width == crate::Dimension::Auto
                                 && (depth > 0
                                     || reliable_table_available_width(
                                         tree,
@@ -6258,8 +6279,16 @@ fn layout_dom_once(
                                         initial_cb_width,
                                     )
                                     .is_none()))
-                                || (style.table_layout_fixed
-                                    && matches!(style.width, crate::Dimension::Percent(_)))
+                                || (matches!(style_width, crate::Dimension::Percent(_))
+                                    && (style.table_layout_fixed
+                                        || depth > 0
+                                        || reliable_table_available_width(
+                                            tree,
+                                            *dom,
+                                            &styles,
+                                            initial_cb_width,
+                                        )
+                                        .is_none()))
                         })
                     });
                     if needs_layout_snapshot {
@@ -6273,19 +6302,33 @@ fn layout_dom_once(
                             &mut measure,
                         );
                         for &(tnode, dom, _) in group {
-                            if styles
-                                .get(&dom)
-                                .is_some_and(|style| {
-                                    style.width == crate::Dimension::Auto
-                                        || (style.table_layout_fixed
-                                            && matches!(
-                                                style.width,
-                                                crate::Dimension::Percent(_)
-                                            ))
-                                })
-                            {
+                            let Some(style) = styles.get(&dom) else {
+                                continue;
+                            };
+                            let style_width = effective_width(&dom, style);
+                            if style_width == crate::Dimension::Auto {
                                 if let Ok(layout) = taffy_tree.layout(tnode) {
                                     available_widths.insert(tnode, layout.size.width.max(0.0));
+                                }
+                            } else if matches!(style_width, crate::Dimension::Percent(_)) {
+                                // A percentage resolves against the containing
+                                // block, so sample the parent's content box.
+                                // The table's own snapshot width is not usable
+                                // here: inside a flex/grid subtree the table has
+                                // just been measured at max-content, which is
+                                // the very collapse this pass exists to undo.
+                                let basis = taffy_tree
+                                    .parent(tnode)
+                                    .and_then(|parent| taffy_tree.layout(parent).ok())
+                                    .map(|layout| layout.content_box_width())
+                                    .or_else(|| {
+                                        taffy_tree
+                                            .layout(tnode)
+                                            .ok()
+                                            .map(|layout| layout.size.width)
+                                    });
+                                if let Some(basis) = basis {
+                                    available_widths.insert(tnode, basis.max(0.0));
                                 }
                             }
                         }
@@ -6294,6 +6337,7 @@ fn layout_dom_once(
                         let Some(table_style) = styles.get(&dom) else {
                             continue;
                         };
+                        let width_style = effective_width(&dom, table_style);
                         if let Some(columns) = ifc_items.fixed_table_cols.get(&tnode) {
                             let ncols = columns.len();
                             if ncols == 0 {
@@ -6301,7 +6345,7 @@ fn layout_dom_once(
                             }
                             let inline_outer_edges = table_inline_outer_edges(table_style);
                             let (horizontal_spacing, _) = table_spacing(table_style);
-                            let mut used_outer = match table_style.width {
+                            let mut used_outer = match width_style {
                                 crate::Dimension::Px(width)
                                     if table_style.box_sizing
                                         == crate::BoxSizing::ContentBox =>
@@ -6315,18 +6359,26 @@ fn layout_dom_once(
                                             .max(0.0)
                                 }
                                 crate::Dimension::Px(width) => width.max(0.0),
-                                crate::Dimension::Percent(_) => available_widths
-                                    .get(&tnode)
-                                    .copied()
-                                    .unwrap_or_else(|| {
-                                        reliable_table_available_width(
-                                            tree,
-                                            dom,
-                                            &styles,
-                                            initial_cb_width,
-                                        )
-                                        .unwrap_or(initial_cb_width)
-                                    }),
+                                // `available_widths` now holds the containing
+                                // block for every percentage table, so apply
+                                // the fraction rather than taking the basis as
+                                // the used width (which only ever agreed for
+                                // `width:100%`).
+                                crate::Dimension::Percent(fraction) => {
+                                    let basis = available_widths
+                                        .get(&tnode)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            reliable_table_available_width(
+                                                tree,
+                                                dom,
+                                                &styles,
+                                                initial_cb_width,
+                                            )
+                                            .unwrap_or(initial_cb_width)
+                                        });
+                                    (basis * fraction).max(0.0)
+                                }
                                 _ => continue,
                             };
                             let interior_spacing =
@@ -6360,12 +6412,14 @@ fn layout_dom_once(
                             }
                             continue;
                         }
-                        // A percentage-width table resolves against its container, so
-                        // leave taffy's percentage handling in place.
-                        let width_style = table_style.width;
-                        if matches!(width_style, crate::Dimension::Percent(_)) {
-                            continue;
-                        }
+                        // A percentage-width table resolves against its container.
+                        // Taffy can do that itself only when the containing
+                        // block is definite; inside a flex/grid subtree the
+                        // basis is indefinite while the parent is being
+                        // measured, and the grid then sizes every column to
+                        // max-content and never revisits them. Resolve the
+                        // percentage here and share the auto-width table's
+                        // column distribution below.
                         let min_c = {
                             let _ = taffy_tree.compute_layout_with_measure(
                                 tnode,
@@ -6408,15 +6462,6 @@ fn layout_dom_once(
                                 .unwrap_or(0.0)
                         };
                         let inline_outer_edges = table_inline_outer_edges(table_style);
-                        let preferred_outer = match width_style {
-                            crate::Dimension::Px(w)
-                                if table_style.box_sizing == crate::BoxSizing::ContentBox =>
-                            {
-                                w + inline_outer_edges
-                            }
-                            crate::Dimension::Px(w) => w,
-                            _ => max_c,
-                        };
                         let available_outer = available_widths
                             .get(&tnode)
                             .copied()
@@ -6429,11 +6474,30 @@ fn layout_dom_once(
                                 )
                             })
                             .unwrap_or(initial_cb_width);
+                        let preferred_outer = match width_style {
+                            crate::Dimension::Px(w)
+                                if table_style.box_sizing == crate::BoxSizing::ContentBox =>
+                            {
+                                w + inline_outer_edges
+                            }
+                            crate::Dimension::Px(w) => w,
+                            crate::Dimension::Percent(fraction) => {
+                                let resolved = (fraction * available_outer).max(0.0);
+                                if table_style.box_sizing == crate::BoxSizing::ContentBox {
+                                    resolved + inline_outer_edges
+                                } else {
+                                    resolved
+                                }
+                            }
+                            _ => max_c,
+                        };
                         let mut used_outer = match width_style {
                             // A definite table width is not clamped to its
                             // containing block. Like other fixed boxes it may
                             // overflow, while min-content can still make it wider.
-                            crate::Dimension::Px(_) => preferred_outer.max(min_c),
+                            crate::Dimension::Px(_) | crate::Dimension::Percent(_) => {
+                                preferred_outer.max(min_c)
+                            }
                             _ => preferred_outer.max(min_c).min(available_outer.max(min_c)),
                         };
                         let mut used_declaration =

@@ -4471,3 +4471,74 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
 }
+
+/// A `width:100%` table nested two or more flex containers deep must still
+/// distribute its used width across the columns.
+///
+/// A percentage inline size inside a flex item is cyclic, so it is neutralized
+/// to `0px` while the item is measured intrinsically and restored once the used
+/// size is known. The table used-width pass runs between those two points; when
+/// it read the `0px` placeholder it sized every column to max-content and never
+/// revisited them, so the table box stretched to 100% while the columns kept a
+/// max-content sum (a Bootstrap admin table filled 821px of 1518px). One flex
+/// level did not reproduce it, because only a nested item defers the size.
+#[cfg(feature = "paint")]
+#[test]
+fn percentage_table_in_nested_flex_distributes_columns() {
+    const CELLS: &str = "<thead><tr><th>Title</th><th>Type</th><th>Status</th></tr></thead>\
+        <tbody><tr><td id=c1>Homepage</td><td id=c2>Page</td><td id=c3>Live</td></tr></tbody>";
+    let style = "<style>body{margin:0;font:14px sans-serif}.fx{display:flex}\
+        table{width:100%;border-collapse:collapse}td,th{border:1px solid #999;padding:4px}</style>";
+
+    for depth in 0..=3 {
+        let html = format!(
+            "{style}{open}<div id=host style='width:1000px'><table id=t>{CELLS}</table></div>{close}",
+            open = "<div class=fx>".repeat(depth),
+            close = "</div>".repeat(depth),
+        );
+        let tree = parse_html(&html);
+        let layout = layout_dom(&tree, (1600.0, 1000.0));
+        let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+
+        assert!(
+            (width("t") - 1000.0).abs() < 1.0,
+            "depth {depth}: table box should be 100% of its 1000px container, got {}",
+            width("t")
+        );
+        let cells = [width("c1"), width("c2"), width("c3")];
+        let sum: f32 = cells.iter().sum();
+        assert!(
+            (sum - 1000.0).abs() < 2.0,
+            "depth {depth}: columns should fill the table, got {cells:?} summing to {sum}"
+        );
+        // Chromium 147 gives 453/244/303: the surplus follows each column's
+        // max-content width, so the prose column stays the widest.
+        assert!(
+            cells[0] > cells[1] && cells[0] > cells[2] && cells[0] > 400.0,
+            "depth {depth}: surplus should follow content width, got {cells:?}"
+        );
+    }
+}
+
+/// Surplus table width is shared in proportion to each column's max-content
+/// width (CSS 2.1 17.5.2.2), not equally. A `width:100%` table used to skip the
+/// used-width pass entirely and fall back to the grid's equal share, which
+/// starved a wide prose column to feed one-character columns.
+#[cfg(feature = "paint")]
+#[test]
+fn percentage_table_surplus_follows_column_content_width() {
+    let html = "<style>body{margin:0;font:14px sans-serif}\
+        table{width:100%;border-collapse:collapse}td{border:1px solid #999;padding:4px}</style>\
+        <div style='width:1000px'><table id=t><tbody><tr>\
+        <td id=c1>A very much longer piece of column content here</td>\
+        <td id=c2>Mid</td><td id=c3>X</td></tr></tbody></table></div>";
+    let tree = parse_html(html);
+    let layout = layout_dom(&tree, (1600.0, 1000.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    let cells = [width("c1"), width("c2"), width("c3")];
+    // Chromium 147 gives 861/87/51; an equal split would be about 333 each.
+    assert!(
+        cells[0] > 800.0 && cells[1] < 150.0 && cells[2] < 120.0,
+        "surplus should follow max-content widths, got {cells:?}"
+    );
+}
