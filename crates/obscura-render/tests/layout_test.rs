@@ -4471,3 +4471,49 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
 }
+
+/// A float with a percentage width must keep that width when it also carries a
+/// percentage margin. It used to be disqualified from the native float band by
+/// `has_deferred_or_auto_margin`, fall onto the synthetic float-zone path, and
+/// shrink to its content width — taking the row's height to zero with it, so
+/// following flow content was painted over the float.
+///
+/// This is exactly the Bootstrap 3 grid: `.col-*-N` is `float:left` plus a
+/// percentage width, and `.col-*-offset-M` adds the percentage margin.
+#[test]
+fn a_float_keeps_its_percentage_width_when_it_has_a_percentage_margin() {
+    let tree = parse_html(include_str!(
+        "../../../render-repros/float-percentage-margin.html"
+    ));
+    let layout = layout_dom(&tree, (1400.0, 1000.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    let offset = rect("offset");
+    let plain = rect("plain");
+    let row = rect("row-offset");
+
+    // 83.33333333% of the 1200px row, offset by 8.33333333% of it.
+    assert!(
+        (offset.width - 1000.0).abs() < 1.0,
+        "offset column should be 1000px wide, got {}",
+        offset.width
+    );
+    assert!(
+        (offset.x - 100.0).abs() < 1.0,
+        "offset column should start at x=100, got {}",
+        offset.x
+    );
+    // The margin must not change the width.
+    assert!(
+        (offset.width - plain.width).abs() < 1.0,
+        "a percentage margin changed the width: {} vs {}",
+        offset.width,
+        plain.width
+    );
+    // The clearfixed row must still contain the float rather than collapsing,
+    // or whatever follows is laid out on top of it.
+    assert!(
+        row.height > 0.0,
+        "the row collapsed to zero height around its float"
+    );
+}
