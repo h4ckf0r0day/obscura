@@ -14785,6 +14785,80 @@ mod tests {
         assert_eq!(seen[1].as_str().unwrap(), "http://example.com/app/data/y.json");
     }
 
+    #[test]
+    fn a_blob_url_is_chrome_shaped_and_non_blob_input_throws() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const url = URL.createObjectURL(new Blob(["x"]));
+                    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+                    const second = URL.createObjectURL(new Blob(["y"]));
+                    const threw = argument => {
+                        try {
+                            argument === undefined ? URL.createObjectURL() : URL.createObjectURL(argument);
+                            return "did not throw";
+                        } catch (error) {
+                            return error instanceof TypeError ? error.message : String(error);
+                        }
+                    };
+                    return {
+                        origin: url.slice(0, "blob:http://example.com/".length),
+                        uuid: uuid.test(url.slice("blob:http://example.com/".length)),
+                        names_the_engine: /obscura|fake/.test(url),
+                        unique: url !== second,
+                        no_argument: threw(undefined),
+                        string: threw("nope"),
+                        number: threw(7),
+                        null_value: threw(null),
+                        file_is_a_blob: URL.createObjectURL(new File(["x"], "a.txt")).startsWith("blob:http://example.com/"),
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "origin": "blob:http://example.com/",
+                "uuid": true,
+                "names_the_engine": false,
+                "unique": true,
+                "no_argument": "Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.",
+                "string": "Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.",
+                "number": "Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.",
+                "null_value": "Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.",
+                "file_is_a_blob": true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_blob_url_still_feeds_a_worker_and_survives_revocation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const url = URL.createObjectURL(new Blob(["self.onmessage = () => {};"]));
+                    const stored = globalThis.__blobStore[url];
+                    URL.revokeObjectURL(url);
+                    return {
+                        stored_synchronously: stored === "self.onmessage = () => {};",
+                        revoked: globalThis.__blobStore[url] === undefined,
+                        helpers_hidden: Object.keys(globalThis).filter(
+                            name => name === "_blobUrlOrigin" || name === "_isBlobLike" || name === "_blobUuid",
+                        ),
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "stored_synchronously": true,
+                "revoked": true,
+                "helpers_hidden": [],
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");

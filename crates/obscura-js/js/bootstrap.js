@@ -40,6 +40,7 @@
     '_urlResolveOp', '_decodeBodyWithCharset', '_utf8DecodeBytes',
     '_selectionFor', '_isConstructorCE', '_isValidCustomElementName', '_shadowRootForHost',
     '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
+    '_blobUrlOrigin', '_isBlobLike', '_blobUuid',
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
     '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
     '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
@@ -7387,8 +7388,9 @@ if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
     _updateSearch(qs) { this._set('search', qs ? ('?' + qs) : ''); }
     toString() { return this._c.href; }
     toJSON() { return this._c.href; }
-    static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
-    static revokeObjectURL() {}
+    // createObjectURL/revokeObjectURL are installed further down, next to the
+    // blob store they read and write. Defining stubs here only risked one of
+    // them surviving and handing a page a 'fake-' id to fingerprint. (#751)
     // WHATWG URL.parse: like the constructor but returns null instead of throwing.
     static parse(url, base) { const c = _urlParseOp(url, base); if (!c) return null; const u = Object.create(_URL.prototype); u._c = c; u._sp = null; return u; }
     static canParse(url, base) { return _urlParseOp(url, base) !== null; }
@@ -13281,28 +13283,58 @@ globalThis.Worker = class Worker {
 };
 
 globalThis.__blobStore = globalThis.__blobStore || {};
-URL.createObjectURL = function(blob) {
-  if (blob) {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
-    // Store synchronously so a Worker built from the blob URL in the same
-    // tick sees its source. Blob-URL Worker construction is synchronous in
-    // real browsers; the previous async blob.text().then() store raced the
-    // Worker constructor, so new Worker(blobURL) fell through to fetch() and
-    // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
-    // The obscura Blob materializes _bytes in its constructor; fall back to
-    // the async text() store only for foreign Blob shims without _bytes.
-    if (blob._bytes) {
-      let text = '';
-      try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
-      globalThis.__blobStore[id] = text;
-    } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
-    } else {
-      globalThis.__blobStore[id] = '';
+// Chrome mints blob:<document origin>/<v4 UUID>, and blob:null/<uuid> on an
+// opaque origin. The old 'blob:obscura/' + base36 form named the engine to any
+// page that read a blob URL back -- a Worker's scriptURL, an anchor href,
+// new URL(u).origin, a CSP violation report -- so one startsWith() was a
+// complete check, and the base36 id failed every UUID parser. (#751)
+function _blobUrlOrigin() {
+  try {
+    const href = globalThis.location && globalThis.location.href;
+    if (href) {
+      const origin = new URL(href).origin;
+      if (origin) return origin;
     }
-    return id;
+  } catch (e) {}
+  return 'null';
+}
+// Chrome takes a Blob (File included) or a MediaSource and throws for anything
+// else. Duck-typing keeps the tolerance for foreign Blob shims that the store
+// below already relies on, while still rejecting strings, numbers and null.
+function _isBlobLike(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (typeof Blob === 'function' && value instanceof Blob) return true;
+  return typeof value.size === 'number'
+    && (value._bytes != null || typeof value.text === 'function' || typeof value.slice === 'function');
+}
+// Bound at bootstrap so a page that later replaces globalThis.crypto cannot
+// observe or steer minting.
+var _blobUuid = globalThis.crypto.randomUUID.bind(globalThis.crypto);
+URL.createObjectURL = function(blob) {
+  if (arguments.length < 1) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
   }
-  return 'blob:obscura/fallback';
+  if (!_isBlobLike(blob)) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
+  }
+  const id = 'blob:' + _blobUrlOrigin() + '/' + _blobUuid();
+  // Store synchronously so a Worker built from the blob URL in the same
+  // tick sees its source. Blob-URL Worker construction is synchronous in
+  // real browsers; the previous async blob.text().then() store raced the
+  // Worker constructor, so new Worker(blobURL) fell through to fetch() and
+  // failed (net::ERR_FAILED), which broke AWS WAF's proof-of-work worker.
+  // The obscura Blob materializes _bytes in its constructor; fall back to
+  // the async text() store only for foreign Blob shims without _bytes.
+  if (blob._bytes) {
+    let text = '';
+    try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
+    globalThis.__blobStore[id] = text;
+  } else if (typeof blob.text === 'function') {
+    blob.text().then(text => { globalThis.__blobStore[id] = text; });
+  } else {
+    globalThis.__blobStore[id] = '';
+  }
+  return id;
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
