@@ -2985,7 +2985,25 @@ impl ObscuraJsRuntime {
                     desc = cn;
                 }}
                 else {{ desc = String(v); }}
-                return JSON.stringify({{type:t,subtype:st,className:cn,description:desc}});
+                var meta = {{type:t,subtype:st,className:cn,description:desc}};
+                // A primitive's own value travels with the metadata. Rebuilding
+                // it on the Rust side from `description` cannot work: the
+                // description of the number 2 and of the string "2" is the same
+                // text, so everything arrived as a string.
+                //
+                // `null` is included deliberately (Chrome sends `value: null`
+                // for it) and `undefined` is deliberately absent, which is how
+                // the two stay distinguishable through JSON.
+                if (t === 'string' || t === 'boolean') {{ meta.value = v; }}
+                else if (t === 'number') {{
+                    // NaN and +/-Infinity have no JSON spelling; JSON.stringify
+                    // turns them into null, which would report NaN as the value
+                    // null. Chrome reports them through unserializableValue, so
+                    // until that exists here the description carries them alone.
+                    if (isFinite(v)) {{ meta.value = v; }}
+                }}
+                else if (v === null) {{ meta.value = null; }}
+                return JSON.stringify(meta);
             }})({var_name})"#,
             var_name = var_name,
         )
@@ -3111,7 +3129,14 @@ impl ObscuraJsRuntime {
                 js_type: "number".into(),
                 subtype: None,
                 class_name: String::new(),
-                description: n.to_string(),
+                // Every number here is boxed as f64, and serde's Display keeps
+                // the `.0` that box implies, so the integer 2 described itself
+                // as "2.0". JavaScript has one number type and Chrome spells
+                // this one `2`; Rust's own f64 Display already agrees.
+                description: n
+                    .as_f64()
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| n.to_string()),
                 object_id: None,
                 value: Some(value.clone()),
             },
@@ -3163,13 +3188,12 @@ impl ObscuraJsRuntime {
             .unwrap_or("")
             .to_string();
 
-        let value = if js_type != "object" && js_type != "function" {
-            meta.get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| serde_json::Value::String(s.to_string()))
-        } else {
-            None
-        };
+        // Taken from the metadata rather than rebuilt from `description`.
+        // The old form stringified everything, so `1 + 1` reported
+        // `"type": "number"` next to `"value": "2"` and the object
+        // contradicted itself. An absent key stays absent: that is what
+        // keeps `undefined` (no value) apart from `null` (value null).
+        let value = meta.get("value").cloned();
 
         RemoteObjectInfo {
             js_type,
@@ -3192,6 +3216,75 @@ impl Default for ObscuraJsRuntime {
 mod tests {
     use super::*;
     use obscura_dom::parse_html;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_primitive_reports_its_own_value_not_its_description() {
+        // `value` was filled by copying the description string, so a number
+        // arrived as `"2"` and a boolean as `"true"`: the object said one
+        // type and carried another. returnByValue defaults to false, so this
+        // is the shape most callers see.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        for (expr, expected) in [
+            ("1 + 1", serde_json::json!(2)),
+            ("1.5", serde_json::json!(1.5)),
+            ("true", serde_json::json!(true)),
+            ("'hi'", serde_json::json!("hi")),
+            ("null", serde_json::json!(null)),
+        ] {
+            let info = rt.evaluate_for_cdp(expr, false, false).await.unwrap();
+            assert_eq!(
+                info.value,
+                Some(expected),
+                "{expr} must carry its own value, not its description"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn undefined_and_null_stay_distinguishable() {
+        // Both used to answer with a `value` invented from the description:
+        // undefined reported the empty string, which is a value it does not
+        // have. An absent key and a null key survive JSON as different
+        // things, which is what keeps these two apart.
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        let undef = rt.evaluate_for_cdp("undefined", false, false).await.unwrap();
+        assert_eq!(undef.js_type, "undefined");
+        assert_eq!(undef.subtype, None);
+        assert_eq!(undef.value, None, "undefined has no value to report");
+
+        let null = rt.evaluate_for_cdp("null", false, false).await.unwrap();
+        assert_eq!(null.js_type, "object");
+        assert_eq!(null.subtype.as_deref(), Some("null"));
+        assert_eq!(null.value, Some(serde_json::json!(null)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_integer_is_described_the_way_chrome_spells_it() {
+        // Every number is boxed as f64 and serde's Display keeps the `.0`
+        // that box implies, so the integer 2 described itself as "2.0".
+        // JavaScript has one number type; Chrome writes this one `2`.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt.evaluate_for_cdp("1 + 1", true, false).await.unwrap();
+        assert_eq!(info.description, "2");
+        let fractional = rt.evaluate_for_cdp("1.5", true, false).await.unwrap();
+        assert_eq!(fractional.description, "1.5", "a real fraction keeps its point");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_number_with_no_json_spelling_reports_no_value() {
+        // JSON.stringify turns NaN and Infinity into null, which would have
+        // reported NaN as the value null. Chrome reports them through
+        // unserializableValue; until that exists, the description alone
+        // carries them rather than a value that is wrong.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        for expr in ["NaN", "Infinity", "-Infinity"] {
+            let info = rt.evaluate_for_cdp(expr, false, false).await.unwrap();
+            assert_eq!(info.js_type, "number", "{expr} is still a number");
+            assert_eq!(info.value, None, "{expr} must not be reported as null");
+            assert!(!info.description.is_empty(), "{expr} keeps a description");
+        }
+    }
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
