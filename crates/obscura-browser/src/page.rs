@@ -1447,6 +1447,15 @@ impl Page {
                 &self.context.ua_platform_version,
             );
         }
+        // navigator.language(s) come from the same Accept-Language value the
+        // client sends, exactly as navigator.userAgent is seeded from the
+        // client's user agent above. Reading it here rather than at the
+        // override means a CDP locale change reaches the page on the next
+        // navigation without this command having to touch the isolate.
+        if let Ok(accept_language) = self.http_client.accept_language.try_read() {
+            rt.set_language(&accept_language);
+        }
+
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }

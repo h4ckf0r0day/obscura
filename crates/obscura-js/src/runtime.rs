@@ -93,6 +93,23 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// window.onerror / unhandledrejection fire and later tasks still run. Only
 /// engine-level failures (watchdog termination, the heap cap, an exhausted
 /// task budget) make the loop itself unusable. (#699)
+/// The language tags an `Accept-Language` value names, in the order it names
+/// them: `de-DE,de;q=0.9` becomes `["de-DE", "de"]`.
+///
+/// Quality values order the list rather than appearing in it, and Chrome
+/// reports `navigator.languages` as the tags alone, so they are dropped here.
+/// A `*` entry is a wildcard rather than a language and never reaches
+/// `navigator.languages`.
+pub fn languages_from_accept_language(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|entry| entry.split(';').next())
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty() && *tag != "*")
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn is_fatal_event_loop_error(error: &str) -> bool {
     error.contains("execution terminated")
         || error.contains("heap limit exceeded")
@@ -549,11 +566,13 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 9] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
+            "__obscura_language",
+            "__obscura_languages",
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
@@ -933,6 +952,32 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-ua>",
             format!("globalThis.__obscura_ua = '{}';", escaped),
+        );
+    }
+
+    /// Point `navigator.language` and `navigator.languages` at the locale the
+    /// client sends in `Accept-Language`.
+    ///
+    /// Both come from the one header value for the same reason
+    /// `navigator.userAgent` is seeded from the client's user agent: a page
+    /// and the wire that fetched it must not be able to disagree about who
+    /// they are.
+    ///
+    /// The values are interpolated as JSON rather than quoted by hand, so a
+    /// tag carrying a quote or a backslash cannot escape into the script.
+    pub fn set_language(&mut self, accept_language: &str) {
+        let languages = languages_from_accept_language(accept_language);
+        let Some(primary) = languages.first() else {
+            return;
+        };
+        let primary = serde_json::Value::String(primary.clone());
+        let all = serde_json::json!(languages);
+        let _ = self.execute_runtime_script(
+            "<set-language>",
+            format!(
+                "globalThis.__obscura_language={};globalThis.__obscura_languages={};",
+                primary, all
+            ),
         );
     }
 
@@ -3192,6 +3237,77 @@ impl Default for ObscuraJsRuntime {
 mod tests {
     use super::*;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn set_language_drives_navigator_language_and_languages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate("navigator.language + '|' + navigator.languages.join(',')")
+                .unwrap(),
+            serde_json::json!("en-US|en-US,en"),
+            "the built-in default must stand until an override arrives"
+        );
+
+        // The header form a client actually sends, quality values and all.
+        rt.set_language("de-DE,de;q=0.9");
+        assert_eq!(
+            rt.evaluate("navigator.language + '|' + navigator.languages.join(',')")
+                .unwrap(),
+            serde_json::json!("de-DE|de-DE,de"),
+            "both surfaces must follow the Accept-Language value"
+        );
+    }
+
+    #[test]
+    fn navigator_languages_hands_out_a_fresh_array_each_read() {
+        // The list is observable, so returning the stored array would let one
+        // page mutate what every later read reports.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_language("de-DE,de;q=0.9");
+        assert_eq!(
+            rt.evaluate("(function () { navigator.languages.push('zz-ZZ'); return navigator.languages.join(','); })()")
+            .unwrap(),
+            serde_json::json!("de-DE,de")
+        );
+    }
+
+    #[test]
+    fn an_empty_accept_language_leaves_the_default_alone() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_language("");
+        rt.set_language("*");
+        assert_eq!(
+            rt.evaluate("navigator.language").unwrap(),
+            serde_json::json!("en-US")
+        );
+    }
+
+    #[test]
+    fn a_language_tag_cannot_escape_the_generated_script() {
+        // set_language interpolates JSON rather than hand-quoting, so a tag
+        // carrying a quote is data and not the rest of the statement.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_language("de-DE','x');globalThis.__pwned=1;//");
+        assert_eq!(
+            rt.evaluate("typeof globalThis.__pwned").unwrap(),
+            serde_json::json!("undefined"),
+            "a language tag must not be able to run code"
+        );
+    }
+
+    #[test]
+    fn accept_language_parsing_drops_quality_values_and_wildcards() {
+        assert_eq!(
+            languages_from_accept_language("de-DE,de;q=0.9"),
+            vec!["de-DE", "de"]
+        );
+        assert_eq!(
+            languages_from_accept_language("fr-CH, fr;q=0.9, en;q=0.8, *;q=0.5"),
+            vec!["fr-CH", "fr", "en"]
+        );
+        assert!(languages_from_accept_language("").is_empty());
+        assert!(languages_from_accept_language("*").is_empty());
+    }
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);

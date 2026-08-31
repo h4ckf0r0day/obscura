@@ -402,6 +402,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Network.setBlockedURLs"
             | "Network.setExtraHTTPHeaders"
             | "Network.setUserAgentOverride"
+            | "Emulation.setUserAgentOverride"
             | "Network.getCookies"
             | "Network.getAllCookies"
             | "Network.setCookie"
