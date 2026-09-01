@@ -76,6 +76,8 @@ async fn serve_binary_fetch() -> String {
                     (Some("text/plain"), vec![0xff])
                 } else if request.starts_with("GET /win1252.txt") {
                     (Some("text/plain; charset=windows-1252"), vec![0x80])
+                } else if request.starts_with("GET /gbk.txt") {
+                    (Some("text/plain; charset=gbk"), vec![0xd6, 0xd0, 0xce, 0xc4])
                 } else if request.starts_with("GET /invalid.json") {
                     (Some("application/json"), vec![0xff])
                 } else if request.starts_with("GET /legacy.js") {
@@ -96,6 +98,7 @@ async fn serve_binary_fetch() -> String {
                           fetch('/ascii.bin').then(r => r.arrayBuffer()),
                           fetch('/invalid.txt').then(r => r.text()),
                           fetch('/win1252.txt').then(r => r.text()),
+                          fetch('/gbk.txt').then(r => r.text()),
                           fetch('/invalid.json').then(r => r.arrayBuffer()),
                           fetch('/legacy.js').then(r => r.text()),
                           fetch('/legacy.css').then(r => r.text()),
@@ -251,7 +254,7 @@ async fn js_fetch_get_response_body_preserves_binary_bytes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn js_fetch_get_response_body_uses_chromium_mime_encoding_rules() {
+async fn network_get_response_body_uses_chromium_mime_encoding_rules() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = serve_binary_fetch().await;
     let mut ctx = CdpContext::new();
@@ -367,6 +370,62 @@ async fn js_fetch_get_response_body_uses_chromium_mime_encoding_rules() {
     )
     .await;
     assert_eq!(legacy_css, json!({"body": "ÿ", "base64Encoded": false}));
+
+    let gbk_id = response_request_id(&ctx, "/gbk.txt").expect("GBK text response");
+    let gbk = cdp(
+        &mut ctx,
+        11,
+        "Network.getResponseBody",
+        json!({"requestId": gbk_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(gbk, json!({"body": "中文", "base64Encoded": false}));
+
+    let navigated = cdp(
+        &mut ctx,
+        12,
+        "Page.navigate",
+        json!({"url": format!("{base}gbk.txt")}),
+        session_id,
+    )
+    .await;
+    let loader_id = navigated["loaderId"].as_str().unwrap();
+    let document_gbk = cdp(
+        &mut ctx,
+        13,
+        "Network.getResponseBody",
+        json!({"requestId": loader_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(
+        document_gbk,
+        json!({"body": "中文", "base64Encoded": false}),
+    );
+
+    let navigated = cdp(
+        &mut ctx,
+        14,
+        "Page.navigate",
+        json!({"url": format!("{base}bytes.bin")}),
+        session_id,
+    )
+    .await;
+    let loader_id = navigated["loaderId"].as_str().unwrap();
+    let document_binary = cdp(
+        &mut ctx,
+        15,
+        "Network.getResponseBody",
+        json!({"requestId": loader_id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(document_binary["base64Encoded"], true);
+    assert_eq!(
+        BASE64.decode(document_binary["body"].as_str().unwrap()).unwrap(),
+        (0u8..=255).collect::<Vec<_>>(),
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
