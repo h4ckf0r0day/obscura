@@ -23,6 +23,9 @@
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
+    '__obscura_requestDocumentLoad',
+    '__obscura_documentLoadTaskReady',
+    '__obscura_abortDocumentLoad',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
@@ -250,6 +253,11 @@ let __dynScriptQueue = [];
 let __dynScriptBusy = false;
 let __dynClassicPending = 0;
 let __dynLoadDelayingPending = 0;
+let __documentLoadRequested = false;
+let __documentLoadCompleted = false;
+let __documentLoadNormalTimer;
+let __documentLoadForceTimer;
+let __documentLoadForceDeadline = Infinity;
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
   value: function() {
     return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
@@ -264,7 +272,89 @@ Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
 // dynamic import() and scripts created by a load handler are post-load work.
 // Keep this bridge hidden for the same reason as the general queue status.
 Object.defineProperty(globalThis, '__obscura_hasPendingLoadDelayingScripts', {
-  value: function() { return __dynLoadDelayingPending > 0; },
+  value: function() {
+    return __dynLoadDelayingPending > 0
+      || (__documentLoadRequested && !__documentLoadCompleted);
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+Object.defineProperty(globalThis, '__obscura_documentLoadTaskReady', {
+  value: function() {
+    return __documentLoadRequested && !__documentLoadCompleted
+      && (__dynLoadDelayingPending === 0
+          || performance.now() >= __documentLoadForceDeadline);
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+function __finishDocumentLoad() {
+  if (__documentLoadCompleted) return;
+  // The script deadline is a browser recovery boundary. Late resource tasks
+  // may still finish, but they no longer participate in this document's load
+  // event after the fallback has fired.
+  __dynLoadDelayingPending = 0;
+  if (__documentLoadNormalTimer !== undefined) {
+    _cancelScheduled(__documentLoadNormalTimer);
+    __documentLoadNormalTimer = undefined;
+  }
+  if (__documentLoadForceTimer !== undefined) {
+    _cancelScheduled(__documentLoadForceTimer);
+    __documentLoadForceTimer = undefined;
+  }
+  globalThis.__documentReadyState__ = 'complete';
+  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }
+  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}
+  // This is the authoritative completion bit read by the Rust owner. Set it
+  // only after every synchronous load listener returned; the event-loop turn
+  // performs their Promise checkpoint before yielding back to that owner.
+  __documentLoadCompleted = true;
+}
+function __scheduleDocumentLoadIfReady() {
+  if (!__documentLoadRequested || __documentLoadCompleted
+      || __dynLoadDelayingPending > 0 || __documentLoadNormalTimer !== undefined) return;
+  __documentLoadNormalTimer = _scheduleAfter(0, function() {
+    __documentLoadNormalTimer = undefined;
+    if (__dynLoadDelayingPending === 0) __finishDocumentLoad();
+  });
+  // Synchronous-only embedders have no task queue. They cannot preserve the
+  // DCL/load task boundary, but they must not strand readyState indefinitely.
+  if (__documentLoadNormalTimer === undefined && __dynLoadDelayingPending === 0) {
+    __finishDocumentLoad();
+  }
+}
+Object.defineProperty(globalThis, '__obscura_requestDocumentLoad', {
+  value: function(deadlineMs) {
+    if (__documentLoadRequested) return;
+    __documentLoadRequested = true;
+    __scheduleDocumentLoadIfReady();
+    if (__documentLoadCompleted) return;
+    const forceAfter = Math.max(0, Number(deadlineMs) || 0);
+    __documentLoadForceDeadline = performance.now() + forceAfter;
+    __documentLoadForceTimer = _scheduleAfter(forceAfter, function() {
+      __documentLoadForceTimer = undefined;
+      __finishDocumentLoad();
+    });
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+Object.defineProperty(globalThis, '__obscura_abortDocumentLoad', {
+  value: function() {
+    if (__documentLoadNormalTimer !== undefined) {
+      _cancelScheduled(__documentLoadNormalTimer);
+      __documentLoadNormalTimer = undefined;
+    }
+    if (__documentLoadForceTimer !== undefined) {
+      _cancelScheduled(__documentLoadForceTimer);
+      __documentLoadForceTimer = undefined;
+    }
+    __documentLoadRequested = false;
+    __documentLoadCompleted = true;
+  },
   writable: false,
   enumerable: false,
   configurable: false,
@@ -387,6 +477,7 @@ async function __runDynScriptTask(task) {
     if (task.delaysLoad) {
       task.delaysLoad = false;
       __dynLoadDelayingPending = Math.max(0, __dynLoadDelayingPending - 1);
+      __scheduleDocumentLoadIfReady();
     }
   }
 }

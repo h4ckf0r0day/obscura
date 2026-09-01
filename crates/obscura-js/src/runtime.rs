@@ -2805,7 +2805,8 @@ impl ObscuraJsRuntime {
     }
 
     /// Whether a connected dynamic script prepared before the document load
-    /// event still has fetch/evaluation/load-or-error work outstanding.
+    /// event still has work outstanding, or the queued document load task has
+    /// not completed its task-end microtask checkpoint yet.
     ///
     /// This intentionally excludes `import()` and scripts created by a load
     /// handler. Those are ordinary post-load enhancement work and should only

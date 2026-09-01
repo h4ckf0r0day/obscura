@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use obscura_browser::lifecycle::LifecycleState;
 use obscura_browser::{BrowserContext, Page};
 use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
@@ -60,6 +61,8 @@ pub struct CdpContext {
     /// events when the client attaches; Page.enable emits them once per page
     /// so clients waiting on the initial load (chromiumoxide, #833) unblock.
     pub nav_events_emitted: std::collections::HashSet<String>,
+    pub(crate) emitted_document_lifecycle: HashMap<String, LifecycleState>,
+    pub(crate) navigation_sessions: HashMap<String, Option<String>>,
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
@@ -174,6 +177,8 @@ impl CdpContext {
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
+            emitted_document_lifecycle: HashMap::new(),
+            navigation_sessions: HashMap::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
@@ -336,6 +341,8 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.emitted_document_lifecycle.remove(id);
+        self.navigation_sessions.remove(id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {

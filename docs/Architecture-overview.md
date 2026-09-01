@@ -118,7 +118,25 @@ Lifecycle events are emitted by `obscura-browser/lifecycle.rs` as the page trans
 init → commit → domcontentloaded → load → networkidle2 → networkidle0
 ```
 
-`waitUntil` on `Page.navigate` blocks until the requested level is reached. The Puppeteer / Playwright `goto` resolves on the matching `Page.lifecycleEvent` client-side.
+Puppeteer and Playwright do not send a server-side `waitUntil` with raw
+`Page.navigate`. The WebSocket server therefore returns the navigation result
+at DOMContentLoaded, keeps ownership of the live page runtime, and streams the
+later load transition. Same-page commands may run during
+that continuation. Commands which would activate another page are held in a
+bounded per-connection queue until the active page reaches load or its bounded
+load-script deadline ends, because suspending the single V8 isolate
+earlier would otherwise discard timers, fetches, and dynamic-script jobs.
+After load, a wake-driven drain may retain that ownership for at most one
+second so work queued by a load handler can publish its network/runtime events
+before another target replaces the active isolate.
+
+Load is emitted only after load-delaying scripts and their Network/Runtime
+events have been drained. Lifecycle events are emitted once per document and remain
+routed to the session that initiated the navigation. In-process CDP and MCP do
+not own an autonomous WebSocket pump, so they preserve their historical
+fully-loaded return contract instead of exposing an unowned DCL continuation.
+Puppeteer / Playwright `goto` resolves client-side when its requested lifecycle
+event arrives.
 
 ## Storage
 

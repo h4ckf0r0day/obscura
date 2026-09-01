@@ -13,6 +13,14 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
+const DOCUMENT_LOAD_TASK_TIMEOUT: &str =
+    "document load event task exceeded its one-second budget";
+
+fn document_load_error_is_terminal(error: &str) -> bool {
+    error == DOCUMENT_LOAD_TASK_TIMEOUT
+        || obscura_js::runtime::is_fatal_event_loop_error(error)
+}
+
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
 /// Returns None when unset or malformed, leaving the built-in default in place.
 /// Lets a deployment align the reported coordinates with the region its exit IP
@@ -84,6 +92,16 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// HTML's document-title getter collapses runs of ASCII whitespace. Keep the
+/// native Page snapshot aligned with the DOM op used by `document.title`.
+fn normalize_document_title(title: &str) -> String {
+    title
+        .split(|ch| matches!(ch, '\t' | '\n' | '\u{000C}' | '\r' | ' '))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(feature = "render")]
@@ -242,6 +260,12 @@ impl PendingFrameWork {
     }
 }
 
+struct PendingDocumentLoad {
+    deadline: tokio::time::Instant,
+    #[cfg(feature = "render")]
+    resources_prepared: bool,
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -317,6 +341,8 @@ pub struct Page {
     /// during navigation.
     runtime_events_enabled: std::cell::Cell<bool>,
     pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
+    pending_document_load: Option<PendingDocumentLoad>,
+    deferred_navigation: std::cell::RefCell<Option<(String, String, String)>>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -1168,6 +1194,8 @@ impl Page {
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
+            pending_document_load: None,
+            deferred_navigation: std::cell::RefCell::new(None),
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             callbacks: Arc::new(CallbackRegistry::new()),
@@ -2121,6 +2149,7 @@ impl Page {
             .collect()
     }
 
+    #[cfg(test)]
     async fn execute_scripts(&mut self) {
         self.execute_scripts_with_module_budget(None).await;
     }
@@ -2145,7 +2174,7 @@ impl Page {
             let poll_budget = remaining.min(tokio::time::Duration::from_millis(25));
             match tokio::time::timeout(
                 poll_budget,
-                js.run_load_delaying_event_loop_tick(),
+                Self::run_document_load_event_loop_tick(js),
             )
             .await
             {
@@ -2155,7 +2184,7 @@ impl Page {
                     }
                 }
                 Ok(Err(error)) => {
-                    if obscura_js::runtime::is_fatal_event_loop_error(&error) {
+                    if document_load_error_is_terminal(&error) {
                         tracing::warn!("load-delaying dynamic script event loop failed: {error}");
                         return false;
                     }
@@ -2176,7 +2205,156 @@ impl Page {
         true
     }
 
+    async fn run_document_load_event_loop_tick(
+        js: &mut ObscuraJsRuntime,
+    ) -> Result<bool, String> {
+        let load_task_ready = js
+            .evaluate("globalThis.__obscura_documentLoadTaskReady?.() === true")
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let watchdog = load_task_ready
+            .then(|| js.arm_watchdog(std::time::Duration::from_secs(1)));
+        let result = js.run_load_delaying_event_loop_tick().await;
+        let watchdog_fired = watchdog.is_some_and(|token| js.disarm_watchdog(token));
+        if watchdog_fired {
+            js.cancel_termination();
+            return Err(DOCUMENT_LOAD_TASK_TIMEOUT.into());
+        }
+        result
+    }
+
+    fn capture_pending_replacement(&mut self) -> bool {
+        if self.deferred_navigation.borrow().is_none() {
+            let replacement = self
+                .js
+                .as_ref()
+                .and_then(ObscuraJsRuntime::take_pending_navigation);
+            if replacement.is_some() {
+                self.deferred_navigation.replace(replacement);
+            }
+        }
+        if self.deferred_navigation.borrow().is_some() {
+            self.pending_document_load = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_navigation_continuation(&mut self) {
+        self.pending_document_load = None;
+        self.deferred_navigation.replace(None);
+    }
+
+    fn fail_pending_document_load(&mut self) {
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script_with_timeout(
+                "<abort-document-load>",
+                "globalThis.__obscura_abortDocumentLoad?.();",
+                std::time::Duration::from_millis(100),
+            );
+        }
+        self.pending_document_load = None;
+        self.lifecycle = LifecycleState::Failed;
+    }
+
+    fn finalize_pending_document_load(&mut self) -> bool {
+        if self.pending_document_load.is_none() {
+            return false;
+        }
+        if self.capture_pending_replacement() {
+            return false;
+        }
+        self.pending_document_load = None;
+        self.title = self
+            .with_dom(|dom| {
+                dom.query_selector("title")
+                    .ok()
+                    .flatten()
+                    .map(|title_id| normalize_document_title(&dom.text_content(title_id)))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        self.lifecycle = LifecycleState::Loaded;
+        true
+    }
+
+    #[cfg(feature = "render")]
+    async fn prepare_post_script_render_resources(&mut self) {
+        let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000);
+        let _ = self.prepare_screenshot_resources(warmup_ms).await;
+    }
+
+    async fn prepare_resources_frames_and_finalize_load(&mut self) -> bool {
+        #[cfg(feature = "render")]
+        if !self
+            .pending_document_load
+            .as_ref()
+            .is_some_and(|pending| pending.resources_prepared)
+        {
+            self.prepare_post_script_render_resources().await;
+            if let Some(pending) = self.pending_document_load.as_mut() {
+                pending.resources_prepared = true;
+            }
+        }
+        self.build_document_frames().await;
+        self.finalize_pending_document_load()
+    }
+
+    async fn complete_pending_document_load_inline(&mut self) -> bool {
+        let Some(deadline) = self.pending_document_load.as_ref().map(|state| state.deadline) else {
+            // A client-side replacement intentionally suppresses the old
+            // document's load event. It is successful continuation work, not
+            // a failed attempt to complete that discarded document.
+            return self.lifecycle == LifecycleState::Loaded
+                || self.deferred_navigation.borrow().is_some();
+        };
+        let completed = match self.js.as_mut() {
+            Some(js) => Self::drive_load_delaying_scripts(js, deadline).await,
+            None => true,
+        };
+        if !completed {
+            tracing::warn!(
+                "script deadline reached with load-delaying dynamic scripts still pending"
+            );
+            self.fail_pending_document_load();
+            return false;
+        }
+        self.prepare_resources_frames_and_finalize_load().await
+    }
+
+    #[cfg(test)]
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+        self.execute_scripts_until_dom_content_loaded(module_budget_override).await;
+        #[cfg(feature = "render")]
+        if let Some(pending) = self.pending_document_load.as_mut() {
+            // These test helpers historically exercised script/load behavior
+            // without navigation's post-script render-resource warmup.
+            pending.resources_prepared = true;
+        }
+        let _ = self.complete_pending_document_load_inline().await;
+    }
+
+    async fn execute_scripts_until_dom_content_loaded(
+        &mut self,
+        module_budget_override: Option<u64>,
+    ) {
+        self.execute_scripts_until_dom_content_loaded_with_deadline(
+            module_budget_override,
+            None,
+        )
+        .await;
+    }
+
+    async fn execute_scripts_until_dom_content_loaded_with_deadline(
+        &mut self,
+        module_budget_override: Option<u64>,
+        script_deadline_override: Option<u64>,
+    ) {
         let scripts_started = std::time::Instant::now();
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -2195,10 +2373,12 @@ impl Page {
         // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
         // for very heavy SPAs on slow networks (pair it with a matching client
         // navigation timeout).
-        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
+        let script_deadline_ms: u64 = script_deadline_override.unwrap_or_else(|| {
+            std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000)
+        });
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
@@ -2900,35 +3080,31 @@ impl Page {
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
+            let load_deadline_ms = script_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            // Queue the deadline fallback just before the Rust-side guard so
+            // its load task gets one event-loop turn before the owner stops
+            // driving the document.
+            let load_deadline_ms = load_deadline_ms.saturating_sub(25);
+            let lifecycle_script = format!(
+                "try {{ document.dispatchEvent(new Event('DOMContentLoaded', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+                 try {{ window.dispatchEvent(new Event('DOMContentLoaded', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+                 globalThis.__obscura_requestDocumentLoad?.({load_deadline_ms});"
+            );
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
-            );
-
-            let load_blockers_finished =
-                Self::drive_load_delaying_scripts(js, script_deadline).await;
-            if !load_blockers_finished {
-                tracing::warn!(
-                    "script deadline reached with load-delaying dynamic scripts still pending"
-                );
-            }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try {\n\
-                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   if (typeof window.onload === 'function') {\n\
-                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
-                   }\n\
-                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
-                 } catch(e) {}",
+                &lifecycle_script,
             );
         }
+        self.lifecycle = LifecycleState::DomContentLoaded;
+        self.pending_document_load = Some(PendingDocumentLoad {
+            deadline: script_deadline,
+            #[cfg(feature = "render")]
+            resources_prepared: false,
+        });
+        self.capture_pending_replacement();
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
                 js.disarm_watchdog(token);
@@ -2983,6 +3159,7 @@ impl Page {
         {
             Ok(r) => r,
             Err(_) => {
+                self.reset_navigation_continuation();
                 self.lifecycle = crate::lifecycle::LifecycleState::Failed;
                 Err(PageError::NetworkError(format!(
                     "navigation exceeded {nav_timeout_ms}ms deadline"
@@ -3007,6 +3184,7 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
+        self.finish_pending_document_load_within(max_ms).await;
         // Pump, then give any frame document that finished fetching a realm of
         // its own. Attaching one runs its scripts, which can start timers,
         // fetches and further frames, so keep alternating until no new frame
@@ -3062,8 +3240,11 @@ impl Page {
         if duration_ms == 0 {
             return;
         }
+        let started = tokio::time::Instant::now();
+        self.finish_pending_document_load_within(duration_ms).await;
+        let remaining_ms = duration_ms.saturating_sub(started.elapsed().as_millis() as u64);
         if let Some(js) = &mut self.js {
-            Self::settle_runtime_for_duration(js, duration_ms).await;
+            Self::settle_runtime_for_duration(js, remaining_ms).await;
         }
         // A fixed wait must retain its full wall clock, so frames get their
         // realms once at the end instead of being interleaved as in `settle`.
@@ -3072,22 +3253,110 @@ impl Page {
         self.advance_frames().await;
     }
 
+    async fn finish_pending_document_load_within(&mut self, max_ms: u64) {
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(max_ms);
+        loop {
+            let pending = self.pending_document_load.is_some();
+            if !pending {
+                break;
+            }
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.run_autonomous_event_loop_turn()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!("document load continuation failed during settle: {error}");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Advance one wake-driven browser task for a continuously owned page.
     /// `true` means deno_core reached full idle; `false` means one wake/task was
     /// delivered and the owner should offer another turn after servicing any
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        let reached_idle = match self.js.as_mut() {
-            Some(js) => js.run_autonomous_event_loop_turn().await,
-            None => Ok(true),
-        }?;
+        let mut completed_document_load = false;
+        let reached_idle = if self.pending_document_load.is_some() {
+            if self.capture_pending_replacement() {
+                true
+            } else {
+                let deadline = self
+                    .pending_document_load
+                    .as_ref()
+                    .map(|state| state.deadline)
+                    .unwrap();
+                let has_blockers = self
+                    .js
+                    .as_mut()
+                    .is_some_and(ObscuraJsRuntime::has_pending_load_delaying_scripts);
+                let mut idle = !has_blockers;
+                if has_blockers && tokio::time::Instant::now() < deadline {
+                    let turn = match self.js.as_mut() {
+                        Some(js) => tokio::select! {
+                            result = Self::run_document_load_event_loop_tick(js) => result,
+                            _ = tokio::time::sleep_until(deadline) => Ok(false),
+                        },
+                        None => Ok(true),
+                    };
+                    match turn {
+                        Ok(turn_idle) => idle = turn_idle,
+                        Err(error) if document_load_error_is_terminal(&error) => {
+                            tracing::warn!("document load task failed: {error}");
+                            self.fail_pending_document_load();
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "document load task error, continuing the event loop: {error}"
+                            );
+                            idle = false;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                if !self.capture_pending_replacement() {
+                    let has_blockers = self
+                        .js
+                        .as_mut()
+                        .is_some_and(ObscuraJsRuntime::has_pending_load_delaying_scripts);
+                    if !has_blockers {
+                        completed_document_load =
+                            self.prepare_resources_frames_and_finalize_load().await;
+                    } else if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "script deadline reached before the document load task completed"
+                        );
+                        self.fail_pending_document_load();
+                        idle = true;
+                    }
+                }
+                idle && self.pending_document_load.is_none()
+            }
+        } else {
+            match self.js.as_mut() {
+                Some(js) => js.run_autonomous_event_loop_turn().await,
+                None => Ok(true),
+            }?
+        };
         // Dynamic iframe fetches finish on the page event loop, but their
         // realms must be built by Page between turns. Keep the autonomous CDP
         // pump on the same generic frame path as settle(), so a client that
         // stays attached can observe and run child documents as they arrive.
         let frame_work = self.advance_frames().await;
-        Ok(reached_idle && !frame_work)
+        Ok(reached_idle
+            && !completed_document_load
+            && !frame_work
+            && self.pending_document_load.is_none())
     }
 
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
@@ -3206,6 +3475,7 @@ impl Page {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
         self.lifecycle = LifecycleState::Loading;
+        self.reset_navigation_continuation();
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
         self.network_events.clear();
@@ -3397,45 +3667,20 @@ impl Page {
         // listeners never registered, frameworks never bootstrapped,
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
-        self.execute_scripts().await;
-
-        #[cfg(feature = "render")]
-        {
-            // Page scripts and their bounded post-script event-loop pass can
-            // create responsive images, inline styles, and @font-face rules
-            // that did not exist during the parser warmup above. Discover them
-            // before navigation becomes capture-ready. Known parser resources
-            // are filtered by the render cache, so ordinary pages pay only the
-            // inexpensive scan on this second pass.
-            let warmup_ms = std::env::var("OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(1_000);
-            let _ = self.prepare_screenshot_resources(warmup_ms).await;
-        }
-
-        self.lifecycle = LifecycleState::DomContentLoaded;
-
-        // Before any `wait_until` can return, because the frames belong to the
-        // document rather than to one readiness level. Puppeteer and Playwright
-        // send `Page.navigate` with no `waitUntil`, which lands here and returns
-        // on the next line, so building frames further down left every real CDP
-        // client seeing a page with no frames at all.
-        self.build_document_frames().await;
+        self.execute_scripts_until_dom_content_loaded(None).await;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
+            // Frames belong to the parsed document and must exist before a DCL
+            // waiter can inspect them.
+            self.build_document_frames().await;
             return Ok(());
         }
 
-        if let Some(js) = &mut self.js {
-            if let Ok(new_title) = js.evaluate("document.title") {
-                if let Some(t) = new_title.as_str() {
-                    self.title = t.to_string();
-                }
-            }
+        if !self.complete_pending_document_load_inline().await {
+            return Err(PageError::NetworkError(
+                "document load task did not complete before the script deadline".into(),
+            ));
         }
-
-        self.lifecycle = LifecycleState::Loaded;
 
         if matches!(
             wait_until,
@@ -3446,7 +3691,6 @@ impl Page {
                 crate::lifecycle::WaitUntil::NetworkIdle2 => 2,
                 _ => 0,
             };
-
             // Same hazard as the post-script settle: a synchronous poll can pin
             // the thread past the 5s network-idle deadline, so arm a watchdog
             // that terminates the isolate ~500ms past it.
@@ -4415,6 +4659,9 @@ impl Page {
     }
 
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+        if let Some(navigation) = self.deferred_navigation.borrow_mut().take() {
+            return Some(navigation);
+        }
         if let Some(js) = &self.js {
             js.take_pending_navigation()
         } else {
@@ -4515,7 +4762,7 @@ impl Page {
                 .unwrap_or_default();
             let nav_timeout = self.navigation_timeout();
             let nav_timeout_ms = duration_millis_u64(nav_timeout);
-            let result = tokio::time::timeout(
+            let result = match tokio::time::timeout(
                 nav_timeout,
                 self.navigate_with_wait_post_inner(
                     &url,
@@ -4525,11 +4772,16 @@ impl Page {
                     &source_url,
                 ),
             )
-            .await
-            .map_err(|_| {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
-            })?;
+            .await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.reset_navigation_continuation();
+                    self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                    Err(PageError::NetworkError(format!(
+                        "navigation exceeded {nav_timeout_ms}ms deadline"
+                    )))
+                }
+            };
             result?;
             self.push_history(self.url_string());
             Ok(true)
@@ -5436,6 +5688,58 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{address}"), request_rx)
+    }
+
+    fn spawn_gated_document_script_server() -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut document, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = document.read(&mut request).unwrap();
+            let body = format!(
+                r#"<html><body><script>
+                    globalThis.__order = [];
+                    document.addEventListener('DOMContentLoaded', () => __order.push('dcl'));
+                    window.onload = () => __order.push('onload');
+                    const script = document.createElement('script');
+                    script.src = 'http://{address}/gated.js';
+                    script.onload = () => __order.push('script-load');
+                    document.head.appendChild(script);
+                </script></body></html>"#,
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            document.write_all(response.as_bytes()).unwrap();
+
+            let (mut script, _) = listener.accept().unwrap();
+            let length = script.read(&mut request).unwrap();
+            let path = String::from_utf8_lossy(&request[..length])
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            request_tx.send(path).unwrap();
+            release_rx.recv().unwrap();
+            let body = "globalThis.__dynamicRan = true; __order.push('dynamic');";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            script.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}/"), request_rx, release_tx)
     }
 
     fn spawn_script_resource_cache_server(
@@ -6696,6 +7000,322 @@ mod tests {
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
         );
+        assert_eq!(page.lifecycle, super::LifecycleState::Loaded);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_lifecycle_handoff_keeps_the_runtime_live_until_exactly_one_load() {
+        let (url, requests, release) = spawn_gated_document_script_server();
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "lifecycle-handoff".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("lifecycle-handoff".to_string(), context);
+
+        page.navigate_with_wait(&url, crate::lifecycle::WaitUntil::DomContentLoaded)
+            .await
+            .unwrap();
+        assert_eq!(page.lifecycle, super::LifecycleState::DomContentLoaded);
+        assert!(page.pending_document_load.is_some());
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[document.readyState, __order, globalThis.__dynamicRan === true]")
+                .unwrap(),
+            serde_json::json!(["interactive", ["dcl"], false]),
+            "the DCL-returned runtime must remain immediately evaluable",
+        );
+        release.send(()).unwrap();
+        page.settle(2_000).await;
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/gated.js",
+        );
+        assert_eq!(page.lifecycle, super::LifecycleState::Loaded);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[document.readyState, __order]")
+                .unwrap(),
+            serde_json::json!([
+                "complete",
+                ["dcl", "dynamic", "script-load", "onload"]
+            ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_suppresses_old_load() {
+        let mut replacement = import_map_test_page(
+            "replacement-before-load",
+            "http://127.0.0.1:9",
+            r#"<html><body><script>
+                globalThis.__oldLoad = 0;
+                window.onload = () => globalThis.__oldLoad++;
+                document.addEventListener('DOMContentLoaded', () => {
+                    location.href = 'data:text/html,replacement';
+                });
+            </script></body></html>"#,
+        );
+        replacement.execute_scripts_until_dom_content_loaded(None).await;
+        assert!(replacement.pending_document_load.is_none());
+        assert_eq!(
+            replacement
+                .js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__oldLoad")
+                .unwrap(),
+            serde_json::json!(0.0),
+        );
+        assert!(replacement.take_pending_navigation().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_script_deadline_completes_the_load_task_before_publication() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+
+        let mut deadline = import_map_test_page(
+            "lifecycle-deadline",
+            &format!("http://{address}"),
+            &format!(r#"<html><body><script>
+                globalThis.__deadlineEvents = [];
+                window.onload = () => {{
+                    globalThis.__deadlineEvents.push('onload');
+                    document.body.setAttribute('data-load-sync', 'complete');
+                }};
+                window.addEventListener('load', () => {{
+                    globalThis.__deadlineEvents.push('listener');
+                    Promise.resolve().then(() => {{
+                        globalThis.__deadlineEvents.push('microtask');
+                        document.body.setAttribute('data-load-microtask', 'complete');
+                    }});
+                }});
+                const script = document.createElement('script');
+                script.src = 'http://{address}/never.js';
+                document.head.appendChild(script);
+            </script></body></html>"#),
+        );
+        deadline
+            .execute_scripts_until_dom_content_loaded_with_deadline(None, Some(150))
+            .await;
+        assert!(
+            deadline
+                .js
+                .as_mut()
+                .unwrap()
+                .has_pending_load_delaying_scripts(),
+            "the stalled external script must hold the document load task",
+        );
+        assert!(deadline.complete_pending_document_load_inline().await);
+        assert_eq!(deadline.lifecycle, super::LifecycleState::Loaded);
+        assert!(deadline.pending_document_load.is_none());
+        assert_eq!(
+            deadline
+                .js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__deadlineEvents")
+                .unwrap(),
+            serde_json::json!(["onload", "listener", "microtask"]),
+        );
+        let native_load_state = deadline.with_dom(|dom| {
+            let body = dom.query_selector("body").unwrap().unwrap();
+            let node = dom.get_node(body).unwrap();
+            (
+                node.get_attribute("data-load-sync").map(str::to_owned),
+                node.get_attribute("data-load-microtask").map(str::to_owned),
+            )
+        });
+        assert_eq!(
+            native_load_state,
+            Some((Some("complete".into()), Some("complete".into()))),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_deadline_never_claims_load_before_the_js_task_runs() {
+        let mut page = import_map_test_page(
+            "expired-load-deadline",
+            "http://127.0.0.1:9",
+            "<html><body><script>window.onload = () => { globalThis.__lateLoad = true; };</script></body></html>",
+        );
+        page.execute_scripts_until_dom_content_loaded_with_deadline(None, Some(0))
+            .await;
+
+        assert!(!page.complete_pending_document_load_inline().await);
+        assert_eq!(page.lifecycle, super::LifecycleState::Failed);
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.readyState").unwrap(),
+            serde_json::json!("interactive"),
+        );
+        assert_ne!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__lateLoad === true").unwrap(),
+            serde_json::json!(true),
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .run_event_loop_bounded(50)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("[document.readyState, globalThis.__lateLoad === true]")
+                .unwrap(),
+            serde_json::json!(["interactive", false]),
+            "a failed load must cancel its queued fallback instead of firing late",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_dom_content_loaded_load_handler_is_watchdog_bounded() {
+        let mut page = import_map_test_page(
+            "bounded-load-handler",
+            "http://127.0.0.1:9",
+            "<html><body><script>\
+             globalThis.__lateLoadListener = false;\
+             window.onload = () => { while (true) {} };\
+             window.addEventListener('load', () => { globalThis.__lateLoadListener = true; });\
+             </script></body></html>",
+        );
+        page.execute_scripts_until_dom_content_loaded(None).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            page.run_autonomous_event_loop_turn(),
+        )
+        .await
+        .expect("the load handler watchdog did not terminate synchronous V8 work")
+        .unwrap();
+        assert_eq!(page.lifecycle, super::LifecycleState::Failed);
+        assert!(page.pending_document_load.is_none());
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__lateLoadListener")
+                .unwrap(),
+            serde_json::json!(false),
+            "a terminated onload handler must not be reported as a completed load task",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_load_continues_after_a_page_local_task_error() {
+        let mut page = import_map_test_page(
+            "load-after-task-error",
+            "http://127.0.0.1:9",
+            "<html><body><script>\
+             setTimeout(() => { throw new Error('page-local'); }, 0);\
+             window.onload = () => document.body.setAttribute('data-loaded', 'true');\
+             </script></body></html>",
+        );
+        page.execute_scripts_until_dom_content_loaded(None).await;
+
+        for _ in 0..3 {
+            page.run_autonomous_event_loop_turn().await.unwrap();
+            if page.lifecycle == super::LifecycleState::Loaded {
+                break;
+            }
+        }
+
+        assert_eq!(page.lifecycle, super::LifecycleState::Loaded);
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.body.getAttribute('data-loaded')")
+                .unwrap(),
+            serde_json::json!("true"),
+        );
+    }
+
+    #[test]
+    fn inline_and_autonomous_load_paths_share_terminal_error_classification() {
+        assert!(super::document_load_error_is_terminal(
+            super::DOCUMENT_LOAD_TASK_TIMEOUT,
+        ));
+        assert!(super::document_load_error_is_terminal(
+            "JavaScript heap limit exceeded; execution terminated",
+        ));
+        assert!(super::document_load_error_is_terminal(
+            "autonomous browser task exceeded its task budget",
+        ));
+        assert!(!super::document_load_error_is_terminal(
+            "Event loop error: Uncaught Error: page-local",
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_iframe_is_attached_before_load_finalizes() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requested_tx, requested_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            requested_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let body = "<html><body>child</body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let html = format!(
+            r#"<html><body><script>
+                document.addEventListener('DOMContentLoaded', () => {{
+                    const frame = document.createElement('iframe');
+                    frame.src = 'http://{address}/child';
+                    document.body.appendChild(frame);
+                }});
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "dynamic-frame-before-load",
+            &format!("http://{address}/"),
+            &html,
+        );
+
+        page.execute_scripts_until_dom_content_loaded(None).await;
+        assert_eq!(page.lifecycle, super::LifecycleState::DomContentLoaded);
+        assert!(page.frames.is_empty());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while page.lifecycle != super::LifecycleState::Loaded {
+                page.run_autonomous_event_loop_turn().await.unwrap();
+            }
+        })
+        .await
+        .expect("dynamic iframe load continuation");
+        requested_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("dynamic iframe request");
+        assert_eq!(page.frames.len(), 1, "load published before the child realm attached");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7018,6 +7638,12 @@ mod tests {
             "lazy-module-readiness",
             &base,
             r#"<html><body><script>
+                window.addEventListener("load", () => {
+                    document.body.setAttribute("data-load-state", "loaded");
+                    Promise.resolve().then(() => {
+                        document.body.setAttribute("data-load-microtask", "complete");
+                    });
+                });
                 import("./lazy.js").then(module => {
                     document.body.setAttribute("data-lazy-state", module.ready);
                 });
@@ -7030,13 +7656,32 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(500),
             "dynamic import() must not become an implicit navigation settle",
         );
+        let native_load_state = page.with_dom(|dom| {
+            let body = dom.query_selector("body").unwrap().unwrap();
+            let node = dom.get_node(body).unwrap();
+            (
+                node.get_attribute("data-load-state").map(str::to_owned),
+                node.get_attribute("data-load-microtask").map(str::to_owned),
+                node.get_attribute("data-lazy-state").map(str::to_owned),
+            )
+        });
+        assert_eq!(
+            native_load_state,
+            Some((Some("loaded".into()), Some("complete".into()), None)),
+            "the load task and its microtask checkpoint must finish before load is published",
+        );
         assert_eq!(
             page.js
                 .as_mut()
                 .unwrap()
-                .evaluate("document.body.getAttribute('data-lazy-state')")
+                .evaluate(
+                    "[document.readyState, \
+                      document.body.getAttribute('data-load-state'), \
+                      document.body.getAttribute('data-lazy-state')]",
+                )
                 .unwrap(),
-            serde_json::Value::Null,
+            serde_json::json!(["complete", "loaded", null]),
+            "load must publish without waiting for an unrelated lazy module graph",
         );
 
         page.settle_for_duration(1_000).await;
@@ -7049,6 +7694,25 @@ mod tests {
                 .unwrap(),
             serde_json::json!("lazy-ready"),
             "an explicit caller settle must drive the lazy module graph",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_snapshot_normalizes_mutated_document_title() {
+        let mut page = import_map_test_page(
+            "load-title-normalization",
+            "http://127.0.0.1:9",
+            "<html><head><title> Before\n  Title </title></head><body><script>\
+             window.onload = () => { document.title = ' After\\t  Title '; };\
+             </script></body></html>",
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(page.title, "After Title");
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("document.title").unwrap(),
+            serde_json::json!("After Title"),
         );
     }
 

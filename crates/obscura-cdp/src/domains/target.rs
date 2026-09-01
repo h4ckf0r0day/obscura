@@ -246,6 +246,22 @@ pub async fn handle(
                 ctx.sessions.remove(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
+                    if ctx
+                        .navigation_sessions
+                        .get(&page_id)
+                        .is_some_and(|owner| owner.as_deref() == Some(session_id))
+                    {
+                        let replacement = ctx
+                            .sessions
+                            .iter()
+                            .find(|(_, owner)| *owner == &page_id)
+                            .map(|(remaining, _)| remaining.clone());
+                        if replacement.is_some() {
+                            ctx.navigation_sessions.insert(page_id.clone(), replacement);
+                        } else {
+                            ctx.navigation_sessions.remove(&page_id);
+                        }
+                    }
                     ctx.refresh_runtime_event_collection(&page_id);
                 }
                 #[cfg(feature = "render")]
@@ -380,6 +396,32 @@ mod tests {
         assert!(ctx.get_page(&isolated_page).is_none());
         assert!(ctx.get_page(&default_page).is_some());
         assert!(ctx.browser_contexts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detaching_navigation_session_clears_lifecycle_route() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "explicit-session".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+        ctx.sessions
+            .insert("remaining-session".to_string(), page_id.clone());
+        ctx.navigation_sessions
+            .insert(page_id.clone(), Some(session_id.clone()));
+
+        handle(
+            "detachFromTarget",
+            &json!({"sessionId": session_id}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("detach should succeed");
+
+        assert_eq!(
+            ctx.navigation_sessions.get(&page_id),
+            Some(&Some("remaining-session".to_string())),
+        );
     }
 
     #[tokio::test]

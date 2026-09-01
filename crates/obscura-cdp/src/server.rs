@@ -17,6 +17,7 @@ use crate::dispatch::{self, CdpContext};
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
+const POST_LOAD_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 // The WS-stream forwarding channel must also be bounded: if the LocalSet
 // (CDP processor + nav tasks) stalls, the accept thread keeps pushing
@@ -840,6 +841,8 @@ async fn cdp_processor(
     // in flight.
     let mut deferred: std::collections::VecDeque<ServerMessage> =
         std::collections::VecDeque::new();
+    let mut post_load_deferred: std::collections::VecDeque<ServerMessage> =
+        std::collections::VecDeque::new();
 
     // Graceful shutdown: one signal watcher on the accept side flips the flag
     // and calls `notify_waiters()`. Polled once here (via the select! below) it
@@ -860,29 +863,83 @@ async fn cdp_processor(
     // next command/navigation, so static pages consume no polling budget.
     let mut runtime_pump_armed = false;
     let mut runtime_pump_error_streak = 0_u8;
+    let mut lifecycle_continuation_page: Option<String> = None;
+    let mut lifecycle_release_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        // A DOMContentLoaded listener may have queued a replacement before the
+        // old runtime parked. Navigation wins over pumping that old document.
+        if let (Some(reply_tx), Some((session_id, url, method, body))) = (
+            connection_reply_tx.as_ref(),
+            take_live_pending_navigation(&ctx),
+        ) {
+            let navigation = json!({
+                "id": 0,
+                "method": "Page.navigate",
+                "params": {"url": url, "__method": method, "__body": body},
+                "sessionId": session_id,
+            })
+            .to_string();
+            process_with_interception(
+                &navigation,
+                &mut ctx,
+                reply_tx,
+                &mut rx,
+                &mut intercept_rx,
+                &mut intercepted_paused,
+                &mut deferred,
+                false,
+            )
+            .await;
+            lifecycle_continuation_page = ctx
+                .sessions
+                .get(&session_id)
+                .and_then(|page_id| ctx.get_page(page_id))
+                .filter(|page| {
+                    matches!(
+                        page.lifecycle,
+                        obscura_browser::lifecycle::LifecycleState::DomContentLoaded
+                            | obscura_browser::lifecycle::LifecycleState::Loaded
+                    )
+                })
+                .map(|page| page.id.clone());
+            lifecycle_release_deadline = None;
+            runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+            continue;
+        }
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
         // Isolate is the one dispatch is about to touch.
         let msg = if let Some(d) = deferred.pop_front() {
             Some(d)
+        } else if lifecycle_continuation_page.is_none() {
+            post_load_deferred.pop_front()
+        } else {
+            None
+        };
+        let msg = if msg.is_some() {
+            msg
         } else {
             let screencast_active = has_active_screencast(&ctx);
-            let live_page_route = ctx
-                .pages
-                .iter()
-                .find(|page| page.has_js())
-                .and_then(|page| {
+            let live_page_route = if let Some(page_id) = lifecycle_continuation_page.as_ref() {
+                (|| {
+                    let page = ctx.get_page(page_id)?;
                     ctx.sessions
                         .iter()
-                        .find(|(_, page_id)| *page_id == &page.id)
+                        .find(|(_, owner)| *owner == page_id)
                         .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
-                });
+                })()
+            } else {
+                ctx.pages.iter().find_map(|page| {
+                        ctx.sessions
+                            .iter()
+                            .find(|(_, owner)| *owner == &page.id)
+                            .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
+                })
+            };
             let has_intercept_rx = intercept_rx.is_some();
             tokio::select! {
-                biased;
                 msg = rx.recv() => match msg {
                     Some(m) => Some(m),
                     None => break,
@@ -891,48 +948,113 @@ async fn cdp_processor(
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 },
-                pump_result = pump_live_page_event_loop(&mut ctx), if runtime_pump_armed => {
+                _ = async {
+                    if let Some(deadline) = lifecycle_release_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if lifecycle_release_deadline.is_some() => {
+                    lifecycle_continuation_page = None;
+                    lifecycle_release_deadline = None;
+                    runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    None
+                },
+                pump_result = pump_live_page_event_loop(
+                    &mut ctx,
+                    lifecycle_continuation_page.as_deref(),
+                ), if runtime_pump_armed => {
+                    let mut completed_lifecycle = false;
                     match pump_result {
                         Ok(reached_idle) => {
                             runtime_pump_error_streak = 0;
                             runtime_pump_armed = !reached_idle;
+                            let terminal_lifecycle = lifecycle_continuation_page
+                                .as_ref()
+                                .and_then(|page_id| ctx.get_page(page_id))
+                                .is_some_and(|page| {
+                                    matches!(
+                                        page.lifecycle,
+                                        obscura_browser::lifecycle::LifecycleState::Loaded
+                                            | obscura_browser::lifecycle::LifecycleState::NetworkIdle
+                                            | obscura_browser::lifecycle::LifecycleState::Failed
+                                    )
+                                });
+                            if terminal_lifecycle {
+                                if reached_idle {
+                                    completed_lifecycle = true;
+                                } else {
+                                    lifecycle_release_deadline.get_or_insert_with(|| {
+                                        tokio::time::Instant::now()
+                                            + POST_LOAD_DRAIN_TIMEOUT
+                                    });
+                                }
+                            }
                         }
                         Err(error) => {
                             runtime_pump_error_streak = runtime_pump_error_streak.saturating_add(1);
-                            runtime_pump_armed = runtime_pump_error_streak <= 3
-                                && ctx.pages.iter().any(|page| page.has_js());
                             tracing::warn!("autonomous page task failed: {error}");
-                            tokio::task::yield_now().await;
+                            if runtime_pump_error_streak > 3 {
+                                if let Some(page_id) = lifecycle_continuation_page
+                                    .clone()
+                                    .or_else(|| {
+                                        ctx.pages
+                                            .iter()
+                                            .find(|page| page.has_js())
+                                            .map(|page| page.id.clone())
+                                    })
+                                {
+                                    let sessions = ctx
+                                        .sessions
+                                        .iter()
+                                        .filter(|(_, owner)| *owner == &page_id)
+                                        .map(|(session_id, _)| session_id.clone())
+                                        .collect::<Vec<_>>();
+                                    for session_id in &sessions {
+                                        ctx.pending_events.push(crate::types::CdpEvent {
+                                            method: "Inspector.targetCrashed".to_string(),
+                                            params: json!({"status": "crashed", "errorCode": 0}),
+                                            session_id: Some(session_id.clone()),
+                                        });
+                                        ctx.pending_events.push(crate::types::CdpEvent::new(
+                                            "Target.detachedFromTarget",
+                                            json!({"sessionId": session_id, "targetId": &page_id}),
+                                        ));
+                                    }
+                                    ctx.pending_events.push(crate::types::CdpEvent::new(
+                                        "Target.targetDestroyed",
+                                        json!({"targetId": &page_id}),
+                                    ));
+                                    ctx.remove_page(&page_id);
+                                    if lifecycle_continuation_page.as_deref()
+                                        == Some(page_id.as_str())
+                                    {
+                                        lifecycle_continuation_page = None;
+                                        lifecycle_release_deadline = None;
+                                    }
+                                }
+                                runtime_pump_armed = false;
+                            } else {
+                                runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                                tokio::task::yield_now().await;
+                            }
                         }
                     }
-                    sync_live_page_network_events(&mut ctx);
+                    sync_live_page_network_events(
+                        &mut ctx,
+                        lifecycle_continuation_page.as_deref(),
+                    );
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
+                    // Chromium reports the load-delaying resource completion
+                    // and callbacks caused by that work before document load.
+                    sync_live_page_lifecycle_events(
+                        &mut ctx,
+                        lifecycle_continuation_page.as_deref(),
+                    );
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
-                    if let (Some(reply_tx), Some((session_id, url, method, body))) = (
-                        connection_reply_tx.as_ref(),
-                        take_live_pending_navigation(&ctx),
-                    ) {
-                        let navigation = json!({
-                            "id": 0,
-                            "method": "Page.navigate",
-                            "params": {"url": url, "__method": method, "__body": body},
-                            "sessionId": session_id,
-                        })
-                        .to_string();
-                        process_with_interception(
-                            &navigation,
-                            &mut ctx,
-                            reply_tx,
-                            &mut rx,
-                            &mut intercept_rx,
-                            &mut intercepted_paused,
-                            &mut deferred,
-                            false,
-                        )
-                        .await;
-                        runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    if completed_lifecycle {
+                        lifecycle_continuation_page = None;
+                        lifecycle_release_deadline = None;
                     }
                     None
                 },
@@ -985,6 +1107,26 @@ async fn cdp_processor(
                 );
             }
             ServerMessage::Cdp(cdp_msg) => {
+                if lifecycle_continuation_page.as_ref().is_some_and(|page_id| {
+                    command_targets_other_page(&cdp_msg.text, &ctx, page_id)
+                }) {
+                    if post_load_deferred.len() >= MAX_DEFERRED_MESSAGES {
+                        if let Ok(req) = serde_json::from_str::<CdpRequest>(&cdp_msg.text) {
+                            let response = crate::types::CdpResponse::error(
+                                req.id,
+                                -32000,
+                                "Server busy: another page is completing navigation".to_string(),
+                                req.session_id,
+                            );
+                            if let Ok(json) = serde_json::to_string(&response) {
+                                let _ = cdp_msg.reply_tx.send(json);
+                            }
+                        }
+                    } else {
+                        post_load_deferred.push_back(ServerMessage::Cdp(cdp_msg));
+                    }
+                    continue;
+                }
                 // Route every Page.navigate through the spawn-and-defer path,
                 // not just intercepted ones. Holding the V8 lock across a
                 // multi-second navigate inside the regular dispatch wedges the
@@ -996,11 +1138,24 @@ async fn cdp_processor(
                 let is_navigation = is_navigate_method(&cdp_msg.text);
 
                 if is_navigation {
+                    let navigation_page_id = serde_json::from_str::<CdpRequest>(&cdp_msg.text)
+                        .ok()
+                        .and_then(|request| request_page_id(&request, &ctx));
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                         &mut intercept_rx, &mut intercepted_paused,
                         &mut deferred, true,
                     ).await;
+                    lifecycle_continuation_page = navigation_page_id.filter(|page_id| {
+                        ctx.get_page(page_id).is_some_and(|page| {
+                            matches!(
+                                page.lifecycle,
+                                obscura_browser::lifecycle::LifecycleState::DomContentLoaded
+                                    | obscura_browser::lifecycle::LifecycleState::Loaded
+                            )
+                        })
+                    });
+                    lifecycle_release_deadline = None;
                 } else {
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
                         && handle_fetch_resolution(
@@ -1016,6 +1171,14 @@ async fn cdp_processor(
             }
         }
 
+        if lifecycle_continuation_page
+            .as_ref()
+            .is_some_and(|page_id| ctx.get_page(page_id).is_none())
+        {
+            lifecycle_continuation_page = None;
+            lifecycle_release_deadline = None;
+        }
+
         // Dispatch may have created a page or scheduled new asynchronous work.
         // A single live isolate is the connection's current active target; the
         // pump will park cheaply if its next task is a distant timer.
@@ -1027,6 +1190,40 @@ async fn cdp_processor(
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
     let _ = &ctx;
+}
+
+fn request_page_id(request: &CdpRequest, ctx: &CdpContext) -> Option<String> {
+    if request.method == "Target.sendMessageToTarget" {
+        if let Some(page_id) = request
+            .params
+            .get("sessionId")
+            .and_then(|value| value.as_str())
+            .and_then(|session_id| ctx.sessions.get(session_id))
+        {
+            return Some(page_id.clone());
+        }
+        if let Some(inner) = request.params.get("message").and_then(|value| value.as_str()) {
+            if let Ok(inner) = serde_json::from_str::<CdpRequest>(inner) {
+                return request_page_id(&inner, ctx);
+            }
+        }
+    }
+    request
+        .session_id
+        .as_ref()
+        .and_then(|session_id| ctx.sessions.get(session_id))
+        .cloned()
+}
+
+fn command_targets_other_page(
+    text: &str,
+    ctx: &CdpContext,
+    lifecycle_page_id: &str,
+) -> bool {
+    let Ok(request) = serde_json::from_str::<CdpRequest>(text) else {
+        return false;
+    };
+    request_page_id(&request, ctx).is_some_and(|page_id| page_id != lifecycle_page_id)
 }
 
 fn emit_intercepted_request(
@@ -1090,27 +1287,71 @@ fn emit_intercepted_request(
     intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
 }
 
-async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String> {
-    let Some(page) = ctx.pages.iter_mut().find(|page| page.has_js()) else {
+async fn pump_live_page_event_loop(
+    ctx: &mut CdpContext,
+    lifecycle_page_id: Option<&str>,
+) -> Result<bool, String> {
+    let page_index = lifecycle_page_id
+        .and_then(|page_id| ctx.pages.iter().position(|page| page.id == page_id))
+        .or_else(|| ctx.pages.iter().position(|page| page.has_js()));
+    let Some(page_index) = page_index else {
         return Ok(true);
     };
+    let page = &mut ctx.pages[page_index];
     page.run_autonomous_event_loop_turn().await
 }
 
-fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
-            .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
+fn sync_live_page_lifecycle_events(ctx: &mut CdpContext, lifecycle_page_id: Option<&str>) {
+    let route_for = |page: &obscura_browser::Page| {
+        if !page.has_js() {
+            return None;
+        }
+        let loader_id = ctx.current_loader_ids.get(&page.id)?.clone();
+        let session_id = ctx.navigation_sessions.get(&page.id)?.clone();
+        Some((
+            session_id,
+            page.id.clone(),
+            page.frame_id.clone(),
+            loader_id,
+            page.lifecycle,
+        ))
+    };
+    let route = if let Some(page_id) = lifecycle_page_id {
+        ctx.get_page(page_id).and_then(route_for)
+    } else {
+        ctx.pages.iter().find_map(route_for)
+    };
+    let Some((session_id, page_id, frame_id, loader_id, lifecycle)) = route else {
+        return;
+    };
+    crate::domains::page::emit_document_lifecycle_state(
+        ctx,
+        &session_id,
+        &frame_id,
+        &loader_id,
+        &page_id,
+        lifecycle,
+    );
+}
+
+fn sync_live_page_network_events(ctx: &mut CdpContext, lifecycle_page_id: Option<&str>) {
+    let route_for = |page: &obscura_browser::Page| {
+        if !page.has_js() {
+            return None;
+        }
+        let session_id = ctx.navigation_sessions.get(&page.id)?.clone();
+        Some((
+            session_id,
+            page.id.clone(),
+            page.frame_id.clone(),
+            page.url_string(),
+        ))
+    };
+    let page_route = if let Some(page_id) = lifecycle_page_id {
+        ctx.get_page(page_id).and_then(route_for)
+    } else {
+        ctx.pages.iter().find_map(route_for)
+    };
     let Some((session_id, page_id, frame_id, page_url)) = page_route else {
         return;
     };
@@ -1134,14 +1375,17 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
 fn take_live_pending_navigation(
     ctx: &CdpContext,
 ) -> Option<(String, String, String, String)> {
-    let page = ctx.pages.iter().find(|page| page.has_js())?;
-    let session_id = ctx
-        .sessions
-        .iter()
-        .find(|(_, page_id)| *page_id == &page.id)
-        .map(|(session_id, _)| session_id.clone())?;
-    let (url, method, body) = page.take_pending_navigation()?;
-    Some((session_id, url, method, body))
+    ctx.pages.iter().find_map(|page| {
+        if !page.has_js() {
+            return None;
+        }
+        let session_id = ctx
+            .navigation_sessions
+            .get(&page.id)
+            .and_then(Clone::clone)?;
+        let (url, method, body) = page.take_pending_navigation()?;
+        Some((session_id, url, method, body))
+    })
 }
 
 fn forward_pending_events(
@@ -1324,7 +1568,6 @@ async fn process_with_interception(
     }
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let wait_until = crate::domains::page::parse_wait_until(&req.params);
     let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -1353,11 +1596,14 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
-        let result = if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
-        } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
-        }
+        let result = page
+            .navigate_with_wait_post(
+                &url_owned,
+                obscura_browser::lifecycle::WaitUntil::DomContentLoaded,
+                &nav_method,
+                &nav_body,
+            )
+            .await
         .map_err(|e| e.to_string());
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
@@ -1508,7 +1754,7 @@ async fn process_with_interception(
         &page_url,
         &page_id_for_events,
         &network_events,
-        wait_until,
+        obscura_browser::lifecycle::WaitUntil::DomContentLoaded,
         reached_network_idle,
     );
     #[cfg(feature = "render")]
@@ -1732,6 +1978,7 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        request_page_id, take_live_pending_navigation,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
@@ -1918,6 +2165,59 @@ mod tests {
         assert!(!is_navigate_method("not json"));
     }
 
+    #[test]
+    fn legacy_send_message_wrapper_resolves_its_effective_page() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        ctx.sessions
+            .insert("legacy-session".to_string(), "page-2".to_string());
+        let request: crate::types::CdpRequest = serde_json::from_value(json!({
+            "id": 4,
+            "method": "Target.sendMessageToTarget",
+            "params": {
+                "sessionId": "legacy-session",
+                "message": "{\"id\":5,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1\"}}"
+            }
+        }))
+        .unwrap();
+        assert_eq!(request_page_id(&request, &ctx).as_deref(), Some("page-2"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_navigation_owner_retargets_autonomous_navigation() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.get_page_mut(&page_id)
+            .unwrap()
+            .navigate_with_wait(
+                "data:text/html,current",
+                obscura_browser::lifecycle::WaitUntil::Load,
+            )
+            .await
+            .unwrap();
+        ctx.sessions
+            .insert("detached-session".to_string(), page_id.clone());
+        ctx.sessions
+            .insert("remaining-session".to_string(), page_id.clone());
+        ctx.navigation_sessions
+            .insert(page_id.clone(), Some("detached-session".to_string()));
+
+        crate::domains::target::handle(
+            "detachFromTarget",
+            &json!({"sessionId": "detached-session"}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+        ctx.get_page_mut(&page_id)
+            .unwrap()
+            .evaluate("location.href = 'data:text/html,replacement'");
+
+        let pending = take_live_pending_navigation(&ctx).expect("autonomous navigation");
+        assert_eq!(pending.0, "remaining-session");
+        assert_eq!(pending.1, "data:text/html,replacement");
+    }
+
     // Issue #365: Fetch.continueRequest header overrides must be parsed from the
     // CDP `[{name, value}]` list so they can be applied to the outgoing request.
     #[test]
@@ -2008,7 +2308,7 @@ mod tests {
             .evaluate(
                 "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:green'), 0)",
             );
-        pump_live_page_event_loop(&mut ctx).await.unwrap();
+        pump_live_page_event_loop(&mut ctx, None).await.unwrap();
         pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
         let first_update: serde_json::Value = serde_json::from_str(
             &reply_rx.try_recv().expect("timer mutation should emit a frame"),
@@ -2027,7 +2327,7 @@ mod tests {
             .evaluate(
                 "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:blue'), 0)",
             );
-        pump_live_page_event_loop(&mut ctx).await.unwrap();
+        pump_live_page_event_loop(&mut ctx, None).await.unwrap();
         pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
         assert!(reply_rx.try_recv().is_err());
         assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
@@ -2109,7 +2409,7 @@ mod tests {
                 "requestAnimationFrame(() => document.body.setAttribute('style','margin:0;width:96px;height:64px;background:lime'))",
             );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        pump_live_page_event_loop(&mut ctx).await.unwrap();
+        pump_live_page_event_loop(&mut ctx, None).await.unwrap();
         pump_and_forward_screencast_frames(&mut ctx, None).await;
         let raf_frame = ctx
             .pending_events
