@@ -1056,6 +1056,9 @@ async fn cdp_processor(
                         lifecycle_continuation_page = None;
                         lifecycle_release_deadline = None;
                     }
+                    // A continuously ready page task must still yield to the
+                    // WebSocket reader/writer and to shutdown/deadline arms.
+                    tokio::task::yield_now().await;
                     None
                 },
                 Some(intercepted) = async {
@@ -1184,6 +1187,10 @@ async fn cdp_processor(
         // pump will park cheaply if its next task is a distant timer.
         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
         runtime_pump_error_streak = 0;
+        // Let the WebSocket writer flush this command's response and the
+        // reader enqueue the client's follow-up before background page work is
+        // offered another V8 turn.
+        tokio::task::yield_now().await;
 
     }
 
@@ -2000,12 +2007,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn page_runtime_advances_while_cdp_client_is_silent() {
+    async fn page_runtime_and_shutdown_progress_under_silence_and_command_flood() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let request_shutdown = shutdown.clone();
                 let default_context = crate::dispatch::CdpContext::new().default_context;
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
@@ -2114,10 +2122,65 @@ mod tests {
                     }
                 }
 
-                drop(server_tx);
+                send(json!({
+                    "id": 4,
+                    "method": "Runtime.enable",
+                    "sessionId": session_id,
+                    "params": {},
+                }));
+                while serde_json::from_str::<serde_json::Value>(
+                    &reply_rx.recv().await.expect("Runtime.enable response channel"),
+                )
+                .unwrap()["id"] != 4
+                {}
+                send(json!({
+                    "id": 5,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {
+                        "expression": "setTimeout(() => console.log('__pump_fairness_marker__'), 0)",
+                    },
+                }));
+                while serde_json::from_str::<serde_json::Value>(
+                    &reply_rx.recv().await.expect("timer response channel"),
+                )
+                .unwrap()["id"] != 5
+                {}
+
+                const FLOOD: i64 = 4_096;
+                for id in 10_000..10_000 + FLOOD {
+                    send(json!({"id": id, "method": "Browser.getVersion", "params": {}}));
+                }
+                let mut saw_last_flood_response = false;
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let value: serde_json::Value = serde_json::from_str(
+                            &reply_rx.recv().await.expect("flood response channel"),
+                        )
+                        .unwrap();
+                        saw_last_flood_response |= value["id"] == 10_000 + FLOOD - 1;
+                        if value["method"] == "Runtime.consoleAPICalled"
+                            && value["params"]["args"][0]["value"]
+                                == "__pump_fairness_marker__"
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("continuous commands starved the page event loop");
+                assert!(
+                    !saw_last_flood_response,
+                    "the page pump ran only after draining the unbounded command backlog",
+                );
+
+                for id in 20_000..20_000 + FLOOD {
+                    send(json!({"id": id, "method": "Browser.getVersion", "params": {}}));
+                }
+                request_shutdown.notify_one();
                 tokio::time::timeout(std::time::Duration::from_secs(2), processor)
                     .await
-                    .expect("processor shutdown timeout")
+                    .expect("continuous commands starved processor shutdown")
                     .expect("processor task");
             })
             .await;

@@ -3010,11 +3010,21 @@ impl ObscuraJsRuntime {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
+        self.run_autonomous_event_loop_turn_with_watchdog(
+            std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+        )
+        .await
+    }
+
+    async fn run_autonomous_event_loop_turn_with_watchdog(
+        &mut self,
+        task_budget: std::time::Duration,
+    ) -> Result<bool, String> {
         self.begin_javascript_task();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
-            std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+            task_budget,
         );
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
@@ -3030,7 +3040,7 @@ impl ObscuraJsRuntime {
         let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
-                std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+                task_budget,
             );
             let tick = self
                 .runtime()
@@ -6782,6 +6792,38 @@ mod tests {
             .unwrap(),
             serde_json::json!("usable"),
             "the per-turn watchdog must leave the isolate reusable",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_watchdog_excludes_time_parked_on_a_timer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "autonomous-parked-timer",
+            "globalThis.__parkedTimerDone = false;\
+             setTimeout(() => { globalThis.__parkedTimerDone = true; }, 100);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rt.run_autonomous_event_loop_turn_with_watchdog(
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("autonomous timer turn remained parked")
+        .expect("parked time was incorrectly charged to the synchronous watchdog");
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(80),
+            "the event loop did not remain parked beyond the test watchdog budget",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__parkedTimerDone").unwrap(),
+            serde_json::json!(true),
+            "the isolate must remain reusable after a parked autonomous turn",
         );
     }
 

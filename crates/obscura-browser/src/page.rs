@@ -14,7 +14,9 @@ use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
 const DOCUMENT_LOAD_TASK_TIMEOUT: &str =
-    "document load event task exceeded its one-second budget";
+    "document load event task exceeded its synchronous budget";
+const FINAL_DOCUMENT_LOAD_TASK_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 fn document_load_error_is_terminal(error: &str) -> bool {
     error == DOCUMENT_LOAD_TASK_TIMEOUT
@@ -2213,15 +2215,25 @@ impl Page {
             .ok()
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let watchdog = load_task_ready
-            .then(|| js.arm_watchdog(std::time::Duration::from_secs(1)));
+        if !load_task_ready {
+            // The autonomous pump arms its watchdog only while V8 is running
+            // and disarms it while the event loop is parked on timer/network
+            // I/O. Wrapping this whole await would both reject valid slow
+            // resources and churn one watchdog thread per 25 ms outer poll.
+            return js.run_autonomous_event_loop_turn().await;
+        }
+
+        // The final load task runs outside the ordinary autonomous queue, so
+        // retain its short synchronous V8 backstop here.
+        let watchdog = js.arm_watchdog(FINAL_DOCUMENT_LOAD_TASK_BUDGET);
         let result = js.run_load_delaying_event_loop_tick().await;
-        let watchdog_fired = watchdog.is_some_and(|token| js.disarm_watchdog(token));
+        let watchdog_fired = js.disarm_watchdog(watchdog);
         if watchdog_fired {
             js.cancel_termination();
-            return Err(DOCUMENT_LOAD_TASK_TIMEOUT.into());
+            Err(DOCUMENT_LOAD_TASK_TIMEOUT.into())
+        } else {
+            result
         }
-        result
     }
 
     fn capture_pending_replacement(&mut self) -> bool {
@@ -7216,6 +7228,61 @@ mod tests {
                 .unwrap(),
             serde_json::json!(false),
             "a terminated onload handler must not be reported as a completed load task",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_dom_content_loaded_non_load_task_is_watchdog_bounded() {
+        let (base, _requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_secs(10),
+            "globalThis.__slowDynamicRan = true;",
+        );
+        let html = format!(
+            "<html><body><script>\
+             globalThis.__lateLoadListener = false;\
+             const script = document.createElement('script');\
+             script.src = '{base}/slow.js';\
+             document.head.appendChild(script);\
+             setTimeout(() => {{ while (true) {{}} }}, 0);\
+             window.addEventListener('load', () => {{ globalThis.__lateLoadListener = true; }});\
+             </script></body></html>",
+        );
+        let mut page = import_map_test_page(
+            "bounded-post-dcl-task",
+            &format!("{base}/"),
+            &html,
+        );
+        page.execute_scripts_until_dom_content_loaded(None).await;
+        let js = page.js.as_mut().unwrap();
+        assert!(
+            js.has_pending_load_delaying_scripts(),
+            "the dynamic script must keep document load blocked",
+        );
+        assert_eq!(
+            js.evaluate("globalThis.__obscura_documentLoadTaskReady?.() === true")
+                .unwrap(),
+            serde_json::json!(false),
+            "the infinite timer must run through the non-final autonomous path",
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            page.run_autonomous_event_loop_turn(),
+        )
+        .await
+        .expect("a post-DCL browser task escaped the synchronous watchdog")
+        .unwrap();
+
+        assert_eq!(page.lifecycle, super::LifecycleState::Failed);
+        assert!(page.pending_document_load.is_none());
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__lateLoadListener")
+                .unwrap(),
+            serde_json::json!(false),
+            "a terminated post-DCL task must not publish load",
         );
     }
 
