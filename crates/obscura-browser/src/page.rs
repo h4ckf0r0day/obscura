@@ -13,14 +13,8 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
-const DOCUMENT_LOAD_TASK_TIMEOUT: &str =
-    "document load event task exceeded its synchronous budget";
-const FINAL_DOCUMENT_LOAD_TASK_BUDGET: std::time::Duration =
-    std::time::Duration::from_secs(1);
-
 fn document_load_error_is_terminal(error: &str) -> bool {
-    error == DOCUMENT_LOAD_TASK_TIMEOUT
-        || obscura_js::runtime::is_fatal_event_loop_error(error)
+    obscura_js::runtime::is_fatal_event_loop_error(error)
 }
 
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
@@ -2223,17 +2217,10 @@ impl Page {
             return js.run_autonomous_event_loop_turn().await;
         }
 
-        // The final load task runs outside the ordinary autonomous queue, so
-        // retain its short synchronous V8 backstop here.
-        let watchdog = js.arm_watchdog(FINAL_DOCUMENT_LOAD_TASK_BUDGET);
-        let result = js.run_load_delaying_event_loop_tick().await;
-        let watchdog_fired = js.disarm_watchdog(watchdog);
-        if watchdog_fired {
-            js.cancel_termination();
-            Err(DOCUMENT_LOAD_TASK_TIMEOUT.into())
-        } else {
-            result
-        }
+        // The runtime retains the one-second synchronous budget but arms it
+        // only around each V8 poll. It must be disarmed while this future is
+        // parked on timer or network I/O.
+        js.run_load_delaying_event_loop_tick().await
     }
 
     fn capture_pending_replacement(&mut self) -> bool {
@@ -3281,7 +3268,11 @@ impl Page {
                 break;
             }
             match tokio::time::timeout(remaining, self.run_autonomous_event_loop_turn()).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok(reached_idle)) => {
+                    if !reached_idle {
+                        tokio::task::yield_now().await;
+                    }
+                }
                 Ok(Err(error)) => {
                     tracing::warn!("document load continuation failed during settle: {error}");
                     break;
@@ -3321,7 +3312,17 @@ impl Page {
                         None => Ok(true),
                     };
                     match turn {
-                        Ok(turn_idle) => idle = turn_idle,
+                        Ok(turn_idle) => {
+                            idle = turn_idle;
+                            if !turn_idle {
+                                // The load-specific runtime path intentionally
+                                // performs one V8 poll. Yield here so every
+                                // owner, including MCP's current-thread pump,
+                                // gives timer and network drivers a chance to
+                                // wake the next turn.
+                                tokio::task::yield_now().await;
+                            }
+                        }
                         Err(error) if document_load_error_is_terminal(&error) => {
                             tracing::warn!("document load task failed: {error}");
                             self.fail_pending_document_load();
@@ -7211,13 +7212,14 @@ mod tests {
              </script></body></html>",
         );
         page.execute_scripts_until_dom_content_loaded(None).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            page.run_autonomous_event_loop_turn(),
-        )
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while page.lifecycle == super::LifecycleState::DomContentLoaded {
+                page.run_autonomous_event_loop_turn().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("the load handler watchdog did not terminate synchronous V8 work")
-        .unwrap();
+        .expect("the load handler watchdog did not terminate synchronous V8 work");
         assert_eq!(page.lifecycle, super::LifecycleState::Failed);
         assert!(page.pending_document_load.is_none());
         assert_eq!(
@@ -7298,11 +7300,12 @@ mod tests {
         );
         page.execute_scripts_until_dom_content_loaded(None).await;
 
-        for _ in 0..3 {
+        for _ in 0..8 {
             page.run_autonomous_event_loop_turn().await.unwrap();
             if page.lifecycle == super::LifecycleState::Loaded {
                 break;
             }
+            tokio::task::yield_now().await;
         }
 
         assert_eq!(page.lifecycle, super::LifecycleState::Loaded);
@@ -7318,9 +7321,6 @@ mod tests {
 
     #[test]
     fn inline_and_autonomous_load_paths_share_terminal_error_classification() {
-        assert!(super::document_load_error_is_terminal(
-            super::DOCUMENT_LOAD_TASK_TIMEOUT,
-        ));
         assert!(super::document_load_error_is_terminal(
             "JavaScript heap limit exceeded; execution terminated",
         ));

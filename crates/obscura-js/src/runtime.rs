@@ -3020,6 +3020,14 @@ impl ObscuraJsRuntime {
         &mut self,
         task_budget: std::time::Duration,
     ) -> Result<bool, String> {
+        self.run_event_loop_turn_with_watchdog(task_budget, true).await
+    }
+
+    async fn run_event_loop_turn_with_watchdog(
+        &mut self,
+        task_budget: std::time::Duration,
+        wait_for_wake: bool,
+    ) -> Result<bool, String> {
         self.begin_javascript_task();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
@@ -3066,7 +3074,7 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
-                std::task::Poll::Pending if waiting_for_wake => {
+                std::task::Poll::Pending if !wait_for_wake || waiting_for_wake => {
                     std::task::Poll::Ready(Ok(false))
                 }
                 std::task::Poll::Pending => {
@@ -3079,12 +3087,13 @@ impl ObscuraJsRuntime {
         self.finish_heap_checked(result)
     }
 
-    /// Drive one cooperative event-loop turn for browser lifecycle code that
-    /// must re-check an external readiness predicate after every wake. The
+    /// Drive one event-loop poll for browser lifecycle code that must re-check
+    /// an external readiness predicate without parking on unrelated I/O. The
     /// boolean is true only when deno_core reached full idle.
     #[doc(hidden)]
     pub async fn run_load_delaying_event_loop_tick(&mut self) -> Result<bool, String> {
-        self.run_cooperative_event_loop_tick().await
+        self.run_event_loop_turn_with_watchdog(std::time::Duration::from_secs(1), false)
+            .await
     }
 
     /// Pump deferred work until deno_core reports true idle, or until the page
