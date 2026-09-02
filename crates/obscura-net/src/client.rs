@@ -573,41 +573,73 @@ pub fn env_allows_private_network() -> bool {
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                // std's is_private() covers only RFC1918, so add the IANA
-                // special-purpose ranges that also host internal services and
-                // are common SSRF targets:
-                //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
-                //                  Alibaba 100.100.100.200) lives here.
-                //   198.18.0.0/15  benchmarking / RFC2544.
-                //   192.88.99.0/24 6to4 relay anycast / RFC7526.
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
+            // Ranges std has a stable predicate for.
+            if v4.is_loopback()          // 127.0.0.0/8
+                || v4.is_private()       // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()    // 169.254/16 (incl. 169.254.169.254 metadata)
+                || v4.is_broadcast()     // 255.255.255.255
+                || v4.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
+                || v4.is_unspecified()   // 0.0.0.0 exactly
             {
                 return true;
             }
-            // Unwrap IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
-            // forms and re-check the embedded v4 so e.g. [::ffff:127.0.0.1] or
-            // [::ffff:169.254.169.254] cannot slip past the v6 arm.
-            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+            // IANA special-purpose ranges with no *stable* std predicate
+            // (is_shared / is_benchmarking / is_reserved are unstable,
+            // rust-lang/rust#27709). Just as unsafe an SSRF target.
+            let o = v4.octets();
+            o[0] == 0                                            // 0.0.0.0/8 this-network (RFC1122)
+                || (o[0] == 100 && (0x40..=0x7f).contains(&o[1])) // 100.64.0.0/10 CGNAT (RFC6598) - Alibaba 100.100.100.200
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)       // 192.0.0.0/24 IETF (RFC6890) - Oracle 192.0.0.192
+                || (o[0] == 192 && o[1] == 31 && o[2] == 196)    // 192.31.196.0/24 AS112-v4 (RFC7535)
+                || (o[0] == 192 && o[1] == 52 && o[2] == 193)    // 192.52.193.0/24 AMT (RFC7450)
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)     // 192.88.99.0/24 6to4 relay anycast (RFC7526)
+                || (o[0] == 192 && o[1] == 175 && o[2] == 48)    // 192.175.48.0/24 direct AS112 (RFC7534)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))   // 198.18.0.0/15 benchmarking (RFC2544)
+                || o[0] >= 224                                   // 224/4 multicast + 240/4 reserved + 255.255.255.255
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() { return true; }
+            let s = v6.segments();
+            if (s[0] & 0xfe00) == 0xfc00 { return true; }        // fc00::/7 unique-local
+            if (s[0] & 0xffc0) == 0xfe80 { return true; }        // fe80::/10 link-local
+            if s[0] == 0x2001 && s[1] == 0x0db8 { return true; } // 2001:db8::/32 documentation
+            if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 { return true; } // 100::/64 discard-only
+            if (s[0] & 0xff00) == 0xff00 { return true; }        // ff00::/8 multicast
+            // Re-check any embedded IPv4 through the v4 arm. std only handles
+            // ::ffff:a.b.c.d and ::a.b.c.d; 6to4 (2002::/16) and NAT64
+            // (64:ff9b::/96) also carry a v4 address, and their embedded form
+            // bypassed the guard entirely - e.g. [2002:a9fe:a9fe::] reaches
+            // 169.254.169.254 and [2002:7f00:1::] reaches 127.0.0.1.
+            if let Some(v4) = embedded_ipv4(v6) {
                 return is_forbidden_ip(IpAddr::V4(v4));
             }
             false
         }
     }
+}
+
+/// Extract the IPv4 address embedded in an IPv6 address, across every embedding
+/// format: IPv4-mapped `::ffff:a.b.c.d`, IPv4-compatible `::a.b.c.d`, 6to4
+/// `2002:AABB:CCDD::/16` (RFC 3056), and NAT64 `64:ff9b::/96` incl. the local-use
+/// prefix `64:ff9b:1::/48` (RFC 6052 / RFC 8215). Returns None for a native v6.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    if s[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(
+            (s[1] >> 8) as u8, (s[1] & 0xff) as u8,
+            (s[2] >> 8) as u8, (s[2] & 0xff) as u8,
+        ));
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        return Some(std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8, (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8, (s[7] & 0xff) as u8,
+        ));
+    }
+    None
 }
 
 /// DNS resolver that performs the lookup and then rejects the whole request if
@@ -1788,6 +1820,69 @@ mod ssrf_tests {
     #[test]
     fn public_ipv6_is_allowed() {
         assert!(!is_forbidden_ip(ip("2606:4700:4700::1111"))); // cloudflare dns
+    }
+
+    #[test]
+    fn iana_special_purpose_ipv4_ranges_are_forbidden() {
+        // Full IANA IPv4 special-purpose registry beyond RFC1918.
+        for s in [
+            "100.64.0.1",       // 100.64.0.0/10 CGNAT
+            "100.100.100.200",  // CGNAT - Alibaba Cloud metadata
+            "192.0.0.1",        // 192.0.0.0/24 IETF
+            "192.0.0.192",      // 192.0.0.0/24 - legacy Oracle Cloud metadata
+            "192.31.196.1",     // 192.31.196.0/24 AS112-v4
+            "192.52.193.1",     // 192.52.193.0/24 AMT
+            "192.88.99.1",      // 192.88.99.0/24 6to4 relay anycast
+            "192.175.48.1",     // 192.175.48.0/24 direct AS112
+            "198.18.0.1",       // 198.18.0.0/15 benchmarking
+            "198.19.255.255",   // 198.18.0.0/15 upper edge
+            "224.0.0.1",        // 224.0.0.0/4 multicast
+            "239.255.255.255",  // 224/4 upper edge
+            "240.0.0.1",        // 240.0.0.0/4 reserved
+            "0.1.2.3",          // 0.0.0.0/8 non-zero host
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+        // Hosts just outside each new range must stay allowed.
+        for s in [
+            "100.63.255.255", "100.128.0.1", "192.0.1.1", "192.88.98.1",
+            "192.88.100.1", "198.17.255.255", "198.20.0.1", "223.255.255.255", "1.0.0.1",
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_embedded_ipv4_forms_are_forbidden() {
+        // Every IPv6 embedding of a forbidden IPv4 must be caught: v4-mapped,
+        // v4-compatible, 6to4 (2002::/16) and NAT64 (64:ff9b::/96). 6to4 and
+        // NAT64 previously bypassed the guard entirely on both transports.
+        for s in [
+            "::ffff:100.100.100.200", // v4-mapped Alibaba metadata
+            "64:ff9b::7f00:1",        // NAT64 -> 127.0.0.1
+            "64:ff9b::6464:64c8",     // NAT64 -> 100.100.100.200
+            "2002:7f00:1::",          // 6to4 -> 127.0.0.1
+            "2002:a00:1::",           // 6to4 -> 10.0.0.1
+            "2002:a9fe:a9fe::",       // 6to4 -> 169.254.169.254 (AWS metadata)
+            "2002:6464:64c8::",       // 6to4 -> 100.100.100.200 (Alibaba)
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+        // A public IPv4 wrapped in 6to4 / NAT64 must NOT be over-blocked.
+        assert!(!is_forbidden_ip(ip("2002:0808:0808::")), "6to4 of 8.8.8.8 is public");
+        assert!(!is_forbidden_ip(ip("64:ff9b::0808:0808")), "NAT64 of 8.8.8.8 is public");
+    }
+
+    #[test]
+    fn native_ipv6_special_ranges_are_forbidden() {
+        for s in [
+            "2001:db8::1", // documentation
+            "100::1",      // discard-only
+            "ff02::1",     // multicast all-nodes
+            "ff05::1",     // multicast site-local
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
     }
 
     #[test]
