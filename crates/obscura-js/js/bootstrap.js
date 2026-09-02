@@ -9881,6 +9881,12 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
   }
   get [Symbol.toStringTag]() { return "File"; }
 };
+// A FormData value keeps Blob/File objects as-is (the multipart serializer reads
+// their bytes); every other value is coerced to a string per the Fetch spec.
+function _isFormBlob(v) {
+  return v != null && typeof v === "object" &&
+    (v._bytes !== undefined || (typeof Blob === "function" && v instanceof Blob));
+}
 if (typeof FormData === "undefined") globalThis.FormData = class FormData {
   constructor(form) {
     this._d = [];
@@ -9909,8 +9915,8 @@ if (typeof FormData === "undefined") globalThis.FormData = class FormData {
       }
     }
   }
-  append(k, v) { this._d.push([String(k), String(v)]); }
-  set(k, v) { k = String(k); this._d = this._d.filter(([a]) => a !== k); this._d.push([k, String(v)]); }
+  append(k, v) { this._d.push([String(k), _isFormBlob(v) ? v : String(v)]); }
+  set(k, v) { k = String(k); this._d = this._d.filter(([a]) => a !== k); this._d.push([k, _isFormBlob(v) ? v : String(v)]); }
   delete(k) { k = String(k); this._d = this._d.filter(([a]) => a !== k); }
   get(k) { const e = this._d.find(([a]) => a === k); return e ? e[1] : null; }
   getAll(k) { return this._d.filter(([a]) => a === k).map(([, v]) => v); }
