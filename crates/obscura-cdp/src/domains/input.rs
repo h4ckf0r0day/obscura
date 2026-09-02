@@ -393,6 +393,27 @@ pub async fn handle(
 
             Ok(json!({}))
         }
+        "insertText" => {
+            // Bulk text insertion (paste / IME commit), distinct from
+            // dispatchKeyEvent's per-character path: no keydown/keyup pairs,
+            // just the resulting value change plus the `input` event a
+            // controlled/reactive field listens for. Playwright's
+            // page.fill() calls this directly, so it was previously landing
+            // on the `_ => Err("Unknown Input method")` arm below and timing
+            // out (issue #807): the fix is dispatch, not new JS — the
+            // existing insert_text_js() helper already does the right thing.
+            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !text.is_empty() {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    page.evaluate(&insert_text_js(text));
+                    // Give frameworks (React/Vue/Angular) a turn to react to
+                    // the input event before the caller proceeds, matching
+                    // the "char" dispatchKeyEvent path above.
+                    page.settle(50).await;
+                }
+            }
+            Ok(json!({}))
+        }
         "dispatchTouchEvent" => Ok(json!({})),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {}", method)),

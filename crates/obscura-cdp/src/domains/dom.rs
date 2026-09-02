@@ -299,10 +299,16 @@ pub async fn handle(
         }
         "getBoxModel" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = match resolve_node_id(page, params) {
-                Ok(nid) => nid,
-                Err(_) => return Ok(json!(null)),
-            };
+            // A resolution failure here must reach the client as a real CDP
+            // protocol error, matching Chrome (-32000 "Could not compute box
+            // model."). Playwright's actionability polling re-reads the box
+            // model across animation frames to confirm layout stability; a
+            // silent placeholder quad or a bare `null` result never signals
+            // failure, so the box never (dis)stabilizes and the client spins
+            // until its own timeout with no protocol-level error to explain
+            // why (issue #807).
+            let node_id = resolve_node_id(page, params)
+                .map_err(|_| "Could not compute box model.".to_string())?;
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
@@ -314,16 +320,17 @@ pub async fn handle(
                 node_id
             );
             let val = page.evaluate(&code);
-            let (quad, w, h) = if let Some(arr) = val.as_array() {
-                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() >= 10 {
-                    let q: Vec<Value> = nums[..8].iter().map(|n| coord_value(*n)).collect();
-                    (q, nums[8], nums[9])
-                } else {
-                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+            let (quad, w, h) = match val.as_array() {
+                Some(arr) => {
+                    let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    if nums.len() >= 10 {
+                        let q: Vec<Value> = nums[..8].iter().map(|n| coord_value(*n)).collect();
+                        (q, nums[8], nums[9])
+                    } else {
+                        return Err("Could not compute box model.".to_string());
+                    }
                 }
-            } else {
-                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                None => return Err("Could not compute box model.".to_string()),
             };
             Ok(json!({
                 "model": {
@@ -337,10 +344,10 @@ pub async fn handle(
         }
         "getContentQuads" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = match resolve_node_id(page, params) {
-                Ok(nid) => nid,
-                Err(_) => return Ok(json!(null)),
-            };
+            // See getBoxModel above: a resolution failure must surface as a
+            // real CDP error, not a fake quad or a bare `null`.
+            let node_id = resolve_node_id(page, params)
+                .map_err(|_| "Could not compute box model.".to_string())?;
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
@@ -351,12 +358,16 @@ pub async fn handle(
                 node_id
             );
             let val = page.evaluate(&code);
-            let quad = if let Some(arr) = val.as_array() {
-                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| coord_value(*n)).collect::<Vec<_>>() }
-                else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
-            } else {
-                vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
+            let quad = match val.as_array() {
+                Some(arr) => {
+                    let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    if nums.len() == 8 {
+                        nums.iter().map(|n| coord_value(*n)).collect::<Vec<_>>()
+                    } else {
+                        return Err("Could not compute box model.".to_string());
+                    }
+                }
+                None => return Err("Could not compute box model.".to_string()),
             };
             Ok(json!({ "quads": [quad] }))
         }
