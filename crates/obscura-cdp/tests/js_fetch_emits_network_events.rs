@@ -85,7 +85,7 @@ async fn serve_binary_fetch() -> String {
                 } else if request.starts_with("GET /legacy.css") {
                     (Some("text/css"), vec![0xff])
                 } else if request.starts_with("GET /no-type") {
-                    (None, vec![0xff])
+                    (None, vec![0x81, 0x8d])
                 } else if request.starts_with("GET /empty.json") {
                     (Some("application/json"), Vec::new())
                 } else if request.starts_with("GET /empty-no-type") {
@@ -335,7 +335,7 @@ async fn network_get_response_body_uses_chromium_mime_encoding_rules() {
         session_id,
     )
     .await;
-    assert_eq!(missing, json!({"body": "/w==", "base64Encoded": true}));
+    assert_eq!(missing, json!({"body": "\u{81}\u{8d}", "base64Encoded": false}));
 
     let empty_id = response_request_id(&ctx, "/empty.json").expect("empty JSON response");
     let empty = cdp(

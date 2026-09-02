@@ -86,13 +86,15 @@ fn stored_network_response_body(
 /// Apply Chromium's CDP response-body text policy without exposing it through
 /// obscura-net's public API. A body is text only when its MIME type has a text
 /// decoder and decoding is lossless; otherwise CDP returns the original bytes
-/// as base64. Empty bodies are textual even when Content-Type is absent.
+/// as base64. Chromium treats a missing Content-Type as Windows-1252 text.
 fn decode_devtools_response_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
     if body.is_empty() {
         return Some(String::new());
     }
 
-    let content_type = content_type?;
+    let Some(content_type) = content_type else {
+        return obscura_net::decode_with_label("windows-1252", body, true, false);
+    };
     let mime = content_type
         .split(';')
         .next()
@@ -3239,7 +3241,10 @@ mod tests {
     #[test]
     fn devtools_body_matches_chromium_text_decoding_boundaries() {
         assert_eq!(decode_devtools_response_body(b"", None), Some(String::new()));
-        assert_eq!(decode_devtools_response_body(b"ABC", None), None);
+        assert_eq!(
+            decode_devtools_response_body(&[0x81, 0x8d], None),
+            Some("\u{81}\u{8d}".to_string()),
+        );
         assert_eq!(
             decode_devtools_response_body(b"ABC", Some("application/octet-stream")),
             None,

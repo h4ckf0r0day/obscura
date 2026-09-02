@@ -4622,7 +4622,11 @@ mod tests {
             Some(String::new()),
         );
         for (body, content_type, expected) in [
-            (b"ABC".as_slice(), None, None),
+            (
+                &[0x81, 0x8d][..],
+                None,
+                Some("\u{81}\u{8d}".to_string()),
+            ),
             (b"ABC", Some("application/octet-stream"), None),
             (&[0xff], Some("text/plain"), Some("ÿ".to_string())),
             (&[0xff], Some("application/json"), None),
@@ -8084,7 +8088,9 @@ fn decode_devtools_document_response_body(
         return Some(String::new());
     }
 
-    let content_type = content_type?;
+    let Some(content_type) = content_type else {
+        return obscura_net::decode_with_label("windows-1252", body, true, false);
+    };
     let mime = content_type
         .split(';')
         .next()
