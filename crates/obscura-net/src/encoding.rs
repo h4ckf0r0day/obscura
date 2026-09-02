@@ -33,7 +33,8 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
         enc.new_decoder()
     };
     if fatal {
-        let mut out = String::with_capacity(bytes.len() + 1);
+        let capacity = dec.max_utf8_buffer_length_without_replacement(bytes.len())?;
+        let mut out = String::with_capacity(capacity);
         let (res, _) = dec.decode_to_string_without_replacement(bytes, &mut out, true);
         match res {
             DecoderResult::InputEmpty => Some(out),

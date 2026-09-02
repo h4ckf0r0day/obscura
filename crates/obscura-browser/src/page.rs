@@ -3114,19 +3114,21 @@ impl Page {
             PageError::NetworkError(e.to_string())
         })?;
 
-        // Store binary main resources (images, PDFs, octet-stream) base64 so
-        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
-        // corrupts them (issue #340). Text-like types stay as text.
-        let main_is_binary = !is_text_like_content_type(response.content_type());
-        self.record_network_event_with_body(
+        // Apply Chromium's charset-aware DevTools body policy. This preserves
+        // both non-UTF-8 text and opaque binary bytes without lossy conversion.
+        let request_id = self.record_network_event_inner(
             url.as_str(),
             "GET",
             "Document",
             response.status,
             &response.headers,
-            &response.body,
-            main_is_binary,
+            response.body.len(),
         );
+        let body = &response.body;
+        let content_type = response.content_type();
+        self.store_response_body_with(request_id, body.len(), || {
+            stored_devtools_document_response_body(body, content_type)
+        });
 
         if !response.redirected_from.is_empty() {
             self.url = Some(response.url.clone());
@@ -4084,23 +4086,32 @@ impl Page {
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+        self.store_response_body_with(request_id, body.len(), || StoredResponseBody {
+            body: if base64_encoded {
+                BASE64.encode(body)
+            } else {
+                String::from_utf8_lossy(body).to_string()
+            },
+            base64_encoded,
+        });
+    }
+
+    fn store_response_body_with<F>(
+        &mut self,
+        request_id: String,
+        source_len: usize,
+        make_stored: F,
+    )
+    where
+        F: FnOnce() -> StoredResponseBody,
+    {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+        if max_entries == 0 || max_bytes == 0 || source_len > max_bytes {
             return;
         }
-        let body = if base64_encoded {
-            BASE64.encode(body)
-        } else {
-            String::from_utf8_lossy(body).to_string()
-        };
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body,
-                base64_encoded,
-            },
-        );
+        let stored = make_stored();
+        self.response_bodies.insert(request_id.clone(), stored);
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -4413,6 +4424,67 @@ mod tests {
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn document_devtools_body_matches_fetch_store_decoding_boundaries() {
+        assert_eq!(
+            super::decode_devtools_document_response_body(b"", None),
+            Some(String::new()),
+        );
+        for (body, content_type, expected) in [
+            (
+                &[0x81, 0x8d][..],
+                None,
+                Some("\u{81}\u{8d}".to_string()),
+            ),
+            (b"ABC", Some("application/octet-stream"), None),
+            (&[0xff], Some("text/plain"), Some("ÿ".to_string())),
+            (&[0xff], Some("application/json"), None),
+            (
+                &[0x80],
+                Some("text/plain; CHARSET=\"windows-1252\""),
+                Some("€".to_string()),
+            ),
+            (
+                &[0xd6, 0xd0, 0xce, 0xc4],
+                Some("text/html; Charset='GBK'"),
+                Some("中文".to_string()),
+            ),
+            (&[0xff], Some("text/plain; charset=not-real"), None),
+        ] {
+            assert_eq!(
+                super::decode_devtools_document_response_body(body, content_type),
+                expected,
+                "unexpected DevTools body policy for {content_type:?}",
+            );
+        }
+        for content_type in [
+            "application/x-ecmascript",
+            "application/x-javascript",
+            "text/javascript1.5",
+            "text/json",
+        ] {
+            assert_eq!(
+                super::decode_devtools_document_response_body(&[0xff], Some(content_type)),
+                None,
+                "{content_type} must use Chromium's UTF-8 decoder",
+            );
+        }
+        assert_eq!(
+            super::decode_devtools_document_response_body(
+                b"<html/>",
+                Some("application/xhtml+xml"),
+            ),
+            Some("<html/>".to_string()),
+        );
+        for content_type in ["image/svg+xml", "text/xsl", "foo/bar+xml"] {
+            assert_eq!(
+                super::decode_devtools_document_response_body(b"<xml/>", Some(content_type)),
+                None,
+                "{content_type} has no Chromium raw-resource text decoder",
+            );
+        }
+    }
 
     #[test]
     fn navigation_timeout_environment_default_remains_thirty_seconds() {
@@ -7252,27 +7324,102 @@ impl From<ObscuraNetError> for PageError {
     }
 }
 
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn is_text_like_content_type(content_type: Option<&str>) -> bool {
-    let ct = match content_type {
-        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
-        // No Content-Type: assume text (matches the HTML-parse default).
-        None => return true,
-    };
-    if ct.is_empty() {
-        return true;
+/// Apply Chromium's charset-aware CDP policy to Page-owned response bodies.
+/// The JS fetch store keeps the same small private policy in obscura-js; sharing
+/// it would expose an engine-internal DevTools detail as public Rust API.
+fn stored_devtools_document_response_body(
+    body: &[u8],
+    content_type: Option<&str>,
+) -> StoredResponseBody {
+    if let Some(body) = decode_devtools_document_response_body(body, content_type) {
+        StoredResponseBody {
+            body,
+            base64_encoded: false,
+        }
+    } else {
+        StoredResponseBody {
+            body: BASE64.encode(body),
+            base64_encoded: true,
+        }
     }
-    ct.starts_with("text/")
-        || ct == "application/json"
-        || ct == "application/xml"
-        || ct == "application/xhtml+xml"
-        || ct == "application/javascript"
-        || ct == "application/ecmascript"
-        || ct == "image/svg+xml"
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
+}
+
+fn decode_devtools_document_response_body(
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Option<String> {
+    if body.is_empty() {
+        return Some(String::new());
+    }
+
+    let Some(content_type) = content_type else {
+        return obscura_net::decode_with_label("windows-1252", body, true, false);
+    };
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    let decoder = document_devtools_text_decoder(&mime)?;
+    let explicit_charset = content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        (!value.is_empty()).then_some(value)
+    });
+    let encoding = if let Some(charset) = explicit_charset {
+        charset
+    } else if matches!(decoder, DocumentDevtoolsTextDecoder::Html) {
+        obscura_net::encoding::detect_encoding(body, Some(content_type)).0.name()
+    } else if matches!(decoder, DocumentDevtoolsTextDecoder::Utf8) {
+        "utf-8"
+    } else {
+        "windows-1252"
+    };
+    obscura_net::decode_with_label(encoding, body, true, false)
+}
+
+#[derive(Clone, Copy)]
+enum DocumentDevtoolsTextDecoder {
+    Html,
+    Utf8,
+    Plain,
+}
+
+fn document_devtools_text_decoder(mime: &str) -> Option<DocumentDevtoolsTextDecoder> {
+    if mime == "text/html" {
+        return Some(DocumentDevtoolsTextDecoder::Html);
+    }
+    if matches!(
+        mime,
+        "application/javascript"
+            | "application/ecmascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    ) || matches!(mime, "application/json" | "text/json")
+        || mime.ends_with("+json")
+        || matches!(mime, "application/xml" | "text/xml")
+        || (mime.starts_with("application/") && mime.ends_with("+xml"))
+    {
+        return Some(DocumentDevtoolsTextDecoder::Utf8);
+    }
+    (mime.starts_with("text/") && mime != "text/xsl")
+        .then_some(DocumentDevtoolsTextDecoder::Plain)
 }
 
 fn response_body_entry_limit() -> usize {
