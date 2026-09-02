@@ -56,6 +56,16 @@ async fn serve_delayed_load_fixture(
             let _ = socket.write_all(response.as_bytes()).await;
             continue;
         }
+        if request.starts_with("GET /busy-finished ") {
+            let _ = slow_requested.send(());
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            continue;
+        }
         if request.starts_with("GET /after-load ") {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let body = "ok";
@@ -72,6 +82,8 @@ async fn serve_delayed_load_fixture(
         }
         let dcl_script = if request.starts_with("GET /timeout ") {
             "const script = document.createElement('script'); script.src = '/never'; document.head.appendChild(script);"
+        } else if request.starts_with("GET /busy-after-dcl ") {
+            "setTimeout(() => { globalThis.__busyStarted = true; const until = performance.now() + 300; while (performance.now() < until) {} globalThis.__busyDone = true; fetch('/busy-finished'); }, 0);"
         } else if request.starts_with("GET /post-load-timeout ") {
             ""
         } else {
@@ -455,6 +467,113 @@ async fn domcontentloaded_returns_before_a_load_delaying_script() {
                 "params": {"targetId": second_target},
             }))
             .await;
+            let _ = ws.close(None).await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_page_command_wins_the_first_post_dcl_pump() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_url = format!("http://{}/busy-after-dcl", fixture.local_addr().unwrap());
+    let (slow_requested_tx, mut busy_finished_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(
+        fixture,
+        slow_requested_tx,
+        release_rx,
+    ));
+
+    let port = pick_port().await;
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            tokio::task::spawn_local(async move {
+                let _ = obscura_cdp::server::start(port).await;
+            });
+            let mut ws = connect_cdp(port).await;
+            let (target_id, session_id) = create_target(&mut ws, 1, None).await;
+            enable_page_lifecycle(&mut ws, &session_id, 2).await;
+            send(&mut ws, json!({
+                "id": 3,
+                "method": "Page.startScreencast",
+                "sessionId": session_id,
+                "params": {},
+            })).await;
+            loop {
+                let message = next_json(&mut ws).await;
+                if message["id"] == 3 {
+                    break;
+                }
+            }
+
+            send(&mut ws, json!({
+                "id": 4,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {"url": fixture_url},
+            })).await;
+            loop {
+                let message = next_json(&mut ws).await;
+                if message["id"] == 4 {
+                    break;
+                }
+            }
+
+            // Playwright's waitUntil=commit returns before DOMContentLoaded.
+            // Queue the follow-up while outer response/event finalization still
+            // owns routing; it must precede the first post-DCL background poll.
+            send(&mut ws, json!({
+                "id": 5,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "expression": "[globalThis.__busyStarted === true, globalThis.__busyDone === true]",
+                    "returnByValue": true,
+                },
+            })).await;
+            let immediate = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let message = next_json(&mut ws).await;
+                    if message["id"] == 5 {
+                        break message;
+                    }
+                }
+            })
+            .await
+            .expect("the same-page command did not complete");
+            assert_eq!(
+                immediate["result"]["result"]["value"],
+                json!([false, false]),
+            );
+
+            // The grace is one-shot. Prove autonomous progress out of band,
+            // before another CDP command can wake the processor.
+            tokio::time::timeout(Duration::from_secs(2), busy_finished_rx.recv())
+                .await
+                .expect("the background task did not progress under silence")
+                .expect("the fixture observation channel closed");
+            send(&mut ws, json!({
+                "id": 6,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "expression": "globalThis.__busyDone === true",
+                    "returnByValue": true,
+                },
+            })).await;
+            let completed = loop {
+                let message = next_json(&mut ws).await;
+                if message["id"] == 6 {
+                    break message;
+                }
+            };
+            assert_eq!(completed["result"]["result"]["value"], json!(true));
+            send(&mut ws, json!({
+                "id": 7,
+                "method": "Target.closeTarget",
+                "params": {"targetId": target_id},
+            })).await;
             let _ = ws.close(None).await;
         })
         .await;

@@ -18,6 +18,8 @@ use crate::dispatch::{self, CdpContext};
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
 const POST_LOAD_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const FIRST_LIFECYCLE_PUMP_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(5);
 
 // The WS-stream forwarding channel must also be bounded: if the LocalSet
 // (CDP processor + nav tasks) stalls, the accept thread keeps pushing
@@ -929,8 +931,14 @@ async fn cdp_processor(
     let mut runtime_pump_error_streak = 0_u8;
     let mut lifecycle_continuation_page: Option<String> = None;
     let mut lifecycle_release_deadline: Option<tokio::time::Instant> = None;
+    let mut lifecycle_first_pump_not_before: Option<tokio::time::Instant> = None;
 
     loop {
+        if lifecycle_first_pump_not_before
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            lifecycle_first_pump_not_before = None;
+        }
         // A DOMContentLoaded listener may have queued a replacement before the
         // old runtime parked. Navigation wins over pumping that old document.
         if let (Some(reply_tx), Some((session_id, url, method, body))) = (
@@ -968,6 +976,9 @@ async fn cdp_processor(
                     )
                 })
                 .map(|page| page.id.clone());
+            lifecycle_first_pump_not_before = lifecycle_continuation_page
+                .as_ref()
+                .map(|_| tokio::time::Instant::now() + FIRST_LIFECYCLE_PUMP_GRACE);
             lifecycle_release_deadline = None;
             runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
             continue;
@@ -994,7 +1005,11 @@ async fn cdp_processor(
         let msg = if msg.is_some() {
             msg
         } else {
-            let screencast_active = has_active_screencast(&ctx);
+            // Give the first foreground command after navigation the same
+            // opportunity ahead of compositor work as it has ahead of V8
+            // page tasks. Rasterization can also run synchronously.
+            let screencast_active = lifecycle_first_pump_not_before.is_none()
+                && has_active_screencast(&ctx);
             let live_page_route = if let Some(page_id) = lifecycle_continuation_page.as_ref() {
                 (|| {
                     let page = ctx.get_page(page_id)?;
@@ -1012,6 +1027,7 @@ async fn cdp_processor(
                 })
             };
             let has_intercept_rx = intercept_rx.is_some();
+            let first_pump_not_before = lifecycle_first_pump_not_before;
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(m) => Some(m),
@@ -1028,13 +1044,20 @@ async fn cdp_processor(
                 }, if lifecycle_release_deadline.is_some() => {
                     lifecycle_continuation_page = None;
                     lifecycle_release_deadline = None;
+                    lifecycle_first_pump_not_before = None;
                     runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
                     None
                 },
-                pump_result = pump_live_page_event_loop(
-                    &mut ctx,
-                    lifecycle_continuation_page.as_deref(),
-                ), if runtime_pump_armed => {
+                pump_result = async {
+                    if let Some(deadline) = first_pump_not_before {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                    pump_live_page_event_loop(
+                        &mut ctx,
+                        lifecycle_continuation_page.as_deref(),
+                    ).await
+                }, if runtime_pump_armed => {
+                    lifecycle_first_pump_not_before = None;
                     let mut completed_lifecycle = false;
                     let reached_idle = match pump_result {
                         Ok(reached_idle) => {
@@ -1082,6 +1105,7 @@ async fn cdp_processor(
                                     {
                                         lifecycle_continuation_page = None;
                                         lifecycle_release_deadline = None;
+                                        lifecycle_first_pump_not_before = None;
                                     }
                                 }
                                 runtime_pump_armed = false;
@@ -1129,6 +1153,7 @@ async fn cdp_processor(
                     if completed_lifecycle {
                         lifecycle_continuation_page = None;
                         lifecycle_release_deadline = None;
+                        lifecycle_first_pump_not_before = None;
                     }
                     // A continuously ready page task must still yield to the
                     // WebSocket reader/writer and to shutdown/deadline arms.
@@ -1223,6 +1248,9 @@ async fn cdp_processor(
                             )
                         })
                     });
+                    lifecycle_first_pump_not_before = lifecycle_continuation_page
+                        .as_ref()
+                        .map(|_| tokio::time::Instant::now() + FIRST_LIFECYCLE_PUMP_GRACE);
                     lifecycle_release_deadline = None;
                 } else {
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
@@ -1245,6 +1273,7 @@ async fn cdp_processor(
         {
             lifecycle_continuation_page = None;
             lifecycle_release_deadline = None;
+            lifecycle_first_pump_not_before = None;
         }
 
         // Dispatch may have created a page or scheduled new asynchronous work.
