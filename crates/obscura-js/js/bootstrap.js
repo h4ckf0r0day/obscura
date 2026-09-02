@@ -305,8 +305,18 @@ function __finishDocumentLoad() {
     __documentLoadForceTimer = undefined;
   }
   globalThis.__documentReadyState__ = 'complete';
-  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }
-  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}
+  // The event-path parity implementation provides the authoritative browser
+  // load dispatcher. Keep the legacy fallback so this change remains
+  // independently mergeable when that implementation is not present yet.
+  if (typeof globalThis.__obscura_dispatchWindowLoad === 'function') {
+    try { globalThis.__obscura_dispatchWindowLoad(); } catch(e) {}
+  } else {
+    const loadEvent = new Event('load', {bubbles:false,cancelable:false});
+    if (typeof window.onload === 'function') {
+      try { window.onload.call(window, loadEvent); } catch(e) {}
+    }
+    try { window.dispatchEvent(loadEvent); } catch(e) {}
+  }
   // This is the authoritative completion bit read by the Rust owner. Set it
   // only after every synchronous load listener returned; the event-loop turn
   // performs their Promise checkpoint before yielding back to that owner.
