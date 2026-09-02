@@ -83,7 +83,7 @@ async fn serve_delayed_load_fixture(
             "/after-load"
         };
         let onload_extra = if request.starts_with("GET /post-load-timeout ") {
-            "setInterval(() => {}, 0);"
+            "setInterval(() => {}, 10);"
         } else {
             ""
         };
