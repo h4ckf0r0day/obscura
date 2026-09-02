@@ -1,4 +1,6 @@
 use std::time::Duration;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -6,6 +8,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+struct SharedTraceWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedTraceWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
 
 async fn pick_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -80,6 +93,53 @@ async fn serve_delayed_load_fixture(
             tokio::time::sleep(Duration::from_secs(10)).await;
             continue;
         }
+        if request.starts_with("GET /stalled-primary ") {
+            let _ = slow_requested.send(());
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+        if request.starts_with("GET /stalled-fetch ") {
+            let _ = slow_requested.send(());
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+        if request.starts_with("GET /async-module ") {
+            let body = "<!doctype html><script type=module>await fetch('/stalled-fetch')</script>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            continue;
+        }
+        if request.starts_with("GET /infinite.js ") {
+            let _ = slow_requested.send(());
+            let body = "console.warn('OBSCURA_SYNC_SCRIPT_ENTERED'); while (true) {}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            continue;
+        }
+        if request.starts_with("GET /infinite-parser ") {
+            let body = "<!doctype html><script src=\"/infinite.js\"></script>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            continue;
+        }
+        if request.starts_with("GET /intercept-a") {
+            let body = "<!doctype html><script>fetch('/a-data')</script><p>A</p>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            continue;
+        }
         let dcl_script = if request.starts_with("GET /timeout ") {
             "const script = document.createElement('script'); script.src = '/never'; document.head.appendChild(script);"
         } else if request.starts_with("GET /busy-after-dcl ") {
@@ -112,6 +172,522 @@ async fn serve_delayed_load_fixture(
         );
         let _ = socket.write_all(response.as_bytes()).await;
     }
+}
+
+async fn assert_navigation_teardown(
+    path: &str,
+    dispose_context: bool,
+    wait_for_request: bool,
+) {
+    let sync_trace = (path == "/infinite-parser").then(|| {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let writer = trace.clone();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || SharedTraceWriter(writer.clone()))
+            .try_init()
+            .expect("test process must own the tracing subscriber");
+        trace
+    });
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_url = format!("http://{}{path}", fixture.local_addr().unwrap());
+    let (never_requested_tx, mut never_requested_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(
+        fixture,
+        never_requested_tx,
+        release_rx,
+    ));
+
+    let port = pick_port().await;
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            tokio::task::spawn_local(async move {
+                let _ = obscura_cdp::server::start(port).await;
+            });
+            let mut ws = connect_cdp(port).await;
+            let context_id = if dispose_context {
+                send(&mut ws, json!({
+                    "id": 1,
+                    "method": "Target.createBrowserContext",
+                    "params": {},
+                })).await;
+                Some(loop {
+                    let message = next_json(&mut ws).await;
+                    if message["id"] == 1 {
+                        break message["result"]["browserContextId"]
+                            .as_str()
+                            .unwrap()
+                            .to_string();
+                    }
+                })
+            } else {
+                None
+            };
+            let (target_id, session_id) =
+                create_target(&mut ws, 2, context_id.as_deref()).await;
+            send(&mut ws, json!({
+                "id": 3,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {"url": fixture_url},
+            })).await;
+            if wait_for_request {
+                tokio::time::timeout(Duration::from_secs(7), never_requested_rx.recv())
+                    .await
+                    .expect("navigation fixture request was not observed")
+                    .expect("fixture observation channel closed");
+                if path == "/infinite-parser" {
+                    let trace = sync_trace.as_ref().unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if String::from_utf8_lossy(&trace.lock().unwrap())
+                                .contains("OBSCURA_SYNC_SCRIPT_ENTERED")
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }).await.expect("synchronous script never entered V8");
+                }
+            }
+
+            let teardown = if let Some(context_id) = context_id.as_ref() {
+                json!({
+                    "id": 4,
+                    "method": "Target.disposeBrowserContext",
+                    "params": {"browserContextId": context_id},
+                })
+            } else {
+                json!({
+                    "id": 4,
+                    "method": "Target.closeTarget",
+                    "params": {"targetId": target_id},
+                })
+            };
+            send(&mut ws, teardown).await;
+            let close_started = tokio::time::Instant::now();
+            let mut close_acknowledged = false;
+            let mut destroyed = false;
+            while !close_acknowledged || !destroyed {
+                let message = next_json(&mut ws).await;
+                close_acknowledged |= message["id"] == 4
+                    && (dispose_context || message["result"]["success"] == json!(true));
+                destroyed |= message["method"] == "Target.targetDestroyed"
+                    && message["params"]["targetId"].as_str() == Some(target_id.as_str());
+            }
+            assert!(
+                close_started.elapsed() < Duration::from_secs(2),
+                "closing a task-owned target did not cancel navigation promptly",
+            );
+
+            let (_replacement_id, replacement_session) =
+                create_target(&mut ws, 5, None).await;
+            send(&mut ws, json!({
+                "id": 6,
+                "method": "Runtime.evaluate",
+                "sessionId": replacement_session,
+                "params": {"expression": "40 + 2", "returnByValue": true},
+            })).await;
+            let replacement_result = loop {
+                let message = next_json(&mut ws).await;
+                if message["id"] == 6 {
+                    break message;
+                }
+            };
+            assert_eq!(
+                replacement_result["result"]["result"]["value"],
+                json!(42.0),
+            );
+            let _ = ws.close(None).await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_target_cancels_stalled_primary_navigation() {
+    assert_navigation_teardown("/stalled-primary", false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disposing_context_cancels_stalled_primary_navigation() {
+    assert_navigation_teardown("/stalled-primary", true, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_target_terminates_synchronous_navigation_script() {
+    assert_navigation_teardown("/infinite-parser", false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disposing_context_terminates_synchronous_navigation_script() {
+    assert_navigation_teardown("/infinite-parser", true, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_target_cancels_navigation_parked_in_async_module_fetch() {
+    assert_navigation_teardown("/async-module", false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_queued_immediately_after_navigate_cancels_registered_owner() {
+    assert_navigation_teardown("/stalled-primary", false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_connection_cancels_stalled_primary_navigation() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_url = format!("http://{}/stalled-primary", fixture.local_addr().unwrap());
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(fixture, request_tx, release_rx));
+
+    let port = pick_port().await;
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            tokio::task::spawn_local(async move {
+                let _ = obscura_cdp::server::start_with_serve_options_and_limit(
+                    port,
+                    "127.0.0.1",
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    true,
+                    1,
+                )
+                .await;
+            });
+            let mut ws = connect_cdp(port).await;
+            let (_target_id, session_id) = create_target(&mut ws, 1, None).await;
+            send(&mut ws, json!({
+                "id": 2,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {"url": fixture_url},
+            })).await;
+            tokio::time::timeout(Duration::from_secs(7), request_rx.recv())
+                .await
+                .expect("stalled primary request was not observed")
+                .expect("fixture observation channel closed");
+            let close_started = tokio::time::Instant::now();
+            let _ = ws.close(None).await;
+            drop(ws);
+
+            let mut replacement = connect_cdp(port).await;
+            assert!(
+                close_started.elapsed() < Duration::from_secs(2),
+                "connection slot was not released after cancelling navigation",
+            );
+            let (_replacement_id, replacement_session) =
+                create_target(&mut replacement, 3, None).await;
+            send(&mut replacement, json!({
+                "id": 4,
+                "method": "Runtime.evaluate",
+                "sessionId": replacement_session,
+                "params": {"expression": "6 * 7", "returnByValue": true},
+            })).await;
+            let result = loop {
+                let message = next_json(&mut replacement).await;
+                if message["id"] == 4 {
+                    break message;
+                }
+            };
+            assert_eq!(result["result"]["result"]["value"], json!(42.0));
+            let _ = replacement.close(None).await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_target_fails_paused_navigation_interception() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture_url = format!("http://{}/intercepted", fixture.local_addr().unwrap());
+    let (request_tx, _request_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(fixture, request_tx, release_rx));
+
+    let port = pick_port().await;
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            tokio::task::spawn_local(async move {
+                let _ = obscura_cdp::server::start(port).await;
+            });
+            let mut ws = connect_cdp(port).await;
+            let (target_id, session_id) = create_target(&mut ws, 1, None).await;
+            send(&mut ws, json!({
+                "id": 2,
+                "method": "Fetch.enable",
+                "sessionId": session_id,
+                "params": {"patterns": [{"urlPattern": "*"}]},
+            })).await;
+            loop {
+                if next_json(&mut ws).await["id"] == 2 {
+                    break;
+                }
+            }
+            send(&mut ws, json!({
+                "id": 3,
+                "method": "Page.navigate",
+                "sessionId": session_id,
+                "params": {"url": fixture_url},
+            })).await;
+            loop {
+                let message = next_json(&mut ws).await;
+                if message["method"] == "Fetch.requestPaused" {
+                    break;
+                }
+            }
+            send(&mut ws, json!({
+                "id": 4,
+                "method": "Target.closeTarget",
+                "params": {"targetId": target_id},
+            })).await;
+            let close_started = tokio::time::Instant::now();
+            let mut acknowledged = false;
+            let mut destroyed = false;
+            while !acknowledged || !destroyed {
+                let message = next_json(&mut ws).await;
+                acknowledged |= message["id"] == 4
+                    && message["result"]["success"] == json!(true);
+                destroyed |= message["method"] == "Target.targetDestroyed"
+                    && message["params"]["targetId"].as_str() == Some(target_id.as_str());
+            }
+            assert!(
+                close_started.elapsed() < Duration::from_secs(2),
+                "paused interception prevented target teardown",
+            );
+            let (_replacement_id, replacement_session) =
+                create_target(&mut ws, 5, None).await;
+            send(&mut ws, json!({
+                "id": 6,
+                "method": "Runtime.evaluate",
+                "sessionId": replacement_session,
+                "params": {"expression": "42", "returnByValue": true},
+            })).await;
+            loop {
+                let message = next_json(&mut ws).await;
+                if message["id"] == 6 {
+                    assert_eq!(message["result"]["result"]["value"], json!(42.0));
+                    break;
+                }
+            }
+            let _ = ws.close(None).await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_stalled_target_preserves_sibling_paused_interception() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", fixture.local_addr().unwrap());
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(fixture, request_tx, release_rx));
+
+    let port = pick_port().await;
+    tokio::task::LocalSet::new().run_until(async move {
+        tokio::task::spawn_local(async move {
+            let _ = obscura_cdp::server::start(port).await;
+        });
+        let mut ws = connect_cdp(port).await;
+        let (target_a, session_a) = create_target(&mut ws, 1, None).await;
+        send(&mut ws, json!({
+            "id": 2, "method": "Fetch.enable", "sessionId": session_a,
+            "params": {"patterns": [{"urlPattern": "*"}]},
+        })).await;
+        while next_json(&mut ws).await["id"] != 2 {}
+        send(&mut ws, json!({
+            "id": 3, "method": "Page.navigate", "sessionId": session_a,
+            "params": {"url": format!("{origin}/intercept-a")},
+        })).await;
+        let mut request_a = None;
+        let mut navigation_a_done = false;
+        while request_a.is_none() || !navigation_a_done {
+            let message = next_json(&mut ws).await;
+            navigation_a_done |= message["id"] == 3;
+            if message["method"] == "Fetch.requestPaused"
+                && message["sessionId"].as_str() == Some(session_a.as_str())
+                && message["params"]["request"]["url"].as_str().is_some_and(|url| url.ends_with("/a-data"))
+            {
+                request_a = message["params"]["requestId"].as_str().map(str::to_string);
+            }
+        }
+
+        let (target_b, session_b) = create_target(&mut ws, 4, None).await;
+        send(&mut ws, json!({
+            "id": 40, "method": "Fetch.enable", "sessionId": session_b,
+            "params": {"patterns": [{"urlPattern": "*"}]},
+        })).await;
+        while next_json(&mut ws).await["id"] != 40 {}
+        send(&mut ws, json!({
+            "id": 41, "method": "Page.navigate", "sessionId": session_b,
+            "params": {"url": format!("{origin}/intercept-a?b")},
+        })).await;
+        let mut request_b = None;
+        let mut navigation_b_done = false;
+        while request_b.is_none() || !navigation_b_done {
+            let message = next_json(&mut ws).await;
+            navigation_b_done |= message["id"] == 41;
+            if message["method"] == "Fetch.requestPaused"
+                && message["sessionId"].as_str() == Some(session_b.as_str())
+                && message["params"]["request"]["url"].as_str().is_some_and(|url| url.ends_with("/a-data"))
+            {
+                request_b = message["params"]["requestId"].as_str().map(str::to_string);
+            }
+        }
+        assert_ne!(request_a.as_deref(), request_b.as_deref());
+        send(&mut ws, json!({
+            "id": 5, "method": "Page.navigate", "sessionId": session_b,
+            "params": {"url": format!("{origin}/stalled-primary")},
+        })).await;
+        tokio::time::timeout(Duration::from_secs(7), request_rx.recv())
+            .await.expect("stalled B request not observed").expect("fixture channel closed");
+        send(&mut ws, json!({
+            "id": 6, "method": "Target.closeTarget", "params": {"targetId": target_b},
+        })).await;
+        while next_json(&mut ws).await["id"] != 6 {}
+
+        send(&mut ws, json!({
+            "id": 7, "method": "Fetch.continueRequest", "sessionId": session_a,
+            "params": {"requestId": request_a.unwrap()},
+        })).await;
+        let continued = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = next_json(&mut ws).await;
+                if message["id"] == 7 { break message; }
+            }
+        }).await.expect("closing B discarded A's paused interception");
+        assert!(continued.get("error").is_none(), "{continued}");
+        send(&mut ws, json!({
+            "id": 8, "method": "Target.closeTarget", "params": {"targetId": target_a},
+        })).await;
+        let _ = ws.close(None).await;
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacing_runtime_aborts_old_pause_and_uses_new_request_identity() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", fixture.local_addr().unwrap());
+    let (request_tx, _request_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(fixture, request_tx, release_rx));
+    let port = pick_port().await;
+    tokio::task::LocalSet::new().run_until(async move {
+        tokio::task::spawn_local(async move { let _ = obscura_cdp::server::start(port).await; });
+        let mut ws = connect_cdp(port).await;
+        let (target_id, session_id) = create_target(&mut ws, 1, None).await;
+        send(&mut ws, json!({
+            "id": 2, "method": "Fetch.enable", "sessionId": session_id,
+            "params": {"patterns": [{"urlPattern": "*"}]},
+        })).await;
+        while next_json(&mut ws).await["id"] != 2 {}
+
+        async fn navigate_to_pause<S>(
+            ws: &mut tokio_tungstenite::WebSocketStream<S>,
+            id: i64,
+            session_id: &str,
+            url: &str,
+        ) -> String
+        where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+            send(ws, json!({
+                "id": id, "method": "Page.navigate", "sessionId": session_id,
+                "params": {"url": url},
+            })).await;
+            let mut request_id = None;
+            let mut navigation_done = false;
+            while request_id.is_none() || !navigation_done {
+                let message = next_json(ws).await;
+                navigation_done |= message["id"] == id;
+                if message["method"] == "Fetch.requestPaused"
+                    && message["sessionId"].as_str() == Some(session_id)
+                    && message["params"]["request"]["url"].as_str().is_some_and(|url| url.ends_with("/a-data"))
+                {
+                    request_id = message["params"]["requestId"].as_str().map(str::to_string);
+                }
+            }
+            request_id.unwrap()
+        }
+
+        let first = navigate_to_pause(&mut ws, 3, &session_id, &format!("{origin}/intercept-a")).await;
+        let second = navigate_to_pause(&mut ws, 4, &session_id, &format!("{origin}/intercept-a?replacement")).await;
+        assert_ne!(first, second, "runtime replacement reused interception identity");
+        send(&mut ws, json!({
+            "id": 5, "method": "Fetch.continueRequest", "sessionId": session_id,
+            "params": {"requestId": first},
+        })).await;
+        let old = loop { let message = next_json(&mut ws).await; if message["id"] == 5 { break message; } };
+        assert!(old.get("error").is_some(), "old document pause remained resolvable: first={first} second={second} response={old}");
+        send(&mut ws, json!({
+            "id": 6, "method": "Fetch.continueRequest", "sessionId": session_id,
+            "params": {"requestId": second},
+        })).await;
+        let new = loop { let message = next_json(&mut ws).await; if message["id"] == 6 { break message; } };
+        assert!(new.get("error").is_none(), "replacement pause was lost: {new}");
+        send(&mut ws, json!({"id": 7, "method": "Target.closeTarget", "params": {"targetId": target_id}})).await;
+        let _ = ws.close(None).await;
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closing_loaded_target_aborts_autonomous_paused_request() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let fixture = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/intercept-a", fixture.local_addr().unwrap());
+    let (request_tx, _request_rx) = mpsc::unbounded_channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(serve_delayed_load_fixture(fixture, request_tx, release_rx));
+    let port = pick_port().await;
+    tokio::task::LocalSet::new().run_until(async move {
+        tokio::task::spawn_local(async move { let _ = obscura_cdp::server::start(port).await; });
+        let mut ws = connect_cdp(port).await;
+        let (target_id, session_id) = create_target(&mut ws, 1, None).await;
+        send(&mut ws, json!({
+            "id": 2, "method": "Fetch.enable", "sessionId": session_id,
+            "params": {"patterns": [{"urlPattern": "*"}]},
+        })).await;
+        while next_json(&mut ws).await["id"] != 2 {}
+        send(&mut ws, json!({
+            "id": 3, "method": "Page.navigate", "sessionId": session_id,
+            "params": {"url": url},
+        })).await;
+        let mut request_id = None;
+        let mut navigation_done = false;
+        while request_id.is_none() || !navigation_done {
+            let message = next_json(&mut ws).await;
+            navigation_done |= message["id"] == 3;
+            if message["method"] == "Fetch.requestPaused" {
+                if message["params"]["request"]["url"].as_str().is_some_and(|url| url.ends_with("/a-data")) {
+                    request_id = message["params"]["requestId"].as_str().map(str::to_string);
+                }
+            }
+        }
+        send(&mut ws, json!({
+            "id": 4, "method": "Target.closeTarget", "params": {"targetId": target_id},
+        })).await;
+        while next_json(&mut ws).await["id"] != 4 {}
+        send(&mut ws, json!({
+            "id": 5, "method": "Fetch.continueRequest", "sessionId": session_id,
+            "params": {"requestId": request_id.unwrap()},
+        })).await;
+        let stale = loop { let message = next_json(&mut ws).await; if message["id"] == 5 { break message; } };
+        assert!(stale.get("error").is_some(), "closed target retained paused request: {stale}");
+        let (_other, other_session) = create_target(&mut ws, 6, None).await;
+        send(&mut ws, json!({
+            "id": 7, "method": "Runtime.evaluate", "sessionId": other_session,
+            "params": {"expression": "42", "returnByValue": true},
+        })).await;
+        let result = loop { let message = next_json(&mut ws).await; if message["id"] == 7 { break message; } };
+        assert_eq!(result["result"]["result"]["value"], json!(42.0));
+        let _ = ws.close(None).await;
+    }).await;
 }
 
 async fn next_json<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Value

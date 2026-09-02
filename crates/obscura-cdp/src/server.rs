@@ -53,11 +53,195 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
+const MAX_TEARDOWN_REQUEST_BYTES: usize = 256 * 1024;
 use crate::types::CdpRequest;
 
 struct CdpMessage {
     text: String,
     reply_tx: mpsc::UnboundedSender<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionEnd {
+    Open = 0,
+    Closed = 1,
+    Shutdown = 2,
+}
+
+struct ActiveNavigation {
+    generation: u64,
+    page_id: String,
+    context_id: String,
+    disposable_context: bool,
+    control: obscura_browser::navigation::NavigationControl,
+    teardown_requests: std::collections::VecDeque<String>,
+    teardown_request_bytes: usize,
+}
+
+struct ConnectionControl {
+    end: std::sync::atomic::AtomicU8,
+    end_notify: Notify,
+    next_generation: std::sync::atomic::AtomicU64,
+    active: std::sync::Mutex<Option<ActiveNavigation>>,
+}
+
+impl ConnectionControl {
+    fn new() -> Self {
+        Self {
+            end: std::sync::atomic::AtomicU8::new(ConnectionEnd::Open as u8),
+            end_notify: Notify::new(),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn end(&self) -> ConnectionEnd {
+        match self.end.load(Ordering::Acquire) {
+            1 => ConnectionEnd::Closed,
+            2 => ConnectionEnd::Shutdown,
+            _ => ConnectionEnd::Open,
+        }
+    }
+
+    fn signal_end(&self, end: ConnectionEnd) {
+        let _ = self.end.compare_exchange(
+            ConnectionEnd::Open as u8,
+            end as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let control = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|active| active.control.clone());
+        if let Some(control) = control {
+            control.cancel();
+        }
+        self.end_notify.notify_waiters();
+    }
+
+    async fn ended(&self) -> ConnectionEnd {
+        loop {
+            let notified = self.end_notify.notified();
+            let end = self.end();
+            if end != ConnectionEnd::Open {
+                return end;
+            }
+            notified.await;
+        }
+    }
+
+    fn activate(
+        &self,
+        page_id: String,
+        context_id: String,
+        disposable_context: bool,
+        control: obscura_browser::navigation::NavigationControl,
+    ) -> u64 {
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *active = Some(ActiveNavigation {
+            generation,
+            page_id,
+            context_id,
+            disposable_context,
+            control: control.clone(),
+            teardown_requests: std::collections::VecDeque::new(),
+            teardown_request_bytes: 0,
+        });
+        drop(active);
+        if self.end() != ConnectionEnd::Open {
+            control.cancel();
+        }
+        generation
+    }
+
+    fn signal_teardown_request(&self, text: &str) -> bool {
+        if !text.contains("\"Target.closeTarget\"")
+            && !text.contains("\"Target.disposeBrowserContext\"")
+        {
+            return false;
+        }
+        if self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
+        {
+            return false;
+        }
+        let Ok(request) = serde_json::from_str::<CdpRequest>(text) else {
+            return false;
+        };
+        let mut active_guard = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(active) = active_guard.as_mut() else {
+            return false;
+        };
+        let matches = match request.method.as_str() {
+            "Target.closeTarget" => request
+                .params
+                .get("targetId")
+                .and_then(|value| value.as_str())
+                == Some(active.page_id.as_str()),
+            "Target.disposeBrowserContext" => request
+                .params
+                .get("browserContextId")
+                .and_then(|value| value.as_str())
+                == Some(active.context_id.as_str())
+                && active.disposable_context,
+            _ => false,
+        };
+        if !matches {
+            return false;
+        }
+        // Once full, let the normal processor/deferred-queue path own the
+        // command. That path is also bounded and returns an explicit busy
+        // error instead of silently swallowing an unbounded duplicate flood.
+        if active.teardown_requests.len() >= MAX_DEFERRED_MESSAGES
+            || active.teardown_request_bytes.saturating_add(text.len()) > MAX_TEARDOWN_REQUEST_BYTES
+        {
+            return false;
+        }
+        active.teardown_request_bytes += text.len();
+        active.teardown_requests.push_back(text.to_string());
+        let control = active.control.clone();
+        drop(active_guard);
+        control.cancel();
+        true
+    }
+
+    fn finish_navigation(&self, generation: u64) -> Vec<String> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|navigation| navigation.generation == generation)
+        {
+            return active
+                .take()
+                .map(|navigation| navigation.teardown_requests.into_iter().collect())
+                .unwrap_or_default();
+        }
+        Vec::new()
+    }
+}
+
+struct PausedInterception {
+    page_id: String,
+    resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
 }
 
 enum ServerMessage {
@@ -442,17 +626,27 @@ pub async fn start_with_serve_options_and_limit(
     let live_connections = Arc::new(AtomicUsize::new(0));
     info!("Connection limit: {}", max_connections);
 
-    // Accept loop: hand each WebSocket connection to its own OS thread so its
-    // pages' isolates live on a dedicated thread.
+    // Accept loop: each connection's page processor gets a dedicated OS thread,
+    // while WebSocket I/O stays on this runtime. Keeping ingress off the V8
+    // thread lets target close, connection loss, and shutdown signal a
+    // synchronous navigation without entering its isolate concurrently.
+    let mut server_shutdown = Box::pin(shutdown_notify.notified());
+    server_shutdown.as_mut().enable();
     loop {
         let stream = tokio::select! {
             stream = ws_rx.recv() => stream,
-            _ = shutdown_notify.notified() => None,
+            _ = &mut server_shutdown => None,
         };
         let stream = match stream {
             Some(s) => s,
             None => break,
         };
+        // `select!` is fair when a handoff and shutdown become ready together.
+        // The atomic is the sticky authority: never start a connection after
+        // the one-shot notification has already fired.
+        if shutdown_flag.load(Ordering::Acquire) {
+            break;
+        }
         // Nagle off + nonblocking on the std socket before it moves to the
         // connection thread. CDP exchanges many small (~100-byte) frames during
         // newPage()/navigate; with Nagle on, each small write waits on an ACK or
@@ -481,14 +675,43 @@ pub async fn start_with_serve_options_and_limit(
             refuse_connection(stream);
             continue;
         }
-        run_connection(
-            stream,
+        let tokio_stream = match TcpStream::from_std(stream) {
+            Ok(stream) => stream,
+            Err(error) => {
+                error!("TcpStream::from_std failed: {}", error);
+                live_connections.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+        };
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let connection_control = Arc::new(ConnectionControl::new());
+        if !run_connection(
+            msg_rx,
             shared_ctx.clone(),
             persistence_ctx.clone(),
             persistence_lock.clone(),
             shutdown_notify.clone(),
             live_connections.clone(),
-        );
+            connection_control.clone(),
+        ) {
+            continue;
+        }
+        let ws_shutdown = shutdown_notify.clone();
+        let ws_shutdown_flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_connection_ws(
+                tokio_stream,
+                msg_tx,
+                connection_control.clone(),
+                ws_shutdown,
+                ws_shutdown_flag,
+            )
+            .await
+            {
+                error!("WebSocket connection error: {}", error);
+            }
+            connection_control.signal_end(ConnectionEnd::Closed);
+        });
     }
 
     // Server is shutting down. Connection threads are detached, so saving the
@@ -563,20 +786,19 @@ fn cap_malloc_arenas() {
     }
 }
 
-/// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
-/// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
-/// `CdpContext` and pages) and its frame reader. Confining a connection's pages
-/// to one thread is what removes the #430 abort; the interception handshake and
-/// the nav `spawn_local` all stay on this one thread, so no cross-thread V8
-/// plumbing is needed.
+/// Run one connection's page processor on its own OS thread. WebSocket I/O
+/// remains on the server runtime and communicates only through channels and
+/// [`ConnectionControl`]; all Page/V8 ownership, interception work, and local
+/// navigation futures stay confined to this thread (#430).
 fn run_connection(
-    std_stream: std::net::TcpStream,
+    msg_rx: mpsc::UnboundedReceiver<ServerMessage>,
     context_template: Arc<obscura_browser::BrowserContext>,
     persistence_context: Arc<obscura_browser::BrowserContext>,
     persistence_lock: Arc<std::sync::Mutex<()>>,
     shutdown_notify: Arc<Notify>,
     live_connections: Arc<AtomicUsize>,
-) {
+    connection_control: Arc<ConnectionControl>,
+) -> bool {
     // Releases the slot reserved by the accept loop when the thread unwinds,
     // however it exits — clean close, error return, or panic. A plain
     // decrement at the end of the closure would leak slots on the early
@@ -610,26 +832,13 @@ fn run_connection(
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let tokio_stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("TcpStream::from_std failed: {}", e);
-                        return;
-                    }
-                };
-                let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
-                let processor = tokio::task::spawn_local(cdp_processor(
+                cdp_processor(
                     msg_rx,
                     default_context,
                     shutdown_notify,
-                ));
-                if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
-                    error!("WebSocket connection error: {}", e);
-                }
-                // Connection closed (or shutting down): stop this connection's
-                // processor so the thread can exit.
-                processor.abort();
-                let _ = processor.await;
+                    connection_control,
+                )
+                .await;
             });
 
             // Apply only this connection's cookie changes to the persistence
@@ -651,7 +860,9 @@ fn run_connection(
     if let Err(e) = spawned {
         error!("connection thread spawn failed: {}", e);
         live_connections.fetch_sub(1, Ordering::AcqRel);
+        return false;
     }
+    true
 }
 
 fn cookie_key(cookie: &obscura_net::CookieInfo) -> (String, String, String) {
@@ -892,12 +1103,24 @@ async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
+    connection_control: Arc<ConnectionControl>,
 ) {
+    // Keep shutdown cancellation live even while the main processor future is
+    // inside `process_with_interception`. This waiter performs no page/V8 work;
+    // it only flips the sticky connection control and terminates the currently
+    // registered isolate through NavigationControl.
+    let shutdown_signal = shutdown_notify.clone();
+    let shutdown_control = connection_control.clone();
+    let shutdown_watcher = tokio::task::spawn_local(async move {
+        shutdown_signal.notified().await;
+        shutdown_control.signal_end(ConnectionEnd::Shutdown);
+    });
     let mut ctx = CdpContext::new_with_shared_context(default_context);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut pending_interceptions = std::collections::VecDeque::new();
+    let mut intercepted_paused: HashMap<String, PausedInterception> = HashMap::new();
 
     // Issue #19 follow-up: messages deferred from inside
     // `process_with_interception` because routing them through
@@ -915,6 +1138,7 @@ async fn cdp_processor(
     // registers and stays registered across iterations, so a later
     // `notify_waiters()` wakes this processor even while it is mid-dispatch.
     let mut shutdown = Box::pin(shutdown_notify.notified());
+    shutdown.as_mut().enable();
     // Chromium's PageHandler receives compositor video frames continuously.
     // Obscura has no separate compositor thread yet, so active screencasts get
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
@@ -945,6 +1169,15 @@ async fn cdp_processor(
             connection_reply_tx.as_ref(),
             take_live_pending_navigation(&ctx),
         ) {
+            if let Some(page_id) = ctx.sessions.get(&session_id).cloned() {
+                let replaced_page = std::collections::HashSet::from([page_id]);
+                fail_paused_interceptions(&replaced_page, &mut intercepted_paused);
+                fail_queued_interceptions(
+                    &replaced_page,
+                    &mut pending_interceptions,
+                    &mut intercept_rx,
+                );
+            }
             let navigation = json!({
                 "id": 0,
                 "method": "Page.navigate",
@@ -958,10 +1191,12 @@ async fn cdp_processor(
                 reply_tx,
                 &mut rx,
                 &mut intercept_rx,
+                &mut pending_interceptions,
                 &mut intercepted_paused,
                 &mut deferred,
-                post_load_deferred.len(),
+                &mut post_load_deferred,
                 false,
+                &connection_control,
             )
             .await;
             lifecycle_continuation_page = ctx
@@ -1010,31 +1245,19 @@ async fn cdp_processor(
             // page tasks. Rasterization can also run synchronously.
             let screencast_active = lifecycle_first_pump_not_before.is_none()
                 && has_active_screencast(&ctx);
-            let live_page_route = if let Some(page_id) = lifecycle_continuation_page.as_ref() {
-                (|| {
-                    let page = ctx.get_page(page_id)?;
-                    ctx.sessions
-                        .iter()
-                        .find(|(_, owner)| *owner == page_id)
-                        .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
-                })()
-            } else {
-                ctx.pages.iter().find_map(|page| {
-                        ctx.sessions
-                            .iter()
-                            .find(|(_, owner)| *owner == &page.id)
-                            .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
-                })
-            };
             let has_intercept_rx = intercept_rx.is_some();
             let first_pump_not_before = lifecycle_first_pump_not_before;
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(m) => Some(m),
-                    None => break,
+                    None => {
+                        connection_control.signal_end(ConnectionEnd::Closed);
+                        break;
+                    }
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
+                    connection_control.signal_end(ConnectionEnd::Shutdown);
                     break;
                 },
                 _ = async {
@@ -1160,20 +1383,16 @@ async fn cdp_processor(
                     tokio::task::yield_now().await;
                     None
                 },
-                Some(intercepted) = async {
-                    if let Some(ref mut receiver) = intercept_rx {
-                        receiver.recv().await
-                    } else {
-                        std::future::pending().await
-                    }
-                }, if has_intercept_rx => {
-                    if let (Some((session_id, frame_id)), Some(reply_tx)) =
-                        (live_page_route.as_ref(), connection_reply_tx.as_ref())
+                Some(intercepted) = receive_interception(&mut pending_interceptions, &mut intercept_rx), if has_intercept_rx => {
+                    let route = interception_route(&ctx, &intercepted.owner_page_id);
+                    if let (Some((page_id, session_id, frame_id)), Some(reply_tx)) =
+                        (route, connection_reply_tx.as_ref())
                     {
                         emit_intercepted_request(
                             intercepted,
-                            frame_id,
-                            Some(session_id.clone()),
+                            &page_id,
+                            &frame_id,
+                            Some(session_id),
                             reply_tx,
                             &mut intercepted_paused,
                         );
@@ -1234,10 +1453,21 @@ async fn cdp_processor(
                     let navigation_page_id = serde_json::from_str::<CdpRequest>(&cdp_msg.text)
                         .ok()
                         .and_then(|request| request_page_id(&request, &ctx));
+                    if let Some(page_id) = navigation_page_id.as_ref() {
+                        let replaced_page = std::collections::HashSet::from([page_id.clone()]);
+                        fail_paused_interceptions(&replaced_page, &mut intercepted_paused);
+                        fail_queued_interceptions(
+                            &replaced_page,
+                            &mut pending_interceptions,
+                            &mut intercept_rx,
+                        );
+                    }
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused,
-                        &mut deferred, post_load_deferred.len(), true,
+                        &mut intercept_rx, &mut pending_interceptions,
+                        &mut intercepted_paused,
+                        &mut deferred, &mut post_load_deferred, true,
+                        &connection_control,
                     ).await;
                     lifecycle_continuation_page = navigation_page_id.filter(|page_id| {
                         ctx.get_page(page_id).is_some_and(|page| {
@@ -1253,6 +1483,28 @@ async fn cdp_processor(
                         .map(|_| tokio::time::Instant::now() + FIRST_LIFECYCLE_PUMP_GRACE);
                     lifecycle_release_deadline = None;
                 } else {
+                    if let Some((destroyed_pages, disposed_context)) =
+                        teardown_owners_for_request(&cdp_msg.text, &ctx)
+                    {
+                        fail_paused_interceptions(&destroyed_pages, &mut intercepted_paused);
+                        fail_queued_interceptions(
+                            &destroyed_pages,
+                            &mut pending_interceptions,
+                            &mut intercept_rx,
+                        );
+                        discard_destroyed_target_commands(
+                            &mut deferred,
+                            &ctx,
+                            &destroyed_pages,
+                            disposed_context.as_deref(),
+                        );
+                        discard_destroyed_target_commands(
+                            &mut post_load_deferred,
+                            &ctx,
+                            &destroyed_pages,
+                            disposed_context.as_deref(),
+                        );
+                    }
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
                         && handle_fetch_resolution(
                             &cdp_msg.text,
@@ -1290,6 +1542,7 @@ async fn cdp_processor(
 
     // The connection thread merges this context's cookie delta into the
     // persistence template after the processor stops.
+    shutdown_watcher.abort();
     let _ = &ctx;
 }
 
@@ -1327,15 +1580,60 @@ fn command_targets_other_page(
     request_page_id(&request, ctx).is_some_and(|page_id| page_id != lifecycle_page_id)
 }
 
+fn teardown_owners_for_request(
+    text: &str,
+    ctx: &CdpContext,
+) -> Option<(std::collections::HashSet<String>, Option<String>)> {
+    let request = serde_json::from_str::<CdpRequest>(text).ok()?;
+    match request.method.as_str() {
+        "Target.closeTarget" => {
+            let target_id = request.params.get("targetId")?.as_str()?;
+            Some((std::collections::HashSet::from([target_id.to_string()]), None))
+        }
+        "Target.disposeBrowserContext" => {
+            let context_id = request.params.get("browserContextId")?.as_str()?.to_string();
+            let pages = ctx.pages
+                .iter()
+                .filter(|page| page.context.id == context_id)
+                .map(|page| page.id.clone())
+                .collect();
+            Some((pages, Some(context_id)))
+        }
+        _ => None,
+    }
+}
+
+async fn receive_interception(
+    pending: &mut std::collections::VecDeque<obscura_js::ops::InterceptedRequest>,
+    receiver: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
+) -> Option<obscura_js::ops::InterceptedRequest> {
+    if let Some(intercepted) = pending.pop_front() {
+        return Some(intercepted);
+    }
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn interception_route(
+    ctx: &CdpContext,
+    page_id: &str,
+) -> Option<(String, String, String)> {
+    let page = ctx.get_page(page_id)?;
+    ctx.sessions
+        .iter()
+        .find(|(_, owner)| owner.as_str() == page_id)
+        .map(|(session_id, _)| (page_id.to_string(), session_id.clone(), page.frame_id.clone()))
+}
+
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
+    page_id: &str,
     frame_id: &str,
     session_id: Option<String>,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<
-        String,
-        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
-    >,
+    intercepted_paused: &mut HashMap<String, PausedInterception>,
 ) {
     tracing::info!(
         "INTERCEPTION: requestPaused for {} {} (sending to client)",
@@ -1385,7 +1683,10 @@ fn emit_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_paused.to_string());
-    intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
+    intercepted_paused.insert(intercepted.request_id, PausedInterception {
+        page_id: page_id.to_string(),
+        resolver: intercepted.resolver,
+    });
 }
 
 async fn pump_live_page_event_loop(
@@ -1559,16 +1860,25 @@ fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, Strin
 
 fn handle_fetch_resolution(
     text: &str,
-    _ctx: &mut CdpContext,
+    ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<String, PausedInterception>,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
+        let session_matches_owner = intercepted_paused.get(request_id).is_some_and(|paused| {
+            req.session_id
+                .as_ref()
+                .and_then(|session_id| ctx.sessions.get(session_id))
+                .is_none_or(|page_id| page_id == &paused.page_id)
+        });
+        if session_matches_owner {
+            let Some(paused) = intercepted_paused.remove(request_id) else {
+                return false;
+            };
             tracing::info!("INTERCEPTION resolved: {}", request_id);
             let resolution = match method {
                 "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
@@ -1599,9 +1909,24 @@ fn handle_fetch_resolution(
                 }
                 _ => return false,
             };
-            let _ = resolver.send(resolution);
+            let _ = paused.resolver.send(resolution);
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = reply_tx.send(json);
+            }
+            return true;
+        }
+        // Internal JS fetch interceptions have owner/generation-qualified IDs.
+        // Once their owner is replaced or destroyed, do not let the legacy
+        // static Fetch handler acknowledge the stale ID as if it still existed.
+        if request_id.contains(":intercept-") {
+            let response = crate::types::CdpResponse::error(
+                req.id,
+                -32000,
+                "Invalid InterceptionId".to_string(),
+                req.session_id,
+            );
+            if let Ok(json) = serde_json::to_string(&response) {
                 let _ = reply_tx.send(json);
             }
             return true;
@@ -1610,16 +1935,142 @@ fn handle_fetch_resolution(
     false
 }
 
+fn fail_paused_interceptions(
+    destroyed_pages: &std::collections::HashSet<String>,
+    intercepted_paused: &mut HashMap<String, PausedInterception>,
+) {
+    let request_ids: Vec<String> = intercepted_paused
+        .iter()
+        .filter(|(_, paused)| destroyed_pages.contains(&paused.page_id))
+        .map(|(request_id, _)| request_id.clone())
+        .collect();
+    for request_id in request_ids {
+        let Some(paused) = intercepted_paused.remove(&request_id) else { continue };
+        let _ = paused.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+            reason: "Aborted".into(),
+        });
+    }
+}
+
+fn fail_queued_interceptions(
+    destroyed_pages: &std::collections::HashSet<String>,
+    pending: &mut std::collections::VecDeque<obscura_js::ops::InterceptedRequest>,
+    intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
+) {
+    if let Some(receiver) = intercept_rx.as_mut() {
+        while let Ok(intercepted) = receiver.try_recv() {
+            pending.push_back(intercepted);
+        }
+    }
+    let mut retained = std::collections::VecDeque::with_capacity(pending.len());
+    while let Some(intercepted) = pending.pop_front() {
+        if destroyed_pages.contains(&intercepted.owner_page_id) {
+            let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+                reason: "Aborted".into(),
+            });
+        } else {
+            retained.push_back(intercepted);
+        }
+    }
+    *pending = retained;
+}
+
+fn discard_destroyed_target_commands(
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
+    ctx: &CdpContext,
+    destroyed_pages: &std::collections::HashSet<String>,
+    disposed_context: Option<&str>,
+) {
+    let mut retained = std::collections::VecDeque::with_capacity(deferred.len());
+    while let Some(message) = deferred.pop_front() {
+        let discard = match &message {
+            ServerMessage::Cdp(message) => serde_json::from_str::<CdpRequest>(&message.text)
+                .ok()
+                .is_some_and(|request| {
+                    request_page_id(&request, ctx)
+                        .is_some_and(|page_id| destroyed_pages.contains(&page_id))
+                        || request.params.get("targetId").and_then(|value| value.as_str())
+                            .is_some_and(|page_id| destroyed_pages.contains(page_id))
+                        || disposed_context.is_some_and(|context_id| {
+                            request.params.get("browserContextId").and_then(|value| value.as_str())
+                                == Some(context_id)
+                        })
+                }),
+            ServerMessage::NewConnection { .. } => false,
+        };
+        if discard {
+            if let ServerMessage::Cdp(message) = message {
+                if let Ok(request) = serde_json::from_str::<CdpRequest>(&message.text) {
+                    let response = crate::types::CdpResponse::error(
+                        request.id,
+                        -32000,
+                        "Target closed".to_string(),
+                        request.session_id,
+                    );
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let _ = message.reply_tx.send(json);
+                    }
+                }
+            }
+        } else {
+            retained.push_back(message);
+        }
+    }
+    *deferred = retained;
+}
+
+fn finish_inflight_teardown(
+    text: &str,
+    ctx: &mut CdpContext,
+    page_id: &str,
+    context_id: &str,
+    reply_tx: &mpsc::UnboundedSender<String>,
+) {
+    let Ok(request) = serde_json::from_str::<CdpRequest>(text) else {
+        return;
+    };
+    let result = match request.method.as_str() {
+        "Target.closeTarget" => Ok(json!({"success": ctx.destroy_target(page_id)})),
+        "Target.disposeBrowserContext" => ctx
+            .destroy_browser_context(context_id, Some(page_id))
+            .map(|_| json!({})),
+        _ => return,
+    };
+    for event in ctx.pending_events.drain(..) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
+    }
+    let response = match result {
+        Ok(result) => crate::types::CdpResponse::success(
+            request.id,
+            result,
+            request.session_id,
+        ),
+        Err(error) => crate::types::CdpResponse::error(
+            request.id,
+            -32000,
+            error,
+            request.session_id,
+        ),
+    };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = reply_tx.send(json);
+    }
+}
+
 async fn process_with_interception(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    pending_interceptions: &mut std::collections::VecDeque<obscura_js::ops::InterceptedRequest>,
+    intercepted_paused: &mut HashMap<String, PausedInterception>,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
-    queued_after_navigation: usize,
+    post_load_deferred: &mut std::collections::VecDeque<ServerMessage>,
     send_command_response: bool,
+    connection_control: &Arc<ConnectionControl>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -1682,12 +2133,20 @@ async fn process_with_interception(
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let navigation_context_id = page.context.id.clone();
+    let navigation_control = obscura_browser::navigation::NavigationControl::new();
+    page.set_navigation_control(navigation_control.clone());
+    let navigation_generation = connection_control.activate(
+        page_id.clone(),
+        navigation_context_id.clone(),
+        navigation_context_id != ctx.default_context.id,
+        navigation_control.clone(),
+    );
 
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
     let url_owned = url.to_string();
     let nav_v8_lock = ctx.v8_lock.clone();
 
-    tokio::task::spawn_local(async move {
+    let mut navigation_task = tokio::task::spawn_local(async move {
         // Issue #19: serialize this connection's V8 work across its pages. This
         // nav task runs while the connection's processor keeps pumping other CDP
         // messages via `dispatch` (which takes the same per-connection lock), so
@@ -1698,21 +2157,30 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
-        let result = page
-            .navigate_with_wait_post(
+        let result = {
+            let navigation = page.navigate_with_wait_post(
                 &url_owned,
                 obscura_browser::lifecycle::WaitUntil::DomContentLoaded,
                 &nav_method,
                 &nav_body,
-            )
-            .await
-        .map_err(|e| e.to_string());
+            );
+            tokio::pin!(navigation);
+            tokio::select! {
+                result = &mut navigation => result.map_err(|error| error.to_string()),
+                _ = navigation_control.cancelled() => {
+                    Err("Navigation cancelled".to_string())
+                }
+            }
+        };
+        page.finish_navigation_control();
         drop(_v8_guard);
-        let _ = nav_done_tx.send((page, result)).await;
+        (page, result)
     });
 
     let navigate_result: Result<(), String>;
     let page_back: Option<obscura_browser::Page>;
+    let mut task_failed = false;
+    let mut rx_open = true;
 
     // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
     // While the spawned nav task is executing V8 (potentially parked on
@@ -1738,28 +2206,49 @@ async fn process_with_interception(
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
-            Some((returned_page, result)) = nav_done_rx.recv() => {
-                page_back = Some(returned_page);
-                navigate_result = result;
+            result = &mut navigation_task => {
+                match result {
+                    Ok((returned_page, result)) => {
+                        page_back = Some(returned_page);
+                        navigate_result = result;
+                    }
+                    Err(error) => {
+                        tracing::error!("navigation task failed: {error}");
+                        page_back = None;
+                        navigate_result = Err(format!("navigation task failed: {error}"));
+                        task_failed = true;
+                    }
+                }
                 break;
             }
-            Some(intercepted) = async {
-                if let Some(ref mut irx) = intercept_rx {
-                    irx.recv().await
+            Some(intercepted) = receive_interception(pending_interceptions, intercept_rx), if has_irx => {
+                let owner_page_id = intercepted.owner_page_id.clone();
+                let (owner_session, owner_frame) = if owner_page_id == page_id {
+                    (session_for_events.clone(), frame_id.clone())
+                } else if let Some((_, session, frame)) = interception_route(ctx, &owner_page_id) {
+                    (Some(session), frame)
                 } else {
-                    std::future::pending().await
-                }
-            }, if has_irx => {
+                    let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+                        reason: "Aborted".into(),
+                    });
+                    continue;
+                };
                 emit_intercepted_request(
                     intercepted,
-                    &frame_id,
-                    session_for_events.clone(),
+                    &owner_page_id,
+                    &owner_frame,
+                    owner_session,
                     reply_tx,
                     intercepted_paused,
                 );
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
-            Some(msg) = rx.recv() => {
+            msg = rx.recv(), if rx_open => {
+                let Some(msg) = msg else {
+                    rx_open = false;
+                    connection_control.signal_end(ConnectionEnd::Closed);
+                    continue;
+                };
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
@@ -1770,7 +2259,12 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.continueRequest")
+                        if connection_control.signal_teardown_request(&msg.text) {
+                            // The transport normally recognizes teardown first,
+                            // but a close queued immediately behind navigate may
+                            // arrive before the processor registers ownership.
+                            // Recheck here to close that ordering window.
+                        } else if msg.text.contains("Fetch.continueRequest")
                             || msg.text.contains("Fetch.fulfillRequest")
                             || msg.text.contains("Fetch.failRequest")
                         {
@@ -1789,7 +2283,7 @@ async fn process_with_interception(
                             tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
                             enqueue_deferred_cdp(
                                 deferred,
-                                queued_after_navigation,
+                                post_load_deferred.len(),
                                 msg,
                                 "Server busy: navigation in progress, try again later",
                             );
@@ -1803,7 +2297,74 @@ async fn process_with_interception(
     // Deferred messages are handled by the outer `cdp_processor` loop
     // (it drains `deferred` before pulling the next message off `rx`).
 
-    let mut page = page_back.expect("navigation task should return the page");
+    let teardown_requests = connection_control.finish_navigation(navigation_generation);
+    let connection_end = connection_control.end();
+    if !teardown_requests.is_empty() || connection_end != ConnectionEnd::Open || task_failed {
+        let disposing_context = teardown_requests.iter().any(|text| {
+            serde_json::from_str::<CdpRequest>(text)
+                .ok()
+                .is_some_and(|request| request.method == "Target.disposeBrowserContext")
+        });
+        let mut destroyed_pages = std::collections::HashSet::from([page_id.clone()]);
+        if connection_end != ConnectionEnd::Open {
+            destroyed_pages.extend(ctx.pages.iter().map(|page| page.id.clone()));
+        } else if disposing_context {
+            destroyed_pages.extend(
+                ctx.pages
+                    .iter()
+                    .filter(|page| page.context.id == navigation_context_id)
+                    .map(|page| page.id.clone()),
+            );
+        }
+        fail_paused_interceptions(&destroyed_pages, intercepted_paused);
+        fail_queued_interceptions(
+            &destroyed_pages,
+            pending_interceptions,
+            intercept_rx,
+        );
+        discard_destroyed_target_commands(
+            deferred,
+            ctx,
+            &destroyed_pages,
+            disposing_context.then_some(navigation_context_id.as_str()),
+        );
+        discard_destroyed_target_commands(
+            post_load_deferred,
+            ctx,
+            &destroyed_pages,
+            disposing_context.then_some(navigation_context_id.as_str()),
+        );
+        drop(page_back);
+        if !teardown_requests.is_empty() {
+            for teardown_request in teardown_requests {
+                finish_inflight_teardown(
+                    &teardown_request,
+                    ctx,
+                    &page_id,
+                    &navigation_context_id,
+                    reply_tx,
+                );
+            }
+        } else {
+            ctx.remove_page(&page_id);
+        }
+        if task_failed && connection_end == ConnectionEnd::Open {
+            let response = crate::types::CdpResponse::error(
+                req.id,
+                -32000,
+                navigate_result.err().unwrap_or_else(|| "navigation task failed".into()),
+                req.session_id.clone(),
+            );
+            if send_command_response {
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = reply_tx.send(json);
+                }
+            }
+        }
+        return;
+    }
+
+    let mut page = page_back.expect("completed navigation should return the page");
 
     // Fold in network events for script-initiated requests (fetch/XHR/dynamic
     // resource) so they emit as Network.requestWillBeSent / responseReceived
@@ -1990,6 +2551,9 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    connection_control: Arc<ConnectionControl>,
+    shutdown_notify: Arc<Notify>,
+    shutdown_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -2000,7 +2564,19 @@ async fn handle_connection_ws(
     let mut cfg = WebSocketConfig::default();
     cfg.write_buffer_size = 0;
     cfg.max_write_buffer_size = 64 << 20;
-    let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
+    let mut websocket_shutdown = Box::pin(shutdown_notify.notified());
+    websocket_shutdown.as_mut().enable();
+    if shutdown_flag.load(Ordering::Acquire) {
+        connection_control.signal_end(ConnectionEnd::Shutdown);
+        return Ok(());
+    }
+    let ws_stream = tokio::select! {
+        result = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)) => result?,
+        _ = &mut websocket_shutdown => {
+            connection_control.signal_end(ConnectionEnd::Shutdown);
+            return Ok(());
+        }
+    };
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -2013,18 +2589,36 @@ async fn handle_connection_ws(
         tracing::debug!("Connection init: {}", &init_msg[..init_msg.len().min(100)]);
     }
 
-    let send_task = tokio::task::spawn_local(async move {
+    let send_control = connection_control.clone();
+    let mut send_task = tokio::spawn(async move {
         while let Some(msg) = reply_rx.recv().await {
             if msg.contains("\"__init\"") {
                 continue;
             }
             if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                send_control.signal_end(ConnectionEnd::Closed);
                 break;
             }
         }
     });
 
-    while let Some(msg) = ws_receiver.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = ws_receiver.next() => msg,
+            end = connection_control.ended() => {
+                if end != ConnectionEnd::Open {
+                    break;
+                }
+                continue;
+            }
+            _ = &mut websocket_shutdown => {
+                connection_control.signal_end(ConnectionEnd::Shutdown);
+                break;
+            }
+        };
+        let Some(msg) = msg else {
+            break;
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -2042,7 +2636,12 @@ async fn handle_connection_ws(
                             let _ = reply_tx.send(json);
                         }
                     }
+                    connection_control.signal_end(ConnectionEnd::Closed);
                     break;
+                }
+
+                if connection_control.signal_teardown_request(&text) {
+                    continue;
                 }
 
                 if let Some(resp) = fast_path_response(&text) {
@@ -2062,7 +2661,15 @@ async fn handle_connection_ws(
         }
     }
 
-    send_task.abort();
+    connection_control.signal_end(ConnectionEnd::Closed);
+    drop(reply_tx);
+    drop(msg_tx);
+    if tokio::time::timeout(tokio::time::Duration::from_secs(1), &mut send_task)
+        .await
+        .is_err()
+    {
+        send_task.abort();
+    }
     Ok(())
 }
 
@@ -2070,15 +2677,232 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         enqueue_deferred_cdp, handle_fetch_resolution, is_navigate_method,
+        fail_paused_interceptions, fail_queued_interceptions,
         merge_cookie_delta, parse_cdp_headers, pop_deferred_for_lifecycle_state,
         reclassify_deferred_for_lifecycle, request_page_id, take_live_pending_navigation,
-        CdpMessage, ServerMessage, MAX_DEFERRED_MESSAGES,
+        CdpMessage, PausedInterception, ServerMessage, MAX_DEFERRED_MESSAGES,
+        cdp_processor, ConnectionControl, ConnectionEnd,
+        finish_inflight_teardown,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
+
+    #[test]
+    fn interception_cleanup_is_scoped_to_destroyed_page_owners() {
+        let (a_paused_tx, mut a_paused_rx) = tokio::sync::oneshot::channel();
+        let (b_paused_tx, mut b_paused_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([
+            ("a-paused".to_string(), PausedInterception {
+                page_id: "page-a".to_string(),
+                resolver: a_paused_tx,
+            }),
+            ("b-paused".to_string(), PausedInterception {
+                page_id: "page-b".to_string(),
+                resolver: b_paused_tx,
+            }),
+        ]);
+        let destroyed = std::collections::HashSet::from(["page-b".to_string()]);
+        fail_paused_interceptions(&destroyed, &mut paused);
+        assert!(paused.contains_key("a-paused"));
+        assert!(matches!(a_paused_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(b_paused_rx.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { .. })));
+
+        let (a_queued_tx, mut a_queued_rx) = tokio::sync::oneshot::channel();
+        let (b_queued_tx, mut b_queued_rx) = tokio::sync::oneshot::channel();
+        let (_intercept_tx, intercept_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut intercept_rx = Some(intercept_rx);
+        let mut queued = VecDeque::from([
+            obscura_js::ops::InterceptedRequest {
+                owner_page_id: "page-a".to_string(),
+                request_id: "a-queued".to_string(),
+                url: "https://example.com/a".to_string(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                resource_type: "Fetch".to_string(),
+                resolver: a_queued_tx,
+            },
+            obscura_js::ops::InterceptedRequest {
+                owner_page_id: "page-b".to_string(),
+                request_id: "b-queued".to_string(),
+                url: "https://example.com/b".to_string(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                resource_type: "Fetch".to_string(),
+                resolver: b_queued_tx,
+            },
+        ]);
+        fail_queued_interceptions(&destroyed, &mut queued, &mut intercept_rx);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued.front().unwrap().owner_page_id, "page-a");
+        assert!(matches!(a_queued_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(b_queued_rx.try_recv(), Ok(obscura_js::ops::InterceptResolution::Fail { .. })));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_cancels_task_owned_stalled_navigation() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fixture_url = format!("http://{}/stalled", fixture.local_addr().unwrap());
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = fixture.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let _ = requested_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        tokio::task::LocalSet::new().run_until(async move {
+            let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+            let control = std::sync::Arc::new(ConnectionControl::new());
+            let processor = tokio::task::spawn_local(cdp_processor(
+                msg_rx,
+                std::sync::Arc::new(obscura_browser::BrowserContext::new("default".to_string())),
+                shutdown.clone(),
+                control.clone(),
+            ));
+            msg_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
+            let _ = reply_rx.recv().await.expect("processor init");
+            msg_tx.send(ServerMessage::Cdp(CdpMessage {
+                text: json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}).to_string(),
+                reply_tx: reply_tx.clone(),
+            })).unwrap();
+            let mut target_id = None;
+            let mut session_id = None;
+            while target_id.is_none() || session_id.is_none() {
+                let message: serde_json::Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if message["id"] == 1 {
+                    target_id = message["result"]["targetId"].as_str().map(str::to_string);
+                }
+                if message["method"] == "Target.attachedToTarget" {
+                    session_id = message["params"]["sessionId"].as_str().map(str::to_string);
+                }
+            }
+            msg_tx.send(ServerMessage::Cdp(CdpMessage {
+                text: json!({
+                    "id": 2, "method": "Page.navigate", "sessionId": session_id.unwrap(),
+                    "params": {"url": fixture_url},
+                }).to_string(),
+                reply_tx,
+            })).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), requested_rx)
+                .await.expect("stalled request was not reached").expect("fixture signal dropped");
+            shutdown.notify_waiters();
+            tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                .await.expect("shutdown did not cancel navigation").expect("processor task panicked");
+            assert_eq!(control.end(), ConnectionEnd::Shutdown);
+            assert!(control.active.lock().unwrap().is_none());
+            drop(msg_tx);
+            drop(target_id);
+        }).await;
+    }
+
+    #[test]
+    fn duplicate_inflight_close_requests_each_receive_a_response() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        let context_id = ctx.default_context.id.clone();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        finish_inflight_teardown(
+            &json!({"id": 1, "method": "Target.closeTarget", "params": {"targetId": page_id}}).to_string(),
+            &mut ctx,
+            &page_id,
+            &context_id,
+            &reply_tx,
+        );
+        finish_inflight_teardown(
+            &json!({"id": 2, "method": "Target.closeTarget", "params": {"targetId": page_id}}).to_string(),
+            &mut ctx,
+            &page_id,
+            &context_id,
+            &reply_tx,
+        );
+        let mut responses = HashMap::new();
+        let mut destroyed = 0;
+        while let Ok(text) = reply_rx.try_recv() {
+            let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if let Some(id) = message["id"].as_u64() {
+                responses.insert(id, message);
+            } else if message["method"] == "Target.targetDestroyed" {
+                destroyed += 1;
+            }
+        }
+        assert_eq!(responses[&1]["result"]["success"], json!(true));
+        assert_eq!(responses[&2]["result"]["success"], json!(false));
+        assert_eq!(destroyed, 1);
+    }
+
+    #[test]
+    fn mixed_inflight_teardown_batches_destroy_target_once() {
+        fn run(methods: &[&str]) -> (usize, usize) {
+            let mut ctx = crate::dispatch::CdpContext::new();
+            let context_id = ctx.create_browser_context();
+            let page_id = ctx.create_page_in_context(Some(&context_id)).unwrap();
+            let session_id = format!("{page_id}-session");
+            ctx.sessions.insert(session_id, page_id.clone());
+            // Match process_with_interception: the task owns the Page while
+            // CdpContext retains its session/context identity.
+            ctx.pages.retain(|page| page.id != page_id);
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            for (offset, method) in methods.iter().enumerate() {
+                let params = if *method == "Target.closeTarget" {
+                    json!({"targetId": page_id})
+                } else {
+                    json!({"browserContextId": context_id})
+                };
+                finish_inflight_teardown(
+                    &json!({"id": offset + 1, "method": method, "params": params}).to_string(),
+                    &mut ctx,
+                    &page_id,
+                    &context_id,
+                    &reply_tx,
+                );
+            }
+            let mut destroyed = 0;
+            let mut responses = 0;
+            while let Ok(text) = reply_rx.try_recv() {
+                let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+                destroyed += usize::from(message["method"] == "Target.targetDestroyed");
+                responses += usize::from(message.get("id").is_some());
+            }
+            (destroyed, responses)
+        }
+        for methods in [
+            ["Target.closeTarget", "Target.disposeBrowserContext"],
+            ["Target.disposeBrowserContext", "Target.closeTarget"],
+            ["Target.disposeBrowserContext", "Target.disposeBrowserContext"],
+        ] {
+            let (destroyed, responses) = run(&methods);
+            assert_eq!(destroyed, 1, "{methods:?}");
+            assert_eq!(responses, 2, "{methods:?}");
+        }
+    }
+
+    #[test]
+    fn inflight_teardown_queue_is_bounded() {
+        let control = ConnectionControl::new();
+        let navigation = obscura_browser::navigation::NavigationControl::new();
+        let generation = control.activate(
+            "page-1".to_string(),
+            "default".to_string(),
+            false,
+            navigation,
+        );
+        for id in 0..MAX_DEFERRED_MESSAGES {
+            assert!(control.signal_teardown_request(
+                &json!({"id": id, "method": "Target.closeTarget", "params": {"targetId": "page-1"}}).to_string()
+            ));
+        }
+        assert!(!control.signal_teardown_request(
+            &json!({"id": MAX_DEFERRED_MESSAGES, "method": "Target.closeTarget", "params": {"targetId": "page-1"}}).to_string()
+        ));
+        assert_eq!(control.finish_navigation(generation).len(), MAX_DEFERRED_MESSAGES);
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
@@ -2256,10 +3080,12 @@ mod tests {
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
                 let request_shutdown = shutdown.clone();
                 let default_context = crate::dispatch::CdpContext::new().default_context;
+                let connection_control = std::sync::Arc::new(super::ConnectionControl::new());
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
                     shutdown,
+                    connection_control,
                 ));
 
                 server_tx
@@ -2547,7 +3373,10 @@ mod tests {
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), PausedInterception {
+            page_id: "page-1".to_string(),
+            resolver: resolution_tx,
+        })]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut ctx = crate::dispatch::CdpContext::new();
 

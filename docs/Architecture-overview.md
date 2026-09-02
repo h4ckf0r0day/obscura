@@ -56,9 +56,11 @@ viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
 
-## Single V8 isolate
+## V8 ownership
 
-All pages in a process share one V8 isolate. The isolate is single-threaded by design.
+Each CDP connection owns a dedicated processor thread. Its page runtimes stay
+on that thread and only one page runtime is active at a time. Different
+connections therefore cannot enter each other's V8 isolates.
 
 `obscura_js::v8_lock::global()` is a `tokio::sync::Mutex` that serializes V8 work. A handler that wants to run JS must acquire the lock first:
 
@@ -67,9 +69,17 @@ let _guard = obscura_js::v8_lock::global().lock().await;
 page.evaluate(expr).await
 ```
 
-The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
+The dispatcher routes navigation through `process_with_interception` in
+`server.rs`, which keeps the task's join handle and continues receiving
+WebSocket control messages without entering V8 concurrently. Commands that
+would activate another page are deferred in a bounded queue.
 
-This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
+An internal, feature-gated `NavigationControl` registers the current runtime's
+thread-safe V8 isolate handle. Target close, context disposal, connection loss,
+and shutdown set a sticky cancellation flag and terminate synchronous V8 work
+when necessary. The owner thread then unwinds the navigation future normally,
+clears V8 termination, awaits the task, and drops the page. A canceled page is
+never reinserted.
 
 ## Robustness
 
@@ -108,7 +118,11 @@ OS threads. This is not a complete WorkerGlobalScope implementation.
 Each CDP client connection gets attached to one or more targets.
 Session IDs are `"{targetId}-session"`. The dispatcher routes by `sessionId` in the incoming frame to the right `Page`.
 
-Targets are created by `Target.createTarget`. Closing the WebSocket detaches all sessions but leaves the pages running.
+Targets are created by `Target.createTarget`. Closing the WebSocket is
+connection-local teardown: in-flight navigation is canceled, paused requests
+are failed, and that connection's pages, sessions, loaders, frame state,
+screencasts, streams, pending events, and deferred commands are dropped.
+Other connections are unaffected.
 
 ## Lifecycle
 

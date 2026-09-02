@@ -262,11 +262,21 @@ struct PendingDocumentLoad {
     resources_prepared: bool,
 }
 
+#[cfg(feature = "internal-cdp")]
+struct NavigationOwner {
+    runtime: Option<crate::navigation::RuntimeRegistration>,
+    control: crate::navigation::NavigationControl,
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
+    /// Declared before frame/runtime owners so cancellation unregisters its V8
+    /// handle before either kind of isolate-backed state is dropped.
+    #[cfg(feature = "internal-cdp")]
+    navigation_owner: Option<NavigationOwner>,
     /// Live child frame realms, in creation order. Declared before `js` on
     /// purpose: a realm holds a V8 handle into that isolate, and fields drop in
     /// declaration order, so the frames must go first.
@@ -327,6 +337,8 @@ pub struct Page {
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
+    #[cfg(feature = "internal-cdp")]
+    intercept_runtime_generation: u64,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
@@ -1160,6 +1172,8 @@ impl Page {
             frame_id,
             url: None,
             dom: None,
+            #[cfg(feature = "internal-cdp")]
+            navigation_owner: None,
             frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
@@ -1187,6 +1201,8 @@ impl Page {
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
+            #[cfg(feature = "internal-cdp")]
+            intercept_runtime_generation: 0,
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
@@ -1211,6 +1227,51 @@ impl Page {
     pub fn navigation_timeout(&self) -> std::time::Duration {
         self.navigation_timeout
             .unwrap_or_else(default_navigation_timeout)
+    }
+
+    /// Install the internal control used by the current protocol navigation.
+    /// Existing public navigation entry points remain unchanged.
+    #[cfg(feature = "internal-cdp")]
+    #[doc(hidden)]
+    pub fn set_navigation_control(&mut self, control: crate::navigation::NavigationControl) {
+        let previous = self.navigation_owner.take();
+        drop(previous);
+        let runtime = self
+            .js
+            .as_ref()
+            .map(|js| control.register_runtime(js.isolate_handle()));
+        self.navigation_owner = Some(NavigationOwner { runtime, control });
+    }
+
+    /// Retire the current navigation control after the owner-thread navigation
+    /// future has unwound. This is the only point that clears V8 termination;
+    /// doing so from the cancelling thread could let synchronous JS resume.
+    #[cfg(feature = "internal-cdp")]
+    #[doc(hidden)]
+    pub fn finish_navigation_control(&mut self) {
+        if self.navigation_owner.is_none() {
+            return;
+        }
+        if let Some(js) = self.js.as_mut() {
+            js.cancel_termination();
+        }
+        let owner = self.navigation_owner.take();
+        drop(owner);
+    }
+
+    #[cfg(feature = "internal-cdp")]
+    fn unregister_navigation_runtime(&mut self) {
+        if let Some(owner) = self.navigation_owner.as_mut() {
+            let registration = owner.runtime.take();
+            drop(registration);
+        }
+    }
+
+    #[cfg(feature = "internal-cdp")]
+    fn register_navigation_runtime(&mut self, runtime: &ObscuraJsRuntime) {
+        if let Some(owner) = self.navigation_owner.as_mut() {
+            owner.runtime = Some(owner.control.register_runtime(runtime.isolate_handle()));
+        }
     }
 
     /// Takes precedence over `OBSCURA_NAV_CHAIN_LIMIT`. A limit of 0 is
@@ -1813,6 +1874,8 @@ impl Page {
         // run code in the next document's context.
         self.pending_frame_work.clear();
         if self.js.is_some() {
+            #[cfg(feature = "internal-cdp")]
+            self.unregister_navigation_runtime();
             // Every frame realm holds a V8 handle into this isolate, so the
             // frames of the outgoing document must go before the runtime does.
             self.frames.clear();
@@ -1884,6 +1947,14 @@ impl Page {
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
         }
+        #[cfg(feature = "internal-cdp")]
+        {
+            self.intercept_runtime_generation = self.intercept_runtime_generation.saturating_add(1);
+            rt.set_intercept_owner(
+                self.id.clone(),
+                format!("{}@{}", self.id, self.intercept_runtime_generation),
+            );
+        }
         // Re-apply intercept_enabled: enable_interception()/enable_intercept()
         // called before the first navigation sets this on the Page while the
         // runtime does not exist yet, so the new runtime would otherwise start
@@ -1895,6 +1966,10 @@ impl Page {
             rt.set_dom(dom);
         }
 
+        // All engine configuration is installed. Register before bootstrap or
+        // author code can enter V8, so cancellation always reaches this isolate.
+        #[cfg(feature = "internal-cdp")]
+        self.register_navigation_runtime(&rt);
         rt.run_page_init();
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -3802,6 +3877,8 @@ impl Page {
 
     pub fn navigate_blank(&mut self) {
         self.pending_frame_work.clear();
+        #[cfg(feature = "internal-cdp")]
+        self.unregister_navigation_runtime();
         self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
@@ -4644,6 +4721,8 @@ impl Page {
         // and a realm cannot be suspended and resumed the way the page's DOM
         // can, so they are rebuilt when the page next loads a document.
         self.pending_frame_work.clear();
+        #[cfg(feature = "internal-cdp")]
+        self.unregister_navigation_runtime();
         self.frames.clear();
         self.js = None;
     }
@@ -4812,6 +4891,11 @@ impl Page {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
+            #[cfg(feature = "internal-cdp")]
+            js.set_intercept_owner(
+                self.id.clone(),
+                format!("{}@{}", self.id, self.intercept_runtime_generation),
+            );
         }
     }
 

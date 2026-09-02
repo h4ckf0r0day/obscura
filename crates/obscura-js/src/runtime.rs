@@ -1277,6 +1277,14 @@ impl ObscuraJsRuntime {
         state.intercept_tx = Some(tx);
     }
 
+    #[cfg(feature = "internal-cdp")]
+    #[doc(hidden)]
+    pub fn set_intercept_owner(&self, page_id: String, request_scope: String) {
+        let mut state = self.state.borrow_mut();
+        state.intercept_owner_page_id = page_id;
+        state.intercept_request_scope = request_scope;
+    }
+
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
