@@ -65,6 +65,70 @@ enum ServerMessage {
     },
 }
 
+fn enqueue_deferred_cdp(
+    queue: &mut std::collections::VecDeque<ServerMessage>,
+    queued_elsewhere: usize,
+    message: CdpMessage,
+    full_reason: &str,
+) {
+    if queue.len().saturating_add(queued_elsewhere) < MAX_DEFERRED_MESSAGES {
+        queue.push_back(ServerMessage::Cdp(message));
+        return;
+    }
+    if let Ok(request) = serde_json::from_str::<CdpRequest>(&message.text) {
+        let response = crate::types::CdpResponse::error(
+            request.id,
+            -32000,
+            full_reason.to_string(),
+            request.session_id,
+        );
+        if let Ok(json) = serde_json::to_string(&response) {
+            let _ = message.reply_tx.send(json);
+        }
+    }
+}
+
+fn reclassify_deferred_for_lifecycle(
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
+    post_load_deferred: &mut std::collections::VecDeque<ServerMessage>,
+    ctx: &CdpContext,
+    lifecycle_page_id: &str,
+) -> bool {
+    let should_reclassify = deferred.front().is_some_and(|message| match message {
+        ServerMessage::Cdp(cdp) => {
+            command_targets_other_page(&cdp.text, ctx, lifecycle_page_id)
+        }
+        ServerMessage::NewConnection { .. } => false,
+    });
+    if !should_reclassify {
+        return false;
+    }
+    let Some(ServerMessage::Cdp(message)) = deferred.pop_front() else {
+        unreachable!("only CDP messages are reclassified")
+    };
+    enqueue_deferred_cdp(
+        post_load_deferred,
+        deferred.len(),
+        message,
+        "Server busy: another page is completing navigation",
+    );
+    true
+}
+
+fn pop_deferred_for_lifecycle_state(
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
+    post_load_deferred: &mut std::collections::VecDeque<ServerMessage>,
+    lifecycle_active: bool,
+) -> Option<ServerMessage> {
+    if lifecycle_active {
+        deferred.pop_front()
+    } else {
+        post_load_deferred
+            .pop_front()
+            .or_else(|| deferred.pop_front())
+    }
+}
+
 pub async fn start(port: u16) -> anyhow::Result<()> {
     start_with_options(port, None, false).await
 }
@@ -888,6 +952,7 @@ async fn cdp_processor(
                 &mut intercept_rx,
                 &mut intercepted_paused,
                 &mut deferred,
+                post_load_deferred.len(),
                 false,
             )
             .await;
@@ -911,13 +976,21 @@ async fn cdp_processor(
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
         // Isolate is the one dispatch is about to touch.
-        let msg = if let Some(d) = deferred.pop_front() {
-            Some(d)
-        } else if lifecycle_continuation_page.is_none() {
-            post_load_deferred.pop_front()
-        } else {
-            None
-        };
+        if lifecycle_continuation_page.as_ref().is_some_and(|page_id| {
+            reclassify_deferred_for_lifecycle(
+                &mut deferred,
+                &mut post_load_deferred,
+                &ctx,
+                page_id,
+            )
+        }) {
+            continue;
+        }
+        let msg = pop_deferred_for_lifecycle_state(
+            &mut deferred,
+            &mut post_load_deferred,
+            lifecycle_continuation_page.is_some(),
+        );
         let msg = if msg.is_some() {
             msg
         } else {
@@ -963,31 +1036,11 @@ async fn cdp_processor(
                     lifecycle_continuation_page.as_deref(),
                 ), if runtime_pump_armed => {
                     let mut completed_lifecycle = false;
-                    match pump_result {
+                    let reached_idle = match pump_result {
                         Ok(reached_idle) => {
                             runtime_pump_error_streak = 0;
                             runtime_pump_armed = !reached_idle;
-                            let terminal_lifecycle = lifecycle_continuation_page
-                                .as_ref()
-                                .and_then(|page_id| ctx.get_page(page_id))
-                                .is_some_and(|page| {
-                                    matches!(
-                                        page.lifecycle,
-                                        obscura_browser::lifecycle::LifecycleState::Loaded
-                                            | obscura_browser::lifecycle::LifecycleState::NetworkIdle
-                                            | obscura_browser::lifecycle::LifecycleState::Failed
-                                    )
-                                });
-                            if terminal_lifecycle {
-                                if reached_idle {
-                                    completed_lifecycle = true;
-                                } else {
-                                    lifecycle_release_deadline.get_or_insert_with(|| {
-                                        tokio::time::Instant::now()
-                                            + POST_LOAD_DRAIN_TIMEOUT
-                                    });
-                                }
-                            }
+                            Some(reached_idle)
                         }
                         Err(error) => {
                             runtime_pump_error_streak = runtime_pump_error_streak.saturating_add(1);
@@ -1036,6 +1089,27 @@ async fn cdp_processor(
                                 runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
                                 tokio::task::yield_now().await;
                             }
+                            None
+                        }
+                    };
+                    let terminal_lifecycle = lifecycle_continuation_page
+                        .as_ref()
+                        .and_then(|page_id| ctx.get_page(page_id))
+                        .is_some_and(|page| {
+                            matches!(
+                                page.lifecycle,
+                                obscura_browser::lifecycle::LifecycleState::Loaded
+                                    | obscura_browser::lifecycle::LifecycleState::NetworkIdle
+                                    | obscura_browser::lifecycle::LifecycleState::Failed
+                            )
+                        });
+                    if terminal_lifecycle {
+                        if reached_idle == Some(true) {
+                            completed_lifecycle = true;
+                        } else {
+                            lifecycle_release_deadline.get_or_insert_with(|| {
+                                tokio::time::Instant::now() + POST_LOAD_DRAIN_TIMEOUT
+                            });
                         }
                     }
                     sync_live_page_network_events(
@@ -1113,21 +1187,12 @@ async fn cdp_processor(
                 if lifecycle_continuation_page.as_ref().is_some_and(|page_id| {
                     command_targets_other_page(&cdp_msg.text, &ctx, page_id)
                 }) {
-                    if post_load_deferred.len() >= MAX_DEFERRED_MESSAGES {
-                        if let Ok(req) = serde_json::from_str::<CdpRequest>(&cdp_msg.text) {
-                            let response = crate::types::CdpResponse::error(
-                                req.id,
-                                -32000,
-                                "Server busy: another page is completing navigation".to_string(),
-                                req.session_id,
-                            );
-                            if let Ok(json) = serde_json::to_string(&response) {
-                                let _ = cdp_msg.reply_tx.send(json);
-                            }
-                        }
-                    } else {
-                        post_load_deferred.push_back(ServerMessage::Cdp(cdp_msg));
-                    }
+                    enqueue_deferred_cdp(
+                        &mut post_load_deferred,
+                        deferred.len(),
+                        cdp_msg,
+                        "Server busy: another page is completing navigation",
+                    );
                     continue;
                 }
                 // Route every Page.navigate through the spawn-and-defer path,
@@ -1147,7 +1212,7 @@ async fn cdp_processor(
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                         &mut intercept_rx, &mut intercepted_paused,
-                        &mut deferred, true,
+                        &mut deferred, post_load_deferred.len(), true,
                     ).await;
                     lifecycle_continuation_page = navigation_page_id.filter(|page_id| {
                         ctx.get_page(page_id).is_some_and(|page| {
@@ -1524,6 +1589,7 @@ async fn process_with_interception(
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
+    queued_after_navigation: usize,
     send_command_response: bool,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
@@ -1691,23 +1757,13 @@ async fn process_with_interception(
                             // pushed to the outer `cdp_processor` queue so
                             // it's processed sequentially with no nav task
                             // in flight.
-                            if deferred.len() >= MAX_DEFERRED_MESSAGES {
-                                tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
-                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
-                                    let resp = crate::types::CdpResponse::error(
-                                        req.id,
-                                        -32000,
-                                        "Server busy: navigation in progress, try again later".to_string(),
-                                        req.session_id,
-                                    );
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = msg.reply_tx.send(json);
-                                    }
-                                }
-                            } else {
-                                tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
-                                deferred.push_back(ServerMessage::Cdp(msg));
-                            }
+                            tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
+                            enqueue_deferred_cdp(
+                                deferred,
+                                queued_after_navigation,
+                                msg,
+                                "Server busy: navigation in progress, try again later",
+                            );
                         }
                     }
                 }
@@ -1984,14 +2040,16 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
-        request_page_id, take_live_pending_navigation,
+        enqueue_deferred_cdp, handle_fetch_resolution, is_navigate_method,
+        merge_cookie_delta, parse_cdp_headers, pop_deferred_for_lifecycle_state,
+        reclassify_deferred_for_lifecycle, request_page_id, take_live_pending_navigation,
+        CdpMessage, ServerMessage, MAX_DEFERRED_MESSAGES,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
@@ -2004,6 +2062,160 @@ mod tests {
             same_site: "Lax".to_string(),
             expires: None,
         }
+    }
+
+    #[test]
+    fn lifecycle_reclassification_preserves_fifo_and_the_shared_queue_bound() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let lifecycle_page = ctx.create_page();
+        let foreign_page = ctx.create_page();
+        ctx.sessions
+            .insert("lifecycle-session".to_string(), lifecycle_page.clone());
+        ctx.sessions
+            .insert("foreign-session".to_string(), foreign_page);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let message = |id: i64| CdpMessage {
+            text: json!({
+                "id": id,
+                "method": "Runtime.evaluate",
+                "sessionId": "foreign-session",
+                "params": {"expression": id.to_string()},
+            })
+            .to_string(),
+            reply_tx: reply_tx.clone(),
+        };
+        let mut deferred = VecDeque::from([
+            ServerMessage::Cdp(message(1)),
+            ServerMessage::Cdp(message(2)),
+        ]);
+        let mut post_load = VecDeque::new();
+
+        assert!(reclassify_deferred_for_lifecycle(
+            &mut deferred,
+            &mut post_load,
+            &ctx,
+            &lifecycle_page,
+        ));
+        assert!(reclassify_deferred_for_lifecycle(
+            &mut deferred,
+            &mut post_load,
+            &ctx,
+            &lifecycle_page,
+        ));
+        enqueue_deferred_cdp(&mut post_load, deferred.len(), message(3), "full");
+        let ids = post_load
+            .iter()
+            .map(|entry| match entry {
+                ServerMessage::Cdp(message) => {
+                    serde_json::from_str::<serde_json::Value>(&message.text).unwrap()["id"]
+                        .as_i64()
+                        .unwrap()
+                }
+                ServerMessage::NewConnection { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        deferred = VecDeque::from([
+            ServerMessage::Cdp(message(11)),
+            ServerMessage::Cdp(CdpMessage {
+                text: json!({
+                    "id": 12,
+                    "method": "Target.closeTarget",
+                    "params": {"targetId": lifecycle_page},
+                })
+                .to_string(),
+                reply_tx: reply_tx.clone(),
+            }),
+            ServerMessage::Cdp(message(13)),
+        ]);
+        post_load.clear();
+        assert!(reclassify_deferred_for_lifecycle(
+            &mut deferred,
+            &mut post_load,
+            &ctx,
+            &lifecycle_page,
+        ));
+        let owner_close = pop_deferred_for_lifecycle_state(
+            &mut deferred,
+            &mut post_load,
+            true,
+        )
+        .expect("the owner close remains actionable during lifecycle");
+        let ServerMessage::Cdp(owner_close) = owner_close else {
+            unreachable!()
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&owner_close.text).unwrap()["id"],
+            12,
+        );
+        let first_foreign = pop_deferred_for_lifecycle_state(
+            &mut deferred,
+            &mut post_load,
+            false,
+        )
+        .unwrap();
+        let second_foreign = pop_deferred_for_lifecycle_state(
+            &mut deferred,
+            &mut post_load,
+            false,
+        )
+        .unwrap();
+        let ids = [first_foreign, second_foreign].map(|entry| match entry {
+            ServerMessage::Cdp(message) => {
+                serde_json::from_str::<serde_json::Value>(&message.text).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            }
+            ServerMessage::NewConnection { .. } => unreachable!(),
+        });
+        assert_eq!(ids, [11, 13]);
+
+        post_load.clear();
+        for id in 0..MAX_DEFERRED_MESSAGES {
+            post_load.push_back(ServerMessage::Cdp(message(id as i64)));
+        }
+        deferred.push_back(ServerMessage::Cdp(message(999)));
+        assert!(reclassify_deferred_for_lifecycle(
+            &mut deferred,
+            &mut post_load,
+            &ctx,
+            &lifecycle_page,
+        ));
+        assert_eq!(post_load.len(), MAX_DEFERRED_MESSAGES);
+        let rejected: serde_json::Value = serde_json::from_str(
+            &reply_rx.try_recv().expect("the overflow command must receive an error"),
+        )
+        .unwrap();
+        assert_eq!(rejected["id"], 999);
+        assert_eq!(rejected["error"]["code"], -32000);
+
+        deferred.clear();
+        post_load.clear();
+        for id in 0..(MAX_DEFERRED_MESSAGES - 1) {
+            post_load.push_back(ServerMessage::Cdp(message(id as i64)));
+        }
+        enqueue_deferred_cdp(
+            &mut deferred,
+            post_load.len(),
+            message(1_000),
+            "full",
+        );
+        enqueue_deferred_cdp(
+            &mut deferred,
+            post_load.len(),
+            message(1_001),
+            "full",
+        );
+        assert_eq!(deferred.len() + post_load.len(), MAX_DEFERRED_MESSAGES);
+        let rejected: serde_json::Value = serde_json::from_str(
+            &reply_rx.try_recv().expect(
+                "a navigation-time enqueue must include the existing post-load queue",
+            ),
+        )
+        .unwrap();
+        assert_eq!(rejected["id"], 1_001);
+        assert_eq!(rejected["error"]["code"], -32000);
     }
 
     #[tokio::test(flavor = "current_thread")]

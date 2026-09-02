@@ -82,11 +82,6 @@ async fn serve_delayed_load_fixture(
         } else {
             "/after-load"
         };
-        let onload_extra = if request.starts_with("GET /post-load-timeout ") {
-            "setInterval(() => {}, 10);"
-        } else {
-            ""
-        };
         let body = r#"<!doctype html><script>
             document.addEventListener('DOMContentLoaded', () => {
                 globalThis.__dclSeen = (globalThis.__dclSeen || 0) + 1;
@@ -95,12 +90,10 @@ async fn serve_delayed_load_fixture(
             window.onload = () => {
                 globalThis.__loadSeen = (globalThis.__loadSeen || 0) + 1;
                 fetch('__POST_LOAD_FETCH__');
-                __ONLOAD_EXTRA__
             };
         </script><p>ready</p>"#
             .replace("__DCL_SCRIPT__", dcl_script)
-            .replace("__POST_LOAD_FETCH__", post_load_fetch)
-            .replace("__ONLOAD_EXTRA__", onload_extra);
+            .replace("__POST_LOAD_FETCH__", post_load_fetch);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len(),
