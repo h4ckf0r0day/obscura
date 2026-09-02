@@ -608,6 +608,10 @@ impl ObscuraJsRuntime {
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
         frame.page_in_flight = parent.page_in_flight.clone();
+        #[cfg(feature = "render")]
+        {
+            frame.image_transport_slots = parent.image_transport_slots.clone();
+        }
         #[cfg(feature = "stealth")]
         {
             frame.stealth_client = parent.stealth_client.clone();
@@ -816,6 +820,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().callbacks = Some(callbacks);
     }
 
+    #[cfg(all(test, feature = "render"))]
+    pub(crate) fn image_transport_slots(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Semaphore> {
+        self.state.borrow().image_transport_slots.clone()
+    }
+
     /// Install the stealth (wreq) HTTP client so scripted fetch()/XHR is routed
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
@@ -825,6 +836,14 @@ impl ObscuraJsRuntime {
 
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
+        #[cfg(feature = "render")]
+        {
+            // Retire transport owned by the old document before replacing any
+            // of its DOM or render state.
+            gs.async_image_jobs = crate::ops::AsyncImageJobOwner::default();
+            gs.async_image_loads =
+                std::sync::Arc::new(crate::ops::AsyncImageLoadState::default());
+        }
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
@@ -12247,6 +12266,108 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[test]
+    fn page_transport_without_tokio_abandons_image_job_registration() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(
+            r#"<img id="image" src="https://example.com/image.png">"#,
+        ));
+        rt.set_url("https://example.com/page.html");
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                false,
+            ),
+        ));
+        rt.run_page_init();
+        let result = rt.execute_runtime_script(
+            "<no-tokio-image>",
+            "Deno.core.ops.op_load_image_metadata(document.getElementById('image')._nid);"
+                .to_string(),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("image loading requires an async runtime")
+        );
+        let state = rt.state.borrow();
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(
+            state.page_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+    }
+
+    #[cfg(all(feature = "render", feature = "stealth"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_transport_uses_stealth_client_without_fallback_client() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = two_by_three_png();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&png).unwrap();
+        });
+        let image_url = format!("http://{address}/image.png");
+        let stealth_client = std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+        ));
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<body></body>"));
+        rt.set_url(&format!("http://{address}/page.html"));
+        rt.set_stealth_client(stealth_client);
+        rt.run_page_init();
+        rt.execute_runtime_script(
+            "<stealth-image-transport>",
+            format!(
+                r#"
+                globalThis.__stealthImageResult = null;
+                const image = document.createElement("img");
+                image.onload = () => {{
+                    __stealthImageResult = ["load", image.naturalWidth, image.naturalHeight];
+                }};
+                image.onerror = () => {{ __stealthImageResult = ["error"]; }};
+                image.src = {image_url:?};
+                document.body.appendChild(image);
+                void image.complete;
+                "#
+            ),
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__stealthImageResult").unwrap(),
+            serde_json::json!(["load", 2, 3])
+        );
+        let state = rt.state.borrow();
+        assert!(state.http_client.is_none());
+        assert!(state.stealth_client.is_some());
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(
+            state.image_transport_slots.available_permits(),
+            crate::ops::IMAGE_TRANSPORT_SLOTS
+        );
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn parser_images_load_concurrently_without_blocking_the_event_loop() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -12364,6 +12485,521 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+        assert_eq!(rt.state.borrow().async_image_jobs.active_count(), 0);
+        assert_eq!(rt.state.borrow().async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_op_reaction_can_start_shared_image_transport_without_reentrancy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let body = two_by_three_png();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<body></body>"));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.execute_runtime_script(
+            "<async-image-reaction>",
+            format!(
+                r#"
+                globalThis.__reactionLoaded = 0;
+                globalThis.__reactionErrors = 0;
+                globalThis.__reactionBadDimensions = 0;
+                Deno.core.ops.op_sleep(0).then(() => {{
+                    for (let i = 0; i < 64; i++) {{
+                        const image = document.createElement("img");
+                        image.addEventListener("load", () => {{
+                            __reactionLoaded++;
+                            if (image.naturalWidth !== 2 || image.naturalHeight !== 3) {{
+                                __reactionBadDimensions++;
+                            }}
+                        }});
+                        image.addEventListener("error", () => __reactionErrors++);
+                        image.src = "{base}/shared.png";
+                        document.body.appendChild(image);
+                    }}
+                }});
+                "#
+            ),
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[__reactionLoaded, __reactionErrors, __reactionBadDimensions, document.images.length]"
+            )
+            .unwrap(),
+            serde_json::json!([64, 0, 0, 64])
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let state = rt.state.borrow();
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(
+            state.page_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_image_promise_reaction_releases_native_transport_ownership() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = two_by_three_png();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&png).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<body></body>"));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.execute_runtime_script(
+            "<dropped-image-reaction>",
+            format!(
+                r#"
+                globalThis.__originalPromiseThen = Promise.prototype.then;
+                const image = document.createElement("img");
+                image.src = "{base}/image.png";
+                document.body.appendChild(image);
+                void image.complete;
+                Promise.prototype.then = function() {{ return this; }};
+                "#
+            ),
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(500).await.unwrap();
+        rt.execute_runtime_script(
+            "<restore-promise-then>",
+            "Promise.prototype.then = globalThis.__originalPromiseThen;".to_string(),
+        )
+        .unwrap();
+        let state = rt.state.borrow();
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(
+            state.page_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn panicking_image_request_callback_retires_detached_transport_job() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        callbacks.add_request(std::sync::Arc::new(|_| {
+            panic!("intentional image callback panic");
+        }));
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<body></body>"));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.set_callbacks(callbacks);
+        rt.run_page_init();
+        rt.execute_runtime_script(
+            "<panicking-image-callback>",
+            format!(
+                r#"
+                globalThis.__callbackImageEvents = [];
+                const image = document.createElement("img");
+                image.addEventListener("load", () => __callbackImageEvents.push("load"));
+                image.addEventListener("error", () => __callbackImageEvents.push("error"));
+                image.src = "{base}/image.png";
+                document.body.appendChild(image);
+                void image.complete;
+                "#
+            ),
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__callbackImageEvents").unwrap(),
+            serde_json::json!(["error"])
+        );
+        let state = rt.state.borrow();
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(
+            state.page_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unique_image_bodies_wait_for_isolate_side_transport_admission() {
+        const IMAGE_COUNT: usize = 200;
+        const BODY_BYTES: usize = 256 * 1024;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let release = std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
+        let server_release = release.clone();
+        let mut body = two_by_three_png();
+        body.resize(BODY_BYTES, 0);
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::with_capacity(IMAGE_COUNT);
+            for _ in 0..IMAGE_COUNT {
+                let (mut stream, _) = listener.accept().unwrap();
+                server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response_body = body.clone();
+                let handler_release = server_release.clone();
+                handlers.push(std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let (lock, ready) = &*handler_release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    drop(released);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(&response_body).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<body></body>"));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.execute_runtime_script(
+            "<bounded-unique-images>",
+            format!(
+                r#"
+                globalThis.__boundedImageLoads = 0;
+                globalThis.__boundedImageErrors = 0;
+                for (let i = 0; i < {IMAGE_COUNT}; i++) {{
+                    const image = document.createElement("img");
+                    image.onload = () => __boundedImageLoads++;
+                    image.onerror = () => __boundedImageErrors++;
+                    image.src = "{base}/image-" + i + ".png";
+                    document.body.appendChild(image);
+                    void image.complete;
+                }}
+                "#
+            ),
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(50).await.unwrap();
+
+        let admission_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while requests.load(std::sync::atomic::Ordering::SeqCst)
+            < crate::ops::IMAGE_TRANSPORT_SLOTS
+        {
+            assert!(
+                tokio::time::Instant::now() < admission_deadline,
+                "image transports did not fill the bounded admission slots"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let state_borrow = rt.state.borrow();
+        assert_eq!(state_borrow.image_transport_slots.available_permits(), 0);
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            crate::ops::IMAGE_TRANSPORT_SLOTS,
+            "a transport slot was released before isolate-side apply"
+        );
+        let (_, completed, completed_bytes) = state_borrow.async_image_loads.diagnostics();
+        assert_eq!(completed, crate::ops::IMAGE_TRANSPORT_SLOTS);
+        assert!(
+            completed_bytes <= crate::ops::IMAGE_TRANSPORT_SLOTS * BODY_BYTES,
+            "completed image bodies exceeded transport admission"
+        );
+        drop(state_borrow);
+
+        rt.run_event_loop_bounded(10_000).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__boundedImageLoads, __boundedImageErrors]")
+                .unwrap(),
+            serde_json::json!([IMAGE_COUNT, 0])
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), IMAGE_COUNT);
+        let state = rt.state.borrow();
+        assert_eq!(
+            state.image_transport_slots.available_permits(),
+            crate::ops::IMAGE_TRANSPORT_SLOTS
+        );
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+        drop(state);
+        server.join().unwrap();
+    }
+
+    /// Image transport completion may become ready while layout or CDP code
+    /// synchronously owns page state. Network readiness must not re-enter that
+    /// RefCell; applying bytes waits until the isolate runs the completion.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn async_image_completion_does_not_reenter_borrowed_page_state() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_started = request_started.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let png = two_by_three_png();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            server_started.store(true, std::sync::atomic::Ordering::Release);
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&png).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(&format!(r#"<img id="image" src="{base}/image.png">"#)));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.execute_script(
+            "start-image-load",
+            r#"
+                globalThis.image = document.getElementById("image");
+                globalThis.__imageEvents = [];
+                image.addEventListener("load", () => __imageEvents.push("load"));
+                image.addEventListener("error", () => __imageEvents.push("error"));
+                void image.complete;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let started_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !request_started.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                tokio::time::Instant::now() < started_deadline,
+                "image request did not start"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let state_borrow = rt.state.borrow_mut();
+        release_tx.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(state_borrow);
+
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[image.complete, image.naturalWidth, image.naturalHeight, __imageEvents]"
+            )
+            .unwrap(),
+            serde_json::json!([true, 2, 3, ["load"]])
+        );
+        let state = rt.state.borrow();
+        assert_eq!(
+            state.page_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn replacing_document_aborts_owned_image_transport_jobs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_started = request_started.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            server_started.store(true, std::sync::atomic::Ordering::Release);
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+            let body = two_by_three_png();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+
+        let base = format!("http://{address}");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(&format!(r#"<img id="image" src="{base}/stall.png">"#)));
+        rt.set_url(&format!("{base}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.execute_script(
+            "start-stalled-image",
+            r#"
+                globalThis.__oldImageEvents = 0;
+                const image = document.getElementById("image");
+                image.addEventListener("load", () => __oldImageEvents++);
+                image.addEventListener("error", () => __oldImageEvents++);
+                void image.complete;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let started_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !request_started.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                tokio::time::Instant::now() < started_deadline,
+                "image request did not start"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rt.state.borrow().async_image_jobs.active_count(), 1);
+        let (old_in_flight, transport_slots) = {
+            let state = rt.state.borrow();
+            assert_eq!(
+                state.image_transport_slots.available_permits(),
+                crate::ops::IMAGE_TRANSPORT_SLOTS - 1
+            );
+            (state.page_in_flight.clone(), state.image_transport_slots.clone())
+        };
+
+        rt.set_dom(parse_html("<main id='replacement'>replacement</main>"));
+        assert_eq!(rt.state.borrow().async_image_jobs.active_count(), 0);
+        let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while old_in_flight.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            assert!(
+                tokio::time::Instant::now() < cleanup_deadline,
+                "canceled image job retained page lifecycle accounting"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rt.state.borrow().async_image_loads.diagnostics(), (0, 0, 0));
+        assert_eq!(
+            transport_slots.available_permits(),
+            crate::ops::IMAGE_TRANSPORT_SLOTS
+        );
+
+        rt.run_page_init();
+        let _ = release_tx.send(());
+        rt.run_event_loop_bounded(50).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.textContent, __oldImageEvents]")
+                .unwrap(),
+            serde_json::json!(["replacement", 0])
+        );
+        assert_eq!(rt.state.borrow().async_image_jobs.active_count(), 0);
+        assert_eq!(rt.state.borrow().async_image_loads.diagnostics(), (0, 0, 0));
+        server.join().unwrap();
     }
 
     #[cfg(feature = "render")]
@@ -17548,5 +18184,3 @@ mod tests {
         );
     }
 }
-
-

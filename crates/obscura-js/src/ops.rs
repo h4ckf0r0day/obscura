@@ -86,6 +86,442 @@ pub struct JsNetworkEvent {
 #[cfg(feature = "render")]
 pub use obscura_render::ImageRequestProfile;
 
+#[cfg(feature = "render")]
+thread_local! {
+    static ASYNC_IMAGE_JOB_RESOLVERS: RefCell<HashMap<u32, v8::Global<v8::PromiseResolver>>> =
+        RefCell::new(HashMap::new());
+}
+
+#[cfg(feature = "render")]
+static ASYNC_IMAGE_JOB_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
+
+#[cfg(feature = "render")]
+fn next_async_image_job_id() -> u32 {
+    loop {
+        let request_id =
+            ASYNC_IMAGE_JOB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if request_id == 0 {
+            continue;
+        }
+        let available = ASYNC_IMAGE_JOB_RESOLVERS
+            .with(|resolvers| !resolvers.borrow().contains_key(&request_id));
+        if available {
+            return request_id;
+        }
+    }
+}
+
+#[cfg(all(feature = "render", test))]
+pub(crate) fn async_image_resolver_count() -> usize {
+    ASYNC_IMAGE_JOB_RESOLVERS.with(|resolvers| resolvers.borrow().len())
+}
+
+#[cfg(feature = "render")]
+#[derive(Default)]
+struct AsyncImageJobState {
+    active: std::sync::Mutex<HashMap<u32, AsyncImageJob>>,
+}
+
+#[cfg(feature = "render")]
+struct ExternalImageOpGuard(deno_core::ExternalOpsTracker);
+
+#[cfg(feature = "render")]
+impl Drop for ExternalImageOpGuard {
+    fn drop(&mut self) {
+        self.0.unref_op();
+    }
+}
+
+#[cfg(feature = "render")]
+struct AsyncImageJob {
+    abort_handle: tokio::task::AbortHandle,
+    completion_guard: ImageCompletionDiscardGuard,
+    external_op: ExternalImageOpGuard,
+    _transport_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[cfg(feature = "render")]
+impl AsyncImageJobState {
+    fn insert(
+        &self,
+        request_id: u32,
+        abort_handle: tokio::task::AbortHandle,
+        completion_guard: ImageCompletionDiscardGuard,
+        external_op: ExternalImageOpGuard,
+    ) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                request_id,
+                AsyncImageJob {
+                    abort_handle,
+                    completion_guard,
+                    external_op,
+                    _transport_permit: None,
+                },
+            );
+    }
+
+    fn attach_transport_permit(
+        &self,
+        request_id: u32,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), tokio::sync::OwnedSemaphorePermit> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(job) = active.get_mut(&request_id) else {
+            return Err(permit);
+        };
+        job._transport_permit = Some(permit);
+        Ok(())
+    }
+
+    fn finish(&self, request_id: u32) -> Option<AsyncImageJob> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&request_id)
+    }
+
+    fn abort_all(&self) -> Vec<u32> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut request_ids = Vec::with_capacity(active.len());
+        for (request_id, job) in active.drain() {
+            job.abort_handle.abort();
+            request_ids.push(request_id);
+        }
+        request_ids
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+#[cfg(feature = "render")]
+pub(crate) struct AsyncImageJobOwner {
+    state: Arc<AsyncImageJobState>,
+}
+
+#[cfg(feature = "render")]
+impl Default for AsyncImageJobOwner {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AsyncImageJobState::default()),
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+impl AsyncImageJobOwner {
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.state.len()
+    }
+}
+
+#[cfg(feature = "render")]
+impl Drop for AsyncImageJobOwner {
+    fn drop(&mut self) {
+        let request_ids = self.state.abort_all();
+        ASYNC_IMAGE_JOB_RESOLVERS.with(|resolvers| {
+            let mut resolvers = resolvers.borrow_mut();
+            for request_id in request_ids {
+                resolvers.remove(&request_id);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "render")]
+type ImageRequestKey = (u64, String, ImageRequestProfile);
+
+#[cfg(feature = "render")]
+struct PendingImageLoad {
+    completion_id: u64,
+    waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(feature = "render")]
+struct CompletedImageLoad {
+    request_key: ImageRequestKey,
+    bytes: Option<Vec<u8>>,
+    applied: bool,
+    remaining_consumers: usize,
+}
+
+#[cfg(feature = "render")]
+#[derive(Default)]
+struct AsyncImageLoadInner {
+    pending: HashMap<ImageRequestKey, PendingImageLoad>,
+    completed: HashMap<u64, CompletedImageLoad>,
+}
+
+/// Thread-safe handoff between owned image transport jobs and isolate-owned
+/// render state. Network jobs never borrow a realm after they are scheduled.
+#[cfg(feature = "render")]
+#[derive(Default)]
+pub(crate) struct AsyncImageLoadState {
+    inner: std::sync::Mutex<AsyncImageLoadInner>,
+}
+
+#[cfg(feature = "render")]
+enum ImageLoadRegistration {
+    Leader(u64),
+    Follower(u64, tokio::sync::oneshot::Receiver<()>),
+    Completed(u64),
+}
+
+#[cfg(feature = "render")]
+struct ImageLoadDelivery {
+    request_key: ImageRequestKey,
+    bytes: Option<Vec<u8>>,
+    apply: bool,
+}
+
+#[cfg(feature = "render")]
+struct ImageCompletionDiscardGuard {
+    state: Arc<AsyncImageLoadState>,
+    request_key: ImageRequestKey,
+    completion_id: u64,
+    armed: bool,
+}
+
+#[cfg(feature = "render")]
+impl ImageCompletionDiscardGuard {
+    fn new(
+        state: Arc<AsyncImageLoadState>,
+        request_key: ImageRequestKey,
+        completion_id: u64,
+    ) -> Self {
+        Self {
+            state,
+            request_key,
+            completion_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "render")]
+impl Drop for ImageCompletionDiscardGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state
+                .discard_completion(&self.request_key, self.completion_id);
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+struct ImageLoadLeaderGuard {
+    state: Arc<AsyncImageLoadState>,
+    request_key: ImageRequestKey,
+    completion_id: u64,
+    completed: bool,
+}
+
+#[cfg(feature = "render")]
+struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
+
+#[cfg(feature = "render")]
+impl PageImageInFlightGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+#[cfg(feature = "render")]
+impl Drop for PageImageInFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "render")]
+impl ImageLoadLeaderGuard {
+    fn new(
+        state: Arc<AsyncImageLoadState>,
+        request_key: ImageRequestKey,
+        completion_id: u64,
+    ) -> Self {
+        Self {
+            state,
+            request_key,
+            completion_id,
+            completed: false,
+        }
+    }
+
+    fn finish(mut self, bytes: Option<Vec<u8>>) {
+        self.state
+            .complete(&self.request_key, self.completion_id, bytes);
+        self.completed = true;
+    }
+
+    fn abandon(mut self) {
+        self.state
+            .abandon(&self.request_key, self.completion_id);
+        self.completed = true;
+    }
+}
+
+#[cfg(feature = "render")]
+impl Drop for ImageLoadLeaderGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state
+                .complete(&self.request_key, self.completion_id, None);
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+static IMAGE_COMPLETION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Keep full image bodies bounded while completion waits for the isolate.
+/// The permit is page-shared (including child frames) and is released only
+/// after isolate-side apply/discard, not when the socket finishes reading.
+#[cfg(feature = "render")]
+pub(crate) const IMAGE_TRANSPORT_SLOTS: usize = 6;
+
+#[cfg(feature = "render")]
+impl AsyncImageLoadState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, AsyncImageLoadInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn register(&self, request_key: ImageRequestKey) -> ImageLoadRegistration {
+        let mut inner = self.lock();
+        if let Some(pending) = inner.pending.get_mut(&request_key) {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            pending.waiters.push(sender);
+            return ImageLoadRegistration::Follower(pending.completion_id, receiver);
+        }
+        if let Some((completion_id, completed)) = inner
+            .completed
+            .iter_mut()
+            .find(|(_, completed)| completed.request_key == request_key)
+        {
+            completed.remaining_consumers = completed.remaining_consumers.saturating_add(1);
+            return ImageLoadRegistration::Completed(*completion_id);
+        }
+        let completion_id =
+            IMAGE_COMPLETION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inner.pending.insert(
+            request_key,
+            PendingImageLoad {
+                completion_id,
+                waiters: Vec::new(),
+            },
+        );
+        ImageLoadRegistration::Leader(completion_id)
+    }
+
+    fn complete(
+        &self,
+        request_key: &ImageRequestKey,
+        completion_id: u64,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let mut inner = self.lock();
+        let Some(pending) = inner.pending.remove(request_key) else {
+            return;
+        };
+        if pending.completion_id != completion_id {
+            inner.pending.insert(request_key.clone(), pending);
+            return;
+        }
+        let live_followers = pending
+            .waiters
+            .into_iter()
+            .map(|waiter| usize::from(waiter.send(()).is_ok()))
+            .sum::<usize>();
+        inner.completed.insert(
+            completion_id,
+            CompletedImageLoad {
+                request_key: request_key.clone(),
+                bytes,
+                applied: false,
+                remaining_consumers: live_followers.saturating_add(1),
+            },
+        );
+    }
+
+    fn abandon(&self, request_key: &ImageRequestKey, completion_id: u64) {
+        let mut inner = self.lock();
+        if inner
+            .pending
+            .get(request_key)
+            .is_some_and(|pending| pending.completion_id == completion_id)
+        {
+            inner.pending.remove(request_key);
+        }
+    }
+
+    fn take(&self, completion_id: u64) -> Option<ImageLoadDelivery> {
+        let mut inner = self.lock();
+        let (request_key, apply, bytes, remove) = {
+            let completed = inner.completed.get_mut(&completion_id)?;
+            let request_key = completed.request_key.clone();
+            let apply = !completed.applied;
+            completed.applied = true;
+            let bytes = apply.then(|| completed.bytes.take()).flatten();
+            completed.remaining_consumers = completed.remaining_consumers.saturating_sub(1);
+            (request_key, apply, bytes, completed.remaining_consumers == 0)
+        };
+        if remove {
+            inner.completed.remove(&completion_id);
+        }
+        Some(ImageLoadDelivery {
+            request_key,
+            bytes,
+            apply,
+        })
+    }
+
+    fn discard_completion(&self, request_key: &ImageRequestKey, completion_id: u64) {
+        let mut inner = self.lock();
+        if inner
+            .pending
+            .get(request_key)
+            .is_some_and(|pending| pending.completion_id == completion_id)
+        {
+            inner.pending.remove(request_key);
+        }
+        inner.completed.remove(&completion_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostics(&self) -> (usize, usize, usize) {
+        let inner = self.lock();
+        let completed_bytes = inner
+            .completed
+            .values()
+            .filter_map(|completion| completion.bytes.as_ref())
+            .map(Vec::len)
+            .sum();
+        (inner.pending.len(), inner.completed.len(), completed_bytes)
+    }
+}
+
 /// A live Canvas2D backing store retained from V8. `JsBuffer` owns a shared
 /// reference to the ArrayBuffer backing store, so the pixels stay valid while
 /// the canvas wrapper and native page state share it. Paint only borrows these
@@ -168,6 +604,8 @@ pub struct ObscuraState {
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
     pub page_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    #[cfg(feature = "render")]
+    pub(crate) image_transport_slots: Arc<tokio::sync::Semaphore>,
     /// Monotonic generation for observable changes to the connected document.
     /// The browser settle policy samples this to distinguish useful deferred
     /// rendering work from unrelated long-lived timers.
@@ -212,12 +650,15 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
-    /// Waiters sharing an asynchronous HTMLImageElement request. The key keeps
-    /// navigation identity and request credentials separate so neither stale
-    /// pages nor incompatible CORS profiles share a completion.
+    /// Compatibility field retained for embedders that inspect page state.
+    /// Owned image transport uses `async_image_loads` instead.
     #[cfg(feature = "render")]
     pub render_image_in_flight:
         HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(feature = "render")]
+    pub(crate) async_image_loads: Arc<AsyncImageLoadState>,
+    #[cfg(feature = "render")]
+    pub(crate) async_image_jobs: AsyncImageJobOwner,
     /// One exact-key compiled author stylesheet for this document. Connected
     /// mutations still discard `prepared_render`; the next prepare reuses only
     /// parsing/indexing when ordered CSS source and viewport remain identical.
@@ -326,6 +767,10 @@ impl ObscuraState {
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(feature = "render")]
+            image_transport_slots: Arc::new(tokio::sync::Semaphore::new(
+                IMAGE_TRANSPORT_SLOTS,
+            )),
             activity_generation: 0,
             document_generation: 0,
             base_url_cache: RefCell::new(None),
@@ -349,6 +794,10 @@ impl ObscuraState {
             render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
             render_image_in_flight: HashMap::new(),
+            #[cfg(feature = "render")]
+            async_image_loads: Arc::new(AsyncImageLoadState::default()),
+            #[cfg(feature = "render")]
+            async_image_jobs: AsyncImageJobOwner::default(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
@@ -576,6 +1025,11 @@ impl RealmStates {
             .iter()
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_state_by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+        self.by_frame_id(frame_id)
     }
 }
 
@@ -3069,9 +3523,269 @@ mod tests {
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
+    #[cfg(feature = "render")]
+    use base64::Engine as _;
+    #[cfg(feature = "render")]
+    use super::BASE64;
 
     use super::read_body_capped;
     use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn image_transport_is_sync_and_prepared_state_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::PreparedImageLoad>();
+        assert!(!super::op_load_image_metadata().is_async);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn discarded_pending_image_completion_cannot_publish_after_teardown() {
+        let state = super::AsyncImageLoadState::default();
+        let request_key = (
+            1,
+            "https://example.com/image.png".to_string(),
+            obscura_render::ImageRequestProfile::NoCorsInclude,
+        );
+        let super::ImageLoadRegistration::Leader(completion_id) =
+            state.register(request_key.clone())
+        else {
+            panic!("first image request was not the transport leader");
+        };
+        let super::ImageLoadRegistration::Follower(_, mut follower) =
+            state.register(request_key.clone())
+        else {
+            panic!("second image request did not follow the transport leader");
+        };
+
+        state.discard_completion(&request_key, completion_id);
+        state.complete(&request_key, completion_id, Some(vec![0; 1024]));
+
+        assert_eq!(state.diagnostics(), (0, 0, 0));
+        assert!(matches!(
+            follower.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn bulk_pending_image_teardown_removes_each_owned_registration() {
+        const IMAGE_COUNT: usize = 2_048;
+
+        let state = super::AsyncImageLoadState::default();
+        let mut registrations = Vec::with_capacity(IMAGE_COUNT);
+        let mut followers = Vec::with_capacity(IMAGE_COUNT);
+        for index in 0..IMAGE_COUNT {
+            let request_key = (
+                1,
+                format!("https://example.com/image-{index}.png"),
+                obscura_render::ImageRequestProfile::NoCorsInclude,
+            );
+            let super::ImageLoadRegistration::Leader(completion_id) =
+                state.register(request_key.clone())
+            else {
+                panic!("unique image request was not the transport leader");
+            };
+            let super::ImageLoadRegistration::Follower(_, follower) =
+                state.register(request_key.clone())
+            else {
+                panic!("duplicate image request did not follow its transport leader");
+            };
+            registrations.push((request_key, completion_id));
+            followers.push(follower);
+        }
+
+        for (request_key, completion_id) in registrations {
+            state.discard_completion(&request_key, completion_id);
+        }
+
+        assert_eq!(state.diagnostics(), (0, 0, 0));
+        assert!(followers.into_iter().all(|mut follower| matches!(
+            follower.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        )));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn hostless_image_loader_returns_immediately_without_a_tokio_runtime() {
+        let dom = obscura_dom::parse_html(
+            r#"<img id="image" src="http://example.com/image.png">"#,
+        );
+        let node_id = dom.get_element_by_id("image").unwrap();
+        let png = BASE64
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6B\
+                 AAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=="
+                    .replace(char::is_whitespace, ""),
+            )
+            .unwrap();
+        let mut state = super::ObscuraState::new();
+        state.dom = Some(dom);
+        state.url = "http://example.com/page.html".to_string();
+        state.render_resources =
+            obscura_render::RenderResourceCache::with_loader(move |_url: &str| Some(png.clone()));
+
+        let super::PreparedImageLoad::Immediate(metadata) =
+            super::prepare_image_load(&mut state, node_id)
+        else {
+            panic!("hostless image load scheduled asynchronous work");
+        };
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["ok"], true);
+        assert_eq!(metadata["width"], 2.0);
+        assert_eq!(metadata["height"], 3.0);
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn cached_page_transport_image_returns_immediately_without_a_tokio_runtime() {
+        let dom = obscura_dom::parse_html(
+            r#"<img id="image" src="http://example.com/image.png">"#,
+        );
+        let node_id = dom.get_element_by_id("image").unwrap();
+        let png = BASE64
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6B\
+                 AAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=="
+                    .replace(char::is_whitespace, ""),
+            )
+            .unwrap();
+        let mut state = super::ObscuraState::new();
+        state.dom = Some(dom);
+        state.url = "http://example.com/page.html".to_string();
+        state.http_client = Some(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        state.render_resources.seed_image(
+            "http://example.com/image.png".to_string(),
+            obscura_render::ImageRequestProfile::NoCorsInclude,
+            png,
+        );
+
+        let super::PreparedImageLoad::Immediate(metadata) =
+            super::prepare_image_load(&mut state, node_id)
+        else {
+            panic!("cached page image scheduled asynchronous work");
+        };
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["ok"], true);
+        assert_eq!(metadata["width"], 2.0);
+        assert_eq!(metadata["height"], 3.0);
+        assert_eq!(state.async_image_jobs.active_count(), 0);
+        assert_eq!(state.async_image_loads.diagnostics(), (0, 0, 0));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_image_leader_releases_followers_and_completion_storage() {
+        let state = std::sync::Arc::new(super::AsyncImageLoadState::default());
+        let request_key = (
+            7,
+            "https://example.com/shared.png".to_string(),
+            obscura_render::ImageRequestProfile::NoCorsInclude,
+        );
+        let completion_id = match state.register(request_key.clone()) {
+            super::ImageLoadRegistration::Leader(completion_id) => completion_id,
+            _ => panic!("first request was not the leader"),
+        };
+        let follower = match state.register(request_key.clone()) {
+            super::ImageLoadRegistration::Follower(id, receiver) => {
+                assert_eq!(id, completion_id);
+                receiver
+            }
+            _ => panic!("shared request was not coalesced"),
+        };
+
+        drop(super::ImageLoadLeaderGuard::new(
+            state.clone(),
+            request_key.clone(),
+            completion_id,
+        ));
+        follower.await.unwrap();
+
+        let leader = state.take(completion_id).unwrap();
+        assert!(leader.apply);
+        assert!(leader.bytes.is_none());
+        assert_eq!(leader.request_key, request_key);
+        let follower = state.take(completion_id).unwrap();
+        assert!(!follower.apply);
+        assert!(follower.bytes.is_none());
+        assert_eq!(state.diagnostics(), (0, 0, 0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn completed_image_request_accepts_late_consumers_without_refetching() {
+        let state = std::sync::Arc::new(super::AsyncImageLoadState::default());
+        let request_key = (
+            9,
+            "https://example.com/burst.png".to_string(),
+            obscura_render::ImageRequestProfile::NoCorsInclude,
+        );
+        let completion_id = match state.register(request_key.clone()) {
+            super::ImageLoadRegistration::Leader(completion_id) => completion_id,
+            _ => panic!("first request was not the leader"),
+        };
+        super::ImageLoadLeaderGuard::new(state.clone(), request_key.clone(), completion_id)
+            .finish(Some(vec![1, 2, 3]));
+
+        assert!(matches!(
+            state.register(request_key),
+            super::ImageLoadRegistration::Completed(id) if id == completion_id
+        ));
+        let first = state.take(completion_id).unwrap();
+        assert!(first.apply);
+        assert_eq!(first.bytes, Some(vec![1, 2, 3]));
+        let late = state.take(completion_id).unwrap();
+        assert!(!late.apply);
+        assert!(late.bytes.is_none());
+        assert_eq!(state.diagnostics(), (0, 0, 0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn cancelled_image_follower_does_not_retain_completion_bytes() {
+        let state = std::sync::Arc::new(super::AsyncImageLoadState::default());
+        let request_key = (
+            8,
+            "https://example.com/cancelled-follower.png".to_string(),
+            obscura_render::ImageRequestProfile::NoCorsInclude,
+        );
+        let completion_id = match state.register(request_key.clone()) {
+            super::ImageLoadRegistration::Leader(completion_id) => completion_id,
+            _ => panic!("first request was not the leader"),
+        };
+        let follower = match state.register(request_key.clone()) {
+            super::ImageLoadRegistration::Follower(_, receiver) => receiver,
+            _ => panic!("shared request was not coalesced"),
+        };
+        drop(follower);
+
+        super::ImageLoadLeaderGuard::new(state.clone(), request_key, completion_id)
+            .finish(Some(vec![1, 2, 3, 4]));
+        assert_eq!(state.diagnostics(), (0, 1, 4));
+        assert!(state.take(completion_id).unwrap().apply);
+        assert_eq!(state.diagnostics(), (0, 0, 0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn image_lifecycle_is_counted_at_transport_admission() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let guard = super::PageImageInFlightGuard::new(counter.clone());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
     // caps, a huge iteration count pins the single-threaded runtime and a huge
@@ -4633,6 +5347,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
+        ops.push(op_finish_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
@@ -5199,9 +5914,14 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
-    let gs = shared.borrow();
+fn op_image_metadata(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    nid: u32,
+    _cached_only: bool,
+) -> String {
+    let realm = realm_state(scope, state);
+    let gs = realm.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
         dom.get_node(node_id).is_some_and(|node| {
@@ -5252,13 +5972,12 @@ fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: No
 
 #[cfg(feature = "render")]
 fn finish_async_image_metadata(
-    shared: &SharedState,
+    gs: &ObscuraState,
     node_id: NodeId,
     document_generation: u64,
     expected_url: &str,
     request_profile: ImageRequestProfile,
 ) -> String {
-    let gs = shared.borrow();
     if gs.document_generation != document_generation {
         return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
             .to_string();
@@ -5272,7 +5991,7 @@ fn finish_async_image_metadata(
             .to_string();
     }
     let Some((current_src, density, known, dimensions)) =
-        profiled_cached_image_metadata(&gs, node_id)
+        profiled_cached_image_metadata(gs, node_id)
     else {
         return serde_json::json!({ "state": "stale", "currentSrc": expected_url })
             .to_string();
@@ -5283,125 +6002,161 @@ fn finish_async_image_metadata(
     image_metadata_json(current_src, density, known, dimensions)
 }
 
-/// Load HTMLImageElement bytes through the owning page's async transport.
-/// Network runs after every RefCell borrow is released, requests for the same
-/// navigation/URL/profile share one fetch, and completion revalidates both the
-/// document identity and responsive candidate before exposing lifecycle state.
+/// Apply transport bytes on the isolate-owning thread and return lifecycle
+/// metadata for the requesting element.
 #[cfg(feature = "render")]
-#[op2(async)]
+#[op2]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
-    let shared = {
-        let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+fn op_finish_image_metadata(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    nid: u32,
+    #[string] completion_id: &str,
+) -> String {
+    let Ok(completion_id) = completion_id.parse::<u64>() else {
+        return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
     };
-    let node_id = NodeId::new(nid);
-    let (
+    let realm = realm_state(scope, state);
+    let mut gs = realm.borrow_mut();
+    apply_image_completion(&mut gs, NodeId::new(nid), completion_id)
+}
+
+#[cfg(feature = "render")]
+fn apply_image_completion(
+    gs: &mut ObscuraState,
+    node_id: NodeId,
+    completion_id: u64,
+) -> String {
+    let Some(delivery) = gs.async_image_loads.take(completion_id) else {
+        return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
+    };
+    let (document_generation, expected_url, request_profile) = delivery.request_key;
+    if delivery.apply && gs.document_generation == document_generation {
+        match delivery.bytes {
+            Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
+                gs.render_resources.seed_image(
+                    expected_url.clone(),
+                    request_profile,
+                    bytes,
+                );
+                invalidate_render_resource_geometry(gs);
+            }
+            _ => {
+                gs.render_resources
+                    .seed_image_missing(expected_url.clone(), request_profile);
+            }
+        }
+    }
+    finish_async_image_metadata(
+        gs,
+        node_id,
         document_generation,
-        selected_url,
+        &expected_url,
         request_profile,
+    )
+}
+
+#[cfg(feature = "render")]
+enum PreparedImageLoad {
+    Immediate(String),
+    Completed(u64),
+    Follower {
+        completion_id: u64,
+        request_key: ImageRequestKey,
+        state: Arc<AsyncImageLoadState>,
+        receiver: tokio::sync::oneshot::Receiver<()>,
+    },
+    Leader {
+        completion_id: u64,
+        leader: ImageLoadLeaderGuard,
+        selected_url: String,
+        resource_request: ResourceRequest,
+        http_client: Option<Arc<ObscuraHttpClient>>,
+        callbacks: Option<Arc<CallbackRegistry>>,
+        page_in_flight: PageImageInFlightGuard,
+        transport_slots: Arc<tokio::sync::Semaphore>,
+        blocked: bool,
+        #[cfg(feature = "stealth")]
+        stealth_client: Option<Arc<StealthHttpClient>>,
+    },
+}
+
+#[cfg(feature = "render")]
+impl PreparedImageLoad {
+    fn abandon(self) {
+        if let Self::Leader { leader, .. } = self {
+            leader.abandon();
+        }
+    }
+
+    fn completion(&self) -> Option<(u64, ImageRequestKey, Arc<AsyncImageLoadState>)> {
+        match self {
+            Self::Follower {
+                completion_id,
+                request_key,
+                state,
+                ..
+            } => Some((*completion_id, request_key.clone(), state.clone())),
+            Self::Leader {
+                completion_id,
+                leader,
+                ..
+            } => Some((
+                *completion_id,
+                leader.request_key.clone(),
+                leader.state.clone(),
+            )),
+            Self::Immediate(_) | Self::Completed(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+async fn run_prepared_image_load(
+    prepared: PreparedImageLoad,
+    image_jobs: Arc<AsyncImageJobState>,
+    request_id: u32,
+) -> bool {
+    let PreparedImageLoad::Leader {
+        completion_id: _,
+        leader,
+        selected_url,
         resource_request,
         http_client,
         callbacks,
         page_in_flight,
+        transport_slots,
         blocked,
-    ) = {
-        let gs = shared.borrow();
-        let Some(dom) = gs.dom.as_ref() else {
-            return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
-        };
-        let is_image = dom.get_node(node_id).is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|element| element.local.as_ref() == "img")
-        });
-        if !is_image {
-            return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
-        }
-        let profile = image_request_profile(dom, node_id);
-        let Some((selected_url, _, known, _)) =
-            profiled_cached_image_metadata(&gs, node_id)
-        else {
-            return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" })
-                .to_string();
-        };
-        if known {
-            return cached_image_metadata_for_node(&gs, node_id);
-        }
-        let initiator = url::Url::parse(&gs.url)
-            .or_else(|_| url::Url::parse(&selected_url))
-            .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
-        let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
-        match profile {
-            ImageRequestProfile::CorsInclude => {
-                request.mode = RequestMode::Cors;
-                request.credentials = RequestCredentials::Include;
+        #[cfg(feature = "stealth")]
+        stealth_client,
+    } = prepared
+    else {
+        match prepared {
+            PreparedImageLoad::Follower {
+                completion_id: _,
+                request_key: _,
+                state: _state,
+                receiver,
+            } => {
+                let _ = receiver.await;
             }
-            ImageRequestProfile::CorsSameOrigin => {
-                request.mode = RequestMode::Cors;
-                request.credentials = RequestCredentials::SameOrigin;
-            }
-            ImageRequestProfile::NoCorsInclude => {}
+            PreparedImageLoad::Immediate(_) | PreparedImageLoad::Completed(_) => {}
+            PreparedImageLoad::Leader { .. } => unreachable!(),
         }
-        let blocked = gs.blocked_urls.iter().any(|pattern| {
-            pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
-        });
-        (
-            gs.document_generation,
-            selected_url,
-            profile,
-            request,
-            gs.http_client.clone(),
-            gs.callbacks.clone(),
-            Arc::clone(&gs.page_in_flight),
-            blocked,
-        )
+        return true;
     };
 
-    #[cfg(feature = "stealth")]
-    let stealth_client = shared.borrow().stealth_client.clone();
-    #[cfg(feature = "stealth")]
-    let has_page_transport = http_client.is_some() || stealth_client.is_some();
-    #[cfg(not(feature = "stealth"))]
-    let has_page_transport = http_client.is_some();
-    if !has_page_transport {
-        return load_image_metadata_without_page_transport(&mut shared.borrow_mut(), node_id);
-    }
-
-    // Different CORS/credential profiles do not share an in-flight response.
-    let request_key = (document_generation, selected_url.clone(), request_profile);
-    let follower = {
-        let mut gs = shared.borrow_mut();
-        if let Some(waiters) = gs.render_image_in_flight.get_mut(&request_key) {
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            waiters.push(sender);
-            Some(receiver)
-        } else {
-            gs.render_image_in_flight.insert(request_key.clone(), Vec::new());
-            None
-        }
-    };
-    if let Some(receiver) = follower {
-        let _ = receiver.await;
-        return finish_async_image_metadata(
-            &shared,
-            node_id,
-            document_generation,
-            &selected_url,
-            request_profile,
-        );
-    }
-
-    struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
-    impl Drop for PageImageInFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _page_in_flight = PageImageInFlightGuard(page_in_flight);
+    let _page_in_flight = page_in_flight;
 
     let parsed_url = url::Url::parse(&selected_url).ok();
+    let transport_permit = if !blocked && parsed_url.is_some() {
+        transport_slots.acquire_owned().await.ok()
+    } else {
+        None
+    };
     let response = if blocked || parsed_url.is_none() {
+        None
+    } else if transport_permit.is_none() {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
@@ -5448,46 +6203,278 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .contains(&response.status)
             .then_some(response.body)
     });
-    let waiters = {
-        let mut gs = shared.borrow_mut();
-        if gs.document_generation == document_generation {
-            match bytes {
-                Some(bytes) => {
-                    if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
-                        gs.render_resources.seed_image(
-                            selected_url.clone(),
-                            request_profile,
-                            bytes,
-                        );
-                        // The leader owns the unknown-to-known cache
-                        // transition. Followers only observe this result and
-                        // must not invalidate the retained render again.
-                        invalidate_render_resource_geometry(&mut gs);
-                    } else {
-                        gs.render_resources
-                            .seed_image_missing(selected_url.clone(), request_profile);
-                    }
-                }
-                None => {
-                    gs.render_resources
-                        .seed_image_missing(selected_url.clone(), request_profile);
-                }
+    if let Some(transport_permit) = transport_permit {
+        if image_jobs
+            .attach_transport_permit(request_id, transport_permit)
+            .is_err()
+        {
+            leader.abandon();
+            return false;
+        }
+    }
+    leader.finish(bytes);
+    true
+}
+
+#[cfg(feature = "render")]
+fn deliver_image_result(
+    scope: &mut v8::HandleScope,
+    request_id: u32,
+    nid: u32,
+    completion_id: u64,
+) -> bool {
+    let resolver = ASYNC_IMAGE_JOB_RESOLVERS
+        .with(|resolvers| resolvers.borrow_mut().remove(&request_id));
+    let Some(resolver) = resolver else {
+        return false;
+    };
+    let resolver = v8::Local::new(scope, resolver);
+    let Some(origin_context) = resolver.get_creation_context(scope) else {
+        return false;
+    };
+    let scope = &mut v8::ContextScope::new(scope, origin_context);
+    let scope = &mut v8::TryCatch::new(scope);
+    let global = origin_context.global(scope);
+    let Some(callback_name) = v8::String::new(scope, "__obscura_applyImageCompletion") else {
+        return false;
+    };
+    let Some(callback) = global.get(scope, callback_name.into()) else {
+        return false;
+    };
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(callback) else {
+        tracing::warn!("image completion callback is unavailable");
+        return false;
+    };
+    let Some(completion_id) = v8::String::new(scope, &completion_id.to_string()) else {
+        return false;
+    };
+    let args = [v8::Integer::new_from_unsigned(scope, nid).into(), completion_id.into()];
+    let Some(result) = callback.call(scope, global.into(), &args) else {
+        let message = scope
+            .exception()
+            .map(|exception| exception.to_rust_string_lossy(scope))
+            .unwrap_or_else(|| "execution terminated".to_string());
+        tracing::warn!("image completion callback failed: {message}");
+        return false;
+    };
+    let result = result.to_rust_string_lossy(scope);
+    let Some(result) = v8::String::new(scope, &result) else {
+        tracing::warn!("image metadata response is too large for a V8 string");
+        return false;
+    };
+    let Some(delivered) = resolver.resolve(scope, result.into()) else {
+        let message = scope
+            .exception()
+            .map(|exception| exception.to_rust_string_lossy(scope))
+            .unwrap_or_else(|| "execution terminated".to_string());
+        tracing::warn!("image completion delivery failed: {message}");
+        return false;
+    };
+    delivered
+}
+
+#[cfg(feature = "render")]
+fn prepare_image_load(gs: &mut ObscuraState, node_id: NodeId) -> PreparedImageLoad {
+    let Some(dom) = gs.dom.as_ref() else {
+        return PreparedImageLoad::Immediate(
+            serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string(),
+        );
+    };
+    let is_image = dom.get_node(node_id).is_some_and(|node| {
+        node.as_element()
+            .is_some_and(|element| element.local.as_ref() == "img")
+    });
+    if !is_image {
+        return PreparedImageLoad::Immediate(
+            serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string(),
+        );
+    }
+    let profile = image_request_profile(dom, node_id);
+    let Some((selected_url, _, known, _)) = profiled_cached_image_metadata(gs, node_id) else {
+        return PreparedImageLoad::Immediate(
+            serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" })
+                .to_string(),
+        );
+    };
+    if known {
+        return PreparedImageLoad::Immediate(cached_image_metadata_for_node(gs, node_id));
+    }
+
+    let initiator = url::Url::parse(&gs.url)
+        .or_else(|_| url::Url::parse(&selected_url))
+        .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
+    let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+    match profile {
+        ImageRequestProfile::CorsInclude => {
+            request.mode = RequestMode::Cors;
+            request.credentials = RequestCredentials::Include;
+        }
+        ImageRequestProfile::CorsSameOrigin => {
+            request.mode = RequestMode::Cors;
+            request.credentials = RequestCredentials::SameOrigin;
+        }
+        ImageRequestProfile::NoCorsInclude => {}
+    }
+    let blocked = gs.blocked_urls.iter().any(|pattern| {
+        pattern == "*" || selected_url.contains(pattern) || glob_match(pattern, &selected_url)
+    });
+    #[cfg(feature = "stealth")]
+    let has_page_transport = gs.http_client.is_some() || gs.stealth_client.is_some();
+    #[cfg(not(feature = "stealth"))]
+    let has_page_transport = gs.http_client.is_some();
+    if !has_page_transport {
+        return PreparedImageLoad::Immediate(load_image_metadata_without_page_transport(
+            gs, node_id,
+        ));
+    }
+
+    let request_key = (gs.document_generation, selected_url.clone(), profile);
+    let async_image_loads = gs.async_image_loads.clone();
+    match async_image_loads.register(request_key.clone()) {
+        ImageLoadRegistration::Completed(completion_id) => PreparedImageLoad::Completed(completion_id),
+        ImageLoadRegistration::Follower(completion_id, receiver) => {
+            PreparedImageLoad::Follower {
+                completion_id,
+                request_key,
+                state: async_image_loads,
+                receiver,
             }
         }
-        gs.render_image_in_flight
-            .remove(&request_key)
-            .unwrap_or_default()
-    };
-    for waiter in waiters {
-        let _ = waiter.send(());
+        ImageLoadRegistration::Leader(completion_id) => PreparedImageLoad::Leader {
+            completion_id,
+            leader: ImageLoadLeaderGuard::new(
+                async_image_loads,
+                request_key,
+                completion_id,
+            ),
+            selected_url,
+            resource_request: request,
+            http_client: gs.http_client.clone(),
+            callbacks: gs.callbacks.clone(),
+            page_in_flight: PageImageInFlightGuard::new(Arc::clone(&gs.page_in_flight)),
+            transport_slots: gs.image_transport_slots.clone(),
+            blocked,
+            #[cfg(feature = "stealth")]
+            stealth_client: gs.stealth_client.clone(),
+        },
     }
-    finish_async_image_metadata(
-        &shared,
-        node_id,
-        document_generation,
-        &selected_url,
-        request_profile,
-    )
+}
+
+#[cfg(feature = "render")]
+fn schedule_image_job(
+    state: Rc<RefCell<OpState>>,
+    nid: u32,
+    prepared: PreparedImageLoad,
+    image_jobs: Arc<AsyncImageJobState>,
+    resolver: v8::Global<v8::PromiseResolver>,
+) -> Result<u32, deno_error::JsErrorBox> {
+    let (completion_id, completion_key, completion_state) = prepared
+        .completion()
+        .expect("only scheduled image loads have completion state");
+    let completion_guard =
+        ImageCompletionDiscardGuard::new(completion_state, completion_key, completion_id);
+    let (spawner, external_op) = {
+        let state_borrow = state.borrow();
+        (
+            state_borrow
+                .borrow::<deno_core::V8CrossThreadTaskSpawner>()
+                .clone(),
+            state_borrow.external_ops_tracker.clone(),
+        )
+    };
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            prepared.abandon();
+            return Err(deno_error::JsErrorBox::generic(
+                "image loading requires an async runtime",
+            ));
+        }
+    };
+    let request_id = next_async_image_job_id();
+    ASYNC_IMAGE_JOB_RESOLVERS.with(|resolvers| {
+        resolvers.borrow_mut().insert(request_id, resolver);
+    });
+
+    external_op.ref_op();
+    let external_op = ExternalImageOpGuard(external_op);
+    let job_images = image_jobs.clone();
+    let worker_images = image_jobs.clone();
+    let job_spawner = spawner.clone();
+    let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+    let worker = runtime.spawn(async move {
+        if registered_rx.await.is_err() {
+            return false;
+        }
+        run_prepared_image_load(prepared, worker_images, request_id).await
+    });
+    let abort_handle = worker.abort_handle();
+    runtime.spawn(async move {
+        let should_deliver = worker.await.unwrap_or(true);
+        if !should_deliver {
+            return;
+        }
+        job_spawner.spawn(move |scope| {
+            if let Some(mut job) = job_images.finish(request_id) {
+                if deliver_image_result(scope, request_id, nid, completion_id) {
+                    job.completion_guard.disarm();
+                }
+                drop(job.external_op);
+            }
+        });
+    });
+    image_jobs.insert(
+        request_id,
+        abort_handle,
+        completion_guard,
+        external_op,
+    );
+    let _ = registered_tx.send(());
+    Ok(request_id)
+}
+
+/// Start image transport outside deno_core's async-op driver. Immediate cached
+/// and hostless results remain synchronous and do not require Tokio.
+#[cfg(feature = "render")]
+#[op2]
+fn op_load_image_metadata<'s>(
+    scope: &'s mut v8::HandleScope,
+    state: Rc<RefCell<OpState>>,
+    nid: u32,
+) -> Result<v8::Local<'s, v8::Promise>, deno_error::JsErrorBox> {
+    let realm = {
+        let state_borrow = state.borrow();
+        realm_state(scope, &state_borrow)
+    };
+    let (prepared, image_jobs) = {
+        let mut realm = realm.borrow_mut();
+        let prepared = prepare_image_load(&mut realm, NodeId::new(nid));
+        (prepared, realm.async_image_jobs.state.clone())
+    };
+    let resolver = v8::PromiseResolver::new(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::generic("failed to create image promise"))?;
+    let promise = resolver.get_promise(scope);
+    match prepared {
+        PreparedImageLoad::Immediate(value) => {
+            let value = v8::String::new(scope, &value)
+                .ok_or_else(|| deno_error::JsErrorBox::generic("image metadata is too large"))?;
+            resolver.resolve(scope, value.into());
+        }
+        PreparedImageLoad::Completed(completion_id) => {
+            let value = {
+                let mut realm = realm.borrow_mut();
+                apply_image_completion(&mut realm, NodeId::new(nid), completion_id)
+            };
+            let value = v8::String::new(scope, &value)
+                .ok_or_else(|| deno_error::JsErrorBox::generic("image metadata is too large"))?;
+            resolver.resolve(scope, value.into());
+        }
+        prepared => {
+            let resolver = v8::Global::new(scope, resolver);
+            schedule_image_job(state, nid, prepared, image_jobs, resolver)?;
+        }
+    }
+    Ok(promise)
 }
 
 #[cfg(feature = "render")]

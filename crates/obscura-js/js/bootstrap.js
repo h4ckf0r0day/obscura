@@ -5863,6 +5863,15 @@ function _imageEncodingError() {
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
 // state and event timing.
+Object.defineProperty(globalThis, '__obscura_applyImageCompletion', {
+  value: function(nid, completionId) {
+    return Deno.core.ops.op_finish_image_metadata(nid >>> 0, String(completionId));
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
 class HTMLImageElement extends Element {
   constructor(nid) {
     super(nid);
@@ -6045,7 +6054,9 @@ class HTMLImageElement extends Element {
         Promise.resolve(op(this._nid >>> 0)).then(
           raw => {
             let metadata = null;
-            try { metadata = JSON.parse(raw); }
+            try {
+              metadata = JSON.parse(raw);
+            }
             catch (_error) { metadata = { ok: false, currentSrc: this.src }; }
             finish(metadata);
           },

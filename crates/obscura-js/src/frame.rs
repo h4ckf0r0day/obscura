@@ -559,6 +559,198 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_image_completion_returns_to_its_creation_realm() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            use base64::Engine as _;
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6B\
+                     AAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=="
+                        .replace(char::is_whitespace, ""),
+                )
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut parent = page(&format!("{base}/parent"), "<html><body></body></html>");
+        parent.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            &format!("{base}/frame"),
+            "<html><body><img id='image'></body></html>",
+        )
+        .expect("frame realm");
+        let frame_state = parent
+            .realm_states()
+            .borrow()
+            .test_state_by_frame_id(1)
+            .expect("frame state");
+        let parent_transport_slots = parent.image_transport_slots();
+        assert!(std::sync::Arc::ptr_eq(
+            &parent_transport_slots,
+            &frame_state.borrow().image_transport_slots,
+        ));
+        frame
+            .execute_script(
+                &mut parent,
+                &format!(
+                    "globalThis.__imageLoaded = false;\
+                     const image = document.getElementById('image');\
+                     image.onload = () => {{ __imageLoaded = true; }};\
+                     image.src = '{base}/image.png';"
+                ),
+            )
+            .unwrap();
+
+        parent.run_event_loop_bounded(300).await.unwrap();
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[__imageLoaded, image.complete, image.naturalWidth, image.naturalHeight]",
+                )
+                .unwrap(),
+            serde_json::json!([true, true, 2, 3]),
+            "image completion resolved against the wrong realm"
+        );
+        assert_eq!(
+            parent.evaluate("document.getElementById('image')").unwrap(),
+            serde_json::Value::Null,
+            "frame image completion mutated the parent document"
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_frame_discards_queued_image_completion() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_started = request_started.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            server_started.store(true, std::sync::atomic::Ordering::Release);
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            use base64::Engine as _;
+            let body = base64::engine::general_purpose::STANDARD
+                .decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6B\
+                     AAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg=="
+                        .replace(char::is_whitespace, ""),
+                )
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let base = format!("http://{address}");
+        let mut parent = page(&format!("{base}/parent"), "<html><body></body></html>");
+        parent.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            &format!("{base}/frame"),
+            "<html><body><img id='image'></body></html>",
+        )
+        .expect("frame realm");
+        let frame_state = frame
+            .realms
+            .borrow()
+            .test_state_by_frame_id(1)
+            .expect("frame state");
+        frame
+            .execute_script(
+                &mut parent,
+                &format!("document.getElementById('image').src = '{base}/image.png';"),
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(20).await.unwrap();
+        let request_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !request_started.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(tokio::time::Instant::now() < request_deadline);
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).unwrap();
+        let completion_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while frame_state.borrow().async_image_loads.diagnostics().1 == 0 {
+            assert!(
+                tokio::time::Instant::now() < completion_deadline,
+                "image response did not reach queued completion"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(frame_state.borrow().async_image_jobs.active_count(), 1);
+        assert_eq!(crate::ops::async_image_resolver_count(), 1);
+        let frame_state_weak = std::rc::Rc::downgrade(&frame_state);
+        let page_in_flight = frame_state.borrow().page_in_flight.clone();
+        let transport_slots = frame_state.borrow().image_transport_slots.clone();
+        assert_eq!(
+            transport_slots.available_permits(),
+            crate::ops::IMAGE_TRANSPORT_SLOTS - 1
+        );
+        drop(frame_state);
+
+        drop(frame);
+        let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while page_in_flight.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            assert!(
+                tokio::time::Instant::now() < cleanup_deadline,
+                "dropped frame retained image lifecycle accounting"
+            );
+            parent.run_event_loop_bounded(20).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert!(frame_state_weak.upgrade().is_none());
+        assert_eq!(crate::ops::async_image_resolver_count(), 0);
+        assert_eq!(
+            transport_slots.available_permits(),
+            crate::ops::IMAGE_TRANSPORT_SLOTS
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
