@@ -1345,6 +1345,28 @@ impl PreparedRender {
             }
             .to_string(),
         );
+        // The inset properties. A static box computes them to `auto` however it
+        // is laid out; a positioned one reports its own declared value. These
+        // are not box coordinates, so they must not be taken from the rect.
+        {
+            let names = ["top", "right", "bottom", "left"];
+            // `position: static` is represented as `None` here.
+            let positioned = style.position.is_some();
+            for (index, name) in names.into_iter().enumerate() {
+                let value = if !positioned {
+                    "auto".to_string()
+                } else {
+                    match style.inset[index] {
+                        Some(crate::Dimension::Px(px)) => css_px(px),
+                        Some(crate::Dimension::Percent(fraction)) => {
+                            format!("{}%", fraction * 100.0)
+                        }
+                        _ => "auto".to_string(),
+                    }
+                };
+                out.insert(name, value);
+            }
+        }
         out.insert(
             "clear",
             match style.clear {
@@ -14997,6 +15019,43 @@ mod tests {
             computed.get("word-break").map(String::as_str),
             Some("keep-all")
         );
+    }
+
+    /// The inset properties are CSS *insets*, not box coordinates. A statically
+    /// positioned element computes them to `auto` wherever it sits on the page.
+    /// `getComputedStyle` served them from `getBoundingClientRect`, so every
+    /// element looked positioned and a relative box reported its viewport
+    /// offset (21px) instead of its declared inset (5px).
+    #[test]
+    fn computed_style_reports_insets_not_box_coordinates() {
+        let tree = parse_html(
+            r#"<style>
+                 body{margin:0}
+                 #stat{height:20px}
+                 #rel{position:relative;top:5px;left:7px}
+                 #abs{position:absolute;top:10px;left:12px}
+               </style>
+               <div id="stat">s</div><div id="rel">r</div><div id="abs">a</div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        // Chromium 147: a static box is `auto` on every side, however far down
+        // the page it is laid out.
+        let stat = computed("stat");
+        for side in ["top", "right", "bottom", "left"] {
+            assert_eq!(stat[side], "auto", "static {side}");
+        }
+        assert_eq!(computed("rel")["top"], "5px");
+        assert_eq!(computed("rel")["left"], "7px");
+        assert_eq!(computed("abs")["top"], "10px");
+        assert_eq!(computed("abs")["left"], "12px");
     }
 
     #[test]

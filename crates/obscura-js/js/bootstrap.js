@@ -8229,10 +8229,12 @@ globalThis.getComputedStyle = (el) => {
           return r.width != null ? `${r.width}px` : null;
         case 'height': case 'block-size':
           return r.height != null ? `${r.height}px` : null;
-        case 'left': return r.left != null ? `${r.left}px` : null;
-        case 'top': return r.top != null ? `${r.top}px` : null;
-        case 'right': return r.right != null ? `${r.right}px` : null;
-        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
+        // NOTE: `top`/`left`/`right`/`bottom` are deliberately NOT served from
+        // the bounding rect. They are CSS *insets*, not box coordinates: a
+        // statically positioned element computes them to `auto` no matter where
+        // it sits on the page. Returning the rect made every element look
+        // positioned, and reported a relative element's viewport offset instead
+        // of its declared inset.
         case 'client-width': case 'offset-width':
           return r.width != null ? `${r.width}px` : null;
         case 'client-height': case 'offset-height':
@@ -8266,6 +8268,9 @@ globalThis.getComputedStyle = (el) => {
     'justify-content': 'normal', gap: 'normal',
     'grid-template-columns': 'none', 'grid-template-rows': 'none',
     'will-change': 'auto', 'backface-visibility': 'visible',
+    // Initial value of the inset properties. A positioned element overrides
+    // these from its own declarations through the cascade below.
+    'top': 'auto', 'right': 'auto', 'bottom': 'auto', 'left': 'auto',
   };
 
   const lookup = (rawProp) => {
