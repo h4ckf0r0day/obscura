@@ -1321,6 +1321,11 @@ impl PreparedRender {
             "-webkit-box"
         } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
             "-webkit-inline-box"
+        } else if let Some(computed) = style.computed_display {
+            // Tables and list items have no dedicated layout mode here, so the
+            // box type the cascade produced is carried separately from the
+            // block/flex stand-in that actually lays them out.
+            computed
         } else if style.internal_flex_container {
             "block"
         } else {
@@ -1520,8 +1525,11 @@ impl PreparedRender {
             out.insert("width", dimension_css(style.width, "auto"));
             out.insert("height", dimension_css(style.height, "auto"));
         }
-        out.insert("min-width", dimension_css(style.min_width, "auto"));
-        out.insert("min-height", dimension_css(style.min_height, "auto"));
+        // `auto` is the initial *specified* value, but it computes to `0px` on
+        // everything that is not a flex/grid item, which is what browsers
+        // report. Reporting `auto` made a caller unable to do length math.
+        out.insert("min-width", dimension_css(style.min_width, "0px"));
+        out.insert("min-height", dimension_css(style.min_height, "0px"));
         out.insert("max-width", dimension_css(style.max_width, "none"));
         out.insert("max-height", dimension_css(style.max_height, "none"));
         out.insert(
@@ -1630,7 +1638,11 @@ impl PreparedRender {
         ] {
             out.insert(name, corner_radius_css(radius));
         }
-        out.insert("outline-width", css_px(style.outline.used_width()));
+        // Chromium reports the *specified* width here even when the style is
+        // `none` (`outline-width:9px;outline-style:none` computes to `9px`, and
+        // an untouched element to the `medium` 3px). Only the used width, which
+        // paint and geometry take from `used_width()`, collapses to zero.
+        out.insert("outline-width", css_px(style.outline.specified_width));
         out.insert("outline-style", style.outline.style.css_name().to_string());
         out.insert(
             "outline-color",
@@ -1638,9 +1650,17 @@ impl PreparedRender {
         );
         out.insert("outline-offset", css_px(style.outline.offset));
 
+        // The table approximation sets a column direction and stretch alignment
+        // on every table box. Those are our layout stand-in, not values the
+        // author wrote, so CSSOM reports the initial values instead.
+        let internal_flex_only = style.internal_flex_container;
         out.insert(
             "flex-direction",
-            match style.flex_direction.unwrap_or(taffy::FlexDirection::Row) {
+            match style
+                .flex_direction
+                .filter(|_| style.flex_direction_authored || !internal_flex_only)
+                .unwrap_or(taffy::FlexDirection::Row)
+            {
                 taffy::FlexDirection::Row => "row",
                 taffy::FlexDirection::RowReverse => "row-reverse",
                 taffy::FlexDirection::Column => "column",
@@ -1661,6 +1681,7 @@ impl PreparedRender {
             "align-items",
             style
                 .align_items
+                .filter(|_| style.align_items_authored || !internal_flex_only)
                 .map_or_else(|| "normal".to_string(), align_items_css),
         );
         out.insert(
@@ -1728,6 +1749,239 @@ impl PreparedRender {
                 |(x, y)| format!("{} {}", css_number(x), css_number(y)),
             ),
         );
+
+        // ---------------------------------------------------------------
+        // Properties the layout model already computes but never exposed.
+        // Every one of these previously came back as the empty string, which
+        // a caller cannot distinguish from "not set" (issue #771).
+        // ---------------------------------------------------------------
+        out.insert(
+            "direction",
+            match style.direction.unwrap_or(taffy::Direction::Ltr) {
+                taffy::Direction::Rtl => "rtl",
+                _ => "ltr",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "font-style",
+            if style.font_style_italic.unwrap_or(false) {
+                "italic"
+            } else {
+                "normal"
+            }
+            .to_string(),
+        );
+        let text_decoration_line = if style.underline.unwrap_or(false) {
+            "underline"
+        } else {
+            "none"
+        };
+        out.insert("text-decoration-line", text_decoration_line.to_string());
+        // The shorthand serializes its longhands; only the line is modeled, so
+        // the other two stay at their initial values.
+        out.insert(
+            "text-decoration",
+            if text_decoration_line == "none" {
+                "none solid rgb(0, 0, 0)".to_string()
+            } else {
+                format!(
+                    "underline solid {}",
+                    css_color(style.color.unwrap_or([0, 0, 0, 255]))
+                )
+            },
+        );
+        out.insert(
+            "text-indent",
+            dimension_css(style.text_indent.unwrap_or(crate::Dimension::Px(0.0)), "0px"),
+        );
+        out.insert(
+            "border-spacing",
+            match style.border_spacing {
+                // Browsers collapse the pair when both axes agree.
+                Some((x, y)) if x == y => css_px(x),
+                Some((x, y)) => format!("{} {}", css_px(x), css_px(y)),
+                None => "0px".to_string(),
+            },
+        );
+        out.insert(
+            "background-image",
+            match &style.background_image {
+                Some(url) => format!("url(\"{url}\")"),
+                None => "none".to_string(),
+            },
+        );
+        out.insert(
+            "background-size",
+            match (&style.background_size_expression, style.background_size_fit) {
+                (Some(expression), _) => expression.clone(),
+                (None, Some(crate::ObjectFit::Cover)) => "cover".to_string(),
+                (None, Some(crate::ObjectFit::Contain)) => "contain".to_string(),
+                _ => match style.background_size {
+                    Some((x, y)) => format!("{} {}", css_px(x), css_px(y)),
+                    None => "auto".to_string(),
+                },
+            },
+        );
+        out.insert(
+            "background-position",
+            format!(
+                "{} {}",
+                position_axis_css(style.background_position.x),
+                position_axis_css(style.background_position.y)
+            ),
+        );
+        out.insert(
+            "background-repeat",
+            match style.background_repeat.unwrap_or((true, true)) {
+                (true, true) => "repeat",
+                (true, false) => "repeat-x",
+                (false, true) => "repeat-y",
+                (false, false) => "no-repeat",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "object-fit",
+            match style.object_fit {
+                crate::ObjectFit::Fill => "fill",
+                crate::ObjectFit::Contain => "contain",
+                crate::ObjectFit::Cover => "cover",
+                crate::ObjectFit::ScaleDown => "scale-down",
+                crate::ObjectFit::None => "none",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "object-position",
+            format!(
+                "{} {}",
+                position_axis_css(style.object_position.x),
+                position_axis_css(style.object_position.y)
+            ),
+        );
+        out.insert(
+            "box-shadow",
+            match style.box_shadow {
+                Some(shadow) => {
+                    let mut value = format!(
+                        "{} {} {} {} {}",
+                        css_color(shadow.color),
+                        css_px(shadow.offset_x),
+                        css_px(shadow.offset_y),
+                        css_px(shadow.blur),
+                        css_px(shadow.spread)
+                    );
+                    if shadow.inset {
+                        value.push_str(" inset");
+                    }
+                    value
+                }
+                None => "none".to_string(),
+            },
+        );
+        // Both default to `currentColor`, so they follow the element's color
+        // rather than a fixed default.
+        out.insert(
+            "text-decoration-color",
+            css_color(style.color.unwrap_or([0, 0, 0, 255])),
+        );
+        out.insert(
+            "caret-color",
+            css_color(style.color.unwrap_or([0, 0, 0, 255])),
+        );
+        out.insert(
+            "aspect-ratio",
+            match style.aspect_ratio {
+                // An intrinsic ratio is the replaced element's own, not an
+                // authored one; `auto` is what the property computes to.
+                Some(_) if style.aspect_ratio_is_intrinsic => "auto".to_string(),
+                Some(ratio) => format!("{} / 1", css_number(ratio)),
+                None => "auto".to_string(),
+            },
+        );
+        out.insert(
+            "align-self",
+            style
+                .align_self
+                .map_or_else(|| "auto".to_string(), align_items_css),
+        );
+        out.insert(
+            "justify-self",
+            style
+                .justify_self
+                .map_or_else(|| "auto".to_string(), align_items_css),
+        );
+        out.insert("flex-grow", css_number(style.flex_grow.unwrap_or(0.0)));
+        out.insert("flex-shrink", css_number(style.flex_shrink.unwrap_or(1.0)));
+        out.insert("flex-basis", dimension_css(style.flex_basis, "auto"));
+        out.insert("order", style.order.to_string());
+        out.insert(
+            "grid-column",
+            style
+                .grid_column_raw
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+        );
+        out.insert(
+            "grid-row",
+            style
+                .grid_row_raw
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+        );
+        out.insert(
+            "animation-name",
+            style
+                .animation_name
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        );
+        out.insert(
+            "animation-duration",
+            css_seconds(style.animation_timing.duration_ms),
+        );
+        out.insert(
+            "animation-delay",
+            css_seconds(style.animation_timing.delay_ms),
+        );
+        out.insert(
+            "animation-iteration-count",
+            if style.animation_timing.iteration_count.is_infinite() {
+                "infinite".to_string()
+            } else {
+                css_number(style.animation_timing.iteration_count)
+            },
+        );
+        out.insert(
+            "animation-direction",
+            match style.animation_timing.direction {
+                crate::AnimationDirection::Normal => "normal",
+                crate::AnimationDirection::Reverse => "reverse",
+                crate::AnimationDirection::Alternate => "alternate",
+                crate::AnimationDirection::AlternateReverse => "alternate-reverse",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "animation-fill-mode",
+            match style.animation_timing.fill_mode {
+                crate::AnimationFillMode::None => "none",
+                crate::AnimationFillMode::Forwards => "forwards",
+                crate::AnimationFillMode::Backwards => "backwards",
+                crate::AnimationFillMode::Both => "both",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "animation-play-state",
+            match style.animation_timing.play_state {
+                crate::AnimationPlayState::Running => "running",
+                crate::AnimationPlayState::Paused => "paused",
+            }
+            .to_string(),
+        );
+
         Some(out)
     }
 
@@ -1937,6 +2191,29 @@ fn dimension_css(value: crate::Dimension, auto: &str) -> String {
         crate::Dimension::Vmin(v) => format!("{}vmin", css_number(v)),
         crate::Dimension::Vmax(v) => format!("{}vmax", css_number(v)),
     }
+}
+
+/// CSSOM serialization of one `background-position`/`object-position` axis.
+/// A pure percentage (the initial value of both) serializes as a percentage, a
+/// pure length as `px`, and a mixed value keeps both terms in a `calc()`.
+fn position_axis_css(axis: crate::BackgroundPositionAxis) -> String {
+    match (axis.length, axis.percentage) {
+        // Both axes have a percentage initial value, so an all-zero axis is
+        // the unset one and serializes as `0%`, matching browsers.
+        (0.0, percentage) => format!("{}%", css_number(percentage * 100.0)),
+        (length, 0.0) => css_px(length),
+        (length, percentage) => format!(
+            "calc({} + {}%)",
+            css_px(length),
+            css_number(percentage * 100.0)
+        ),
+    }
+}
+
+/// CSS time serialization. Durations are modeled in milliseconds internally but
+/// computed values are always in seconds.
+fn css_seconds(milliseconds: f32) -> String {
+    format!("{}s", css_number(milliseconds / 1000.0))
 }
 
 fn radius_value_css(value: crate::RadiusValue) -> String {
@@ -12733,7 +13010,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_none_retains_width_but_does_not_change_geometry_or_computed_used_width() {
+    fn outline_none_retains_specified_width_but_does_not_change_geometry() {
         let tree = parse_html(
             r#"<html><body style="margin:0"><div id="box" style="width:40px;height:20px;
                 outline-width:9px;outline-style:none"></div></body></html>"#,
@@ -12744,7 +13021,13 @@ mod tests {
         let rect = prepared.document_rect(id).unwrap();
         assert_eq!((rect.width, rect.height), (40.0, 20.0));
         assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
-        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
+        // The *used* width is zero (hence the unchanged geometry above), but
+        // the computed value browsers report is the specified one. Measured on
+        // Chromium 147: `outline-width:9px;outline-style:none` computes to
+        // `9px`, and an element with no outline at all to the `medium` `3px`.
+        // CSS-UI's "computed value: ... 0 if the outline style is none" is not
+        // what Blink implements, and matching Blink is this engine's contract.
+        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "9px");
     }
 
     #[test]
@@ -14997,6 +15280,142 @@ mod tests {
             computed.get("word-break").map(String::as_str),
             Some("keep-all")
         );
+    }
+
+
+    #[test]
+    fn computed_style_reports_table_and_list_item_box_types() {
+        // The layout model approximates tables with flex containers, so
+        // `display` used to report `block` for every table box and CSSOM could
+        // not read a table's box type back at all. The internal column
+        // direction and stretch alignment leaked out with it.
+        let tree = parse_html(
+            r#"<table id="t"><thead id="head"><tr id="tr"><th id="th">h</th></tr></thead>
+                 <tbody id="body"><tr><td id="td">c</td></tr></tbody></table>
+               <ul><li id="li">z</li></ul>
+               <div id="celldiv" style="display:table-cell">x</div>
+               <div id="tablediv" style="display:table">y</div>
+               <div id="authored" style="display:flex;flex-direction:column;align-items:stretch">z</div>
+               <div id="plain">d</div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        for (id, expected) in [
+            ("t", "table"),
+            ("head", "table-header-group"),
+            ("body", "table-row-group"),
+            ("tr", "table-row"),
+            ("th", "table-cell"),
+            ("td", "table-cell"),
+            ("li", "list-item"),
+            ("celldiv", "table-cell"),
+            ("tablediv", "table"),
+            ("plain", "block"),
+            ("authored", "flex"),
+        ] {
+            assert_eq!(computed(id)["display"], expected, "display of #{id}");
+        }
+
+        // A table box never wrote these; reporting our stand-in made every
+        // table look like a column flexbox.
+        for id in ["t", "tr", "td", "celldiv"] {
+            assert_eq!(computed(id)["flex-direction"], "row", "#{id}");
+            assert_eq!(computed(id)["align-items"], "normal", "#{id}");
+        }
+        // An author who really did write them still gets them back.
+        let authored = computed("authored");
+        assert_eq!(authored["flex-direction"], "column");
+        assert_eq!(authored["align-items"], "stretch");
+    }
+
+    #[test]
+    fn computed_style_exposes_previously_empty_longhands() {
+        // Each of these returned the empty string, which a caller cannot tell
+        // apart from "not set".
+        let tree = parse_html(
+            r##"<style>#set{background-image:url(a.png);background-repeat:no-repeat;
+                 background-position:right 10px;background-size:cover;font-style:italic;
+                 text-indent:2em;align-self:center;flex-grow:2;flex-shrink:0;
+                 flex-basis:10px;order:3;aspect-ratio:1.5;object-fit:contain;
+                 box-shadow:1px 2px 3px 4px #f00;color:#00f;direction:rtl}</style>
+               <div id="set"></div><div id="unset"></div>
+               <table id="spaced" cellspacing="2"><tr><td>c</td></tr></table>
+               <a id="link" href="#">l</a>"##,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        let unset = computed("unset");
+        for (name, expected) in [
+            ("background-image", "none"),
+            ("background-size", "auto"),
+            ("background-position", "0% 0%"),
+            ("background-repeat", "repeat"),
+            ("font-style", "normal"),
+            ("text-decoration-line", "none"),
+            ("text-indent", "0px"),
+            ("border-spacing", "0px"),
+            ("align-self", "auto"),
+            ("justify-self", "auto"),
+            ("flex-grow", "0"),
+            ("flex-shrink", "1"),
+            ("flex-basis", "auto"),
+            ("order", "0"),
+            ("grid-column", "auto"),
+            ("grid-row", "auto"),
+            ("animation-name", "none"),
+            ("animation-duration", "0s"),
+            ("animation-iteration-count", "1"),
+            ("box-shadow", "none"),
+            ("object-fit", "fill"),
+            ("object-position", "50% 50%"),
+            ("aspect-ratio", "auto"),
+            ("direction", "ltr"),
+            // `auto` is the initial specified value but computes to zero on
+            // anything that is not a flex or grid item.
+            ("min-width", "0px"),
+            ("min-height", "0px"),
+            // Chromium reports the specified width even when the style is
+            // `none`; only the *used* width collapses to zero.
+            ("outline-width", "3px"),
+        ] {
+            assert_eq!(unset[name], expected, "unset {name}");
+        }
+
+        let set = computed("set");
+        assert_eq!(set["background-image"], r#"url("a.png")"#);
+        assert_eq!(set["background-repeat"], "no-repeat");
+        assert_eq!(set["background-size"], "cover");
+        assert_eq!(set["font-style"], "italic");
+        assert_eq!(set["text-indent"], "32px");
+        assert_eq!(set["align-self"], "center");
+        assert_eq!(set["flex-grow"], "2");
+        assert_eq!(set["flex-shrink"], "0");
+        assert_eq!(set["flex-basis"], "10px");
+        assert_eq!(set["order"], "3");
+        assert_eq!(set["object-fit"], "contain");
+        assert_eq!(set["aspect-ratio"], "1.5 / 1");
+        assert_eq!(set["direction"], "rtl");
+        assert_eq!(set["box-shadow"], "rgb(255, 0, 0) 1px 2px 3px 4px");
+        // currentColor-derived, so they track the element's own color.
+        assert_eq!(set["caret-color"], "rgb(0, 0, 255)");
+        assert_eq!(set["text-decoration-color"], "rgb(0, 0, 255)");
+
+        assert_eq!(computed("spaced")["border-spacing"], "2px");
+        assert_eq!(computed("link")["text-decoration-line"], "underline");
     }
 
     #[test]

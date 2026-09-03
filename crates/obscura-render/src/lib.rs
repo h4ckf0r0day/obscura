@@ -994,6 +994,22 @@ pub struct LayoutStyle {
     /// layout such as table cells, rather than the computed CSS display.
     /// Descendants are not CSS flex items in these containers.
     pub internal_flex_container: bool,
+    /// The CSS box type to report from `getComputedStyle().display`, when the
+    /// layout model represents it with something else.
+    ///
+    /// Table boxes are approximated with flex containers and list items have no
+    /// dedicated layout mode, so `style.display` alone reports `block`/`flex`
+    /// for every one of them and CSSOM callers cannot read a table's box type
+    /// back at all. This keeps the computed value the cascade actually produced.
+    pub(crate) computed_display: Option<&'static str>,
+    /// The author (not the UA table approximation) specified `flex-direction`.
+    ///
+    /// The table stand-in sets a column direction on every table box, which
+    /// would otherwise be reported as the computed value of a property the
+    /// author never wrote.
+    pub(crate) flex_direction_authored: bool,
+    /// The author specified `align-items`. See `flex_direction_authored`.
+    pub(crate) align_items_authored: bool,
     /// The computed inner display is `table`.
     ///
     /// Taffy has no table display mode, so authored table boxes are represented

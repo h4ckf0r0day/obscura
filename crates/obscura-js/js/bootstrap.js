@@ -8266,6 +8266,25 @@ globalThis.getComputedStyle = (el) => {
     'justify-content': 'normal', gap: 'normal',
     'grid-template-columns': 'none', 'grid-template-rows': 'none',
     'will-change': 'auto', 'backface-visibility': 'visible',
+    // Properties the renderer does not model at all. Returning '' for these
+    // is indistinguishable from "not set", so a caller that branches on the
+    // value silently takes the wrong path instead of failing visibly; the CSS
+    // initial value is both a valid answer and the right one for the
+    // overwhelming majority of elements. Anything the renderer *does* compute
+    // is served from its snapshot above and never reaches this table.
+    'word-spacing': '0px', 'list-style-position': 'outside',
+    'list-style-image': 'none', 'caption-side': 'top', 'empty-cells': 'show',
+    'transition-property': 'all', 'transition-duration': '0s',
+    'transition-delay': '0s', 'transition-timing-function': 'ease',
+    'animation-timing-function': 'ease',
+    'user-select': 'auto', 'text-shadow': 'none', 'content': 'normal',
+    'resize': 'none', 'appearance': 'none', 'filter': 'none',
+    'mix-blend-mode': 'normal', 'isolation': 'auto', 'contain': 'none',
+    'writing-mode': 'horizontal-tb', 'unicode-bidi': 'normal', 'zoom': '1',
+    'overflow-anchor': 'auto', 'text-decoration-style': 'solid',
+    'font-variant': 'normal', 'font-stretch': '100%',
+    'background-attachment': 'scroll', 'border-image-source': 'none',
+    'clip-path': 'none', 'scroll-behavior': 'auto', 'touch-action': 'auto',
   };
 
   const lookup = (rawProp) => {
