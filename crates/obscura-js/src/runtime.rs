@@ -13720,15 +13720,20 @@ mod tests {
         );
         assert!(out.contains("one"), "visible text missing: {out:?}");
         assert!(out.contains("two"), "visible text missing: {out:?}");
-        assert!(
-            out.contains("one\ntwo"),
-            "block boundary must produce a line break: {out:?}"
-        );
+        // The display:none leg needs a renderer for box geometry: without one
+        // that div is indistinguishable from visible content and stays in the
+        // output, so the adjacency check only holds in render builds.
         #[cfg(feature = "render")]
-        assert!(
-            !out.contains("hidden block"),
-            "display:none subtree must not appear in innerText: {out:?}"
-        );
+        {
+            assert!(
+                !out.contains("hidden block"),
+                "display:none subtree must not appear in innerText: {out:?}"
+            );
+            assert!(
+                out.contains("one\ntwo"),
+                "block boundary must produce a line break: {out:?}"
+            );
+        }
     }
 
     #[test]
