@@ -933,16 +933,23 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
         .ok_or("Missing url parameter")?;
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
-    let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
+    let condition = match obscura_browser::lifecycle::WaitUntil::from_str(wait_until) {
+        // MCP has no continuously running owner for a live DCL continuation.
+        obscura_browser::lifecycle::WaitUntil::DomContentLoaded => {
+            obscura_browser::lifecycle::WaitUntil::Load
+        }
+        condition => condition,
+    };
     let ua = state.user_agent.clone();
-    let page = state.page_mut();
-    if let Some(ref ua) = ua {
-        page.http_client.set_user_agent(ua).await;
+    {
+        let page = state.page_mut();
+        if let Some(ref ua) = ua {
+            page.http_client.set_user_agent(ua).await;
+        }
+        page.navigate_with_wait(url, condition).await
+            .map_err(|e| e.to_string())?;
     }
-
-    page.navigate_with_wait(url, condition).await
-        .map_err(|e| e.to_string())?;
-
+    let page = state.page_mut();
     let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
     // DOM changed — invalidate the ref table. Next snapshot will rebuild.
     state.interactive_refs.clear();
@@ -1350,7 +1357,7 @@ async fn tool_back(state: &mut BrowserState) -> Result<String, String> {
     let prev_idx = page.history_index - 1;
     let url = page.history[prev_idx].clone();
     page.set_history_index(prev_idx);
-    let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
+    let condition = obscura_browser::lifecycle::WaitUntil::Load;
     let stash = (page.history.clone(), page.history_index);
     page.navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     let page = state.page_mut();
@@ -1368,7 +1375,7 @@ async fn tool_forward(state: &mut BrowserState) -> Result<String, String> {
     let next_idx = page.history_index + 1;
     let url = page.history[next_idx].clone();
     page.set_history_index(next_idx);
-    let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
+    let condition = obscura_browser::lifecycle::WaitUntil::Load;
     let stash = (page.history.clone(), page.history_index);
     page.navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     let page = state.page_mut();
@@ -1383,7 +1390,7 @@ async fn tool_reload(state: &mut BrowserState) -> Result<String, String> {
     if url == "about:blank" {
         return Err("Nothing to reload.".to_string());
     }
-    let condition = obscura_browser::lifecycle::WaitUntil::DomContentLoaded;
+    let condition = obscura_browser::lifecycle::WaitUntil::Load;
     state.page_mut().navigate_with_wait(&url, condition).await.map_err(|e| e.to_string())?;
     state.interactive_refs.clear();
     Ok(format!("Reloaded {url}"))
@@ -1772,9 +1779,9 @@ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, 
         if let Some(ref ua) = ua {
             page.http_client.set_user_agent(ua).await;
         }
-        page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
+        page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::Load)
             .await.map_err(|e| e.to_string())?;
-        Ok(format!("Opened {id} and navigated to {}", page.url_string()))
+        Ok(format!("Opened {id} and navigated to {}", state.page_mut().url_string()))
     } else {
         Ok(format!("Opened {id} (about:blank)."))
     }
@@ -2076,6 +2083,25 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_dcl_navigation_keeps_its_historical_loaded_contract() {
+        let mut state = BrowserState::new(None, None, false);
+        tool_navigate(
+            &json!({
+                "url": "data:text/html,<script>window.addEventListener('load',()=>globalThis.__loadSeen=true)</script>",
+                "waitUntil": "domcontentloaded",
+            }),
+            &mut state,
+        )
+        .await
+        .expect("MCP navigation");
+        assert_eq!(
+            state.page_mut().lifecycle,
+            obscura_browser::lifecycle::LifecycleState::Loaded,
+        );
+        assert_eq!(state.page_mut().evaluate("globalThis.__loadSeen === true"), json!(true));
+    }
 
     fn listed_tools() -> Vec<Value> {
         handle_tools_list(json!(1)).result.expect("tools/list result")

@@ -1,4 +1,5 @@
 use obscura_browser::lifecycle::WaitUntil;
+use obscura_browser::lifecycle::LifecycleState;
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -845,11 +846,18 @@ pub fn emit_navigation_events(
     page_url: &str,
     page_id: &str,
     network_events: &[obscura_browser::NetworkEvent],
-    wait_until: WaitUntil,
-    reached_network_idle: bool,
+    _wait_until: WaitUntil,
+    _reached_network_idle: bool,
 ) {
+    // The final two arguments remain for downstream callers of this public
+    // helper. Lifecycle emission now derives solely from Page state so a
+    // requested wait mode cannot fabricate a transition.
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
+    ctx.navigation_sessions
+        .insert(page_id.to_string(), session_id.clone());
+    ctx.emitted_document_lifecycle
+        .insert(page_id.to_string(), LifecycleState::Loading);
     let es = session_id.clone();
     let ts = timestamp();
 
@@ -997,38 +1005,18 @@ pub fn emit_navigation_events(
         });
     }
 
-    let mut phase3 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.domContentEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.loadEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-    ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
-        let idle_ts = timestamp();
-        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
-    }
-    phase3.push(CdpEvent {
-        method: "Page.frameStoppedLoading".into(),
-        params: json!({"frameId": frame_id}),
-        session_id: es,
-    });
-    ctx.pending_events.extend(phase3);
+    let lifecycle_state = ctx
+        .get_page(page_id)
+        .map(|page| page.lifecycle)
+        .unwrap_or(LifecycleState::Failed);
+    emit_document_lifecycle_state(
+        ctx,
+        session_id,
+        frame_id,
+        loader_id,
+        page_id,
+        lifecycle_state,
+    );
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
     // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
@@ -1053,6 +1041,74 @@ pub fn emit_navigation_events(
             }
         }),
     ));
+}
+
+pub(crate) fn emit_document_lifecycle_state(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    page_id: &str,
+    state: LifecycleState,
+) {
+    let last = ctx
+        .emitted_document_lifecycle
+        .get(page_id)
+        .copied()
+        .unwrap_or(LifecycleState::Loading);
+    let emit_dom_content_loaded = matches!(
+        state,
+        LifecycleState::DomContentLoaded | LifecycleState::Loaded | LifecycleState::NetworkIdle
+    ) && !matches!(
+        last,
+        LifecycleState::DomContentLoaded | LifecycleState::Loaded | LifecycleState::NetworkIdle
+    );
+    let emit_load = matches!(state, LifecycleState::Loaded | LifecycleState::NetworkIdle)
+        && !matches!(last, LifecycleState::Loaded | LifecycleState::NetworkIdle);
+    let emit_network_idle = state == LifecycleState::NetworkIdle
+        && last != LifecycleState::NetworkIdle;
+
+    if emit_dom_content_loaded {
+        let timestamp = timestamp();
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.domContentEventFired".into(),
+            params: json!({"timestamp": timestamp}),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": timestamp}),
+            session_id: session_id.clone(),
+        });
+    }
+    if emit_load {
+        let timestamp = timestamp();
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({"timestamp": timestamp}),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": timestamp}),
+            session_id: session_id.clone(),
+        });
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame_id}),
+            session_id: session_id.clone(),
+        });
+    }
+    if emit_network_idle {
+        let timestamp = timestamp();
+        ctx.pending_events.push(CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": timestamp}),
+            session_id: session_id.clone(),
+        });
+    }
+    ctx.emitted_document_lifecycle
+        .insert(page_id.to_string(), state);
 }
 
 /// Emit completed script-initiated requests after the document lifecycle has
@@ -1171,6 +1227,15 @@ async fn do_navigate(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     let wait_until = parse_wait_until(params);
+    // The public in-process dispatcher has no autonomous owner to preserve a
+    // post-DCL runtime across a command targeting another page. Keep its
+    // historical fully-loaded contract; the WebSocket server owns the real
+    // DCL handoff and continuation pump.
+    let navigation_wait = if wait_until == WaitUntil::DomContentLoaded {
+        WaitUntil::Load
+    } else {
+        wait_until
+    };
 
     // Block CDP-initiated file:// navigation by default.
     // Anyone who can reach the CDP port (default localhost,
@@ -1190,7 +1255,14 @@ async fn do_navigate(
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
-    let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
+    let (
+        frame_id,
+        loader_id,
+        network_events,
+        page_url,
+        page_id,
+        reached_network_idle,
+    ) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
@@ -1208,11 +1280,11 @@ async fn do_navigate(
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
         if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
+            page.navigate_with_wait_post(url, navigation_wait, nav_method, nav_body)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
-            page.navigate_with_wait(url, wait_until)
+            page.navigate_with_wait(url, navigation_wait)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1475,11 +1547,17 @@ pub async fn handle(
                         .ok_or("No page for session")?;
                     (page.history.clone(), page.history_index)
                 };
-                let (frame_id, page_id, network_events, page_url, reached_idle) = {
+                let (
+                    frame_id,
+                    page_id,
+                    network_events,
+                    page_url,
+                    reached_idle,
+                ) = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
-                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
+                    page.navigate_with_wait(&url, WaitUntil::Load)
                         .await
                         .map_err(|e| e.to_string())?;
                     page.history = stash.0;
@@ -1729,6 +1807,31 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_navigation_finishes_load_before_returning() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id);
+
+        handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<script>window.addEventListener('load',()=>globalThis.__loadSeen=true)</script>",
+                "waitUntil": "domcontentloaded",
+            }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("in-process navigation");
+
+        let page = ctx.get_session_page_mut(&session_id).expect("page");
+        assert_eq!(page.lifecycle, LifecycleState::Loaded);
+        assert_eq!(page.evaluate("globalThis.__loadSeen === true"), json!(true));
+    }
 
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {

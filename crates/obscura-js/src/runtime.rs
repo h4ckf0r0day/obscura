@@ -283,10 +283,7 @@ pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> Wat
 }
 
 impl WatchdogToken {
-    /// Stop the watchdog. Returns true if it had already fired (terminated the
-    /// isolate). The caller must then clear the termination flag via
-    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
-    pub fn stop(mut self) -> bool {
+    fn cancel_and_join(&mut self) {
         {
             let (lock, cvar) = &*self.pair;
             *lock.lock().unwrap() = true;
@@ -295,7 +292,23 @@ impl WatchdogToken {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+
+    /// Stop the watchdog. Returns true if it had already fired (terminated the
+    /// isolate). The caller must then clear the termination flag via
+    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
+    pub fn stop(mut self) -> bool {
+        self.cancel_and_join();
         self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WatchdogToken {
+    fn drop(&mut self) {
+        // Futures which own a watchdog may be cancelled while parked on I/O.
+        // Dropping the token must not leave a detached thread which later
+        // terminates an isolate that has already moved on to another task.
+        self.cancel_and_join();
     }
 }
 
@@ -1213,6 +1226,14 @@ impl ObscuraJsRuntime {
     ) {
         let mut state = self.state.borrow_mut();
         state.intercept_tx = Some(tx);
+    }
+
+    #[cfg(feature = "internal-cdp")]
+    #[doc(hidden)]
+    pub fn set_intercept_owner(&self, page_id: String, request_scope: String) {
+        let mut state = self.state.borrow_mut();
+        state.intercept_owner_page_id = page_id;
+        state.intercept_request_scope = request_scope;
     }
 
     pub fn set_intercept_enabled(&self, enabled: bool) {
@@ -2690,7 +2711,8 @@ impl ObscuraJsRuntime {
     }
 
     /// Whether a connected dynamic script prepared before the document load
-    /// event still has fetch/evaluation/load-or-error work outstanding.
+    /// event still has work outstanding, or the queued document load task has
+    /// not completed its task-end microtask checkpoint yet.
     ///
     /// This intentionally excludes `import()` and scripts created by a load
     /// handler. Those are ordinary post-load enhancement work and should only
@@ -2894,11 +2916,29 @@ impl ObscuraJsRuntime {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
+        self.run_autonomous_event_loop_turn_with_watchdog(
+            std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+        )
+        .await
+    }
+
+    async fn run_autonomous_event_loop_turn_with_watchdog(
+        &mut self,
+        task_budget: std::time::Duration,
+    ) -> Result<bool, String> {
+        self.run_event_loop_turn_with_watchdog(task_budget, true).await
+    }
+
+    async fn run_event_loop_turn_with_watchdog(
+        &mut self,
+        task_budget: std::time::Duration,
+        wait_for_wake: bool,
+    ) -> Result<bool, String> {
         self.begin_javascript_task();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
             self.isolate_handle(),
-            std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+            task_budget,
         );
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
@@ -2914,7 +2954,7 @@ impl ObscuraJsRuntime {
         let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
-                std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
+                task_budget,
             );
             let tick = self
                 .runtime()
@@ -2940,7 +2980,7 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
-                std::task::Poll::Pending if waiting_for_wake => {
+                std::task::Poll::Pending if !wait_for_wake || waiting_for_wake => {
                     std::task::Poll::Ready(Ok(false))
                 }
                 std::task::Poll::Pending => {
@@ -2953,12 +2993,13 @@ impl ObscuraJsRuntime {
         self.finish_heap_checked(result)
     }
 
-    /// Drive one cooperative event-loop turn for browser lifecycle code that
-    /// must re-check an external readiness predicate after every wake. The
+    /// Drive one event-loop poll for browser lifecycle code that must re-check
+    /// an external readiness predicate without parking on unrelated I/O. The
     /// boolean is true only when deno_core reached full idle.
     #[doc(hidden)]
     pub async fn run_load_delaying_event_loop_tick(&mut self) -> Result<bool, String> {
-        self.run_cooperative_event_loop_tick().await
+        self.run_event_loop_turn_with_watchdog(std::time::Duration::from_secs(1), false)
+            .await
     }
 
     /// Pump deferred work until deno_core reports true idle, or until the page
@@ -6186,6 +6227,49 @@ mod tests {
             serde_json::json!("usable"),
             "the per-turn watchdog must leave the isolate reusable",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_watchdog_excludes_time_parked_on_a_timer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "autonomous-parked-timer",
+            "globalThis.__parkedTimerDone = false;\
+             setTimeout(() => { globalThis.__parkedTimerDone = true; }, 100);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rt.run_autonomous_event_loop_turn_with_watchdog(
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("autonomous timer turn remained parked")
+        .expect("parked time was incorrectly charged to the synchronous watchdog");
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(80),
+            "the event loop did not remain parked beyond the test watchdog budget",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__parkedTimerDone").unwrap(),
+            serde_json::json!(true),
+            "the isolate must remain reusable after a parked autonomous turn",
+        );
+    }
+
+    #[test]
+    fn dropping_a_cancelled_watchdog_cannot_terminate_later_work() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        {
+            let _cancelled = rt.arm_watchdog(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
 
     #[tokio::test(flavor = "current_thread")]

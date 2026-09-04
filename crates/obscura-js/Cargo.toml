@@ -7,6 +7,8 @@ repository.workspace = true
 
 [features]
 default = []
+# Unstable ownership metadata used only by obscura-cdp.
+internal-cdp = []
 # Builds obscura-net with its stealth (wreq) HTTP client and lets scripted
 # fetch()/XHR be routed through it so JS-level requests carry the same Chrome
 # TLS fingerprint and client hints as stealth navigation.

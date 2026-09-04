@@ -1,6 +1,9 @@
 pub mod context;
 mod fork_virtual_url;
 pub mod lifecycle;
+#[cfg(feature = "internal-cdp")]
+#[doc(hidden)]
+pub mod navigation;
 pub mod page;
 #[cfg(feature = "render")]
 pub mod pdf;

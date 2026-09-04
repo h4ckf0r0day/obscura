@@ -7,6 +7,8 @@ repository.workspace = true
 
 [features]
 default = []
+# Unstable bridge used only by obscura-cdp; not part of the embeddable API.
+internal-cdp = ["obscura-js/internal-cdp"]
 stealth = ["obscura-net/stealth", "obscura-js/stealth"]
 render = ["obscura-js/render", "dep:image"]
 

@@ -51,6 +51,9 @@ pub enum InterceptResolution {
 }
 
 pub struct InterceptedRequest {
+    #[cfg(feature = "internal-cdp")]
+    #[doc(hidden)]
+    pub owner_page_id: String,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -123,6 +126,10 @@ pub struct ObscuraState {
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    #[cfg(feature = "internal-cdp")]
+    pub intercept_owner_page_id: String,
+    #[cfg(feature = "internal-cdp")]
+    pub intercept_request_scope: String,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
     // Queue of (binding_name, payload) calls made by page JS via the
@@ -308,6 +315,10 @@ impl ObscuraState {
             stealth_client: None,
             pending_navigation: None,
             intercept_tx: None,
+            #[cfg(feature = "internal-cdp")]
+            intercept_owner_page_id: String::new(),
+            #[cfg(feature = "internal-cdp")]
+            intercept_request_scope: String::new(),
             intercept_counter: 0,
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
@@ -2339,9 +2350,19 @@ async fn op_fetch_url(
         );
         let itx = if gs.intercept_enabled {
             gs.intercept_counter += 1;
-            gs.intercept_tx
-                .clone()
-                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+            #[cfg(feature = "internal-cdp")]
+            let owner_page_id = gs.intercept_owner_page_id.clone();
+            #[cfg(not(feature = "internal-cdp"))]
+            let owner_page_id = String::new();
+            #[cfg(feature = "internal-cdp")]
+            let request_id = if !gs.intercept_request_scope.is_empty() {
+                format!("{}:intercept-{}", gs.intercept_request_scope, gs.intercept_counter)
+            } else {
+                format!("intercept-{}", gs.intercept_counter)
+            };
+            #[cfg(not(feature = "internal-cdp"))]
+            let request_id = format!("intercept-{}", gs.intercept_counter);
+            gs.intercept_tx.clone().map(|tx| (tx, request_id, owner_page_id))
         } else {
             None
         };
@@ -2391,11 +2412,15 @@ async fn op_fetch_url(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    if let Some((tx, request_id)) = intercept_tx {
+    if let Some((tx, request_id, owner_page_id)) = intercept_tx {
+        #[cfg(not(feature = "internal-cdp"))]
+        let _ = &owner_page_id;
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
+            #[cfg(feature = "internal-cdp")]
+            owner_page_id,
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),

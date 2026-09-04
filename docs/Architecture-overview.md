@@ -56,9 +56,11 @@ viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
 
-## Single V8 isolate
+## V8 ownership
 
-All pages in a process share one V8 isolate. The isolate is single-threaded by design.
+Each CDP connection owns a dedicated processor thread. Its page runtimes stay
+on that thread and only one page runtime is active at a time. Different
+connections therefore cannot enter each other's V8 isolates.
 
 `obscura_js::v8_lock::global()` is a `tokio::sync::Mutex` that serializes V8 work. A handler that wants to run JS must acquire the lock first:
 
@@ -67,9 +69,17 @@ let _guard = obscura_js::v8_lock::global().lock().await;
 page.evaluate(expr).await
 ```
 
-The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
+The dispatcher routes navigation through `process_with_interception` in
+`server.rs`, which keeps the task's join handle and continues receiving
+WebSocket control messages without entering V8 concurrently. Commands that
+would activate another page are deferred in a bounded queue.
 
-This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
+An internal, feature-gated `NavigationControl` registers the current runtime's
+thread-safe V8 isolate handle. Target close, context disposal, connection loss,
+and shutdown set a sticky cancellation flag and terminate synchronous V8 work
+when necessary. The owner thread then unwinds the navigation future normally,
+clears V8 termination, awaits the task, and drops the page. A canceled page is
+never reinserted.
 
 ## Robustness
 
@@ -98,7 +108,11 @@ Worked example: [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.
 Each CDP client connection gets attached to one or more targets.
 Session IDs are `"{targetId}-session"`. The dispatcher routes by `sessionId` in the incoming frame to the right `Page`.
 
-Targets are created by `Target.createTarget`. Closing the WebSocket detaches all sessions but leaves the pages running.
+Targets are created by `Target.createTarget`. Closing the WebSocket is
+connection-local teardown: in-flight navigation is canceled, paused requests
+are failed, and that connection's pages, sessions, loaders, frame state,
+screencasts, streams, pending events, and deferred commands are dropped.
+Other connections are unaffected.
 
 ## Lifecycle
 
@@ -108,7 +122,25 @@ Lifecycle events are emitted by `obscura-browser/lifecycle.rs` as the page trans
 init → commit → domcontentloaded → load → networkidle2 → networkidle0
 ```
 
-`waitUntil` on `Page.navigate` blocks until the requested level is reached. The Puppeteer / Playwright `goto` resolves on the matching `Page.lifecycleEvent` client-side.
+Puppeteer and Playwright do not send a server-side `waitUntil` with raw
+`Page.navigate`. The WebSocket server therefore returns the navigation result
+at DOMContentLoaded, keeps ownership of the live page runtime, and streams the
+later load transition. Same-page commands may run during
+that continuation. Commands which would activate another page are held in a
+bounded per-connection queue until the active page reaches load or its bounded
+load-script deadline ends, because suspending the single V8 isolate
+earlier would otherwise discard timers, fetches, and dynamic-script jobs.
+After load, a wake-driven drain may retain that ownership for at most one
+second so work queued by a load handler can publish its network/runtime events
+before another target replaces the active isolate.
+
+Load is emitted only after load-delaying scripts and their Network/Runtime
+events have been drained. Lifecycle events are emitted once per document and remain
+routed to the session that initiated the navigation. In-process CDP and MCP do
+not own an autonomous WebSocket pump, so they preserve their historical
+fully-loaded return contract instead of exposing an unowned DCL continuation.
+Puppeteer / Playwright `goto` resolves client-side when its requested lifecycle
+event arrives.
 
 ## Storage
 

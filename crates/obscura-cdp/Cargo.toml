@@ -14,7 +14,7 @@ render = ["obscura-browser/render", "dep:image", "dep:png"]
 
 [dependencies]
 obscura-dom = { workspace = true }
-obscura-browser = { workspace = true }
+obscura-browser = { workspace = true, features = ["internal-cdp"] }
 obscura-js = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
@@ -37,3 +37,4 @@ libc = "0.2"
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
+tracing-subscriber = { workspace = true }
