@@ -13691,6 +13691,47 @@ mod tests {
     }
 
     #[test]
+    fn inner_text_excludes_non_rendered_subtrees() {
+        // #828: innerText approximates rendered text. Script and style
+        // source must never appear, and block boundaries produce line
+        // breaks. The display:none leg needs a renderer for box geometry.
+        let mut rt = setup_runtime(
+            "<html><body>\n\
+             <div id='d'>one</div>\n\
+             <script>var leaked = 'SCRIPT_SOURCE';</script>\n\
+             <style>p { color: red; }</style>\n\
+             <div id='h' style='display:none'>hidden block</div>\n\
+             <p>two</p>\n\
+             </body></html>",
+        );
+        let out = rt
+            .evaluate("document.body.innerText")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !out.contains("SCRIPT_SOURCE"),
+            "script source leaked into innerText: {out:?}"
+        );
+        assert!(
+            !out.contains("color: red"),
+            "style source leaked into innerText: {out:?}"
+        );
+        assert!(out.contains("one"), "visible text missing: {out:?}");
+        assert!(out.contains("two"), "visible text missing: {out:?}");
+        assert!(
+            out.contains("one\ntwo"),
+            "block boundary must produce a line break: {out:?}"
+        );
+        #[cfg(feature = "render")]
+        assert!(
+            !out.contains("hidden block"),
+            "display:none subtree must not appear in innerText: {out:?}"
+        );
+    }
+
+    #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ua = rt.evaluate("navigator.userAgent").unwrap();
