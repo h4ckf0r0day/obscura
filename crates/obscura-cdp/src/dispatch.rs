@@ -55,14 +55,12 @@ pub struct CdpContext {
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
-    /// Pages whose initial navigation event sequence has been emitted. A page
-    /// is created already loaded (about:blank), but Chrome emits that load's
-    /// events when the client attaches; Page.enable emits them once per page
-    /// so clients waiting on the initial load (chromiumoxide, #833) unblock.
-    pub nav_events_emitted: std::collections::HashSet<String>,
-    /// Child frame ids already reported to the client, per page, so each frame
-    /// is announced once and a frame that goes away can be retracted.
+    /// Child frame ids currently observed per page.
     pub announced_frames: HashMap<String, Vec<String>>,
+    /// Child frame ids reported to each Page-enabled session.
+    pub(crate) page_announced_frames_by_session: HashMap<String, Vec<String>>,
+    /// Sessions that have received the page snapshot emitted by Page.enable.
+    pub(crate) page_initial_events_emitted_sessions: HashSet<String>,
     pub pending_events: Vec<CdpEvent>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -75,6 +73,12 @@ pub struct CdpContext {
     target_session_counter: u64,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
+    /// Sessions that called Page.enable.
+    pub(crate) page_enabled_sessions: HashSet<String>,
+    /// Sessions that enabled the optional Page.lifecycleEvent stream.
+    pub(crate) lifecycle_enabled_sessions: HashSet<String>,
+    /// Sessions that called Network.enable.
+    pub(crate) network_enabled_sessions: HashSet<String>,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
     // session-scoped subscription in CDP, and a client discards any event whose
     // sessionId is not one it holds, so the call has to go back to the session
@@ -173,8 +177,9 @@ impl CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
-            nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
+            page_announced_frames_by_session: HashMap::new(),
+            page_initial_events_emitted_sessions: HashSet::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -187,6 +192,9 @@ impl CdpContext {
             target_session_counter: 0,
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
+            page_enabled_sessions: HashSet::new(),
+            lifecycle_enabled_sessions: HashSet::new(),
+            network_enabled_sessions: HashSet::new(),
             runtime_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
@@ -344,7 +352,7 @@ impl CdpContext {
             }
         }
         for session_id in &removed_sessions {
-            self.runtime_enabled_sessions.remove(session_id);
+            self.remove_session_subscriptions(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -502,6 +510,62 @@ impl CdpContext {
         sessions
     }
 
+    pub(crate) fn remove_session_subscriptions(&mut self, session_id: &str) {
+        self.page_announced_frames_by_session.remove(session_id);
+        self.page_initial_events_emitted_sessions.remove(session_id);
+        self.page_enabled_sessions.remove(session_id);
+        self.lifecycle_enabled_sessions.remove(session_id);
+        self.network_enabled_sessions.remove(session_id);
+        self.runtime_enabled_sessions.remove(session_id);
+        for sessions in self.binding_sessions.values_mut() {
+            sessions.retain(|registered| registered != session_id);
+        }
+    }
+
+    pub(crate) fn detach_session(&mut self, session_id: &str) -> Option<String> {
+        let page_id = self.sessions.remove(session_id)?;
+        let had_network_subscription = self.network_enabled_sessions.contains(session_id);
+        self.remove_session_subscriptions(session_id);
+        if had_network_subscription
+            && !self.has_session_for_page(&self.network_enabled_sessions, &page_id)
+        {
+            if let Some(page) = self.get_page_mut(&page_id) {
+                page.clear_response_bodies();
+            }
+        }
+        Some(page_id)
+    }
+
+    pub(crate) fn has_session_for_page(
+        &self,
+        enabled_sessions: &HashSet<String>,
+        page_id: &str,
+    ) -> bool {
+        enabled_sessions.iter().any(|session_id| {
+            self.sessions
+                .get(session_id)
+                .is_some_and(|owner| owner == page_id)
+        })
+    }
+
+    pub(crate) fn sessions_for_page(
+        &self,
+        enabled_sessions: &HashSet<String>,
+        page_id: &str,
+    ) -> Vec<String> {
+        let mut sessions = enabled_sessions
+            .iter()
+            .filter(|session_id| {
+                self.sessions
+                    .get(*session_id)
+                    .is_some_and(|owner| owner == page_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions
+    }
+
     #[cfg(feature = "render")]
     pub(crate) fn next_screencast_session(&mut self) -> i64 {
         // Never wrap a delayed acknowledgement onto a replacement stream.
@@ -639,6 +703,38 @@ mod context_ownership_tests {
         assert!(ctx.context_by_id(child.id).is_none());
         assert!(ctx.context_by_id(main.id).is_some());
         assert!(ctx.context_by_id(sibling.id).is_some());
+    }
+
+    #[test]
+    fn detached_frame_contexts_are_pruned_without_a_page_subscriber() {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let runtime_session = "runtime-session".to_string();
+        ctx.sessions.insert(runtime_session.clone(), page.clone());
+        ctx.runtime_enabled_sessions.insert(runtime_session.clone());
+        let child = ctx.create_isolated_context(
+            &page,
+            "detached-child",
+            "https://example.test/child",
+            "utility",
+            false,
+        ).0;
+        ctx.announced_frames.insert(
+            page,
+            vec!["detached-child".to_string()],
+        );
+
+        drain_frame_events(&mut ctx);
+
+        assert!(ctx.context_by_id(child.id).is_none());
+        assert!(ctx.pending_events.iter().any(|event| {
+            event.method == "Runtime.executionContextDestroyed"
+                && event.session_id.as_deref() == Some(runtime_session.as_str())
+                && event.params["executionContextId"] == child.id
+        }));
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.method != "Page.frameDetached"
+        }));
     }
 
 }
@@ -973,21 +1069,16 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
         let execution_context_id = ctx.default_context_id(&page_id).unwrap_or(1);
         for (name, payload) in calls {
             // The sessions that asked for this binding, narrowed to the page the
-            // call came from. Falling back to every session of the page keeps a
-            // binding that was installed without a session (a preload, or a
-            // direct embedder) deliverable rather than silently dropped.
-            let registered = ctx.binding_sessions.get(&name);
-            let targets: Vec<&str> = page_sessions
-                .iter()
-                .copied()
-                .filter(|session| {
-                    registered.is_none_or(|owners| owners.iter().any(|owner| owner == session))
-                })
-                .collect();
-            let targets = if targets.is_empty() {
-                page_sessions.clone()
-            } else {
-                targets
+            // call came from. A missing registration belongs to an embedder and
+            // is delivered page-wide. An empty registration belonged to a
+            // detached client and must remain silent.
+            let targets: Vec<&str> = match ctx.binding_sessions.get(&name) {
+                Some(owners) => page_sessions
+                    .iter()
+                    .copied()
+                    .filter(|session| owners.iter().any(|owner| owner == session))
+                    .collect(),
+                None => page_sessions.clone(),
             };
             for session_id in targets {
                 events.push(CdpEvent {
@@ -1014,43 +1105,34 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
 // after every dispatch, reports a frame whenever it actually appears instead
 // of only at navigation, and is the same drain point binding calls use.
 pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
-    // Every session on the page, not just one: a client that reaches a page the
-    // ordinary way holds two of them, because Target.createTarget opens a
-    // session and the Target.attachToTarget that follows opens another. A
-    // client drops any event whose sessionId is not the one it attached with,
-    // so announcing to an arbitrary session is the same as not announcing.
-    let mut page_to_sessions: HashMap<String, Vec<String>> = HashMap::new();
-    for (session_id, page_id) in &ctx.sessions {
-        page_to_sessions
-            .entry(page_id.clone())
-            .or_default()
-            .push(session_id.clone());
-    }
-    // ctx.sessions is a HashMap, so fix an order the events can be asserted in.
-    for sessions in page_to_sessions.values_mut() {
-        sessions.sort();
-    }
-
     let mut events: Vec<CdpEvent> = Vec::new();
-    let mut announced: HashMap<String, Vec<String>> = HashMap::new();
+    let mut frame_detach_events: Vec<CdpEvent> = Vec::new();
+    let mut announced_by_page: HashMap<String, Vec<String>> = HashMap::new();
+    let mut announced_by_session: HashMap<String, Vec<String>> = HashMap::new();
     let mut detached = Vec::new();
     for page in &ctx.pages {
-        let Some(session_ids) = page_to_sessions.get(&page.id) else {
-            continue;
-        };
         let live = crate::domains::page::child_frame_values(page);
-        let known = ctx.announced_frames.get(&page.id);
         let live_ids: Vec<String> = live
             .iter()
             .map(|frame| frame["id"].as_str().unwrap_or_default().to_string())
             .collect();
-
-        for frame in &live {
-            let id = frame["id"].as_str().unwrap_or_default();
-            if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
-                continue;
+        if let Some(known) = ctx.announced_frames.get(&page.id) {
+            for id in known {
+                if !live_ids.contains(id) {
+                    detached.push((page.id.clone(), id.clone()));
+                }
             }
-            for session_id in session_ids {
+        }
+        announced_by_page.insert(page.id.clone(), live_ids.clone());
+        let session_ids = ctx.sessions_for_page(&ctx.page_enabled_sessions, &page.id);
+
+        for session_id in session_ids {
+            let known = ctx.page_announced_frames_by_session.get(&session_id);
+            for frame in &live {
+                let id = frame["id"].as_str().unwrap_or_default();
+                if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
+                    continue;
+                }
                 // Attach before navigate: a client builds its frame from the
                 // attach event and treats a navigation of a frame it has never
                 // seen as a protocol error.
@@ -1075,18 +1157,22 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
                     session_id: Some(session_id.clone()),
                 });
             }
-        }
 
-        if let Some(known) = known {
-            for id in known {
-                if !live_ids.contains(id) {
-                    detached.push((page.id.clone(), id.clone(), session_ids.clone()));
+            if let Some(known) = known {
+                for id in known {
+                    if !live_ids.contains(id) {
+                        frame_detach_events.push(CdpEvent {
+                            method: "Page.frameDetached".into(),
+                            params: json!({ "frameId": id, "reason": "remove" }),
+                            session_id: Some(session_id.clone()),
+                        });
+                    }
                 }
             }
+            announced_by_session.insert(session_id, live_ids.clone());
         }
-        announced.insert(page.id.clone(), live_ids);
     }
-    for (page_id, frame_id, page_sessions) in detached {
+    for (page_id, frame_id) in detached {
         let removed = ctx.remove_frame_contexts(&page_id, &frame_id);
         let runtime_sessions = ctx.runtime_sessions_for_page(&page_id);
         for context in removed {
@@ -1101,15 +1187,14 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
                 ));
             }
         }
-        for session_id in page_sessions {
-            events.push(CdpEvent {
-                method: "Page.frameDetached".into(),
-                params: json!({ "frameId": frame_id, "reason": "remove" }),
-                session_id: Some(session_id),
-            });
-        }
     }
-    ctx.announced_frames.extend(announced);
+    // A page can be temporarily absent while a navigation task owns it. Keep
+    // its announcement state until explicit page/session teardown so draining
+    // another page cannot make the child frames look new on reinsertion.
+    ctx.announced_frames.extend(announced_by_page);
+    ctx.page_announced_frames_by_session
+        .extend(announced_by_session);
+    events.extend(frame_detach_events);
     ctx.pending_events.extend(events);
 }
 

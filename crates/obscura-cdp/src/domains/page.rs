@@ -833,6 +833,42 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     )
 }
 
+fn emit_to_sessions(
+    ctx: &mut CdpContext,
+    sessions: &[String],
+    method: &str,
+    params: Value,
+) {
+    for session_id in sessions {
+        ctx.pending_events.push(CdpEvent::with_session(
+            method,
+            params.clone(),
+            session_id.clone(),
+        ));
+    }
+}
+
+fn initial_lifecycle_events(
+    frame_id: &str,
+    loader_id: &str,
+    timestamp: f64,
+    session_id: &str,
+) -> Vec<CdpEvent> {
+    ["commit", "DOMContentLoaded", "load", "networkIdle"]
+        .into_iter()
+        .map(|name| CdpEvent::with_session(
+            "Page.lifecycleEvent",
+            json!({
+                "frameId": frame_id,
+                "loaderId": loader_id,
+                "name": name,
+                "timestamp": timestamp,
+            }),
+            session_id.to_string(),
+        ))
+        .collect()
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -850,8 +886,9 @@ pub fn emit_navigation_events(
 ) {
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
-    ctx.nav_events_emitted.insert(page_id.to_string());
-    let es = session_id.clone();
+    let page_sessions = ctx.sessions_for_page(&ctx.page_enabled_sessions, page_id);
+    let lifecycle_sessions = ctx.sessions_for_page(&ctx.lifecycle_enabled_sessions, page_id);
+    let network_sessions = ctx.sessions_for_page(&ctx.network_enabled_sessions, page_id);
     let ts = timestamp();
 
     // Real Chrome uses the navigation's loaderId as the main document's
@@ -900,42 +937,32 @@ pub fn emit_navigation_events(
     if let Some(idx) = nav_idx {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
+        let params = json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id});
+        emit_to_sessions(ctx, &network_sessions, "Network.requestWillBeSent", params);
     }
 
     let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
     let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
-    let mut phase1 = vec![CdpEvent {
-        method: "Page.lifecycleEvent".into(),
-        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-        session_id: es.clone(),
-    }];
-    for runtime_session in &runtime_sessions {
-        phase1.push(CdpEvent::with_session(
-            "Runtime.executionContextsCleared",
-            json!({}),
-            runtime_session.clone(),
-        ));
-    }
-    phase1.push(CdpEvent {
-        method: "Page.frameNavigated".into(),
-        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
-        session_id: es.clone(),
-    });
+    let init_params = json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts});
+    emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", init_params);
+    emit_to_sessions(
+        ctx,
+        &runtime_sessions,
+        "Runtime.executionContextsCleared",
+        json!({}),
+    );
+    let frame_params = json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"});
+    emit_to_sessions(ctx, &page_sessions, "Page.frameNavigated", frame_params);
     for runtime_session in runtime_sessions {
         for context in &contexts {
-            phase1.push(super::runtime::execution_context_created_event(
+            ctx.pending_events.push(super::runtime::execution_context_created_event(
                 context,
                 Some(runtime_session.clone()),
             ));
         }
     }
-    phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
-    ctx.pending_events.extend(phase1);
+    let commit_params = json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts});
+    emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", commit_params);
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
@@ -953,7 +980,7 @@ pub fn emit_navigation_events(
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
                 }),
-                session_id: es.clone(),
+                session_id: session_id.clone(),
             });
         }
     }
@@ -961,56 +988,31 @@ pub fn emit_navigation_events(
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
         if Some(i) != nav_idx {
-            ctx.pending_events.push(CdpEvent {
-                method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-                session_id: es.clone(),
-            });
+            let params = json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id});
+            emit_to_sessions(ctx, &network_sessions, "Network.requestWillBeSent", params);
         }
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
-            session_id: es.clone(),
-        });
+        let response_params = json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id});
+        let finished_params = json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size});
+        emit_to_sessions(ctx, &network_sessions, "Network.responseReceived", response_params);
+        emit_to_sessions(ctx, &network_sessions, "Network.loadingFinished", finished_params);
     }
 
-    let mut phase3 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.domContentEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.loadEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-    ];
+    for (name, method) in [
+        ("DOMContentLoaded", "Page.domContentEventFired"),
+        ("load", "Page.loadEventFired"),
+    ] {
+        let lifecycle_params = json!({"frameId": frame_id, "loaderId": loader_id, "name": name, "timestamp": ts});
+        emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", lifecycle_params);
+        let page_params = json!({"timestamp": ts});
+        emit_to_sessions(ctx, &page_sessions, method, page_params);
+    }
     if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
         let idle_ts = timestamp();
-        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
+        let params = json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts});
+        emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", params);
     }
-    phase3.push(CdpEvent {
-        method: "Page.frameStoppedLoading".into(),
-        params: json!({"frameId": frame_id}),
-        session_id: es,
-    });
-    ctx.pending_events.extend(phase3);
+    let stopped_params = json!({"frameId": frame_id});
+    emit_to_sessions(ctx, &page_sessions, "Page.frameStoppedLoading", stopped_params);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
     // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
@@ -1042,7 +1044,7 @@ pub fn emit_navigation_events(
 /// must not replay frame navigation or load lifecycle events.
 pub(crate) fn emit_runtime_network_events(
     ctx: &mut CdpContext,
-    session_id: &Option<String>,
+    _session_id: &Option<String>,
     frame_id: &str,
     page_url: &str,
     page_id: &str,
@@ -1056,11 +1058,10 @@ pub(crate) fn emit_runtime_network_events(
         .get(page_id)
         .cloned()
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+    let sessions = ctx.sessions_for_page(&ctx.network_enabled_sessions, page_id);
     for network_event in network_events {
         let request_id = &network_event.request_id;
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({
+        let request_params = json!({
                 "requestId": request_id,
                 "loaderId": loader_id,
                 "documentURL": page_url,
@@ -1074,12 +1075,8 @@ pub(crate) fn emit_runtime_network_events(
                 "initiator": {"type": "script"},
                 "type": network_event.resource_type,
                 "frameId": frame_id,
-            }),
-            session_id: session_id.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({
+            });
+        let response_params = json!({
                 "requestId": request_id,
                 "loaderId": loader_id,
                 "timestamp": network_event.timestamp,
@@ -1095,18 +1092,29 @@ pub(crate) fn emit_runtime_network_events(
                         .unwrap_or_default(),
                 },
                 "frameId": frame_id,
-            }),
-            session_id: session_id.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({
+            });
+        let finished_params = json!({
                 "requestId": request_id,
                 "timestamp": network_event.timestamp,
                 "encodedDataLength": network_event.body_size,
-            }),
-            session_id: session_id.clone(),
-        });
+            });
+        for session_id in &sessions {
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.requestWillBeSent",
+                request_params.clone(),
+                session_id.clone(),
+            ));
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.responseReceived",
+                response_params.clone(),
+                session_id.clone(),
+            ));
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.loadingFinished",
+                finished_params.clone(),
+                session_id.clone(),
+            ));
+        }
     }
 }
 
@@ -1242,43 +1250,91 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
+            if let Some(session_id) = session_id {
+                ctx.page_enabled_sessions.insert(session_id.clone());
+            }
             // Chrome loads a new target's initial about:blank right after
             // createTarget, so by the time a client attaches and calls
             // Page.enable the page has already produced its load events.
             // obscura creates pages silently, which starves clients that wait
             // for the initial load: chromiumoxide's new_page blocks until the
-            // main frame's "load" lifecycle event arrives (#833). Emit those
-            // events once, the first time a session enables the page domain
-            // on a page that has not emitted a navigation. This is not a
-            // document change, so there is no execution-context churn: the
-            // existing context announced by Runtime.enable stays valid.
-            let initial = ctx.get_session_page(session_id).and_then(|page| {
-                if ctx.nav_events_emitted.contains(&page.id) {
+            // main frame's load event arrives (#833). Emit Page-domain events
+            // once for each enabling session. Lifecycle events remain behind
+            // Page.setLifecycleEventsEnabled and are emitted there if it is
+            // enabled after this snapshot.
+            let initial = session_id.as_ref().and_then(|enabled_session| {
+                if ctx.page_initial_events_emitted_sessions.contains(enabled_session) {
                     return None;
                 }
-                Some((page.id.clone(), page.frame_id.clone(), page.url_string()))
+                ctx.get_session_page(session_id).map(|page| {
+                    (
+                        enabled_session.clone(),
+                        page.id.clone(),
+                        page.frame_id.clone(),
+                        page.url_string(),
+                    )
+                })
             });
-            if let Some((page_id, frame_id, url)) = initial {
-                ctx.nav_events_emitted.insert(page_id.clone());
+            if let Some((enabled_session, page_id, frame_id, url)) = initial {
+                ctx.page_initial_events_emitted_sessions
+                    .insert(enabled_session.clone());
                 let ts = timestamp();
-                let loader_id = format!("loader-blank-{page_id}");
-                let es = session_id.clone();
+                let loader_id = ctx.current_loader_ids
+                    .get(&page_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                let es = Some(enabled_session.clone());
                 // Build the frame through the schema-complete helper: generated
                 // CDP clients (chromiumoxide) reject a frameNavigated payload
                 // missing secureContextType/crossOriginIsolatedContextType and
                 // drop the whole connection (#833).
                 let frame = frame_value(&frame_id, None, &loader_id, &url, "text/html");
-                let events = vec![
-                    CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": frame, "type": "Navigation"}), session_id: es.clone() },
-                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() },
-                    CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
-                ];
+                let lifecycle_enabled = ctx.lifecycle_enabled_sessions
+                    .contains(&enabled_session);
+                let mut events = vec![CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    params: json!({"frame": frame, "type": "Navigation"}),
+                    session_id: es.clone(),
+                }];
+                let mut lifecycle = initial_lifecycle_events(
+                    &frame_id,
+                    &loader_id,
+                    ts,
+                    &enabled_session,
+                ).into_iter();
+                if lifecycle_enabled {
+                    events.extend(lifecycle.by_ref().take(2));
+                }
+                events.push(CdpEvent {
+                    method: "Page.domContentEventFired".into(),
+                    params: json!({"timestamp": ts}),
+                    session_id: es.clone(),
+                });
+                if lifecycle_enabled {
+                    events.push(lifecycle.next().expect("load lifecycle event"));
+                }
+                events.push(CdpEvent {
+                    method: "Page.loadEventFired".into(),
+                    params: json!({"timestamp": ts}),
+                    session_id: es.clone(),
+                });
+                if lifecycle_enabled {
+                    events.push(lifecycle.next().expect("network-idle lifecycle event"));
+                }
+                events.push(CdpEvent {
+                    method: "Page.frameStoppedLoading".into(),
+                    params: json!({"frameId": frame_id, "timestamp": ts}),
+                    session_id: es,
+                });
                 ctx.pending_events.extend(events);
+            }
+            Ok(json!({}))
+        }
+        "disable" => {
+            if let Some(session_id) = session_id {
+                ctx.page_enabled_sessions.remove(session_id);
+                ctx.lifecycle_enabled_sessions.remove(session_id);
+                ctx.page_announced_frames_by_session.remove(session_id);
             }
             Ok(json!({}))
         }
@@ -1360,7 +1416,37 @@ pub async fn handle(
 
             Ok(json!({ "executionContextId": context.id }))
         }
-        "setLifecycleEventsEnabled" => Ok(json!({})),
+        "setLifecycleEventsEnabled" => {
+            if let Some(session_id) = session_id {
+                if params.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+                    let newly_enabled = ctx.lifecycle_enabled_sessions
+                        .insert(session_id.clone());
+                    let needs_snapshot = newly_enabled
+                        && ctx.page_enabled_sessions.contains(session_id)
+                        && ctx.page_initial_events_emitted_sessions.contains(session_id);
+                    if needs_snapshot {
+                        let snapshot = ctx.get_session_page(&Some(session_id.clone())).map(|page| {
+                            let loader_id = ctx.current_loader_ids
+                                .get(&page.id)
+                                .cloned()
+                                .unwrap_or_else(|| format!("loader-blank-{}", page.id));
+                            (page.frame_id.clone(), loader_id)
+                        });
+                        if let Some((frame_id, loader_id)) = snapshot {
+                            ctx.pending_events.extend(initial_lifecycle_events(
+                                &frame_id,
+                                &loader_id,
+                                timestamp(),
+                                session_id,
+                            ));
+                        }
+                    }
+                } else {
+                    ctx.lifecycle_enabled_sessions.remove(session_id);
+                }
+            }
+            Ok(json!({}))
+        }
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
             ctx.preload_counter += 1;
@@ -1749,14 +1835,15 @@ mod tests {
 
     // #833: chromiumoxide's new_page waits for the initial target's "load"
     // lifecycle event before returning. Page.enable on a freshly created
-    // (silently loaded) page must emit the initial load sequence once, with a
-    // schema-complete frame, and must not replay it on a second enable.
+    // (silently loaded) page must emit the initial load sequence once per CDP
+    // session, with a schema-complete frame, and must not replay it when that
+    // same session enables the domain again.
     #[tokio::test(flavor = "current_thread")]
-    async fn page_enable_emits_the_initial_load_events_once() {
+    async fn page_enable_emits_the_initial_load_events_once_per_session() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
-        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
 
         handle("enable", &json!({}), &mut ctx, &session)
             .await
@@ -1787,6 +1874,13 @@ mod tests {
             );
         }
         assert!(ctx.pending_events.is_empty() == false);
+        assert_eq!(
+            ctx.pending_events.iter()
+                .filter(|event| event.method == "Page.lifecycleEvent")
+                .count(),
+            0,
+            "Page.enable must not bypass lifecycle opt-in",
+        );
 
         ctx.pending_events.clear();
         handle("enable", &json!({}), &mut ctx, &session)
@@ -1796,6 +1890,122 @@ mod tests {
             ctx.pending_events.is_empty(),
             "the initial sequence must not replay on a second enable"
         );
+
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("lifecycle enable must succeed");
+        assert_eq!(
+            ctx.pending_events.iter()
+                .filter(|event| event.method == "Page.lifecycleEvent")
+                .count(),
+            4,
+        );
+        ctx.pending_events.clear();
+
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": false}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("lifecycle disable must succeed");
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("lifecycle re-enable must succeed");
+        assert_eq!(
+            ctx.pending_events.iter()
+                .filter(|event| event.method == "Page.lifecycleEvent")
+                .count(),
+            4,
+            "false-to-true lifecycle opt-in must emit the current snapshot",
+        );
+        ctx.pending_events.clear();
+
+        handle("disable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("page disable must succeed");
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("page re-enable must succeed");
+        assert!(
+            ctx.pending_events.is_empty(),
+            "Page re-enable must not replay the Page-domain initial sequence",
+        );
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": true}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("lifecycle opt-in after Page re-enable must succeed");
+        assert_eq!(
+            ctx.pending_events.iter()
+                .filter(|event| event.method == "Page.lifecycleEvent")
+                .count(),
+            4,
+            "Page disable must reset the lifecycle snapshot state",
+        );
+        ctx.pending_events.clear();
+
+        let current_loader_id = "loader-after-navigation";
+        ctx.current_loader_ids
+            .insert(page_id.clone(), current_loader_id.to_string());
+        let second_session = Some("attached-session".to_string());
+        ctx.sessions
+            .insert(second_session.clone().unwrap(), page_id);
+        handle("enable", &json!({}), &mut ctx, &second_session)
+            .await
+            .expect("enable on a second session must succeed");
+        assert!(!ctx.pending_events.is_empty());
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.session_id.as_ref() == second_session.as_ref()
+        }));
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.method != "Page.lifecycleEvent"
+        }));
+        let late_frame = ctx.pending_events.iter()
+            .find(|event| event.method == "Page.frameNavigated")
+            .expect("late-attached session receives the current frame");
+        assert_eq!(late_frame.params["frame"]["loaderId"], current_loader_id);
+
+        ctx.pending_events.clear();
+        handle("enable", &json!({}), &mut ctx, &second_session)
+            .await
+            .expect("repeated second-session enable must succeed");
+        assert!(ctx.pending_events.is_empty());
+
+        handle(
+            "setLifecycleEventsEnabled",
+            &json!({"enabled": true}),
+            &mut ctx,
+            &second_session,
+        )
+        .await
+        .expect("second-session lifecycle enable must succeed");
+        assert_eq!(
+            ctx.pending_events.iter()
+                .filter(|event| event.method == "Page.lifecycleEvent")
+                .count(),
+            4,
+        );
+        assert!(ctx.pending_events.iter()
+            .filter(|event| event.method == "Page.lifecycleEvent")
+            .all(|event| event.params["loaderId"] == current_loader_id));
+        assert!(ctx.pending_events.iter().all(|event| {
+            event.session_id.as_ref() == second_session.as_ref()
+        }));
     }
 
     #[test]
@@ -1805,6 +2015,8 @@ mod tests {
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
             .insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.network_enabled_sessions
+            .insert(session_id.clone().unwrap());
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
