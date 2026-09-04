@@ -7,6 +7,48 @@ use std::io::{Read, Write};
 
 use obscura::Browser;
 
+/// Sets an environment variable for the duration of the guard and restores the
+/// previous value on drop.
+///
+/// `.cargo/config.toml` pins `RUST_TEST_THREADS = "1"`, so every test in this
+/// binary shares one process and libtest runs them in alphabetical order. A
+/// bare `std::env::set_var` therefore leaks into every test that sorts after
+/// it. That was not hypothetical here:
+/// `a_rejected_child_frame_does_not_leave_js_references` set
+/// `OBSCURA_MAX_LIVE_FRAMES=0` and never restored it, capping live frames at
+/// zero for the rest of the run and failing the three later tests that need a
+/// frame to survive. They passed in isolation and failed in the full file,
+/// which is the signature of exactly this bug.
+#[must_use = "the variable is restored when the guard drops, so it must be bound"]
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// Every test here drives a loopback fixture, so it needs the private-network
+/// gate open. Returned as a guard so it cannot outlive the test.
+#[must_use]
+fn allow_loopback() -> EnvGuard {
+    EnvGuard::set("OBSCURA_ALLOW_PRIVATE_NETWORK", "1")
+}
+
 const PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
 <script>
   var f = document.createElement('iframe');
@@ -115,7 +157,7 @@ fn spawn_server(parent_html: &'static str) -> String {
 
 #[tokio::test]
 async fn a_child_frame_runs_its_own_script() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -149,7 +191,7 @@ async fn a_child_frame_runs_its_own_script() {
 
 #[tokio::test]
 async fn a_child_frame_set_by_attribute_runs_its_own_script() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(ATTRIBUTE_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -170,7 +212,7 @@ async fn a_child_frame_set_by_attribute_runs_its_own_script() {
 
 #[tokio::test]
 async fn a_shadow_dom_child_frame_stays_alive_and_runs_its_script() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(SHADOW_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -193,7 +235,7 @@ async fn a_shadow_dom_child_frame_stays_alive_and_runs_its_script() {
 /// its result back out. This is the reporter's `parentGot` assertion.
 #[tokio::test]
 async fn a_child_frame_reaches_its_parent_with_post_message() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(MESSAGING_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -221,7 +263,7 @@ async fn a_child_frame_reaches_its_parent_with_post_message() {
 /// The other direction: a page talking into its frame.
 #[tokio::test]
 async fn a_parent_reaches_its_child_with_post_message() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(MESSAGING_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -244,7 +286,7 @@ async fn a_parent_reaches_its_child_with_post_message() {
 /// forever.
 #[tokio::test]
 async fn window_post_message_delivers_to_the_same_window() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(
         r#"<!doctype html><html><body><script>
   window.__got = [];
@@ -272,7 +314,7 @@ async fn window_post_message_delivers_to_the_same_window() {
 /// delivered.
 #[tokio::test]
 async fn window_post_message_honours_target_origin() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(
         r#"<!doctype html><html><body><script>
   window.__got = [];
@@ -299,7 +341,7 @@ async fn window_post_message_honours_target_origin() {
 /// nothing used to start its load at all.
 #[tokio::test]
 async fn a_static_child_frame_runs_its_own_script() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(STATIC_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -320,8 +362,11 @@ async fn a_static_child_frame_runs_its_own_script() {
 
 #[tokio::test]
 async fn a_rejected_child_frame_does_not_leave_js_references() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    std::env::set_var("OBSCURA_MAX_LIVE_FRAMES", "0");
+    let _loopback = allow_loopback();
+    // Bound, not bare: leaving this set capped live frames at zero for every
+    // alphabetically-later test in this binary, which is what failed three of
+    // them.
+    let _max_frames = EnvGuard::set("OBSCURA_MAX_LIVE_FRAMES", "0");
     let base = spawn_server(STATIC_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -346,7 +391,7 @@ async fn a_rejected_child_frame_does_not_leave_js_references() {
 
 #[tokio::test]
 async fn navigating_blank_releases_child_realms() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(STATIC_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
@@ -361,7 +406,7 @@ async fn navigating_blank_releases_child_realms() {
 
 #[tokio::test]
 async fn changing_iframe_src_releases_the_previous_realm() {
-    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let _loopback = allow_loopback();
     let base = spawn_server(RESET_PARENT_HTML);
 
     let browser = Browser::new().unwrap();
