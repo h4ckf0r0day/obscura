@@ -2902,8 +2902,7 @@ impl Page {
             // a DOMContentLoaded listener.
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:true,cancelable:false})); } catch(e) {}",
             );
 
             let load_blockers_finished =
@@ -2920,8 +2919,7 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                 try { globalThis.__obscura_dispatchWindowLoad(); } catch(e) {}",
             );
         }
         if let Some(token) = exec_wd {
@@ -6569,12 +6567,38 @@ mod tests {
         let html = format!(
             r#"<html><head></head><body><script>
                 globalThis.__lifecycleOrder = [];
+                globalThis.__domContentLoadedPath = [];
+                globalThis.__windowLoadPath = [];
+                globalThis.__capturedWindowLoad = null;
+                const recordDomContentLoaded = label => event =>
+                    globalThis.__domContentLoadedPath.push([
+                        label, event.eventPhase, event.target === document,
+                        event.currentTarget === window,
+                    ]);
+                window.addEventListener('DOMContentLoaded',
+                    recordDomContentLoaded('window-capture'), true);
+                document.addEventListener('DOMContentLoaded',
+                    recordDomContentLoaded('document-target'));
+                window.addEventListener('DOMContentLoaded',
+                    recordDomContentLoaded('window-bubble'));
                 document.addEventListener('DOMContentLoaded', () =>
                     globalThis.__lifecycleOrder.push('dom-content-loaded'));
-                window.onload = () =>
+                window.onload = event => {{
+                    globalThis.__capturedWindowLoad = event;
                     globalThis.__lifecycleOrder.push('window-onload');
-                window.addEventListener('load', () =>
-                    globalThis.__lifecycleOrder.push('window-load'));
+                    globalThis.__windowLoadPath.push([
+                        'property', event.target === document,
+                        event.currentTarget === window, event.eventPhase,
+                        event.isTrusted]);
+                    throw new Error('load-listener-test');
+                }};
+                window.addEventListener('load', event => {{
+                    globalThis.__lifecycleOrder.push('window-load');
+                    globalThis.__windowLoadPath.push([
+                        'listener', event.target === document,
+                        event.currentTarget === window, event.eventPhase,
+                        event.isTrusted]);
+                }});
                 const script = document.createElement('script');
                 script.src = '{base}/preload-dynamic.js';
                 script.onload = () => globalThis.__lifecycleOrder.push('script-load');
@@ -6614,12 +6638,59 @@ mod tests {
             page.js
                 .as_mut()
                 .unwrap()
+                .evaluate("globalThis.__domContentLoadedPath")
+                .unwrap(),
+            serde_json::json!([
+                ["window-capture", 1, true, true],
+                ["document-target", 2, true, false],
+                ["window-bubble", 3, true, true],
+            ]),
+            "DOMContentLoaded must traverse Document to Window exactly once",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
                 .evaluate(
                     "globalThis.__lifecycleOrder.filter(value => value === 'window-onload').length",
                 )
                 .unwrap(),
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__windowLoadPath")
+                .unwrap(),
+            serde_json::json!([
+                ["property", true, true, 2, true],
+                ["listener", true, true, 2, true],
+            ]),
+            "browser-generated Window load uses the Document legacy target",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "(() => {\
+                         const browserEvent = globalThis.__capturedWindowLoad;\
+                         let seen;\
+                         window.addEventListener('load', event => {\
+                             if (event === browserEvent) seen = [\
+                                 event.target === window,\
+                                 event.currentTarget === window,\
+                                 event.eventPhase, event.isTrusted];\
+                         }, { once: true });\
+                         window.dispatchEvent(browserEvent);\
+                         return seen;\
+                     })()",
+                )
+                .unwrap(),
+            serde_json::json!([true, true, 2, false]),
+            "redispatched browser load must use author-dispatch semantics",
         );
     }
 

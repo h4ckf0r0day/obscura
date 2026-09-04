@@ -130,14 +130,10 @@ impl FrameRealm {
             parent,
             "globalThis.__documentReadyState__ = 'interactive';\
              try { document.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             try { window.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
+                 { bubbles: true, cancelable: false })); } catch (_) {}\
              globalThis.__documentReadyState__ = 'complete';\
              try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
-             if (typeof window.onload === 'function') { try { window.onload(); } catch (_) {} }\
-             try { window.dispatchEvent(new Event('load', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}",
+             try { globalThis.__obscura_dispatchWindowLoad(); } catch (_) {}",
         )
     }
 
@@ -439,6 +435,88 @@ mod tests {
         assert_eq!(frame.frame_id(), 1);
         assert!(!frame.is_same_origin_as("https://parent.example"));
         assert!(frame.is_same_origin_as("https://child.example"));
+    }
+
+    #[test]
+    fn frame_window_load_handlers_run_once_in_registration_order() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.loadEvents = [];\
+                 globalThis.domContentLoadedEvents = [];\
+                 const recordDomContentLoaded = label => event =>\
+                     domContentLoadedEvents.push([\
+                         label, event.eventPhase, event.target === document,\
+                         event.currentTarget === window]);\
+                 window.addEventListener('DOMContentLoaded',\
+                     recordDomContentLoaded('window-capture'), true);\
+                 document.addEventListener('DOMContentLoaded',\
+                     recordDomContentLoaded('document-target'));\
+                 window.addEventListener('DOMContentLoaded',\
+                     recordDomContentLoaded('window-bubble'));\
+                 globalThis.capturedLoadEvent = null;\
+                 window.onload = event => {\
+                     capturedLoadEvent = event;\
+                     loadEvents.push([\
+                         'property', event.target === document,\
+                         event.currentTarget === window, event.eventPhase, event.isTrusted]);\
+                     throw new Error('load-listener-test');\
+                 };\
+                 window.addEventListener('load', event => loadEvents.push([\
+                     'listener', event.target === document,\
+                     event.currentTarget === window, event.eventPhase, event.isTrusted]));",
+            )
+            .unwrap();
+        frame.dispatch_load_events(&mut parent).unwrap();
+
+        assert_eq!(
+            frame.evaluate(&mut parent, "loadEvents").unwrap(),
+            serde_json::json!([
+                ["property", true, true, 2, true],
+                ["listener", true, true, 2, true],
+            ]),
+        );
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "(() => {\
+                         const browserEvent = capturedLoadEvent;\
+                         let redispatched;\
+                         window.addEventListener('load', event => {\
+                             if (event === browserEvent) redispatched = [\
+                                 event.target === window,\
+                                 event.currentTarget === window,\
+                                 event.eventPhase, event.isTrusted];\
+                         }, { once: true });\
+                         window.dispatchEvent(browserEvent);\
+                         return redispatched;\
+                     })()",
+                )
+                .unwrap(),
+            serde_json::json!([true, true, 2, false]),
+            "redispatched browser load must use author-dispatch semantics",
+        );
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "domContentLoadedEvents")
+                .unwrap(),
+            serde_json::json!([
+                ["window-capture", 1, true, true],
+                ["document-target", 2, true, false],
+                ["window-bubble", 3, true, true],
+            ]),
+        );
     }
 
     #[test]

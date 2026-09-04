@@ -78,27 +78,22 @@ globalThis.__obscura_core_handoff = Deno.core;
 
 globalThis.__obscura_errors = [];
 
-globalThis.addEventListener = globalThis.addEventListener || function(){};
-globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
+// Listener state belongs to the JS wrapper. Window uses a stable private key
+// because V8 may expose different global-proxy wrappers across evaluations.
+const _eventTargetListeners = new WeakMap();
+const _eventHandlerSlots = new WeakMap();
+const _eventDispatchStates = new WeakMap();
+const _windowEventTargetKey = {};
+let _eventListenerOrder = 0;
 
-globalThis.onerror = function(msg, src, line, col, error) {
-  globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
+globalThis.addEventListener = function(type, fn, options) {
+  _eventTargetAdd(globalThis, type, fn, options);
 };
-globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
-  if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
-};
-globalThis.removeEventListener = function(type, fn) {
-  if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
-  }
+globalThis.removeEventListener = function(type, fn, options) {
+  _eventTargetRemove(globalThis, type, fn, options);
 };
 globalThis.dispatchEvent = function(event) {
-  if (!event) return true;
-  const handlers = globalThis.__windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
-  return !event.defaultPrevented;
+  return _eventTargetDispatch(globalThis, event);
 };
 
 let _domMutationEpoch = 0;
@@ -696,11 +691,9 @@ function _getFp() {
   return _fpCache;
 }
 function _fp(key) { return _getFp()[key]; }
-globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
 globalThis._formIndeterminate = globalThis._formIndeterminate || {};
-const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
@@ -1783,10 +1776,29 @@ function _shallowCloneNode(node) {
   return el;
 }
 
-// EventTarget listener state belongs to the JS wrapper rather than the backing
-// DOM node.  This is also what makes `new EventTarget()` and subclasses used by
-// framework schedulers work: those targets deliberately have no native node id.
-const _eventTargetListeners = new WeakMap();
+function _eventTargetKey(target) {
+  return target === globalThis ? _windowEventTargetKey : target;
+}
+function _eventHandlerGet(target, name) {
+  name = String(name);
+  return _eventHandlerSlots
+    .get(_eventTargetKey(target))?.get(name)?.callback || null;
+}
+function _eventHandlerSet(target, name, callback) {
+  name = String(name);
+  const key = _eventTargetKey(target);
+  let slots = _eventHandlerSlots.get(key);
+  if (!slots) {
+    slots = new Map();
+    _eventHandlerSlots.set(key, slots);
+  }
+  if (typeof callback !== "function") {
+    slots.delete(name);
+    return;
+  }
+  const previous = slots.get(name);
+  slots.set(name, { callback, order: previous?.order ?? ++_eventListenerOrder });
+}
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1795,13 +1807,22 @@ function _eventTargetAdd(target, type, callback, options) {
   const isFunction = typeof callback === "function";
   if (!isFunction && typeof callback.handleEvent !== "function") return;
   type = String(type);
+  if (target !== globalThis && globalThis.Element && target instanceof globalThis.Element) {
+    const handlerName = "on" + type;
+    const key = _eventTargetKey(target);
+    if (!_eventHandlerSlots.get(key)?.has(handlerName)
+        && target.getAttribute(handlerName) !== null) {
+      _eventHandlerSet(target, handlerName, target._resolveInlineHandler(handlerName));
+    }
+  }
   const capture = _eventCapture(options);
   const signal = options && typeof options === "object" ? options.signal : null;
   if (signal && signal.aborted) return;
-  let byType = _eventTargetListeners.get(target);
+  const key = _eventTargetKey(target);
+  let byType = _eventTargetListeners.get(key);
   if (!byType) {
     byType = new Map();
-    _eventTargetListeners.set(target, byType);
+    _eventTargetListeners.set(key, byType);
   }
   let listeners = byType.get(type);
   if (!listeners) {
@@ -1816,6 +1837,8 @@ function _eventTargetAdd(target, type, callback, options) {
     passive: !!(options && typeof options === "object" && options.passive),
     signal,
     abortHandler: null,
+    order: ++_eventListenerOrder,
+    removed: false,
   };
   listeners.push(entry);
   if (signal && typeof signal.addEventListener === "function") {
@@ -1824,7 +1847,8 @@ function _eventTargetAdd(target, type, callback, options) {
   }
 }
 function _eventTargetRemove(target, type, callback, options) {
-  const byType = _eventTargetListeners.get(target);
+  const key = _eventTargetKey(target);
+  const byType = _eventTargetListeners.get(key);
   if (!byType) return;
   type = String(type);
   const listeners = byType.get(type);
@@ -1833,6 +1857,7 @@ function _eventTargetRemove(target, type, callback, options) {
   for (let i = 0; i < listeners.length; i++) {
     const entry = listeners[i];
     if (entry.callback !== callback || entry.capture !== capture) continue;
+    entry.removed = true;
     listeners.splice(i, 1);
     if (entry.signal && entry.abortHandler && typeof entry.signal.removeEventListener === "function") {
       entry.signal.removeEventListener("abort", entry.abortHandler);
@@ -1840,36 +1865,234 @@ function _eventTargetRemove(target, type, callback, options) {
     break;
   }
   if (listeners.length === 0) byType.delete(type);
-  if (byType.size === 0) _eventTargetListeners.delete(target);
+  if (byType.size === 0) _eventTargetListeners.delete(key);
 }
-function _eventTargetDispatch(target, event) {
-  if (!event || typeof event.type === "undefined") {
-    throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+
+function _eventShadowRoot(node) {
+  if (!node || typeof node.getRootNode !== "function") return null;
+  const root = node.getRootNode();
+  return typeof ShadowRoot !== "undefined" && root instanceof ShadowRoot ? root : null;
+}
+function _eventRetarget(node, against) {
+  let candidate = node;
+  while (candidate) {
+    const root = _eventShadowRoot(candidate);
+    if (!root) return candidate;
+    if (against === root || (against instanceof Node && root.contains(against))) {
+      return candidate;
+    }
+    candidate = root.host;
   }
-  if (String(event.type) === "") {
-    throw new DOMException("The event's type was not specified.", "InvalidStateError");
+  return null;
+}
+function _eventPathFor(target, composed, closedRootIndexes) {
+  const path = [target];
+  let hasShadowRoot = typeof ShadowRoot !== "undefined" && target instanceof ShadowRoot;
+  if (hasShadowRoot && target.mode === "closed") closedRootIndexes.push(0);
+  let current = target;
+  while (current && typeof Node !== "undefined" && current instanceof Node) {
+    let parent = current.parentNode || null;
+    if (!parent && typeof ShadowRoot !== "undefined" && current instanceof ShadowRoot) {
+      if (!composed) break;
+      parent = current.host || null;
+    }
+    if (!parent) break;
+    path.push(parent);
+    if (typeof ShadowRoot !== "undefined" && parent instanceof ShadowRoot) {
+      hasShadowRoot = true;
+      if (parent.mode === "closed") closedRootIndexes.push(path.length - 1);
+    }
+    current = parent;
   }
-  if (!event.target) event.target = target;
-  event.currentTarget = target;
-  event.eventPhase = 2;
-  const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
-  for (const entry of listeners) {
-    const current = _eventTargetListeners.get(target)?.get(String(event.type));
-    if (!current || !current.includes(entry)) continue;
-    if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
-    const callback = entry.callback;
+  if (path[path.length - 1] instanceof Document) path.push(globalThis);
+  return { path, hasShadowRoot };
+}
+function _eventVisiblePath(path, currentIndex, closedRootIndexes) {
+  if (closedRootIndexes.length === 0) return path;
+  let hiddenThrough = -1;
+  for (const rootIndex of closedRootIndexes) {
+    if (rootIndex < currentIndex) hiddenThrough = rootIndex;
+  }
+  return hiddenThrough < 0 ? path : path.slice(hiddenThrough + 1);
+}
+function _eventSetSurface(event, name, value) {
+  try { event[name] = value; } catch (_) {}
+}
+function _eventInvoke(state, node, pathIndex, phase, capture) {
+  const key = _eventTargetKey(node);
+  const listeners = _eventTargetListeners.get(key)?.get(state.eventType);
+  let hasMatchingListener = false;
+  if (listeners) {
+    for (const entry of listeners) {
+      if (!entry.removed && entry.capture === capture) {
+        hasMatchingListener = true;
+        break;
+      }
+    }
+  }
+  let handler = null;
+  let handlerName = null;
+  if (!capture) {
+    handlerName = "on" + state.eventType;
+    handler = _eventHandlerSlots.get(key)?.get(handlerName);
+    const inlineCache = node?.__inlineHandlerCache;
+    const inlineAlreadyResolved = inlineCache
+      && Object.prototype.hasOwnProperty.call(inlineCache, handlerName);
+    if (!handler && !inlineAlreadyResolved
+        && typeof node?._resolveInlineHandler === "function") {
+      const inline = node._resolveInlineHandler(handlerName);
+      if (inline) {
+        _eventHandlerSet(node, handlerName, inline);
+        handler = _eventHandlerSlots.get(key)?.get(handlerName);
+      }
+    }
+  }
+  if (!hasMatchingListener && !handler) return;
+  const retargetedTarget = state.hasShadowRoot
+    ? _eventRetarget(state.dispatchTarget, node) : state.dispatchTarget;
+  const retargetedRelated = state.hasShadowRoot
+    ? _eventRetarget(state.originalRelatedTarget, node) : state.originalRelatedTarget;
+  if (state.originalRelatedTarget && retargetedTarget === retargetedRelated) return;
+  _eventSetSurface(state.event, 'target', retargetedTarget);
+  if ("relatedTarget" in state.event) {
+    _eventSetSurface(state.event, 'relatedTarget', retargetedRelated);
+  }
+  _eventSetSurface(state.event, 'currentTarget', node);
+  _eventSetSurface(state.event, 'eventPhase', phase);
+  state.currentPathIndex = pathIndex;
+  state.composedPathCache = null;
+  let invocations;
+  if (handler) {
+    invocations = [];
+    if (listeners) {
+      for (const entry of listeners) {
+        if (!entry.removed && entry.capture === capture) invocations.push(entry);
+      }
+    }
+    invocations.push({
+      handler: true, handlerName, order: handler.order,
+      capture: false, once: false, passive: false,
+    });
+    invocations.sort((a, b) => a.order - b.order);
+  } else {
+    invocations = listeners.slice();
+  }
+  for (const entry of invocations) {
+    if (!entry.handler && (entry.removed || entry.capture !== capture)) continue;
+    const liveHandler = entry.handler
+      ? _eventHandlerSlots.get(key)?.get(entry.handlerName) : null;
+    if (entry.handler && (!liveHandler || liveHandler.order !== entry.order)) continue;
+    if (entry.once && !entry.removed) {
+      _eventTargetRemove(node, state.eventType, entry.callback, entry.capture);
+    }
     try {
-      if (typeof callback === "function") callback.call(target, event);
-      else callback.handleEvent.call(callback, event);
+      state.inPassiveListener = entry.passive;
+      const callback = entry.handler ? liveHandler.callback : entry.callback;
+      const result = typeof callback === "function"
+        ? (entry.handler && node === globalThis && state.eventType === "error"
+          ? callback.call(node, state.event.message, state.event.filename || "",
+              state.event.lineno || 0, state.event.colno || 0, state.event.error)
+          : callback.call(node, state.event))
+        : callback.handleEvent.call(callback, state.event);
+      if (entry.handler && ((node === globalThis && state.eventType === "error")
+          ? result === true : result === false)) state.event.preventDefault();
     } catch (error) {
       console.error(error);
+    } finally {
+      state.inPassiveListener = false;
     }
-    if (event._immediatePropagationStopped) break;
+    if (state.immediatePropagationStopped) break;
   }
-  event.currentTarget = null;
-  event.eventPhase = 0;
-  return !event.defaultPrevented;
 }
+function _eventTargetDispatch(target, event, dispatchTargetOverride = null) {
+  if (!event) {
+    throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+  }
+  const firstTrustedDispatch = _pendingTrustedEvents.delete(event);
+  let eventType, dispatchTarget, path, closedRootIndexes, hasShadowRoot, originalRelatedTarget;
+  let dispatchState = null;
+  try {
+    if (_eventDispatchStates.has(event)) {
+      throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+    }
+    const rawEventType = event.type;
+    if (typeof rawEventType === "undefined") {
+      throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+    }
+    eventType = String(rawEventType);
+    if (eventType === "") {
+      throw new DOMException("The event's type was not specified.", "InvalidStateError");
+    }
+    if (!firstTrustedDispatch) _trustedEvents.delete(event);
+    dispatchTarget = target === globalThis && eventType === 'load'
+        && dispatchTargetOverride === globalThis.document
+      ? globalThis.document : target;
+    const composed = !!event.composed;
+    closedRootIndexes = [];
+    ({ path, hasShadowRoot } = _eventPathFor(target, composed, closedRootIndexes));
+    originalRelatedTarget = event.relatedTarget || null;
+    dispatchState = {
+      event, eventType, dispatchTarget, originalRelatedTarget, hasShadowRoot,
+      path, closedRootIndexes, currentPathIndex: -1, composedPathCache: null,
+      propagationStopped: false, immediatePropagationStopped: false,
+      inPassiveListener: false, bubbles: !!event.bubbles,
+      cancelable: !!event.cancelable, defaultPrevented: !!event.defaultPrevented,
+    };
+    _eventDispatchStates.set(event, dispatchState);
+  } catch (error) {
+    if (firstTrustedDispatch) _trustedEvents.delete(event);
+    throw error;
+  }
+
+  try {
+    for (let i = path.length - 1; i > 0 && !dispatchState.propagationStopped; i--) {
+      const crossesShadowBoundary = typeof ShadowRoot !== "undefined"
+        && path[i - 1] instanceof ShadowRoot;
+      _eventInvoke(dispatchState, path[i], i, crossesShadowBoundary ? 2 : 1, true);
+    }
+    if (!dispatchState.propagationStopped) {
+      _eventInvoke(dispatchState, target, 0, 2, true);
+      if (!dispatchState.immediatePropagationStopped) _eventInvoke(dispatchState, target, 0, 2, false);
+    }
+    if (dispatchState.bubbles && !dispatchState.propagationStopped) {
+      for (let i = 1; i < path.length && !dispatchState.propagationStopped; i++) {
+        const crossesShadowBoundary = typeof ShadowRoot !== "undefined"
+          && path[i - 1] instanceof ShadowRoot;
+        _eventInvoke(dispatchState, path[i], i, crossesShadowBoundary ? 2 : 3, false);
+      }
+    } else if (!dispatchState.bubbles && !dispatchState.propagationStopped) {
+      // A composed non-bubbling event treats each shadow host as an additional
+      // target. Its non-capture listeners run on the forward leg after the
+      // inner target, rather than during capture descent.
+      for (let i = 1; i < path.length && !dispatchState.propagationStopped; i++) {
+        if (typeof ShadowRoot !== "undefined" && path[i - 1] instanceof ShadowRoot) {
+          _eventInvoke(dispatchState, path[i], i, 2, false);
+        }
+      }
+    }
+    return !dispatchState.defaultPrevented;
+  } finally {
+    try {
+      const outermost = path[path.length - 1];
+      _eventSetSurface(event, 'target', hasShadowRoot
+        ? _eventRetarget(dispatchTarget, outermost) : dispatchTarget);
+      if ("relatedTarget" in event) _eventSetSurface(event, 'relatedTarget', hasShadowRoot
+        ? _eventRetarget(originalRelatedTarget, outermost) : originalRelatedTarget);
+      _eventSetSurface(event, 'currentTarget', null);
+      _eventSetSurface(event, 'eventPhase', 0);
+    } finally {
+      _eventDispatchStates.delete(event);
+    }
+  }
+}
+
+globalThis.addEventListener("unhandledrejection", event => event?.preventDefault?.());
+globalThis.addEventListener("error", event => {
+  globalThis.__obscura_errors.push({
+    msg: String(event?.message || event || ""), src: String(event?.filename || ""),
+    line: event?.lineno, error: String(event?.error || ""),
+  });
+});
 
 // During custom-element upgrade, HTMLElement's constructor must return the
 // already-existing element being upgraded. A class constructor cannot be
@@ -3469,6 +3692,10 @@ class Element extends Node {
       }
     }
     if (n === "style") this._style._replaceFromAttribute(value);
+    if (n.startsWith("on")) {
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache[n];
+      _eventHandlerSet(this, n, this._resolveInlineHandler(n));
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
     if (this.localName === "source"
@@ -3493,9 +3720,14 @@ class Element extends Node {
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (ns === "" && n.startsWith("on")) {
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache[n];
+      _eventHandlerSet(this, n, this._resolveInlineHandler(n));
+    }
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
+    const hadEventAttribute = n.startsWith("on") && this.getAttribute(n) !== null;
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
@@ -3509,6 +3741,10 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") this._style._replaceFromAttribute("");
+    if (hadEventAttribute) {
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache[n];
+      _eventHandlerSet(this, n, null);
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -3524,9 +3760,15 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    const hadEventAttribute = ns === "" && n.startsWith("on")
+      && this.getAttributeNS(ns, n) !== null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     this._nullNamespaceAttrs = null;
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (hadEventAttribute) {
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache[n];
+      _eventHandlerSet(this, n, null);
+    }
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -3644,44 +3886,13 @@ class Element extends Node {
     return null;
   }
   addEventListener(type, handler, opts) {
-    const key = this._nid;
-    if (!_eventRegistry[key]) _eventRegistry[key] = {};
-    if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
+    _eventTargetAdd(this, type, handler, opts);
   }
-  removeEventListener(type, handler) {
-    const key = this._nid;
-    if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
-    }
+  removeEventListener(type, handler, opts) {
+    _eventTargetRemove(this, type, handler, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    // Spec: inline `onclick="..."` content attributes are event handlers
-    // for the matching event type. Fire them alongside any
-    // addEventListener handlers. Also honor the IDL property
-    // `el.onclick = fn` if set. Without this, b.click() never invokes
-    // the inline handler and forms with onsubmit / buttons with onclick
-    // are silently dead.
-    const handlerName = 'on' + event.type;
-    const inlineFn = this[handlerName] || this._resolveInlineHandler(handlerName);
-    if (typeof inlineFn === 'function') {
-      try {
-        const ret = inlineFn.call(this, event);
-        if (ret === false) event.preventDefault();
-      } catch(e) { console.error(e); }
-    }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
-      if (event._immediatePropagationStopped) break;
-    }
-    if (event.bubbles && !event._propagationStopped && this.parentNode) {
-      this.parentNode.dispatchEvent(event);
-    }
-    return !event.defaultPrevented;
+    return _eventTargetDispatch(this, event);
   }
   _resolveInlineHandler(name) {
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
@@ -3898,10 +4109,10 @@ class Element extends Node {
   set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
   set returnValue(v) { this._returnValue = String(v); }
-  get oncancel() { return this._oncancel || null; }
-  set oncancel(f) { this._oncancel = typeof f === 'function' ? f : null; }
-  get onclose() { return this._onclose || null; }
-  set onclose(f) { this._onclose = typeof f === 'function' ? f : null; }
+  get oncancel() { return _eventHandlerGet(this, "oncancel"); }
+  set oncancel(f) { _eventHandlerSet(this, "oncancel", f); }
+  get onclose() { return _eventHandlerGet(this, "onclose"); }
+  set onclose(f) { _eventHandlerSet(this, "onclose", f); }
   get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
   set closedBy(v) { this.setAttribute('closedby', String(v)); }
   show() {
@@ -5470,21 +5681,13 @@ class Document extends Node {
   }
   createRange() { return new Range(); }
   addEventListener(type, fn, opts) {
-    if (typeof fn !== 'function') return;
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+    _eventTargetAdd(this, type, fn, opts);
   }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
+  removeEventListener(type, fn, opts) {
+    _eventTargetRemove(this, type, fn, opts);
   }
   dispatchEvent(event) {
-    if (!event) return true;
-    const handlers = (this._listeners?.[event.type] || []).slice();
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
-    return !event.defaultPrevented;
+    return _eventTargetDispatch(this, event);
   }
   createTreeWalker(root, whatToShow, filter) {
     // whatToShow is unsigned long; default SHOW_ALL only when the arg is omitted.
@@ -6054,18 +6257,18 @@ class HTMLImageElement extends Element {
     this._queueImageRequest();
     return this._imageNaturalHeight;
   }
-  get onload() { return this._imageOnload || null; }
+  get onload() { return _eventHandlerGet(this, "onload"); }
   set onload(value) {
-    this._imageOnload = typeof value === "function" ? value : null;
-    if (this._imageOnload) {
+    _eventHandlerSet(this, "onload", value);
+    if (_eventHandlerGet(this, "onload")) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
   }
-  get onerror() { return this._imageOnerror || null; }
+  get onerror() { return _eventHandlerGet(this, "onerror"); }
   set onerror(value) {
-    this._imageOnerror = typeof value === "function" ? value : null;
-    if (this._imageOnerror) {
+    _eventHandlerSet(this, "onerror", value);
+    if (_eventHandlerGet(this, "onerror")) {
       this._refreshImageFromCache();
       this._queueImageRequest();
     }
@@ -6569,11 +6772,18 @@ for (const _ev of [
   "unload","volumechange","waiting","wheel",
 ]) {
   const _on = "on" + _ev;
-  if (!(_on in globalThis)) globalThis[_on] = null;
-  for (const _proto of [Document.prototype, Element.prototype]) {
-    if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
-    }
+  for (const _owner of [globalThis, Document.prototype, Element.prototype]) {
+    const _descriptor = Object.getOwnPropertyDescriptor(_owner, _on);
+    if (_descriptor && _owner !== globalThis) continue;
+    if (_descriptor && !_descriptor.configurable) continue;
+    const _existingHandler = _descriptor && "value" in _descriptor ? _descriptor.value : null;
+    Object.defineProperty(_owner, _on, {
+      get() { return _eventHandlerGet(this, _on); },
+      set(value) { _eventHandlerSet(this, _on, value); },
+      configurable: true,
+      enumerable: false,
+    });
+    if (typeof _existingHandler === "function") _eventHandlerSet(_owner, _on, _existingHandler);
   }
 }
 
@@ -9718,7 +9928,18 @@ globalThis.DOMException = (function () {
 // obscura's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
-globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+const _pendingTrustedEvents = new WeakSet();
+globalThis.__obscura_markTrusted = function(ev) { try { if (ev) { _trustedEvents.add(ev); _pendingTrustedEvents.add(ev); } } catch (_e) {} return ev; };
+Object.defineProperty(globalThis, '__obscura_dispatchWindowLoad', {
+  value: function() {
+    const event = globalThis.__obscura_markTrusted(
+      new Event('load', { bubbles: false, cancelable: false }));
+    return _eventTargetDispatch(globalThis, event, globalThis.document);
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -9775,17 +9996,20 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now(); }
   get isTrusted() { return _trustedEvents.has(this); }
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  preventDefault() { const s=_eventDispatchStates.get(this); if ((s ? s.cancelable : this.cancelable) && !(s && s.inPassiveListener)) { if (s) s.defaultPrevented=true; try { this.defaultPrevented=true; } catch (_) {} } }
+  stopPropagation(){ const s=_eventDispatchStates.get(this); if (s) s.propagationStopped=true; }
+  stopImmediatePropagation(){ const s=_eventDispatchStates.get(this); if (s) { s.propagationStopped=true; s.immediatePropagationStopped=true; } }
+  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); if (_eventDispatchStates.has(this)) return; this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.composed=false;this.defaultPrevented=false; }
   composedPath() {
-    if (!this.target) return [];
-    const path = [];
-    let n = this.target;
-    while (n) { path.push(n); n = n.parentNode || null; }
-    if (typeof window !== "undefined" && window && path[path.length - 1] !== window) path.push(window);
-    return path;
+    const state = _eventDispatchStates.get(this);
+    if (!state) return [];
+    if (!state.composedPathCache) {
+      state.composedPathCache = _eventVisiblePath(
+        state.path, state.currentPathIndex, state.closedRootIndexes || []);
+    }
+    return state.composedPathCache.slice();
   }
 };
 _markNative(Event);
@@ -9795,9 +10019,8 @@ globalThis.CustomEvent = class extends Event {
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
   // instead of new CustomEvent(...). See issue #41.
   initCustomEvent(type,bubbles,cancelable,detail) {
-    this.type = type;
-    this.bubbles = !!bubbles;
-    this.cancelable = !!cancelable;
+    if (_eventDispatchStates.has(this)) return;
+    this.initEvent(type,bubbles,cancelable);
     this.detail = detail;
   }
 };
@@ -9806,6 +10029,7 @@ globalThis.MouseEvent = class extends Event {
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
+    if (_eventDispatchStates.has(this)) return;
     this.initEvent(type,canBubble,cancelable);
     this.view=view===undefined?null:view;
     this.detail=detail||0;
@@ -9826,6 +10050,7 @@ globalThis.KeyboardEvent = class extends Event {
   // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
   initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
+    if (_eventDispatchStates.has(this)) return;
     this.initEvent(type,canBubble,cancelable);
     this.view=view===undefined?null:view;
     this.key=key===undefined?"":String(key);
@@ -9847,6 +10072,7 @@ globalThis.UIEvent = class extends Event {
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initUIEvent(type,canBubble,cancelable,view,detail) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");
+    if (_eventDispatchStates.has(this)) return;
     this.initEvent(type,canBubble,cancelable);
     this.view=view===undefined?null:view;
     this.detail=detail||0;
@@ -9864,6 +10090,7 @@ globalThis.CompositionEvent = class extends Event {
   // Legacy DOM Level 3 initializer. Positional signature per UI Events spec.
   initCompositionEvent(type,canBubble,cancelable,view,data) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initCompositionEvent' on 'CompositionEvent': 1 argument required, but only 0 present.");
+    if (_eventDispatchStates.has(this)) return;
     this.initEvent(type,canBubble,cancelable);
     this.view=view===undefined?null:view;
     this.data=data===undefined?"":String(data);
@@ -9964,6 +10191,7 @@ globalThis.StorageEvent = class StorageEvent extends Event {
     this.storageArea = init.storageArea || null;
   }
   initStorageEvent(type, bubbles, cancelable, key, oldValue, newValue, url, storageArea) {
+    if (_eventDispatchStates.has(this)) return;
     this.initEvent(type, bubbles, cancelable);
     this.key = key !== undefined ? key : null;
     this.oldValue = oldValue !== undefined ? oldValue : null;

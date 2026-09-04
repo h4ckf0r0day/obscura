@@ -18135,6 +18135,614 @@ mod tests {
     }
 
     #[test]
+    fn dom_event_path_observes_phases_handlers_stops_and_once() {
+        let mut rt = setup_runtime(r#"<main id="parent"><button id="target">go</button></main>"#);
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const parent = document.getElementById("parent");
+                    const target = document.getElementById("target");
+                    const calls = [];
+                    const record = name => event => calls.push([
+                        name, event.eventPhase, event.target.id,
+                        event.currentTarget === window ? "window" :
+                          event.currentTarget === document ? "document" : event.currentTarget.id,
+                        event.composedPath().map(node => node === window ? "window" :
+                          node === document ? "document" : (node.id || node.nodeName)),
+                    ]);
+                    window.addEventListener("probe", record("window-capture"), true);
+                    document.addEventListener("probe", record("document-capture"), true);
+                    parent.addEventListener("probe", record("parent-capture"), true);
+                    target.addEventListener("probe", record("target-capture"), true);
+                    target.addEventListener("probe", record("target-bubble"));
+                    parent.addEventListener("probe", record("parent-bubble"));
+                    document.addEventListener("probe", record("document-bubble"));
+                    window.addEventListener("probe", record("window-bubble"));
+                    const probe = new Event("probe", {bubbles: true, composed: true});
+                    target.dispatchEvent(probe);
+
+                    const targetStop = [];
+                    target.addEventListener("target-stop", event => {
+                        targetStop.push("capture"); event.stopPropagation();
+                    }, true);
+                    target.addEventListener("target-stop", () => targetStop.push("bubble"));
+                    parent.addEventListener("target-stop", () => targetStop.push("parent"));
+                    target.dispatchEvent(new Event("target-stop", {bubbles: true}));
+
+                    const immediate = [];
+                    target.addEventListener("immediate", event => {
+                        immediate.push("first"); event.stopImmediatePropagation();
+                    });
+                    target.addEventListener("immediate", () => immediate.push("second"));
+                    target.dispatchEvent(new Event("immediate", {bubbles: true}));
+
+                    let once = 0;
+                    parent.addEventListener("once", () => once++, {once: true});
+                    target.dispatchEvent(new Event("once", {bubbles: true}));
+                    target.dispatchEvent(new Event("once", {bubbles: true}));
+
+                    const handlerOrder = [];
+                    target.addEventListener("change", () => handlerOrder.push("before"));
+                    target.onchange = () => handlerOrder.push("handler");
+                    target.addEventListener("change", () => handlerOrder.push("after"));
+                    target.dispatchEvent(new Event("change"));
+                    const removedHandler = [];
+                    target.addEventListener("reset", () => {
+                        removedHandler.push("listener"); target.onreset = null;
+                    });
+                    target.onreset = () => removedHandler.push("stale-handler");
+                    target.dispatchEvent(new Event("reset"));
+                    const replacedHandler = [];
+                    target.addEventListener("select", () => {
+                        replacedHandler.push("listener");
+                        target.onselect = () => replacedHandler.push("replacement");
+                    });
+                    target.onselect = () => replacedHandler.push("stale-handler");
+                    target.dispatchEvent(new Event("select"));
+                    const imageOrder = [];
+                    const image = document.createElement("img");
+                    image.addEventListener("load", () => imageOrder.push("before"));
+                    image.onload = () => imageOrder.push("handler");
+                    image.addEventListener("load", () => imageOrder.push("after"));
+                    image.dispatchEvent(new Event("load"));
+                    const passive = new Event("passive", {cancelable:true});
+                    target.addEventListener("passive", event => event.preventDefault(), {passive:true});
+                    const passiveResult = target.dispatchEvent(passive);
+
+                    const reusable = new Event("reusable", {bubbles:true, cancelable:true});
+                    const reuse = [];
+                    target.addEventListener("reusable", event => {
+                        let redispatchError = "";
+                        try { target.dispatchEvent(event); }
+                        catch (error) { redispatchError = error.name; }
+                        event.initEvent("changed-during-dispatch", false, false);
+                        reuse.push([event.type, event.bubbles, event.cancelable, redispatchError]);
+                    });
+                    target.dispatchEvent(reusable);
+                    target.dispatchEvent(reusable);
+                    reusable.initEvent("renamed", false, false);
+                    target.addEventListener("renamed", () => reuse.push(["renamed"]));
+                    target.dispatchEvent(reusable);
+
+                    let deep = target;
+                    for (let i = 0; i < 64; i++) {
+                        const wrapper = document.createElement("div");
+                        deep.parentNode.insertBefore(wrapper, deep);
+                        wrapper.appendChild(deep);
+                    }
+                    const lazy = {};
+                    target.addEventListener("lazy-path", event => {
+                        lazy.internalKeys = Object.keys(event).filter(key => key.startsWith("_"));
+                        const first = event.composedPath();
+                        const second = event.composedPath();
+                        lazy.distinctResults = first !== second;
+                        lazy.length = first.length;
+                    });
+                    target.dispatchEvent(new Event("lazy-path", {bubbles:true, composed:true}));
+                    return {calls, targetStop, immediate, once, handlerOrder,
+                        removedHandler, replacedHandler, imageOrder,
+                        passiveResult, passiveDefault:passive.defaultPrevented, reuse, lazy,
+                        pathAfter: probe.composedPath(), phaseAfter: probe.eventPhase,
+                        currentAfter: probe.currentTarget};
+                })()"#,
+            )
+            .unwrap();
+        let names: Vec<&str> = result["calls"].as_array().unwrap().iter()
+            .map(|call| call[0].as_str().unwrap()).collect();
+        assert_eq!(names, [
+            "window-capture", "document-capture", "parent-capture", "target-capture",
+            "target-bubble", "parent-bubble", "document-bubble", "window-bubble",
+        ]);
+        assert_eq!(result["calls"][0][1], 1);
+        assert_eq!(result["calls"][3][1], 2);
+        assert_eq!(result["calls"][5][1], 3);
+        assert_eq!(result["targetStop"], serde_json::json!(["capture", "bubble"]));
+        assert_eq!(result["immediate"], serde_json::json!(["first"]));
+        assert_eq!(result["once"], 1);
+        assert_eq!(result["handlerOrder"], serde_json::json!(["before", "handler", "after"]));
+        assert_eq!(result["removedHandler"], serde_json::json!(["listener"]));
+        assert_eq!(result["replacedHandler"], serde_json::json!(["listener", "replacement"]));
+        assert_eq!(result["imageOrder"], serde_json::json!(["before", "handler", "after"]));
+        assert_eq!(result["passiveResult"], true);
+        assert_eq!(result["passiveDefault"], false);
+        assert_eq!(result["reuse"], serde_json::json!([
+            ["reusable", true, true, "InvalidStateError"],
+            ["reusable", true, true, "InvalidStateError"], ["renamed"],
+        ]));
+        assert_eq!(result["lazy"], serde_json::json!({
+            "internalKeys": [], "distinctResults": true, "length": 70,
+        }));
+        assert_eq!(result["pathAfter"], serde_json::json!([]));
+        assert_eq!(result["phaseAfter"], 0);
+        assert!(result["currentAfter"].is_null());
+    }
+
+    #[test]
+    fn failed_trusted_event_setup_cannot_leak_trust_to_redispatch() {
+        let mut rt = setup_runtime(r#"<button id="target"></button>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const target = document.getElementById("target");
+                    const event = globalThis.__obscura_markTrusted(new Event("probe"));
+                    Object.defineProperty(event, "type", {
+                        configurable: true,
+                        get() { throw new Error("setup failed"); },
+                    });
+                    let failed = false;
+                    try { target.dispatchEvent(event); } catch (_) { failed = true; }
+                    Object.defineProperty(event, "type", {
+                        configurable: true, value: "probe",
+                    });
+                    let trustedOnRedispatch = null;
+                    target.addEventListener("probe", current => {
+                        trustedOnRedispatch = current.isTrusted;
+                    });
+                    target.dispatchEvent(event);
+
+                    const nested = globalThis.__obscura_markTrusted(new Event("nested"));
+                    const outerTrust = [];
+                    let nestedError = null;
+                    target.addEventListener("nested", current => {
+                        outerTrust.push(current.isTrusted);
+                        try { target.dispatchEvent(current); }
+                        catch (error) { nestedError = error.name; }
+                        outerTrust.push(current.isTrusted);
+                    }, {once:true});
+                    target.addEventListener("nested", current => {
+                        outerTrust.push(current.isTrusted);
+                    }, {once:true});
+                    target.dispatchEvent(nested);
+                    return [failed, trustedOnRedispatch, nestedError, outerTrust];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, false, "InvalidStateError", [true, true, true],
+        ]));
+    }
+
+    #[test]
+    fn dispatch_cleanup_survives_throwing_event_surface_setters() {
+        let mut rt = setup_runtime(r#"<button id="target"></button>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const target = document.getElementById("target");
+                    const calls = [];
+                    target.addEventListener("probe", event => calls.push(event.isTrusted));
+                    const event = globalThis.__obscura_markTrusted(new Event("probe"));
+                    for (const name of ["target", "currentTarget", "eventPhase"]) {
+                        Object.defineProperty(event, name, {
+                            configurable: true,
+                            get() { return null; },
+                            set() { throw new Error("blocked " + name); },
+                        });
+                    }
+                    const first = target.dispatchEvent(event);
+                    const second = target.dispatchEvent(event);
+                    const fresh = target.dispatchEvent(new Event("probe"));
+                    return {first, second, fresh, calls, trustedAfter:event.isTrusted};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "first": true, "second": true, "fresh": true,
+            "calls": [true, false, false], "trustedAfter": false,
+        }));
+    }
+
+    #[test]
+    fn no_listener_dispatch_blocks_redispatch_from_target_setter() {
+        let mut rt = setup_runtime(r#"<button id="target"></button>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const target = document.getElementById("target");
+                    const event = new Event("probe");
+                    let setterCalls = 0;
+                    let nestedError = null;
+                    let lateCalls = 0;
+                    Object.defineProperty(event, "target", {
+                        configurable: true,
+                        get() { return null; },
+                        set() {
+                            setterCalls++;
+                            target.addEventListener("probe", () => lateCalls++);
+                            try { target.dispatchEvent(event); }
+                            catch (error) { nestedError = error.name; }
+                        },
+                    });
+                    const result = target.dispatchEvent(event);
+                    return {result, setterCalls, nestedError, lateCalls};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "result": true, "setterCalls": 1,
+            "nestedError": "InvalidStateError", "lateCalls": 0,
+        }));
+    }
+
+    #[test]
+    fn dispatch_snapshots_type_and_bubbling_before_capture_listeners() {
+        let mut rt = setup_runtime(r#"<main id="parent"><button id="target"></button></main>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const parent = document.getElementById("parent");
+                    const target = document.getElementById("target");
+                    const calls = [];
+                    addEventListener("original", event => {
+                        calls.push("window-capture");
+                        event.type = "renamed";
+                        event.bubbles = false;
+                    }, true);
+                    document.addEventListener("original", () => calls.push("document-capture"), true);
+                    parent.addEventListener("original", () => calls.push("parent-capture"), true);
+                    target.addEventListener("original", () => calls.push("target"));
+                    parent.addEventListener("original", () => calls.push("parent-bubble"));
+                    document.addEventListener("original", () => calls.push("document-bubble"));
+                    addEventListener("original", () => calls.push("window-bubble"));
+                    for (const node of [target, parent, document, globalThis]) {
+                        node.addEventListener("renamed", () => calls.push("wrong-type"));
+                    }
+                    target.dispatchEvent(new Event("original", {bubbles:true, composed:true}));
+                    return calls;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([
+            "window-capture", "document-capture", "parent-capture", "target",
+            "parent-bubble", "document-bubble", "window-bubble",
+        ]));
+    }
+
+    #[test]
+    fn dispatch_coerces_type_once_and_reentrant_guard_precedes_type_access() {
+        let mut rt = setup_runtime(r#"<button id="target"></button>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const target = document.getElementById("target");
+                    let coercions = 0;
+                    const event = new Event("initial");
+                    event.type = {
+                        toString() {
+                            coercions++;
+                            if (coercions > 1) throw new Error("coerced twice");
+                            return "coerced";
+                        }
+                    };
+                    let nestedError = null;
+                    target.addEventListener("coerced", current => {
+                        Object.defineProperty(current, "type", {
+                            configurable: true,
+                            get() { throw new Error("nested type read"); },
+                        });
+                        try { target.dispatchEvent(current); }
+                        catch (error) { nestedError = error.name; }
+                    });
+                    const dispatched = target.dispatchEvent(event);
+                    return {coercions, nestedError, dispatched};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "coercions": 1, "nestedError": "InvalidStateError", "dispatched": true,
+        }));
+    }
+
+    #[test]
+    fn listener_mutation_reentrancy_abort_and_non_bubbling_document_path_match_browser() {
+        let mut rt = setup_runtime(r#"<button id="target"></button>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const target = document.getElementById("target");
+                    const mutation = [];
+                    const late = () => mutation.push("late");
+                    target.addEventListener("mutate", () => {
+                        mutation.push("once");
+                        target.addEventListener("mutate", late);
+                        target.dispatchEvent(new Event("mutate"));
+                    }, {once:true});
+                    target.addEventListener("mutate", () => mutation.push("existing"));
+                    target.dispatchEvent(new Event("mutate"));
+
+                    const aborted = [];
+                    const controller = new AbortController();
+                    target.addEventListener("aborted", () => aborted.push("called"), {
+                        signal: controller.signal,
+                    });
+                    controller.abort();
+                    target.dispatchEvent(new Event("aborted"));
+
+                    const documentPath = [];
+                    addEventListener("document-only", () => documentPath.push("window-capture"), true);
+                    addEventListener("document-only", () => documentPath.push("window-bubble"));
+                    document.addEventListener("document-only", () => documentPath.push("document-target"));
+                    document.dispatchEvent(new Event("document-only", {bubbles:false}));
+                    return {mutation, aborted, documentPath};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "mutation": ["once", "existing", "late", "existing"],
+            "aborted": [],
+            "documentPath": ["window-capture", "document-target"],
+        }));
+    }
+
+    #[test]
+    fn shadow_event_path_retargets_and_hides_closed_internals() {
+        let mut rt = setup_runtime(r#"<div id="open"></div><div id="closed"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const openHost = document.getElementById("open");
+                    const openRoot = openHost.attachShadow({mode:"open"});
+                    const openTarget = document.createElement("button");
+                    openTarget.id = "open-target";
+                    openRoot.appendChild(openTarget);
+                    const openSeen = [];
+                    openRoot.addEventListener("open-probe", event => openSeen.push([
+                        "root", event.target.id, event.composedPath().includes(openTarget), event.eventPhase,
+                    ]));
+                    openHost.addEventListener("open-probe", event => openSeen.push([
+                        "host", event.target.id, event.composedPath().includes(openTarget), event.eventPhase,
+                    ]));
+                    document.addEventListener("open-probe", event => openSeen.push([
+                        "document", event.target.id, event.composedPath().includes(openTarget), event.eventPhase,
+                    ]));
+                    openTarget.dispatchEvent(new Event("open-probe", {bubbles:true, composed:true}));
+
+                    const nonBubbling = [];
+                    openHost.addEventListener("non-bubbling", () => nonBubbling.push("host-capture"), true);
+                    openHost.addEventListener("non-bubbling", () => nonBubbling.push("host-bubble"));
+                    openTarget.addEventListener("non-bubbling", () => nonBubbling.push("target"));
+                    openTarget.dispatchEvent(new Event("non-bubbling", {bubbles:false, composed:true}));
+                    const stoppedAtHost = [];
+                    openHost.addEventListener("stopped-at-host", event => {
+                        stoppedAtHost.push("host-capture"); event.stopPropagation();
+                    }, true);
+                    openHost.addEventListener("stopped-at-host", () => stoppedAtHost.push("host-bubble"));
+                    openTarget.addEventListener("stopped-at-host", () => stoppedAtHost.push("target"));
+                    openTarget.dispatchEvent(new Event("stopped-at-host", {bubbles:false, composed:true}));
+
+                    const closedHost = document.getElementById("closed");
+                    const closedRoot = closedHost.attachShadow({mode:"closed"});
+                    const closedTarget = document.createElement("button");
+                    const related = document.createElement("span");
+                    closedTarget.id = "closed-target";
+                    related.id = "related";
+                    closedRoot.appendChild(closedTarget);
+                    closedRoot.appendChild(related);
+                    const closedSeen = [];
+                    closedRoot.addEventListener("closed-probe", event => closedSeen.push([
+                        "root", event.target.id, event.relatedTarget.id,
+                        event.composedPath().includes(closedTarget),
+                    ]));
+                    document.addEventListener("closed-probe", event => closedSeen.push([
+                        "document", event.target.id, event.relatedTarget.id,
+                        event.composedPath().includes(closedTarget),
+                    ]));
+                    closedTarget.dispatchEvent(new MouseEvent("closed-probe", {
+                        bubbles:true, composed:true, relatedTarget:document.body,
+                    }));
+
+                    const confined = [];
+                    closedRoot.addEventListener("confined", () => confined.push("root"));
+                    closedHost.addEventListener("confined", () => confined.push("host"));
+                    document.addEventListener("confined", () => confined.push("document"));
+                    closedTarget.dispatchEvent(new Event("confined", {bubbles:true, composed:false}));
+
+                    let suppressedOutside = 0;
+                    document.addEventListener("related", () => suppressedOutside++);
+                    closedTarget.dispatchEvent(new MouseEvent("related", {
+                        bubbles:true, composed:true, relatedTarget:related,
+                    }));
+                    return {openSeen, nonBubbling, stoppedAtHost, closedSeen, confined, suppressedOutside};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["openSeen"], serde_json::json!([
+            ["root", "open-target", true, 3], ["host", "open", true, 2],
+            ["document", "open", true, 3],
+        ]));
+        assert_eq!(result["nonBubbling"], serde_json::json!([
+            "host-capture", "target", "host-bubble",
+        ]));
+        assert_eq!(result["stoppedAtHost"], serde_json::json!(["host-capture"]));
+        assert_eq!(result["closedSeen"], serde_json::json!([
+            ["root", "closed-target", "", true], ["document", "closed", "", false],
+        ]));
+        assert_eq!(result["confined"], serde_json::json!(["root"]));
+        assert_eq!(result["suppressedOutside"], 0);
+    }
+
+    #[test]
+    fn direct_shadow_root_dispatch_retargets_and_cleanup_survives_hostile_root_lookup() {
+        let mut rt = setup_runtime(r#"<div id="open"></div><div id="closed"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const seen = [];
+                    for (const mode of ["open", "closed"]) {
+                        const host = document.getElementById(mode);
+                        const root = host.attachShadow({mode});
+                        root.addEventListener(mode, event => seen.push([
+                            mode, "root", event.target === root,
+                            event.composedPath().includes(root),
+                        ]));
+                        document.addEventListener(mode, event => seen.push([
+                            mode, "document", event.target === host,
+                            event.composedPath().includes(root),
+                        ]));
+                        root.dispatchEvent(new Event(mode, {bubbles:true, composed:true}));
+                    }
+
+                    const host = document.createElement("div");
+                    document.body.appendChild(host);
+                    const root = host.attachShadow({mode:"open"});
+                    const target = document.createElement("button");
+                    root.appendChild(target);
+                    const originalGetRootNode = target.getRootNode;
+                    target.getRootNode = () => { throw new Error("hostile root lookup"); };
+                    const event = new Event("hostile", {bubbles:true, composed:true});
+                    let firstError = null;
+                    try { target.dispatchEvent(event); }
+                    catch (error) { firstError = error.message; }
+                    target.getRootNode = originalGetRootNode;
+                    let laterCalls = 0;
+                    document.addEventListener("hostile", () => laterCalls++);
+                    const secondResult = target.dispatchEvent(event);
+                    return {seen, firstError, secondResult, laterCalls};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!({
+            "seen": [
+                ["open", "root", true, true],
+                ["open", "document", true, true],
+                ["closed", "root", true, true],
+                ["closed", "document", true, false],
+            ],
+            "firstError": "hostile root lookup",
+            "secondResult": true,
+            "laterCalls": 1,
+        }));
+    }
+
+    #[test]
+    fn nested_shadow_hosts_are_additional_targets_on_the_forward_event_leg() {
+        let mut rt = setup_runtime(r#"<div id="outer"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const outer = document.getElementById("outer");
+                    const outerRoot = outer.attachShadow({mode:"open"});
+                    const inner = document.createElement("div");
+                    inner.id = "inner";
+                    outerRoot.appendChild(inner);
+                    const innerRoot = inner.attachShadow({mode:"open"});
+                    const target = document.createElement("button");
+                    innerRoot.appendChild(target);
+                    const calls = [];
+                    const record = name => event => calls.push([name, event.eventPhase]);
+                    outer.addEventListener("probe", record("outer-capture"), true);
+                    outer.addEventListener("probe", record("outer-target"));
+                    inner.addEventListener("probe", record("inner-capture"), true);
+                    inner.addEventListener("probe", record("inner-target"));
+                    target.addEventListener("probe", record("target-capture"), true);
+                    target.addEventListener("probe", record("target"));
+                    target.dispatchEvent(new Event("probe", {bubbles:false, composed:true}));
+
+                    const stopped = [];
+                    outer.addEventListener("stopped", () => stopped.push("outer-capture"), true);
+                    inner.addEventListener("stopped", event => {
+                        stopped.push("inner-capture"); event.stopPropagation();
+                    }, true);
+                    inner.addEventListener("stopped", () => stopped.push("inner-target"));
+                    target.addEventListener("stopped", () => stopped.push("target"));
+                    outer.addEventListener("stopped", () => stopped.push("outer-target"));
+                    target.dispatchEvent(new Event("stopped", {bubbles:false, composed:true}));
+                    return {calls, stopped};
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["calls"], serde_json::json!([
+            ["outer-capture", 2], ["inner-capture", 2],
+            ["target-capture", 2], ["target", 2],
+            ["inner-target", 2], ["outer-target", 2],
+        ]));
+        assert_eq!(result["stopped"], serde_json::json!([
+            "outer-capture", "inner-capture",
+        ]));
+    }
+
+    #[test]
+    fn legacy_event_initializers_are_noops_during_dispatch() {
+        let mut rt = setup_runtime(r#"<div id="target"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const target = document.getElementById("target");
+                    const checks = [];
+                    let initialized = 0;
+                    const preserve = (event, initialize, read) => {
+                        const before = read(event);
+                        target.addEventListener(event.type, () => { initialized++; initialize(event); }, {once:true});
+                        target.dispatchEvent(event);
+                        checks.push([before, read(event)]);
+                    };
+                    preserve(
+                        new CustomEvent("custom", {bubbles:true, composed:true, detail:"old"}),
+                        event => event.initCustomEvent("changed", false, false, "new"),
+                        event => [event.type,event.bubbles,event.composed,event.detail]);
+                    preserve(
+                        new MouseEvent("mouse", {bubbles:true, composed:true, clientX:3, relatedTarget:document.body}),
+                        event => event.initMouseEvent("changed",false,false,null,9,1,2,30,40,true,true,true,true,2,null),
+                        event => [event.type,event.bubbles,event.composed,event.clientX,event.relatedTarget===document.body]);
+                    preserve(
+                        new KeyboardEvent("keyboard", {bubbles:true, composed:true, key:"Old", location:1}),
+                        event => event.initKeyboardEvent("changed",false,false,null,"New",2,true,true,true,true),
+                        event => [event.type,event.bubbles,event.composed,event.key,event.location]);
+                    preserve(
+                        new UIEvent("ui", {bubbles:true, composed:true, detail:4}),
+                        event => event.initUIEvent("changed",false,false,null,9),
+                        event => [event.type,event.bubbles,event.composed,event.detail]);
+                    preserve(
+                        new CompositionEvent("composition", {bubbles:true, composed:true, data:"old"}),
+                        event => event.initCompositionEvent("changed",false,false,null,"new"),
+                        event => [event.type,event.bubbles,event.composed,event.data]);
+                    preserve(
+                        new StorageEvent("storage", {bubbles:true, composed:true, key:"old", newValue:"value"}),
+                        event => event.initStorageEvent("changed",false,false,"new",null,"other","x",null),
+                        event => [event.type,event.bubbles,event.composed,event.key,event.newValue]);
+
+                    const outside = new Event("before", {bubbles:false, cancelable:false, composed:true});
+                    outside.initEvent("after", true, true);
+                    const outsideCustom = new CustomEvent("before-custom", {composed:true, detail:"old"});
+                    outsideCustom.initCustomEvent("after-custom", true, true, "new");
+                    return {checks, initialized,
+                        outside:[outside.type,outside.bubbles,outside.cancelable,outside.composed],
+                        outsideCustom:[outsideCustom.type,outsideCustom.bubbles,
+                            outsideCustom.cancelable,outsideCustom.composed,outsideCustom.detail]};
+                })()"#,
+            )
+            .unwrap();
+        for check in result["checks"].as_array().unwrap() {
+            assert_eq!(check[0], check[1]);
+        }
+        assert_eq!(result["initialized"], 6);
+        assert_eq!(result["outside"], serde_json::json!(["after", true, true, false]));
+        assert_eq!(result["outsideCustom"], serde_json::json!([
+            "after-custom", true, true, false, "new",
+        ]));
+    }
+
+    #[test]
     fn media_text_tracks_expose_loaded_webvtt_cues() {
         let mut rt = setup_runtime(
             r#"<video><track id="captions" kind="captions" srclang="en" default
