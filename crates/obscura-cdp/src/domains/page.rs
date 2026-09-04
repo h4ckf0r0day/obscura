@@ -833,6 +833,21 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     )
 }
 
+fn emit_to_sessions(
+    ctx: &mut CdpContext,
+    sessions: &[String],
+    method: &str,
+    params: Value,
+) {
+    for session_id in sessions {
+        ctx.pending_events.push(CdpEvent::with_session(
+            method,
+            params.clone(),
+            session_id.clone(),
+        ));
+    }
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -850,7 +865,9 @@ pub fn emit_navigation_events(
 ) {
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
-    let es = session_id.clone();
+    let page_sessions = ctx.sessions_for_page(&ctx.page_enabled_sessions, page_id);
+    let lifecycle_sessions = ctx.sessions_for_page(&ctx.lifecycle_enabled_sessions, page_id);
+    let network_sessions = ctx.sessions_for_page(&ctx.network_enabled_sessions, page_id);
     let ts = timestamp();
 
     // Real Chrome uses the navigation's loaderId as the main document's
@@ -899,11 +916,8 @@ pub fn emit_navigation_events(
     if let Some(idx) = nav_idx {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
+        let params = json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id});
+        emit_to_sessions(ctx, &network_sessions, "Network.requestWillBeSent", params);
     }
 
     // executionContextsCleared invalidates every prior context id, so a
@@ -913,28 +927,24 @@ pub fn emit_navigation_events(
     // executionContextCreated events are emitted. Issue #407: previously this
     // set was insert-only, so stale ids kept validating and grew unbounded.
     ctx.valid_context_ids.clear();
-    let mut phase1 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextsCleared".into(),
-            params: json!({}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.frameNavigated".into(),
-            params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        },
-    ];
+    let runtime_sessions = ctx.sessions_for_page(&ctx.runtime_enabled_sessions, page_id);
+    let init_params = json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts});
+    emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", init_params);
+    emit_to_sessions(
+        ctx,
+        &runtime_sessions,
+        "Runtime.executionContextsCleared",
+        json!({}),
+    );
+    let frame_params = json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"});
+    emit_to_sessions(ctx, &page_sessions, "Page.frameNavigated", frame_params);
+    let default_context_params = json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}});
+    emit_to_sessions(
+        ctx,
+        &runtime_sessions,
+        "Runtime.executionContextCreated",
+        default_context_params,
+    );
     // The default world is re-created as context id 2; re-register it. Isolated
     // worlds register themselves via next_isolated_context in the loop below.
     ctx.valid_context_ids.insert(2);
@@ -946,14 +956,11 @@ pub fn emit_navigation_events(
     // Issue #192: fresh, monotonically increasing executionContextId per re-create.
     for world_name in &world_names {
         let world_ctx_id = ctx.next_isolated_context();
-        phase1.push(CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        });
+        let params = json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}});
+        emit_to_sessions(ctx, &runtime_sessions, "Runtime.executionContextCreated", params);
     }
-    phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
-    ctx.pending_events.extend(phase1);
+    let commit_params = json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts});
+    emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", commit_params);
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
@@ -971,7 +978,7 @@ pub fn emit_navigation_events(
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
                 }),
-                session_id: es.clone(),
+                session_id: session_id.clone(),
             });
         }
     }
@@ -979,56 +986,31 @@ pub fn emit_navigation_events(
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
         if Some(i) != nav_idx {
-            ctx.pending_events.push(CdpEvent {
-                method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-                session_id: es.clone(),
-            });
+            let params = json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id});
+            emit_to_sessions(ctx, &network_sessions, "Network.requestWillBeSent", params);
         }
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
-            session_id: es.clone(),
-        });
+        let response_params = json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id});
+        let finished_params = json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size});
+        emit_to_sessions(ctx, &network_sessions, "Network.responseReceived", response_params);
+        emit_to_sessions(ctx, &network_sessions, "Network.loadingFinished", finished_params);
     }
 
-    let mut phase3 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.domContentEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.loadEventFired".into(),
-            params: json!({"timestamp": ts}),
-            session_id: es.clone(),
-        },
-    ];
+    for (name, method) in [
+        ("DOMContentLoaded", "Page.domContentEventFired"),
+        ("load", "Page.loadEventFired"),
+    ] {
+        let lifecycle_params = json!({"frameId": frame_id, "loaderId": loader_id, "name": name, "timestamp": ts});
+        emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", lifecycle_params);
+        let page_params = json!({"timestamp": ts});
+        emit_to_sessions(ctx, &page_sessions, method, page_params);
+    }
     if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
         let idle_ts = timestamp();
-        phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
+        let params = json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts});
+        emit_to_sessions(ctx, &lifecycle_sessions, "Page.lifecycleEvent", params);
     }
-    phase3.push(CdpEvent {
-        method: "Page.frameStoppedLoading".into(),
-        params: json!({"frameId": frame_id}),
-        session_id: es,
-    });
-    ctx.pending_events.extend(phase3);
+    let stopped_params = json!({"frameId": frame_id});
+    emit_to_sessions(ctx, &page_sessions, "Page.frameStoppedLoading", stopped_params);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
     // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
@@ -1060,7 +1042,7 @@ pub fn emit_navigation_events(
 /// must not replay frame navigation or load lifecycle events.
 pub(crate) fn emit_runtime_network_events(
     ctx: &mut CdpContext,
-    session_id: &Option<String>,
+    _session_id: &Option<String>,
     frame_id: &str,
     page_url: &str,
     page_id: &str,
@@ -1074,11 +1056,10 @@ pub(crate) fn emit_runtime_network_events(
         .get(page_id)
         .cloned()
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+    let sessions = ctx.sessions_for_page(&ctx.network_enabled_sessions, page_id);
     for network_event in network_events {
         let request_id = &network_event.request_id;
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({
+        let request_params = json!({
                 "requestId": request_id,
                 "loaderId": loader_id,
                 "documentURL": page_url,
@@ -1092,12 +1073,8 @@ pub(crate) fn emit_runtime_network_events(
                 "initiator": {"type": "script"},
                 "type": network_event.resource_type,
                 "frameId": frame_id,
-            }),
-            session_id: session_id.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.responseReceived".into(),
-            params: json!({
+            });
+        let response_params = json!({
                 "requestId": request_id,
                 "loaderId": loader_id,
                 "timestamp": network_event.timestamp,
@@ -1113,18 +1090,29 @@ pub(crate) fn emit_runtime_network_events(
                         .unwrap_or_default(),
                 },
                 "frameId": frame_id,
-            }),
-            session_id: session_id.clone(),
-        });
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.loadingFinished".into(),
-            params: json!({
+            });
+        let finished_params = json!({
                 "requestId": request_id,
                 "timestamp": network_event.timestamp,
                 "encodedDataLength": network_event.body_size,
-            }),
-            session_id: session_id.clone(),
-        });
+            });
+        for session_id in &sessions {
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.requestWillBeSent",
+                request_params.clone(),
+                session_id.clone(),
+            ));
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.responseReceived",
+                response_params.clone(),
+                session_id.clone(),
+            ));
+            ctx.pending_events.push(CdpEvent::with_session(
+                "Network.loadingFinished",
+                finished_params.clone(),
+                session_id.clone(),
+            ));
+        }
     }
 }
 
@@ -1259,7 +1247,20 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            if let Some(session_id) = session_id {
+                ctx.page_enabled_sessions.insert(session_id.clone());
+            }
+            Ok(json!({}))
+        }
+        "disable" => {
+            if let Some(session_id) = session_id {
+                ctx.page_enabled_sessions.remove(session_id);
+                ctx.lifecycle_enabled_sessions.remove(session_id);
+                ctx.page_announced_frames_by_session.remove(session_id);
+            }
+            Ok(json!({}))
+        }
         "navigate" => {
             let url = params
                 .get("url")
@@ -1343,7 +1344,16 @@ pub async fn handle(
 
             Ok(json!({ "executionContextId": context_id }))
         }
-        "setLifecycleEventsEnabled" => Ok(json!({})),
+        "setLifecycleEventsEnabled" => {
+            if let Some(session_id) = session_id {
+                if params.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+                    ctx.lifecycle_enabled_sessions.insert(session_id.clone());
+                } else {
+                    ctx.lifecycle_enabled_sessions.remove(session_id);
+                }
+            }
+            Ok(json!({}))
+        }
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
             ctx.preload_counter += 1;
@@ -1737,6 +1747,8 @@ mod tests {
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
             .insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.network_enabled_sessions
+            .insert(session_id.clone().unwrap());
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {

@@ -24,6 +24,8 @@ async fn serve() -> String {
                     "<html><body><iframe src=\"/grandchild.html\"></iframe></body></html>"
                 } else if request.starts_with("GET /grandchild.html ") {
                     "<html><body><p>deep</p></body></html>"
+                } else if request.starts_with("GET /plain.html ") {
+                    "<html><body><p>plain</p></body></html>"
                 } else {
                     "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
                 };
@@ -94,8 +96,10 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
 async fn get_frame_tree_reports_nested_child_frames() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
+    let plain_url = format!("{url}plain.html");
     let mut ctx = CdpContext::new();
     let session = &attached_session(&mut ctx).await;
+    cdp(&mut ctx, 0, "Page.enable", json!({}), session).await;
 
     // Deliberately no `waitUntil`: that is what Puppeteer and Playwright send,
     // and it resolves to DomContentLoaded rather than to load. Passing
@@ -132,25 +136,20 @@ async fn get_frame_tree_reports_nested_child_frames() {
     assert_eq!(grandchild["frame"]["parentId"], child["frame"]["id"]);
 
     // A client builds its frame list from the events, so the tree alone is not
-    // enough. They have to carry the session the client attached with, because
-    // a client discards anything addressed to a session it does not hold, and
-    // Target.createTarget leaves a second session on the same page.
+    // enough. Events belong only to the session that enabled Page.
     let child_id = child["frame"]["id"].as_str().unwrap().to_string();
     let page_id = ctx.sessions.get(session.as_str()).cloned().unwrap();
-    // Announcing to one arbitrary session of the page is what the ordering of a
-    // HashMap decides, so require every session on the page to be told. That
-    // makes the client's own session covered whichever one it is.
     for (candidate, owner) in &ctx.sessions {
-        if owner != &page_id {
+        if owner != &page_id || candidate == session {
             continue;
         }
         assert!(
-            ctx.pending_events.iter().any(|e| {
+            !ctx.pending_events.iter().any(|e| {
                 e.method == "Page.frameAttached"
                     && e.params["frameId"] == child_id
                     && e.session_id.as_deref() == Some(candidate.as_str())
             }),
-            "session {candidate} on the page was never told the child frame attached"
+            "Page-disabled session {candidate} received a child-frame event"
         );
     }
 
@@ -182,4 +181,83 @@ async fn get_frame_tree_reports_nested_child_frames() {
         .filter(|e| e.method == "Page.frameAttached")
         .count();
     assert_eq!(repeats, 0, "the same frame was announced twice");
+
+    // A spawned navigation temporarily moves its page out of the context. A
+    // drain caused by another command must not forget that page's child-frame
+    // announcements and duplicate them when the page comes back.
+    let page_index = ctx
+        .pages
+        .iter()
+        .position(|page| page.id == page_id)
+        .expect("page in context");
+    let task_owned_page = ctx.pages.remove(page_index);
+    cdp(&mut ctx, 4, "Browser.getVersion", json!({}), session).await;
+    ctx.pages.push(task_owned_page);
+    let reinsert_start = ctx.pending_events.len();
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({"expression": "1"}), session).await;
+    assert!(!ctx.pending_events[reinsert_start..].iter().any(|event| {
+        matches!(event.method.as_str(), "Page.frameAttached" | "Page.frameNavigated")
+            && (event.params["frameId"] == child_id
+                || event.params["frame"]["id"] == child_id)
+            && event.session_id.as_deref() == Some(session.as_str())
+    }), "task-owned page lost its frame announcement state");
+
+    let late_session = ctx
+        .sessions
+        .iter()
+        .find(|(candidate, owner)| {
+            owner.as_str() == page_id.as_str() && candidate.as_str() != session.as_str()
+        })
+        .map(|(candidate, _)| candidate.clone())
+        .expect("second page session");
+    let late_start = ctx.pending_events.len();
+    cdp(&mut ctx, 6, "Page.enable", json!({}), &late_session).await;
+    assert!(ctx.pending_events[late_start..].iter().any(|event| {
+        event.method == "Page.frameAttached"
+            && event.params["frameId"] == child_id
+            && event.session_id.as_deref() == Some(late_session.as_str())
+    }));
+    assert!(!ctx.pending_events[late_start..].iter().any(|event| {
+        event.method == "Page.frameAttached"
+            && event.params["frameId"] == child_id
+            && event.session_id.as_deref() == Some(session.as_str())
+    }));
+
+    cdp(&mut ctx, 7, "Page.disable", json!({}), &late_session).await;
+    let reenable_start = ctx.pending_events.len();
+    cdp(&mut ctx, 8, "Page.enable", json!({}), &late_session).await;
+    assert!(ctx.pending_events[reenable_start..].iter().any(|event| {
+        event.method == "Page.frameAttached"
+            && event.params["frameId"] == child_id
+            && event.session_id.as_deref() == Some(late_session.as_str())
+    }));
+    assert!(!ctx.pending_events[reenable_start..].iter().any(|event| {
+        event.method == "Page.frameAttached"
+            && event.params["frameId"] == child_id
+            && event.session_id.as_deref() == Some(session.as_str())
+    }));
+
+    let removal_start = ctx.pending_events.len();
+    cdp(
+        &mut ctx,
+        9,
+        "Page.navigate",
+        json!({"url": plain_url, "waitUntil": "load"}),
+        session,
+    )
+    .await;
+    for expected_session in [session.as_str(), late_session.as_str()] {
+        assert_eq!(
+            ctx.pending_events[removal_start..]
+                .iter()
+                .filter(|event| {
+                    event.method == "Page.frameDetached"
+                        && event.params["frameId"] == child_id
+                        && event.session_id.as_deref() == Some(expected_session)
+                })
+                .count(),
+            1,
+            "child removal was not routed exactly once to {expected_session}",
+        );
+    }
 }

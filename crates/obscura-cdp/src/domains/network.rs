@@ -31,13 +31,25 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            if let Some(session_id) = session_id {
+                ctx.network_enabled_sessions.insert(session_id.clone());
+            }
+            Ok(json!({}))
+        }
         "disable" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.clear_response_bodies();
-            } else {
-                for page in &mut ctx.pages {
-                    page.clear_response_bodies();
+            let page_id = session_id
+                .as_ref()
+                .and_then(|session_id| ctx.sessions.get(session_id))
+                .cloned();
+            if let Some(session_id) = session_id {
+                ctx.network_enabled_sessions.remove(session_id);
+            }
+            if let Some(page_id) = page_id {
+                if !ctx.has_session_for_page(&ctx.network_enabled_sessions, &page_id) {
+                    if let Some(page) = ctx.get_page_mut(&page_id) {
+                        page.clear_response_bodies();
+                    }
                 }
             }
             Ok(json!({}))
@@ -400,6 +412,37 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("No response body found"));
+    }
+
+    #[tokio::test]
+    async fn browser_level_network_disable_preserves_page_session_bodies() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.network_enabled_sessions
+            .insert(session_id.clone().unwrap());
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html><body>owned body</body></html>")
+            .await
+            .unwrap();
+        let request_id = page.network_events[0].request_id.clone();
+
+        handle("disable", &json!({}), &mut ctx, &None)
+            .await
+            .unwrap();
+        let result = handle(
+            "getResponseBody",
+            &json!({ "requestId": request_id }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+        assert!(result["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("owned body")));
     }
 }
 

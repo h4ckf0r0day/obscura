@@ -103,6 +103,7 @@ async fn js_fetch_emits_network_request_and_response() {
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    cdp(&mut ctx, 0, "Network.enable", json!({}), session_id).await;
 
     // An ordinary fetch() is not load-delaying in Chromium: `load` may fire
     // while its response is still pending. Ask for networkidle0 explicitly so
@@ -172,6 +173,7 @@ async fn navigation_without_script_fetch_is_unaffected() {
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    cdp(&mut ctx, 0, "Network.enable", json!({}), session_id).await;
 
     cdp(&mut ctx, 1, "Page.navigate", json!({"url": base, "waitUntil": "load"}), session_id).await;
 

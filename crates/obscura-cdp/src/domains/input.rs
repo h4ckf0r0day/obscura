@@ -248,9 +248,7 @@ pub async fn handle(
                         .get(&page_id)
                         .cloned()
                         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                    ctx.pending_events.push(crate::types::CdpEvent {
-                        method: "Page.frameNavigated".into(),
-                        params: json!({
+                    let params = json!({
                             "frame": crate::domains::page::frame_value(
                                 &frame_id,
                                 None,
@@ -259,9 +257,16 @@ pub async fn handle(
                                 "text/html",
                             ),
                             "type": "Navigation",
-                        }),
-                        session_id: Some(session_id.clone().unwrap_or_default()),
-                    });
+                        });
+                    for session_id in
+                        ctx.sessions_for_page(&ctx.page_enabled_sessions, &page_id)
+                    {
+                        ctx.pending_events.push(crate::types::CdpEvent {
+                            method: "Page.frameNavigated".into(),
+                            params: params.clone(),
+                            session_id: Some(session_id),
+                        });
+                    }
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);

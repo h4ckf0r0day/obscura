@@ -122,6 +122,23 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
     )
     .await;
     let session_id = attached["sessionId"].as_str().unwrap().to_string();
+    let managed_session = format!("{page_id}-session");
+    cdp(
+        &mut ctx,
+        30,
+        "Page.enable",
+        json!({}),
+        Some(&session_id),
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        31,
+        "Page.enable",
+        json!({}),
+        Some(&managed_session),
+    )
+    .await;
 
     let initial_tree = cdp(
         &mut ctx,
@@ -223,6 +240,20 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         })
         .expect("same-document navigation event was not emitted")
         .params["frame"];
+    for expected_session in [&session_id, &managed_session] {
+        assert_eq!(
+            ctx.pending_events[route_event_start..]
+                .iter()
+                .filter(|event| {
+                    event.method == "Page.frameNavigated"
+                        && event.params["frame"]["id"] == page_id
+                        && event.session_id.as_deref() == Some(expected_session.as_str())
+                })
+                .count(),
+            1,
+            "same-document navigation was not routed exactly once to {expected_session}",
+        );
+    }
     assert_frame_contract(route_frame);
     assert_eq!(route_frame["loaderId"], loader_id);
     assert!(route_frame["url"].as_str().unwrap().ends_with("/next"));
