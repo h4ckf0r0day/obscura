@@ -51,6 +51,22 @@ struct Args {
     #[arg(long, global = true)]
     allow_private_network: bool,
 
+    /// Permit fetches to specific otherwise-blocked networks, as CIDR prefixes
+    /// or bare addresses. Repeatable, and comma-separated lists are accepted.
+    ///
+    /// Prefer this over `--allow-private-network` when testing an internal
+    /// application: that flag disables the whole deny-set, including the cloud
+    /// metadata endpoints (169.254.169.254, 100.100.100.200), so a page you
+    /// load gets an unrestricted internal pivot. `--allow-network` opens only
+    /// what you name.
+    ///
+    ///   --allow-network 10.20.0.0/16 --allow-network 192.168.1.5
+    ///
+    /// Equivalent to `OBSCURA_ALLOW_NETWORK`, but per-process and survives in
+    /// command pipelines.
+    #[arg(long, global = true, value_name = "CIDR")]
+    allow_network: Vec<String>,
+
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
     /// Applied once at startup before any isolate is created.
@@ -350,6 +366,28 @@ async fn main() -> anyhow::Result<()> {
         // threaded at this point.
         unsafe {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        }
+    }
+    if !args.allow_network.is_empty() {
+        // Validate before publishing it: a typo'd prefix must fail loudly at
+        // startup, not silently leave the operator with a policy that denies
+        // the thing they meant to allow.
+        let joined = args.allow_network.join(",");
+        match obscura_net::NetworkPolicy::new(args.allow_private_network, &args.allow_network) {
+            Ok(policy) => {
+                if policy.has_catch_all() {
+                    tracing::warn!(
+                        "--allow-network includes a /0 prefix, which disables the SSRF guard for that address family entirely"
+                    );
+                }
+                // SAFETY: same as above -- before any thread reads the env.
+                unsafe {
+                    std::env::set_var("OBSCURA_ALLOW_NETWORK", &joined);
+                }
+            }
+            Err(error) => {
+                anyhow::bail!("invalid --allow-network: {error}");
+            }
         }
     }
 

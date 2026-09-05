@@ -2,6 +2,7 @@ pub mod client;
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
+pub mod policy;
 pub mod robots;
 pub mod blocklist;
 #[cfg(feature = "stealth")]
@@ -17,6 +18,7 @@ pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,
 };
+pub use policy::{NetworkPolicy, Prefix};
 pub use robots::RobotsCache;
 pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]

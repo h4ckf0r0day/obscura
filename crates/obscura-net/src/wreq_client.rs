@@ -19,8 +19,8 @@ use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, SsrfGuardResolver, cors_required, env_allows_private_network,
-    fetch_file_url, is_forbidden_ip, redirect_taints_origin, request_fetch_site,
+    ResourceRequest, Response, SsrfGuardResolver, cors_required, fetch_file_url,
+    redirect_taints_origin, request_fetch_site,
     request_referrer, response_too_large, serialized_request_origin, validate_cors_response,
     validate_request_mode, validate_url,
 };
@@ -34,22 +34,20 @@ use crate::client::{
 #[cfg(feature = "stealth")]
 impl wreq::dns::Resolve for SsrfGuardResolver {
     fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
-        let allow = self.allow_private || env_allows_private_network();
+        let policy = self.policy.clone();
         let host = name.as_str().to_string();
         Box::pin(async move {
             let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await
                 .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?
                 .collect();
-            if !allow {
-                if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
-                        "SSRF blocked: '{}' resolves to forbidden address {}",
-                        host,
-                        bad.ip()
-                    )
-                    .into());
-                }
+            if let Some(bad) = addrs.iter().find(|sa| !policy.permits(sa.ip())) {
+                return Err(format!(
+                    "SSRF blocked: '{}' resolves to forbidden address {}",
+                    host,
+                    bad.ip()
+                )
+                .into());
             }
             let iter: wreq::dns::Addrs = Box::new(addrs.into_iter());
             Ok(iter)
@@ -173,10 +171,29 @@ async fn send_get_with_connection_reset_retry(
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
-    allow_private_network: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// Same policy the default transport enforces: seeded from
+    /// `allow_private_network` (#831), with the scoped `OBSCURA_ALLOW_NETWORK`
+    /// allowlist layered on top.
+    network_policy: crate::policy::NetworkPolicy,
+}
+
+/// The network policy for the stealth transport.
+///
+/// `allow_all_private` is `--allow-private-network` (#793); the scoped
+/// `OBSCURA_ALLOW_NETWORK` allowlist layers on top of it. A malformed
+/// allowlist denies the extra networks rather than silently widening or
+/// narrowing the policy, and says so.
+#[cfg(feature = "stealth")]
+fn stealth_network_policy(allow_all_private: bool) -> crate::policy::NetworkPolicy {
+    crate::policy::NetworkPolicy::from_env(allow_all_private).unwrap_or_else(|error| {
+        tracing::error!(
+            "ignoring OBSCURA_ALLOW_NETWORK: {error}. No extra networks are permitted."
+        );
+        crate::policy::NetworkPolicy::deny_private()
+    })
 }
 
 #[cfg(feature = "stealth")]
@@ -190,6 +207,8 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
+        let network_policy = stealth_network_policy(allow_private_network);
+
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -202,7 +221,7 @@ impl StealthHttpClient {
             // IP. Use the same opt-in as the `validate_url` calls below so
             // `--allow-private-network` reaches this transport (#793); the
             // resolver still honours OBSCURA_ALLOW_PRIVATE_NETWORK on its own.
-            .dns_resolver(Arc::new(SsrfGuardResolver::new(allow_private_network)))
+            .dns_resolver(Arc::new(SsrfGuardResolver::new(network_policy.clone())))
             .redirect(wreq::redirect::Policy::none());
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
@@ -249,10 +268,10 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
-            allow_private_network,
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            network_policy,
         }
     }
 
@@ -284,7 +303,7 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, self.allow_private_network)?;
+        validate_url(url, &self.network_policy)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes).await;
@@ -404,7 +423,7 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, self.allow_private_network)?;
+                    validate_url(&next_url, &self.network_policy)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -542,7 +561,7 @@ mod tests {
     // public name points inward, so the stealth client needs the same resolver.
     #[tokio::test]
     async fn stealth_resolver_blocks_hostname_that_resolves_to_loopback() {
-        let resolver = SsrfGuardResolver::new(false);
+        let resolver = SsrfGuardResolver::new(crate::policy::NetworkPolicy::deny_private());
         let res = resolver.resolve(Name::from("localtest.me")).await;
         assert!(res.is_err(), "localtest.me -> 127.0.0.1 must be blocked");
     }
@@ -550,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn stealth_resolver_does_not_block_public_host() {
         // Tolerate a no-network sandbox: only an actual SSRF rejection fails.
-        let resolver = SsrfGuardResolver::new(false);
+        let resolver = SsrfGuardResolver::new(crate::policy::NetworkPolicy::deny_private());
         match resolver.resolve(Name::from("example.com")).await {
             Ok(_) => {}
             Err(e) => assert!(
@@ -630,10 +649,12 @@ mod tests {
         let (port, server) = reset_fixture(false);
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
-            allow_private_network: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            // This test drives send_single against a loopback fixture and does
+            // its own reachability assertions; the policy is not under test.
+            network_policy: crate::policy::NetworkPolicy::allow_all_private(),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

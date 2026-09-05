@@ -2214,8 +2214,13 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .redirect(reqwest::redirect::Policy::none())
         .timeout(fetch_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
+        //
+        // This is the fallback client, used when no page client is available,
+        // so it has none of the page's configuration to inherit. Reading the
+        // policy from the environment keeps it consistent with what the CLI set
+        // rather than silently denying an allowlist the operator configured.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
-            false,
+            obscura_net::NetworkPolicy::from_env(false).unwrap_or_default(),
         )))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
@@ -2375,11 +2380,12 @@ async fn op_fetch_url(
     // process-wide environment setting.  Navigation already honours the
     // context's configured HTTP client; scripted fetch/XHR must use the same
     // policy for its initial URL and every URL it can reach below.
-    let allow_private_network = http_client
+    let network_policy = http_client
         .as_ref()
-        .is_some_and(|client| client.allow_private_network);
+        .map(|client| client.network_policy().clone())
+        .unwrap_or_default();
     if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
+        if let Err(e) = validate_fetch_url(&parsed_url, &network_policy) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -2476,7 +2482,7 @@ async fn op_fetch_url(
     // bypass validate_fetch_url entirely.
     let url = if let Some(new_url) = override_url {
         if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+            if let Err(reason) = validate_fetch_url(&parsed, &network_policy) {
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
@@ -2607,7 +2613,7 @@ async fn op_fetch_url(
                 mode.clone(),
                 credentials,
                 callbacks.clone(),
-                allow_private_network,
+                network_policy.clone(),
             )
             .await;
         }
@@ -2720,7 +2726,7 @@ async fn op_fetch_url(
         };
 
         // Re-validate every redirect target against the SSRF policy.
-        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
+        if let Err(reason) = validate_fetch_url(&next_url, &network_policy) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -2924,7 +2930,7 @@ async fn stealth_fetch_all(
     mode: String,
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
-    allow_private_network: bool,
+    network_policy: obscura_net::NetworkPolicy,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -2981,7 +2987,7 @@ async fn stealth_fetch_all(
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
-        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
+        if let Err(reason) = validate_fetch_url(&next_url, &network_policy) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
                 "blocked": true,
@@ -3306,7 +3312,27 @@ mod tests {
     #[test]
     fn fetch_url_validation_honors_per_context_private_network_opt_in() {
         let loopback = url::Url::parse("http://127.0.0.1:8080/resource").unwrap();
-        assert!(validate_fetch_url(&loopback, true).is_ok());
+        let allow_all = obscura_net::NetworkPolicy::allow_all_private();
+        assert!(validate_fetch_url(&loopback, &allow_all).is_ok());
+        // Denied by default, so the opt-in above is what changed the outcome.
+        let deny = obscura_net::NetworkPolicy::deny_private();
+        assert!(validate_fetch_url(&loopback, &deny).is_err());
+    }
+
+    /// A scoped allowlist reaches only what it names, and in particular does
+    /// not open the cloud metadata endpoint the blanket flag does.
+    #[test]
+    fn fetch_url_validation_honors_a_scoped_network_allowlist() {
+        let scoped =
+            obscura_net::NetworkPolicy::new(false, &["127.0.0.1/32".to_string()]).unwrap();
+        let loopback = url::Url::parse("http://127.0.0.1:8080/resource").unwrap();
+        assert!(validate_fetch_url(&loopback, &scoped).is_ok());
+
+        let metadata = url::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        assert!(
+            validate_fetch_url(&metadata, &scoped).is_err(),
+            "a loopback-scoped allowlist must not open cloud metadata"
+        );
     }
 
     // SEC-005 / #708 — fetch() must not accept file:// (deny-by-default, matching
@@ -3316,7 +3342,7 @@ mod tests {
     fn fetch_url_validation_rejects_file_scheme() {
         let file = url::Url::parse("file:///etc/passwd").unwrap();
         // Rejected even with private-network access granted.
-        let err = validate_fetch_url(&file, true)
+        let err = validate_fetch_url(&file, &obscura_net::NetworkPolicy::allow_all_private())
             .expect_err("file:// must be rejected by the fetch scheme gate");
         assert!(
             err.to_lowercase().contains("scheme"),
@@ -3838,7 +3864,10 @@ mod tests {
     }
 }
 
-fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
+fn validate_fetch_url(
+    url: &url::Url,
+    policy: &obscura_net::NetworkPolicy,
+) -> Result<(), String> {
     let scheme = url.scheme();
     // file:// is denied by default here, matching Page.navigate /
     // Target.createTarget (which gate it behind --allow-file-access). The
@@ -3851,14 +3880,14 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
         ));
     }
 
-    if allow_private_network || obscura_net::env_allows_private_network() {
+    if policy.allows_all_private() {
         return Ok(());
     }
 
     if let Some(host) = url.host() {
         match host {
             url::Host::Ipv4(ip) => {
-                if obscura_net::is_forbidden_ip(std::net::IpAddr::V4(ip)) {
+                if !policy.permits(std::net::IpAddr::V4(ip)) {
                     return Err(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
@@ -3866,7 +3895,7 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
                 }
             }
             url::Host::Ipv6(ip) => {
-                if obscura_net::is_forbidden_ip(std::net::IpAddr::V6(ip)) {
+                if !policy.permits(std::net::IpAddr::V6(ip)) {
                     return Err(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
@@ -3874,11 +3903,15 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
                 }
             }
             url::Host::Domain(domain) => {
+                // A hostname carries no address, so an allowlist cannot be
+                // evaluated here; the SSRF resolver makes the real decision on
+                // the addresses the name resolves to.
                 let lower_domain = domain.to_lowercase();
-                if lower_domain == "localhost"
-                    || lower_domain.ends_with(".localhost")
-                    || lower_domain == "127.0.0.1"
-                    || lower_domain == "::1"
+                if !policy.has_allowlist()
+                    && (lower_domain == "localhost"
+                        || lower_domain.ends_with(".localhost")
+                        || lower_domain == "127.0.0.1"
+                        || lower_domain == "::1")
                 {
                     return Err(format!(
                         "Access to localhost domain '{}' is not allowed",

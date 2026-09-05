@@ -669,33 +669,33 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
 /// `wreq::dns::Resolve` in `wreq_client.rs`, so `--stealth` never trades the
 /// guard away for a better TLS fingerprint.
 pub struct SsrfGuardResolver {
-    pub(crate) allow_private: bool,
+    pub(crate) policy: crate::policy::NetworkPolicy,
 }
 
 impl SsrfGuardResolver {
-    pub fn new(allow_private: bool) -> Self {
-        Self { allow_private }
+    pub fn new(policy: crate::policy::NetworkPolicy) -> Self {
+        Self { policy }
     }
 }
 
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let allow = self.allow_private || env_allows_private_network();
+        let policy = self.policy.clone();
         let host = name.as_str().to_string();
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
                 .collect();
-            if !allow {
-                if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
-                    return Err(format!(
-                        "SSRF blocked: '{}' resolves to forbidden address {}",
-                        host,
-                        bad.ip()
-                    )
-                    .into());
-                }
+            // The authoritative check: it sees the addresses the name actually
+            // resolves to, which is what closes DNS rebinding.
+            if let Some(bad) = addrs.iter().find(|sa| !policy.permits(sa.ip())) {
+                return Err(format!(
+                    "SSRF blocked: '{}' resolves to forbidden address {}",
+                    host,
+                    bad.ip()
+                )
+                .into());
             }
             let iter: Addrs = Box::new(addrs.into_iter());
             Ok(iter)
@@ -703,8 +703,10 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
-pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
-    let allow_private_network = allow_private_network || env_allows_private_network();
+pub(crate) fn validate_url(
+    url: &Url,
+    policy: &crate::policy::NetworkPolicy,
+) -> Result<(), ObscuraNetError> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
@@ -713,14 +715,15 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
         )));
     }
 
-    if scheme == "file" || allow_private_network {
+    // file:// is gated separately, at the read primitive.
+    if scheme == "file" || policy.allows_all_private() {
         return Ok(());
     }
 
     if let Some(host) = url.host() {
         match host {
             url::Host::Ipv4(ip) => {
-                if is_forbidden_ip(IpAddr::V4(ip)) {
+                if !policy.permits(IpAddr::V4(ip)) {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
@@ -728,7 +731,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                 }
             }
             url::Host::Ipv6(ip) => {
-                if is_forbidden_ip(IpAddr::V6(ip)) {
+                if !policy.permits(IpAddr::V6(ip)) {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
@@ -736,11 +739,19 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                 }
             }
             url::Host::Domain(domain) => {
+                // A hostname carries no address, so an allowlist cannot be
+                // evaluated here. When the operator listed prefixes, defer to
+                // `SsrfGuardResolver`, which sees what the name actually
+                // resolves to and is the authoritative check -- otherwise
+                // `--allow-network 127.0.0.1/32` would still refuse
+                // `http://localhost:8080`, which is the exact case the flag
+                // exists for.
                 let lower_domain = domain.to_lowercase();
-                if lower_domain == "localhost"
-                    || lower_domain.ends_with(".localhost")
-                    || lower_domain == "127.0.0.1"
-                    || lower_domain == "::1"
+                if !policy.has_allowlist()
+                    && (lower_domain == "localhost"
+                        || lower_domain.ends_with(".localhost")
+                        || lower_domain == "127.0.0.1"
+                        || lower_domain == "::1")
                 {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to localhost domain '{}' is not allowed",
@@ -908,6 +919,11 @@ pub struct ObscuraHttpClient {
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+    /// Which otherwise-forbidden destinations this client may reach. Built once
+    /// at construction from `allow_private_network` plus
+    /// `OBSCURA_ALLOW_NETWORK`, so the decision is data on the client rather
+    /// than a process-global consulted per request.
+    network_policy: crate::policy::NetworkPolicy,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1119,7 +1135,36 @@ impl ObscuraHttpClient {
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
+            network_policy: crate::policy::NetworkPolicy::from_env(allow_private_network)
+                .unwrap_or_else(|error| {
+                    // A malformed OBSCURA_ALLOW_NETWORK must not silently widen
+                    // or narrow the policy. Refuse the entries, keep the
+                    // blanket flag's meaning, and say so loudly.
+                    tracing::error!(
+                        "ignoring OBSCURA_ALLOW_NETWORK: {error}. No extra networks are permitted."
+                    );
+                    if allow_private_network {
+                        crate::policy::NetworkPolicy::allow_all_private()
+                    } else {
+                        crate::policy::NetworkPolicy::deny_private()
+                    }
+                }),
         }
+    }
+
+    /// The network policy this client enforces.
+    pub fn network_policy(&self) -> &crate::policy::NetworkPolicy {
+        &self.network_policy
+    }
+
+    /// Replace the network policy.
+    ///
+    /// Takes `&mut self` deliberately: the reqwest client is built lazily and
+    /// captures the policy in its DNS resolver at that point, so this is only
+    /// meaningful before the first request. Requiring exclusive access makes
+    /// that ordering a compile-time constraint rather than a comment.
+    pub fn set_network_policy(&mut self, policy: crate::policy::NetworkPolicy) {
+        self.network_policy = policy;
     }
 
     async fn get_client(&self) -> &Client {
@@ -1129,7 +1174,7 @@ impl ObscuraHttpClient {
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
-                .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
+                .dns_resolver(Arc::new(SsrfGuardResolver::new(self.network_policy.clone())))
 ;
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
@@ -1428,7 +1473,7 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, self.allow_private_network)?;
+        validate_url(url, &self.network_policy)?;
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
@@ -1651,7 +1696,7 @@ impl ObscuraHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, self.allow_private_network)?;
+                    validate_url(&next_url, &self.network_policy)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -1755,6 +1800,16 @@ mod ssrf_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use url::Url;
+
+    /// The default policy: everything in the deny-set stays denied.
+    fn deny() -> crate::policy::NetworkPolicy {
+        crate::policy::NetworkPolicy::deny_private()
+    }
+
+    /// The blanket `--allow-private-network` opt-out.
+    fn allow_all() -> crate::policy::NetworkPolicy {
+        crate::policy::NetworkPolicy::allow_all_private()
+    }
 
     fn ip(s: &str) -> IpAddr {
         IpAddr::from_str(s).unwrap()
@@ -1906,21 +1961,21 @@ mod ssrf_tests {
     #[test]
     fn validate_url_blocks_unspecified_and_allows_public() {
         // 0.0.0.0 previously slipped through validate_url's literal-host check.
-        assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false).is_err());
-        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), false).is_err());
-        assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
+        assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), &deny()).is_err());
+        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), &deny()).is_err());
+        assert!(validate_url(&Url::parse("http://example.com/").unwrap(), &deny()).is_ok());
         assert!(
-            validate_url(&Url::parse("http://[64:ff9b::7f00:1]/").unwrap(), false).is_err()
+            validate_url(&Url::parse("http://[64:ff9b::7f00:1]/").unwrap(), &deny()).is_err()
         );
         assert!(
-            validate_url(&Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(), false).is_err()
+            validate_url(&Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(), &deny()).is_err()
         );
-        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), false).is_ok());
+        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), &deny()).is_ok());
         assert!(
-            validate_url(&Url::parse("http://[64:ff9b::808:808]/").unwrap(), false).is_ok()
+            validate_url(&Url::parse("http://[64:ff9b::808:808]/").unwrap(), &deny()).is_ok()
         );
         // The allow flag bypasses the guard (local-dev escape hatch).
-        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
+        assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), &allow_all()).is_ok());
     }
 
     #[test]
@@ -2654,7 +2709,7 @@ mod ssrf_tests {
         // canonical DNS-rebinding test. The guard must reject it. If DNS is
         // unavailable the lookup itself errors (also Err), so the assertion
         // holds either way.
-        let r = SsrfGuardResolver::new(false);
+        let r = SsrfGuardResolver::new(deny());
         let res = r.resolve(Name::from_str("localtest.me").unwrap()).await;
         assert!(res.is_err(), "localtest.me -> 127.0.0.1 must be blocked");
     }
@@ -2663,7 +2718,7 @@ mod ssrf_tests {
     async fn resolver_does_not_ssrf_block_public_host() {
         // A public host must not be SSRF-blocked. Tolerate a no-network sandbox
         // by only failing on an actual SSRF rejection, not a lookup failure.
-        let r = SsrfGuardResolver::new(false);
+        let r = SsrfGuardResolver::new(deny());
         match r.resolve(Name::from_str("example.com").unwrap()).await {
             Ok(_) => {}
             Err(e) => assert!(
