@@ -15056,6 +15056,54 @@ if (typeof Element !== 'undefined' && !Element.prototype.toggleAttribute) {
   };
 }
 
+// Rank hit-test candidates the way the page paints them.
+//
+// The renderer already sorts boxes into the CSS 2.1 Appendix E stacking bands
+// to build its display list, so the order it reaches them in IS paint order.
+// `op_paint_slots` reports that position rather than recomputing z-order here:
+// a comparator written in JS would have to read `z-index` through
+// `getComputedStyle`, which only surfaces inline styles, so anything styled
+// from a <style> block would silently rank as z:0.
+//
+// Returns the candidates front-to-back (topmost first). Without the op — the
+// no-render build registers no layout — this falls back to document order,
+// which is what hit testing did before paint order was available.
+function __rankHitCandidates(candidates) {
+  if (candidates.length < 2) return candidates.slice();
+
+  var slots = null;
+  try {
+    var op = Deno.core.ops.op_paint_slots;
+    if (op) {
+      var reply = op(candidates.map(function(el) { return el._nid | 0; }).join(','));
+      if (reply) {
+        slots = reply.split(',').map(function(v) { return parseInt(v, 10); });
+        if (slots.length !== candidates.length) slots = null;
+      }
+    }
+  } catch (_e) {
+    slots = null;
+  }
+
+  var ranked = candidates.map(function(el, i) {
+    var slot = slots ? slots[i] : -1;
+    return {
+      el: el,
+      // A boxless element (-1) cannot be ordered by paint; keep it below
+      // anything that paints, and settle it by document order as before.
+      slot: (typeof slot === 'number' && !isNaN(slot)) ? slot : -1,
+      nid: el._nid | 0,
+    };
+  });
+
+  ranked.sort(function(a, b) {
+    if (a.slot !== b.slot) return b.slot - a.slot;
+    return b.nid - a.nid;
+  });
+
+  return ranked.map(function(entry) { return entry.el; });
+}
+
 // Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
 // in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
 // Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
@@ -15068,22 +15116,18 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // containing (x,y) would never reach a deep <input> inside <label><p>.
   // Returns the deepest matching element (highest nid wins as a proxy for
   // tree depth) so descendants beat ancestors.
-  Document.prototype.elementFromPoint = function(x, y) {
-    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
-      return null;
-    }
-    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
-    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
-    if (x < 0 || y < 0 || x > w || y > h) return null;
-    var all = this.querySelectorAll('*');
-    var best = null;
-    var bestNid = -1;
+  // Every element whose box contains the point, unordered. Shared by
+  // elementFromPoint and elementsFromPoint so the two cannot disagree about
+  // what was hit, only about how much of the stack they report.
+  function __hitCandidatesAt(doc, x, y) {
+    var all = doc.querySelectorAll('*');
+    var candidates = [];
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
       // documentElement / body span the viewport; skip them so we pick a
       // real descendant instead of falling back to <html>/<body>.
-      if (el === this.documentElement || el === this.body) continue;
+      if (el === doc.documentElement || el === doc.body) continue;
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
@@ -15093,7 +15137,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         // instead of the page behind it.
         var visible = true;
         var ancestor = el.parentElement;
-        while (ancestor && ancestor !== this.documentElement && ancestor !== this.body) {
+        while (ancestor && ancestor !== doc.documentElement && ancestor !== doc.body) {
           var style = null;
           try { style = getComputedStyle(ancestor); } catch (_e) {}
           var ox = style ? (style.overflowX || style.overflow || '') : '';
@@ -15120,15 +15164,37 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
-        var nid = el._nid | 0;
-        if (nid > bestNid) { best = el; bestNid = nid; }
+        candidates.push(el);
       }
     }
-    return best || this.body || this.documentElement || null;
+    return candidates;
+  }
+
+  Document.prototype.elementFromPoint = function(x, y) {
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return null;
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    if (x < 0 || y < 0 || x > w || y > h) return null;
+    var ranked = __rankHitCandidates(__hitCandidatesAt(this, x, y));
+    return ranked[0] || this.body || this.documentElement || null;
   };
+  // The real front-to-back stack, not just the topmost element repeated. Same
+  // candidates and the same ranking as elementFromPoint, so the two agree by
+  // construction.
   Document.prototype.elementsFromPoint = function(x, y) {
-    var el = this.elementFromPoint(x, y);
-    return el ? [el] : [];
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return [];
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    if (x < 0 || y < 0 || x > w || y > h) return [];
+    var top = this.elementFromPoint(x, y);
+    if (!top) return [];
+    var stack = __rankHitCandidates(__hitCandidatesAt(this, x, y));
+    if (!stack.length) return [top];
+    return stack;
   };
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
