@@ -477,6 +477,7 @@ mod tests {
         let mut parent = ObscuraJsRuntime::new();
         parent.set_user_agent(user_agent);
         parent.set_platform("Win32", "Windows", "19.0.0");
+        parent.set_language("de-DE,de;q=0.9");
         parent.set_dom(parse_html("<html><body></body></html>"));
         parent.set_url("https://parent.example/");
         parent.run_page_init();
@@ -494,6 +495,8 @@ mod tests {
             "navigator.userAgent",
             "navigator.platform",
             "navigator.userAgentData.platform",
+            "navigator.language",
+            "navigator.languages.join(',')",
         ] {
             assert_eq!(
                 frame.evaluate(&mut parent, surface).unwrap(),
@@ -504,6 +507,11 @@ mod tests {
         assert_eq!(
             frame.evaluate(&mut parent, "navigator.userAgent").unwrap(),
             serde_json::json!(user_agent)
+        );
+        assert_eq!(
+            frame.evaluate(&mut parent, "navigator.language").unwrap(),
+            serde_json::json!("de-DE"),
+            "the frame must carry the parent's locale, not the built-in default"
         );
     }
 
