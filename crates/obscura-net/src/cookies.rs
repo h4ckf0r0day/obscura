@@ -465,12 +465,39 @@ impl CookieJar {
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // 0700 on a directory we just created. The file below is 0600, but
+            // a world-readable *directory* still leaks the jar's existence and
+            // lets anything with write access replace it. Only applied when we
+            // created it: an operator who deliberately shares a storage dir
+            // keeps their own mode.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(parent) {
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                }
+            }
         }
         let mut tmp = tempfile::NamedTempFile::new_in(
             path.parent().unwrap_or(std::path::Path::new(".")),
         )?;
         tmp.write_all(json.as_bytes())?;
         tmp.persist(path).map_err(|e| e.error)?;
+        // `NamedTempFile` creates at 0600 and `persist` renames, so the mode is
+        // already right on a fresh file -- but not when persisting over an
+        // existing cookies.json that something else created world-readable.
+        // Set it explicitly rather than relying on that, because the file holds
+        // live session tokens in plaintext.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 

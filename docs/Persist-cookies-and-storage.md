@@ -56,3 +56,15 @@ obscura serve --port 9223 --storage-dir ./identity-b
 ```bash
 rm -rf ./obscura-data
 ```
+
+## What the store is, and is not
+
+`{storage-dir}/cookies.json` holds live session tokens **in plaintext**. The
+file is written 0600, and a directory Obscura creates for it is 0700, but the
+contents are not encrypted — Chrome uses Keychain on macOS and DPAPI on Windows;
+Obscura has no equivalent. Do not point `--storage-dir` at shared or backed-up
+storage for a credentialed session.
+
+In the container image the process runs as uid 65532, so a mounted storage dir
+must be writable by that uid. If it is not, the run still completes and exits 0
+— check that `cookies.json` exists after the first run rather than assuming it.
