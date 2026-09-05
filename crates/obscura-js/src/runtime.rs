@@ -222,6 +222,19 @@ fn js_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// JS member-access path to the stored object `object_id`, in the page realm
+/// (`frame_id` 0) or a child frame's realm. The id is embedded as a JSON string
+/// literal so a non-identifier id can never break out of the accessor — the ids
+/// are internally generated today, so this is defense-in-depth consistency.
+fn object_access_path(object_id: &str, frame_id: u32) -> String {
+    let oid = js_string_literal(object_id);
+    if frame_id == 0 {
+        format!("globalThis.__obscura_objects[{oid}]")
+    } else {
+        format!("globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{oid}]")
+    }
+}
+
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
     let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
     if remaining.is_zero() {
@@ -1134,13 +1147,7 @@ impl ObscuraJsRuntime {
                     .and_then(|rest| rest.split_once('-'))
                     .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
                     .unwrap_or(0);
-                let retrieval = if frame_id == 0 {
-                    format!("globalThis.__obscura_objects['{object_id}']")
-                } else {
-                    format!(
-                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}']"
-                    )
-                };
+                let retrieval = object_access_path(object_id, frame_id);
                 self.object_store.insert(object_id.to_string(), retrieval);
             }
         }
@@ -2277,13 +2284,7 @@ impl ObscuraJsRuntime {
                 .and_then(|rest| rest.split_once('-'))
                 .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
                 .unwrap_or(0);
-            let code = if frame_id == 0 {
-                format!("delete globalThis.__obscura_objects['{object_id}'];")
-            } else {
-                format!(
-                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}'];"
-                )
-            };
+            let code = format!("delete {};", object_access_path(object_id, frame_id));
             let _ = self.execute_runtime_script("<release>", code);
         }
     }
@@ -3700,6 +3701,26 @@ mod tests {
             rejected,
             serde_json::json!(true),
             "createObjectURL must throw TypeError for non-Blob input"
+        );
+    }
+
+    // SEC-603 / #843 — object_access_path must embed the object id as a JSON
+    // literal so a non-identifier id cannot break out of the accessor.
+    #[test]
+    fn object_access_path_escapes_the_object_id() {
+        let p = super::object_access_path("a'b\nc", 0);
+        assert!(
+            !p.contains('\n'),
+            "control characters in the id must be escaped: {p:?}"
+        );
+        assert!(
+            p.contains("[\"a'b\\nc\"]"),
+            "the id must be embedded as a JSON string literal: {p:?}"
+        );
+        let f = super::object_access_path("x", 3);
+        assert!(
+            f.contains("__obscura_frameObjects[3]") && f.contains("[\"x\"]"),
+            "frame path must interpolate the frame id and JSON-embed the object id: {f:?}"
         );
     }
 
