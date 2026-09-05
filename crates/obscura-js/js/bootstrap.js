@@ -3235,6 +3235,56 @@ function _animationsForTarget(target) {
   });
 }
 
+// innerText approximates rendered text (issue #828), not the raw DOM: a
+// browser never shows <script> or <style> source, and display:none
+// subtrees are skipped too. Non-box-producing tags are skipped by name so
+// the rule holds in no-render builds as well; where a renderer is present,
+// an element without a layout box (display:none and friends) drops its
+// whole subtree, matching what would actually paint.
+const _INNER_TEXT_SKIP = new Set([
+  'script', 'style', 'template', 'noscript', 'iframe', 'canvas',
+  'video', 'audio', 'object', 'embed',
+]);
+const _INNER_TEXT_BLOCK = new Set([
+  'address', 'article', 'aside', 'blockquote', 'dd', 'details', 'div', 'dl',
+  'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2',
+  'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'li', 'main', 'nav', 'ol', 'p',
+  'pre', 'section', 'table', 'tbody', 'tfoot', 'thead', 'tr', 'ul',
+]);
+
+function _renderTextOf(node) {
+  if (node.nodeType === 3) return node.nodeValue || '';
+  if (node.nodeType !== 1) return '';
+  const tag = node.localName;
+  if (_INNER_TEXT_SKIP.has(tag)) return '';
+  if (tag === 'br') return '\n';
+  if (typeof node._renderBoxGeometry === 'function') {
+    // null: renderer present but this element has no box. undefined:
+    // no-render build, fall back to the tag rules alone.
+    if (node._renderBoxGeometry() === null) return '';
+  }
+  const parts = [];
+  const kids = node.childNodes;
+  for (let i = 0; i < kids.length; i++) {
+    const text = _renderTextOf(kids[i]);
+    if (!text) continue;
+    if (_INNER_TEXT_BLOCK.has(kids[i].localName)) {
+      parts.push('\n' + text + '\n');
+    } else {
+      parts.push(text);
+    }
+  }
+  return parts.join('');
+}
+
+function _elementInnerText(el) {
+  return _renderTextOf(el)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .join('\n');
+}
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -3343,7 +3393,7 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  get innerText() { return _elementInnerText(this); }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
