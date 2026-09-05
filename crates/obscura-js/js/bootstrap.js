@@ -8513,7 +8513,15 @@ globalThis.getComputedStyle = (el) => {
               || prop.includes('-'))) {
         return lookup(prop);
       }
-      if (prop in target) return target[prop];
+      if (prop in target) {
+        const fromTarget = target[prop];
+        // Bind methods that pass through (setProperty, removeProperty) to the
+        // declaration. Called through this proxy, `this` would otherwise be
+        // the proxy itself, where the declaration's own fields (_loaded,
+        // _owner) miss the style proxy's has trap and read as "" from the CSS
+        // lookup, so _pull() crashes on ''.getAttribute (issue #635).
+        return typeof fromTarget === 'function' ? fromTarget.bind(target) : fromTarget;
+      }
       if (typeof prop === 'string') return lookup(prop);
       return undefined;
     },
