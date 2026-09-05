@@ -9378,7 +9378,15 @@ function _scheduleIntersectionObserverDelivery(observer) {
     for (const current of pending) {
       if (!current._connected || !current._records.length) continue;
       const records = current.takeRecords();
+      const mutationEpochBeforeCallback = _domMutationEpoch;
       try { current._callback(records, current); } catch (e) {}
+      // Callback DOM writes affect the next rendering opportunity. Queue one
+      // recheck even when MutationObserver delivery is deferred. Do not add a
+      // native layout read after callbacks which left the DOM unchanged.
+      if (_domMutationEpoch !== mutationEpochBeforeCallback &&
+          current._connected && current._targets.size) {
+        _scheduleIntersectionRenderCheckpoint();
+      }
     }
   }, _schedulerPriorityRank["user-visible"] * 2, documentGeneration, () => {
     _intersectionDeliveryTaskPending = false;
@@ -9635,15 +9643,39 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     return index;
   }
   _queueChanged(target, forceInitial, root, measurements) {
-    const entry = this._entry(target, root, measurements);
+    let entry = this._entry(target, root, measurements);
     const previous = this._previous.get(target);
+    // Zero-area sentinels are widely used to advance virtual and infinite
+    // lists. Their ratio is binary, so moving an intersecting sentinel after
+    // DOM growth otherwise loses the rendering update that advances the list.
+    const zeroAreaMoved = !!previous && entry.isIntersecting &&
+      entry.boundingClientRect.width * entry.boundingClientRect.height === 0 &&
+      (previous.x !== entry.boundingClientRect.x ||
+       previous.y !== entry.boundingClientRect.y);
+    const zeroAreaMovedOut = !!previous && previous.isIntersecting &&
+      !entry.isIntersecting &&
+      !previous.zeroAreaOutsideGrace &&
+      entry.boundingClientRect.width * entry.boundingClientRect.height === 0 &&
+      (previous.x !== entry.boundingClientRect.x ||
+       previous.y !== entry.boundingClientRect.y);
+    if (zeroAreaMovedOut) {
+      // Give work triggered by the sentinel's own callback one rendering
+      // opportunity to move it again. A stable outside position reports the
+      // normal false transition on the next checkpoint.
+      entry = { ...entry, isIntersecting: true, intersectionRatio: 1 };
+      _scheduleIntersectionRenderCheckpoint();
+    }
     const changed = forceInitial || !previous ||
       previous.isIntersecting !== entry.isIntersecting ||
+      zeroAreaMoved || zeroAreaMovedOut ||
       this._thresholdIndex(previous.intersectionRatio) !==
         this._thresholdIndex(entry.intersectionRatio);
     this._previous.set(target, {
       isIntersecting: entry.isIntersecting,
       intersectionRatio: entry.intersectionRatio,
+      x: entry.boundingClientRect.x,
+      y: entry.boundingClientRect.y,
+      zeroAreaOutsideGrace: zeroAreaMovedOut,
     });
     if (changed) this._records.push(entry);
   }

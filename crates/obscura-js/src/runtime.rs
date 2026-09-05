@@ -11324,7 +11324,7 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
-    async fn intersection_observer_does_not_refire_while_target_stays_intersecting() {
+    async fn intersection_observer_rechecks_a_moved_zero_area_sentinel() {
         let dom = parse_html(
             r#"<html><body>
                 <div id="feed"></div>
@@ -11364,7 +11364,36 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.value.unwrap(), serde_json::json!([10, 10]));
+        assert_eq!(result.value.unwrap(), serde_json::json!([50, 50]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn intersection_observer_does_not_refire_without_geometry_change() {
+        let dom = parse_html(
+            r#"<html><body><div id="target" style="height:10px"></div></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(1280.0, 720.0);
+        rt.run_page_init();
+
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    let deliveries = 0;
+                    const observer = new IntersectionObserver(() => deliveries++);
+                    observer.observe(document.getElementById("target"));
+                    setTimeout(() => resolve(deliveries), 100);
+                })
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap().as_f64(), Some(1.0));
     }
 
     #[cfg(feature = "render")]
