@@ -5077,6 +5077,15 @@ function _convertNodes(nodes) {
     return (ln === "button" || ln === "input" || ln === "select" || ln === "textarea" || ln === "iframe") ? 0 : -1;
   });
 
+  // HTMLTableCellElement.colSpan/rowSpan. These are IDL attributes that reflect
+  // the `colspan`/`rowspan` content attributes, and layout reads the content
+  // attribute. Without the reflection, `cell.colSpan = 9` stored a plain JS
+  // property that nothing else could see: DataTables sets exactly that on its
+  // "No records found" row, so the cell stayed one column wide and the message
+  // wrapped one word per line instead of spanning the table.
+  reflectLong("colSpan", "colspan", 1);
+  reflectLong("rowSpan", "rowspan", 1);
+
   // ARIAMixin: aria-* content attributes reflected as nullable DOMString IDL
   // properties (ariaAtomic <-> aria-atomic, ...).
   const ARIA = {

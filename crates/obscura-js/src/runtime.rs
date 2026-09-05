@@ -5724,6 +5724,48 @@ mod tests {
         );
     }
 
+    /// `colSpan`/`rowSpan` are IDL attributes that reflect `colspan`/`rowspan`.
+    /// Layout reads the content attribute, so without the reflection a
+    /// `cell.colSpan = n` assignment stored an invisible JS property and the
+    /// cell never spanned. DataTables sets exactly that on its "No records
+    /// found" row, which then wrapped one word per line instead of spanning
+    /// the table.
+    #[test]
+    fn table_cell_colspan_and_rowspan_reflect_through_the_idl_surface() {
+        let mut rt = setup_runtime(
+            r#"<html><body><table><tbody>
+                <tr><td id="plain">a</td></tr>
+                <tr><td id="markup" colspan="4" rowspan="2">b</td></tr>
+                <tr><td id="invalid" colspan="abc">c</td></tr>
+                <tr><td id="setter">d</td></tr>
+            </tbody></table></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const cell = document.getElementById("setter");
+                cell.colSpan = 5;
+                cell.rowSpan = 2;
+                const plain = document.getElementById("plain");
+                const markup = document.getElementById("markup");
+                const invalid = document.getElementById("invalid");
+                return [
+                    plain.colSpan, plain.rowSpan, plain.getAttribute("colspan"),
+                    markup.colSpan, markup.rowSpan,
+                    invalid.colSpan,
+                    cell.colSpan, cell.rowSpan,
+                    cell.getAttribute("colspan"), cell.getAttribute("rowspan")
+                ];
+                "#,
+            )
+            .unwrap();
+        // Chromium 147 gives exactly this for the same markup and assignments.
+        assert_eq!(
+            result,
+            serde_json::json!([1, 1, null, 4, 2, 1, 5, 2, "5", "2"])
+        );
+    }
+
     #[test]
     fn hyperlink_content_attributes_reflect_through_the_idl_surface() {
         let mut rt = setup_runtime(
