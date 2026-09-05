@@ -16983,6 +16983,94 @@ mod tests {
         assert_eq!(tag, serde_json::json!("BODY"));
     }
 
+    /// The repro from issue #738. A close button with a higher z-index that
+    /// precedes a lower-z overlay in the DOM used to lose the hit, because
+    /// candidates were ranked by node id — document order — and z-index never
+    /// entered the decision. CDP coordinate clicks resolve through this, so
+    /// automation clicked the buried overlay instead of the button.
+    ///
+    /// The styles are in a <style> block on purpose, not inline. Computed
+    /// style only surfaces inline values for z-index and position, so a
+    /// comparator that read z through getComputedStyle would pass this test
+    /// with inline styles and still rank everything as z:0 on a real page.
+    #[cfg(feature = "render")]
+    #[test]
+    fn test_element_from_point_ranks_by_paint_order_not_document_order() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style>
+              .dialog { position: fixed; top: 100px; left: 100px; width: 400px; height: 200px; z-index: 1000; }
+              .close-button { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; z-index: 1002; }
+              .loading-overlay { position: absolute; inset: 0; z-index: 1001; }
+            </style></head><body>
+              <div class="dialog">
+                <button class="close-button">x</button>
+                <div class="loading-overlay"></div>
+              </div>
+            </body></html>"#,
+        );
+
+        let hit = rt
+            .evaluate(
+                "(function(){ var b = document.querySelector('.close-button');
+                   var r = b.getBoundingClientRect();
+                   var e = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
+                   return e ? e.className : null; })()",
+            )
+            .unwrap();
+
+        assert_eq!(
+            hit,
+            serde_json::json!("close-button"),
+            "a z-index 1002 button must beat a z-index 1001 overlay that follows it in the DOM"
+        );
+    }
+
+    /// elementsFromPoint used to return the single elementFromPoint result in
+    /// a one-element array. Ranking every candidate gives the real stack for
+    /// free, so it now reports what is actually under the point.
+    #[cfg(feature = "render")]
+    #[test]
+    fn test_elements_from_point_returns_front_to_back_stack() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style>
+              .dialog { position: fixed; top: 100px; left: 100px; width: 400px; height: 200px; z-index: 1000; }
+              .close-button { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; z-index: 1002; }
+              .loading-overlay { position: absolute; inset: 0; z-index: 1001; }
+            </style></head><body>
+              <div class="dialog">
+                <button class="close-button">x</button>
+                <div class="loading-overlay"></div>
+              </div>
+            </body></html>"#,
+        );
+
+        let stack = rt
+            .evaluate(
+                "(function(){ var b = document.querySelector('.close-button');
+                   var r = b.getBoundingClientRect();
+                   var s = document.elementsFromPoint(r.left + r.width/2, r.top + r.height/2);
+                   return Array.prototype.map.call(s, function(e){ return e.className; }); })()",
+            )
+            .unwrap();
+
+        let stack = stack.as_array().expect("elementsFromPoint returns an array");
+        let names: Vec<&str> = stack.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            names.len() > 1,
+            "expected the real stack, not the single top element: {names:?}"
+        );
+        assert_eq!(names[0], "close-button", "topmost first: {names:?}");
+        let overlay = names
+            .iter()
+            .position(|name| *name == "loading-overlay")
+            .expect("the overlay is under the point too: {names:?}");
+        assert!(
+            overlay > 0,
+            "the overlay paints below the button: {names:?}"
+        );
+    }
+
     #[test]
     fn test_element_from_point_out_of_viewport_returns_null() {
         let mut rt = setup_runtime("<html><body></body></html>");
