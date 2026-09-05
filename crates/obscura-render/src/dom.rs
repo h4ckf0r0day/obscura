@@ -11587,13 +11587,16 @@ fn assign_native_control_size(
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    let declared_inline = if content_box {
+        (intrinsic_width - horizontal_edges).max(0.0)
+    } else {
+        intrinsic_width
+    };
+    // Kept even when an authored width wins, because a *cyclic* authored width
+    // is neutralized after this pass and then has nothing to fall back on.
+    style.native_control_intrinsic_width = Some(declared_inline);
     if style.width == crate::Dimension::Auto && !stretch_inline {
-        let declared = if content_box {
-            (intrinsic_width - horizontal_edges).max(0.0)
-        } else {
-            intrinsic_width
-        };
-        style.width = crate::Dimension::Px(declared);
+        style.width = crate::Dimension::Px(declared_inline);
     }
     if style.height == crate::Dimension::Auto && !stretch_block {
         let declared = if content_box {
@@ -11905,7 +11908,34 @@ fn defer_cyclic_flex_inline_sizes(
         if let Some(style) = styles.get_mut(&id) {
             let intrinsic = crate::Dimension::Px(intrinsic.max(0.0));
             match slot {
-                0 => style.width = intrinsic,
+                // A cyclic inline size behaves as `auto` during intrinsic
+                // contribution sizing (CSS Sizing 3 §5.2.3), exactly as the
+                // max-size arm below already does. Evaluating the expression
+                // at a zero basis instead made `calc(100% - 32px)` a permanent
+                // `0px`: every shrink-to-fit ancestor then wrapped that zero,
+                // and the basis re-sampled after flex sizing came back as the
+                // neutralized box's own padding instead of a containing block,
+                // so the second pass could not recover it either (#767).
+                //
+                // Two kinds of box cannot say "auto" and mean their own size:
+                //
+                // - A replaced element would contribute its full natural width
+                //   and inflate every ancestor's max-content size. It keeps the
+                //   zero-basis value, which the resolve pass below lifts back
+                //   to that natural width once the flex item is pinned (#698).
+                // - A native control's intrinsic geometry is assigned before
+                //   this pass and only to an *auto* width, so one with a cyclic
+                //   width never received any and would contribute nothing.
+                0 => {
+                    style.width = match (
+                        style.native_control_intrinsic_width,
+                        style.replaced_intrinsic.is_some() || style.has_replaced_sizing,
+                    ) {
+                        (Some(control), _) => crate::Dimension::Px(control),
+                        (None, true) => intrinsic,
+                        (None, false) => crate::Dimension::Auto,
+                    }
+                }
                 2 => style.min_width = intrinsic,
                 // A cyclic percentage max-size behaves as its initial value
                 // during intrinsic contribution sizing; treating 50% as a

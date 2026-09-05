@@ -1055,6 +1055,14 @@ pub struct LayoutStyle {
     /// size when percentage dimensions are resolved through an auto-sized
     /// wrapper (`img { width:100%; height:auto }`).
     pub intrinsic_size: Option<(f32, f32)>,
+    /// The intrinsic inline size of a native form control (`<input>`,
+    /// `<select>`, `<textarea>`), whether or not it was used.
+    ///
+    /// Control geometry is assigned before cyclic inline sizes are deferred,
+    /// and only to an auto width, so a control with a cyclic `width` never
+    /// receives one. The deferral needs the size the control would have had in
+    /// order to neutralize to something other than zero.
+    pub(crate) native_control_intrinsic_width: Option<f32>,
     /// Per-axis decoded intrinsic metadata used by the replaced sizing path.
     /// SVG can expose only one dimension or a `viewBox` ratio, distinctions
     /// that the stable public `intrinsic_size` tuple cannot represent.
