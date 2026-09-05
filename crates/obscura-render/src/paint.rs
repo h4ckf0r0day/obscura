@@ -15088,6 +15088,53 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_float_does_not_widen_a_shrink_to_fit_parent() {
+        // #764: `display:none` generates no box, so it cannot float -- but the
+        // check that decides whether a block container has a floating child
+        // did not say so. One hidden float sent the whole container down the
+        // legacy float-zone path instead of the mixed-block builder, and those
+        // two size an inline run holding an atomic box differently.
+        //
+        // This is the Bootstrap navbar shape: `.dropdown-menu{display:none;
+        // float:left}` inside a nav item whose link contains icons. Every
+        // top-level item came out several px too wide, enough to wrap the last
+        // one onto a second row and double the navbar's height.
+        //
+        // Chromium 147 reports 71.1 for all three cases with an atomic inline
+        // and 31.1 for the one without.
+        let case = |inner: &str| {
+            let html = format!(
+                r#"<body style="margin:0;font:14px Arial,sans-serif">
+                   <style>.ib{{display:inline-block;width:20px}}</style>
+                   <div id="t" style="float:left">{inner}</div></body>"#
+            );
+            let tree = parse_html(&html);
+            let mut resources = RenderResourceCache::default();
+            let prepared =
+                prepare_dom(&tree, (800.0, 600.0), None, &mut resources).expect("prepared render");
+            prepared
+                .document_rect(tree.get_element_by_id("t").unwrap())
+                .expect("rect")
+                .width
+        };
+
+        let icons = r##"<a href="#"><i class="ib"></i>CMS<i class="ib"></i></a>"##;
+        let hidden_float = r#"<div style="display:none;float:left">A much longer hidden string</div>"#;
+        let hidden_block = r#"<div style="display:none">A much longer hidden string</div>"#;
+
+        let baseline = case(icons);
+        // Neither half alone was ever wrong; only the combination.
+        assert_eq!(case(&format!("{icons}{hidden_block}")), baseline);
+        assert_eq!(case(&format!("{icons}{hidden_float}")), baseline);
+        // ... and a hidden float with no atomic inline beside it is still the
+        // width of the visible text alone.
+        assert!(
+            case(&format!(r##"<a href="#">CMS</a>{hidden_float}"##)) < baseline,
+            "a hidden float must not contribute its own content width"
+        );
+    }
+
+    #[test]
     fn computed_style_exposes_float_and_clear() {
         let tree = parse_html(
             r#"<style>#left{float:left} #right{float:right;clear:both}</style>
