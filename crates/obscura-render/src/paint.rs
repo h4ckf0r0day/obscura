@@ -6785,7 +6785,17 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
 
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
     let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size);
+    // `PxScale` maps the font's *height* (ascent + descent + line gap) to the
+    // given value, not its em square, so `PxScale::from(css_px)` renders every
+    // advance short by `units_per_em / height_unscaled` — 12% for Liberation
+    // Sans (2048/2288). Scale by the em ratio so one CSS pixel of `font-size`
+    // is one em, matching the shaped inline path and the browser.
+    let em_scale = font
+        .units_per_em()
+        .filter(|em| *em > 0.0)
+        .map(|em| size * font.height_unscaled() / em)
+        .unwrap_or(size);
+    let scale = PxScale::from(em_scale);
     let scaled_font = font.as_scaled(scale);
     let mut width = 0.0;
     for c in text.chars() {
@@ -11359,6 +11369,30 @@ fn paint_mask(
         clip.as_ref(),
     );
     true
+}
+
+#[cfg(test)]
+mod measure_text_scale_tests {
+    use super::measure_text;
+
+    /// `measure_text` sizes native form-control labels and list markers. It uses
+    /// ab_glyph, whose `PxScale` maps the font's *height* (ascent + descent +
+    /// line gap) to the given value rather than its em square — so passing a CSS
+    /// pixel size directly rendered every advance short by
+    /// `units_per_em / height_unscaled`, which is 2048/2288 = 12% for Liberation
+    /// Sans. A `<button>` label therefore measured ~11% narrower than the same
+    /// text in a `<span>`, and the button shrink-wrapped too tightly.
+    #[test]
+    fn measure_text_matches_browser_advance_widths() {
+        // Chromium 147, Liberation Sans (its `Arial` substitute) at 14px.
+        for (text, chromium) in [("abcdefghij", 63.8_f32), ("ab", 15.6), ("Create new form", 103.0)] {
+            let got = measure_text(text, 14.0, false, Some("Arial"));
+            assert!(
+                (got - chromium).abs() < 1.0,
+                "measure_text({text:?}) = {got}, Chromium gives {chromium}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -17217,3 +17251,4 @@ mod tests {
         assert!(!at_end.has_active_css_animations());
     }
 }
+
