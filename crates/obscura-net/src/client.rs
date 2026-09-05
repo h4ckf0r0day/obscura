@@ -647,6 +647,18 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                     s[2] as u8,
                 )));
             }
+            // Teredo (2001:0000::/32, RFC 4380) hides the client IPv4 in the
+            // last 32 bits, XOR-obfuscated with 0xFFFFFFFF.
+            if s[0] == 0x2001 && s[1] == 0x0000 {
+                let hi = s[6] ^ 0xFFFF;
+                let lo = s[7] ^ 0xFFFF;
+                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    hi as u8,
+                    (lo >> 8) as u8,
+                    lo as u8,
+                )));
+            }
 
             // Discard-only, local-use NAT64, and documentation prefixes.
             (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
@@ -1888,6 +1900,23 @@ mod ssrf_tests {
         for s in ["2002:808:808::", "64:ff9b::808:808"] {
             assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
         }
+    }
+
+    // SEC-601 / #842 — Teredo (2001:0000::/32) embeds the client IPv4 in the
+    // last 32 bits XOR 0xFFFFFFFF; a forbidden embedded IPv4 must not slip past,
+    // matching the 6to4 / NAT64 handling. A public embedded IPv4 stays allowed.
+    #[test]
+    fn teredo_cannot_hide_forbidden_ipv4() {
+        for s in [
+            "2001::80ff:fffe", // client 127.0.0.1 (loopback)
+            "2001::5601:5601", // client 169.254.169.254 (link-local metadata)
+            "2001::f5ff:fffe", // client 10.0.0.1 (RFC1918)
+            "2001::9b9b:9b37", // client 100.100.100.200 (CGNAT metadata)
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+        // Teredo carrying a public client IPv4 (8.8.8.8) stays allowed.
+        assert!(!is_forbidden_ip(ip("2001::f7f7:f7f7")), "public Teredo client must be allowed");
     }
 
     #[test]
