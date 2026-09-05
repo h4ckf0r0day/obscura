@@ -4,7 +4,8 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use obscura::{Browser, InterceptResolution, ResourceType};
 
@@ -41,6 +42,70 @@ fn spawn_echo_server() -> String {
         }
     });
     format!("http://{}", addr)
+}
+
+fn spawn_binary_server() -> (String, mpsc::Receiver<Vec<u8>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (body_tx, body_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = match incoming {
+                Ok(stream) => stream,
+                Err(_) => continue,
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let path = headers.split_whitespace().nth(1).unwrap_or("/");
+            if path == "/binary" {
+                let end = header_end + content_length.min(request.len() - header_end);
+                let _ = body_tx.send(request[header_end..end].to_vec());
+            }
+            let body = if path == "/" {
+                b"<!doctype html><title>binary interception</title>".as_slice()
+            } else {
+                b"ok".as_slice()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    (format!("http://{}", addr), body_rx)
 }
 
 #[tokio::test]
@@ -210,6 +275,110 @@ async fn page_rewrites_request_url_via_interception() {
         body.contains("REWRITTEN"),
         "interception Continue url-rewrite did not take effect; captured: {:?}",
         body
+    );
+}
+
+#[tokio::test]
+async fn page_continue_overrides_post_body_with_non_utf8_bytes() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let (base, received_body) = spawn_binary_server();
+    let expected: Vec<u8> = vec![0, 255, 128, 195, 40];
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+
+    let mut rx = page.enable_interception();
+    let override_body = expected.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let body = req.url.ends_with("/binary").then(|| override_body.clone());
+            if req
+                .resolver
+                .send(InterceptResolution::Continue {
+                    url: None,
+                    method: None,
+                    headers: None,
+                    body,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    page.evaluate(
+        "fetch('/binary', { method: 'POST', body: new Uint8Array([1, 2, 3]) })\
+         .then(() => { globalThis.__binaryPostDone = true; })",
+    );
+    for _ in 0..20 {
+        page.settle(100).await;
+        if page.evaluate("globalThis.__binaryPostDone === true") == serde_json::json!(true) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        received_body
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should receive the overridden POST"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn page_fulfill_preserves_non_utf8_response_bytes() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let (base, _received_body) = spawn_binary_server();
+    let expected: Vec<u8> = vec![0, 255, 128, 195, 40];
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+
+    let mut rx = page.enable_interception();
+    let fulfilled_body = expected.clone();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let resolution = if req.url.ends_with("/fulfilled") {
+                InterceptResolution::Fulfill {
+                    status: 200,
+                    headers: std::collections::HashMap::from([(
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    )]),
+                    body: fulfilled_body.clone(),
+                }
+            } else {
+                InterceptResolution::Continue {
+                    url: None,
+                    method: None,
+                    headers: None,
+                    body: None,
+                }
+            };
+            if req.resolver.send(resolution).is_err() {
+                break;
+            }
+        }
+    });
+
+    page.evaluate(
+        "fetch('/fulfilled')\
+         .then(response => response.arrayBuffer())\
+         .then(body => { globalThis.__fulfilledBytes = Array.from(new Uint8Array(body)); })",
+    );
+    for _ in 0..20 {
+        page.settle(100).await;
+        if page.evaluate("Array.isArray(globalThis.__fulfilledBytes)") == serde_json::json!(true) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        page.evaluate("globalThis.__fulfilledBytes"),
+        serde_json::json!(expected)
     );
 }
 

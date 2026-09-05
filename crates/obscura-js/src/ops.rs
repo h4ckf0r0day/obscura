@@ -38,12 +38,12 @@ pub enum InterceptResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
-        body: String,
+        body: Vec<u8>,
     },
     Fail {
         reason: String,
@@ -2427,9 +2427,11 @@ async fn op_fetch_url(
                     body: b,
                 }) => {
                     let resp_headers: HashMap<String, String> = h;
+                    let resp_body = String::from_utf8_lossy(&b).into_owned();
                     return Ok(serde_json::json!({
                         "status": status,
-                        "body": b,
+                        "body": resp_body,
+                        "bodyBase64": BASE64.encode(&b),
                         "url": url,
                         "headers": resp_headers,
                     })
@@ -2455,7 +2457,7 @@ async fn op_fetch_url(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body.map(String::into_bytes);
+                    override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
