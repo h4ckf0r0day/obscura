@@ -3203,6 +3203,183 @@ fn resolve_css_counters(tree: &DomTree, styles: &mut HashMap<NodeId, crate::Layo
     counters.pop_created(&root_scopes);
 }
 
+/// Run only the CSS cascade for `tree` and return the resulting computed
+/// style map. This deliberately skips layout: callers that need to discover
+/// which resource URLs the renderer's cascade would paint can avoid paying for
+/// the full layout pass and, more importantly, must not let any
+/// synchronous-loader side effects piggyback on layout to fetch bytes.
+///
+/// Issue #662 motivated this entry point: the prior path scanned `<style>` text
+/// for `url(...)` regardless of selector matching, so a rule like
+/// `.unused { background-image: url('/protected/bg.png') }` would still
+/// trigger a pre-seed fetch of `/protected/bg.png`. With the actual cascade
+/// consulted, an unmatched rule contributes no `background-image` and the URL
+/// is never collected for the page transport.
+///
+/// Container-query semantics. This pass runs before the first layout snapshot
+/// exists, so no `ContainerQueryEvaluator` is supplied to the cascade walker
+/// (`evaluator = None`). Rules gated by a `@container` condition therefore
+/// resolve as if the condition never matched and any `url(...)` they declare
+/// is deliberately not pre-warmed here. A subsequent `prepare_dom_with_*`
+/// call owns the layout snapshot and resolves container queries on its own; this
+/// entry point is intentionally the conservative, layout-free precursor and
+/// does not silently fall back to a raw CSS scan.
+///
+/// Gated to the `paint` feature because URL parsing uses the optional `url`
+/// crate, which only ships when the rest of the renderer pulls it in.
+#[cfg(feature = "paint")]
+pub fn compute_render_warmup_styles(
+    tree: &DomTree,
+    viewport: (f32, f32),
+) -> HashMap<NodeId, crate::LayoutStyle> {
+    let css_sources = render_warmup_css_sources(tree, viewport);
+    let sheet = std::sync::Arc::new(crate::css::Stylesheet::parse_for_viewport_and_media(
+        tree,
+        &css_sources,
+        viewport,
+        crate::CssMediaType::Screen,
+    ));
+    let shadow_sheets = collect_shadow_stylesheets(tree, viewport, crate::CssMediaType::Screen);
+    let mut matcher = tree.matcher();
+    let mut styles = HashMap::new();
+    let mut custom_properties = HashMap::new();
+    let root_props = std::rc::Rc::new(HashMap::new());
+    let quirks_mode = !tree.descendants(tree.document()).into_iter().any(|id| {
+        tree.get_node(id).map_or(false, |node| {
+            matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
+        })
+    });
+    let mut animation_timeline = crate::AnimationTimelineState::default();
+    cascade_walk(
+        tree,
+        tree.document(),
+        &sheet,
+        &sheet,
+        &shadow_sheets,
+        &mut matcher,
+        &mut styles,
+        &mut custom_properties,
+        &root_props,
+        &mut None,
+        quirks_mode,
+        viewport,
+        crate::AnimationSample::default(),
+        &mut animation_timeline,
+        None,
+        false,
+        None,
+    );
+    resolve_css_counters(tree, &mut styles);
+    grow_trailing_auto_cells(tree, &mut styles);
+    styles
+}
+
+/// Walk one fully-cascaded style map and collect the URLs the renderer would
+/// actually paint. Includes `background-image`, `mask-image`,
+/// `content: url(...)`, and the same trio on `::before`/`::after`/
+/// `::placeholder` pseudo-elements. URLs are resolved against `base_url` and
+/// deduplicated.
+#[cfg(feature = "paint")]
+pub fn collect_render_warmup_resource_urls<I>(
+    styles: I,
+    base_url: Option<&str>,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = crate::LayoutStyle>,
+{
+    fn push_url(out: &mut Vec<String>, raw: Option<&String>, base_url: Option<&str>) {
+        let Some(raw) = raw else { return };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("data:") {
+            return;
+        }
+        let resolved = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            Some(trimmed.to_string())
+        } else if let Some(rest) = trimmed.strip_prefix("//") {
+            let scheme = base_url
+                .and_then(|b| url::Url::parse(b).ok())
+                .map(|u| u.scheme().to_string())
+                .filter(|s| s == "http" || s == "https")
+                .unwrap_or_else(|| "https".to_string());
+            Some(format!("{scheme}://{rest}"))
+        } else {
+            base_url
+                .and_then(|b| url::Url::parse(b).ok())
+                .and_then(|base| base.join(trimmed).ok())
+                .map(|u| u.to_string())
+        };
+        if let Some(resolved) = resolved {
+            if matches!(
+                url::Url::parse(&resolved).ok().map(|u| u.scheme().to_string()),
+                Some(scheme) if scheme == "http" || scheme == "https"
+            ) {
+                out.push(resolved);
+            }
+        }
+    }
+
+    let mut urls = Vec::new();
+    for style in styles {
+        push_url(&mut urls, style.background_image.as_ref(), base_url);
+        push_url(&mut urls, style.mask_image.as_ref(), base_url);
+        push_url(&mut urls, style.content_image.as_ref(), base_url);
+        for pseudo in [
+            style.before_pseudo.as_deref(),
+            style.after_pseudo.as_deref(),
+            style.placeholder_pseudo.as_deref(),
+        ] {
+            let Some(pseudo_style) = pseudo else { continue };
+            push_url(&mut urls, pseudo_style.background_image.as_ref(), base_url);
+            push_url(&mut urls, pseudo_style.mask_image.as_ref(), base_url);
+        }
+    }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+/// One-shot helper: collect `<style>` blocks, run the cascade, and emit the
+/// resolved resource URLs the page transport should pre-seed before a
+/// synchronous screenshot. This is the entry point used by
+/// `obscura-browser::Page::prepare_screenshot_resources`.
+#[cfg(feature = "paint")]
+pub fn compute_render_warmup_resource_urls(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+) -> Vec<String> {
+    let styles = compute_render_warmup_styles(tree, viewport);
+    collect_render_warmup_resource_urls(styles.into_values(), base_url)
+}
+
+#[cfg(feature = "paint")]
+fn render_warmup_css_sources(tree: &DomTree, viewport: (f32, f32)) -> Vec<String> {
+    let mut sources = Vec::new();
+    for nid in tree.descendants(tree.document()) {
+        let Some(node) = tree.get_node(nid) else {
+            continue;
+        };
+        let Some(element) = node.as_element() else {
+            continue;
+        };
+        if element.local.as_ref() != "style" {
+            continue;
+        }
+        let applies = node.get_attribute("media").is_none_or(|media| {
+            media.trim().is_empty()
+                || crate::css::media_query_applies_for_viewport_and_type(
+                    media,
+                    viewport,
+                    crate::CssMediaType::Screen,
+                )
+        });
+        if applies {
+            sources.push(tree.text_content(nid));
+        }
+    }
+    sources
+}
+
 /// Lay out a DOM tree within `viewport` (width, height) in CSS pixels.
 pub fn layout_dom(tree: &DomTree, viewport: (f32, f32)) -> DomLayout {
     layout_dom_with_images(tree, viewport, &HashMap::new())
@@ -20656,5 +20833,75 @@ mod tests {
         let style = &laid.styles[&tree.get_element_by_id("plain").unwrap()];
         assert_eq!(style.display, crate::Display::Inline);
         assert!(style.is_inline_block);
+    }
+
+    // Issue #662 container-query semantic pin: the warmup API runs the
+    // cascade without a `ContainerQueryEvaluator`, so any rule whose selector
+    // is wrapped in `@container (...)` resolves as if the condition never
+    // matched and its `background-image` / `mask-image` / `content: url(...)`
+    // assets are deliberately NOT pre-warmed. We do not fall back to a raw
+    // text scan to recover them; a later layout pass owns the snapshot and
+    // resolves container queries on its own.
+    #[cfg(feature = "paint")]
+    #[test]
+    fn warmup_resource_urls_omit_container_query_gated_rules() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                #shell { container: shell / inline-size; width: 600px; height: 200px }
+                @container shell (min-width: 500px) {
+                    #target { background-image: url('/container-gated.png') }
+                }
+                #control { background-image: url('/unconditional.png') }
+            </style></head><body>
+                <div id="shell"><div id="target"></div></div>
+                <div id="control"></div>
+            </body></html>"#,
+        );
+        let base = url::Url::parse("https://example.test/page").unwrap();
+        let urls = compute_render_warmup_resource_urls(
+            &tree,
+            (1024.0, 768.0),
+            Some(base.as_str()),
+        );
+        assert!(
+            urls.iter().any(|u| u.ends_with("/unconditional.png")),
+            "unconditional rule must still warm its URL: {urls:?}",
+        );
+        assert!(
+            !urls.iter().any(|u| u.ends_with("/container-gated.png")),
+            "container-query rule must NOT be pre-warmed at this stage \
+             (no layout snapshot exists): {urls:?}",
+        );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn warmup_resource_urls_omit_unmatched_pseudo_targets() {
+        // A `::before` rule that targets an element which has no `::before`
+        // (no `content` actually generated) still cascades a `before_pseudo`
+        // style, but a rule whose selector matches no element at all must
+        // not contribute any URL.
+        let tree = parse_html(
+            r#"<html><head><style>
+                .nope::before { content: 'x'; background-image: url('/unmatched.png') }
+                .yes::before  { content: 'y'; background-image: url('/matched.png') }
+            </style></head><body>
+                <span class="yes">x</span>
+            </body></html>"#,
+        );
+        let base = url::Url::parse("https://example.test/page").unwrap();
+        let urls = compute_render_warmup_resource_urls(
+            &tree,
+            (1024.0, 768.0),
+            Some(base.as_str()),
+        );
+        assert!(
+            urls.iter().any(|u| u.ends_with("/matched.png")),
+            "matched pseudo-element rule must warm its URL: {urls:?}",
+        );
+        assert!(
+            !urls.iter().any(|u| u.ends_with("/unmatched.png")),
+            "unmatched selector must not contribute a URL: {urls:?}",
+        );
     }
 }

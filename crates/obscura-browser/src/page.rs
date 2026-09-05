@@ -562,6 +562,13 @@ fn rebase_css_urls(css: &str, base: &url::Url) -> String {
 /// Extract network-backed `url(...)` assets while respecting CSS comments and
 /// strings. Linked sheets have already been rebased before materialization;
 /// inline declarations are resolved against the document base here.
+///
+/// Kept as `#[cfg(test)]` after the issue #662 fix moved page-transport
+/// discovery to the actual cascade. The unit tests that pin the comment,
+/// string, and `@import`/`@font-face` carve-out behavior still matter as
+/// documentation of what the old text scan used to recognize, even though the
+/// runtime no longer reads the helper.
+#[cfg(test)]
 fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
     let mut urls = Vec::new();
     let mut index = 0usize;
@@ -654,6 +661,7 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
 ///
 /// Shared by the generic scan and the `@font-face` path so the two cannot
 /// disagree about quoting, fragments, `data:` or an unresolved `var()`.
+#[cfg(any(test, feature = "render"))]
 fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
     let raw = raw.trim();
     let value = if raw.len() >= 2
@@ -692,6 +700,7 @@ fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
 ///
 /// A malformed block is left to the normal scanner, so this cannot swallow the
 /// rules that follow it.
+#[cfg(any(test, feature = "render"))]
 fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)> {
     if !css.get(..10)?.eq_ignore_ascii_case("@font-face") {
         return None;
@@ -716,6 +725,7 @@ fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)
 
 /// Byte offset of the brace closing the block that `css` opens, or `None` when
 /// the block is unterminated. Braces inside strings do not count.
+#[cfg(any(test, feature = "render"))]
 fn css_block_end(css: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
@@ -753,6 +763,7 @@ fn css_block_end(css: &str) -> Option<usize> {
 /// Value of the last declaration named `name` in a declaration block. Last
 /// rather than first, because that is what the cascade resolves to and what
 /// `obscura-render` reads.
+#[cfg(any(test, feature = "render"))]
 fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
     let mut found = None;
     let mut start = 0usize;
@@ -798,6 +809,7 @@ fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// The `url(...)` values of one declaration, unquoted, in source order.
+#[cfg(any(test, feature = "render"))]
 fn css_url_values(value: &str) -> Vec<&str> {
     let lower = value.to_ascii_lowercase();
     let mut out = Vec::new();
@@ -827,6 +839,7 @@ fn css_url_values(value: &str) -> Vec<&str> {
 
 /// Whether the renderer can decode a font source, by the same extension rule
 /// `obscura-render` applies before it will even consider one.
+#[cfg(any(test, feature = "render"))]
 fn font_source_is_decodable(src: &str) -> bool {
     let path = src
         .split(['?', '#'])
@@ -840,6 +853,7 @@ fn font_source_is_decodable(src: &str) -> bool {
 /// terminating semicolon. Semicolons inside quoted URLs, comments, or `url()`
 /// parentheses do not end the rule. A malformed import is left to the normal
 /// scanner so this helper cannot swallow following declarations.
+#[cfg(test)]
 fn css_import_rule_len(css: &str) -> Option<usize> {
     let prefix = css.get(..7)?;
     if !prefix.eq_ignore_ascii_case("@import") {
@@ -891,6 +905,7 @@ fn css_import_rule_len(css: &str) -> Option<usize> {
     None
 }
 
+#[cfg(feature = "render")]
 fn render_resource_type(url: &url::Url) -> ResourceType {
     let path = url.path().to_ascii_lowercase();
     if [".woff", ".woff2", ".ttf", ".otf", ".eot"]
@@ -901,6 +916,101 @@ fn render_resource_type(url: &url::Url) -> ResourceType {
     } else {
         ResourceType::Image
     }
+}
+
+/// Walk the DOM and collect the network portion of every `<use>` `href`
+/// that names an external SVG file. `<use href="external.svg#id">` contributes
+/// the file portion (the renderer fetches the sprite then resolves `#id`
+/// inside it); `<use href="external.svg">` (no fragment) is still a full
+/// fetch — a whole-document SVG can serve as a symbol bank. Local fragment
+/// references (`href="#local-id"`, where `#` is at byte 0) resolve inside the
+/// same document and are intentionally excluded.
+#[cfg(feature = "render")]
+fn svg_external_use_urls(js: &obscura_js::runtime::ObscuraJsRuntime) -> Vec<String> {
+    let mut urls = Vec::new();
+    let collected = js.with_dom(|dom| {
+        let mut out = Vec::new();
+        for id in dom.descendants(dom.document()) {
+            let Some(node) = dom.get_node(id) else {
+                continue;
+            };
+            if !node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "use")
+            {
+                continue;
+            }
+            let Some(href) = node
+                .get_attribute("href")
+                .or_else(|| node.get_attribute("xlink:href"))
+            else {
+                continue;
+            };
+            // `<use href="external.svg#id">` is an external sprite reference
+            // (file portion before `#`); `<use href="#local">` resolves inside
+            // the same document and never opens a request; `<use href="external.svg">`
+            // with no fragment at all still names a whole-document fetch the
+            // renderer may inline as a symbol bank, so it must be requested
+            // in full.
+            let url_part = match href.find('#') {
+                Some(hash) if hash > 0 => &href[..hash],
+                Some(_) => continue,
+                None => href,
+            };
+            if url_part.is_empty() {
+                continue;
+            }
+            out.push(url_part.to_string());
+        }
+        out
+    });
+    if let Some(list) = collected {
+        urls.extend(list);
+    }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+/// Walk every `<style>` block in the DOM and pull the network URLs from the
+/// last `src` declaration of each `@font-face` block. This is the only carve
+/// out from the "no raw text scan" rule (issue #662): `@font-face` rules have
+/// no selector, so the cascade never produces a computed-style URL for them,
+/// and the renderer still relies on the page transport pre-seeding these
+/// bytes so synchronous paint does not have to.
+#[cfg(feature = "render")]
+fn font_face_urls_in_style_blocks(
+    js: &obscura_js::runtime::ObscuraJsRuntime,
+    base_url_str: &str,
+) -> Vec<String> {
+    let Ok(base) = url::Url::parse(base_url_str) else {
+        return Vec::new();
+    };
+    let collected = js.with_dom(|dom| {
+        let mut out = Vec::new();
+        for id in dom.descendants(dom.document()) {
+            let Some(node) = dom.get_node(id) else {
+                continue;
+            };
+            if !node
+                .as_element()
+                .is_some_and(|element| element.local.as_ref() == "style")
+            {
+                continue;
+            }
+            let css = dom.text_content(id);
+            let mut index = 0usize;
+            while let Some((length, urls)) = css_font_face_rule(&css[index..], &base) {
+                out.extend(urls);
+                index += length;
+            }
+        }
+        out
+    });
+    let mut urls = collected.unwrap_or_default();
+    urls.sort();
+    urls.dedup();
+    urls
 }
 
 /// Pull leading `@import` rules out of a stylesheet. Returns each import target
@@ -3595,43 +3705,55 @@ impl Page {
                     candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
                 }
             }
-            let css_sources = js
+            // Discover CSS-driven resources from the actual cascade rather
+            // than by re-scanning raw `<style>` text. A rule whose selector
+            // matches no element (`.unused { background-image: url(...) }`)
+            // contributes no `background-image` to any computed style, so its
+            // URL is never collected here and the page transport never opens
+            // a redundant request to it.  This is the load-bearing fix for
+            // issue #662: the old scan issued a request for every `url(...)`
+            // literal it found in any rule body, including rules that did not
+            // match anything, and a 302 redirect from a protected route
+            // would then overwrite the navigation state with the login page.
+            let cascade_urls = js
                 .with_dom(|dom| {
-                    let mut sources = Vec::new();
-                    for id in dom.descendants(dom.document()) {
-                        let Some(node) = dom.get_node(id) else {
-                            continue;
-                        };
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "style")
-                        {
-                            sources.push(dom.text_content(id));
-                        }
-                        if let Some(style) = node.get_attribute("style") {
-                            sources.push(style.to_string());
-                        }
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "use")
-                        {
-                            if let Some(href) = node
-                                .get_attribute("href")
-                                .or_else(|| node.get_attribute("xlink:href"))
-                            {
-                                sources.push(format!("url({href})"));
-                            }
-                        }
-                    }
-                    sources
+                    obscura_js::compute_render_warmup_resource_urls(
+                        dom,
+                        self.viewport,
+                        Some(base_url.as_str()),
+                    )
                 })
                 .unwrap_or_default();
-            for css in css_sources {
-                for raw in css_resource_urls(&css, &base_url) {
-                    if let Ok(mut url) = url::Url::parse(&raw) {
-                        let kind = render_resource_type(&url);
-                        url.set_fragment(None);
-                        candidates.insert((url.to_string(), None), kind);
+            for raw in cascade_urls {
+                if let Ok(mut url) = url::Url::parse(&raw) {
+                    let kind = render_resource_type(&url);
+                    url.set_fragment(None);
+                    candidates.insert((url.to_string(), None), kind);
+                }
+            }
+            // `@font-face { src: url(...) }` declarations have no selector —
+            // every URL listed in the descriptor is unconditionally fetched
+            // by the cascade — so the cascade does not surface them as
+            // computed styles on any element. Walk the `<style>` blocks just
+            // for font-face `src` lists; this is the one carve-out from the
+            // no-raw-text-scan rule (issue #662) because the cascade path
+            // would otherwise miss fonts entirely.
+            for raw in font_face_urls_in_style_blocks(js, base_url.as_str()) {
+                if let Ok(mut url) = url::Url::parse(&raw) {
+                    let kind = render_resource_type(&url);
+                    url.set_fragment(None);
+                    candidates.insert((url.to_string(), None), kind);
+                }
+            }
+            // SVG `<use href="external.svg#id">` references an external
+            // sprite file; the cascade does not look at `<use>`, but the URL
+            // before the `#` is still a renderer-paintable network fetch.
+            // Local fragment references (`href="#local"`) skip the network.
+            for raw in svg_external_use_urls(js) {
+                if let Ok(mut url) = url::Url::parse(&raw) {
+                    url.set_fragment(None);
+                    if matches!(url.scheme(), "http" | "https") {
+                        candidates.insert((url.to_string(), None), ResourceType::Image);
                     }
                 }
             }
@@ -5238,7 +5360,17 @@ mod tests {
         }
         #[cfg(feature = "render")]
         {
-            for path in ["/local.svg", "/imported.svg"] {
+            // The cascade on the test page resolves
+            //   `.imported-a { background: ... url('/imported.svg') }` (in the
+            //   materialized <style>) overridden by
+            //   `.local        { background-image: url('/local.svg') }`       (in the source <style>)
+            // so the cascade-final `background-image` is `/local.svg`. With the
+            // issue #662 fix the page transport now discovers resources from the
+            // actual cascade rather than re-scanning every `<style>` text for
+            // `url(...)`, so `/imported.svg` is no longer pre-fetched: a rule
+            // that the cascade drops on the floor never contributes a paintable
+            // asset and pulling its bytes wastes a connection.
+            for path in ["/local.svg"] {
                 assert_eq!(
                     observed_requests
                         .iter()
@@ -5246,9 +5378,19 @@ mod tests {
                         .map(|(_, resource_type)| *resource_type)
                         .collect::<Vec<_>>(),
                     vec![obscura_net::ResourceType::Image],
-                    "ordinary rule assets must remain in render warmup"
+                    "cascade-final matched rule asset must remain in render warmup"
                 );
             }
+            assert!(
+                !observed_requests
+                    .iter()
+                    .any(|(request_path, _)| request_path == "/imported.svg"),
+                "an overridden cascade rule must not pre-fetch (issue #662): {:?}",
+                observed_requests
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>(),
+            );
         }
         drop(observed_requests);
 
@@ -7319,6 +7461,467 @@ mod tests {
                 .unwrap()
                 .render_resource_is_known(&asset_url),
             "a deadline-cancelled request must remain retryable"
+        );
+    }
+
+    /// Regression for issue #662. A CSS rule whose selector matches no element
+    /// (`.unused { background-image: url('/protected/bg.png') }`) must NOT
+    /// trigger a pre-seed fetch of `/protected/bg.png`. The fix moves URL
+    /// discovery from raw `<style>` text scanning to the actual cascade, so
+    /// an unmatched rule contributes no `background-image` to any computed
+    /// style and the URL is never collected.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unused_css_rule_does_not_trigger_unrelated_fetch() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let first = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                seen_tx.send(first.clone()).unwrap();
+                let (status, body): (&str, &[u8]) = match first
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                {
+                    "/page" => (
+                        "200 OK",
+                        br#"<!doctype html><html><head><style>
+                            .unused { background-image: url('/protected/bg.png'); }
+                            .used   { background-image: url('/used.png'); }
+                        </style></head><body>
+                            <div class="used">marker</div>
+                        </body></html>"#,
+                    ),
+                    "/used.png" => ("200 OK", b"used-bytes"),
+                    "/protected/bg.png" => (
+                        "302 Found",
+                        b"",
+                    ),
+                    _ => ("404 Not Found", b"not found"),
+                };
+                let headers = if status == "302 Found" {
+                    format!(
+                        "HTTP/1.1 {status}\r\nLocation: /login\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                };
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "unused-css-rule".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("unused-css-rule".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let dom = parse_html(&format!(
+            r#"<html><head><style>
+                .unused {{ background-image: url('http://{address}/protected/bg.png'); }}
+                .used   {{ background-image: url('http://{address}/used.png'); }}
+            </style></head><body>
+                <div class="used">marker</div>
+            </body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        let mut paths: Vec<String> = Vec::new();
+        while let Ok(path) = seen_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            paths.push(path);
+        }
+        paths.sort();
+        let requested: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.split_whitespace().nth(1))
+            .collect();
+        assert!(
+            !requested
+                .iter()
+                .any(|path| path.starts_with("/protected/bg.png")),
+            "unused selector must not cause a network request: {requested:?}",
+        );
+        assert!(
+            requested.iter().any(|path| *path == "/used.png"),
+            "matched selector still prefetches: {requested:?}",
+        );
+        // The page transport must not follow a 302 from the protected route
+        // either, because no request was issued in the first place. A
+        // regression that resurrected the text scan would also surface here,
+        // since the 302 redirects to /login and that path has no handler.
+        assert!(
+            !requested.iter().any(|path| path.starts_with("/login")),
+            "redirect to login must not appear in the warmup: {requested:?}",
+        );
+    }
+
+    /// A 302 redirect from a subresource must not overwrite the page's
+    /// navigation state. With the cascade-based URL collector this is
+    /// unreachable for an unmatched rule (no fetch at all), so this test
+    /// pins the guard on the matched path too: a 302 response body is still
+    /// only consumed by the page transport, never by `Page::navigate`.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepare_screenshot_resources_does_not_overwrite_navigation_on_302() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"##;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{address}/login\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "render-redirect".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("render-redirect".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/asset.svg");
+        let dom = parse_html(&format!(
+            r#"<html><body><img src="{asset_url}" crossorigin="anonymous"></body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        page.prepare_screenshot_resources(1_000).await;
+        assert_eq!(
+            page.url.as_ref().unwrap().to_string(),
+            page_url,
+            "a subresource 302 must not overwrite the page navigation URL"
+        );
+    }
+
+    /// Computed `::before` content with `background-image: url(...)` must
+    /// still be discovered, because the cascade produces a real
+    /// `before_pseudo` style whose URL the page transport pre-seeds.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn matched_pseudo_background_still_prefetches() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"##;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "matched-pseudo-bg".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("matched-pseudo-bg".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let dom = parse_html(&format!(
+            r#"<html><head><style>
+                .badge::before {{ content: 'x'; background-image: url('http://{address}/badge.svg'); }}
+            </style></head><body><span class="badge">ok</span></body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        let first = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            first.contains("/badge.svg"),
+            "matched pseudo-element background must be prefetched: {first}"
+        );
+    }
+
+    /// `<use href="external.svg#id">` references an external sprite file:
+    /// the renderer fetches the whole SVG and then resolves the `#id` inside
+    /// it. The page transport must pre-seed the file portion. Companion to
+    /// the local-fragment exclusion: `#local` alone never opens a request.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn svg_use_with_external_fragment_prefetches_the_sprite() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"##;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "svg-use-sprite".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("svg-use-sprite".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let sprite_url = format!("http://{address}/sprite.svg#icon");
+        let dom = parse_html(&format!(
+            r#"<html><body>
+                <svg width="20" height="20"><use href="{sprite_url}"></use></svg>
+            </body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        let first = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            first.contains("/sprite.svg"),
+            "external <use> sprite must be prefetched: {first}"
+        );
+    }
+
+    /// `<use href="external.svg">` with no fragment at all is still a whole-
+    /// document fetch — the renderer may pull the SVG as a symbol bank.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn svg_use_with_no_fragment_prefetches_the_whole_sprite() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><symbol id="a"/></svg>"##;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "svg-use-bare".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("svg-use-bare".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let sprite_url = format!("http://{address}/sprite.svg");
+        let dom = parse_html(&format!(
+            r#"<html><body>
+                <svg width="20" height="20"><use href="{sprite_url}"></use></svg>
+            </body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        let first = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            first.contains("/sprite.svg"),
+            "external <use> with no fragment must still be prefetched: {first}"
+        );
+    }
+
+    /// `<use href="#local">` resolves inside the same document; the page
+    /// transport must NOT issue a network request for it.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn svg_use_with_local_fragment_does_not_prefetch() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Accept (and immediately answer) so the test fails loudly if a
+            // request reaches the listener instead of silently timing out.
+            for _ in 0..1 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_tx.send(path.clone()).unwrap();
+                let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"##;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "svg-use-local".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("svg-use-local".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let page_url = format!("http://{address}/page");
+        let dom = parse_html(
+            r##"<html><body>
+                <svg width="20" height="20">
+                    <symbol id="a"><rect width="10" height="10"/></symbol>
+                    <use href="#a"></use>
+                </svg>
+            </body></html>"##,
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(&page_url).unwrap());
+
+        assert_eq!(page.prepare_screenshot_resources(1_000).await, 0);
+        assert!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "local-fragment <use> must not open a network request"
         );
     }
 
