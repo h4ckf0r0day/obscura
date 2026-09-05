@@ -195,6 +195,19 @@ impl BrowserContext {
 
     /// Persist cookies to disk if storage_dir is configured.
     /// Called during graceful shutdown.
+    /// Permit or refuse `file://` reads for this context.
+    ///
+    /// Sets the context flag *and* the HTTP client's, because they are the same
+    /// decision expressed twice: the context flag is what the CDP navigate
+    /// entrypoints consult, the client's is what the filesystem-read primitive
+    /// consults. Assigning `allow_file_access` directly leaves the client
+    /// refusing, which is safe but confusing; letting them drift the other way
+    /// would be the bug this fix exists to prevent.
+    pub fn set_allow_file_access(&mut self, allow: bool) {
+        self.allow_file_access = allow;
+        self.http_client.set_allow_file_access(allow);
+    }
+
     pub fn save_cookies(&self) {
         if let Some(ref dir) = self.storage_dir {
             let _ = std::fs::create_dir_all(dir);

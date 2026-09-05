@@ -1131,6 +1131,12 @@ async fn fetch_original_response(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
     );
+    // `obscura fetch file://...` is a local operator running the CLI against
+    // their own filesystem, which is a different trust boundary from a CDP
+    // client driving the browser over a socket. Documented as unaffected by
+    // --allow-file-access, so opt in explicitly here rather than inheriting a
+    // default that exists to protect the network-facing path.
+    client.set_allow_file_access(true);
     if let Some(ua) = user_agent {
         client.set_user_agent(&ua).await;
     }
