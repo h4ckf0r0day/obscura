@@ -3703,6 +3703,86 @@ mod tests {
         );
     }
 
+    // #751 — the accepted case above only asserts the `blob:` scheme, which the
+    // old `blob:obscura/<base36>` form also satisfied. Pin the shape itself:
+    // Chrome mints `blob:<document origin>/<v4 UUID>`, so a URL that names the
+    // engine, or carries a token no UUID parser accepts, is a regression even
+    // though it still starts with `blob:`.
+    #[test]
+    fn a_blob_url_is_chrome_shaped() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const url = URL.createObjectURL(new Blob(["x"]));
+                    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+                    const second = URL.createObjectURL(new Blob(["y"]));
+                    const threw = argument => {
+                        try {
+                            argument === undefined ? URL.createObjectURL() : URL.createObjectURL(argument);
+                            return "did not throw";
+                        } catch (error) {
+                            return error instanceof TypeError ? error.message : String(error);
+                        }
+                    };
+                    return {
+                        origin: url.slice(0, "blob:http://example.com/".length),
+                        uuid: uuid.test(url.slice("blob:http://example.com/".length)),
+                        names_the_engine: /obscura|fake/.test(url),
+                        unique: url !== second,
+                        no_argument: threw(undefined),
+                        string: threw("nope"),
+                        number: threw(7),
+                        null_value: threw(null),
+                        file_is_a_blob: URL.createObjectURL(new File(["x"], "a.txt")).startsWith("blob:http://example.com/"),
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "origin": "blob:http://example.com/",
+                "uuid": true,
+                "names_the_engine": false,
+                "unique": true,
+                "no_argument": "Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.",
+                "string": "Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.",
+                "number": "Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.",
+                "null_value": "Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.",
+                "file_is_a_blob": true,
+            })
+        );
+    }
+
+    // #751 — the source has to be in the store by the time createObjectURL
+    // returns. Blob-URL Worker construction is synchronous in a real browser,
+    // so an async `blob.text().then()` store races the Worker constructor and
+    // the Worker falls through to fetch() and fails; revocation then has to
+    // remove it again rather than leaving the entry readable.
+    #[test]
+    fn a_blob_url_is_stored_synchronously_and_revocation_removes_it() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const url = URL.createObjectURL(new Blob(["self.onmessage = () => {};"]));
+                    const stored = globalThis.__blobStore[url];
+                    URL.revokeObjectURL(url);
+                    return {
+                        stored_synchronously: stored === "self.onmessage = () => {};",
+                        revoked: globalThis.__blobStore[url] === undefined,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "stored_synchronously": true,
+                "revoked": true,
+            })
+        );
+    }
+
     // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
     // set_platform must not allow a backslash-before-quote to break out of the
     // JS string literal (injection), and set_user_agent must not silently fail
