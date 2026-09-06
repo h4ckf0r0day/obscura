@@ -1739,8 +1739,42 @@ pub enum ObscuraNetError {
     ResponseTooLarge { url: String, limit: usize },
 }
 
+/// Test-only environment guard, shared by this crate's test modules.
+///
+/// `.cargo/config.toml` pins `RUST_TEST_THREADS = "1"`, so every test in a
+/// binary shares one process and libtest runs them alphabetically. A bare
+/// `std::env::set_var` leaks into every test that sorts after it, which is how
+/// several tests in this workspace ended up depending on, or being broken by,
+/// a neighbour's setting. Bind one of these instead.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    #[must_use = "the variable is restored when the guard drops, so it must be bound"]
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod ssrf_tests {
+    use super::EnvGuard;
     use super::{
         is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
@@ -2729,17 +2763,23 @@ mod ssrf_tests {
         (port, ca_cert.pem())
     }
 
-    // The two configured-roots tests set/rely on SSL_CERT_FILE, which is
-    // cached once per process at client build. They are only correct under
-    // `cargo nextest` (one process per test), the same constraint the whole
-    // workspace already has.
+    // Both configured-roots tests need a process where no client has been
+    // built yet: the rustls root store is resolved from SSL_CERT_FILE /
+    // SSL_CERT_DIR once per process, at first client build. Under `cargo
+    // nextest` (one process per test, the supported runner) that always holds.
+    // Under plain `cargo test` the first test to build a client fixes the root
+    // store for every later one, so at most one of these can pass per run.
+    //
+    // Either way the variables must not leak: an unrestored SSL_CERT_DIR
+    // pointing at a deleted tempdir is collateral damage for any later HTTPS
+    // test, so both bind their variable to a guard.
 
     #[tokio::test]
     async fn configured_roots_trust_a_private_ca_via_ssl_cert_file() {
         let (port, ca_pem) = https_fixture_with_private_ca().await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(ca_file.path(), ca_pem).unwrap();
-        std::env::set_var("SSL_CERT_FILE", ca_file.path());
+        let _cert_file = EnvGuard::set("SSL_CERT_FILE", &ca_file.path().to_string_lossy());
 
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
@@ -2754,7 +2794,7 @@ mod ssrf_tests {
         let (port, ca_pem) = https_fixture_with_private_ca().await;
         let ca_dir = tempfile::tempdir().unwrap();
         std::fs::write(ca_dir.path().join("private-ca.pem"), ca_pem).unwrap();
-        std::env::set_var("SSL_CERT_DIR", ca_dir.path());
+        let _cert_dir = EnvGuard::set("SSL_CERT_DIR", &ca_dir.path().to_string_lossy());
 
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);

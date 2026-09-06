@@ -526,6 +526,12 @@ impl ObscuraJsRuntime {
             // lands before the first isolate exists.
             deno_core::v8::icu::set_default_locale("en-US");
 
+            // From here on V8's platform is up, and `set_flags_from_string`
+            // becomes fatal rather than merely ineffective. Record it under the
+            // same lock that serialises isolate creation, so a later
+            // `set_v8_flags` refuses instead of aborting the process.
+            crate::v8_flags::mark_v8_started();
+
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
@@ -17289,8 +17295,29 @@ mod tests {
         );
     }
 
+    /// `--max-old-space-size` is a process-global V8 flag and can only be
+    /// applied before the first isolate exists. Under `cargo nextest` every
+    /// test has its own process, so that always holds. Under plain `cargo test`
+    /// the whole binary shares one process and earlier tests have already built
+    /// runtimes; `set_v8_flags` used to abort the process in that situation (V8
+    /// answers a late `set_flags_from_string` with `V8_Fatal`), taking every
+    /// later test down with it. The abort is fixed, and this test skips instead
+    /// of asserting something the process can no longer show.
+    ///
+    /// The proper fix is a per-isolate heap cap via `RuntimeOptions`'
+    /// `create_params` (`v8::CreateParams::heap_limits`), which would make this
+    /// order-independent. Deliberately not attempted here: it means threading a
+    /// parameter through three public constructors in this file for a test's
+    /// benefit.
     #[test]
     fn heap_limit_terminates_script_and_runtime_recovers() {
+        if crate::v8_flags::v8_started() {
+            eprintln!(
+                "skipping: an isolate already exists in this process, so \
+                 --max-old-space-size cannot apply; run under cargo nextest"
+            );
+            return;
+        }
         crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
         let mut rt = ObscuraJsRuntime::new();
 

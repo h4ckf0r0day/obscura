@@ -680,6 +680,15 @@ mod tests {
     // decoder the raw gzip bytes reach the HTML parser as document text.
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
+        // The fixture is on loopback, and `StealthHttpClient::fetch_with_profile`
+        // calls `validate_url(url, false)` -- it carries no allow-private-network
+        // field of its own, so the gate can only be opened through the
+        // environment. This test previously passed only when some *other* test
+        // happened to have set the variable and not restored it; run in an order
+        // where that had not happened, it failed with "Access to
+        // private/internal IP address 127.0.0.1 is not allowed". Set it here,
+        // bound to a guard so it does not leak onward.
+        let _loopback = crate::client::EnvGuard::set("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let port = gzip_fixture().await;
         let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
