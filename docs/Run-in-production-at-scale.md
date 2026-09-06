@@ -148,9 +148,11 @@ Tune the bounds with environment variables (see [Environment variables](Environm
 
 ```bash
 OBSCURA_NAV_TIMEOUT_MS=60000 \
-OBSCURA_CDP_COMMAND_TIMEOUT_MS=30000 \
+OBSCURA_SCRIPT_DEADLINE_MS=45000 \
+OBSCURA_MODULE_BUDGET_MS=10000 \
+OBSCURA_CDP_COMMAND_TIMEOUT_MS=70000 \
 OBSCURA_FETCH_TIMEOUT_MS=20000 \
   obscura serve
 ```
 
-`OBSCURA_NAV_TIMEOUT_MS` is the per-navigation ceiling (default 30000). `OBSCURA_CDP_COMMAND_TIMEOUT_MS` is the per-CDP-command V8 deadline (default 60000, `0` disables). `OBSCURA_FETCH_TIMEOUT_MS` bounds scripted fetch/XHR and module loads (default 30000).
+`OBSCURA_NAV_TIMEOUT_MS` is the per-navigation ceiling (default 30000). `OBSCURA_SCRIPT_DEADLINE_MS` bounds the complete script phase (default 30000), while `OBSCURA_MODULE_BUDGET_MS` bounds each enhancement module's graph loading and evaluation (default 3000; unmounted SPA shells use the full script deadline). `OBSCURA_CDP_COMMAND_TIMEOUT_MS` is the outer per-CDP-command V8 deadline (default 60000, `0` disables), so keep it above the navigation ceiling. `OBSCURA_FETCH_TIMEOUT_MS` bounds scripted fetch/XHR and module network requests (default 30000).

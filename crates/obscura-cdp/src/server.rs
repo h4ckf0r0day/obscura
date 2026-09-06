@@ -210,8 +210,10 @@ pub async fn start_with_serve_options_and_limit(
     // forwarded to the existing LocalSet for CDP processing.
     let std_listener = std::net::TcpListener::bind(addr)
         .map_err(|e| anyhow::anyhow!("bind {}:{}: {}", host, port, e))?;
+    // Non-blocking so the accept thread can alternate between draining the
+    // backlog and re-polling parked connections (see the accept thread below).
     std_listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
     info!("Obscura CDP server listening on ws://{}:{}", host, port);
@@ -242,24 +244,92 @@ pub async fn start_with_serve_options_and_limit(
     // Dedicated accept thread: drains the kernel backlog immediately and
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
+    //
+    // A connection that is accepted but never sends its request head
+    // (speculative browser preconnects, port probes, slow-loris clients)
+    // must not be able to park this single thread in a blocking read: every
+    // later connection, including CDP clients like Playwright's
+    // connectOverCDP, would then sit in the kernel backlog unanswered until
+    // its own connect timeout (issue #715). The thread therefore never
+    // blocks on a *stream* — undecided connections are parked and re-polled
+    // every ACCEPT_POLL_INTERVAL, and dropped once they outlive
+    // SILENT_CONNECTION_TTL without sending a request head.
+    //
+    // While nothing is parked the thread blocks in accept() itself, the
+    // pre-#715 fast path: zero added latency for the next connection and no
+    // CPU while idle. Blocking on the listener is safe — it waits for the
+    // kernel, not for client bytes. While something is parked, the listener
+    // is drained without blocking at least once per 1 ms poll round, far
+    // above any real connect rate, so the kernel backlog cannot overflow
+    // under a connection burst.
     let accept_flag = shutdown_flag.clone();
     let http_registry = target_registry.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
-            for stream in std_listener.incoming() {
-                if accept_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                match stream {
-                    Ok(stream) => {
-                        if let Err(e) = accept_dispatch(stream, port, &ws_tx, &http_registry) {
-                            if !format!("{}", e).contains("close") {
-                                error!("Accept dispatch error: {}", e);
+            let mut pending: Vec<(std::net::TcpStream, std::time::Instant)> = Vec::new();
+            while !accept_flag.load(Ordering::Relaxed) {
+                if pending.is_empty() {
+                    // Fast path: nothing parked, block until a connection
+                    // arrives, then classify it in the sweep below.
+                    let _ = std_listener.set_nonblocking(false);
+                    match std_listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(true);
+                            pending.push((stream, std::time::Instant::now()));
+                        }
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                            // A persistent error (e.g. EMFILE) must not turn
+                            // into a log flood while the thread idles.
+                            std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                        }
+                    }
+                    let _ = std_listener.set_nonblocking(true);
+                } else {
+                    // Drain everything the kernel has already queued for us.
+                    loop {
+                        match std_listener.accept() {
+                            Ok((stream, _)) => {
+                                let _ = stream.set_nonblocking(true);
+                                if pending.len() < MAX_SILENT_PENDING {
+                                    pending.push((stream, std::time::Instant::now()));
+                                } else {
+                                    warn!(
+                                        "dropping connection: {} connections parked without a request head",
+                                        MAX_SILENT_PENDING
+                                    );
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                error!("Accept error: {}", e);
+                                break;
                             }
                         }
                     }
-                    Err(e) => error!("Accept error: {}", e),
+                }
+                // Give every parked connection a chance to speak; keep the
+                // ones still silent and inside the TTL, dispatch the ones
+                // with a request head. Dropping a stream closes its socket.
+                for (stream, since) in std::mem::take(&mut pending) {
+                    if since.elapsed() >= SILENT_CONNECTION_TTL {
+                        continue;
+                    }
+                    match peek_request_head(&stream) {
+                        PeekStatus::NotReady => pending.push((stream, since)),
+                        PeekStatus::Closed => {}
+                        PeekStatus::Head(head) => {
+                            if let Err(e) = accept_dispatch(stream, port, &ws_tx, &head, &http_registry) {
+                                if !format!("{}", e).contains("close") {
+                                    error!("Accept dispatch error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !pending.is_empty() {
+                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
                 }
             }
         })?;
@@ -634,55 +704,120 @@ fn merge_cookie_delta(
 /// Best-effort: the socket is going away either way, so a failed write just
 /// means the client sees a reset instead of the 503.
 fn refuse_connection(stream: std::net::TcpStream) {
-    use std::io::Write;
+    use std::io::{Read, Write};
     let mut stream = stream;
     let _ = stream.set_nonblocking(false);
+
+    // The accept thread only peeked at the WebSocket handshake. Consume its
+    // bounded HTTP header before closing: Windows resets a socket closed with
+    // unread receive data, which can discard the queued 503 response.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+    let mut request = [0u8; HTTP_PEEK_BUF];
+    let mut received = 0;
+    while received < request.len() {
+        match stream.read(&mut request[received..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                received += n;
+                if request[..received].windows(4).any(|end| end == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
     let _ = stream.write_all(CONNECTION_LIMIT_RESPONSE.as_bytes());
     let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
-const WS_PEEK_BUF: usize = 4;
+
+/// How long a freshly accepted connection may sit without sending a request
+/// head before the accept thread drops it. Real clients send their handshake
+/// immediately after connecting; only probes and preconnects linger.
+const SILENT_CONNECTION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the accept thread re-polls parked connections that have not sent
+/// a request head yet. Also the retry delay on a persistent accept error, so
+/// it cannot become a log flood. Only paid while something is actually
+/// parked; an idle server blocks in accept() and polls nothing.
+const ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Cap on connections parked without a request head. Bounds the accept
+/// thread's polling work and the server's fd usage under probe floods.
+const MAX_SILENT_PENDING: usize = 256;
+
+/// Result of polling a freshly accepted connection for its request head.
+enum PeekStatus {
+    /// No classifiable request head yet; poll again next accept round.
+    NotReady,
+    /// Peer went away without sending a full head.
+    Closed,
+    /// A classifiable request head.
+    Head(String),
+}
+
+/// Peek — without consuming — at a freshly accepted connection's request
+/// head. `GET` requests are only classified once the terminating blank line
+/// has arrived, so `/json` route matching never sees a truncated head;
+/// anything that cannot be a `GET` is handed over immediately so non-HTTP
+/// garbage still gets tungstenite's prompt rejection instead of waiting out
+/// the silent-connection TTL.
+fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
+    let mut buf = [0u8; HTTP_PEEK_BUF];
+    let n = match stream.peek(&mut buf) {
+        Ok(0) => return PeekStatus::Closed,
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return PeekStatus::NotReady,
+        Err(_) => return PeekStatus::Closed,
+    };
+    let head = &buf[..n];
+    if n >= 4 && head[..4] != *b"GET " {
+        return PeekStatus::Head(String::from_utf8_lossy(head).into_owned());
+    }
+    // A head that overflows the peek buffer is classified with what arrived,
+    // matching the pre-polling behavior for oversized headers.
+    let complete = n == HTTP_PEEK_BUF || head.windows(4).any(|w| w == b"\r\n\r\n");
+    if !complete {
+        return PeekStatus::NotReady;
+    }
+    PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
+}
 
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
-/// Peek at the first bytes to decide HTTP vs WebSocket:
+/// The connection's request head has already been peeked by the accept loop
+/// (`peek_request_head`) and is passed in as `head`:
 /// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
 ///   response is never stalled by the LocalSet.
-/// - WebSocket: set non-blocking, convert to tokio `TcpStream`, and forward
-///   to the LocalSet for CDP processing.
+/// - WebSocket: forward to the LocalSet for CDP processing.
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    head: &str,
     target_registry: &TargetRegistry,
 ) -> anyhow::Result<()> {
-    let mut buf = [0u8; WS_PEEK_BUF];
-    let n = stream.peek(&mut buf)?;
+    let endpoint = if head.contains("/json/version") {
+        Some("version")
+    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
+        Some("list")
+    } else if head.contains("/json/protocol") {
+        Some("protocol")
+    } else {
+        None
+    };
 
-    if n >= 4 && &buf == b"GET " {
-        let mut peek_buf = [0u8; HTTP_PEEK_BUF];
-        let n = stream.peek(&mut peek_buf)?;
-        let line = String::from_utf8_lossy(&peek_buf[..n]);
-
-        let endpoint = if line.contains("/json/version") {
-            Some("version")
-        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
-            Some("list")
-        } else if line.contains("/json/protocol") {
-            Some("protocol")
-        } else {
-            None
-        };
-
-        if let Some(ep) = endpoint {
-            return handle_http_json_blocking(stream, port, ep, target_registry);
-        }
-        // Fall through: GET request that isn't a /json endpoint → treat as
-        // WebSocket upgrade (Chromium DevTools clients issue GET with
-        // Upgrade: websocket).
+    if let Some(ep) = endpoint {
+        // The request head is already sitting in the kernel receive buffer;
+        // switch back to blocking mode for the synchronous /json serve.
+        let _ = stream.set_nonblocking(false);
+        return handle_http_json_blocking(stream, port, ep, target_registry);
     }
+    // Fall through: GET request that isn't a /json endpoint → treat as
+    // WebSocket upgrade (Chromium DevTools clients issue GET with
+    // Upgrade: websocket).
 
     // Try to hand off the WS stream to the LocalSet. If the bounded channel
     // is full the LocalSet is saturated — drop the connection cleanly
@@ -860,7 +995,9 @@ async fn cdp_processor(
                         }
                     }
                     sync_live_page_network_events(&mut ctx);
+                    dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
+                    dispatch::drain_frame_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     if let (Some(reply_tx), Some((session_id, url, method, body))) = (
                         connection_reply_tx.as_ref(),
@@ -1949,7 +2086,7 @@ fn fast_path_response(text: &str) -> Option<String> {
     // attachedToTarget flood).
     let result = match req.method.as_str() {
         "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
+        "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
         "Emulation.setTouchEmulationEnabled" |

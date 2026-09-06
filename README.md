@@ -8,6 +8,7 @@
 <p align="center">
   <a href="https://docs.obscura.sh"><img src="https://img.shields.io/badge/Docs-1a1a1a?style=for-the-badge&logo=gitbook&logoColor=white" alt="Documentation" /></a>
   <a href="https://obscura.sh"><img src="https://img.shields.io/badge/Website-1a1a1a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjE5MCAxNzAgNDIwIDQyMCI+PHBhdGggZmlsbD0iI0ZGRkZGRiIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNDA2LDE3NS4wMDA0MTIgQzQ0MC40OTg5MzIsMTc1LjAwMDM1MSA0NzQuNDk4MTA4LDE3NS4wODA5OTQgNTA4LjQ5NjczNSwxNzQuOTc1NjYyIEM1MzcuNzMzNjQzLDE3NC44ODUwODYgNTYxLjI3MDY5MSwxODcuMjIwNTUxIDU3OS45Mzk2MzYsMjA4Ljc4NjYyMSBDNTkwLjg0MTA2NCwyMjEuMzc5Nzc2IDU5Ny44ODM1NDUsMjM2LjM1MjY2MSA1OTkuOTgxODczLDI1My4yMjAzNjcgQzYwMC40NDU1NTcsMjU2Ljk0NzU0MCA2MDAuOTUxMTExLDI2MC43MDQ0MzcgNjAwLjk1NjYwNCwyNjQuNDQ4MzY0IEM2MDEuMDIyNjQ0LDMwOS42MTM1MjUgNjAxLjA3NTgwNiwzNTQuNzc5MDIyIDYwMC45NTE3ODIsMzk5Ljk0MzkzOSBDNjAwLjkxMzE0Nyw0MTQuMDMyMzQ5IDYwMC42NjMyNjksNDI4LjE0MDEwNiA1OTkuNzgyMjg4LDQ0Mi4xOTMzNTkgQzU5OS41NDEwMTYsNDQ2LjA0MDg5NCA1OTcuNTYwNzkxLDQ1MC42MTU2MDEgNTk0Ljg1MzIxMCw0NTMuMzQxMzA5IEM1NzEuMTc3NTUxLDQ3Ny4xNzUzMjMgNTQ3LjE4MDcyNSw1MDAuNjkwNzk2IDUyMy4yMjc5NjYsNTI0LjI0ODc3OSBDNTA2Ljc5OTgzNSw1NDAuNDA2MTI4IDQ5MC4yMDk5OTEsNTU2LjM5OTkwMiA0NzMuODY0NTYzLDU3Mi42NDAxMzcgQzQ2OC44MDA4NDIsNTc3LjY3MTIwNCA0NjMuMDgyODg2LDU4MC4wNTQxOTkgNDU1Ljk3MDYxMiw1ODAuMDQzODIzIEM0MDAuOTcyNDQzLDU3OS45NjM1MDEgMzQ1Ljk3MzY2Myw1ODAuMTMyMDE5IDI5MC45NzYwNDQsNTc5LjkzNjc2OCBDMjY3LjU4MDQxNCw1NzkuODUzNjk5IDI0Ni41NTEyMDgsNTcyLjA0MzU3OSAyMjguOTM5NzQzLDU1Ni44Mjc1MTUgQzIxMi44NDk2MjUsNTQyLjkyNTg0MiAyMDIuNzUxOTY4LDUyNC45MDIxMDAgMTk4LjE1NjE1OCw1MDQuMDM5NjczIEMxOTcuMjgyMTk2LDUwMC4wNzIyOTYgMTk3LjA1MjQxNCw0OTUuODk1Mzg2IDE5Ny4wNDczMzMsNDkxLjgxNDQ4NCBDMTk2Ljk3ODE0OSw0MzYuMTQ5NjU4IDE5Ny4wNTA3MjAsMzgwLjQ4NDYxOSAxOTYuOTMyNjE3LDMyNC44MTk5NDYgQzE5Ni45MTkxNDQsMzE4LjQ3MDkxNyAxOTkuMTg0ODQ1LDMxMy40MTYxOTkgMjAzLjQ5NTU3NSwzMDkuMTAwNTI1IEMyNDAuNTg3OTk3LDI3MS45NjU0MjQgMjc3LjY4MjQ5NSwyMzQuODMyMzA2IDMxNC44MzQ1NjQsMTk3Ljc1Njk1OCBDMzIwLjk1NjQyMSwxOTEuNjQ3Nzk3IDMyNy4yNjQ0MzUsMTg1LjcxNTI1NiAzMzMuNjczOTIwLDE3OS45MDgwODEgQzMzNy4zNzYwMzgsMTc2LjU1MzgzMyAzNDEuNzIxNDY2LDE3NC44NTMzMTcgMzQ3LjAwNTc5OCwxNzQuOTEyODcyIEMzNjYuNTAxNzA5LDE3NS4xMzI2MTQgMzg2LjAwMTYxNywxNzUuMDAwMzIwIDQwNiwxNzUuMDAwNDEyIFogTTUwMy4zNDQ2NjYsMjczLjg0MDE0OSBDNTA0LjEwMjcyMiwyNzYuMTY3NTcyIDUwNC45NDA5NDgsMjc4LjIxMTA5MCA1MDQuOTQzMjY4LDI4MC4yNTU1MjQgQzUwNS4wMTI4NDgsMzQxLjc0MjI0OSA1MDQuOTY5MTQ3LDQwMy4yMjkwNjUgNTA1LjAzMDc5Miw0NjQuNzE1NzkwIEM1MDUuMDQwODAyLDQ3NC42ODY0OTMgNDk2LjExNzQ2Miw0ODMuOTUzMTg2IDQ4NS43Nzc5MjQsNDgzLjk2NTI3MSBDNDI0LjYyNDQ1MSw0ODQuMDM2ODk2IDM2My40NzA5MTcsNDg0LjAwMzIzNSAzMDIuMzE3MzgzLDQ4My45OTY3MzUgQzI5NS41ODc3NjksNDgzLjk5NjAzMyAyOTMuMDAxMjUxLDQ4MS4zMDE2MDUgMjkzLjAwMDkxNiw0NzQuMzM4NTYyIEMyOTIuOTk3ODY0LDQxMy4zNTE2NTQgMjkzLjIwOTYyNSwzNTIuMzYzMzEyIDI5Mi43ODA3MDEsMjkxLjM3OTM5NSBDMjkyLjcxMzUzMSwyODEuODI4MDk0IDMwMy4yMTMwNDMsMjcwLjgyNDE1OCAzMTMuNDc4MjcxLDI3MC44OTQzMTggQzM1MS45NjgyMDEsMjcxLjE1NzQ0MCAzOTAuNDYwOTk5LDI3MC45OTk3ODYgNDI4Ljk1MjcyOCwyNzAuOTk5Nzg2IEM0NTEuMTE0NjI0LDI3MC45OTk3ODYgNDczLjI3NzI4MywyNzAuOTE3NDgwIDQ5NS40Mzc0NjksMjcxLjExMjE1MiBDNDk3Ljk3NzAyMCwyNzEuMTM0NDkxIDUwMC41MDI5MzAsMjcyLjcwNDM3NiA1MDMuMzQ0NjY2LDI3My44NDAxNDkgWiI+PC9wYXRoPjwvc3ZnPgo=&logoColor=white" alt="Website" /></a>
+  <a href="https://x.com/obscura_sh" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/TWITTER%20%2F%20X-1a1a1a?style=for-the-badge&logo=x&logoColor=white" alt="Obscura on Twitter/X" /></a>
   <a href="https://cal.com/obscura/quick-chat"><img src="https://img.shields.io/badge/Book_a_Demo-1a1a1a?style=for-the-badge&logo=googlecalendar&logoColor=white" alt="Book a demo" /></a>
   <a href="https://github.com/h4ckf0r0day/obscura/releases"><img src="https://img.shields.io/badge/Releases-1a1a1a?style=for-the-badge&logo=github&logoColor=white" alt="Releases" /></a>
 </p>
@@ -26,8 +27,6 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
 
 ### Why Obscura over headless Chrome?
 
-Designed for automation at scale, not desktop browsing.
-
 | Metric       | Obscura      | Headless Chrome |
 |--------------|--------------|------------------|
 | Memory       | **30 MB**    | 200+ MB          |
@@ -38,7 +37,31 @@ Designed for automation at scale, not desktop browsing.
 | Puppeteer    | **Yes**      | Yes              |
 | Playwright   | **Yes**      | Yes              |
 
-## 🎉 10,000 stars and what's next
+<table>
+  <tr>
+    <td width="90" align="center">
+      <a href="https://blog.cloudflare.com/kitesurf/">
+        <img
+          src="https://cdn.simpleicons.org/cloudflare/F38020"
+          alt="Cloudflare"
+          width="54"
+        />
+      </a>
+    </td>
+    <td>
+      <strong>Obscura inspired Cloudflare Kitesurf’s first prototype</strong>
+      <br>
+      Cloudflare began by porting Obscura to Workers while developing its
+      new agent-first browser.
+      <br>
+      <a href="https://blog.cloudflare.com/kitesurf/">
+        Read Cloudflare’s engineering story →
+      </a>
+    </td>
+  </tr>
+</table>
+
+## Obscura Cloud
 
 We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
 
@@ -50,47 +73,28 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 
 ## Sponsors
 
-**Obscura** is supported by sponsors who help keep development independent. 
+**Obscura** is supported by organizations helping us build independent open-source browser infrastructure.
 
 Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 
 <table>
-  <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://sx.org/?c=40h-N7" target="_blank">
-        <img alt="SX.org" src="assets/sponsors/sxproxy.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      🚀 <b>Obscura × SX.org</b><br>
-      Using Obscura for AI agents, browser automation, or web scraping? Power your workflow with stable proxies from <a href="https://sx.org/?c=40h-N7"><b>SX.org</b></a>.<br><br>
-      <b>🌍 12M+ IPs across 235 countries<br>
-      🏠 7M+ residential IPs<br>
-      📱 4M+ mobile IPs<br>
-      🏢 1M+ corporate proxies<br>
-      🔁 Rotating & sticky sessions<br>
-      📍 Flexible geo setup<br>
-      🌐 HTTP, HTTPS & SOCKS5 support<br>
-      ⚡ Up to 99.97% connection success<br>
-      🛟 24/7 support<br><br>
-      🎁 Use code <b>Obscura3gb</b> to get a <b>free 3GB trial</b>.<br><br></b>
-      Stable proxies. Fewer blocks. Most reliable Obscura automation.
-    </td>
-  </tr>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscura" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
+      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven2.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://go.nodemaven.com/obscuraread"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
-      <b>99.9% uptime<br>
-      Sticky sessions up to 7 days<br>
-      IP filtering on every proxy<br>
+      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
+      <b>Why <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">NodeMaven</a>?</b><br>
+      ZIP targeting<br>
+      99.9% uptime<br>
+      IP filtering: all proxies have fraud score &lt;97%<br>
       No KYC required<br>
-      Cashback on traffic — earn up to 10% back<br><br></b>
-      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
+      Unique free tools: Proxy Bandwidth Checker, Meta Tag Checker, IP Lookup and others!<br><br>
+      🎁 <b>Special codes for Obscura users:</b><br>
+      <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
+      <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies
     </td>
   </tr>
   <tr>
@@ -110,34 +114,15 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br></b>
       Better proxies. Fewer blocks. More scalable automation.
     </td>
-  </tr>
-      <td width="200" align="center" valign="middle">
-        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura" target="_blank">
-          <img alt="9Proxy" src="assets/sponsors/9proxy.png" width="180"/>
-        </a>
-      </td>
-      <td valign="middle">
-        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura"><b>9Proxy</b></a> provides residential proxies from
-  just $0.018/IP or $0.68/GB. 20M+ IPs across 90+ countries. Sticky or rotating sessions, managed from desktop or mobile app.
-      </td>
-    </tr>
+ <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://www.thordata.com/?ls=dob&lk=dob" target="_blank">
-        <img alt="Thordata" src="/assets/sponsors/thordatalogo.png" width="180"/>
+      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
+        <img alt="NiuProxy" src="assets/sponsors/niuproxlogo.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      🚀 <b>Obscura × Thordata</b><br>
-      Need more stable proxies for automation, public web scraping, SEO, or ad verification? Power your workflow with <a href="https://www.thordata.com/?ls=dob&lk=dob"><b>Thordata</b></a>.<br><br>
-      <b>🌍 Residential Proxies: 100M+ real residential IPs in 190+ countries<br>
-      ♾️ Unlimited Proxies: for heavy traffic and high concurrency<br>
-      ✨ Recently upgraded residential IP pool<br>
-      ✨ Unlimited Concurrent Sessions<br>
-      🔁 Rotating & Sticky Sessions<br>
-      📍 Flexible GEO targeting<br>
-      ⚡ Stable HTTP(S) connections<br><br>
-      🎁 Use code <b>obscura</b> for <b>10% off</b>.<br><br></b>
-      Get started with a 3-day free trial and test Thordata with your own workflow.
+      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura"><b>NiuProxy</b></a> Rotating Residential Proxies — Special Offer: 10TB at $0.35/GB | 1TB at $0.50/GB.<br><br>
+      🎁 Use code <b>PAY2</b> for <b>10% off</b> your recharge.
     </td>
   </tr>
 </table>
@@ -266,6 +251,22 @@ obscura fetch https://example.com --screenshot page.png
 
 # The screenshot flag also has a short form
 obscura fetch https://example.com -s page.png
+
+### Testing against localhost / LAN dev servers
+
+Obscura blocks fetches to private/internal IPs by default (SSRF protection).
+To point it at a local dev server, pass `--allow-private-network` (or set
+`OBSCURA_ALLOW_PRIVATE_NETWORK=1`):
+
+```bash
+obscura fetch http://127.0.0.1:3000 --allow-private-network --dump text
+
+# Works on any subcommand, e.g. the CDP server for local Puppeteer/Playwright:
+obscura serve --port 9222 --allow-private-network
+```
+
+See [docs/Environment-variables.md](docs/Environment-variables.md) for the
+full allow/deny rules (DNS-resolution-time checks included).
 ```
 
 ## Rendering
@@ -442,6 +443,14 @@ Obscura caps the page's script-execution phase so one slow or hung page cannot s
 ```bash
 OBSCURA_SCRIPT_DEADLINE_MS=60000 obscura serve --port 9222
 ```
+
+Modules that enhance an already-rendered page have a separate 3s per-module budget so one non-essential module cannot hold navigation open. Raise it for legitimate long-running modules such as a Vite HMR client:
+
+```bash
+OBSCURA_MODULE_BUDGET_MS=10000 obscura serve --port 9222
+```
+
+An unmounted SPA shell already gives its app modules the full `OBSCURA_SCRIPT_DEADLINE_MS` budget. `OBSCURA_FETCH_TIMEOUT_MS` controls the module's network request, not its evaluation time. See [Environment variables](docs/Environment-variables.md) for the complete timeout model.
 
 ### `obscura serve`
 

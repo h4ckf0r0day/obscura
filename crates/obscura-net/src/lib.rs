@@ -12,7 +12,7 @@ pub use client::{
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
     ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
 };
-pub use cookies::{default_cookie_path, CookieInfo, CookieJar};
+pub use cookies::{canonical_domain, default_cookie_path, CookieInfo, CookieJar};
 pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,

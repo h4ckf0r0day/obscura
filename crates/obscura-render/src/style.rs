@@ -243,6 +243,38 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.border_model.colors = crate::Sides::all(Some([118, 118, 118, 255]));
         style.border_color = Some([118, 118, 118, 255]);
         style.background_color = Some([255, 255, 255, 255]);
+    } else if tag == "textarea" {
+        // A native textarea is an atomic inline-block control whose
+        // intrinsic box comes from rows/cols (resolved in dom.rs once the
+        // attributes are readable), not from its text content. Unlike the
+        // other controls it keeps its content in the tree (the value is the
+        // text child), laid out inside the sized box; line breaks in the
+        // value must survive, hence pre-wrap. Chromium defaults the control
+        // to the fixed-pitch face and to border-box sizing.
+        style.display = Display::Inline;
+        style.is_inline_block = true;
+        style.font_size = Some(13.333_333);
+        style.font_family = Some("monospace".to_string());
+        style.line_height = Some(crate::LineHeight::Normal);
+        style.white_space = Some(crate::WhiteSpace::PreWrap);
+        style.box_sizing = crate::BoxSizing::BorderBox;
+        style.padding = Edges {
+            top: 2.0,
+            right: 2.0,
+            bottom: 2.0,
+            left: 2.0,
+        };
+        style.border = Edges {
+            top: 1.0,
+            right: 1.0,
+            bottom: 1.0,
+            left: 1.0,
+        };
+        style.border_model.specified_widths = crate::Sides::all(1.0);
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Solid);
+        style.border_model.colors = crate::Sides::all(Some([118, 118, 118, 255]));
+        style.border_color = Some([118, 118, 118, 255]);
+        style.background_color = Some([255, 255, 255, 255]);
     } else if matches!(tag, "table" | "tbody" | "thead" | "tfoot") {
         style.display = Display::Flex;
         style.internal_flex_container = true;

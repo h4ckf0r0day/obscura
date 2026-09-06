@@ -4471,3 +4471,28 @@ fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     assert_eq!(size("parent-align-stretch"), (400.0, 200.0));
     assert_eq!(size("parent-justify-stretch"), (300.0, 150.0));
 }
+
+#[test]
+fn deeply_nested_wrappers_cascade_without_stack_overflow() {
+    // The style cascade used to recurse once per DOM level with a fat frame,
+    // so a page-controlled tree a few dozen levels deep overflowed the native
+    // stack and aborted the process. The traversal is iterative now; depth
+    // must change neither survival nor rule matching.
+    let open: String = (0..400).map(|_| "<span>").collect::<Vec<_>>().join("");
+    let close = "</span>".repeat(400);
+    let tree = parse_html(&format!(
+        r#"<style>
+          html, body {{ margin:0; font:16px/18px monospace }}
+          div span #deep {{ display:block; width:50px }}
+        </style>
+        <div>{open}<span id="deep">deep</span>{close}<input type="checkbox"></div>"#
+    ));
+    let layout = layout_dom(&tree, (400.0, 200.0));
+    let rect = layout.rects[&tree.get_element_by_id("deep").unwrap()];
+    // A descendant-combinator match at depth 400: the matcher's ancestor
+    // filter is maintained across the whole iterative walk.
+    assert!(
+        (rect.width - 50.0).abs() < 0.01,
+        "the descendant rule must match at depth 400, got {rect:?}"
+    );
+}

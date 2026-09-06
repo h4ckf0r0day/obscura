@@ -10,6 +10,7 @@ license = "Apache-2.0"
 [features]
 default = ["api"]
 api = ["obscura-browser", "obscura-net", "tokio"]
+stealth = ["api", "obscura-browser/stealth"]
 render = ["api", "obscura-browser/render"]
 
 [dependencies]
@@ -24,3 +25,7 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[[example]]
+name = "basic"
+required-features = ["stealth"]

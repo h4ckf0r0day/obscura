@@ -2,9 +2,12 @@
 name = "obscura-cdp"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
+stealth = ["obscura-browser/stealth"]
 # Enable Page.captureScreenshot via obscura-render. Propagates render to
 # obscura-browser so Page::screenshot is available.
 render = ["obscura-browser/render", "dep:image", "dep:png"]

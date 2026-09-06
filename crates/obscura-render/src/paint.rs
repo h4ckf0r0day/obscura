@@ -2104,14 +2104,41 @@ pub fn paint_dom_scrolled_at_animation_time_with_surface_color(
     surface_color: [u8; 4],
 ) -> Option<Pixmap> {
     let mut resources = RenderResourceCache::default();
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        &mut resources,
+    )
+}
+
+/// As [`paint_dom_scrolled_at_animation_time_with_surface_color`], but painting
+/// against a caller-owned resource cache instead of a fresh one.
+///
+/// The default-cache version starts empty, so every image is fetched again on
+/// every call. A caller that already holds a warm cache for this document — a
+/// page repeating a capture, for instance — can pass it here and pay the
+/// network cost once rather than per frame.
+pub fn paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Pixmap> {
     let mut prepared = prepare_dom_at_animation_time(
         tree,
         viewport,
         base_url,
-        &mut resources,
+        resources,
         animation_sample_time,
     )?;
-    paint_prepared_with_surface_color(tree, &mut prepared, &mut resources, scroll, surface_color)
+    paint_prepared_with_surface_color(tree, &mut prepared, resources, scroll, surface_color)
 }
 
 /// Resolve image candidates and web fonts, then create the single final layout
@@ -4536,11 +4563,24 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        // `::before`/`::after` generated text (see `dom::build_pseudo_content`)
-        // has no DOM text node of its own; its word runs are registered under
-        // the host element's own id instead, so paint them here rather than
-        // through `paint_text_node` (which only runs for real text nodes).
-        if let Some(runs) = laid.text_runs.get(&nid) {
+        // `::before`/`::after` generated text has no DOM text node of its own.
+        // Its shaped word items are registered under the host element, so
+        // paint them here. The static path remains for layout-only builds and
+        // for a face that cosmic-text cannot decode.
+        if let Some(items) = laid.word_ifc_items.get(&nid) {
+            let offset = scroll_state.translation_for(laid, nid);
+            for &item in items {
+                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
+                    item,
+                    &mut pixmap,
+                    offset,
+                    clip,
+                    element_clip_mask,
+                    raster_scale,
+                    print_economy,
+                );
+            }
+        } else if let Some(runs) = laid.text_runs.get(&nid) {
             let color = style.color.unwrap_or([0, 0, 0, 255]);
             let fsize = style.font_size.unwrap_or(16.0);
             let is_bold = crate::style::used_font_weight(style) >= 600;
@@ -4621,6 +4661,48 @@ fn paint_laid_dom_scrolled(
                 .unwrap_or(false)
                 || (name.local.as_ref() == "textarea"
                     && !tree.text_content(nid).is_empty());
+            // A text `<input>`'s value is not a DOM text node either, so it
+            // needs painting from the attribute the same way. Without this the
+            // control renders empty however it was filled in — from markup,
+            // from script, or by typing — while its `value` reads back
+            // correctly, so only a screenshot or PDF shows anything wrong.
+            // `<textarea>` is unaffected: its value *is* a text node.
+            if has_value && name.local.as_ref() == "input" {
+                if let Some(value) = node.get_attribute("value") {
+                    if !value.is_empty() {
+                        let fsize = style.font_size.unwrap_or(16.0);
+                        let text_x = rect.x + style.padding.left + style.border.left;
+                        let text_y = rect.y + style.padding.top + style.border.top;
+                        let color = style.color.unwrap_or([0, 0, 0, 255]);
+                        let masked;
+                        let shown = if node
+                            .get_attribute("type")
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+                        {
+                            masked = "\u{2022}".repeat(value.chars().count());
+                            masked.as_str()
+                        } else {
+                            value
+                        };
+                        if color[3] != 0 {
+                            draw_text(
+                                &mut pixmap,
+                                shown,
+                                text_x,
+                                text_y,
+                                color,
+                                fsize,
+                                false,
+                                style.font_family.as_deref(),
+                                style.letter_spacing.unwrap_or(0.0),
+                                clip,
+                                element_clip_mask,
+                                raster_scale,
+                            );
+                        }
+                    }
+                }
+            }
             if !has_value {
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
@@ -5981,10 +6063,10 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
 /// tiny-skia has no gaussian blur, so the blur is approximated by nested
 /// rounded rects from a solid core out to the blur radius, each at a fraction of
 /// the shadow alpha so source-over accumulation ramps the coverage from full at
-/// the core to near-zero at the outer edge. `inset` shadows are parsed but not
-/// painted (an inner shadow needs a hole-punched fill this box model does not
-/// build). `clip`, when set, is the ancestor `overflow: hidden` region and is
-/// applied as a mask so the shadow is clipped like the element itself.
+/// the core to near-zero at the outer edge. A shared mask removes the element's
+/// original border box from every outset layer. `inset` shadows are parsed but
+/// not painted. `clip`, when set, is the ancestor `overflow: hidden` region and
+/// is intersected with the shadow mask.
 fn paint_box_shadow(
     pixmap: &mut Pixmap,
     shadow: &crate::BoxShadow,
@@ -6003,7 +6085,8 @@ fn paint_box_shadow(
     if w0 <= 0.0 || h0 <= 0.0 {
         return;
     }
-    let radius = border_radius.resolve(rect.width, rect.height).top_left;
+    let border_radii = border_radius.resolve(rect.width, rect.height);
+    let radius = border_radii.top_left;
     let rx0 = (radius.0 + spread).max(0.0);
     let ry0 = (radius.1 + spread).max(0.0);
     let blur = shadow.blur.max(0.0);
@@ -6018,41 +6101,86 @@ fn paint_box_shadow(
     if !rect_intersects_paint_surface(&shadow_bounds, pixmap, 1.0) {
         return;
     }
-    // Ancestor overflow clip is already the complete rect/rounded chain.
-    let mask = ancestor_clip;
+    let left = shadow_bounds.x.floor().max(0.0) as i32;
+    let top = shadow_bounds.y.floor().max(0.0) as i32;
+    let right = (shadow_bounds.x + shadow_bounds.width)
+        .ceil()
+        .min(pixmap.width() as f32) as i32;
+    let bottom = (shadow_bounds.y + shadow_bounds.height)
+        .ceil()
+        .min(pixmap.height() as f32) as i32;
+    let Some(mut shadow_pixmap) = Pixmap::new((right - left) as u32, (bottom - top) as u32)
+    else {
+        return;
+    };
+    let local_rect = crate::Rect {
+        x: rect.x - left as f32,
+        y: rect.y - top as f32,
+        ..*rect
+    };
+    let Some(mut shadow_mask) =
+        rounded_box_clip_mask_radii(
+            shadow_pixmap.width(),
+            shadow_pixmap.height(),
+            &local_rect,
+            border_radii,
+        )
+    else {
+        return;
+    };
+    shadow_mask.invert();
     let color = shadow.color;
     if blur < 0.5 {
         // No blur: a single crisp, offset (and spread) rounded rect.
-        fill_shadow_rect(pixmap, x0, y0, w0, h0, rx0, ry0, color, mask);
-        return;
-    }
-    let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
-    // Per-layer alpha chosen so `steps` source-over composites reach the target
-    // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
-    let a_frac = color[3] as f32 / 255.0;
-    let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
-    let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
-    let layer_color = [color[0], color[1], color[2], layer_alpha];
-    for j in 0..steps {
-        // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
-        // radius. Larger rects paint first, smaller (more-covered) ones on top.
-        let e = blur * (j as f32) / ((steps - 1) as f32);
         fill_shadow_rect(
-            pixmap,
-            x0 - e,
-            y0 - e,
-            w0 + 2.0 * e,
-            h0 + 2.0 * e,
-            rx0 + e,
-            ry0 + e,
-            layer_color,
-            mask,
+            &mut shadow_pixmap,
+            x0 - left as f32,
+            y0 - top as f32,
+            w0,
+            h0,
+            rx0,
+            ry0,
+            color,
+            Some(&shadow_mask),
         );
+    } else {
+        let steps: u32 = (blur.ceil() as u32).clamp(2, 24);
+        // Per-layer alpha chosen so `steps` source-over composites reach the target
+        // alpha at the core: 1 - (1 - a)^steps == A  =>  a = 1 - (1 - A)^(1/steps).
+        let a_frac = color[3] as f32 / 255.0;
+        let per = 1.0 - (1.0 - a_frac).powf(1.0 / steps as f32);
+        let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
+        let layer_color = [color[0], color[1], color[2], layer_alpha];
+        for j in 0..steps {
+            // j = 0 is the solid core (expansion 0); j = steps-1 reaches the blur
+            // radius. Larger rects paint first, smaller (more-covered) ones on top.
+            let e = blur * (j as f32) / ((steps - 1) as f32);
+            fill_shadow_rect(
+                &mut shadow_pixmap,
+                x0 - e - left as f32,
+                y0 - e - top as f32,
+                w0 + 2.0 * e,
+                h0 + 2.0 * e,
+                rx0 + e,
+                ry0 + e,
+                layer_color,
+                Some(&shadow_mask),
+            );
+        }
     }
+    // Ancestor overflow clip is already the complete rect/rounded chain.
+    pixmap.draw_pixmap(
+        left,
+        top,
+        shadow_pixmap.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        ancestor_clip,
+    );
 }
 
 /// Fill one (possibly rounded) shadow rectangle with a flat color, optionally
-/// masked to an ancestor clip region. A helper for `paint_box_shadow`'s layers.
+/// constrained by an alpha mask. A helper for `paint_box_shadow`'s layers.
 fn fill_shadow_rect(
     pixmap: &mut Pixmap,
     x: f32,
@@ -6206,6 +6334,28 @@ pub fn screenshot_png_scrolled_at_animation_time_with_surface_color(
         scroll,
         animation_sample_time,
         surface_color,
+    )
+    .and_then(|pixmap| pixmap.encode_png().ok())
+}
+
+/// PNG wrapper for [`paint_dom_scrolled_at_animation_time_with_surface_color_and_resources`].
+pub fn screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    scroll: (f32, f32),
+    animation_sample_time: crate::AnimationSampleTime,
+    surface_color: [u8; 4],
+    resources: &mut RenderResourceCache,
+) -> Option<Vec<u8>> {
+    paint_dom_scrolled_at_animation_time_with_surface_color_and_resources(
+        tree,
+        viewport,
+        base_url,
+        scroll,
+        animation_sample_time,
+        surface_color,
+        resources,
     )
     .and_then(|pixmap| pixmap.encode_png().ok())
 }
@@ -6854,6 +7004,13 @@ fn collect_web_fonts(
     cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
 ) -> Vec<crate::inline::WebFont> {
+    struct FontRule {
+        sources: Vec<(String, String)>,
+        family: Option<String>,
+        weight: Option<(u16, u16)>,
+        italic: Option<bool>,
+    }
+
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
@@ -6874,16 +7031,20 @@ fn collect_web_fonts(
             if !font_face_covers_ascii(face) {
                 continue;
             }
-            let Some(src) = font_face_urls(face).into_iter().next() else {
+            let sources: Vec<_> = font_face_urls(face)
+                .into_iter()
+                .filter(|src| font_source_may_be_supported(src))
+                .map(|src| (font_resource_key(&src, base_url), src))
+                .collect();
+            if sources.is_empty() {
                 continue;
-            };
-            rules.push((
-                font_resource_key(&src, base_url),
-                src,
-                font_face_family(face),
-                font_face_weight(face),
-                font_face_italic(face),
-            ));
+            }
+            rules.push(FontRule {
+                sources,
+                family: font_face_family(face),
+                weight: font_face_weight(face),
+                italic: font_face_italic(face),
+            });
         }
     }
     for face in dynamic_fonts {
@@ -6894,16 +7055,20 @@ fn collect_web_fonts(
         if !font_face_covers_ascii(&descriptor_block) {
             continue;
         }
-        let Some(src) = font_face_urls(&descriptor_block).into_iter().next() else {
+        let sources: Vec<_> = font_face_urls(&descriptor_block)
+            .into_iter()
+            .filter(|src| font_source_may_be_supported(src))
+            .map(|src| (font_resource_key(&src, base_url), src))
+            .collect();
+        if sources.is_empty() {
             continue;
-        };
-        rules.push((
-            font_resource_key(&src, base_url),
-            src,
-            (!face.family.is_empty()).then(|| face.family.clone()),
-            font_face_weight(&descriptor_block),
-            font_face_italic(&descriptor_block),
-        ));
+        }
+        rules.push(FontRule {
+            sources,
+            family: (!face.family.is_empty()).then(|| face.family.clone()),
+            weight: font_face_weight(&descriptor_block),
+            italic: font_face_italic(&descriptor_block),
+        });
     }
 
     // Critical web fonts are normally preloaded from the document with a URL
@@ -6939,33 +7104,52 @@ fn collect_web_fonts(
             continue;
         }
         if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
-            let metadata = rules.iter().find(|rule| rule.0 == key);
+            let metadata = rules.iter().find(|rule| {
+                rule.sources
+                    .iter()
+                    .any(|(source_key, _)| *source_key == key)
+            });
             fonts.push(crate::inline::WebFont {
                 data: decoded,
-                family: metadata.and_then(|rule| rule.2.clone()),
-                weight: metadata.and_then(|rule| rule.3),
-                italic: metadata.and_then(|rule| rule.4),
+                family: metadata.and_then(|rule| rule.family.clone()),
+                weight: metadata.and_then(|rule| rule.weight),
+                italic: metadata.and_then(|rule| rule.italic),
             });
         }
     }
 
-    for (key, src, family, weight, italic) in rules {
+    for rule in rules {
         if fonts.len() >= 16 {
             break;
         }
-        if !seen.insert(key) {
-            continue;
-        }
-        if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
-            fonts.push(crate::inline::WebFont {
-                data: decoded,
-                family,
-                weight,
-                italic,
-            });
+        for (key, src) in rule.sources {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
+                fonts.push(crate::inline::WebFont {
+                    data: decoded,
+                    family: rule.family,
+                    weight: rule.weight,
+                    italic: rule.italic,
+                });
+                break;
+            }
         }
     }
     fonts
+}
+
+/// Exclude source formats that fontdb cannot consume before issuing a request.
+/// Unknown and extensionless URLs are retained because their response bytes can
+/// still identify a supported sfnt, WOFF, or WOFF2 resource.
+fn font_source_may_be_supported(src: &str) -> bool {
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    !path.ends_with(".eot") && !path.ends_with(".svg")
 }
 
 fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
@@ -7055,13 +7239,14 @@ fn font_face_blocks(css: &str) -> Vec<&str> {
 fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
     split_css_top_level(face, ';')
         .into_iter()
-        .find_map(|declaration| {
+        .filter_map(|declaration| {
             let (property, value) = declaration.split_once(':')?;
             property
                 .trim()
                 .eq_ignore_ascii_case(name)
                 .then_some(value.trim())
         })
+        .last()
 }
 
 fn font_face_family(face: &str) -> Option<String> {
@@ -10013,6 +10198,15 @@ fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
             FONT_BOLD_OBLIQUE_BYTES,
             SERIF_FONT_BYTES,
             MONO_FONT_BYTES,
+            // The Liberation families stop at Latin/Greek/Cyrillic: an SVG
+            // text run with a symbol glyph (★/U+2605 and friends) had no face
+            // covering it anywhere in the database, so usvg's per-glyph
+            // fallback dropped the glyph and warned per character (#701).
+            // DejaVu Sans is the same embedded broad-coverage face the HTML
+            // engine already keeps for `system-ui`; family selection is
+            // unchanged (Liberation stays the sans/serif/mono default), it
+            // only extends what the fallback search can find.
+            SYSTEM_FONT_BYTES,
         ] {
             database.load_font_data(bytes.to_vec());
         }
@@ -11199,6 +11393,76 @@ mod tests {
     }
 
     #[test]
+    fn outset_box_shadow_stays_outside_transparent_and_opaque_border_boxes() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <div style="position:absolute;left:20px;top:20px;width:40px;height:30px;
+                            box-shadow:4px 4px 0 black"></div>
+                <div style="position:absolute;left:100px;top:20px;width:40px;height:30px;
+                            background:rgb(0,255,0);box-shadow:4px 4px 0 black"></div>
+                <div style="position:absolute;left:20px;top:70px;width:40px;height:30px;
+                            border-radius:12px;box-shadow:0 0 0 4px black"></div>
+                <div style="position:absolute;left:100px;top:70px;width:40px;height:30px;
+                            box-shadow:2px 2px 3px rgb(51,51,51)"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (160.0, 120.0), None).expect("box shadow paint");
+
+        let transparent_center = pixmap.pixel(35, 35).expect("transparent center");
+        assert_eq!(
+            (
+                transparent_center.red(),
+                transparent_center.green(),
+                transparent_center.blue(),
+            ),
+            (255, 255, 255),
+            "an outset shadow must not cover a transparent border box"
+        );
+        let offset_gap = pixmap.pixel(21, 35).expect("offset gap");
+        assert_eq!(
+            (offset_gap.red(), offset_gap.green(), offset_gap.blue()),
+            (255, 255, 255),
+            "the clip must not turn the shadow and border-box paths into a symmetric difference"
+        );
+        let shadow_edge = pixmap.pixel(62, 35).expect("shadow edge");
+        assert!(
+            shadow_edge.red() < 10 && shadow_edge.green() < 10 && shadow_edge.blue() < 10,
+            "shadow ink must remain outside the border box: {shadow_edge:?}"
+        );
+        let opaque_center = pixmap.pixel(115, 35).expect("opaque center");
+        assert!(
+            opaque_center.green() > 245
+                && opaque_center.red() < 10
+                && opaque_center.blue() < 10,
+            "opaque backgrounds must continue to cover the shadow: {opaque_center:?}"
+        );
+        let rounded_corner = pixmap.pixel(21, 71).expect("rounded corner shadow");
+        assert!(
+            rounded_corner.red() < 10
+                && rounded_corner.green() < 10
+                && rounded_corner.blue() < 10,
+            "the hole must follow the rounded border box rather than its rectangular bounds: {rounded_corner:?}"
+        );
+        let blurred_center = pixmap.pixel(115, 85).expect("blurred center");
+        assert_eq!(
+            (
+                blurred_center.red(),
+                blurred_center.green(),
+                blurred_center.blue(),
+            ),
+            (255, 255, 255),
+            "blurred outset shadows must keep the border-box interior transparent"
+        );
+        let blurred_edge = pixmap.pixel(142, 85).expect("blurred edge");
+        assert!(
+            blurred_edge.red() < 240
+                && blurred_edge.green() < 240
+                && blurred_edge.blue() < 240,
+            "the issue's 2px 2px 3px shadow must retain ink outside the box: {blurred_edge:?}"
+        );
+    }
+
+    #[test]
     fn svg_image_metadata_keeps_view_box_as_ratio_only() {
         let ratio_only = svg_image_intrinsic_metadata(
             br#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'/>"#,
@@ -11412,10 +11676,21 @@ mod tests {
             "the authored placeholder color must reach glyph paint"
         );
         assert_eq!(non_white(60), 0, "opacity:0 must suppress placeholder glyphs");
-        assert_eq!(
-            non_white(90),
-            0,
-            "a non-empty control value must suppress placeholder glyphs"
+        // `#filled` carries `value="actual"`, so the placeholder is suppressed
+        // and the value paints in its place — Chromium 147 renders the value
+        // here too. Assert glyphs are present *and* that they are the value's
+        // near-black text rather than the grey `rgb(117,117,117)` placeholder,
+        // so this still fails if the placeholder leaks through.
+        assert!(
+            non_white(90) > 10,
+            "a control's value must paint where its placeholder is suppressed"
+        );
+        assert!(
+            (90..120).any(|y| (0..180).any(|x| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() < 60 && pixel.green() < 60 && pixel.blue() < 60
+            })),
+            "the painted glyphs must be the value's color, not the grey placeholder"
         );
     }
 
@@ -14509,6 +14784,61 @@ mod tests {
     }
 
     #[test]
+    fn svg_text_symbol_glyphs_resolve_in_the_font_database() {
+        // The Liberation faces stop at Latin/Greek/Cyrillic: without a
+        // broad-coverage face in the SVG database, usvg's per-glyph fallback
+        // finds nothing for ★/U+2605, renders the .notdef tofu, and warns per
+        // character (#701). Pixel presence cannot distinguish a real glyph
+        // from tofu, so capture usvg's warnings while rasterizing a
+        // symbol-bearing SVG text run through the same database the page
+        // pipeline uses.
+        static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        struct SymbolWarningLogger;
+        impl log::Log for SymbolWarningLogger {
+            fn enabled(&self, _metadata: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                if record.level() == log::Level::Warn {
+                    WARNINGS.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        let _ = log::set_boxed_logger(Box::new(SymbolWarningLogger));
+        log::set_max_level(log::LevelFilter::Warn);
+        WARNINGS.lock().unwrap().clear();
+
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="50">
+            <text x="8" y="34" font-size="24" fill="#00cc55">★</text>
+            <text x="8" y="4" font-size="24" fill="#00cc55">&#x378;</text>
+        </svg>"##;
+        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database())
+            .expect("raster");
+        assert!(
+            pixmap
+                .pixels()
+                .iter()
+                .any(|pixel| pixel.green() > 150 && pixel.red() < 80 && pixel.blue() < 120),
+            "the ★ text run should rasterize"
+        );
+        let warnings = WARNINGS.lock().unwrap();
+        // Positive control first: an unassigned codepoint must still warn, so
+        // the test fails loudly if the logger wiring breaks instead of
+        // vacuously passing.
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("U+378 character")),
+            "the unassigned-codepoint control must warn: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("U+2605")),
+            "the SVG font database must cover ★ instead of dropping to .notdef: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn injects_xmlns_only_when_absent() {
         let tree = parse_html(
             r#"<html><body><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><rect width="4" height="4"/></svg></body></html>"#,
@@ -14720,6 +15050,41 @@ mod tests {
             computed.get("word-break").map(String::as_str),
             Some("keep-all")
         );
+    }
+
+    /// A text `<input>`'s value has no DOM text node, so it needs painting from
+    /// the attribute the way the placeholder does. Without it the control
+    /// rendered empty while `value` read back correctly — visible only in a
+    /// screenshot or PDF. `type=password` masks with bullets.
+    #[test]
+    fn input_values_paint_like_placeholders() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                 body{margin:0;background:#fff}
+                 input{display:block;width:180px;height:30px;border:0;padding:0;font-size:16px}
+               </style></head><body>
+                 <input id="filled" value="ABC">
+                 <input id="empty">
+                 <input id="secret" type="password" value="ABC">
+               </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (200.0, 120.0), None, &mut resources)
+            .expect("input layout");
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("input paint");
+        let ink = |top: u32| {
+            (top..top + 30)
+                .flat_map(|y| (0..180).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = pixmap.pixel(x, y).unwrap();
+                    pixel.red() < 200 || pixel.green() < 200 || pixel.blue() < 200
+                })
+                .count()
+        };
+        assert!(ink(0) > 10, "a value from markup must paint");
+        assert_eq!(ink(30), 0, "an empty control paints nothing");
+        assert!(ink(60) > 10, "a password value must paint as bullets");
     }
 
     #[test]
@@ -15110,6 +15475,76 @@ mod tests {
         let face = font_face_blocks(css)[0];
         assert!(font_face_covers_ascii(face));
         assert_eq!(font_face_urls(face), vec!["example.otf"]);
+    }
+
+    #[test]
+    fn font_face_uses_the_first_decodable_source() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                @font-face {
+                    font-family: Fixture;
+                    src: url("fixture.eot") format("embedded-opentype"),
+                         url("fixture.woff2") format("woff2"),
+                         url("fixture.ttf") format("truetype");
+                }
+            </style></head><body></body></html>"#,
+        );
+        let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_loads = Arc::clone(&loads);
+        let mut resources = RenderResourceCache::with_loader(move |url: &str| {
+            loader_loads
+                .lock()
+                .expect("font loads")
+                .push(url.to_string());
+            match url {
+                // A server can return malformed bytes for a preferred source;
+                // CSS Fonts requires trying the next candidate in the list.
+                "https://example.test/fixture.woff2" => Some(b"not a font".to_vec()),
+                "https://example.test/fixture.ttf" => Some(SERIF_FONT_BYTES.to_vec()),
+                _ => None,
+            }
+        });
+
+        let fonts = collect_web_fonts(
+            &tree,
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+        );
+
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(fonts[0].family.as_deref(), Some("Fixture"));
+        assert_eq!(fonts[0].data, SERIF_FONT_BYTES);
+        assert_eq!(
+            *loads.lock().expect("font loads"),
+            vec![
+                "https://example.test/fixture.woff2".to_string(),
+                "https://example.test/fixture.ttf".to_string(),
+            ],
+            "unsupported EOT must be skipped without a request"
+        );
+    }
+
+    #[test]
+    fn font_face_uses_the_last_duplicate_src_descriptor() {
+        let css = r#"@font-face {
+            font-family: FontAwesome;
+            src: url("legacy.eot");
+            src: url("legacy.eot?#iefix") format("embedded-opentype"),
+                 url("icons.woff2") format("woff2"),
+                 url("icons.ttf") format("truetype");
+        }"#;
+        let face = font_face_blocks(css)[0];
+
+        assert_eq!(
+            font_face_urls(face),
+            vec![
+                "legacy.eot?#iefix".to_string(),
+                "icons.woff2".to_string(),
+                "icons.ttf".to_string(),
+            ],
+            "CSS keeps the final duplicate @font-face descriptor"
+        );
     }
 
     #[test]

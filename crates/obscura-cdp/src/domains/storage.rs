@@ -40,6 +40,10 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
+        "clearCookies" => {
+            cookie_jar_for(ctx, params, session_id)?.clear();
+            Ok(json!({}))
+        }
         "deleteCookies" => {
             if let Some(filter) = parse_delete_cookies_params(params) {
                 cookie_jar_for(ctx, params, session_id)?.delete_cookies_filtered(
@@ -51,5 +55,70 @@ pub async fn handle(
             Ok(json!({}))
         }
         _ => Ok(json!({})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obscura_net::CookieInfo;
+
+    fn sample_cookie(value: &str) -> CookieInfo {
+        CookieInfo {
+            name: "sid".to_string(),
+            value: value.to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_cookies_is_scoped_to_browser_context() {
+        let mut ctx = CdpContext::new();
+        let browser_context_id = ctx.create_browser_context();
+        ctx.browser_context(&browser_context_id)
+            .unwrap()
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("isolated")]);
+        ctx.default_context
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("default")]);
+
+        handle(
+            "clearCookies",
+            &json!({ "browserContextId": browser_context_id }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx
+            .browser_context(&browser_context_id)
+            .unwrap()
+            .cookie_jar
+            .get_all_cookies()
+            .is_empty());
+        let default = ctx.default_context.cookie_jar.get_all_cookies();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].value, "default");
+    }
+
+    #[tokio::test]
+    async fn clear_cookies_without_context_clears_default_context() {
+        let mut ctx = CdpContext::new();
+        ctx.default_context
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("default")]);
+
+        handle("clearCookies", &json!({}), &mut ctx, &None)
+            .await
+            .unwrap();
+
+        assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
     }
 }

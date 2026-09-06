@@ -6,8 +6,8 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::op2;
 use deno_core::Extension;
-#[cfg(feature = "render")]
 use deno_core::JsBuffer;
+use deno_core::v8;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 
 use crate::import_map::ImportMap;
+use crate::write_stream::DocumentWriteStream;
 
 pub type InterceptCallback = Arc<
     Mutex<
@@ -128,6 +129,11 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
+    // Console calls and uncaught script exceptions, in occurrence order.
+    // The CDP layer drains this after commands and autonomous event-loop turns.
+    pub pending_runtime_events: VecDeque<RuntimeEvent>,
+    pub runtime_events_enabled: bool,
+    pub runtime_exception_counter: u64,
     pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
     pub network_response_body_counter: u64,
@@ -139,6 +145,25 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    // Frame documents that have been fetched and are waiting for a realm.
+    // Building one needs the whole runtime, which an op cannot reach, so
+    // `op_frame_document_ready` queues here and the Page drains it between
+    // event loop turns. Same shape as `pending_binding_calls`.
+    pub pending_frames: Vec<PendingFrame>,
+    /// Total URL and HTML bytes held by `pending_frames`.
+    pub pending_frame_bytes: usize,
+    pub frame_id_counter: u32,
+    /// Which frame this state belongs to; 0 is the page's own realm.
+    pub frame_id: u32,
+    // postMessage traffic between realms, waiting to be delivered. A realm
+    // cannot reach another realm's context on its own, so the message is queued
+    // here and the Page dispatches it, the same way frames themselves are
+    // built. Queued on the *page's* state whichever realm sent it, so one drain
+    // sees the traffic of the whole tree.
+    pub pending_frame_messages: Vec<PendingFrameMessage>,
+    /// Bytes of payload currently queued above, tracked rather than summed so
+    /// the cap costs nothing per message.
+    pub pending_frame_message_bytes: usize,
     /// Requests initiated by this runtime only. Browser contexts share their
     /// transport client across pages, so the client's aggregate counter cannot
     /// be used as a page-readiness signal.
@@ -151,6 +176,10 @@ pub struct ObscuraState {
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
     pub document_generation: u64,
+    /// Cached document base URL. Computing it walks the tree and runs the selector engine, and
+    /// the JS layer asks for it on every relative URL, including the URL parts of `<a>`.
+    /// Interior mutability so the read path keeps its shared borrow.
+    pub base_url_cache: RefCell<Option<BaseUrlCache>>,
     /// Final image/font-aware layout shared by CSSOM geometry and screenshots.
     /// DOM/style/viewport changes clear this value but retain resource bytes.
     #[cfg(feature = "render")]
@@ -226,6 +255,41 @@ pub struct ObscuraState {
     /// rather than wrapper state, because it must survive moves and clones and
     /// because fragment parsing can create nodes before a JS wrapper exists.
     pub(crate) already_started_scripts: RefCell<HashSet<NodeId>>,
+    /// The document's input stream for `document.write()`, created on the first call.
+    /// Why the calls share one parser is in `write_stream`.
+    pub(crate) write_stream: RefCell<Option<crate::write_stream::DocumentWriteStream>>,
+}
+
+/// A frame document waiting to be given a realm.
+pub struct PendingFrame {
+    pub frame_id: u32,
+    pub url: String,
+    pub html: String,
+    pub viewport_width: u64,
+    pub viewport_height: u64,
+    /// The frame that holds this one; 0 when the page does.
+    pub parent_frame_id: u32,
+}
+
+/// One `postMessage` in flight between two realms.
+pub struct PendingFrameMessage {
+    /// Where it is going. 0 is the page's realm.
+    pub target_frame_id: u32,
+    /// Where it came from, so the receiver can reply through `event.source`.
+    pub source_frame_id: u32,
+    /// The sender's origin, for `event.origin`.
+    pub origin: String,
+    /// The origin the sender restricted delivery to (postMessage's
+    /// `targetOrigin`). `"*"` means any origin; `"/"` means the receiver must be
+    /// same-origin as the sender; anything else is matched against the
+    /// receiver's own origin, and a mismatch drops the message. An empty string
+    /// means the sender did not specify one and delivery stays permissive.
+    pub target_origin: String,
+    /// The payload, JSON encoded. Structured clone is not available across
+    /// realms here, and JSON covers what postMessage is used for in practice:
+    /// a widget reporting a result. Anything it cannot encode is rejected by
+    /// the sender rather than silently arriving as null.
+    pub data_json: String,
 }
 
 impl ObscuraState {
@@ -247,14 +311,24 @@ impl ObscuraState {
             intercept_counter: 0,
             intercept_enabled: false,
             pending_binding_calls: Vec::new(),
+            pending_runtime_events: VecDeque::new(),
+            runtime_events_enabled: false,
+            runtime_exception_counter: 0,
             network_response_bodies: HashMap::new(),
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            pending_frames: Vec::new(),
+            pending_frame_bytes: 0,
+            frame_id_counter: 0,
+            frame_id: 0,
+            pending_frame_messages: Vec::new(),
+            pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             document_generation: 0,
+            base_url_cache: RefCell::new(None),
             #[cfg(feature = "render")]
             prepared_render: None,
             #[cfg(feature = "render")]
@@ -293,8 +367,34 @@ impl ObscuraState {
             resolved_scroll: None,
             import_map: Rc::new(RefCell::new(ImportMap::default())),
             already_started_scripts: RefCell::new(HashSet::new()),
+            write_stream: RefCell::new(None),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConsoleEvent {
+    pub kind: String,
+    pub args: Vec<serde_json::Value>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeExceptionEvent {
+    pub exception_id: u64,
+    pub name: String,
+    pub description: String,
+    pub url: String,
+    pub line_number: i64,
+    pub column_number: i64,
+    pub stack_trace: Vec<serde_json::Value>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    Console(RuntimeConsoleEvent),
+    Exception(RuntimeExceptionEvent),
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -398,7 +498,149 @@ fn response_body_byte_limit() -> usize {
         .unwrap_or(2 * 1024 * 1024)
 }
 
+/// Hard cap on a single JS fetch/XHR response body buffered fully in memory.
+/// `op_fetch_url` reads the whole body, then makes a UTF-8 copy and a base64
+/// copy of it, so an unbounded body OOMs the process. This bounds the initial
+/// read; it is far larger than `response_body_byte_limit()` (which only decides
+/// whether a body is *cached*) because real page fetches can be large.
+/// Configurable via `OBSCURA_FETCH_MAX_BODY_BYTES`.
+fn fetch_max_body_bytes() -> usize {
+    std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100 * 1024 * 1024)
+}
+
+/// Read a response body into memory, refusing bodies larger than `max` bytes —
+/// both when the server advertises an oversized `Content-Length` and when the
+/// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
+/// a multi-GB response from ever being fully allocated.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if let Some(len) = response.content_length() {
+        if len > max as u64 {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "response body of {len} bytes exceeds the maximum of {max}"
+            )));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "response body exceeds the maximum of {max} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
+/// `fetch()`/XHR and grow it without bound on the process heap (where V8's
+/// heap-limit guard never sees it). It only feeds the CLI's `--dump assets`
+/// listing, so keeping a bounded most-recent window is enough.
+const MAX_FETCHED_URLS: usize = 16384;
+
+/// Push `item` onto `list`, evicting the oldest entries so it never holds more
+/// than `max`. Mirrors the front-drain used for `js_network_events`.
+fn push_capped(list: &mut Vec<String>, item: String, max: usize) {
+    list.push(item);
+    if list.len() > max {
+        let overflow = list.len() - max;
+        list.drain(0..overflow);
+    }
+}
+
 pub type SharedState = Rc<RefCell<ObscuraState>>;
+
+/// Which document belongs to which realm.
+///
+/// An op has to read the state of the realm that *called* it. Making a realm
+/// "current" around the host's own calls into it is not enough: a frame's
+/// deferred work, a timer firing or a promise settling, re-enters JavaScript
+/// from the event loop, where nothing had the chance to swap anything. Without
+/// this a frame's `setTimeout` callback runs with the frame's globals but
+/// writes to the *parent's* DOM.
+#[derive(Default)]
+pub struct RealmStates {
+    entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+}
+
+impl RealmStates {
+    pub fn register(
+        &mut self,
+        context: v8::Global<v8::Context>,
+        frame_id: u32,
+        state: SharedState,
+    ) {
+        self.entries.push((context, frame_id, state));
+    }
+
+    pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        self.entries.retain(|(known, _, _)| known != context);
+    }
+
+    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+        self.entries
+            .iter()
+            .find(|(_, id, _)| *id == frame_id)
+            .map(|(_, _, state)| state.clone())
+    }
+}
+
+/// The document of the realm a DOM call came from, named rather than inferred.
+///
+/// A wrapper's methods live on its own realm's prototypes, so the code running
+/// for `parentPage.frameDoc.title` is the *frame's* getter even though the
+/// caller is the page. Inferring the realm from the running context therefore
+/// answers the wrong question for any cross-realm access, and would silently
+/// read the page's document. Each realm's bootstrap closure knows its own frame
+/// id and passes it, which is both correct here and cheaper than asking V8:
+/// a page with no frames resolves on `frame_id == 0` alone.
+pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    if frame_id == 0 {
+        return page();
+    }
+    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
+        None => page(),
+    }
+}
+
+/// The state of the realm running right now, or the page's when the caller is
+/// the page itself.
+///
+/// A page with no frames pays only an `is_empty` check: looking up the current
+/// context is not free, and `op_dom` is the hottest op in the system.
+pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.clone(),
+        None => return page(),
+    };
+    let registry = registry.borrow();
+    if registry.entries.is_empty() {
+        return page();
+    }
+    // Not `get_current_context`: an op is a native function bound in the page
+    // realm, so V8 reports that realm as current no matter who called it. This
+    // one answers "whose code is running", which is the question.
+    let current = scope.get_entered_or_microtask_context();
+    registry
+        .entries
+        .iter()
+        .find(|(context, _, _)| *context == current)
+        .map(|(_, _, state)| state.clone())
+        .unwrap_or_else(page)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct RenderMutationImpact {
@@ -941,7 +1183,9 @@ fn op_dom(
     #[string] cmd: String,
     #[string] arg1: String,
     #[string] arg2: String,
+    frame_id: u32,
 ) -> String {
+    let shared = frame_state(state, frame_id);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -949,7 +1193,7 @@ fn op_dom(
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        op_dom_inner(state, cmd, arg1, arg2)
+        op_dom_inner(shared, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
@@ -957,8 +1201,7 @@ fn op_dom(
     })
 }
 
-fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
@@ -1157,6 +1400,18 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        // The base for relative URLs. It differs from document_url exactly when the page carries
+        // a <base href>, and that is the point: HTML resolves against the base, not the document.
+        "document_base_url" => serde_json::to_string(
+            &document_base_url_memoized(&gs).unwrap_or_else(|| gs.url.clone()),
+        )
+        .unwrap_or("\"\"".into()),
+        // The unresolved attribute. After history.pushState only JS knows the URL, so only JS
+        // can resolve a relative base against it.
+        "document_base_href" => {
+            serde_json::to_string(&document_base_href_memoized(&gs).unwrap_or_default())
+                .unwrap_or("\"\"".into())
+        }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
@@ -1596,6 +1851,33 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             }
             "true".into()
         }
+        // document.write() feeds the document's input stream, so the calls
+        // share one parser and one tokenizer state. Returns the nodes that
+        // became complete with this call, for the caller to run scripts among.
+        // Returns [[parent, node], …], parents before children. A `parent` of 0 means the node
+        // belongs at the insertion point, which the caller knows. Nothing is inserted here:
+        // that must go through Node.appendChild on the JS side, because that call also reports
+        // the mutation, registers window named access, and loads a written stylesheet.
+        "document_write" => {
+            let mut slot = gs.write_stream.borrow_mut();
+            let stream = slot.get_or_insert_with(DocumentWriteStream::new);
+            let pairs: Vec<[i32; 2]> = stream
+                .write(&arg2, dom)
+                .iter()
+                .map(|placement| {
+                    [
+                        placement.parent.map_or(0, |id| id.index() as i32),
+                        placement.node.index() as i32,
+                    ]
+                })
+                .collect();
+            serde_json::to_string(&pairs).unwrap_or("[]".into())
+        }
+        // document.open() discards what the input stream holds and starts over.
+        "document_write_reset" => {
+            *gs.write_stream.borrow_mut() = None;
+            "true".into()
+        }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| match &mut n.data {
@@ -1846,13 +2128,45 @@ fn compare_node_order(dom: &DomTree, a: NodeId, b: NodeId) -> i32 {
 }
 
 #[op2(fast)]
-fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
-    let _ = state;
+fn op_runtime_events_enabled(state: &OpState) -> bool {
+    state.borrow::<SharedState>().borrow().runtime_events_enabled
+}
+
+#[op2(fast)]
+fn op_console_msg(
+    state: &OpState,
+    #[string] level: &str,
+    #[string] msg: &str,
+    #[string] args_json: &str,
+) {
     match level {
-        "warn" => tracing::warn!(target: "obscura::console", "{}", msg),
+        "warn" | "warning" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
         _ => tracing::info!(target: "obscura::console", "{}", msg),
     }
+
+    let page = state.borrow::<SharedState>().clone();
+    let mut page = page.borrow_mut();
+    if !page.runtime_events_enabled {
+        return;
+    }
+    let Ok(args) = serde_json::from_str::<Vec<serde_json::Value>>(args_json) else {
+        return;
+    };
+    if page.pending_runtime_events.len() >= 1_024 {
+        page.pending_runtime_events.pop_front();
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1_000.0;
+    page.pending_runtime_events
+        .push_back(RuntimeEvent::Console(RuntimeConsoleEvent {
+            kind: level.to_string(),
+            args,
+            timestamp,
+        }));
 }
 
 // Fallback cache for runtimes that have no owning ObscuraHttpClient, such as
@@ -1928,8 +2242,17 @@ fn fetch_timeout() -> std::time::Duration {
 }
 
 /// Cap on the number of redirect hops op_fetch_url will follow.
-/// Matches reqwest's default policy of 10.
-const FETCH_REDIRECT_LIMIT: usize = 10;
+///
+/// The Fetch standard fixes the number at 20. HTTP-redirect fetch returns
+/// a network error as soon as a request's redirect count *reaches* 20,
+/// and only increments it afterwards. So the twentieth hop must still
+/// succeed and the twenty-first must fail:
+/// https://fetch.spec.whatwg.org/#http-redirect-fetch
+///
+/// The reqwest default of 10 does not apply here. The redirects are
+/// followed by hand in this file, one hop per loop iteration, so that
+/// each hop can be checked against the SSRF rules again.
+const FETCH_REDIRECT_LIMIT: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FetchCredentials {
@@ -1984,11 +2307,12 @@ async fn op_fetch_url(
     #[string] url: String,
     #[string] method: String,
     #[string] headers_json: String,
-    #[string] body: String,
+    #[buffer] body: JsBuffer,
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -2014,7 +2338,7 @@ async fn op_fetch_url(
         // Record the resource the page pulled in via fetch()/XHR so `--dump
         // assets` can list it (issue #301). URL is already absolute here, since
         // reqwest needs an absolute URL to send the request.
-        gs.fetched_urls.push(url.clone());
+        push_capped(&mut gs.fetched_urls, url.clone(), MAX_FETCHED_URLS);
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         // #139: thread the configured proxy through to the per-request
@@ -2081,7 +2405,7 @@ async fn op_fetch_url(
     let mut override_url: Option<String> = None;
     let mut override_method: Option<String> = None;
     let mut override_headers: Option<HashMap<String, String>> = None;
-    let mut override_body: Option<String> = None;
+    let mut override_body: Option<Vec<u8>> = None;
 
     if let Some((tx, request_id)) = intercept_tx {
         let custom_headers: HashMap<String, String> =
@@ -2131,7 +2455,7 @@ async fn op_fetch_url(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body;
+                    override_body = body.map(String::into_bytes);
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
@@ -2297,6 +2621,8 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
+    let mut crossed_origin = is_cross_origin;
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -2305,6 +2631,7 @@ async fn op_fetch_url(
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
+        crossed_origin |= current_is_cross_origin;
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
         }
@@ -2426,9 +2753,11 @@ async fn op_fetch_url(
             current_body.clear();
         }
 
+        redirected_from.push(base);
         current_url = next_url.to_string();
     };
 
+    let redirected = redirects_followed > 0;
     let status = response.status().as_u16();
 
     let resp_headers: std::collections::HashMap<String, String> = response
@@ -2470,18 +2799,21 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
+            let resp = fetch_response(
+                current_url.as_str(),
+                status,
+                resp_headers.clone(),
+                resp_bytes.to_vec(),
+                redirected_from,
+            );
             let info = RequestInfo {
                 url: resp.url.clone(),
-                method: method.clone(),
+                method: current_method.as_str().to_string(),
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
@@ -2521,8 +2853,8 @@ async fn op_fetch_url(
             .as_secs_f64();
         gs.js_network_events.push(JsNetworkEvent {
             request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
+            url: current_url.clone(),
+            method: current_method.as_str().to_string(),
             status,
             response_headers: resp_headers.clone(),
             body_size: resp_bytes.len(),
@@ -2548,7 +2880,9 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
+        "redirected": redirected,
+        "opaque": mode == "no-cors" && crossed_origin,
         "headers": resp_headers,
     })
     .to_string())
@@ -2562,13 +2896,14 @@ fn fetch_response(
     status: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    redirected_from: Vec<url::Url>,
 ) -> Response {
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
         status,
         headers,
         body,
-        redirected_from: Vec::new(),
+        redirected_from,
     }
 }
 
@@ -2584,7 +2919,7 @@ async fn stealth_fetch_all(
     url: String,
     method: String,
     custom_headers: HashMap<String, String>,
-    body: String,
+    body: Vec<u8>,
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
@@ -2595,6 +2930,10 @@ async fn stealth_fetch_all(
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
+    let mut crossed_origin = request_origin(&current_url)
+        .map(|request_origin| request_origin != page_origin)
+        .unwrap_or(false);
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -2609,6 +2948,7 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
+        crossed_origin |= current_is_cross_origin;
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
@@ -2663,6 +3003,7 @@ async fn stealth_fetch_all(
             current_method = "GET".to_string();
             current_body.clear();
         }
+        redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
 
@@ -2702,7 +3043,13 @@ async fn stealth_fetch_all(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
+            let resp = fetch_response(
+                current_url.as_str(),
+                status,
+                resp_headers.clone(),
+                resp_bytes.clone(),
+                redirected_from,
+            );
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: current_method.clone(),
@@ -2717,7 +3064,9 @@ async fn stealth_fetch_all(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
+        "redirected": redirects_followed > 0,
+        "opaque": mode == "no-cors" && crossed_origin,
         "headers": resp_headers,
     })
     .to_string())
@@ -2752,18 +3101,135 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[cfg(feature = "render")]
     use super::{
         ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
         queue_retained_style_mutation, retained_style_mutation,
-        shadow_including_connected_nodes, ObscuraState, MAX_PENDING_STYLE_MUTATIONS,
+        shadow_including_connected_nodes, MAX_PENDING_STYLE_MUTATIONS,
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
+
+    use super::read_body_capped;
+    use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
+    #[test]
+    fn push_capped_bounds_the_list_and_keeps_the_newest() {
+        let mut list = Vec::new();
+        for i in 0..10 {
+            push_capped(&mut list, format!("u{i}"), 4);
+        }
+        assert_eq!(list.len(), 4, "the list must be capped at max");
+        assert_eq!(
+            list,
+            vec!["u6", "u7", "u8", "u9"],
+            "the newest entries must be kept, oldest evicted",
+        );
+    }
+
+    // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
+    // caps, a huge iteration count pins the single-threaded runtime and a huge
+    // output length forces an unbounded allocation. The derivation must reject
+    // both above the fixed maximums, and still work for ordinary inputs.
+
+    #[test]
+    fn pbkdf2_rejects_excessive_iterations() {
+        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", PBKDF2_MAX_ITERATIONS + 1, 32)
+            .expect_err("iteration count above the cap must be rejected");
+        assert!(
+            err.to_string().contains("iteration"),
+            "error should name the iteration cap: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_rejects_excessive_output_length() {
+        let err = pbkdf2_derive("SHA-256", b"pw", b"salt", 1_000, PBKDF2_MAX_OUTPUT_BYTES + 1)
+            .expect_err("output length above the cap must be rejected");
+        assert!(
+            err.to_string().contains("length"),
+            "error should name the length cap: {err}"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_derives_within_limits() {
+        let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
+            .expect("ordinary parameters must derive successfully");
+        assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+
+    // SEC-005 / #581 — op_fetch_url must not buffer an unbounded response body.
+    // read_body_capped streams the body and refuses anything larger than the
+    // cap, covering a server that just keeps sending with no Content-Length.
+
+    async fn serve_body_once(body_len: usize, with_content_length: bool) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            if with_content_length {
+                header.push_str(&format!("Content-Length: {body_len}\r\n"));
+            }
+            header.push_str("\r\n");
+            let _ = sock.write_all(header.as_bytes()).await;
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut sent = 0;
+            while sent < body_len {
+                let n = std::cmp::min(chunk.len(), body_len - sent);
+                if sock.write_all(&chunk[..n]).await.is_err() {
+                    break;
+                }
+                sent += n;
+            }
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversized_streamed_body() {
+        // No Content-Length forces the streaming-cap branch (lying/chunked server).
+        let addr = serve_body_once(4 * 1024 * 1024, false).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request should reach the local server");
+        let err = read_body_capped(resp, 1024 * 1024)
+            .await
+            .expect_err("a body larger than the cap must be rejected");
+        assert!(
+            err.to_string().contains("maximum"),
+            "error should mention the cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_reads_body_within_cap() {
+        let addr = serve_body_once(1024, true).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request should reach the local server");
+        let body = read_body_capped(resp, 1024 * 1024)
+            .await
+            .expect("a small body must be read successfully");
+        assert_eq!(body.len(), 1024, "should read the whole small body");
+    }
 
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
@@ -2841,6 +3307,21 @@ mod tests {
     fn fetch_url_validation_honors_per_context_private_network_opt_in() {
         let loopback = url::Url::parse("http://127.0.0.1:8080/resource").unwrap();
         assert!(validate_fetch_url(&loopback, true).is_ok());
+    }
+
+    // SEC-005 / #708 — fetch() must not accept file:// (deny-by-default, matching
+    // Page.navigate / Target.createTarget). The transports can't fetch it, but
+    // it should be rejected up front rather than short-circuiting the gate.
+    #[test]
+    fn fetch_url_validation_rejects_file_scheme() {
+        let file = url::Url::parse("file:///etc/passwd").unwrap();
+        // Rejected even with private-network access granted.
+        let err = validate_fetch_url(&file, true)
+            .expect_err("file:// must be rejected by the fetch scheme gate");
+        assert!(
+            err.to_lowercase().contains("scheme"),
+            "error should name the forbidden scheme: {err}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2968,6 +3449,157 @@ mod tests {
                 "message-2-microtask",
                 "background",
             ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bulk_posted_task_batch_completes() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-bulk");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-bulk",
+                r#"
+                    globalThis.__bulkPosted = { count: 0 };
+                    const tasks = [];
+                    for (let i = 0; i < 4096; i++) {
+                        tasks.push(scheduler.postTask(() => __bulkPosted.count++));
+                    }
+                    Promise.all(tasks);
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(500).await.unwrap();
+        let result = runtime.evaluate("__bulkPosted").unwrap();
+        assert_eq!(result["count"].as_f64(), Some(4096.0));
+    }
+
+    /// A network-op Promise reaction can schedule browser work while
+    /// deno_core is dispatching an async-op result batch. Posted tasks must not
+    /// recursively submit another async op through that borrowed driver.
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_from_async_op_resolution_avoids_driver_submission() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-from-async-op");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-from-op-resolution",
+                r#"
+                    globalThis.__postedFromOp = 0;
+                    Deno.core.ops.op_sleep(0).then(() => {
+                        const rearm = () => scheduler.postTask(() => {
+                            __postedFromOp++;
+                            if (__postedFromOp < 250) rearm();
+                        });
+                        rearm();
+                    });
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(300).await.unwrap();
+        assert_eq!(
+            runtime.evaluate("__postedFromOp").unwrap(),
+            serde_json::json!(250.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_is_cancelled_when_its_document_is_replaced() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
+        runtime.set_url("http://example.com/posted-task-old-document");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-old-document",
+                "const staleController = new AbortController();\
+                 scheduler.postTask(\
+                   () => document.body.setAttribute('data-stale-task', 'ran'),\
+                   { signal: staleController.signal });",
+            )
+            .unwrap();
+
+        runtime.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        runtime
+            .execute_script(
+                "posted-task-new-document",
+                "scheduler.postTask(() => document.body.setAttribute('data-fresh-task', 'ran'));",
+            )
+            .unwrap();
+        runtime.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-document')")
+                .unwrap(),
+            serde_json::json!("new"),
+        );
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-fresh-task')")
+                .unwrap(),
+            serde_json::json!("ran"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_posted_task_keeps_its_creation_document_generation() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
+        runtime.set_url("http://example.com/delayed-posted-task-old-document");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "delayed-posted-task-old-document",
+                "scheduler.postTask(\
+                   () => document.body.setAttribute('data-delayed-stale-task', 'ran'),\
+                   { delay: 1 });",
+            )
+            .unwrap();
+
+        runtime.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        runtime.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-delayed-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+    }
+
+    #[test]
+    fn posted_task_owner_contention_is_panic_safe() {
+        let owner = Rc::new(RefCell::new(ObscuraState::new()));
+        let weak = Rc::downgrade(&owner);
+        let generation = owner.borrow().document_generation;
+
+        let held = owner.borrow_mut();
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Busy,
+        );
+        drop(held);
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Generation(generation),
+        );
+        drop(owner);
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Gone,
         );
     }
 
@@ -3208,17 +3840,18 @@ mod tests {
 
 fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" && scheme != "file" {
+    // file:// is denied by default here, matching Page.navigate /
+    // Target.createTarget (which gate it behind --allow-file-access). The
+    // transports cannot fetch file:// anyway, so a page never reaches the
+    // filesystem through fetch()/XHR.
+    if scheme != "http" && scheme != "https" {
         return Err(format!(
-            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
+            "Forbidden URL scheme '{}' - only http and https are allowed",
             scheme
         ));
     }
 
-    if scheme == "file"
-        || allow_private_network
-        || obscura_net::env_allows_private_network()
-    {
+    if allow_private_network || obscura_net::env_allows_private_network() {
         return Ok(());
     }
 
@@ -3261,8 +3894,8 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(state: &OpState) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -3276,8 +3909,8 @@ fn op_get_cookies(state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -3290,12 +3923,140 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+// A frame that navigates itself must not move the top document. Recording the
+// navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
-fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_navigate(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+fn frame_message_queue_entry_limit() -> usize {
+    std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+}
+
+fn frame_message_queue_byte_limit() -> usize {
+    std::env::var("OBSCURA_FRAME_MESSAGE_QUEUE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+// Queues one postMessage for another realm. Always on the page's state, never
+// the caller's: the Page drains a single queue, and a message sent by a nested
+// frame would otherwise sit in that frame's own state and never be looked at.
+//
+// The queue is capped. Script can post in a synchronous loop while the host
+// only drains between event loop turns, and this buffer lives on the process
+// heap rather than V8's, so an unbounded queue would let a page grow memory
+// without bound in the one place the heap-limit guard cannot see. Over the cap
+// the newest message is dropped, keeping the earlier traffic that a widget
+// handshake actually depends on.
+#[op2(fast)]
+fn op_post_frame_message(
+    state: &OpState,
+    target_frame_id: u32,
+    source_frame_id: u32,
+    #[string] origin: &str,
+    #[string] target_origin: &str,
+    #[string] data_json: &str,
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
+    let over_bytes = gs
+        .pending_frame_message_bytes
+        .saturating_add(data_json.len())
+        > frame_message_queue_byte_limit();
+    if over_entries || over_bytes {
+        tracing::warn!(
+            "dropping a postMessage for frame {}: {} already queued, {} bytes",
+            target_frame_id,
+            gs.pending_frame_messages.len(),
+            gs.pending_frame_message_bytes,
+        );
+        return;
+    }
+    gs.pending_frame_message_bytes = gs.pending_frame_message_bytes.saturating_add(data_json.len());
+    gs.pending_frame_messages.push(PendingFrameMessage {
+        target_frame_id,
+        source_frame_id,
+        origin: origin.to_string(),
+        target_origin: target_origin.to_string(),
+        data_json: data_json.to_string(),
+    });
+}
+
+/// Resolves after `millis`, as the timer source for child frame realms.
+///
+/// deno_core's own timer queue is not usable from a frame: `op_timer_queue`
+/// resolves per-context state that only a deno_core-created context carries,
+/// and a snapshot-restored realm has none. This resolves an ordinary promise
+/// instead, and V8 reports the frame as the microtask context, so the ops a
+/// timer callback makes still find the frame's own document.
+#[op2(async)]
+async fn op_sleep(#[number] millis: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
+const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
+const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+// Hands a fetched frame document to the host and returns the id the frame will
+// have. The realm itself is built later, by whoever owns the runtime. A zero
+// id means the bounded native queue refused the document.
+#[op2(fast)]
+fn op_frame_document_ready(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] html: &str,
+    #[number] viewport_width: u64,
+    #[number] viewport_height: u64,
+) -> u32 {
+    // Whoever called this is the new frame's parent, which is how a frame
+    // nested two deep gets `parent` pointing at the frame above it rather than
+    // at the page.
+    let parent_frame_id = realm_state(scope, state).borrow().frame_id;
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let bytes = url.len().saturating_add(html.len());
+    if gs.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+        || gs.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
+    {
+        tracing::warn!(
+            "dropping frame document: {} pending documents, {} bytes",
+            gs.pending_frames.len(),
+            gs.pending_frame_bytes,
+        );
+        return 0;
+    }
+    let Some(frame_id) = gs.frame_id_counter.checked_add(1) else {
+        tracing::warn!("frame id space exhausted");
+        return 0;
+    };
+    gs.frame_id_counter = frame_id;
+    gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
+    gs.pending_frames.push(PendingFrame {
+        frame_id,
+        url: url.to_string(),
+        html: html.to_string(),
+        viewport_width,
+        viewport_height,
+        parent_frame_id,
+    });
+    frame_id
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -3310,14 +4071,87 @@ fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
-/// Wake one browser posted task without routing through Tokio's timer wheel.
-/// `yield_now` guarantees the op cannot settle in the initiating JavaScript
-/// turn, while avoiding the roughly one-millisecond floor of a zero-duration
-/// timer. The bootstrap owns task priority, FIFO order, and one-at-a-time
-/// delivery; this op supplies only the event-loop wake boundary.
-#[op2(async)]
-async fn op_posted_task() {
-    tokio::task::yield_now().await;
+/// Queue one browser posted-task delivery on deno_core's engine-local V8 task
+/// spawner. It is safe to call from an async-op reaction and wakes the event
+/// loop without Tokio's timer-wheel floor or another async-op registration.
+#[op2]
+fn op_posted_task(
+    state: &OpState,
+    frame_id: u32,
+    #[global] callback: v8::Global<v8::Function>,
+) -> f64 {
+    let Some(owner) = posted_task_owner(state, frame_id) else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let Ok(owner_state) = owner.try_borrow() else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let document_generation = owner_state.document_generation;
+    drop(owner_state);
+    let owner = Rc::downgrade(&owner);
+    let spawner = state.borrow::<deno_core::V8TaskSpawner>().clone();
+    spawner.spawn(move |scope| {
+        let current_generation = match posted_task_owner_status(&owner) {
+            PostedTaskOwnerStatus::Gone | PostedTaskOwnerStatus::Busy => {
+                INVALID_POSTED_TASK_GENERATION
+            }
+            PostedTaskOwnerStatus::Generation(generation) => generation as f64,
+        };
+        let scope = &mut v8::TryCatch::new(scope);
+        let callback = v8::Local::new(scope, callback);
+        let receiver = v8::undefined(scope).into();
+        let current_generation = v8::Number::new(scope, current_generation);
+        if callback.call(scope, receiver, &[current_generation.into()]).is_none() {
+            let message = scope
+                .exception()
+                .map(|exception| exception.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "execution terminated".to_string());
+            tracing::warn!("posted-task delivery failed: {message}");
+        }
+    });
+    document_generation as f64
+}
+
+const INVALID_POSTED_TASK_GENERATION: f64 = -1.0;
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostedTaskOwnerStatus {
+    Gone,
+    Busy,
+    Generation(u64),
+}
+
+fn posted_task_owner_status(
+    owner: &std::rc::Weak<RefCell<ObscuraState>>,
+) -> PostedTaskOwnerStatus {
+    let Some(owner) = owner.upgrade() else {
+        return PostedTaskOwnerStatus::Gone;
+    };
+    let Ok(owner) = owner.try_borrow() else {
+        return PostedTaskOwnerStatus::Busy;
+    };
+    PostedTaskOwnerStatus::Generation(owner.document_generation)
+}
+
+#[op2(fast)]
+fn op_posted_task_generation(state: &OpState, frame_id: u32) -> f64 {
+    let Some(owner) = posted_task_owner(state, frame_id) else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let generation = owner
+        .try_borrow()
+        .map(|owner| owner.document_generation as f64)
+        .unwrap_or(INVALID_POSTED_TASK_GENERATION);
+    generation
+}
+
+fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 {
+        return Some(state.borrow::<SharedState>().clone());
+    }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.clone();
+    let owner = registry.try_borrow().ok()?.by_frame_id(frame_id);
+    owner
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -3527,16 +4361,34 @@ fn op_subtle_aes_ctr(
     Ok(buf)
 }
 
-/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
-#[op2]
-#[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+/// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
+/// page JS drives this op on the single-threaded runtime: an unbounded
+/// iteration count pins the V8 isolate (blocking every other CDP command on the
+/// connection) and a huge output length forces an unbounded `vec![0u8; length]`
+/// allocation. Both caps sit far above any legitimate use — OWASP recommends
+/// ~600k iterations and derived keys are tens of bytes.
+const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
+const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+
+/// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
+/// are unit-testable without the `#[op2]` wrapper.
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if iterations > PBKDF2_MAX_ITERATIONS {
+        return Err(crypto_err(format!(
+            "PBKDF2 iteration count {iterations} exceeds the supported maximum of {PBKDF2_MAX_ITERATIONS}"
+        )));
+    }
+    if length > PBKDF2_MAX_OUTPUT_BYTES {
+        return Err(crypto_err(format!(
+            "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
+        )));
+    }
     use pbkdf2::pbkdf2_hmac;
     let mut dk = vec![0u8; length as usize];
     match hash {
@@ -3547,6 +4399,19 @@ fn op_subtle_pbkdf2(
         _ => return Err(crypto_err("unsupported PBKDF2 hash")),
     }
     Ok(dk)
+}
+
+/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+#[op2]
+#[buffer]
+fn op_subtle_pbkdf2(
+    #[string] hash: &str,
+    #[buffer] password: &[u8],
+    #[buffer] salt: &[u8],
+    iterations: u32,
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    pbkdf2_derive(hash, password, salt, iterations, length)
 }
 
 /// HKDF key derivation. `length` is the output length in bytes. An empty salt
@@ -4016,13 +4881,18 @@ pub fn build_extension() -> Extension {
         op_script_try_start(),
         op_shadow_attach(),
         op_shadow_root_info(),
+        op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_frame_document_ready(),
+        op_post_frame_message(),
+        op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),
+        op_posted_task_generation(),
         op_binding_called(),
         op_subtle_digest(),
         op_subtle_hmac(),
@@ -4231,7 +5101,8 @@ fn op_waapi_control(
     changed
 }
 
-#[cfg(feature = "render")]
+// Not tied to `render`: the JS layer resolves every relative URL through here, in all build
+// variants.
 pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
     let document_url = url::Url::parse(&state.url).ok()?;
     let base_href = state.dom.as_ref().and_then(|dom| {
@@ -4244,9 +5115,72 @@ pub(crate) fn document_base_url(state: &ObscuraState) -> Option<String> {
             })
     });
     match base_href {
-        Some(href) => document_url.join(&href).ok().map(|url| url.to_string()),
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // A data: or javascript: base falls back to the document URL. Accepting it would instead
+        // make every later relative resolution fail.
+        Some(href) => match document_url.join(&href) {
+            Ok(base) if base.scheme() != "data" && base.scheme() != "javascript" => {
+                Some(base.to_string())
+            }
+            _ => Some(document_url.to_string()),
+        },
         None => Some(document_url.to_string()),
     }
+}
+
+/// The raw `href` attribute of the first `<base href>`, unresolved. The JS layer needs it after
+/// `history.pushState`: the document URL has moved, only JS knows the new one, so only JS can
+/// resolve a relative base against it.
+fn document_base_href(state: &ObscuraState) -> Option<String> {
+    state.dom.as_ref().and_then(|dom| {
+        dom.query_selector("base[href]")
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                dom.get_node(id)
+                    .and_then(|node| node.get_attribute("href").map(str::to_string))
+            })
+    })
+}
+
+/// What the cached values were computed from. If any of the three changes, they are recomputed.
+pub struct BaseUrlCache {
+    activity_generation: u64,
+    document_generation: u64,
+    url: String,
+    resolved: Option<String>,
+    raw_href: Option<String>,
+}
+
+/// Both base values behind a cache. Uncached, each one walks the tree and runs the selector
+/// engine, which would make `a.href` an O(nodes) read.
+fn base_values_memoized(state: &ObscuraState) -> (Option<String>, Option<String>) {
+    if let Some(cached) = state.base_url_cache.borrow().as_ref() {
+        if cached.activity_generation == state.activity_generation
+            && cached.document_generation == state.document_generation
+            && cached.url == state.url
+        {
+            return (cached.resolved.clone(), cached.raw_href.clone());
+        }
+    }
+    let resolved = document_base_url(state);
+    let raw_href = document_base_href(state);
+    *state.base_url_cache.borrow_mut() = Some(BaseUrlCache {
+        activity_generation: state.activity_generation,
+        document_generation: state.document_generation,
+        url: state.url.clone(),
+        resolved: resolved.clone(),
+        raw_href: raw_href.clone(),
+    });
+    (resolved, raw_href)
+}
+
+pub(crate) fn document_base_url_memoized(state: &ObscuraState) -> Option<String> {
+    base_values_memoized(state).0
+}
+
+pub(crate) fn document_base_href_memoized(state: &ObscuraState) -> Option<String> {
+    base_values_memoized(state).1
 }
 
 #[cfg(feature = "render")]

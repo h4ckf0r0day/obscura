@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
+use obscura_js::frame::FrameRealm;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -213,11 +214,43 @@ struct DeviceMetricsBaseline {
     device_scale_factor: f32,
 }
 
+enum PendingFrameWork {
+    Unattached(obscura_js::ops::PendingFrame),
+    Attached {
+        frame_id: u32,
+        parent_frame_id: u32,
+        frame_url: String,
+        urls: Vec<String>,
+        next_url: usize,
+        sources: std::collections::HashMap<String, String>,
+    },
+}
+
+impl PendingFrameWork {
+    fn frame_id(&self) -> u32 {
+        match self {
+            Self::Unattached(frame) => frame.frame_id,
+            Self::Attached { frame_id, .. } => *frame_id,
+        }
+    }
+
+    fn parent_frame_id(&self) -> u32 {
+        match self {
+            Self::Unattached(frame) => frame.parent_frame_id,
+            Self::Attached { parent_frame_id, .. } => *parent_frame_id,
+        }
+    }
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
+    /// Live child frame realms, in creation order. Declared before `js` on
+    /// purpose: a realm holds a V8 handle into that isolate, and fields drop in
+    /// declaration order, so the frames must go first.
+    pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
@@ -259,6 +292,8 @@ pub struct Page {
     /// 50-second navigation is not silently cut off by the process default.
     /// Pages without an override retain the environment-configurable default.
     navigation_timeout: Option<std::time::Duration>,
+    /// Optional per-page cap. Pages without a value keep the default.
+    navigation_chain_limit: Option<usize>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
     /// Entries are URLs in visit order; `history_index` is the current position.
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
@@ -277,10 +312,19 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// Whether at least one attached CDP session enabled the Runtime domain.
+    /// Page-owned so the subscription survives replacement of the JS runtime
+    /// during navigation.
+    runtime_events_enabled: std::cell::Cell<bool>,
+    pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
     suspended_started_script_ids: Vec<u32>,
+    /// Re-creatable CDP handles retained while tab switching replaces this
+    /// page's V8 runtime. Chromium keeps these handles alive with the target;
+    /// preserving them avoids order-dependent failures in concurrent clients.
+    suspended_cdp_object_state: obscura_js::runtime::CdpObjectState,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -293,6 +337,22 @@ const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 
+/// How many child frame realms one document may hold at once.
+///
+/// Real pages use a handful; the cap exists so a page that creates iframes in a
+/// loop cannot make the engine hold an unbounded number of contexts and DOM
+/// trees. Frames are released when the document is replaced.
+fn max_live_frames() -> usize {
+    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
+/// The first navigation counts. The low default stops a page that resets
+/// `location` on every load.
+const DEFAULT_NAVIGATION_CHAIN_LIMIT: usize = 10;
+
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
@@ -302,6 +362,19 @@ fn navigation_timeout_from_env_value(value: Option<&str>) -> std::time::Duration
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NAVIGATION_TIMEOUT_MS);
     std::time::Duration::from_millis(milliseconds)
+}
+
+fn default_navigation_chain_limit() -> usize {
+    navigation_chain_limit_from_env_value(std::env::var("OBSCURA_NAV_CHAIN_LIMIT").ok().as_deref())
+}
+
+fn navigation_chain_limit_from_env_value(value: Option<&str>) -> usize {
+    // Only an unreadable value falls back to the default, so
+    // `OBSCURA_NAV_CHAIN_LIMIT=0` and `set_navigation_chain_limit(0)` agree.
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|limit| limit.max(1))
+        .unwrap_or(DEFAULT_NAVIGATION_CHAIN_LIMIT)
 }
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
@@ -510,6 +583,16 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             index += length;
             continue;
         }
+        // A `@font-face` `src` list is a priority order, not a set of
+        // resources. Scanning it generically warms every entry of every
+        // descriptor; the renderer considers far fewer. `css_font_face_rule`
+        // collects the ones it will consider and reports the whole block as
+        // consumed, the same shape as the `@import` skip above.
+        if let Some((length, sources)) = css_font_face_rule(rest, base) {
+            urls.extend(sources);
+            index += length;
+            continue;
+        }
         let Some(first) = rest.chars().next() else {
             break;
         };
@@ -561,8 +644,172 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
             }
         }
         let Some(end) = end else { break };
-        let raw = rest[4..end].trim();
-        let value = if raw.len() >= 2
+        push_css_url(&rest[4..end], base, &mut urls);
+        index += end + 1;
+    }
+    urls
+}
+
+/// Record one `url(...)` value when it names a network resource.
+///
+/// Shared by the generic scan and the `@font-face` path so the two cannot
+/// disagree about quoting, fragments, `data:` or an unresolved `var()`.
+fn push_css_url(raw: &str, base: &url::Url, urls: &mut Vec<String>) {
+    let raw = raw.trim();
+    let value = if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    if value.is_empty()
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.contains("var(")
+    {
+        return;
+    }
+    if let Ok(mut url) = base.join(value) {
+        url.set_fragment(None);
+        if matches!(url.scheme(), "http" | "https") {
+            urls.push(url.to_string());
+        }
+    }
+}
+
+/// Return the byte length of a leading `@font-face` block, together with the
+/// sources the renderer will actually consider, in source order.
+///
+/// A `src` list is a priority order, not a set. Both rules here are taken from
+/// the layer this warms, `obscura-render`: `font_face_declaration` ends in
+/// `.last()`, so a rule carrying several `src` descriptors uses the final one,
+/// which is the cascade and what the `src: url(.eot); src: url(...)` idiom
+/// relies on; and `font_source_may_be_supported` drops `.eot` and `.svg` after
+/// stripping the query and fragment. Warming anything else fetches bytes the
+/// renderer has already ruled out.
+///
+/// A malformed block is left to the normal scanner, so this cannot swallow the
+/// rules that follow it.
+fn css_font_face_rule(css: &str, base: &url::Url) -> Option<(usize, Vec<String>)> {
+    if !css.get(..10)?.eq_ignore_ascii_case("@font-face") {
+        return None;
+    }
+    let open_relative = css[10..].find('{')?;
+    if !css[10..10 + open_relative].trim().is_empty() {
+        return None;
+    }
+    let open = 10 + open_relative;
+    let close = open + css_block_end(&css[open..])?;
+
+    let mut urls = Vec::new();
+    if let Some(src) = css_last_declaration(&css[open + 1..close], "src") {
+        for value in css_url_values(src) {
+            if font_source_is_decodable(value) {
+                push_css_url(value, base, &mut urls);
+            }
+        }
+    }
+    Some((close + 1, urls))
+}
+
+/// Byte offset of the brace closing the block that `css` opens, or `None` when
+/// the block is unterminated. Braces inside strings do not count.
+fn css_block_end(css: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, ch) in css.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of the last declaration named `name` in a declaration block. Last
+/// rather than first, because that is what the cascade resolves to and what
+/// `obscura-render` reads.
+fn css_last_declaration<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut boundaries: Vec<usize> = Vec::new();
+    for (offset, ch) in block.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => boundaries.push(offset),
+            _ => {}
+        }
+    }
+    boundaries.push(block.len());
+    for end in boundaries {
+        let declaration = &block[start..end];
+        start = (end + 1).min(block.len());
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if property.trim().eq_ignore_ascii_case(name) {
+            found = Some(value.trim());
+        }
+    }
+    found
+}
+
+/// The `url(...)` values of one declaration, unquoted, in source order.
+fn css_url_values(value: &str) -> Vec<&str> {
+    let lower = value.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative + 4;
+        let Some(end_relative) = value[start..].find(')') else {
+            break;
+        };
+        let end = start + end_relative;
+        let raw = value[start..end].trim();
+        let unquoted = if raw.len() >= 2
             && ((raw.starts_with('"') && raw.ends_with('"'))
                 || (raw.starts_with('\'') && raw.ends_with('\'')))
         {
@@ -570,21 +817,23 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
         } else {
             raw
         };
-        if !value.is_empty()
-            && !value.starts_with('#')
-            && !value.starts_with("data:")
-            && !value.contains("var(")
-        {
-            if let Ok(mut url) = base.join(value) {
-                url.set_fragment(None);
-                if matches!(url.scheme(), "http" | "https") {
-                    urls.push(url.to_string());
-                }
-            }
+        if !unquoted.is_empty() {
+            out.push(unquoted);
         }
-        index += end + 1;
+        cursor = end + 1;
     }
-    urls
+    out
+}
+
+/// Whether the renderer can decode a font source, by the same extension rule
+/// `obscura-render` applies before it will even consider one.
+fn font_source_is_decodable(src: &str) -> bool {
+    let path = src
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(src)
+        .to_ascii_lowercase();
+    !path.ends_with(".eot") && !path.ends_with(".svg")
 }
 
 /// Return the byte length of a leading CSS `@import` rule, including its
@@ -878,6 +1127,7 @@ impl Page {
             Some(Arc::new(StealthHttpClient::with_proxy(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                context.allow_private_network,
             )))
         } else {
             None
@@ -888,6 +1138,7 @@ impl Page {
             frame_id,
             url: None,
             dom: None,
+            frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
             http_client,
@@ -903,6 +1154,7 @@ impl Page {
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timeout: None,
+            navigation_chain_limit: None,
             history: Vec::new(),
             history_index: 0,
             network_events: Vec::new(),
@@ -914,7 +1166,10 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            runtime_events_enabled: std::cell::Cell::new(false),
+            pending_frame_work: std::collections::VecDeque::new(),
             suspended_started_script_ids: Vec::new(),
+            suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -934,6 +1189,18 @@ impl Page {
             .unwrap_or_else(default_navigation_timeout)
     }
 
+    /// Takes precedence over `OBSCURA_NAV_CHAIN_LIMIT`. A limit of 0 is
+    /// raised to 1, which would otherwise report success having loaded
+    /// nothing.
+    pub fn set_navigation_chain_limit(&mut self, limit: usize) {
+        self.navigation_chain_limit = Some(limit.max(1));
+    }
+
+    pub fn navigation_chain_limit(&self) -> usize {
+        self.navigation_chain_limit
+            .unwrap_or_else(default_navigation_chain_limit)
+    }
+
     fn should_block_url(&self, url: &str) -> bool {
         for pattern in &self.blocked_url_patterns {
             if url_matches_cdp_pattern(pattern, url) {
@@ -948,6 +1215,445 @@ impl Page {
             }
         }
         false
+    }
+
+    /// Moves fetched frame documents into Page ownership without doing work
+    /// that can be cancelled. Realms are still created one at a time, in the
+    /// same sibling order as before this queue existed.
+    fn queue_pending_frames(&mut self) -> bool {
+        // Keep exactly one bounded batch in Page ownership. Additional frame
+        // documents remain in the runtime's existing 64-document/32 MiB queue
+        // until this batch finishes, so repeated cancellation cannot multiply
+        // the configured retention ceiling.
+        if !self.pending_frame_work.is_empty() {
+            return false;
+        }
+        let pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frames(),
+            None => return false,
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        self.pending_frame_work
+            .extend(pending.into_iter().map(PendingFrameWork::Unattached));
+        true
+    }
+
+    /// Creates, fetches, and runs the front frame. The record remains Page-
+    /// owned at each await, so cancellation resumes the current URL and leaves
+    /// every untouched sibling in order.
+    async fn run_next_pending_frame(&mut self) -> bool {
+        if matches!(self.pending_frame_work.front(), Some(PendingFrameWork::Unattached(_))) {
+            let Some(PendingFrameWork::Unattached(frame)) = self.pending_frame_work.pop_front()
+            else {
+                return false;
+            };
+            // A realm is a live v8::Context plus a DOM tree, and the page realm
+            // holds its window and document, so nothing here can be collected
+            // while the document lives. Frames are released when the document
+            // is replaced, so a page that churns iframes would otherwise grow
+            // the process without bound. Refuse past the cap rather than let a
+            // page decide how much memory to take.
+            let cap = max_live_frames();
+            if self.frames.len() >= cap {
+                tracing::warn!(
+                    "refusing a realm for frame {}: already at the {} live frame cap",
+                    frame.url,
+                    cap,
+                );
+                self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                return true;
+            }
+            let realm = match self.js.as_mut().and_then(|js| {
+                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+            }) {
+                Some(realm) => realm,
+                None => {
+                    tracing::warn!("could not build a realm for frame {}", frame.url);
+                    self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                    return true;
+                }
+            };
+            // Discover author scripts before preload code can mutate the frame
+            // DOM, preserving the existing preparation order.
+            let urls = match self.js.as_mut() {
+                Some(js) => realm.external_script_urls(js),
+                None => Vec::new(),
+            };
+
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = realm.set_viewport(
+                    js,
+                    frame.viewport_width as f64,
+                    frame.viewport_height as f64,
+                ) {
+                    tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
+                }
+                // New-document scripts must be installed before the published
+                // child context can be observed, including while its external
+                // scripts are still loading.
+                for source in &self.preload_scripts {
+                    if let Err(error) = realm.execute_script(js, source) {
+                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                    }
+                }
+            }
+            let frame_id = frame.frame_id;
+            let parent_frame_id = frame.parent_frame_id;
+            let frame_url = frame.url;
+            self.frames.push(realm);
+            self.pending_frame_work.push_front(PendingFrameWork::Attached {
+                frame_id,
+                parent_frame_id,
+                frame_url,
+                urls,
+                next_url: 0,
+                sources: std::collections::HashMap::new(),
+            });
+        }
+
+        while let Some((frame_id, url)) = self.pending_frame_work.front().and_then(|pending| {
+            let PendingFrameWork::Attached {
+                frame_id,
+                urls,
+                next_url,
+                ..
+            } = pending
+            else {
+                return None;
+            };
+            urls.get(*next_url).cloned().map(|url| (*frame_id, url))
+        }) {
+            let source = if self.should_block_url(&url) {
+                None
+            } else if let Ok(parsed) = Url::parse(&url) {
+                match self.do_fetch(&parsed).await {
+                    Ok(response) => Some(String::from_utf8_lossy(&response.body).into_owned()),
+                    Err(error) => {
+                        tracing::warn!("frame script {} failed: {}", url, error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let Some(PendingFrameWork::Attached {
+                frame_id: pending_frame_id,
+                urls,
+                next_url,
+                sources,
+                ..
+            }) = self.pending_frame_work.front_mut()
+            else {
+                return false;
+            };
+            if *pending_frame_id != frame_id || urls.get(*next_url) != Some(&url) {
+                continue;
+            }
+            if let Some(source) = source {
+                sources.insert(url, source);
+            }
+            *next_url += 1;
+        }
+
+        let Some(PendingFrameWork::Attached {
+            frame_id,
+            frame_url,
+            sources,
+            ..
+        }) = self.pending_frame_work.front_mut()
+        else {
+            return false;
+        };
+        let frame_id = *frame_id;
+        let frame_url = frame_url.clone();
+        let sources = std::mem::take(sources);
+        let Some(index) = self
+            .frames
+            .iter()
+            .position(|frame| frame.frame_id() == frame_id)
+        else {
+            self.pending_frame_work.pop_front();
+            return true;
+        };
+        if let Some(js) = self.js.as_mut() {
+            for problem in self.frames[index]
+                .run_document_scripts(js, |url| sources.get(url).cloned())
+            {
+                tracing::debug!("frame {}: {}", frame_url, problem);
+            }
+            if let Err(error) = self.frames[index].dispatch_load_events(js) {
+                tracing::debug!("frame {} load events failed: {error}", frame_url);
+            }
+        }
+        self.pending_frame_work.pop_front();
+        true
+    }
+
+    /// Hands each queued `postMessage` to the realm it was addressed to.
+    ///
+    /// Reports whether anything was delivered, because a message usually causes
+    /// a reply: a widget posts its result, the page answers, and the exchange
+    /// only finishes if the caller settles and drains again.
+    fn deliver_frame_messages(&mut self) -> bool {
+        let pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frame_messages(),
+            None => return false,
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        for message in pending {
+            let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
+            let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
+            let escaped_target_origin =
+                serde_json::to_string(&message.target_origin).unwrap_or_default();
+            if message.target_frame_id == 0 {
+                let Some(js) = self.js.as_mut() else { continue };
+                let script = format!(
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
+                    message.source_frame_id,
+                );
+                if let Err(error) = js.execute_script("<frame-message>", &script) {
+                    tracing::debug!("message to the page failed: {error}");
+                }
+                continue;
+            }
+
+            let Some(index) = self
+                .frames
+                .iter()
+                .position(|frame| frame.frame_id() == message.target_frame_id)
+            else {
+                // The frame was torn down between the send and the drain.
+                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                continue;
+            };
+            let Some(js) = self.js.as_mut() else { continue };
+            if let Err(error) = self.frames[index].deliver_message(
+                js,
+                &message.data_json,
+                &message.origin,
+                message.source_frame_id,
+                &message.target_origin,
+            ) {
+                tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
+            }
+        }
+        true
+    }
+
+    /// Removes the JS references owned by the iframe's parent realm and by the
+    /// page's same-origin frame table. This also covers a frame rejected before
+    /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
+    fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
+        let script = format!(
+            "if (globalThis.__obscura_frameElements[{frame_id}] &&\
+             globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
+               globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
+               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
+                 globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
+             }}\
+             delete globalThis.__obscura_frameObjects[{frame_id}];\
+             delete globalThis.__obscura_frameWindows[{frame_id}];\
+             delete globalThis.__obscura_frameElements[{frame_id}];"
+        );
+        self.execute_frame_owner_script(parent_frame_id, &script);
+        if parent_frame_id != 0 {
+            let page_script = format!(
+                "delete globalThis.__obscura_frameObjects[{frame_id}];"
+            );
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
+                    tracing::debug!("releasing page frame reference failed: {error}");
+                }
+            }
+        }
+    }
+
+    /// Executes cleanup in the realm that owns the iframe element. Nested
+    /// iframe registries live in their parent frame, not in the page realm.
+    fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
+        if parent_frame_id == 0 {
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = js.execute_script("<frame-detach>", script) {
+                    tracing::debug!("releasing frame references failed: {error}");
+                }
+            }
+            return;
+        }
+
+        let Some(index) = self
+            .frames
+            .iter()
+            .position(|frame| frame.frame_id() == parent_frame_id)
+        else {
+            return;
+        };
+        let Some(js) = self.js.as_mut() else { return };
+        if let Err(error) = self.frames[index].execute_script(js, script) {
+            tracing::debug!("releasing nested frame references failed: {error}");
+        }
+    }
+
+    /// Discards the realms whose iframe element has left the document.
+    ///
+    /// A browser discards a child browsing context when its element is
+    /// removed: the document and its context are torn down. Nothing here can
+    /// be collected on its own, because the page realm holds each frame's
+    /// window and document so that `contentWindow` can be the frame's real
+    /// object, so a page that replaces an iframe repeatedly would otherwise
+    /// accumulate contexts and DOM trees for the life of the document.
+    ///
+    /// Descendants are discarded in the same pass so none can run after their
+    /// owner has left the document.
+    fn release_detached_frames(&mut self) {
+        if self.frames.is_empty() && self.pending_frame_work.is_empty() {
+            return;
+        }
+        // Each realm reports its own frames whose element is still connected.
+        // Liveness is asked of the element rather than of a document query,
+        // because an iframe inside a shadow root is absent from
+        // `document.querySelectorAll('iframe')` — the shape a challenge widget
+        // uses — and treating it as detached tears down a live frame.
+        const LIVE_FRAME_IDS: &str = "__obscura_liveFrameIds()";
+
+        let mut live: Vec<u32> = Vec::new();
+        let Some(js) = self.js.as_mut() else { return };
+        match js.evaluate(LIVE_FRAME_IDS) {
+            Ok(value) => live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default()),
+            // A query that did not run says nothing about which frames are
+            // gone, and an empty answer here reads as "all of them". Holding
+            // them is bounded by the live-frame cap; discarding a live frame
+            // is not recoverable, so leave the tree alone.
+            Err(error) => {
+                tracing::debug!("could not list the page's live frames: {error}");
+                return;
+            }
+        }
+        // A frame's own children are in that frame's document, not the page's.
+        for index in 0..self.frames.len() {
+            let Some(js) = self.js.as_mut() else { return };
+            match self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
+                Ok(value) => {
+                    live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default())
+                }
+                Err(error) => {
+                    tracing::debug!("could not list a frame's live frames: {error}");
+                    return;
+                }
+            }
+        }
+        let mut discarded_ids: std::collections::HashSet<u32> = self
+            .frames
+            .iter()
+            .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
+            .filter(|(id, _)| !live.contains(id))
+            .map(|(id, _)| id)
+            .chain(
+                self.pending_frame_work
+                    .iter()
+                    .filter(|pending| !live.contains(&pending.frame_id()))
+                    .map(PendingFrameWork::frame_id),
+            )
+            .collect();
+        loop {
+            let before = discarded_ids.len();
+            let descendants: Vec<u32> = self
+                .frames
+                .iter()
+                .filter(|frame| discarded_ids.contains(&frame.parent_frame_id()))
+                .map(FrameRealm::frame_id)
+                .chain(
+                    self.pending_frame_work
+                        .iter()
+                        .filter(|pending| discarded_ids.contains(&pending.parent_frame_id()))
+                        .map(PendingFrameWork::frame_id),
+                )
+                .collect();
+            discarded_ids.extend(descendants);
+            if discarded_ids.len() == before {
+                break;
+            }
+        }
+        if discarded_ids.is_empty() {
+            return;
+        }
+
+        let discarded: Vec<(u32, u32)> = self
+            .frames
+            .iter()
+            .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
+            .chain(
+                self.pending_frame_work
+                    .iter()
+                    .filter_map(|pending| match pending {
+                        PendingFrameWork::Unattached(_) => {
+                            Some((pending.frame_id(), pending.parent_frame_id()))
+                        }
+                        PendingFrameWork::Attached { .. } => None,
+                    }),
+            )
+            .filter(|(id, _)| discarded_ids.contains(id))
+            .collect();
+
+        // Clean owner realms before dropping any parent. This matters for a
+        // nested child whose iframe registry lives in a parent that is also
+        // being removed during this pass.
+        for &(frame_id, parent_frame_id) in &discarded {
+            self.forget_frame_references(frame_id, parent_frame_id);
+        }
+        self.frames
+            .retain(|frame| !discarded_ids.contains(&frame.frame_id()));
+        self.pending_frame_work
+            .retain(|pending| !discarded_ids.contains(&pending.frame_id()));
+        tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
+    }
+
+    /// Moves the frame tree forward by one step: give any fetched frame
+    /// document a realm, then hand on any message waiting for a realm.
+    ///
+    /// Reports whether anything happened, so a caller can pump again. A new
+    /// frame runs scripts that can post, and a message usually causes a reply,
+    /// so neither queue is finished until both are quiet.
+    async fn advance_frames(&mut self) -> bool {
+        let mut queued_new = self.queue_pending_frames();
+        self.release_detached_frames();
+        if self.pending_frame_work.is_empty() && self.queue_pending_frames() {
+            queued_new = true;
+            self.release_detached_frames();
+        }
+        let queued = self.pending_frame_work.len();
+        let mut scripts_ran = false;
+        for _ in 0..queued {
+            scripts_ran |= self.run_next_pending_frame().await;
+        }
+        let delivered = self.deliver_frame_messages();
+        self.release_detached_frames();
+        queued_new || scripts_ran || delivered
+    }
+
+    /// URLs of the page's live child frames, in creation order.
+    pub fn frame_urls(&self) -> Vec<String> {
+        self.frames
+            .iter()
+            .map(|frame| frame.url().to_string())
+            .collect()
+    }
+
+    /// Evaluates an expression inside one of the page's child frames.
+    pub fn evaluate_in_frame(
+        &mut self,
+        index: usize,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        let realm = self.frames.get(index).ok_or("no such frame")?;
+        let js = self.js.as_mut().ok_or("no runtime")?;
+        realm.evaluate(js, expression)
     }
 
     /// Update the page's CSS viewport. Calling this before navigation makes
@@ -1056,7 +1762,12 @@ impl Page {
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            // Pass the page callbacks so CDP Network events and
+            // page.on('request'/'response') observers fire for stealth-mode
+            // navigations too, matching the non-stealth path below.
+            return stealth
+                .fetch_with_callbacks(url, Some(&self.callbacks))
+                .await;
         }
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
@@ -1068,6 +1779,7 @@ impl Page {
         // same DomTree is installed; a navigation must never inherit IDs from
         // a suspended prior document whose allocator may reuse them.
         self.suspended_started_script_ids.clear();
+        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
         // Drop any existing runtime so the JS realm starts clean on
         // every navigation. The old code reused the V8 isolate and
         // only re-bound `globalThis.document`, leaving window.onload,
@@ -1075,7 +1787,11 @@ impl Page {
         // page in place. That made it possible for a page to set
         // attacker-controlled state, trigger a navigation, and then
         // run code in the next document's context.
+        self.pending_frame_work.clear();
         if self.js.is_some() {
+            // Every frame realm holds a V8 handle into this isolate, so the
+            // frames of the outgoing document must go before the runtime does.
+            self.frames.clear();
             let _ = self.js.take();
         }
 
@@ -1149,6 +1865,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
 
         if let Some(dom) = self.dom.take() {
             rt.set_dom(dom);
@@ -1438,8 +2155,17 @@ impl Page {
                     }
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!("load-delaying dynamic script event loop failed: {error}");
-                    return false;
+                    if obscura_js::runtime::is_fatal_event_loop_error(&error) {
+                        tracing::warn!("load-delaying dynamic script event loop failed: {error}");
+                        return false;
+                    }
+                    // A load-delaying script threw or left an unhandled
+                    // rejection. Chrome reports the error and runs the rest;
+                    // killing the pump would strand every still-pending script
+                    // (#699). The absolute deadline above bounds a page that
+                    // errors on every turn.
+                    tracing::warn!("load-delaying script task error, continuing: {error}");
+                    tokio::task::yield_now().await;
                 }
                 Err(_) => {
                     // This timeout only cancels a parked event-loop poll. The
@@ -2194,8 +2920,13 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                 try {\n\
+                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
+                   if (typeof window.onload === 'function') {\n\
+                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
+                   }\n\
+                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
+                 } catch(e) {}",
             );
         }
         if let Some(token) = exec_wd {
@@ -2276,17 +3007,30 @@ impl Page {
             return;
         }
         let settle_started = std::time::Instant::now();
-        if let Some(js) = &mut self.js {
-            if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
-                Self::settle_runtime_for_duration(js, max_ms).await;
-            } else {
-                // A deno_core event loop remains "busy" for any future timer,
-                // including analytics intervals and animation loops which do
-                // not make the page more ready. Require a short window without
-                // observable document/network/script activity instead. The
-                // absolute caller budget and V8 watchdog still bound both
-                // asynchronous work and synchronous microtask storms.
-                let _ = js.run_event_loop_until_quiescent(max_ms, 150).await;
+        // Pump, then give any frame document that finished fetching a realm of
+        // its own. Attaching one runs its scripts, which can start timers,
+        // fetches and further frames, so keep alternating until no new frame
+        // appears or the budget is gone (issue #600).
+        loop {
+            let remaining = max_ms.saturating_sub(settle_started.elapsed().as_millis() as u64);
+            if remaining == 0 {
+                break;
+            }
+            if let Some(js) = &mut self.js {
+                if std::env::var_os("OBSCURA_STRICT_SETTLE").is_some() {
+                    Self::settle_runtime_for_duration(js, remaining).await;
+                } else {
+                    // A deno_core event loop remains "busy" for any future timer,
+                    // including analytics intervals and animation loops which do
+                    // not make the page more ready. Require a short window without
+                    // observable document/network/script activity instead. The
+                    // absolute caller budget and V8 watchdog still bound both
+                    // asynchronous work and synchronous microtask storms.
+                    let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
+                }
+            }
+            if !self.advance_frames().await {
+                break;
             }
         }
         #[cfg(feature = "render")]
@@ -2321,6 +3065,11 @@ impl Page {
         if let Some(js) = &mut self.js {
             Self::settle_runtime_for_duration(js, duration_ms).await;
         }
+        // A fixed wait must retain its full wall clock, so frames get their
+        // realms once at the end instead of being interleaved as in `settle`.
+        // Their document scripts still run; only their own deferred work is
+        // left for a later settle.
+        self.advance_frames().await;
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
@@ -2329,10 +3078,16 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        match self.js.as_mut() {
+        let reached_idle = match self.js.as_mut() {
             Some(js) => js.run_autonomous_event_loop_turn().await,
             None => Ok(true),
-        }
+        }?;
+        // Dynamic iframe fetches finish on the page event loop, but their
+        // realms must be built by Page between turns. Keep the autonomous CDP
+        // pump on the same generic frame path as settle(), so a client that
+        // stays attached can observe and run child documents as they arrive.
+        let frame_work = self.advance_frames().await;
+        Ok(reached_idle && !frame_work)
     }
 
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
@@ -2383,8 +3138,8 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
-        const REDIRECT_LIMIT: usize = 10;
-        for chain in 0..REDIRECT_LIMIT {
+        let chain_limit = self.navigation_chain_limit();
+        for chain in 0..chain_limit {
             self.navigate_single(
                 &current_url,
                 wait_until,
@@ -2426,12 +3181,12 @@ impl Page {
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
-                if chain + 1 == REDIRECT_LIMIT {
+                if chain + 1 == chain_limit {
                     // Hit the cap and the page still wants to keep
                     // chaining. Surface that as an error instead of
                     // returning Ok(()) so callers can distinguish a
-                    // successful load from a redirect storm.
-                    return Err(PageError::TooManyRedirects(REDIRECT_LIMIT));
+                    // successful load from a navigation storm.
+                    return Err(PageError::TooManyClientNavigations(chain_limit));
                 }
                 continue;
             }
@@ -2456,28 +3211,31 @@ impl Page {
         self.network_events.clear();
 
         if self.context.obey_robots {
-            if let Some(domain) = url.host_str() {
-                if self.context.robots_cache.is_allowed(domain, "/robots.txt") {
-                    let robots_url = format!("{}://{}/robots.txt", url.scheme(), domain);
-                    if let Ok(robots_url) = Url::parse(&robots_url) {
-                        if let Ok(resp) = self
-                            .http_client
-                            .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
-                            .await
-                        {
-                            if resp.status == 200 {
-                                let body = String::from_utf8_lossy(&resp.body);
-                                self.context.robots_cache.parse_and_store(
-                                    domain,
-                                    &body,
-                                    &self.context.user_agent,
-                                );
-                            }
+            if url.scheme() == "http" || url.scheme() == "https" {
+                let origin = url.origin().ascii_serialization();
+                if !self.context.robots_cache.contains(&origin) {
+                    let mut robots_url = url.clone();
+                    robots_url.set_path("/robots.txt");
+                    robots_url.set_query(None);
+                    robots_url.set_fragment(None);
+                    let body = match self
+                        .http_client
+                        .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
+                        .await
+                    {
+                        Ok(resp) if resp.status == 200 => {
+                            String::from_utf8_lossy(&resp.body).into_owned()
                         }
-                    }
+                        _ => String::new(),
+                    };
+                    self.context.robots_cache.parse_and_store(
+                        &origin,
+                        &body,
+                        &self.context.user_agent,
+                    );
                 }
 
-                if !self.context.robots_cache.is_allowed(domain, url.path()) {
+                if !self.context.robots_cache.is_allowed(&origin, url.path()) {
                     self.lifecycle = LifecycleState::Failed;
                     return Err(PageError::NetworkError(format!(
                         "Blocked by robots.txt: {}",
@@ -2658,6 +3416,13 @@ impl Page {
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
+        // Before any `wait_until` can return, because the frames belong to the
+        // document rather than to one readiness level. Puppeteer and Playwright
+        // send `Page.navigate` with no `waitUntil`, which lands here and returns
+        // on the next line, so building frames further down left every real CDP
+        // client seeing a page with no frames at all.
+        self.build_document_frames().await;
+
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
         }
@@ -2739,7 +3504,48 @@ impl Page {
         Ok(())
     }
 
+    /// Builds the child frames of the document that just loaded.
+    ///
+    /// Loading a document includes loading the frames in it, so this belongs to
+    /// navigation rather than to `settle`: a CDP client that only navigates
+    /// would otherwise be told the page has no frames, because nothing had
+    /// given them realms yet.
+    ///
+    /// A frame's document is fetched by page script, so it arrives from the
+    /// event loop rather than being ready the moment parsing ends. Pages
+    /// without an iframe skip the pumping entirely and pay one native selector
+    /// query.
+    async fn build_document_frames(&mut self) {
+        // How many rounds of "attach a frame, let it start its own" to follow.
+        // A frame can add a frame, so this needs a bound rather than a loop
+        // until quiet: a page that adds one on every turn would never finish.
+        const ROUNDS: usize = 8;
+        const ROUND_MS: u64 = 50;
+
+        let has_iframe = self
+            .with_dom(|dom| dom.query_selector("iframe").ok().flatten().is_some())
+            .unwrap_or(false);
+        if !has_iframe {
+            return;
+        }
+
+        for _ in 0..ROUNDS {
+            if let Some(js) = &mut self.js {
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(ROUND_MS),
+                    js.run_event_loop(),
+                )
+                .await;
+            }
+            if !self.advance_frames().await {
+                break;
+            }
+        }
+    }
+
     pub fn navigate_blank(&mut self) {
+        self.pending_frame_work.clear();
+        self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
@@ -3001,6 +3807,22 @@ impl Page {
             .as_ref()
             .map(|js| js.scroll_offset())
             .unwrap_or((0.0, 0.0));
+        // When there IS a runtime, paint against the resource cache it already
+        // holds for this document. Building a fresh one here refetched every
+        // image on every capture, so a caller repeating a screenshot at a
+        // viewport that does not match the prepared key paid the whole network
+        // cost per frame.
+        if let Some(js) = &self.js {
+            if let Some(png) = js.screenshot_unprepared_with_retained_resources(
+                viewport,
+                base_url,
+                scroll,
+                animation_sample.time,
+                self.capture_surface_color(),
+            ) {
+                return Some(png);
+            }
+        }
         self.with_dom(|dom| {
             obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color(
                 dom,
@@ -3235,6 +4057,7 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
+                        thrown: false,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -3247,6 +4070,7 @@ impl Page {
         } else {
             let val = self.evaluate(expression);
             obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: match &val {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3280,6 +4104,7 @@ impl Page {
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: match &value {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3318,6 +4143,7 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
+                        thrown: false,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -3329,6 +4155,7 @@ impl Page {
             }
         } else {
             obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: "undefined".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3542,10 +4369,11 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
-        let Some(js) = &self.js else {
+        let Some(js) = &mut self.js else {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.suspended_cdp_object_state = js.take_cdp_object_state();
         let dom = js.take_dom();
         if let Some(dom) = dom {
             self.dom = Some(dom);
@@ -3553,6 +4381,13 @@ impl Page {
         } else {
             self.suspended_started_script_ids.clear();
         }
+        // Every frame realm holds a V8 handle into this isolate, so the frames
+        // go before the runtime does — the same order init_js keeps on a new
+        // document. Suspending is a teardown of the realm the frames live in,
+        // and a realm cannot be suspended and resumed the way the page's DOM
+        // can, so they are rebuilt when the page next loads a document.
+        self.pending_frame_work.clear();
+        self.frames.clear();
         self.js = None;
     }
 
@@ -3561,9 +4396,11 @@ impl Page {
             return;
         }
         let started_script_ids = std::mem::take(&mut self.suspended_started_script_ids);
+        let cdp_object_state = std::mem::take(&mut self.suspended_cdp_object_state);
         self.init_js();
-        if let Some(js) = &self.js {
+        if let Some(js) = &mut self.js {
             js.restore_started_script_ids(&started_script_ids);
+            js.restore_cdp_object_state(cdp_object_state);
         }
     }
 
@@ -3590,6 +4427,21 @@ impl Page {
             js.take_pending_binding_calls()
         } else {
             Vec::new()
+        }
+    }
+
+    pub fn take_pending_runtime_events(&mut self) -> Vec<obscura_js::ops::RuntimeEvent> {
+        if let Some(js) = &mut self.js {
+            js.take_pending_runtime_events()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.runtime_events_enabled.set(enabled);
+        if let Some(js) = &self.js {
+            js.set_runtime_events_enabled(enabled);
         }
     }
 
@@ -3682,7 +4534,9 @@ impl Page {
             self.push_history(self.url_string());
             Ok(true)
         } else {
-            Ok(false)
+            // Fork: a page that routed itself through history has still
+            // navigated. See fork_virtual_url.rs.
+            Ok(self.sync_virtual_url())
         }
     }
 
@@ -3739,9 +4593,11 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::{
         css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_referrer, navigation_timeout_from_env_value,
-        parse_import_url, rebase_css_urls, script_response_is_executable, split_css_imports,
-        truncate_on_char_boundary, url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        materialize_stylesheet_graph, navigation_chain_limit_from_env_value, navigation_referrer,
+        navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
+        script_response_is_executable, split_css_imports, truncate_on_char_boundary,
+        url_matches_cdp_pattern, LoadedStylesheet, PendingFrameWork, StylesheetImport,
+        DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
@@ -3769,6 +4625,25 @@ mod tests {
     }
 
     #[test]
+    fn navigation_chain_limit_environment_default_remains_ten() {
+        assert_eq!(navigation_chain_limit_from_env_value(None), 10);
+        assert_eq!(
+            navigation_chain_limit_from_env_value(Some("not-a-limit")),
+            10
+        );
+    }
+
+    #[test]
+    fn navigation_chain_limit_environment_override_remains_available() {
+        assert_eq!(navigation_chain_limit_from_env_value(Some("25")), 25);
+    }
+
+    #[test]
+    fn navigation_chain_limit_raises_a_zero_that_would_load_nothing() {
+        assert_eq!(navigation_chain_limit_from_env_value(Some("0")), 1);
+    }
+
+    #[test]
     fn css_resource_discovery_ignores_strings_comments_data_and_fragments() {
         let base = url::Url::parse("https://example.test/css/app/main.css").unwrap();
         let css = r#"
@@ -3787,6 +4662,88 @@ mod tests {
                 "https://example.test/css/img/hero.png".to_string(),
                 "https://cdn.test/icon.svg".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_takes_the_last_src_descriptor_and_skips_undecodable_sources() {
+        // The IE8 idiom: a bare `.eot` in its own descriptor, then the real
+        // list. The renderer resolves the cascade to the second descriptor and
+        // then drops `.eot` and `.svg`, so three of the six are all it will
+        // ever consider. The warmup used to fetch all six.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'Probe';
+              src: url('/font/probe.eot');
+              src: url('/font/probe.eot?#iefix') format('embedded-opentype'),
+                   url('/font/probe.woff2') format('woff2'),
+                   url('/font/probe.woff') format('woff'),
+                   url('/font/probe.ttf') format('truetype'),
+                   url('/font/probe.svg#probe') format('svg');
+            }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/font/probe.woff2".to_string(),
+                "https://example.test/font/probe.woff".to_string(),
+                "https://example.test/font/probe.ttf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_ignores_local_sources_and_keeps_scanning_after_the_block() {
+        // `local()` names an installed face and is not a fetch, and the block
+        // has to be reported as consumed at exactly its closing brace, or the
+        // rule after it would be skipped with it.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'Probe';
+              src: local('Probe'), url('probe.woff2') format('woff2');
+            }
+            .hero { background: url('../img/hero.png'); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/probe.woff2".to_string(),
+                "https://example.test/img/hero.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn font_face_warmup_skips_data_sources_and_survives_a_brace_in_a_string() {
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = r#"
+            @font-face {
+              font-family: 'A }';
+              src: url(data:font/woff2;base64,d09GMg==) format('woff2'),
+                   url('fallback.woff') format('woff');
+            }
+            .after { background: url('after.png'); }
+        "#;
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec![
+                "https://example.test/css/fallback.woff".to_string(),
+                "https://example.test/css/after.png".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_font_face_block_falls_back_to_the_generic_scan() {
+        // Better to warm too much than to drop the rest of the stylesheet on
+        // the floor, which is the same policy `css_import_rule_len` follows.
+        let base = url::Url::parse("https://example.test/css/app.css").unwrap();
+        let css = "@font-face { src: url('probe.woff2') format('woff2');";
+        assert_eq!(
+            css_resource_urls(css, &base),
+            vec!["https://example.test/css/probe.woff2".to_string()]
         );
     }
 
@@ -3987,6 +4944,161 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+    }
+
+    /// `/hop/N` sets `location.href = "/hop/N-1"`, `/hop/0` is the target.
+    /// An unreadable path gets a 404, so a broken fixture fails the test.
+    fn client_navigation_chain_address(name: &str, connections: usize) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let length = stream.read(&mut buffer).unwrap_or(0);
+                let hop = String::from_utf8_lossy(&buffer[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .and_then(|path| path.strip_prefix("/hop/"))
+                    .and_then(|hop| hop.parse::<usize>().ok());
+                let response = match hop {
+                    Some(0) => {
+                        let body = format!("<!doctype html><title>{name}</title>");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    Some(hop) => {
+                        let body = format!("<script>location.href='/hop/{}'</script>", hop - 1);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        address
+    }
+
+    /// Without a limit set the getter reaches its fallback to the environment.
+    fn page_without_chain_limit(name: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        super::Page::new(name.to_string(), context)
+    }
+
+    /// The only place where the name of the environment variable is checked
+    /// as a string, and the variable is the only way to raise the limit at
+    /// runtime. Without this test a typo in the name would stay green.
+    #[test]
+    fn navigation_chain_limit_reads_the_environment_variable_by_name() {
+        std::env::set_var("OBSCURA_NAV_CHAIN_LIMIT", "17");
+
+        let page = page_without_chain_limit("chain-from-environment");
+
+        assert_eq!(page.navigation_chain_limit(), 17);
+    }
+
+    #[test]
+    fn a_per_page_navigation_chain_limit_wins_over_the_environment() {
+        std::env::set_var("OBSCURA_NAV_CHAIN_LIMIT", "17");
+
+        let mut page = page_without_chain_limit("chain-per-page-wins");
+        page.set_navigation_chain_limit(4);
+
+        assert_eq!(page.navigation_chain_limit(), 4);
+    }
+
+    /// The limit is always set explicitly, never inherited. Otherwise anyone
+    /// running the suite with `OBSCURA_NAV_CHAIN_LIMIT` set would see these
+    /// tests fail through no fault of the code.
+    fn chain_page(name: &str, limit: usize) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new(name.to_string(), context);
+        page.set_navigation_chain_limit(limit);
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_default_allows_nine_client_navigations() {
+        let address = client_navigation_chain_address("arrived", 10);
+        let mut page = chain_page("chain-within-default", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        page.navigate(&format!("http://{address}/hop/9"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_beyond_the_default_reports_client_navigations() {
+        let address = client_navigation_chain_address("arrived", 10);
+        let mut page = chain_page("chain-beyond-default", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        let error = page
+            .navigate(&format!("http://{address}/hop/10"))
+            .await
+            .expect_err("a chain past the limit must not report success");
+
+        assert!(
+            matches!(error, super::PageError::TooManyClientNavigations(10)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Too many client-initiated navigations, the chain reached its limit of 10 documents"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raised_navigation_chain_limit_reaches_a_longer_chain() {
+        let address = client_navigation_chain_address("arrived", 12);
+        let mut page = chain_page("chain-raised", 12);
+
+        page.navigate(&format!("http://{address}/hop/11"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_navigation_chain_limit_still_loads_the_initial_document() {
+        let address = client_navigation_chain_address("arrived", 1);
+        let mut page = chain_page("chain-zero", 0);
+
+        page.navigate(&format!("http://{address}/hop/0"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.url_string(), format!("http://{address}/hop/0"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4469,6 +5581,528 @@ mod tests {
         assert!(!script_response_is_executable(500));
     }
 
+    /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the
+    /// same iframe straight in the document, and `/child.html` is the frame.
+    async fn spawn_shadow_frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.starts_with("GET /child.html ") {
+                        "<html><body><script>window.__ran = 'YES';</script></body></html>"
+                    } else if request.starts_with("GET /plain.html ") {
+                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    } else {
+                        "<html><body><div id=\"host\"></div><script>\
+                         var r = document.getElementById('host').attachShadow({mode:'closed'});\
+                         var f = document.createElement('iframe');\
+                         f.src = '/child.html';\
+                         r.appendChild(f);\
+                         </script></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    async fn spawn_slow_frame_script_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let slow_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server_slow_seen = slow_seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let requests = server_requests.clone();
+                let slow_seen = server_slow_seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    requests.lock().unwrap().push(path.clone());
+                    let (content_type, body) = if path == "/slow.js" {
+                        slow_seen.notify_waiters();
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        (
+                            "application/javascript",
+                            "globalThis.__order.push('second'); globalThis.__childReady = true;",
+                        )
+                    } else if path == "/first.js" {
+                        (
+                            "application/javascript",
+                            "globalThis.__order.push('first');",
+                        )
+                    } else {
+                        (
+                            "text/html",
+                            "<html><body><script src=/first.js></script><script src=/slow.js></script></body></html>",
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests, slow_seen)
+    }
+
+    async fn page_with_fetched_slow_frames(
+        name: &str,
+        frame_count: usize,
+    ) -> (
+        super::Page,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (base, requests, slow_seen) = spawn_slow_frame_script_server().await;
+        let iframes = (0..frame_count)
+            .map(|_| "<iframe src=/child.html></iframe>")
+            .collect::<String>();
+        let html = format!("<html><body>{iframes}</body></html>");
+        let mut page = import_map_test_page(name, &base, &html);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .expect("frame documents did not finish fetching")
+        .unwrap();
+        (page, requests, slow_seen)
+    }
+
+    async fn spawn_nested_pending_frame_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let requests = server_requests.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    requests.lock().unwrap().push(path.clone());
+                    let (content_type, body) = match path.as_str() {
+                        "/parent.html" => (
+                            "text/html",
+                            "<html><body><script>const child = document.createElement('iframe'); child.src = '/grandchild.html'; document.body.appendChild(child);</script></body></html>",
+                        ),
+                        "/grandchild.html" => (
+                            "text/html",
+                            "<html><body><script src=/grandchild-slow.js></script></body></html>",
+                        ),
+                        _ => ("application/javascript", "globalThis.__mustNotRun = true;"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_frame_script_fetch_keeps_all_siblings_resumable() {
+        let (mut page, requests, slow_seen) =
+            page_with_fetched_slow_frames("cancel-frame-scripts", 2).await;
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        assert!(page.queue_pending_frames());
+        let expected_viewport = match &page.pending_frame_work[0] {
+            PendingFrameWork::Unattached(frame) => {
+                (frame.viewport_width, frame.viewport_height)
+            }
+            PendingFrameWork::Attached { .. } => panic!("frame work started before advancement"),
+        };
+        let slow_request = slow_seen.notified();
+        let mut advance = Box::pin(page.advance_frames());
+        tokio::select! {
+            _ = advance.as_mut() => panic!("frame advance completed before the slow request"),
+            _ = slow_request => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("frame advance never reached the slow request")
+            }
+        }
+        drop(advance);
+        assert_eq!(page.frames.len(), 1);
+        let observable = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){ const w = document.querySelector('iframe').contentWindow; \
+                 return { order: w.__order, width: w.innerWidth, height: w.innerHeight }; })()",
+            )
+            .unwrap();
+        assert_eq!(
+            observable,
+            serde_json::json!({
+                "order": ["preload"],
+                "width": expected_viewport.0,
+                "height": expected_viewport.1,
+            }),
+            "a published loading frame was observable before new-document initialization",
+        );
+        assert_eq!(page.pending_frame_work.len(), 2);
+        assert!(matches!(
+            page.pending_frame_work[0],
+            PendingFrameWork::Attached { next_url: 1, .. }
+        ));
+        assert!(matches!(page.pending_frame_work[1], PendingFrameWork::Unattached(_)));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.advance_frames())
+            .await
+            .expect("resumed frame script fetch timed out");
+        assert!(page.pending_frame_work.is_empty());
+        for index in 0..2 {
+            assert_eq!(
+                page.evaluate_in_frame(index, "globalThis.__childReady").unwrap(),
+                serde_json::json!(true),
+            );
+            assert_eq!(
+                page.evaluate_in_frame(index, "globalThis.__order").unwrap(),
+                serde_json::json!(["preload", "first", "second"]),
+            );
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/first.js")
+                .count(),
+            2,
+            "a completed source was fetched again after cancellation",
+        );
+        let script_order: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with(".js"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            script_order,
+            ["/first.js", "/slow.js", "/slow.js", "/first.js", "/slow.js"],
+            "sibling script fetches were interleaved or reordered",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_frame_discards_queued_script_work_before_fetching() {
+        let (mut page, _, slow_seen) = page_with_fetched_slow_frames("detach-frame-scripts", 2).await;
+        let slow_request = slow_seen.notified();
+        let mut advance = Box::pin(page.advance_frames());
+        tokio::select! {
+            _ = advance.as_mut() => panic!("frame advance completed before the slow request"),
+            _ = slow_request => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("frame advance never reached the slow request")
+            }
+        }
+        drop(advance);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+
+        page.release_detached_frames();
+        assert!(page.frames.is_empty());
+        assert_eq!(page.pending_frame_work.len(), 1);
+        assert!(matches!(page.pending_frame_work[0], PendingFrameWork::Unattached(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_unattached_frame_is_discarded_before_realm_or_script_work() {
+        let (mut page, requests, _) =
+            page_with_fetched_slow_frames("detach-unattached-frame", 1).await;
+        assert!(page.queue_pending_frames());
+        assert!(page.frames.is_empty());
+        assert!(matches!(page.pending_frame_work[0], PendingFrameWork::Unattached(_)));
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+
+        assert!(page.frames.is_empty());
+        assert!(page.pending_frame_work.is_empty());
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with(".js")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pruning_an_old_batch_does_not_strand_a_new_runtime_batch() {
+        let (mut page, _, slow_seen) =
+            page_with_fetched_slow_frames("replace-frame-work-batch", 1).await;
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        let slow_request = slow_seen.notified();
+        let mut advance = Box::pin(page.advance_frames());
+        tokio::select! {
+            _ = advance.as_mut() => panic!("frame advance completed before the slow request"),
+            _ = slow_request => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("frame advance never reached the slow request")
+            }
+        }
+        drop(advance);
+        assert_eq!(page.pending_frame_work.len(), 1);
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){ const next = document.createElement('iframe'); next.src = '/child.html'; document.body.appendChild(next); return 1; })()",
+            )
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), page.advance_frames())
+            .await
+            .expect("new runtime batch was stranded after old batch cleanup");
+        assert_eq!(page.frames.len(), 1);
+        assert!(page.pending_frame_work.is_empty());
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__childReady").unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_teardown_discards_queued_frame_script_work() {
+        let (mut suspended, _, _) = page_with_fetched_slow_frames("suspend-frame-scripts", 1).await;
+        assert!(suspended.queue_pending_frames());
+        suspended.suspend_js();
+        assert!(suspended.frames.is_empty());
+        assert!(suspended.pending_frame_work.is_empty());
+
+        let (mut replaced, _, _) = page_with_fetched_slow_frames("replace-frame-scripts", 1).await;
+        assert!(replaced.queue_pending_frames());
+        replaced.navigate_blank();
+        assert!(replaced.frames.is_empty());
+        assert!(replaced.pending_frame_work.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detaching_a_parent_discards_its_queued_descendant_work() {
+        let (base, requests) = spawn_nested_pending_frame_server().await;
+        let mut page = import_map_test_page(
+            "detach-nested-frame-work",
+            &base,
+            "<html><body><iframe src=/parent.html></iframe></body></html>",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(page.queue_pending_frames());
+        assert!(page.run_next_pending_frame().await);
+        assert_eq!(page.frames.len(), 1);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(page.queue_pending_frames());
+        assert_eq!(page.pending_frame_work.len(), 1);
+        assert_eq!(
+            page.pending_frame_work[0].parent_frame_id(),
+            page.frames[0].frame_id(),
+        );
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+        assert!(page.frames.is_empty());
+        assert!(page.pending_frame_work.is_empty());
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/grandchild-slow.js"));
+    }
+
+    /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
+    /// why `init_js` clears the frames before it drops the runtime. `suspend_js`
+    /// drops the same runtime and has to honour the same order, otherwise the
+    /// realms of a suspended page outlive the isolate they point into and the
+    /// next navigation drops those handles against a different one.
+    #[tokio::test]
+    async fn suspending_the_runtime_releases_the_frame_realms_it_owns() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "suspend-frames".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("suspend-frames".to_string(), context);
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        assert_eq!(
+            page.frame_urls().len(),
+            1,
+            "the page never built its child frame, so this proves nothing"
+        );
+
+        page.suspend_js();
+        assert!(
+            page.frame_urls().is_empty(),
+            "the frame realms outlived the isolate they hold a handle into: {:?}",
+            page.frame_urls()
+        );
+
+        // The page still works afterwards: resuming rebuilds the runtime, and
+        // navigating again builds the frames of the new document.
+        page.resume_js();
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        assert_eq!(page.frame_urls().len(), 1);
+    }
+
+    fn frame_page(name: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        super::Page::new(name.to_string(), context)
+    }
+
+    /// An iframe inside a shadow root is absent from
+    /// `document.querySelectorAll('iframe')` — real Chrome reports 0 for it too
+    /// — so a liveness check built on that query reads a live frame as detached
+    /// and tears it down. That is the shape a challenge widget uses, so the
+    /// frame it depends on would be discarded moments after it loaded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_inside_a_shadow_root_survives_the_detach_sweep() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("shadow-frame-survives");
+        page.navigate(&base).await.unwrap();
+        page.settle(1_000).await;
+
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "the shadow-root frame was discarded as detached: {:?}",
+            page.frame_urls()
+        );
+        // The realm is not merely alive; the page can still reach into it.
+        let published = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
+            .unwrap();
+        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+    }
+
+    /// The sweep still does its job: an iframe removed from the document has
+    /// its realm and every reference the page realm holds to it released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_an_iframe_releases_its_realm() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("detached-frame-released");
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        page.settle(1_000).await;
+        assert_eq!(page.frames.len(), 1, "no frame to remove");
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+
+        assert!(page.frames.is_empty(), "the detached realm was kept");
+        let left = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "Object.keys(globalThis.__obscura_frameObjects).length\
+                 + Object.keys(globalThis.__obscura_frameWindows).length\
+                 + Object.keys(globalThis.__obscura_frameElements).length",
+            )
+            .unwrap();
+        assert_eq!(
+            left.as_f64(),
+            Some(0.0),
+            "a reference to the discarded frame survived, so its context cannot be collected"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn suspend_resume_preserves_document_script_start_state() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
@@ -4543,6 +6177,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, serde_json::json!(["1", "1", "0"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn suspend_resume_preserves_cdp_evaluation_handles() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "cdp-handle-suspend".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("cdp-handle-suspend".to_string(), context);
+        page.url = Some(url::Url::parse("http://example.com/").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+
+        let object = page
+            .evaluate_for_cdp_with_timeout("({ increment(value) { return value + 1; } })", false, false, 1_000)
+            .await
+            .unwrap();
+        let object_id = object.object_id.expect("remote evaluation returned no handle");
+
+        page.suspend_js();
+        page.resume_js();
+
+        let result = page
+            .call_function_on_for_cdp_with_timeout(
+                "function(value) { return this.increment(value); }",
+                Some(&object_id),
+                &[serde_json::json!({ "value": 41 })],
+                true,
+                false,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(42.0)));
     }
 
     #[test]
@@ -4894,6 +6566,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn body_onload_content_attribute_reflects_to_window() {
+        let mut page = import_map_test_page(
+            "body-onload-content-attribute",
+            "http://127.0.0.1:9",
+            r#"<html><head></head><body onload="
+                globalThis.__bodyOnloadCalls++;
+                globalThis.__bodyOnloadThisIsWindow = this === window;
+                globalThis.__bodyOnloadEventType = event && event.type;
+                throw new Error('body onload failure');
+            "><script>
+                globalThis.__bodyOnloadCalls = 0;
+                globalThis.__bodyOnloadThisIsWindow = false;
+                globalThis.__bodyOnloadEventType = null;
+                globalThis.__bodyOnloadReflectedBeforeLoad =
+                    typeof document.body.onload === 'function' &&
+                    document.body.onload === window.onload;
+                globalThis.__windowLoadListenerCalls = 0;
+                window.addEventListener('load', () => __windowLoadListenerCalls++);
+            </script></body></html>"#,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"[
+                        __bodyOnloadCalls,
+                        __bodyOnloadThisIsWindow,
+                        __bodyOnloadEventType,
+                        __bodyOnloadReflectedBeforeLoad,
+                        __windowLoadListenerCalls
+                    ]"#,
+                )
+                .unwrap(),
+            serde_json::json!([1, true, "load", true, 1]),
+        );
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"(function() {
+                        const fromBody = function fromBody() {};
+                        document.body.onload = fromBody;
+                        const bodySetsWindow = window.onload === fromBody;
+                        const fromWindow = function fromWindow() {};
+                        window.onload = fromWindow;
+                        const windowSetsBody = document.body.onload === fromWindow;
+                        document.body.setAttribute('onload', 'globalThis.__bodyOnloadFromAttribute = true');
+                        const attributeReplacesWindow = document.body.onload !== fromWindow
+                            && document.body.onload === window.onload;
+                        const reflected = window.onload;
+                        const detachedBody = document.createElement('body');
+                        detachedBody.onload = function detachedBodyOnload() {};
+                        const detachedBodyStaysLocal = window.onload === reflected
+                            && detachedBody.onload !== window.onload;
+                        return bodySetsWindow && windowSetsBody && attributeReplacesWindow
+                            && detachedBodyStaysLocal;
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn preload_dynamic_script_delays_load_but_not_dom_content_loaded() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(150),
@@ -5062,6 +6804,73 @@ mod tests {
                 .unwrap(),
             "/slow-dynamic.js",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_delaying_script_driver_survives_a_page_script_exception() {
+        // An exception from an async page callback reaches the pump as an
+        // event-loop error, and the pump used to answer it by abandoning every
+        // still-pending load-delaying script. The error is transient: measured
+        // against this runtime, the tick carrying it fails and the following
+        // ticks poll clean, so the pending script below was dropped over a
+        // condition that had already cleared, and dropped silently, since the
+        // script simply never arrives.
+        //
+        // The throw is deferred through a timer so it lands on a pump tick.
+        // Thrown during the installing script's own microtask drain it would
+        // clear the pending-script bookkeeping before the fetch even starts,
+        // which is a different bug from the one under test here.
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(150),
+            "globalThis.__lateDynamicRan = true;",
+        );
+        let mut page = import_map_test_page(
+            "load-delayer-throws",
+            "http://127.0.0.1:9",
+            "<html><head></head><body></body></html>",
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "install-load-delayer",
+                &format!(
+                    "globalThis.__documentReadyState__ = 'loading'; \
+                     const script = document.createElement('script'); \
+                     script.src = '{base}/slow-dynamic.js'; \
+                     document.head.appendChild(script); \
+                     setTimeout(() => {{ \
+                         queueMicrotask(() => {{ throw new Error('page script boom'); }}); \
+                     }}, 0);",
+                ),
+            )
+            .unwrap();
+        assert!(page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completed =
+            super::Page::drive_load_delaying_scripts(page.js.as_mut().unwrap(), deadline).await;
+
+        assert!(
+            completed,
+            "the throw must not end the pump while a script is still pending"
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/slow-dynamic.js",
+            "the pending script must still be fetched"
+        );
+        assert!(!page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6166,8 +7975,11 @@ pub enum PageError {
     #[error("Parse error: {0}")]
     ParseError(String),
 
-    #[error("Too many redirects (limit {0})")]
-    TooManyRedirects(usize),
+    /// A page kept triggering its own navigations until the chain's limit
+    /// was exhausted. HTTP 3xx redirects are followed one layer down, in
+    /// obscura-net, and report `ObscuraNetError::TooManyRedirects`.
+    #[error("Too many client-initiated navigations, the chain reached its limit of {0} documents")]
+    TooManyClientNavigations(usize),
 }
 
 impl From<ObscuraNetError> for PageError {

@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-// Serves an HTML page that, on load, fetches /api/data.json, plus that JSON.
+// Serves an HTML page that fetches /api/start.json, which redirects to the
+// JSON response at /api/data.json.
 async fn serve() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -22,6 +23,11 @@ async fn serve() -> String {
                 let mut buf = [0u8; 2048];
                 let _ = socket.read(&mut buf).await.unwrap();
                 let req = String::from_utf8_lossy(&buf[..]);
+                if req.starts_with("GET /api/start.json") {
+                    let resp = "HTTP/1.1 302 Found\r\nLocation: /api/data.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
                 let (ct, body) = if req.starts_with("GET /api/data.json") {
                     ("application/json", "{\"value\":42}")
                 } else {
@@ -31,7 +37,7 @@ async fn serve() -> String {
 <div id="r">stage1</div>
 <script>
 window.__done = new Promise(function (resolve) {
-  fetch("/api/data.json")
+  fetch("/api/start.json")
     .then(function (r) { return r.json(); })
     .then(function (d) { document.getElementById("r").textContent = "got:" + d.value; resolve("ok"); })
     .catch(function (e) { resolve("err:" + e); });
@@ -117,7 +123,7 @@ async fn js_fetch_emits_network_request_and_response() {
     )
     .await;
 
-    // The fetched JSON URL must appear as a requestWillBeSent event.
+    // The final fetched JSON URL must appear as a requestWillBeSent event.
     let request_urls = ctx
         .pending_events
         .iter()
@@ -128,7 +134,6 @@ async fn js_fetch_emits_network_request_and_response() {
         request_urls.iter().any(|u| u.contains("/api/data.json")),
         "script-initiated fetch must emit Network.requestWillBeSent; saw {request_urls:?}"
     );
-
     // And its response body must be resolvable via the same requestId, so a
     // client can read the captured JSON.
     let request_id = response_request_id(&ctx, "/api/data.json")

@@ -1,0 +1,8 @@
+# Repository maintainers.
+* @SGavrl @h4ckf0r0day
+
+# Keep security-sensitive automation explicit even if more owners are added later.
+/.github/CODEOWNERS @SGavrl @h4ckf0r0day
+/.github/workflows/ @SGavrl @h4ckf0r0day
+/scripts/ci/ @SGavrl @h4ckf0r0day
+/deny.toml @SGavrl @h4ckf0r0day

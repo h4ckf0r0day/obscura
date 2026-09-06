@@ -346,21 +346,64 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
 }
 
 /// Compute the accessible value for a node (e.g., current input value).
-fn compute_value(_dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
+fn compute_value(dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
     if let NodeData::Element { name, attrs, .. } = &node.data {
         let tag = name.local.as_ref();
-        // For input elements, return the value attribute
+        // For native form controls, return the value attribute.
         if tag == "input" || tag == "textarea" || tag == "select" {
-            if let Some(val) = attrs
+            return attrs
                 .iter()
                 .find(|a| a.name.local.as_ref() == "value")
-                .map(|a| a.value.clone())
-            {
-                return Some(val);
-            }
+                .map(|a| a.value.clone());
+        }
+
+        if is_content_editing_host(dom, node) {
+            return Some(dom.text_content(node.id));
         }
     }
     None
+}
+
+fn contenteditable_keyword(node: &obscura_dom::Node) -> Option<bool> {
+    let NodeData::Element { attrs, .. } = &node.data else {
+        return None;
+    };
+    let value = &attrs
+        .iter()
+        .find(|attr| attr.name.local.as_ref() == "contenteditable")?
+        .value;
+
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("plaintext-only")
+    {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn is_effectively_contenteditable(dom: &DomTree, node_id: NodeId) -> bool {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let Some(node) = dom.get_node(id) else {
+            return false;
+        };
+        if let Some(editable) = contenteditable_keyword(&node) {
+            return editable;
+        }
+        current = node.parent;
+    }
+    false
+}
+
+fn is_content_editing_host(dom: &DomTree, node: &obscura_dom::Node) -> bool {
+    is_effectively_contenteditable(dom, node.id)
+        && node
+            .parent
+            .is_none_or(|parent| !is_effectively_contenteditable(dom, parent))
 }
 
 /// Compute accessibility properties for a node.
@@ -429,5 +472,53 @@ fn compute_properties(_dom: &DomTree, node: &obscura_dom::Node) -> Vec<Value> {
         props
     } else {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obscura_dom::parse_html;
+
+    fn ax_node_for<'a>(nodes: &'a [Value], backend_node_id: NodeId) -> &'a Value {
+        nodes
+            .iter()
+            .find(|node| node["backendDOMNodeId"] == backend_node_id.raw())
+            .expect("element is present in the AX tree")
+    }
+
+    fn assert_ax_value(nodes: &[Value], dom: &DomTree, id: &str, expected: Option<&str>) {
+        let node = ax_node_for(nodes, dom.get_element_by_id(id).unwrap());
+        assert_eq!(
+            node.get("value").and_then(|value| value["value"].as_str()),
+            expected,
+            "unexpected AX value for #{id}"
+        );
+    }
+
+    #[test]
+    fn content_editing_hosts_expose_ax_values_without_duplicating_descendants() {
+        let dom = parse_html(
+            r#"<div id="true" contenteditable="TrUe">true</div>
+               <div id="empty-keyword" contenteditable>empty keyword</div>
+               <div id="plaintext" contenteditable="PlAiNtExT-OnLy">plaintext</div>
+               <div id="empty-host" contenteditable></div>
+               <div id="host" contenteditable="true">host<span id="inherited"> inherited</span><span id="invalid" contenteditable="bogus"> invalid</span><span id="nested-explicit" contenteditable="plaintext-only"> nested</span></div>
+               <div id="disabled" contenteditable="FaLsE">disabled<span id="invalid-disabled" contenteditable="bogus"> inherited off</span><span id="reenabled" contenteditable="TRUE">reenabled<span id="reenabled-child"> child</span></span></div>"#,
+        );
+        let nodes = build_ax_nodes(&dom);
+
+        assert_ax_value(&nodes, &dom, "true", Some("true"));
+        assert_ax_value(&nodes, &dom, "empty-keyword", Some("empty keyword"));
+        assert_ax_value(&nodes, &dom, "plaintext", Some("plaintext"));
+        assert_ax_value(&nodes, &dom, "empty-host", Some(""));
+        assert_ax_value(&nodes, &dom, "host", Some("host inherited invalid nested"));
+        assert_ax_value(&nodes, &dom, "inherited", None);
+        assert_ax_value(&nodes, &dom, "invalid", None);
+        assert_ax_value(&nodes, &dom, "nested-explicit", None);
+        assert_ax_value(&nodes, &dom, "disabled", None);
+        assert_ax_value(&nodes, &dom, "invalid-disabled", None);
+        assert_ax_value(&nodes, &dom, "reenabled", Some("reenabled child"));
+        assert_ax_value(&nodes, &dom, "reenabled-child", None);
     }
 }

@@ -82,6 +82,11 @@ pub struct ObscuraModuleLoader {
     standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
     import_map: Rc<RefCell<ImportMap>>,
     activity: Arc<ModuleLoadActivity>,
+    /// Canonical and requested specifiers fetched into deno_core's module map.
+    /// The runtime uses a cursor into this append-only list to associate a
+    /// prepared root with the dependencies that its successful evaluation also
+    /// evaluates.
+    loaded_specifiers: Rc<RefCell<Vec<String>>>,
 }
 
 impl ObscuraModuleLoader {
@@ -110,6 +115,7 @@ impl ObscuraModuleLoader {
             standalone_client: Some(standalone_client),
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
+            loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -126,11 +132,16 @@ impl ObscuraModuleLoader {
             standalone_client: None,
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
+            loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
     pub(crate) fn activity(&self) -> Arc<ModuleLoadActivity> {
         self.activity.clone()
+    }
+
+    pub(crate) fn loaded_specifiers(&self) -> Rc<RefCell<Vec<String>>> {
+        self.loaded_specifiers.clone()
     }
 }
 
@@ -194,6 +205,8 @@ impl ModuleLoader for ObscuraModuleLoader {
         // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
         let activity = self.activity.clone();
+        let loaded_specifiers = self.loaded_specifiers.clone();
+        loaded_specifiers.borrow_mut().push(url.clone());
         // Register before returning the future. The lifecycle can inspect the
         // runtime between deno_core accepting the load and first polling it.
         // Keeping the guard inside the future makes cancellation/navigation
@@ -211,12 +224,28 @@ impl ModuleLoader for ObscuraModuleLoader {
                     .http_client
                     .clone()
                     .ok_or_else(|| "No http_client wired to module loader".to_string())?;
-                Ok((client, state.callbacks.clone()))
+                // Fork: in stealth mode an ES module must be fetched over the
+                // same transport as the document. Upstream sends it through the
+                // plain reqwest client, so a `type="module"` script arrives with
+                // a different TLS fingerprint and none of the browser identity
+                // headers, while the HTML that referenced it came over wreq.
+                // That cross-transport mismatch is trivially detectable.
+                #[cfg(feature = "stealth")]
+                let stealth = state.stealth_client.clone();
+                #[cfg(not(feature = "stealth"))]
+                let stealth: Option<std::sync::Arc<()>> = None;
+                Ok((client, stealth, state.callbacks.clone()))
             })(),
             None => self
                 .standalone_client
                 .clone()
-                .map(|client| (client, None))
+                .map(|client| {
+                    #[cfg(feature = "stealth")]
+                    let stealth = None;
+                    #[cfg(not(feature = "stealth"))]
+                    let stealth: Option<std::sync::Arc<()>> = None;
+                    (client, stealth, None)
+                })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
 
@@ -232,17 +261,43 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, callbacks)) => {
+                Ok((client, stealth, callbacks)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-                    let resp = client
-                        .fetch_resource_with_callbacks(
-                            &requested,
-                            obscura_net::ResourceRequest::module_script(&document_url, &referrer),
-                            callbacks.as_deref(),
-                        )
-                        .await
-                        .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    let request =
+                        obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    #[cfg(feature = "stealth")]
+                    let resp = match stealth {
+                        Some(stealth) => stealth
+                            .fetch_resource_with_callbacks(
+                                &requested,
+                                request,
+                                callbacks.as_deref(),
+                            )
+                            .await,
+                        None => {
+                            client
+                                .fetch_resource_with_callbacks(
+                                    &requested,
+                                    request,
+                                    callbacks.as_deref(),
+                                )
+                                .await
+                        }
+                    }
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    #[cfg(not(feature = "stealth"))]
+                    let resp = {
+                        let _ = &stealth;
+                        client
+                            .fetch_resource_with_callbacks(
+                                &requested,
+                                request,
+                                callbacks.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+                    };
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",
@@ -252,6 +307,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
                         io_err(format!("Invalid final module URL {}: {}", resp.url, e))
                     })?;
+                    if found.as_str() != requested.as_str() {
+                        loaded_specifiers
+                            .borrow_mut()
+                            .push(found.to_string());
+                    }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,

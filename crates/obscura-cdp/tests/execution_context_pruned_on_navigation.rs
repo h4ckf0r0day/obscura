@@ -1,69 +1,56 @@
-// Regression for issue #407: `CdpContext.valid_context_ids` was insert-only,
-// so `Runtime.executionContextsCleared` on navigation never pruned the old
-// context ids. A `Runtime.callFunctionOn` targeting a pre-navigation context
-// still ran (Chrome rejects it with "Cannot find context with specified id"),
-// and the set grew by one id per navigation on a long-lived connection.
+// Regression for issue #407: navigation must retire a page's old execution
+// context ids without deleting live contexts owned by another page.
 
-use obscura_cdp::dispatch::CdpContext;
-use obscura_cdp::domains::page::emit_navigation_events;
-use obscura_browser::lifecycle::WaitUntil;
+use obscura_cdp::dispatch::{dispatch, CdpContext};
+use obscura_cdp::types::CdpRequest;
+use serde_json::{json, Value};
 
-fn navigate(ctx: &mut CdpContext, page_id: &str) {
-    emit_navigation_events(
-        ctx,
-        &Some("session-1".to_string()),
-        "frame-1",
-        "loader-1",
-        "http://127.0.0.1/page",
-        page_id,
-        &[],
-        WaitUntil::Load,
-        true,
-    );
+async fn cdp(
+    ctx: &mut CdpContext,
+    id: u64,
+    method: &str,
+    params: Value,
+    session_id: &str,
+) -> obscura_cdp::types::CdpResponse {
+    dispatch(&CdpRequest {
+        id,
+        method: method.to_string(),
+        params,
+        session_id: Some(session_id.to_string()),
+    }, ctx).await
 }
 
-#[test]
-fn navigation_prunes_stale_execution_context_ids() {
+#[tokio::test(flavor = "current_thread")]
+async fn navigation_prunes_only_the_navigated_pages_stale_context_ids() {
     let mut ctx = CdpContext::new();
-    // Seed a stale id that no navigation re-creates (simulates a context from
-    // a prior page state, or simply the pre-navigation main id 1).
-    ctx.valid_context_ids.insert(999);
+    let first_page = ctx.create_page();
+    let second_page = ctx.create_page();
+    ctx.sessions.insert("first".to_string(), first_page);
+    ctx.sessions.insert("second".to_string(), second_page);
 
-    navigate(&mut ctx, "page-1");
+    let stale = cdp(
+        &mut ctx, 1, "Page.createIsolatedWorld",
+        json!({"worldName": "first-world"}), "first",
+    ).await.result.unwrap()["executionContextId"].as_i64().unwrap();
+    let other_page = cdp(
+        &mut ctx, 2, "Page.createIsolatedWorld",
+        json!({"worldName": "second-world"}), "second",
+    ).await.result.unwrap()["executionContextId"].as_i64().unwrap();
 
-    // The stale id is gone after executionContextsCleared; the default world
-    // (id 2) and the first isolated world (id 100, counter starts at 100) remain.
-    assert!(
-        !ctx.valid_context_ids.contains(&999),
-        "stale execution context id must be pruned on navigation"
-    );
-    assert!(ctx.valid_context_ids.contains(&2), "default world id 2 must be re-registered");
-    assert!(
-        ctx.valid_context_ids.contains(&100),
-        "isolated world id 100 must be registered: {:?}",
-        ctx.valid_context_ids
-    );
+    cdp(
+        &mut ctx, 3, "Page.navigate",
+        json!({"url": "data:text/html,<p>replacement</p>", "waitUntil": "load"}),
+        "first",
+    ).await;
 
-    navigate(&mut ctx, "page-1");
-
-    // Second navigation: the first nav's isolated id (100) is now stale, and a
-    // fresh id (101) takes its place. The set must not grow across navigations.
-    assert!(
-        !ctx.valid_context_ids.contains(&100),
-        "previous navigation's isolated context id must be pruned"
-    );
-    assert!(ctx.valid_context_ids.contains(&101), "fresh isolated id 101 must be registered");
-    assert!(ctx.valid_context_ids.contains(&2), "default world id 2 must survive navigation");
-
-    // Unbounded-growth check: two navigations leave exactly the default world
-    // plus the current isolated world(s), not an accumulating union.
-    let count_after_two_navs = ctx.valid_context_ids.len();
-    navigate(&mut ctx, "page-1");
-    navigate(&mut ctx, "page-1");
-    assert_eq!(
-        ctx.valid_context_ids.len(),
-        count_after_two_navs,
-        "valid_context_ids must not grow across navigations (was {count_after_two_navs}, now {})",
-        ctx.valid_context_ids.len()
-    );
+    let stale_result = cdp(
+        &mut ctx, 4, "Runtime.evaluate",
+        json!({"expression": "1", "contextId": stale}), "first",
+    ).await;
+    assert!(stale_result.error.unwrap().message.contains("Cannot find context"));
+    let other_result = cdp(
+        &mut ctx, 5, "Runtime.evaluate",
+        json!({"expression": "1", "contextId": other_page}), "second",
+    ).await;
+    assert!(other_result.error.is_none(), "other page context was pruned");
 }

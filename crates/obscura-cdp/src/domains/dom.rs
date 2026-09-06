@@ -17,9 +17,9 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     }
     if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
         let code = format!(
-            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
+            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects[{}]; \
              return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-            oid.replace('\'', "\\'")
+            crate::util::object_id_literal(oid)
         );
         let result = page.evaluate(&code);
         let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
@@ -87,15 +87,6 @@ fn guess_mime(path: &str) -> &'static str {
     }
 }
 
-// The CDP BoxModel protocol types its coordinates as integers (Quad is an
-// array of 8 integer pairs; x/y/width/height are integers too).
-// getBoundingClientRect returns CSS floats, and Hermes refuses to deserialize
-// them ("invalid type: floating point 32.0, expected i64"), so round every
-// emitted coordinate to the nearest whole pixel.
-fn round_px(v: f64) -> i64 {
-    v.round() as i64
-}
-
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -149,10 +140,9 @@ pub async fn handle(
             {
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    escaped_oid
+                    "(function() {{ var o = globalThis.__obscura_objects[{}]; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
                 result.as_f64().map(|n| n as u64).unwrap_or(0)
@@ -173,8 +163,8 @@ pub async fn handle(
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    oid
+                    "(function() {{ var o = globalThis.__obscura_objects[{}]; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
                 result.as_f64().map(|n| n as u64).unwrap_or(0)
@@ -189,7 +179,7 @@ pub async fn handle(
                     if (globalThis._cache && globalThis._cache.has(nid)) {{\
                         node = globalThis._cache.get(nid);\
                     }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '');\
+                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
                         if (t === 1) node = new Element(nid);\
                         else if (t === 9) node = globalThis.document;\
                         else node = new Node(nid);\
@@ -271,6 +261,14 @@ pub async fn handle(
             // builds real File objects and fires input+change like a real
             // selection so page code can read/upload them.
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            // setFileInputFiles reads local files and hands their bytes to page
+            // JS. Anyone who can reach the CDP port (default localhost, but
+            // Docker images bind 0.0.0.0) could otherwise read any file the
+            // process can read — the same threat as Page.navigate to file://, so
+            // it honours the same opt-in and is off by default.
+            if !page.context.allow_file_access {
+                return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
+            }
             let node_id = resolve_node_id(page, params)?;
             let paths: Vec<String> = params
                 .get("files")
@@ -319,13 +317,13 @@ pub async fn handle(
             let (quad, w, h) = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                 if nums.len() >= 10 {
-                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(round_px(*n))).collect();
-                    (q, round_px(nums[8]), round_px(nums[9]))
+                    let q: Vec<Value> = nums[..8].iter().map(|n| coord_value(*n)).collect();
+                    (q, nums[8], nums[9])
                 } else {
-                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100, 20)
+                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
                 }
             } else {
-                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100, 20)
+                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
             };
             Ok(json!({
                 "model": {
@@ -333,7 +331,7 @@ pub async fn handle(
                     "padding": quad.clone(),
                     "border": quad.clone(),
                     "margin": quad,
-                    "width": w, "height": h,
+                    "width": coord_value(w), "height": coord_value(h),
                 }
             }))
         }
@@ -355,7 +353,7 @@ pub async fn handle(
             let val = page.evaluate(&code);
             let quad = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| json!(round_px(*n))).collect::<Vec<_>>() }
+                if nums.len() == 8 { nums.iter().map(|n| coord_value(*n)).collect::<Vec<_>>() }
                 else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
             } else {
                 vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
@@ -363,6 +361,23 @@ pub async fn handle(
             Ok(json!({ "quads": [quad] }))
         }
         _ => Err(format!("Unknown DOM method: {}", method)),
+    }
+}
+
+/// Serialize a CDP box-model coordinate the way Chrome does: an integral double
+/// (e.g. `256.0`) becomes a JSON integer (`256`), while a genuinely fractional
+/// value (`206.0390625`) stays a float. serde_json always writes an `f64` with a
+/// decimal point, so `json!(256.0)` yields `256.0` — which strict CDP clients
+/// (Hermes Agent) deserialize as `i64` and reject, breaking every click-by-
+/// coordinate flow. Chrome only widens fractional coordinates, so mirroring that
+/// keeps those clients working. (issue #576)
+fn coord_value(n: f64) -> Value {
+    // Collapse to an integer only when the value is exactly integral and fits an
+    // i64 losslessly; NaN/inf and out-of-range doubles fall through unchanged.
+    if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        json!(n as i64)
+    } else {
+        json!(n)
     }
 }
 
@@ -514,6 +529,11 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
+    // The escaping this file used to own now lives in `util::object_id_literal`,
+    // which is where its tests went with it: the three lookup sites here embed
+    // the id as a JSON literal rather than splicing it into a single-quoted
+    // string, so there is no per-domain escaping left to assert on.
+
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
         // CDP clients (browser-use) focus an input via DOM.focus before typing;
@@ -551,57 +571,6 @@ mod tests {
             active,
             json!("INPUT"),
             "DOM.focus must set document.activeElement to the focused input"
-        );
-    }
-
-    // Hermes deserializes DOM.getBoxModel coordinates as i64 and fails on the
-    // float pixels getBoundingClientRect returns ("invalid type: floating
-    // point 32.0, expected i64"). Every coordinate in the model must be an
-    // integer.
-    #[tokio::test]
-    async fn get_box_model_returns_integer_coordinates() {
-        let mut ctx = CdpContext::new();
-        let page_id = ctx.create_page();
-        let session = Some(format!("{page_id}-session"));
-        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
-
-        crate::domains::page::handle(
-            "navigate",
-            &json!({ "url": "data:text/html,<div id=b style='position:absolute;left:10.5px;top:20.25px;width:100px;height:50px'>x</div>", "waitUntil": "load" }),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("navigate should succeed");
-
-        let qs = handle("querySelector", &json!({ "selector": "#b" }), &mut ctx, &session)
-            .await
-            .expect("querySelector should succeed");
-        let nid = qs["nodeId"].as_u64().expect("div nodeId");
-
-        let model = handle("getBoxModel", &json!({ "nodeId": nid }), &mut ctx, &session)
-            .await
-            .expect("getBoxModel should succeed");
-
-        for quad in ["content", "padding", "border", "margin"] {
-            let coords = model["model"][quad].as_array().expect("quad array");
-            assert_eq!(coords.len(), 8, "{quad} quad must have 8 coordinates");
-            for c in coords {
-                assert!(
-                    c.as_i64().is_some(),
-                    "{quad} coordinate must be an integer, got {c}"
-                );
-            }
-        }
-        assert!(
-            model["model"]["width"].as_i64().is_some(),
-            "width must be an integer, got {}",
-            model["model"]["width"]
-        );
-        assert!(
-            model["model"]["height"].as_i64().is_some(),
-            "height must be an integer, got {}",
-            model["model"]["height"]
         );
     }
 
@@ -747,6 +716,73 @@ mod tests {
         assert!(
             levels < depth,
             "nesting must be bounded below the tree's true depth, got {levels}"
+        );
+    }
+
+    /// SEC-003 / #579 — DOM.setFileInputFiles reads local files and hands
+    /// their bytes to page JS. Without a gate, any CDP client (e.g. against a
+    /// Docker image that binds the port to 0.0.0.0) gets an arbitrary
+    /// file-read primitive. It must honour the same `allow_file_access` opt-in
+    /// as Page.navigate to `file://`, which defaults to off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_file_input_files_refuses_without_allow_file_access() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<input type=file id=f>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let qs = handle("querySelector", &json!({ "selector": "input" }), &mut ctx, &session)
+            .await
+            .expect("querySelector should succeed");
+        let nid = qs["nodeId"].as_u64().expect("input nodeId");
+
+        // A real, readable file. Without the gate the handler slurps it and
+        // returns Ok; with the gate it must refuse before touching the disk.
+        let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        let err = handle(
+            "setFileInputFiles",
+            &json!({ "nodeId": nid, "files": [existing] }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect_err("setFileInputFiles must be gated behind --allow-file-access");
+        assert!(
+            err.contains("allow-file-access"),
+            "error must point at the allow-file-access flag: {err}"
+        );
+    }
+
+    // issue #576: DOM.getBoxModel / getContentQuads build their quad from f64
+    // pixel values, so serde_json emits integral coordinates as `256.0`. Strict
+    // CDP clients (Hermes Agent) deserialize the quad as i64 and reject the
+    // float. coord_value must serialize integral coordinates as integers, the way
+    // Chrome does, while leaving genuinely fractional ones as floats.
+    #[test]
+    fn box_model_integral_coordinates_serialize_as_integers() {
+        assert_eq!(serde_json::to_string(&coord_value(256.0)).unwrap(), "256");
+        assert_eq!(serde_json::to_string(&coord_value(0.0)).unwrap(), "0");
+        // fractional coordinates stay floats
+        assert_eq!(serde_json::to_string(&coord_value(206.0390625)).unwrap(), "206.0390625");
+        // a full quad mixes both, exactly as DOM.getBoxModel returns it
+        let quad: Vec<Value> = [
+            256.0, 206.0390625, 347.25, 206.0390625, 347.25, 225.0390625, 256.0, 225.0390625,
+        ]
+        .iter()
+        .map(|n| coord_value(*n))
+        .collect();
+        assert_eq!(
+            serde_json::to_string(&quad).unwrap(),
+            "[256,206.0390625,347.25,206.0390625,347.25,225.0390625,256,225.0390625]"
         );
     }
 }

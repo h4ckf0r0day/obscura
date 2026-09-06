@@ -10,6 +10,18 @@ const OBSCURA: &str = env!("CARGO_BIN_EXE_obscura");
 const TEST_PAGE: &str = r#"<!doctype html><html><head><title>Example Domain</title></head>
 <body><h1>Example Domain</h1><p>Deterministic local MCP fixture.</p>
 <a href="/more">More information...</a></body></html>"#;
+const QUEUED_NAVIGATION_PAGE: &str =
+    "data:text/html,<title>queued-task-finished</title><p id=queued>queued</p>";
+const QUEUED_NAVIGATION_SELECTOR: &str = "#queued";
+const QUEUED_NAVIGATION_TITLE: &str = "queued-task-finished";
+const TIMER_TEST_INITIAL_PAGE: &str = "data:text/html,<title>initial</title>";
+const TIMER_TEST_TIMEOUT_SECONDS: u64 = 1;
+const INLINE_TEXT_URL: &str = "data:text/html,\
+<html><body>\
+<h1><span>H</span><span>e</span><span>l</span><span>l</span><span>o</span>%20\
+<span>w</span><span>o</span><span>r</span><span>l</span><span>d</span><span>.</span></h1>\
+<p><span>Hello</span><span>,</span>%20<span>world</span><span>!</span></p>\
+</body></html>";
 
 /// A loopback fixture keeps protocol tests independent of public-site bot
 /// policy, DNS, and content changes. The previous example.com dependency can
@@ -197,6 +209,27 @@ fn test_initialize() {
 }
 
 #[test]
+fn snapshot_preserves_whitespace_between_inline_spans() {
+    let mut client = McpClient::spawn();
+    let navigation = client.tool(
+        "browser_navigate",
+        serde_json::json!({ "url": INLINE_TEXT_URL }),
+    );
+    assert!(
+        navigation.get("error").is_none(),
+        "navigation failed: {navigation}"
+    );
+
+    let snapshot = client.tool("browser_snapshot", serde_json::json!({}));
+    let text = content_text(&snapshot);
+    assert!(
+        text.contains("Hello world.\n\nHello, world!"),
+        "snapshot mangled inline text: {text}"
+    );
+    assert!(!text.contains("H e l l o"), "snapshot inserted spaces: {text}");
+}
+
+#[test]
 fn test_ping() {
     let mut c = McpClient::spawn();
     let resp = c.call("ping", serde_json::json!({}));
@@ -308,6 +341,40 @@ fn test_evaluate_math() {
     let text = content_text(&resp);
     // V8 serialises integer results as floats ("3" or "3.0" depending on context)
     assert!(text == "3" || text == "3.0", "unexpected result: {text}");
+}
+
+#[test]
+fn test_wait_drives_timer_and_queued_navigation() {
+    let mut c = McpClient::spawn();
+    c.tool(
+        "browser_navigate",
+        serde_json::json!({"url": TIMER_TEST_INITIAL_PAGE}),
+    );
+    let target = serde_json::to_string(QUEUED_NAVIGATION_PAGE).expect("data URL should serialize");
+    c.tool(
+        "browser_evaluate",
+        serde_json::json!({
+            "expression": format!("setTimeout(() => {{ location.href = {target}; }}, 0)")
+        }),
+    );
+
+    let waited = c.tool(
+        "browser_wait_for",
+        serde_json::json!({
+            "selector": QUEUED_NAVIGATION_SELECTOR,
+            "timeout": TIMER_TEST_TIMEOUT_SECONDS,
+        }),
+    );
+
+    assert!(
+        waited["result"]["isError"].is_null(),
+        "wait failed: {waited}"
+    );
+    let title = c.tool(
+        "browser_evaluate",
+        serde_json::json!({"expression": "document.title"}),
+    );
+    assert_eq!(content_text(&title), QUEUED_NAVIGATION_TITLE);
 }
 
 #[test]

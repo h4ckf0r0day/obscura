@@ -1,6 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
@@ -13,7 +17,10 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, RuntimeEvent, RuntimeExceptionEvent,
+    StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -51,6 +58,53 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
+const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct HeapLimitState {
+    tripped: std::sync::atomic::AtomicBool,
+    restore_limit: std::sync::atomic::AtomicUsize,
+}
+
+fn install_heap_limit_guard(
+    runtime: &mut JsRuntime,
+    isolate_handle: IsolateHandle,
+    state: std::sync::Arc<HeapLimitState>,
+) {
+    runtime.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        let _ = state.restore_limit.compare_exchange(
+            0,
+            current_limit,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        state
+            .tripped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        isolate_handle.terminate_execution();
+        current_limit.saturating_add(HEAP_LIMIT_RECOVERY_HEADROOM_BYTES)
+    });
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("unknown panic")
+}
+
+/// Whether an event-loop task error is fatal to the page or page-local noise.
+/// deno_core reports a task's uncaught exception and an unhandled promise
+/// rejection as an event-loop error, but a browser treats both as page-local:
+/// window.onerror / unhandledrejection fire and later tasks still run. Only
+/// engine-level failures (watchdog termination, the heap cap, an exhausted
+/// task budget) make the loop itself unusable. (#699)
+pub fn is_fatal_event_loop_error(error: &str) -> bool {
+    error.contains("execution terminated")
+        || error.contains("heap limit exceeded")
+        || error.contains("task budget")
+}
 
 #[cfg(feature = "render")]
 fn with_sync_render_loading_disabled<R>(
@@ -72,6 +126,11 @@ fn with_sync_render_loading_disabled<R>(
 
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
+    /// True when this object is a value that was thrown or that a promise
+    /// rejected with, rather than the evaluation result. CDP reports those
+    /// through `exceptionDetails` on a successful reply, so the difference
+    /// has to survive the trip out of the runtime.
+    pub thrown: bool,
     pub js_type: String,
     pub subtype: Option<String>,
     pub class_name: String,
@@ -80,10 +139,24 @@ pub struct RemoteObjectInfo {
     pub value: Option<serde_json::Value>,
 }
 
+/// CDP remote objects that can be rebuilt when a page's V8 runtime is
+/// temporarily replaced during tab switching.
+///
+/// Obscura currently keeps one entered isolate per connection. Switching tabs
+/// therefore rebuilds the target page's runtime, but CDP clients reasonably
+/// expect handles returned by `Runtime.evaluate` to remain usable. Retaining
+/// the originating expressions lets the page restore a handle on demand under
+/// the same id without retaining a second isolate.
+#[derive(Default)]
+pub struct CdpObjectState {
+    object_counter: u64,
+    evaluation_recipes: HashMap<String, String>,
+}
+
 pub struct ObscuraJsRuntime {
-    runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
+    evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
@@ -94,6 +167,41 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// Signals that V8 approached its configured heap limit. The callback
+    /// terminates the current script and temporarily raises the limit just
+    /// enough for V8 to unwind instead of aborting the worker process.
+    heap_limit_state: std::sync::Arc<HeapLimitState>,
+    /// Browser module-map evaluation is idempotent. deno_core 0.350 asserts if
+    /// the same ModuleId is evaluated twice, so retain the first outcome for
+    /// duplicate script tags and roots already seen by Obscura.
+    module_evaluations: HashMap<deno_core::ModuleId, Result<(), String>>,
+    /// Append-only record owned by the module loader. A cursor around each
+    /// graph load identifies the dependency specifiers that become evaluated
+    /// with its root.
+    loaded_module_specifiers: Rc<RefCell<Vec<String>>>,
+    /// Successful graph evaluation also evaluates every dependency. Remember
+    /// those URLs so a dependency later encountered as a top-level script is a
+    /// browser-style no-op instead of a second deno_core `mod_evaluate` call.
+    evaluated_module_specifiers: HashMap<String, Result<(), String>>,
+    /// The bound op table, taken from bootstrap at construction and removed from
+    /// the global in the same step. Child frame realms are handed this object so
+    /// their shims can call ops; nothing else can reach it, including page
+    /// script.
+    ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    // Keep the runtime last: custom `Drop` enters its isolate, then every
+    // V8-backed field above is released before `OwnedIsolate` performs the
+    // matching exit and disposes the isolate.
+    js_runtime: JsRuntime,
+}
+
+/// Renders a caught V8 exception as a message for realm evaluation errors.
+fn exception_text(
+    scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
+) -> String {
+    match scope.exception() {
+        Some(exception) => exception.to_rust_string_lossy(scope),
+        None => "unknown error".to_string(),
+    }
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -101,6 +209,17 @@ pub struct ObscuraJsRuntime {
 pub struct PreparedModule {
     module_id: deno_core::ModuleId,
     description: String,
+    entry_specifier: Option<String>,
+    graph_specifiers: Vec<String>,
+}
+
+/// Embed a string as a JS string literal — double-quoted, with backslash,
+/// quotes, and control characters (newline, CR, NUL) escaped — for safe
+/// interpolation into generated script. Mirrors `object_id_literal` in
+/// obscura-cdp; a hand-rolled `replace('\'', ...)` misses backslashes and
+/// control chars, which either breaks out of the literal or SyntaxErrors.
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
@@ -169,10 +288,10 @@ pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> Wat
 }
 
 impl WatchdogToken {
-    /// Stop the watchdog. Returns true if it had already fired (terminated the
-    /// isolate). The caller must then clear the termination flag via
-    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
-    pub fn stop(mut self) -> bool {
+    fn cancel_and_join(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
         {
             let (lock, cvar) = &*self.pair;
             *lock.lock().unwrap() = true;
@@ -181,7 +300,23 @@ impl WatchdogToken {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+
+    /// Stop the watchdog. Returns true if it had already fired (terminated the
+    /// isolate). The caller must then clear the termination flag via
+    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
+    pub fn stop(mut self) -> bool {
+        self.cancel_and_join();
         self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WatchdogToken {
+    fn drop(&mut self) {
+        // Futures which own a watchdog may be cancelled while parked on I/O.
+        // Dropping the token must not leave a detached thread which later
+        // terminates an isolate that has already moved on to another task.
+        self.cancel_and_join();
     }
 }
 
@@ -191,12 +326,161 @@ impl WatchdogToken {
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
+/// A [`JsRuntime`] whose isolate is entered for the duration of one operation.
+///
+/// V8 requires the isolate that owns a context to be the thread's *current*
+/// one whenever that context is entered or left, and rusty_v8's scopes do not
+/// arrange that themselves -- they only ever pass the isolate explicitly. What
+/// made it work by accident was rusty_v8 entering an isolate when it is
+/// constructed and leaving it entered for life: with a single page, that page's
+/// isolate is trivially the current one.
+///
+/// With two pages it is not. The isolates form a stack, only the newest is
+/// current, and the consequences were both immediate and fatal:
+///
+/// - running any script on the *older* page aborted the process
+///   (`Check failed: heap->isolate() == Isolate::TryGetCurrent()`), so a second
+///   page effectively disabled the first;
+/// - dropping either page aborted too, because rusty_v8 requires isolates to
+///   be dropped in reverse construction order -- a contract an embedder holding
+///   independent `Page` objects cannot keep (#756).
+///
+/// So the isolate is exited once construction finishes and entered again only
+/// around work that touches V8. Entries are then properly nested no matter how
+/// many pages exist or what order they are used and dropped in.
+struct EnteredRuntime<'a>(&'a mut JsRuntime);
+
+/// Enters an isolate only while an async deno_core operation is being polled.
+/// Holding an entry across `.await` would let interleaved page futures violate
+/// V8's per-thread isolate stack.
+struct EnteredRuntimeFuture<F> {
+    isolate: *mut deno_core::v8::Isolate,
+    future: Option<Pin<Box<F>>>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+struct IsolateEntry(*mut deno_core::v8::Isolate);
+
+impl IsolateEntry {
+    unsafe fn new(isolate: *mut deno_core::v8::Isolate) -> Self {
+        unsafe { (&mut *isolate).enter() };
+        Self(isolate)
+    }
+}
+
+impl Drop for IsolateEntry {
+    fn drop(&mut self) {
+        unsafe { (&mut *self.0).exit() };
+    }
+}
+
+impl<F: Future> Future for EnteredRuntimeFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: construction ties the pointer and future to the same
+        // borrowed JsRuntime, which cannot move or drop while this exists.
+        let this = unsafe { self.get_unchecked_mut() };
+        let _entry = unsafe { IsolateEntry::new(this.isolate) };
+        this.future
+            .as_mut()
+            .expect("entered runtime future polled after drop")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<F> Drop for EnteredRuntimeFuture<F> {
+    fn drop(&mut self) {
+        // deno_core futures can own V8 handles, so drop them while their
+        // isolate is current too.
+        let _entry = unsafe { IsolateEntry::new(self.isolate) };
+        drop(self.future.take());
+    }
+}
+
+fn entered_runtime_future<'a, F>(
+    runtime: &'a mut JsRuntime,
+    make_future: impl FnOnce(&'a mut JsRuntime) -> F,
+) -> EnteredRuntimeFuture<F>
+where
+    F: Future,
+{
+    let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
+    let entry = unsafe { IsolateEntry::new(isolate) };
+    let future = Box::pin(make_future(runtime));
+    drop(entry);
+    EnteredRuntimeFuture {
+        isolate,
+        future: Some(future),
+        _not_send: PhantomData,
+    }
+}
+
+impl std::ops::Deref for EnteredRuntime<'_> {
+    type Target = JsRuntime;
+
+    fn deref(&self) -> &JsRuntime {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for EnteredRuntime<'_> {
+    fn deref_mut(&mut self) -> &mut JsRuntime {
+        self.0
+    }
+}
+
+impl Drop for EnteredRuntime<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this isolate was entered by the matching `runtime()` call
+        // and, entries being a per-thread stack, is the current one: any
+        // isolate entered since belongs to a nested operation that has already
+        // exited it.
+        unsafe {
+            self.0.v8_isolate().exit();
+        }
+    }
+}
+
+impl Drop for ObscuraJsRuntime {
+    fn drop(&mut self) {
+        // Teardown needs the isolate current as much as any other V8 work:
+        // deno_core's context cleanup clears the context's embedder slots, and
+        // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
+        // when `js_runtime` is dropped, immediately after this returns, and
+        // that `OwnedIsolate::drop` performs the matching exit.
+        //
+        // SAFETY: `enter` only pushes this isolate onto the current thread's
+        // entry stack; the pop is guaranteed by the drop that follows.
+        unsafe {
+            self.js_runtime.v8_isolate().enter();
+        }
+    }
+}
+
 impl ObscuraJsRuntime {
+    /// The V8 runtime, with its isolate entered for as long as the returned
+    /// guard lives. Every path that touches V8 goes through here; see
+    /// [`EnteredRuntime`] for why.
+    fn runtime(&mut self) -> EnteredRuntime<'_> {
+        // SAFETY: entering is always sound -- it pushes this isolate onto the
+        // current thread's entry stack -- and the guard's `Drop` pops it.
+        unsafe {
+            self.js_runtime.v8_isolate().enter();
+        }
+        EnteredRuntime(&mut self.js_runtime)
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
     /// share the retained layout on pages with running animations.
     fn begin_javascript_task(&mut self) {
+        // Some internal callers intentionally ignore script errors. Recover a
+        // heap-limit termination before any later task enters V8 even when the
+        // caller that triggered it did not need the error value.
+        self.recover_heap_limit();
         #[cfg(feature = "render")]
         begin_animation_task(&mut self.state.borrow_mut());
     }
@@ -223,14 +507,24 @@ impl ObscuraJsRuntime {
             import_map.clone(),
         );
         let module_load_activity = module_loader.activity();
+        let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
-        let (runtime, isolate_handle) = {
+        let (runtime, isolate_handle, heap_limit_state) = {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // ICU falls back to the host OS locale when no default is set,
+            // so Intl.* formats and resolvedOptions().locale leaked the
+            // operator's real locale (an en-AU host showed en-AU) while
+            // navigator.language and Accept-Language say en-US. Pin the one
+            // locale the other surfaces claim (#734). Process-global and
+            // idempotent; setting it under the create lock guarantees it
+            // lands before the first isolate exists.
+            deno_core::v8::icu::set_default_locale("en-US");
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -239,7 +533,22 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
 
-            runtime.op_state().borrow_mut().put(state_clone);
+            {
+                let op_state = runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                op_state.put(state_clone);
+                // Empty until a frame realm exists, which is what keeps the
+                // lookup free for pages that have no frames.
+                op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+            }
+
+            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+            let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
+            install_heap_limit_guard(
+                &mut runtime,
+                isolate_handle.clone(),
+                heap_limit_state.clone(),
+            );
 
             runtime
                 .execute_script(
@@ -248,19 +557,452 @@ impl ObscuraJsRuntime {
                 )
                 .expect("init should not fail");
 
-            let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-            (runtime, isolate_handle)
+            (runtime, isolate_handle, heap_limit_state)
         };
 
-        ObscuraJsRuntime {
-            runtime,
+        let mut instance = ObscuraJsRuntime {
             state,
             object_store: HashMap::new(),
+            evaluation_recipes: HashMap::new(),
             object_counter: 0,
             import_map,
             module_load_activity,
             isolate_handle,
+            heap_limit_state,
+            module_evaluations: HashMap::new(),
+            loaded_module_specifiers,
+            evaluated_module_specifiers: HashMap::new(),
+            ops_handoff: None,
+            js_runtime: runtime,
+        };
+        // Take the op table before any page script can run, and drop the global
+        // that exposed it in the same step.
+        instance.ops_handoff = instance.take_ops_handoff();
+
+        // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
+        // entered for life. Leave the thread's entry stack empty instead; every
+        // operation enters for its own duration. See `EnteredRuntime`.
+        //
+        // SAFETY: this isolate is the current one -- it was entered above and
+        // nothing on this thread has entered another since.
+        unsafe {
+            instance.js_runtime.v8_isolate().exit();
         }
+
+        instance
+    }
+
+    /// Creates an additional realm in this isolate: a second `v8::Context`.
+    ///
+    /// The startup snapshot already contains the whole bootstrap (see
+    /// `build.rs`), so a context restored from it arrives with every DOM class
+    /// and shim installed. Building a realm is therefore a context restore, not
+    /// a re-parse of the whole bootstrap.
+    ///
+    /// The new context has no ops: deno_core binds those into the main context
+    /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
+    /// object, which is legal because native function objects are shareable
+    /// between contexts of one isolate.
+    pub(crate) fn create_realm_context(
+        &mut self,
+    ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let context = {
+            let mut entered = self.runtime();
+            let isolate = entered.v8_isolate();
+            let scope = &mut deno_core::v8::HandleScope::new(isolate);
+            let context = deno_core::v8::Context::from_snapshot(
+                scope,
+                1,
+                deno_core::v8::ContextOptions::default(),
+            )
+            .or_else(|| {
+                deno_core::v8::Context::from_snapshot(
+                    scope,
+                    0,
+                    deno_core::v8::ContextOptions::default(),
+                )
+            })?;
+            deno_core::v8::Global::new(scope, context)
+        };
+        Some(context)
+    }
+
+    /// Takes the ops object bootstrap handed out, and removes the handoff from
+    /// the global so page script can never reach `Deno.core.ops`.
+    ///
+    /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
+    /// reference in a private const, so this handoff is the only way for the
+    /// host to reach the bound op functions and pass them to a child realm.
+    fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let ops_key = v8::String::new(scope, "ops")?;
+        let global = context.global(scope);
+
+        let core = global.get(scope, handoff_key.into())?;
+        let core = core.to_object(scope)?;
+        let ops = core.get(scope, ops_key.into())?;
+        if !ops.is_object() {
+            return None;
+        }
+        let ops = v8::Global::new(scope, ops);
+        global.delete(scope, handoff_key.into());
+        Some(ops)
+    }
+
+    /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
+    ///
+    /// A realm restored from the snapshot has its own `Deno.core` with an empty
+    /// ops table, and its bootstrap captured that exact object, so filling the
+    /// `ops` table on it is enough to give every shim in that realm a working
+    /// op surface. The functions are shared, not copied: same isolate.
+    pub(crate) fn share_ops_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) -> bool {
+        use deno_core::v8;
+
+        let Some(ops) = self.ops_handoff.clone() else {
+            return false;
+        };
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
+            return false;
+        };
+        let Some(ops_key) = v8::String::new(scope, "ops") else {
+            return false;
+        };
+        let global = context.global(scope);
+        let Some(core) = global.get(scope, handoff_key.into()) else {
+            return false;
+        };
+        let Some(core) = core.to_object(scope) else {
+            return false;
+        };
+        // `Deno.core.ops` is non-writable and non-configurable, so the table
+        // cannot be swapped wholesale: V8 reports success and changes nothing.
+        // Copy the bound op functions into the realm's existing table instead.
+        let Some(target) = core
+            .get(scope, ops_key.into())
+            .and_then(|value| value.to_object(scope))
+        else {
+            return false;
+        };
+        let source = v8::Local::new(scope, ops);
+        let Some(source) = source.to_object(scope) else {
+            return false;
+        };
+        let Some(names) = source.get_own_property_names(scope, Default::default()) else {
+            return false;
+        };
+        let mut copied = 0;
+        for index in 0..names.length() {
+            let Some(key) = names.get_index(scope, index) else {
+                continue;
+            };
+            let Some(value) = source.get(scope, key) else {
+                continue;
+            };
+            if target.set(scope, key, value).unwrap_or(false) {
+                copied += 1;
+            }
+        }
+        // The child realm must not expose the handoff to frame script either.
+        global.delete(scope, handoff_key.into());
+        copied > 0
+    }
+
+    /// Runs `source` inside `realm` and returns its value as a string. Errors
+    /// come back as `Err(message)`.
+    pub(crate) fn eval_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+    ) -> Result<String, String> {
+        use deno_core::v8;
+
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let code = v8::String::new(scope, source).ok_or("source too large")?;
+        let script = match v8::Script::compile(scope, code, None) {
+            Some(script) => script,
+            None => return Err(exception_text(scope)),
+        };
+        match script.run(scope) {
+            Some(value) => Ok(value.to_rust_string_lossy(scope)),
+            None => Err(exception_text(scope)),
+        }
+    }
+
+    /// Copies the browser-identity globals from the main realm into `realm`.
+    ///
+    /// A frame must present the same identity as its parent: anti-bot code
+    /// fingerprints inside the frame and compares it with the top document.
+    /// Copying the values the parent already has makes that true by
+    /// construction, instead of relying on a caller to reapply the same
+    /// settings to both.
+    pub(crate) fn copy_identity_to_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        const IDENTITY_GLOBALS: [&str; 7] = [
+            "__obscura_ua",
+            "__obscura_platform",
+            "__obscura_ua_platform",
+            "__obscura_ua_platform_version",
+            "__obscura_stealth",
+            "__obscura_geo_lat",
+            "__obscura_geo_lon",
+        ];
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        let main_context = v8::Local::new(scope, main);
+        let mut carried = Vec::new();
+        {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let global = main_context.global(scope);
+            for name in IDENTITY_GLOBALS {
+                let Some(key) = v8::String::new(scope, name) else {
+                    continue;
+                };
+                match global.get(scope, key.into()) {
+                    Some(value) if !value.is_undefined() => {
+                        carried.push((name, v8::Global::new(scope, value)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let realm_context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, realm_context);
+        let global = realm_context.global(scope);
+        for (name, value) in carried {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            let value = v8::Local::new(scope, value);
+            global.set(scope, key.into(), value);
+        }
+    }
+
+    /// Gives a frame's state the resources the page owns: cookie jar, HTTP
+    /// client, callbacks and the stealth transport. A frame shares these with
+    /// its page, exactly as it shares them in a browser.
+    pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
+        let parent = self.state.borrow();
+        frame.cookie_jar = parent.cookie_jar.clone();
+        frame.http_client = parent.http_client.clone();
+        frame.callbacks = parent.callbacks.clone();
+        frame.encoding = parent.encoding.clone();
+        frame.blocked_urls = parent.blocked_urls.clone();
+        frame.intercept_enabled = parent.intercept_enabled;
+        frame.page_in_flight = parent.page_in_flight.clone();
+        #[cfg(feature = "stealth")]
+        {
+            frame.stealth_client = parent.stealth_client.clone();
+        }
+    }
+
+    /// The origin of the document this runtime is running, or `"null"` for a
+    /// scheme that has no tuple origin.
+    pub(crate) fn page_origin(&self) -> String {
+        let url = self.state.borrow().url.clone();
+        match url::Url::parse(&url) {
+            Ok(parsed) if parsed.origin().is_tuple() => parsed.origin().ascii_serialization(),
+            _ => "null".to_string(),
+        }
+    }
+
+    /// Gives a same-origin frame realm the page's security token.
+    ///
+    /// V8 access-checks property reads across contexts and answers `undefined`
+    /// unless the two carry the same token, which is how a browser keeps one
+    /// origin out of another's window. Two contexts of one origin must share a
+    /// token, or the page reads its own frame's globals as undefined. Only
+    /// ever called after an origin comparison; a cross-origin frame keeps its
+    /// own token and stays opaque.
+    pub(crate) fn share_security_token_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let main = v8::Local::new(scope, main);
+        let realm = v8::Local::new(scope, realm);
+        let token = main.get_security_token(scope);
+        realm.set_security_token(token);
+    }
+
+    /// Publishes a frame realm's own `window` and `document` objects into the
+    /// page realm, under `__obscura_frameObjects[frameId]`.
+    ///
+    /// This is what the single isolate buys. Objects cannot cross isolates, so
+    /// a parent could only ever be handed a copy or a shim; within one isolate
+    /// it can hold the frame's real globals, which is what a browser gives it
+    /// for a same-origin frame. `contentWindow.someGlobal` is then a plain
+    /// property read of the frame's own object, and `contentDocument` is the
+    /// document the frame's scripts actually mutated.
+    pub(crate) fn publish_realm_objects(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+    ) -> bool {
+        use deno_core::v8;
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        // Read the frame's globals first, then install them in the page realm.
+        // Both contexts belong to this isolate, so the handles stay valid
+        // across the switch.
+        let realm_context = v8::Local::new(scope, realm);
+        let (frame_window, frame_document) = {
+            let scope = &mut v8::ContextScope::new(scope, realm_context);
+            let global = realm_context.global(scope);
+            let Some(key) = v8::String::new(scope, "document") else {
+                return false;
+            };
+            let document = global.get(scope, key.into());
+            (
+                v8::Global::new(scope, global),
+                document.map(|value| v8::Global::new(scope, value)),
+            )
+        };
+
+        let main_context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, main_context);
+        let global = main_context.global(scope);
+        let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
+            return false;
+        };
+        let registry = match global
+            .get(scope, registry_key.into())
+            .and_then(|value| value.to_object(scope))
+        {
+            Some(registry) if !registry.is_null_or_undefined() => registry,
+            _ => {
+                let fresh = v8::Object::new(scope);
+                global.set(scope, registry_key.into(), fresh.into());
+                fresh
+            }
+        };
+
+        let entry = v8::Object::new(scope);
+        let window = v8::Local::new(scope, frame_window);
+        if let Some(key) = v8::String::new(scope, "window") {
+            entry.set(scope, key.into(), window.into());
+        }
+        if let (Some(key), Some(document)) = (
+            v8::String::new(scope, "document"),
+            frame_document.map(|document| v8::Local::new(scope, document)),
+        ) {
+            entry.set(scope, key.into(), document);
+        }
+        let index = v8::Integer::new_from_unsigned(scope, frame_id);
+        registry.set(scope, index.into(), entry.into()).unwrap_or(false)
+    }
+
+    /// The table ops consult to find the calling realm's document.
+    pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
+        // `op_state` is a plain Rust-side table; no V8 access, no guard.
+        self.js_runtime
+            .op_state()
+            .borrow()
+            .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
+            .clone()
+    }
+
+    /// Frame documents fetched by any realm that still need one of their own.
+    /// The op queues onto the page's state whichever frame asked, so a frame
+    /// nested inside a frame is drained here too.
+    pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
+        let mut state = self.state.borrow_mut();
+        state.pending_frame_bytes = 0;
+        std::mem::take(&mut state.pending_frames)
+    }
+
+    /// postMessage traffic waiting to be delivered to another realm.
+    pub fn take_pending_frame_messages(&self) -> Vec<crate::ops::PendingFrameMessage> {
+        let mut state = self.state.borrow_mut();
+        state.pending_frame_message_bytes = 0;
+        std::mem::take(&mut state.pending_frame_messages)
+    }
+
+    /// Restore the configured V8 heap limit after the emergency headroom has
+    /// allowed a terminated allocation to unwind. The callback is then armed
+    /// again so a second hostile script cannot grow the isolate without bound.
+    fn recover_heap_limit(&mut self) -> bool {
+        if !self
+            .heap_limit_state
+            .tripped
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+
+        self.runtime().v8_isolate().cancel_terminate_execution();
+        let restore_limit = self
+            .heap_limit_state
+            .restore_limit
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        self.runtime()
+            .remove_near_heap_limit_callback(restore_limit);
+        let isolate_handle = self.isolate_handle.clone();
+        let heap_limit_state = self.heap_limit_state.clone();
+        install_heap_limit_guard(&mut *self.runtime(), isolate_handle, heap_limit_state);
+        tracing::warn!("V8 heap limit reached: terminated the current JavaScript task");
+        true
+    }
+
+    fn finish_heap_checked<T>(&mut self, result: Result<T, String>) -> Result<T, String> {
+        if self.recover_heap_limit() {
+            Err("JavaScript heap limit exceeded; execution terminated".to_string())
+        } else {
+            result
+        }
+    }
+
+    fn execute_runtime_script(
+        &mut self,
+        name: &'static str,
+        source: String,
+    ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
+        let result = self
+            .runtime()
+            .execute_script(name, source)
+            .map_err(|error| error.to_string());
+        self.finish_heap_checked(result)
     }
 
     /// Parse and merge an inline document import map. Rules which would alter
@@ -372,6 +1114,101 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
+    pub fn take_pending_runtime_events(&mut self) -> Vec<RuntimeEvent> {
+        let events: Vec<_> = self
+            .state
+            .borrow_mut()
+            .pending_runtime_events
+            .drain(..)
+            .collect();
+        for event in &events {
+            let RuntimeEvent::Console(event) = event else {
+                continue;
+            };
+            for arg in &event.args {
+                let Some(object_id) = arg.get("objectId").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let frame_id = object_id
+                    .strip_prefix("console-")
+                    .and_then(|rest| rest.split_once('-'))
+                    .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let retrieval = if frame_id == 0 {
+                    format!("globalThis.__obscura_objects['{object_id}']")
+                } else {
+                    format!(
+                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}']"
+                    )
+                };
+                self.object_store.insert(object_id.to_string(), retrieval);
+            }
+        }
+        events
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().runtime_events_enabled = enabled;
+    }
+
+    fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
+        let mut state = self.state.borrow_mut();
+        if !state.runtime_events_enabled {
+            return;
+        }
+        state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+        let first = error.frames.first();
+        let url = first
+            .and_then(|frame| frame.file_name.clone())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| fallback_url.to_string());
+        let line_number = first
+            .and_then(|frame| frame.line_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let column_number = first
+            .and_then(|frame| frame.column_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let stack_trace = error
+            .frames
+            .iter()
+            .map(|frame| {
+                serde_json::json!({
+                    "functionName": frame.function_name.as_deref().unwrap_or(""),
+                    "scriptId": "",
+                    "url": frame.file_name.as_deref().unwrap_or(fallback_url),
+                    "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+                    "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+                })
+            })
+            .collect();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1_000.0;
+        if state.pending_runtime_events.len() >= 1_024 {
+            state.pending_runtime_events.pop_front();
+        }
+        let exception_id = state.runtime_exception_counter;
+        state
+            .pending_runtime_events
+            .push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
+                exception_id,
+                name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
+                description: error
+                    .stack
+                    .clone()
+                    .unwrap_or_else(|| error.exception_message.clone()),
+                url,
+                line_number,
+                column_number,
+                stack_trace,
+                timestamp,
+            }));
+    }
+
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
         self.state
             .borrow()
@@ -405,28 +1242,26 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {
-        let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
         );
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
-        let p = platform.replace('\'', "\\'");
-        let uap = ua_platform.replace('\'', "\\'");
-        let uapv = ua_platform_version.replace('\'', "\\'");
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-platform>",
             format!(
-                "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
-                p, uap, uapv
+                "globalThis.__obscura_platform={};globalThis.__obscura_ua_platform={};globalThis.__obscura_ua_platform_version={};",
+                js_string_literal(platform),
+                js_string_literal(ua_platform),
+                js_string_literal(ua_platform_version),
             ),
         );
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-stealth>",
             format!("globalThis.__obscura_stealth = {};", enabled),
         );
@@ -450,7 +1285,7 @@ impl ObscuraJsRuntime {
                 state.resolved_scroll = None;
             }
         }
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-viewport>",
             format!(
                 "globalThis.__obscura_viewport_w={width};\
@@ -490,7 +1325,7 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_set_screen_override(null,null,{emulated});"
             ),
         };
-        let _ = self.runtime.execute_script("<set-screen-size>", script);
+        let _ = self.execute_runtime_script("<set-screen-size>", script);
     }
 
     /// Current clamped root scroll offset shared by CSSOM geometry and paint.
@@ -611,6 +1446,41 @@ impl ObscuraJsRuntime {
             viewport,
             base_url,
             [255, 255, 255, 255],
+        )
+    }
+
+    /// Paint an unprepared view of the current document against the runtime's
+    /// retained resource cache.
+    ///
+    /// `Page` falls back to a raw-DOM paint when a capture's viewport does not
+    /// match the prepared render key. That fallback used a fresh
+    /// `RenderResourceCache`, so it refetched every image on every call and a
+    /// repeated capture paid the network cost per frame. Reusing the cache the
+    /// runtime already holds for this document keeps the fallback correct while
+    /// fetching each resource once.
+    #[cfg(feature = "render")]
+    pub fn screenshot_unprepared_with_retained_resources(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        scroll: (f32, f32),
+        animation_sample_time: obscura_render::AnimationSampleTime,
+        surface_color: [u8; 4],
+    ) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let ObscuraState {
+            dom,
+            render_resources,
+            ..
+        } = &mut *state;
+        obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+            dom.as_ref()?,
+            viewport,
+            base_url,
+            scroll,
+            animation_sample_time,
+            surface_color,
+            render_resources,
         )
     }
 
@@ -916,7 +1786,7 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
@@ -926,7 +1796,7 @@ impl ObscuraJsRuntime {
     /// values are injected as numeric globals the bootstrap reads; when unset it
     /// keeps the built-in default. Callers validate the range before calling.
     pub fn set_geolocation(&mut self, latitude: f64, longitude: f64) {
-        let _ = self.runtime.execute_script(
+        let _ = self.execute_runtime_script(
             "<set-geo>",
             format!(
                 "globalThis.__obscura_geo_lat={};globalThis.__obscura_geo_lon={};",
@@ -939,8 +1809,7 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let result = self
-            .runtime
-            .execute_script("<eval>", wrapped)
+            .execute_runtime_script("<eval>", wrapped)
             .map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
     }
@@ -967,33 +1836,40 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        if !await_promise && return_by_value {
-            let val = self.evaluate(expression)?;
-            return Ok(Self::info_from_json(&val));
-        }
+        // Every shape of this command now travels the same path. The
+        // by-value sync case used to short-circuit through `evaluate`,
+        // whose wrapper answers an exception with `null` — indistinguishable
+        // from an expression that really evaluated to null (#746).
         self.begin_javascript_task();
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
 
-        // Same trailing-semicolon trim as wrap_expression — Playwright's
-        // utility-script eval ends with `})();`, and `({expr})` would
-        // otherwise become `(...;)` which is a parse-time SyntaxError.
-        let cleaned_expr = expression
-            .trim()
-            .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
-
-        // Puppeteer / Playwright bundles end with a `//# sourceURL=...`
-        // line comment. If we put `{expr})` on a single line the comment
-        // swallows the closing paren and our wrapper breaks. A newline
-        // before the `)` terminates any trailing line comment so the
-        // parens close on their own line.
+        // The expression travels as a *string* into an indirect eval rather
+        // than being pasted into a wrapper. Pasting forced two workarounds
+        // that only half worked: a trailing `;` had to be trimmed or
+        // `(expr;)` failed to parse, and a trailing `//# sourceURL=` comment
+        // (Puppeteer and Playwright both append one) would swallow the
+        // closing paren unless it sat on its own line. Neither can happen to
+        // a string literal.
+        //
+        // It also makes statements legal. `Runtime.evaluate` is specified to
+        // take a script, not an expression, so `throw new Error('x')` and
+        // `var x = 1; x * 2` are both valid input; wrapped in parentheses the
+        // first was a parse-time SyntaxError, which is not catchable, and the
+        // second returned the wrapper's own `undefined` instead of the
+        // completion value Chrome reports (#746).
+        //
+        // `(0, eval)` rather than `eval` so the script runs at global scope,
+        // where `var` lands on `globalThis` the way it does in Chrome, and
+        // cannot see this wrapper's `__result`.
+        let source_literal = serde_json::Value::String(expression.to_string());
         let done_counter = self.object_counter;
         let meta_code = if await_promise {
             format!(
                 "(async function() {{\n\
                     try {{\n\
-                        var __result = await (\n{expr}\n);\n\
+                        var __result = await (0, eval)({src});\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
                         globalThis.__obscura_await_rejected = false;\n\
@@ -1004,29 +1880,43 @@ impl ObscuraJsRuntime {
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
-                expr = cleaned_expr,
+                src = source_literal,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = Self::meta_extract_js("e"),
                 done_counter = done_counter,
             )
         } else {
+            // The synchronous half writes the same two globals as the await
+            // half above, so one outcome protocol covers both and the reply
+            // builder does not have to care which path produced the value.
+            // Before this, a throw here became `__result = undefined`: the
+            // command answered successfully with `undefined`, so a page error
+            // was indistinguishable from an expression with no value.
             format!(
                 "(function() {{\n\
                     var __result;\n\
-                    try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
+                    try {{\n\
+                        __result = (0, eval)({src});\n\
+                    }} catch(e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
+                        return globalThis.__obscura_await_meta;\n\
+                    }}\n\
                     globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    globalThis.__obscura_await_rejected = false;\n\
                     return {meta_fn};\n\
                 }})()",
-                expr = cleaned_expr,
+                src = source_literal,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = Self::meta_extract_js("e"),
             )
         };
 
         let result = self
-            .runtime
-            .execute_script("<eval-remote>", meta_code)
+            .execute_runtime_script("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
         let meta_str = if await_promise {
@@ -1035,8 +1925,7 @@ impl ObscuraJsRuntime {
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.runtime
-                            .execute_script("<done?>", sentinel.clone())
+                        rt.execute_runtime_script("<done?>", sentinel.clone())
                             .ok()
                             .and_then(|v| rt.v8_to_json(v).ok())
                             .and_then(|j| j.as_bool())
@@ -1063,27 +1952,28 @@ impl ObscuraJsRuntime {
                     preview,
                 );
             }
-            let rejected = self
-                .runtime
-                .execute_script(
-                    "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.runtime.execute_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
-                    .map_err(|e| format!("JS error: {}", e))?;
-                return Err(format!(
-                    "Promise rejected: {}",
-                    self.v8_to_json(err)?.as_str().unwrap_or("")
-                ));
-            }
-            self.runtime
-                .execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
         };
+
+        // Neither a rejection nor a synchronous throw is a protocol failure.
+        // CDP answers the command and puts the value in `exceptionDetails`,
+        // which is what a client rebuilds the page error from, so it travels
+        // back as a remote object flagged `thrown`. It is reported by
+        // reference even when the caller asked for a value:
+        // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
+        // would throw the message away.
+        let thrown = self
+            .execute_runtime_script(
+                "<readRejected>",
+                "globalThis.__obscura_await_rejected".to_string(),
+            )
+            .map_err(|e| format!("JS error: {}", e))?;
+        if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
+            return self.thrown_info(&oid);
+        }
         let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
@@ -1094,11 +1984,16 @@ impl ObscuraJsRuntime {
             oid.clone(),
             format!("globalThis.__obscura_objects['{}']", oid),
         );
+        if !return_by_value {
+            // The eval-based wrapper above parses the raw expression as
+            // statements, so no trailing-semicolon trim is needed here.
+            self.evaluation_recipes
+                .insert(oid.clone(), expression.to_string());
+        }
 
-        if await_promise && return_by_value {
+        if return_by_value {
             let read = self
-                .runtime
-                .execute_script(
+                .execute_runtime_script(
                     "<readResult>",
                     format!("globalThis.__obscura_objects['{}']", oid),
                 )
@@ -1158,10 +2053,12 @@ impl ObscuraJsRuntime {
                         __result = await __fn.call(__this, {args});\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
+                        globalThis.__obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
                         globalThis.__obscura_objects['{oid}'] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
                     }} finally {{\n\
                         globalThis.__obscura_done_{done_counter} = true;\n\
                     }}\n\
@@ -1176,8 +2073,7 @@ impl ObscuraJsRuntime {
                 done_counter = done_counter,
             );
 
-            self.runtime
-                .execute_script("<callFnAsync>", code)
+            self.execute_runtime_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
 
             let __t0 = std::time::Instant::now();
@@ -1185,8 +2081,7 @@ impl ObscuraJsRuntime {
             let settled = self
                 .resolve_promises_until(
                     |rt| {
-                        rt.runtime
-                            .execute_script("<done?>", sentinel.clone())
+                        rt.execute_runtime_script("<done?>", sentinel.clone())
                             .ok()
                             .and_then(|v| rt.v8_to_json(v).ok())
                             .and_then(|j| j.as_bool())
@@ -1214,10 +2109,25 @@ impl ObscuraJsRuntime {
                 );
             }
 
+            // Same rule as evaluate: a rejected call is answered, not failed,
+            // and the value is never serialized by value. Without this the
+            // wrapper stored the error under the object id a success uses, so
+            // a rejection came back as an ordinary result: an Error as `{}`,
+            // and `Promise.reject({code: 42})` as `{code: 42}`, which is
+            // indistinguishable from resolving with it.
+            let rejected = self
+                .execute_runtime_script(
+                    "<readRejected>",
+                    "globalThis.__obscura_await_rejected".to_string(),
+                )
+                .map_err(|e| format!("JS error: {}", e))?;
+            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+                return self.thrown_info(&oid);
+            }
+
             if return_by_value {
                 let read = self
-                    .runtime
-                    .execute_script(
+                    .execute_runtime_script(
                         "<readResult>",
                         format!("globalThis.__obscura_objects['{}']", oid),
                     )
@@ -1227,8 +2137,7 @@ impl ObscuraJsRuntime {
             }
 
             let meta_result = self
-                .runtime
-                .execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -1257,8 +2166,7 @@ impl ObscuraJsRuntime {
                 args = args_list,
             );
             let result = self
-                .runtime
-                .execute_script("<callFnByValue>", code)
+                .execute_runtime_script("<callFnByValue>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
             let json_val = self.v8_to_json(result)?;
             return Ok(Self::info_from_json(&json_val));
@@ -1281,8 +2189,7 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .runtime
-            .execute_script("<callFnRemote>", code)
+            .execute_runtime_script("<callFnRemote>", code)
             .map_err(|e| format!("JS error: {}", e))?;
         let meta_str = self.v8_to_json(result)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -1320,8 +2227,7 @@ impl ObscuraJsRuntime {
             "globalThis.__obscura_objects['{}'] = ({});",
             oid, js_expression,
         );
-        self.runtime
-            .execute_script("<store>", code)
+        self.execute_runtime_script("<store>", code)
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
@@ -1348,8 +2254,7 @@ impl ObscuraJsRuntime {
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
-            .runtime
-            .execute_script("<store-meta>", code)
+            .execute_runtime_script("<store-meta>", code)
             .map_err(|e| format!("Store error: {}", e))?;
         let meta_str = self.v8_to_json(result)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -1365,18 +2270,56 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object(&mut self, object_id: &str) {
+        self.evaluation_recipes.remove(object_id);
         if self.object_store.remove(object_id).is_some() {
-            let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
-            let _ = self.runtime.execute_script("<release>", code);
+            let frame_id = object_id
+                .strip_prefix("console-")
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                .unwrap_or(0);
+            let code = if frame_id == 0 {
+                format!("delete globalThis.__obscura_objects['{object_id}'];")
+            } else {
+                format!(
+                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}'];"
+                )
+            };
+            let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let _ = self.runtime.execute_script(
-            "<releaseGroup>",
-            "globalThis.__obscura_objects = {};".to_string(),
-        );
+        let mut frame_ids: Vec<u32> = self
+            .object_store
+            .keys()
+            .filter_map(|object_id| object_id.strip_prefix("console-"))
+            .filter_map(|rest| rest.split_once('-'))
+            .filter_map(|(frame_id, _)| frame_id.parse().ok())
+            .filter(|frame_id| *frame_id != 0)
+            .collect();
+        frame_ids.sort_unstable();
+        frame_ids.dedup();
+        let mut code = "globalThis.__obscura_objects = {};".to_string();
+        for frame_id in frame_ids {
+            code.push_str(&format!(
+                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
+            ));
+        }
+        let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
+        self.evaluation_recipes.clear();
+    }
+
+    pub fn take_cdp_object_state(&mut self) -> CdpObjectState {
+        CdpObjectState {
+            object_counter: self.object_counter,
+            evaluation_recipes: std::mem::take(&mut self.evaluation_recipes),
+        }
+    }
+
+    pub fn restore_cdp_object_state(&mut self, state: CdpObjectState) {
+        self.object_counter = self.object_counter.max(state.object_counter);
+        self.evaluation_recipes = state.evaluation_recipes;
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
@@ -1398,6 +2341,7 @@ impl ObscuraJsRuntime {
         let budget = tokio::time::Duration::from_millis(budget_ms);
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
+        let loaded_start = self.loaded_module_specifiers.borrow().len();
 
         // Bound the recursive import-graph fetch. deno_core fetches the graph
         // concurrently through the one page-scoped module loader. Loading the
@@ -1406,12 +2350,10 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
-        let module_id = match tokio::time::timeout(
-            budget,
-            self.runtime.load_side_es_module(&specifier),
-        )
-        .await
-        {
+        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.load_side_es_module(&specifier)
+        });
+        let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
             Err(_) => {
@@ -1425,9 +2367,16 @@ impl ObscuraJsRuntime {
         // Return as soon as the module finishes evaluating rather than waiting
         // for the loop to go fully idle: a page timer (setInterval) keeps the
         // loop busy forever and would otherwise burn the whole budget (#374).
+        let mut graph_specifiers = self.loaded_module_specifiers.borrow()[loaded_start..].to_vec();
+        graph_specifiers.push(specifier.to_string());
+        graph_specifiers.sort_unstable();
+        graph_specifiers.dedup();
+
         Ok(PreparedModule {
             module_id,
             description: format!("Module {}", url),
+            entry_specifier: Some(specifier.to_string()),
+            graph_specifiers,
         })
     }
 
@@ -1447,32 +2396,68 @@ impl ObscuraJsRuntime {
         budget_ms: u64,
         what: &str,
     ) -> Result<(), String> {
+        if let Some(outcome) = self.module_evaluations.get(&module_id) {
+            return outcome.clone();
+        }
+
         self.begin_javascript_task();
         let budget = tokio::time::Duration::from_millis(budget_ms);
-        let result = self.runtime.mod_evaluate(module_id);
+        // deno_core 0.350 asserts instead of treating a second evaluation as
+        // the module-map no-op required by browsers. The local outcome cache
+        // covers duplicate roots prepared by Obscura. A root can also have
+        // been evaluated earlier as another graph's dependency, which is only
+        // observable when mod_evaluate checks V8's private module status, so
+        // contain that dependency assertion at this boundary as well.
+        let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime().mod_evaluate(module_id)
+        }));
+        let result = match evaluation {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = panic_payload_message(payload.as_ref());
+                let outcome = if message.contains("Module already evaluated") {
+                    self
+                        .runtime()
+                        .get_module_namespace(module_id)
+                        .map(|_| ())
+                        .map_err(|error| format!("{} eval error: {}", what, error))
+                } else {
+                    Err(format!("{} evaluation panicked: {}", what, message))
+                };
+                self.module_evaluations.insert(module_id, outcome.clone());
+                return outcome;
+            }
+        };
         tokio::pin!(result);
 
-        let outcome = tokio::time::timeout(budget, async {
-            let event_loop = self
-                .runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default());
-            tokio::pin!(event_loop);
-            tokio::select! {
-                biased;
-                e = &mut event_loop => { e?; (&mut result).await }
-                r = &mut result => r,
-            }
-        })
+        let outcome = tokio::time::timeout(
+            budget,
+            std::future::poll_fn(|cx| {
+                let mut entered = self.runtime();
+                match entered.poll_event_loop(cx, deno_core::PollEventLoopOptions::default()) {
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => result.as_mut().poll(cx),
+                    Poll::Pending => result.as_mut().poll(cx),
+                }
+            }),
+        )
         .await;
 
-        match outcome {
-            Ok(Ok(())) => Ok(()),
+        let outcome = match outcome {
+            Ok(Ok(())) => self
+                .runtime()
+                .get_module_namespace(module_id)
+                .map(|_| ())
+                .map_err(|error| format!("{} eval error: {}", what, error)),
             Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
             Err(_) => Err(format!(
                 "{} evaluation timed out after {}ms",
                 what, budget_ms
             )),
-        }
+        };
+        let outcome = self.finish_heap_checked(outcome);
+        self.module_evaluations.insert(module_id, outcome.clone());
+        outcome
     }
 
     pub async fn load_inline_module(
@@ -1508,16 +2493,15 @@ impl ObscuraJsRuntime {
         // each prepared module distinct until its scheduled evaluation.
         let specifier = deno_core::ModuleSpecifier::parse(base_url)
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
+        let loaded_start = self.loaded_module_specifiers.borrow().len();
 
-        let module_id = match tokio::time::timeout(
-            budget,
-            self.runtime.load_side_es_module_from_code(
+        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
-            ),
-        )
-        .await
-        {
+            )
+        });
+        let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
             Err(_) => {
@@ -1533,9 +2517,17 @@ impl ObscuraJsRuntime {
         // keeps the loop busy forever, and waiting for idle burned the whole
         // budget on this preamble module and starved the module that mounts the
         // app, leaving #root empty (issue #374).
+        let mut graph_specifiers = self.loaded_module_specifiers.borrow()[loaded_start..].to_vec();
+        graph_specifiers.sort_unstable();
+        graph_specifiers.dedup();
+
         Ok(PreparedModule {
             module_id,
             description: "Inline module".to_string(),
+            // Multiple inline modules intentionally share the document URL,
+            // but each has its own source and ModuleId.
+            entry_specifier: None,
+            graph_specifiers,
         })
     }
 
@@ -1547,7 +2539,15 @@ impl ObscuraJsRuntime {
         let PreparedModule {
             module_id,
             description,
+            entry_specifier,
+            graph_specifiers,
         } = prepared;
+        if let Some(outcome) = entry_specifier
+            .as_ref()
+            .and_then(|specifier| self.evaluated_module_specifiers.get(specifier))
+        {
+            return outcome.clone();
+        }
         // Tokio timeouts cannot run while synchronous top-level module work
         // pins the runtime thread in V8. Pair the async timeout with a hard V8
         // watchdog so this budget is a real wall-clock ceiling for both forms
@@ -1557,69 +2557,100 @@ impl ObscuraJsRuntime {
             .drive_module_eval(module_id, budget_ms, &description)
             .await;
         let watchdog_fired = self.disarm_watchdog(watchdog);
-        if watchdog_fired {
+        let result = if watchdog_fired {
             Err(format!(
                 "{} evaluation timed out after {}ms",
                 description, budget_ms
             ))
         } else {
             result
+        };
+
+        if let Some(entry_specifier) = entry_specifier {
+            self.evaluated_module_specifiers
+                .insert(entry_specifier, result.clone());
         }
+        if result.is_ok() {
+            for specifier in graph_specifiers {
+                self.evaluated_module_specifiers.insert(specifier, Ok(()));
+            }
+        }
+        result
     }
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
         self.begin_javascript_task();
+        let script_url = name.to_string();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let scope = &mut self.runtime.handle_scope();
-        let source = deno_core::v8::String::new(scope, source)
-            .ok_or_else(|| "JS error: source allocation failed".to_string())?;
-        let name = deno_core::v8::String::new(scope, name)
-            .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
-        let origin = deno_core::v8::ScriptOrigin::new(
-            scope,
-            name.into(),
-            0,
-            0,
-            false,
-            0,
-            None,
-            false,
-            false,
-            false,
-            None,
-        );
-        let scope = &mut deno_core::v8::TryCatch::new(scope);
-        let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
-        let Some(script) = script else {
-            if scope.is_execution_terminating() {
-                scope.cancel_terminate_execution();
-                return Err("JS error: Uncaught Error: execution terminated".to_string());
-            }
-            return match scope.exception() {
-                Some(exception) => {
-                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                    Err(format!("JS error: {error}"))
+        let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
+            let mut entered = self.runtime();
+            let scope = &mut entered.handle_scope();
+            let source = deno_core::v8::String::new(scope, source)
+                .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
+            let name = deno_core::v8::String::new(scope, name)
+                .ok_or_else(|| ("JS error: script URL allocation failed".to_string(), None))?;
+            let origin = deno_core::v8::ScriptOrigin::new(
+                scope,
+                name.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                false,
+                None,
+            );
+            let scope = &mut deno_core::v8::TryCatch::new(scope);
+            let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
+            let Some(script) = script else {
+                if scope.is_execution_terminating() {
+                    scope.cancel_terminate_execution();
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
-                None => Err("JS error: script compilation failed without an exception".to_string()),
+                return match scope.exception() {
+                    Some(exception) => {
+                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                        Err((format!("JS error: {error}"), Some(error)))
+                    }
+                    None => Err((
+                        "JS error: script compilation failed without an exception".to_string(),
+                        None,
+                    )),
+                };
             };
+            if script.run(scope).is_none() {
+                if scope.is_execution_terminating() {
+                    scope.cancel_terminate_execution();
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
+                }
+                return match scope.exception() {
+                    Some(exception) => {
+                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                        Err((format!("JS error: {error}"), Some(error)))
+                    }
+                    None => Err((
+                        "JS error: script execution failed without an exception".to_string(),
+                        None,
+                    )),
+                };
+            }
+            Ok(())
+        })();
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err((message, error)) => {
+                if let Some(error) = error.as_ref() {
+                    self.record_uncaught_exception(error, &script_url);
+                }
+                Err(message)
+            }
         };
-        if script.run(scope).is_none() {
-            if scope.is_execution_terminating() {
-                scope.cancel_terminate_execution();
-                return Err("JS error: Uncaught Error: execution terminated".to_string());
-            }
-            return match scope.exception() {
-                Some(exception) => {
-                    let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                    Err(format!("JS error: {error}"))
-                }
-                None => Err("JS error: script execution failed without an exception".to_string()),
-            };
-        }
-        Ok(())
+        self.finish_heap_checked(result)
     }
 
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
@@ -1644,7 +2675,7 @@ impl ObscuraJsRuntime {
             return self.execute_classic_script(name, source);
         }
 
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let isolate_handle = self.runtime().v8_isolate().thread_safe_handle();
 
         let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let pair_clone = pair.clone();
@@ -1699,14 +2730,15 @@ impl ObscuraJsRuntime {
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
-        let result = self
-            .runtime
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+        });
+        let result = event_loop
             .await
             .map_err(|e| format!("Event loop error: {}", e));
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
-        result
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        self.finish_heap_checked(result)
     }
 
     /// Whether the serialized dynamic-script queue is still fetching or
@@ -1773,7 +2805,7 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        spawn_watchdog(self.runtime.v8_isolate().thread_safe_handle(), budget)
+        spawn_watchdog(self.runtime().v8_isolate().thread_safe_handle(), budget)
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
@@ -1782,7 +2814,7 @@ impl ObscuraJsRuntime {
     pub fn disarm_watchdog(&mut self, token: WatchdogToken) -> bool {
         let fired = token.stop();
         if fired {
-            self.runtime.v8_isolate().cancel_terminate_execution();
+            self.runtime().v8_isolate().cancel_terminate_execution();
             tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
         }
         fired
@@ -1799,7 +2831,7 @@ impl ObscuraJsRuntime {
     /// isolate handle) fired, so the isolate is usable for the next command.
     /// No-op when the isolate is not terminating.
     pub fn cancel_termination(&mut self) {
-        self.runtime.v8_isolate().cancel_terminate_execution();
+        self.runtime().v8_isolate().cancel_terminate_execution();
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
@@ -1841,15 +2873,26 @@ impl ObscuraJsRuntime {
                     // queued from them belongs to a subsequent cooperative
                     // turn. Yield so the wall deadline remains observable even
                     // when every turn immediately schedules another one.
-                    self.runtime.v8_isolate().perform_microtask_checkpoint();
+                    self.runtime().v8_isolate().perform_microtask_checkpoint();
                     tokio::task::yield_now().await;
                 }
-                Ok(Err(error)) => break Err(error),
+                Ok(Err(error)) => {
+                    if is_fatal_event_loop_error(&error) {
+                        break Err(error);
+                    }
+                    // A page task threw or a promise rejected without a
+                    // handler. Chrome reports it and keeps scheduling; the
+                    // pump must do the same, or one throwing script starves
+                    // every later task (#699). The wall deadline above still
+                    // bounds a page that errors on every turn.
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                }
                 Err(_) => break Ok(()),
             }
         };
         let fired = self.disarm_watchdog(token);
         match result {
+            Err(error) if error.contains("heap limit exceeded") => Err(error),
             Err(error) if fired || error.contains("execution terminated") => Ok(()),
             other => other,
         }
@@ -1885,11 +2928,11 @@ impl ObscuraJsRuntime {
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             let tick = self
-                .runtime
+                .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -1905,7 +2948,8 @@ impl ObscuraJsRuntime {
                 }
             }
         })
-        .await
+        .await;
+        self.finish_heap_checked(result)
     }
 
     /// Drive one browser task while allowing the future to remain parked on
@@ -1930,31 +2974,43 @@ impl ObscuraJsRuntime {
             self.isolate_handle(),
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
         );
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
         }
+        if self.recover_heap_limit() {
+            return Err("JavaScript heap limit exceeded; execution terminated".into());
+        }
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
-        std::future::poll_fn(|cx| {
+        let result = std::future::poll_fn(|cx| {
             let watchdog = crate::cdp_watchdog::arm(
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
             );
             let tick = self
-                .runtime
+                .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
-                self.runtime.v8_isolate().cancel_terminate_execution();
+                self.runtime().v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                // A page task error (uncaught exception, unhandled rejection)
+                // is page-local in a browser: log it, report one delivered
+                // task, and let the owner keep pumping (#699).
+                std::task::Poll::Ready(Err(error))
+                    if !is_fatal_event_loop_error(&error.to_string()) =>
+                {
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
@@ -1967,7 +3023,8 @@ impl ObscuraJsRuntime {
                 }
             }
         })
-        .await
+        .await;
+        self.finish_heap_checked(result)
     }
 
     /// Drive one cooperative event-loop turn for browser lifecycle code that
@@ -2089,15 +3146,21 @@ impl ObscuraJsRuntime {
             if tick_fired {
                 break Ok(());
             }
-            self.runtime.v8_isolate().perform_microtask_checkpoint();
+            self.runtime().v8_isolate().perform_microtask_checkpoint();
             match tick {
                 Ok(Ok(true)) => break Ok(()),
                 Ok(Ok(false)) | Err(_) => {}
+                // A page task error is page-local noise, not a reason to stop
+                // settling: later timers and fetches still run (#699).
+                Ok(Err(error)) if !is_fatal_event_loop_error(&error) => {
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                }
                 Ok(Err(error)) => break Err(error),
             }
         };
         let fired = self.disarm_watchdog(token);
         match result {
+            Err(error) if error.contains("heap limit exceeded") => Err(error),
             Err(error) if fired || error.contains("execution terminated") => Ok(()),
             other => other,
         }
@@ -2117,8 +3180,11 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime.execute_script("<eval>", wrapped);
+        let result = self.runtime().execute_script("<eval>", wrapped);
         let fired = self.disarm_watchdog(token);
+        if self.recover_heap_limit() {
+            return Err("JavaScript heap limit exceeded; execution terminated".to_string());
+        }
         match result {
             Ok(v) if !fired => self.v8_to_json(v),
             Ok(_) => Err("eval timed out".to_string()),
@@ -2136,12 +3202,11 @@ impl ObscuraJsRuntime {
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
+        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+        });
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_loop).await;
+        self.recover_heap_limit();
     }
 
     /// Pump the event loop until `done_check` returns true (e.g. an IIFE
@@ -2177,12 +3242,17 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+                runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+            });
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
-                self.runtime
-                    .run_event_loop(deno_core::PollEventLoopOptions::default()),
+                event_loop,
             )
             .await;
+            if self.recover_heap_limit() {
+                return false;
+            }
             // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
             // worst case we miss the result by <50ms.
             if tick_ms < 50 {
@@ -2326,6 +3396,12 @@ impl ObscuraJsRuntime {
                     cn = 'Function';
                     desc = v.name ? 'function ' + v.name + '()' : 'function()';
                 }}
+                else if (t === 'object' && v instanceof Error) {{
+                    st = 'error';
+                    cn = (v.constructor && v.constructor.name) || 'Error';
+                    desc = (typeof v.stack === 'string' && v.stack) ? v.stack
+                         : (cn + (v.message ? ': ' + v.message : ''));
+                }}
                 else if (t === 'object') {{
                     cn = (v.constructor && v.constructor.name) || 'Object';
                     desc = cn;
@@ -2337,11 +3413,27 @@ impl ObscuraJsRuntime {
         )
     }
 
-    fn resolve_this(&self, object_id: Option<&str>) -> String {
+    fn resolve_remote_object(&mut self, object_id: &str) -> Option<String> {
+        if let Some(retrieval) = self.object_store.get(object_id) {
+            return Some(retrieval.clone());
+        }
+        let expression = self.evaluation_recipes.get(object_id)?.clone();
+        let object_id_literal = js_string_literal(object_id);
+        let code = format!(
+            "globalThis.__obscura_objects[{object_id_literal}] = (\n{expression}\n);"
+        );
+        self.execute_runtime_script("<restore-cdp-object>", code).ok()?;
+        let retrieval = format!("globalThis.__obscura_objects[{object_id_literal}]");
+        self.object_store
+            .insert(object_id.to_string(), retrieval.clone());
+        Some(retrieval)
+    }
+
+    fn resolve_this(&mut self, object_id: Option<&str>) -> String {
         match object_id {
             Some(oid) => {
-                if let Some(retrieval) = self.object_store.get(oid) {
-                    retrieval.clone()
+                if let Some(retrieval) = self.resolve_remote_object(oid) {
+                    retrieval
                 } else if oid.starts_with("node-") {
                     let nid = oid.strip_prefix("node-").unwrap_or("0");
                     format!(
@@ -2361,7 +3453,7 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn build_args(&self, arguments: &[serde_json::Value]) -> (String, String) {
+    fn build_args(&mut self, arguments: &[serde_json::Value]) -> (String, String) {
         let mut setup_lines = Vec::new();
         let mut arg_names = Vec::new();
 
@@ -2372,7 +3464,7 @@ impl ObscuraJsRuntime {
                     serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
                 setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
-                if let Some(retrieval) = self.object_store.get(oid) {
+                if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
@@ -2392,7 +3484,8 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
+        let mut entered = self.runtime();
+        let scope = &mut entered.handle_scope();
         let local = deno_core::v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
@@ -2438,6 +3531,7 @@ impl ObscuraJsRuntime {
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
         match value {
             serde_json::Value::Null => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: Some("null".into()),
                 class_name: String::new(),
@@ -2446,6 +3540,7 @@ impl ObscuraJsRuntime {
                 value: Some(serde_json::Value::Null),
             },
             serde_json::Value::Bool(b) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "boolean".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -2454,6 +3549,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Number(n) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "number".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -2462,6 +3558,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::String(s) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "string".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -2470,6 +3567,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Array(arr) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: Some("array".into()),
                 class_name: "Array".into(),
@@ -2478,6 +3576,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Object(_) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: None,
                 class_name: "Object".into(),
@@ -2486,6 +3585,33 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
         }
+    }
+
+    /// Build the remote object for a value that was thrown, or that a promise
+    /// rejected with.
+    ///
+    /// Both wrappers have already stored the value under `oid` and put its
+    /// metadata in `__obscura_await_meta`, so this reads them back and marks
+    /// the result. The mark is what lets the CDP layer answer the command with
+    /// `exceptionDetails` rather than fail it or, worse, present the value as
+    /// the evaluation result.
+    fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
+        let meta = self
+            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            .map_err(|e| format!("JS error: {}", e))?;
+        let meta = self.v8_to_json(meta)?;
+        let meta_json = if let serde_json::Value::String(text) = &meta {
+            serde_json::from_str(text).unwrap_or_else(|_| meta.clone())
+        } else {
+            meta
+        };
+        self.object_store.insert(
+            oid.to_string(),
+            format!("globalThis.__obscura_objects['{}']", oid),
+        );
+        let mut info = Self::info_from_meta(&meta_json, Some(oid.to_string()));
+        info.thrown = true;
+        Ok(info)
     }
 
     fn info_from_meta(meta: &serde_json::Value, object_id: Option<String>) -> RemoteObjectInfo {
@@ -2518,6 +3644,7 @@ impl ObscuraJsRuntime {
         };
 
         RemoteObjectInfo {
+            thrown: false,
             js_type,
             subtype,
             class_name,
@@ -2547,6 +3674,100 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
+    // that merely has a .text() method, e.g. Response) with a TypeError, as
+    // Chrome does; a real Blob is still accepted.
+    #[test]
+    fn create_object_url_rejects_non_blob_input() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        // A real Blob is accepted and yields a blob: URL.
+        let ok = rt
+            .evaluate("URL.createObjectURL(new Blob(['hello'])).startsWith('blob:')")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!(true), "a real Blob must be accepted");
+
+        // A non-Blob object with only .text() must be rejected.
+        let rejected = rt
+            .evaluate(
+                "(function(){ try { URL.createObjectURL({ text: () => Promise.resolve('x') }); return false; }\
+                   catch (e) { return !!(e && e.name === 'TypeError'); } })()",
+            )
+            .unwrap();
+        assert_eq!(
+            rejected,
+            serde_json::json!(true),
+            "createObjectURL must throw TypeError for non-Blob input"
+        );
+    }
+
+    // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
+    // set_platform must not allow a backslash-before-quote to break out of the
+    // JS string literal (injection), and set_user_agent must not silently fail
+    // on a control character; both must store the value verbatim.
+    #[test]
+    fn profile_setters_escape_backslash_and_control_characters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("globalThis.__pwned = 0;").unwrap();
+
+        // SEC-301: `Win\';...` — the trailing backslash used to escape our own
+        // closing quote, letting the rest run as JS.
+        rt.set_platform("Win\\';globalThis.__pwned=1;//", "px", "pv");
+        assert_ne!(
+            rt.evaluate("globalThis.__pwned").unwrap().as_f64(),
+            Some(1.0),
+            "set_platform must not execute JS injected via the platform value"
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__obscura_platform").unwrap(),
+            serde_json::json!("Win\\';globalThis.__pwned=1;//"),
+            "the platform value must be stored verbatim"
+        );
+
+        // SEC-302: a UA with a literal newline used to SyntaxError into a silent
+        // no-op, leaving the wrong UA.
+        rt.set_user_agent("Mozilla/5.0 line1\nline2");
+        assert_eq!(
+            rt.evaluate("globalThis.__obscura_ua").unwrap(),
+            serde_json::json!("Mozilla/5.0 line1\nline2"),
+            "the UA must be stored verbatim, including control characters"
+        );
+    }
+
+    #[test]
+    fn function_to_string_has_native_function_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const fn = Function.prototype.toString;
+                    let constructible = true;
+                    try {
+                        Reflect.construct(function () {}, [], fn);
+                    } catch (error) {
+                        constructible = false;
+                    }
+                    return {
+                        source: fn.toString(),
+                        name: fn.name,
+                        length: fn.length,
+                        hasOwnPrototype: Object.prototype.hasOwnProperty.call(fn, "prototype"),
+                        constructible,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "source": "function toString() { [native code] }",
+                "name": "toString",
+                "length": 0,
+                "hasOwnPrototype": false,
+                "constructible": false,
+            })
+        );
     }
 
     #[test]
@@ -3015,6 +4236,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn message_port_drops_old_document_payloads_before_fresh_delivery() {
+        let mut rt = setup_runtime("<html><body data-document='old'></body></html>");
+        rt.execute_script(
+            "message-port-old-document",
+            r#"
+                globalThis.__replacementPortOrder = [];
+                globalThis.__replacementChannel = new MessageChannel();
+                __replacementChannel.port2.onmessage = event => {
+                    __replacementPortOrder.push(event.data);
+                };
+                __replacementChannel.port1.postMessage("old");
+            "#,
+        )
+        .unwrap();
+
+        rt.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        rt.execute_script(
+            "message-port-new-document",
+            r#"__replacementChannel.port1.postMessage("fresh");"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("__replacementPortOrder").unwrap(),
+            serde_json::json!(["fresh"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn message_port_close_discards_delivery_already_queued_for_a_task() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -3285,6 +4536,24 @@ mod tests {
             lead.as_f64().unwrap() <= 1.0,
             "performance.now() advanced ahead of elapsed time: {lead}"
         );
+    }
+
+    #[test]
+    fn time_origin_never_lands_in_the_future() {
+        // __obscura_init deletes itself, so a realm yields one draw of the
+        // origin jitter. Build a fresh runtime per draw, do not hoist this out.
+        for _ in 0..40 {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            let skew = rt
+                .evaluate("performance.timeOrigin - Date.now()")
+                .unwrap()
+                .as_f64()
+                .unwrap();
+            assert!(
+                skew <= 0.0,
+                "performance.timeOrigin is {skew} ms ahead of Date.now()"
+            );
+        }
     }
 
     #[test]
@@ -4936,6 +6205,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn zero_delay_interval_created_by_timer_yields_to_embedder() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "nested-zero-interval",
+            "globalThis.__outerTimerRan = false;\
+             globalThis.__zeroIntervalTicks = 0;\
+             setTimeout(() => {\
+               globalThis.__outerTimerRan = true;\
+               globalThis.__zeroInterval = setInterval(\
+                 () => __zeroIntervalTicks++, 0);\
+             }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "a repeating timer must yield between ticks; elapsed={elapsed:?}",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__outerTimerRan").unwrap(),
+            serde_json::json!(true),
+        );
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        for _ in 0..5 {
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__zeroIntervalTicks").unwrap(),
+            serde_json::json!(6.0),
+            "the repeating timer must make one tick of progress per event-loop turn",
+        );
+        rt.execute_script("clear-zero-interval", "clearInterval(globalThis.__zeroInterval)")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_level_zero_delay_interval_clamps_after_six_ticks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "top-level-zero-interval",
+            "globalThis.__nestedTimerDelays = [];\
+             globalThis.__topInterval = setInterval(\
+               () => {\
+                 const nested = setTimeout(() => {}, 0);\
+                 __nestedTimerDelays.push(__obscura_nextPendingTimeoutDelay());\
+                 clearTimeout(nested);\
+               }, 0);",
+        )
+        .unwrap();
+
+        for _ in 0..7 {
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__nestedTimerDelays.length")
+                .unwrap(),
+            serde_json::json!(7.0),
+            "the interval must continue yielding and making progress",
+        );
+        let observed = rt.evaluate("globalThis.__nestedTimerDelays").unwrap();
+        let delays = observed.as_array().unwrap();
+        assert!(
+            delays[0].as_f64().unwrap() < 2.0,
+            "a shallow nested timer must remain unclamped: {delays:?}",
+        );
+        assert!(
+            delays[4].as_f64().unwrap() < 2.0,
+            "the fifth-level parent must remain below the clamp boundary: {delays:?}",
+        );
+        assert!(
+            delays[5].as_f64().unwrap() >= 2.0,
+            "a timer nested from the sixth interval task must receive the four-millisecond clamp: {delays:?}",
+        );
+        rt.execute_script("clear-top-interval", "clearInterval(globalThis.__topInterval)")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deeply_nested_interval_inherits_the_timer_task_nesting() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "deep-zero-interval",
+            "globalThis.__deepIntervalTicks = 0;\
+             function installDeepInterval(depth) {\
+               if (depth === 0) {\
+                 globalThis.__deepInterval = setInterval(\
+                   () => __deepIntervalTicks++, 0);\
+               } else {\
+                 setTimeout(() => installDeepInterval(depth - 1), 0);\
+               }\
+             }\
+             installDeepInterval(6);",
+        )
+        .unwrap();
+
+        for _ in 0..8 {
+            if rt.evaluate("globalThis.__deepInterval !== undefined")
+                .unwrap()
+                == serde_json::json!(true)
+            {
+                break;
+            }
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
+            serde_json::json!(0.0),
+            "an interval installed by a level-six timer must clamp before its first tick",
+        );
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
+            serde_json::json!(1.0),
+        );
+        rt.execute_script(
+            "clear-deep-interval",
+            "clearInterval(globalThis.__deepInterval)",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn short_observation_deadline_does_not_terminate_the_active_task() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -5058,6 +6453,18 @@ mod tests {
             serde_json::json!("usable"),
             "the per-turn watchdog must leave the isolate reusable",
         );
+    }
+
+    #[test]
+    fn dropping_a_watchdog_cannot_terminate_later_work() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        {
+            let _cancelled = rt.arm_watchdog(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9632,6 +11039,45 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_delivery_recovers_across_document_replacement() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        rt.execute_script(
+            "old-intersection-delivery",
+            r#"
+                globalThis.__intersectionReplacementOrder = [];
+                const oldObserver = new IntersectionObserver(() => {
+                    __intersectionReplacementOrder.push("old");
+                });
+                oldObserver._records.push({ old: true });
+                oldObserver._check([], false, new Map());
+            "#,
+        )
+        .unwrap();
+
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.execute_script(
+            "fresh-intersection-delivery",
+            r#"
+                const freshObserver = new IntersectionObserver(() => {
+                    __intersectionReplacementOrder.push("fresh");
+                });
+                freshObserver._records.push({ fresh: true });
+                freshObserver._check([], false, new Map());
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__intersectionReplacementOrder").unwrap(),
+            serde_json::json!(["fresh"]),
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_element_root_uses_live_padding_box_and_scroll() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -11212,6 +12658,49 @@ mod tests {
     }
 
     #[test]
+    fn dom_string_map_is_exposed_and_backs_dataset() {
+        let mut rt = setup_runtime(r#"<div id="x" data-foo="bar"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const dataset = document.getElementById("x").dataset;
+                    const interface = window.DOMStringMap;
+                    const descriptor = Object.getOwnPropertyDescriptor(window, "DOMStringMap");
+                    let illegalConstructor = false;
+                    if (interface) {
+                        try { new interface(); }
+                        catch (error) { illegalConstructor = error instanceof TypeError; }
+                    }
+                    return JSON.stringify({
+                        type: typeof interface,
+                        instance: !!interface && dataset instanceof interface,
+                        prototype: !!interface && Object.getPrototypeOf(dataset) === interface.prototype,
+                        constructor: !!interface && dataset.constructor === interface,
+                        tag: Object.prototype.toString.call(dataset),
+                        enumerable: descriptor ? descriptor.enumerable : "missing",
+                        illegalConstructor,
+                        value: dataset.foo,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "function",
+                "instance": true,
+                "prototype": true,
+                "constructor": true,
+                "tag": "[object DOMStringMap]",
+                "enumerable": false,
+                "illegalConstructor": true,
+                "value": "bar",
+            })
+        );
+    }
+
+    #[test]
     fn style_declaration_reflects_and_removes_parsed_attributes() {
         let mut rt = setup_runtime(
             "<html><body><div id='icon' style='font-size: 0px; color: red'></div></body></html>",
@@ -12418,6 +13907,301 @@ mod tests {
     }
 
     #[test]
+    fn test_label_click_activates_its_labeled_control() {
+        let mut rt = setup_runtime(
+            r#"<label id="explicit" for="a">a</label><input type="checkbox" id="a">
+               <label id="implicit">b <input type="checkbox" id="b"></label>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['explicit', 'implicit'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return [document.getElementById('a').checked, document.getElementById('b').checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    #[test]
+    fn test_label_click_honors_the_association_rules() {
+        // A present `for` associates by id alone: an empty value associates
+        // nothing and must not fall back to the nested control, and a dangling
+        // id activates nothing. A disabled control has no activation behavior.
+        let mut rt = setup_runtime(
+            r#"<label id="empty" for="">a <input type="checkbox" id="a"></label>
+               <label id="dangling" for="missing">b</label><input type="checkbox" id="b">
+               <label id="disabled" for="c">c</label><input type="checkbox" id="c" disabled>
+               <label id="both" for="d">d <input type="checkbox" id="e"></label>
+               <input type="checkbox" id="d">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            for (const id of ['empty', 'dangling', 'disabled', 'both']) {
+                document.getElementById(id).click();
+            }
+            return ['a', 'b', 'c', 'd', 'e'].map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([false, false, false, true, false])
+        );
+    }
+
+    #[test]
+    fn test_label_activation_does_not_double_fire_or_recurse() {
+        // Clicking the control inside its own label toggles once, and a click
+        // handler that clicks that label back cannot re-enter the forwarding.
+        let mut rt = setup_runtime(
+            r#"<label id="wrapper"><input type="checkbox" id="nested"></label>
+               <label id="host" for="reentrant">r</label>
+               <input type="checkbox" id="reentrant">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const reentrant = document.getElementById('reentrant');
+            document.getElementById('nested').click();
+            let bounces = 0;
+            reentrant.addEventListener('click', () => {
+                if (bounces++ < 1) { document.getElementById('host').click(); }
+            });
+            document.getElementById('host').click();
+            return [document.getElementById('nested').checked, reentrant.checked, bounces];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, 1]));
+    }
+
+    #[test]
+    fn test_click_respects_disabled_controls_and_interactive_content() {
+        // A disabled control has no activation behaviour, whether it is clicked
+        // directly, reached through its label, or disabled by an ancestor
+        // fieldset. Interactive content inside a label swallows the label's
+        // activation, but an <a> without href is not interactive content.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="direct" disabled>
+               <fieldset disabled><label id="in-set" for="set-box">s</label>
+                 <input type="checkbox" id="set-box"></fieldset>
+               <label id="link"><a href="/x"><span id="in-link">go</span></a>
+                 <input type="checkbox" id="link-box"></label>
+               <label id="plain"><a><span id="in-plain">go</span></a>
+                 <input type="checkbox" id="plain-box"></label>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['direct', 'in-set', 'in-link', 'in-plain'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ['direct', 'set-box', 'link-box', 'plain-box']
+                .map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([false, false, false, true]));
+    }
+
+    #[test]
+    fn test_checkbox_indeterminate_is_idl_only_and_cleared_by_activation() {
+        // `indeterminate` has no content attribute, so it exists only if the
+        // prototype defines it -- `'indeterminate' in el` is the check that
+        // fails when it is missing. Activation clears it as well as toggling
+        // checkedness (HTML legacy-pre-activation behaviour), and a cancelled
+        // click puts both back, so a script-set flag is never left stuck.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="fresh">
+               <input type="checkbox" id="click">
+               <input type="checkbox" id="cancel">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const fresh = document.getElementById('fresh');
+            const present = 'indeterminate' in fresh;
+            const initial = fresh.indeterminate;
+            fresh.indeterminate = true;
+            const roundTrip = fresh.indeterminate;
+
+            const clicked = document.getElementById('click');
+            clicked.indeterminate = true;
+            clicked.click();
+
+            const cancelled = document.getElementById('cancel');
+            cancelled.indeterminate = true;
+            cancelled.addEventListener('click', e => e.preventDefault());
+            cancelled.click();
+
+            return [present, initial, roundTrip,
+                    clicked.checked, clicked.indeterminate,
+                    cancelled.checked, cancelled.indeterminate];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, true, false, false, true])
+        );
+    }
+
+    #[test]
+    fn test_disabled_only_applies_to_disableable_elements() {
+        // A `disabled` attribute is meaningless on anything that cannot be
+        // disabled, and only listed form controls inherit it from a fieldset.
+        // Component libraries do put `disabled` on plain <div>s, so treating
+        // that as disabled would silently stop their clicks.
+        let mut rt = setup_runtime(
+            r#"<div id="plain" disabled>x</div>
+               <fieldset disabled><a id="link" href="x">l</a>
+                 <input type="checkbox" id="control"></fieldset>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const seen = [];
+            for (const id of ['plain', 'link']) {
+                const el = document.getElementById(id);
+                el.addEventListener('click', e => { seen.push(id); e.preventDefault(); });
+                el.click();
+            }
+            document.getElementById('control').click();
+            return [seen.join(','), document.getElementById('control').checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["plain,link", false]));
+    }
+
+    #[test]
+    fn test_label_forwarding_uses_interactive_content_not_labelable() {
+        // meter, output and progress are labelable but not interactive, so a
+        // click on one still activates the label. An <a> counts only with href.
+        let mut rt = setup_runtime(
+            r#"<label id="l1" for="c1"><output id="o">v</output></label>
+               <input type="checkbox" id="c1">
+               <label id="l2" for="c2"><a id="bare">t</a></label>
+               <input type="checkbox" id="c2">
+               <label id="l3" for="c3"><a id="linked" href="x">t</a></label>
+               <input type="checkbox" id="c3">
+               <label id="l4" for="c4"><button id="btn" type="button">b</button></label>
+               <input type="checkbox" id="c4">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['o', 'bare', 'linked', 'btn'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ['c1', 'c2', 'c3', 'c4'].map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, false, false]));
+    }
+
+    #[test]
+    fn test_radio_activation_moves_the_checked_peer_and_reverts_on_cancel() {
+        let mut rt = setup_runtime(
+            r#"<form><label id="pick" for="b">b</label>
+                 <input type="radio" name="g" id="a" checked>
+                 <input type="radio" name="g" id="b"></form>
+               <form><label id="veto" for="d">d</label>
+                 <input type="radio" name="h" id="c" checked>
+                 <input type="radio" name="h" id="d"></form>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const seen = [];
+            document.getElementById('b').addEventListener('change', () => seen.push('change'));
+            document.getElementById('pick').click();
+            document.getElementById('d').addEventListener('click', e => e.preventDefault());
+            document.getElementById('veto').click();
+            return [
+                document.getElementById('a').checked, document.getElementById('b').checked,
+                document.getElementById('c').checked, document.getElementById('d').checked,
+                seen.join(','),
+            ];
+        "#,
+            )
+            .unwrap();
+        // Activating b unchecks its peer a; the cancelled activation of d
+        // restores c.
+        assert_eq!(
+            result,
+            serde_json::json!([false, true, true, false, "change"])
+        );
+    }
+
+    #[test]
+    fn test_disabled_fieldset_exemption_is_the_first_legend_child_only() {
+        // Every disabled fieldset ancestor counts, and only descendants of that
+        // fieldset's first <legend> child escape it. A legend wrapped in a div
+        // is not the fieldset's legend, a second legend does not exempt, and an
+        // inner fieldset's legend does not escape an outer disabled fieldset.
+        let mut rt = setup_runtime(
+            r#"<fieldset disabled><legend><input type="checkbox" id="a"></legend>
+                 <input type="checkbox" id="b"></fieldset>
+               <fieldset disabled><legend>x</legend>
+                 <legend><input type="checkbox" id="c"></legend></fieldset>
+               <fieldset disabled><div><legend>
+                 <input type="checkbox" id="d"></legend></div></fieldset>
+               <fieldset disabled><div><fieldset disabled><legend>
+                 <input type="checkbox" id="e"></legend></fieldset></div></fieldset>
+               <fieldset disabled><fieldset><legend>
+                 <input type="checkbox" id="f"></legend></fieldset></fieldset>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['a', 'b', 'c', 'd', 'e', 'f'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ids.map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, false, false, false, false])
+        );
+    }
+
+    #[test]
+    fn test_label_click_runs_checkbox_pre_click_activation() {
+        // The control flips before the click event dispatches, so listeners
+        // observe the new state, `input` and `change` follow, and a cancelled
+        // event restores the old state.
+        let mut rt = setup_runtime(
+            r#"<label id="live" for="live-box">a</label><input type="checkbox" id="live-box">
+               <label id="cancel" for="cancel-box">b</label>
+               <input type="checkbox" id="cancel-box">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const events = [];
+            const live = document.getElementById('live-box');
+            for (const type of ['click', 'input', 'change']) {
+                live.addEventListener(type, () => events.push(type + ':' + live.checked));
+            }
+            document.getElementById('live').click();
+            const cancelled = document.getElementById('cancel-box');
+            cancelled.addEventListener('click', event => event.preventDefault());
+            document.getElementById('cancel').click();
+            return [events.join(','), live.checked, cancelled.checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["click:true,input:true,change:true", true, false])
+        );
+    }
+
+    #[test]
     fn test_dispatch_mouse_event_runs_listener() {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt
@@ -12452,6 +14236,39 @@ mod tests {
     }
 
     #[test]
+    fn test_location_navigation_coerces_url_objects() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let hrefs = rt
+            .evaluate(
+                r#"(() => {
+                    location.href = new URL('/from-href', location.href);
+                    const href = location.href;
+                    location.assign(new URL('/from-assign', location.href));
+                    const assigned = location.href;
+                    location.replace(new URL('/from-replace', location.href));
+                    return [href, assigned, location.href];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            hrefs,
+            serde_json::json!([
+                "http://example.com/from-href",
+                "http://example.com/from-assign",
+                "http://example.com/from-replace"
+            ])
+        );
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/from-replace".to_string(),
+                "GET".to_string(),
+                "".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
         let mut rt =
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
@@ -12477,6 +14294,46 @@ mod tests {
                 "".to_string()
             ))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_exposes_stream_and_consumption_state() {
+        // #818: a non-null Response body must expose a ReadableStream through
+        // .body, a boolean .bodyUsed, and a working getReader(); consuming
+        // the body marks it used and a second consumption throws.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const r = new Response("hello");
+                    const meta = {
+                        bodyType: r.body === null ? "null" : typeof r.body,
+                        bodyUsed: r.bodyUsed,
+                        hasReader: !!(r.body && r.body.getReader),
+                    };
+                    const reader = r.body.getReader();
+                    const first = await reader.read();
+                    const second = await reader.read();
+                    const chunkText = first.value ? new TextDecoder().decode(first.value) : "";
+                    const consumed = r.bodyUsed;
+                    let doubleThrew = false;
+                    try { await r.text(); } catch (e) { doubleThrew = true; }
+                    return { meta, chunkText, done: second.done, consumed, doubleThrew, nullBody: new Response(null).body === null };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .expect("evaluation must succeed");
+        let out = result.value.unwrap();
+        assert_eq!(out["meta"]["bodyType"], "object");
+        assert_eq!(out["meta"]["bodyUsed"], false);
+        assert_eq!(out["meta"]["hasReader"], true);
+        assert_eq!(out["chunkText"], "hello");
+        assert_eq!(out["done"], true);
+        assert_eq!(out["consumed"], true);
+        assert_eq!(out["doubleThrew"], true);
+        assert_eq!(out["nullBody"], true);
     }
 
     #[test]
@@ -12675,14 +14532,188 @@ mod tests {
         assert_eq!(result.value.unwrap().as_str().unwrap(), "async-ok");
     }
 
+    // This test used to assert that a rejection came back as `Err`. It does
+    // not any more, and the old expectation was the defect: CDP answers the
+    // command and reports the rejected value through `exceptionDetails`, so
+    // failing the command loses the page error rather than delivering it.
     #[tokio::test(flavor = "current_thread")]
     async fn test_evaluate_for_cdp_reports_promise_rejection() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let err = rt
+        let info = rt
             .evaluate_for_cdp("Promise.reject(new Error('boom'))", true, true)
             .await
-            .unwrap_err();
-        assert!(err.contains("boom"));
+            .expect("a rejection is answered, not failed");
+        assert!(info.thrown, "the rejected value must be marked as thrown");
+        assert_eq!(info.js_type, "object");
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert_eq!(info.class_name, "Error");
+        assert!(
+            info.description.contains("boom"),
+            "the description is what a client rebuilds the error from: {}",
+            info.description
+        );
+        // Reported by reference, never serialized: an Error has no own
+        // enumerable properties, so by value it would be `{}`.
+        assert!(info.value.is_none());
+        assert!(info.object_id.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_marks_a_rejection_instead_of_returning_it() {
+        // The reported shape: returnByValue on a rejected call answered
+        // successfully with `{}`, because the wrapper stored the error under
+        // the object id a success uses and nothing said which branch ran.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .call_function_on_for_cdp("() => Promise.reject(new Error('boom'))", None, &[], true, true)
+            .await
+            .expect("a rejection is answered, not failed");
+        assert!(info.thrown, "expected a thrown value, got {:?}", info.value);
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert!(info.description.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_separates_a_rejected_object_from_a_resolved_one() {
+        // The sharper half of the same defect: rejecting with a plain object
+        // produced a reply byte-identical to resolving with it, so no client
+        // could tell the two apart.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let resolved = rt
+            .call_function_on_for_cdp("() => Promise.resolve({code: 42})", None, &[], true, true)
+            .await
+            .unwrap();
+        let rejected = rt
+            .call_function_on_for_cdp("() => Promise.reject({code: 42})", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(!resolved.thrown);
+        assert!(rejected.thrown);
+        assert_eq!(resolved.value, Some(serde_json::json!({"code": 42})));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_synchronous_throw_is_reported_instead_of_swallowed() {
+        // The sync wrapper answered a throw with `__result = undefined`, so the
+        // command succeeded and the page error vanished. A client cannot tell
+        // that from an expression that genuinely has no value.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("undefined_variable_xyz", false, false)
+            .await
+            .expect("a page error is not a protocol failure");
+        assert!(info.thrown, "a ReferenceError must come back flagged thrown");
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert!(
+            info.description.contains("ReferenceError"),
+            "the description is what a client rebuilds the error from: {:?}",
+            info.description
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_synchronous_throw_is_reported_when_a_value_was_asked_for() {
+        // returnByValue took a different route entirely, through `evaluate`,
+        // whose wrapper answers an exception with null. That is the shape a
+        // Puppeteer `page.evaluate` uses most, and it reported success.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("undefined_variable_xyz", true, false)
+            .await
+            .expect("a page error is not a protocol failure");
+        assert!(info.thrown, "a ReferenceError must not serialize to null");
+        assert!(info.description.contains("ReferenceError"));
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_throw_statement_is_run_as_a_script_not_wrapped_in_parentheses() {
+        // `Runtime.evaluate` takes a script. Pasted into `(...)` a throw is a
+        // parse-time SyntaxError, which no catch can see, so the whole command
+        // failed at the protocol level instead of reporting the page's error.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("throw new Error('boom')", false, false)
+            .await
+            .expect("a throw statement must be evaluated, not rejected as invalid");
+        assert!(info.thrown);
+        assert!(
+            info.description.contains("boom"),
+            "the thrown error must survive: {:?}",
+            info.description
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statement_bundle_yields_its_completion_value() {
+        // Chrome reports the completion value of the script. The old wrapper
+        // put statement bundles in a function body with no `return`, so every
+        // one of them evaluated to the wrapper's own undefined.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("var completion_x = 1; completion_x * 2", true, false)
+            .await
+            .expect("statement bundles are valid input");
+        assert!(!info.thrown);
+        // Compared as a number rather than against a literal: the engine
+        // boxes every number as f64, so `json!(2)` would not match `2.0`.
+        // That spelling is its own defect and does not belong to this test.
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(2.0),
+            "the bundle's completion value, not the wrapper's undefined"
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_trailing_semicolon_and_source_url_still_parse() {
+        // Both were handled by hand before: the semicolon had to be trimmed or
+        // `(expr;)` failed to parse, and the sourceURL comment had to be closed
+        // by a newline or it swallowed the wrapper's own paren. Passing the
+        // script as a string removes the class, so these pin that it stays gone.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("(() => 7)();", true, false)
+            .await
+            .expect("a trailing semicolon is legal");
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(7.0)
+        );
+    
+        let info = rt
+            .evaluate_for_cdp("(() => 8)()\n//# sourceURL=__puppeteer_evaluation_script__", true, false)
+            .await
+            .expect("a trailing sourceURL comment is legal");
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(8.0)
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejection_does_not_leak_into_the_next_call() {
+        // `__obscura_await_rejected` is a global, so the success branch has to
+        // clear it. Without that the first rejection would mark every later
+        // call on the same runtime as thrown.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let rejected = rt
+            .call_function_on_for_cdp("() => Promise.reject(new Error('first'))", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(rejected.thrown);
+        let after = rt
+            .call_function_on_for_cdp("() => Promise.resolve(7)", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(!after.thrown, "a later success was still marked as thrown");
+        assert_eq!(after.value.unwrap().as_f64(), Some(7.0));
+
+        let evaluated = rt
+            .evaluate_for_cdp("Promise.resolve(8)", true, true)
+            .await
+            .unwrap();
+        assert!(!evaluated.thrown);
+        assert_eq!(evaluated.value.unwrap().as_f64(), Some(8.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13260,6 +15291,320 @@ mod tests {
         );
     }
 
+    /// Document URL two levels deep, base one level deep and the origin root on neither of the
+    /// two. The three possible bases land on three different paths, and one assert keeps them
+    /// apart:
+    ///   document base URL  ->  /app/data/x.json   (the spec)
+    ///   document URL       ->  /deep/data/x.json  (the bug)
+    ///   origin root        ->  /data/x.json       (a base "/" would hide this one)
+    fn setup_runtime_at_deep_url(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/deep/page");
+        rt.run_page_init();
+        rt
+    }
+
+    const BASE_HREF_PAGE: &str = r#"<html><head><base href="/app/"></head><body>
+            <a id="link" href="data/x.json"></a>
+            <form id="form" action="submit"></form>
+            <script id="script" src="chunk.js"></script>
+        </body></html>"#;
+
+    #[test]
+    fn base_href_governs_dom_url_reflection() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+
+        // One evaluate, one assert: a bundle of assert_eq! aborts at the first failure and
+        // reports one broken path while hiding the others.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/app/"),
+                serde_json::json!("http://example.com/app/data/x.json"),
+                serde_json::json!("http://example.com/app/submit"),
+                serde_json::json!("http://example.com/app/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relative_location_assignment_follows_the_base() {
+        // _resolveUrl serves location.href=, assign, replace and window.location=. Of the six
+        // call sites it has the largest external effect, so it gets its own test.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        rt.evaluate("location.href = 'users/42'").unwrap();
+
+        let landed = rt.evaluate("location.href").unwrap();
+        assert_eq!(landed.as_str().unwrap(), "http://example.com/app/users/42");
+    }
+
+    #[test]
+    fn without_base_href_resolution_stays_on_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body>
+                <a id="link" href="data/x.json"></a>
+                <form id="form" action="submit"></form>
+                <script id="script" src="chunk.js"></script>
+            </body></html>"#,
+        );
+
+        // Every call site, not just the anchor: a site that resolves to the origin root instead
+        // of the document URL slips through on a page without a base only when nobody is looking.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/deep/page"),
+                serde_json::json!("http://example.com/deep/data/x.json"),
+                serde_json::json!("http://example.com/deep/submit"),
+                serde_json::json!("http://example.com/deep/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_element_href_reflects_the_resolved_url() {
+        // Resolved against the fallback base URL, i.e. the document URL and not /app/.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let href = rt.evaluate("document.querySelector('base').href").unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/app/");
+
+        let mut relative = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body></body></html>"#,
+        );
+        let href = relative
+            .evaluate("document.querySelector('base').href")
+            .unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/deep/assets/");
+    }
+
+    #[test]
+    fn the_first_base_with_an_href_wins() {
+        // Tree order, and a <base> without href does not count.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base><base href="/a/"><base href="/b/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/a/x.json");
+    }
+
+    #[test]
+    fn an_empty_base_href_resolves_to_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href=""></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/x.json");
+    }
+
+    #[test]
+    fn a_cross_origin_base_moves_the_target_but_not_the_page_origin() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="https://cdn.example.net/v2/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let seen = rt
+            .evaluate("return [document.getElementById('link').href, location.origin]")
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("https://cdn.example.net/v2/x.json"),
+                serde_json::json!("http://example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_href_rejects_a_data_url_base() {
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // Accepting it would make every later relative resolution fail instead of falling back.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="data:text/html,x"></head><body>
+                <a id="link" href="data/x.json"></a>
+            </body></html>"#,
+        );
+
+        let base_uri = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(base_uri.as_str().unwrap(), "http://example.com/deep/page");
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
+    }
+
+    #[test]
+    fn base_resolution_follows_the_url_set_by_push_state() {
+        // pushState changes the document URL, and without <base> that very URL is the base.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/x.json");
+    }
+
+    #[test]
+    fn a_relative_base_href_resolves_against_the_push_state_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/assets/x.json");
+    }
+
+    /// Guards the cache in `document_base_url_memoized`. Without it, each of these reads walked
+    /// the tree and ran the selector engine, and `a.href` went from a field read to O(nodes).
+    /// The bound is deliberately loose: it should catch the regression, not watch the allocator.
+    #[test]
+    fn anchor_href_reads_do_not_scale_with_document_size() {
+        let mut body = String::from(r#"<html><head></head><body><a id="link" href="x.json"></a>"#);
+        for i in 0..4000 {
+            body.push_str(&format!("<div id=\"n{i}\"><span>text</span></div>"));
+        }
+        body.push_str("</body></html>");
+        let mut rt = setup_runtime_at_deep_url(&body);
+
+        let elapsed = rt
+            .evaluate(
+                r#"
+                const link = document.getElementById('link');
+                const started = Date.now();
+                for (let i = 0; i < 2000; i++) { link.href; }
+                return Date.now() - started;
+                "#,
+            )
+            .unwrap();
+        let ms = elapsed.as_f64().expect("elapsed ms");
+        assert!(
+            ms < 500.0,
+            "2000 a.href reads on a document with 12000 nodes took {ms} ms, the base query is not cached"
+        );
+    }
+
+    #[test]
+    fn the_base_memo_still_sees_a_base_element_added_later() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/deep/x.json");
+
+        rt.evaluate(
+            r#"
+            const base = document.createElement('base');
+            base.setAttribute('href', '/');
+            document.head.appendChild(base);
+            "#,
+        )
+        .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/x.json");
+    }
+
+    #[test]
+    fn the_base_memo_notices_a_changed_href_attribute() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/app/data/x.json");
+
+        rt.evaluate("document.querySelector('base').setAttribute('href', '/other/')")
+            .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/other/data/x.json");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_href_governs_fetch_and_xhr_targets() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const seen = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url) => {
+                        seen.push(url);
+                        return JSON.stringify({ status: 200, headers: {}, body: "{}", url });
+                    };
+                    await fetch("data/x.json");
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "data/y.json");
+                    xhr.send();
+                    await new Promise((r) => setTimeout(r, 0));
+                    return seen;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.expect("captured URLs");
+        let seen = value.as_array().expect("captured URLs");
+        // The XHR entry cannot isolate its own layer: send() passes the already absolute URL on
+        // to fetch, so fetch takes over the resolution if it is removed from send, and the assert
+        // still holds. It pins the result, not the layer.
+        assert_eq!(seen.len(), 2, "one fetch, one XHR");
+        assert_eq!(seen[0].as_str().unwrap(), "http://example.com/app/data/x.json");
+        assert_eq!(seen[1].as_str().unwrap(), "http://example.com/app/data/y.json");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -13374,6 +15719,650 @@ mod tests {
                 "invalidFetchRejected": true,
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_preserves_binary_body_sources_at_the_op_boundary() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    method,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes: Array.from(
+                                        body instanceof Uint8Array
+                                            ? body
+                                            : new TextEncoder().encode(body),
+                                    ),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const sentinel = [0, 128, 255, 16];
+                        await fetch("/blob", {
+                            method: "POST",
+                            body: new Blob([new Uint8Array(sentinel)]),
+                        });
+
+                        const arrayBuffer = new Uint8Array(sentinel).buffer;
+                        await fetch("/array-buffer", { method: "POST", body: arrayBuffer });
+
+                        const backing = new Uint8Array([9, ...sentinel, 8]);
+                        await fetch("/typed-array-view", {
+                            method: "POST",
+                            body: backing.subarray(1, 5),
+                        });
+
+                        const request = new Request("/request", {
+                            method: "POST",
+                            headers: {
+                                authorization: "Bearer test-token",
+                                "x-request-source": "request",
+                            },
+                            body: new Uint8Array(sentinel),
+                        });
+                        await fetch(request);
+                        await fetch(request, {
+                            headers: { "x-init-override": "yes" },
+                        });
+
+                        await fetch(new Request("/request-params-object", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: {} });
+                        await fetch(new Request("/request-params-headers", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: new Headers() });
+
+                        return calls;
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                { "path": "/blob", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/array-buffer", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/typed-array-view", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "authorization": "Bearer test-token", "x-request-source": "request" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "x-init-override": "yes" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request-params-object", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+                { "path": "/request-params-headers", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_form_urlencoded_and_xhr_bodies_reach_the_op_as_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    const includesBytes = (bytes, needle) => {
+                        outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
+                            for (let j = 0; j < needle.length; j++) {
+                                if (bytes[i + j] !== needle[j]) continue outer;
+                            }
+                            return true;
+                        }
+                        return false;
+                    };
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                const bytes = Array.from(
+                                    body instanceof Uint8Array
+                                        ? body
+                                        : new TextEncoder().encode(body),
+                                );
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes,
+                                    hasRawSentinel: includesBytes(bytes, [0, 128, 255, 16]),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const form = new FormData();
+                        form.append("note", "snow \u96ea");
+                        form.append(
+                            "upload",
+                            new File([new Uint8Array([0, 128, 255, 16])], "sentinel.bin", {
+                                type: "application/octet-stream",
+                            }),
+                        );
+                        await fetch("/form-data", { method: "POST", body: form });
+
+                        const params = new URLSearchParams();
+                        params.append("greeting", "\u96ea space&");
+                        await fetch("/url-search-params", { method: "POST", body: params });
+
+                        await new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("POST", "/xhr-typed-array");
+                            xhr.onload = resolve;
+                            xhr.onerror = reject;
+                            const backing = new Uint8Array([9, 0, 128, 255, 16, 8]);
+                            xhr.send(backing.subarray(1, 5));
+                        });
+
+                        const formCall = calls.find(call => call.path === "/form-data");
+                        const paramsCall = calls.find(call => call.path === "/url-search-params");
+                        const xhrCall = calls.find(call => call.path === "/xhr-typed-array");
+                        return {
+                            formData: {
+                                isUint8Array: formCall.isUint8Array,
+                                contentType: Object.entries(formCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1]
+                                    .startsWith("multipart/form-data; boundary=----WebKitFormBoundary"),
+                                hasText: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode("snow \u96ea")),
+                                ),
+                                hasFilename: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode('filename="sentinel.bin"')),
+                                ),
+                                hasRawSentinel: formCall.hasRawSentinel,
+                            },
+                            urlSearchParams: {
+                                isUint8Array: paramsCall.isUint8Array,
+                                contentType: Object.entries(paramsCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1],
+                                bytes: paramsCall.bytes,
+                            },
+                            xhr: {
+                                isUint8Array: xhrCall.isUint8Array,
+                                bytes: xhrCall.bytes,
+                            },
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "formData": {
+                    "isUint8Array": true,
+                    "contentType": true,
+                    "hasText": true,
+                    "hasFilename": true,
+                    "hasRawSentinel": true,
+                },
+                "urlSearchParams": {
+                    "isUint8Array": true,
+                    "contentType": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "bytes": "greeting=%E9%9B%AA+space%26".as_bytes(),
+                },
+                "xhr": {
+                    "isUint8Array": true,
+                    "bytes": [0, 128, 255, 16],
+                },
+            })
+        );
+    }
+
+    /// Serves a redirect chain across `connections` consecutive
+    /// requests: `/hop/N` replies with 302 to `/hop/N-1`, `/hop/0` is the
+    /// target. To a path the fixture cannot read it replies with 400
+    /// instead of the target. A broken fixture thereby fails the test
+    /// instead of letting it pass.
+    fn redirect_chain_runtime(connections: usize) -> ObscuraJsRuntime {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let hop = String::from_utf8_lossy(&buffer[..read])
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.strip_prefix("/hop/"))
+                    .and_then(|hop| hop.parse::<usize>().ok());
+                let response = match hop {
+                    Some(0) => {
+                        let body = "arrived";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                    Some(hop) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /hop/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        hop - 1,
+                    ),
+                    None => {
+                        let body = "unparsed";
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len(),
+                        )
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        redirect_runtime_for_origin(&format!("http://{address}"))
+    }
+
+    fn redirect_runtime_for_origin(origin: &str) -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt
+    }
+
+    fn redirect_method_runtime(
+        status: u16,
+    ) -> (
+        ObscuraJsRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_capture = requests.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                requests_capture
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                let response = if request.contains(" /start ") {
+                    format!(
+                        "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        (
+            redirect_runtime_for_origin(&format!("http://{address}")),
+            requests,
+        )
+    }
+
+    fn cross_origin_redirect_runtime() -> ObscuraJsRuntime {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = target.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        });
+
+        let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source_address = source.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = source.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        redirect_runtime_for_origin(&format!("http://{source_address}"))
+    }
+
+    /// HTTP-redirect fetch returns a network error as soon as the
+    /// redirect count *reaches* 20, and only increments it afterwards. So
+    /// the twentieth hop must still succeed:
+    /// https://fetch.spec.whatwg.org/#http-redirect-fetch
+    /// WPT covers the same pair in `fetch/api/redirect/redirect-count.any.js`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_follows_the_twentieth_redirect() {
+        let mut rt = redirect_chain_runtime(21);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => (await fetch("/hop/20")).text()"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_response_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(3);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    const direct = await fetch("/hop/0");
+                    return {
+                        url: response.url,
+                        redirected: response.redirected,
+                        cloneUrl: response.clone().url,
+                        directRedirected: direct.redirected,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert!(
+            value["url"].as_str().unwrap_or_default().ends_with("/hop/0"),
+            "Response.url did not report the final URL: {value}"
+        );
+        assert_eq!(value["redirected"], true);
+        assert_eq!(value["cloneUrl"], value["url"]);
+        assert_eq!(value["directRedirected"], false);
+
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].url.ends_with("/hop/0"),
+            "network response event did not report the final URL: {:?}",
+            events[0].url
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_response_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(2);
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                obscura_net::CookieJar::new(),
+            )),
+        ));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    return { url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/hop/0"));
+        assert_eq!(value["redirected"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_response_url_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(2);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/hop/1");
+                    xhr.onload = () => resolve(xhr.responseURL);
+                    xhr.onerror = reject;
+                    xhr.send();
+                })"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .value
+                .unwrap()
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("/hop/0")
+        );
+    }
+
+    async fn assert_post_redirect_method(status: u16, expected_method: &str) {
+        let (mut rt, wire_requests) = redirect_method_runtime(status);
+        let request_callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response_callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let request_capture = request_callbacks.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            request_capture
+                .lock()
+                .unwrap()
+                .push((request.method.clone(), request.url.path().to_string()));
+        }));
+        let response_capture = response_callbacks.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, response| {
+            response_capture.lock().unwrap().push((
+                request.method.clone(),
+                request.url.path().to_string(),
+                response.url.path().to_string(),
+                response.redirected_from.len(),
+            ));
+        }));
+        rt.set_callbacks(callbacks);
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { method: "POST", body: "payload" });
+                    return { url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/final"));
+        assert_eq!(value["redirected"], true);
+        assert_eq!(
+            *request_callbacks.lock().unwrap(),
+            vec![("POST".to_string(), "/start".to_string())]
+        );
+        assert_eq!(
+            *response_callbacks.lock().unwrap(),
+            vec![(
+                expected_method.to_string(),
+                "/final".to_string(),
+                "/final".to_string(),
+                1,
+            )]
+        );
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, expected_method);
+        assert!(events[0].url.ends_with("/final"));
+        let wire_requests = wire_requests.lock().unwrap();
+        assert!(wire_requests[0].starts_with("POST /start "));
+        assert!(wire_requests[1].starts_with(&format!("{expected_method} /final ")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_302_response_uses_the_final_get_method() {
+        assert_post_redirect_method(302, "GET").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_307_response_preserves_the_post_method() {
+        assert_post_redirect_method(307, "POST").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_no_cors_redirect_keeps_response_identity() {
+        let mut rt = redirect_chain_runtime(2);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(value["type"], "basic");
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/hop/0"));
+        assert_eq!(value["redirected"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_no_cors_redirect_filters_response_identity() {
+        let mut rt = cross_origin_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cross_origin_no_cors_filters_response_identity() {
+        let mut rt = cross_origin_redirect_runtime();
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                obscura_net::CookieJar::new(),
+            )),
+        ));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+        );
+    }
+
+    /// The other end of the same pair: the twenty-first redirect must
+    /// fail. `fetch` reports a rejected result as a `TypeError`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_rejects_the_twenty_first_redirect() {
+        let mut rt = redirect_chain_runtime(21);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    try {
+                        const response = await fetch("/hop/21");
+                        return "resolved " + (await response.text());
+                    } catch (error) {
+                        return error instanceof TypeError ? "rejected" : "other";
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!("rejected"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13712,6 +16701,14 @@ mod tests {
             .evaluate("document.createEvent('KeyboardEvent') instanceof KeyboardEvent")
             .unwrap();
         assert_eq!(kb, serde_json::json!(true));
+        let hash_change = rt
+            .evaluate("document.createEvent('HashChangeEvent') instanceof HashChangeEvent")
+            .unwrap();
+        assert_eq!(hash_change, serde_json::json!(true));
+        let message = rt
+            .evaluate("document.createEvent('MessageEvent') instanceof MessageEvent")
+            .unwrap();
+        assert_eq!(message, serde_json::json!(true));
     }
 
     #[test]
@@ -13729,12 +16726,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_event_unknown_type_returns_event() {
+    fn test_create_event_rejects_unknown_interface() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let kind = rt
-            .evaluate("document.createEvent('NotARealType') instanceof Event")
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        document.createEvent('NotAnEventInterface');
+                        return null;
+                    } catch (error) {
+                        return [error.name, error instanceof DOMException];
+                    }
+                })()"#,
+            )
             .unwrap();
-        assert_eq!(kind, serde_json::json!(true));
+        assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
     }
 
     #[test]
@@ -13810,6 +16816,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
+    }
+
+    #[test]
+    fn test_create_event_supports_legacy_event_aliases() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"['Event', 'Events', 'HTMLEvents', 'SVGEvents'].map(name => {
+                    const event = document.createEvent(name);
+                    return [event instanceof Event, event.constructor === Event, event.type];
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""]
+            ])
+        );
     }
 
     #[test]
@@ -14014,6 +17042,45 @@ mod tests {
         format!("http://{}", address)
     }
 
+    fn spawn_duplicate_module_graph_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = match path {
+                    "/entry.js" => {
+                        "import './shared.js'; globalThis.__module_entry_ran = true;"
+                    }
+                    "/shared.js" => {
+                        "globalThis.__shared_module_runs = \
+                         (globalThis.__shared_module_runs || 0) + 1;"
+                    }
+                    _ => "throw new Error('unexpected module path');",
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/javascript\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{}", address)
+    }
+
     #[derive(Clone, Copy)]
     enum ModuleGraphFixture {
         CookieProtected,
@@ -14185,6 +17252,64 @@ mod tests {
             "expected entry fetch status in error, got: {}",
             error
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dependency_prepared_as_root_is_evaluated_only_once() {
+        let base = spawn_duplicate_module_graph_server();
+        let jar = std::sync::Arc::new(obscura_net::CookieJar::new());
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            jar, None, true,
+        ));
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("{}/", base));
+        rt.set_http_client(client);
+
+        // The HTML scheduler prepares all module graphs before evaluating any
+        // of them. The shared URL is both a dependency and a later root, which
+        // used to reach deno_core::mod_evaluate twice and panic (#591).
+        let entry = rt
+            .prepare_module(&format!("{}/entry.js", base), 1_000)
+            .await
+            .unwrap();
+        let shared = rt
+            .prepare_module(&format!("{}/shared.js", base), 1_000)
+            .await
+            .unwrap();
+
+        rt.evaluate_prepared_module(entry, 1_000).await.unwrap();
+        rt.evaluate_prepared_module(shared, 1_000).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__module_entry_ran === true").unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__shared_module_runs").unwrap(),
+            serde_json::json!(1.0),
+        );
+    }
+
+    #[test]
+    fn heap_limit_terminates_script_and_runtime_recovers() {
+        crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
+        let mut rt = ObscuraJsRuntime::new();
+
+        for _ in 0..2 {
+            let error = rt
+                .evaluate(
+                    "(() => { const chunks = []; for (;;) { \
+                     chunks.push(new Array(262144).fill(1.25)); } })()",
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("heap limit exceeded"),
+                "unexpected heap failure: {error}",
+            );
+            assert_eq!(
+                rt.evaluate("globalThis.__runtime_survived_oom = true").unwrap(),
+                serde_json::json!(true),
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15251,5 +18376,351 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["range", "write"]));
+    }
+
+    // One stream per document. The tokenizer carries its state across the calls.
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
+    #[test]
+    fn document_write_joins_an_element_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<di');
+                document.write('v id="split">');
+                document.write('content</div>');
+                const el = document.getElementById('split');
+                return el ? el.textContent : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("content"));
+    }
+
+    #[test]
+    fn document_write_joins_a_tag_name_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<spa');
+                document.write('n id="half">x</span>');
+                const el = document.getElementById('half');
+                return el ? el.tagName : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // The shape the UI5 cachebuster writes: "<script", one per attribute, then ">".
+    #[test]
+    fn document_write_runs_a_script_split_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__splitScriptRan = false;
+                document.write('<scr' + 'ipt');
+                document.write(' id="split-script"');
+                document.write('>');
+                document.write('globalThis.__splitScriptRan = true;');
+                document.write('<\/scr' + 'ipt>');
+                return [!!document.getElementById('split-script'), globalThis.__splitScriptRan];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    // A script in the <head> inserts behind itself, so that what it writes runs before what
+    // the parser saw after it.
+    #[test]
+    fn document_write_inserts_at_the_writing_scripts_position() {
+        let mut rt = setup_runtime(
+            r#"<html><head><script id="writer"></script></head><body><p id="existing">x</p></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                // What the production path sets while a script runs; bootstrap.js
+                // assigns __currentScriptNid around every script it prepares.
+                globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+                document.write('<span id="written"></span>');
+                return JSON.stringify({
+                  head: Array.from(document.head.children).map(e => e.id || e.tagName),
+                  body: Array.from(document.body.children).map(e => e.id || e.tagName),
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"head":["writer","written"],"body":["existing"]}"#)
+        );
+    }
+
+    // Holding back until the close would lose everything written after it. It belongs inside.
+    #[test]
+    fn document_write_shows_an_element_that_is_never_closed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<div id="unclosed">hello');
+                const el = document.getElementById('unclosed');
+                return el ? el.textContent : null;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn document_write_grows_an_open_element_across_calls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<div id="wrap">');
+                document.write('<span id="inner">y</span>');
+                const inner = document.getElementById('inner');
+                return JSON.stringify({
+                  wrap: !!document.getElementById('wrap'),
+                  inner: !!inner,
+                  nested: !!(inner && inner.parentElement && inner.parentElement.id === 'wrap'),
+                });
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(r#"{"wrap":true,"inner":true,"nested":true}"#)
+        );
+    }
+
+    // Writing goes through the same insertion steps as any other insertion.
+    #[test]
+    fn document_write_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__seen = [];
+                const observer = new MutationObserver((records) => {
+                  for (const record of records) {
+                    for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
+                  }
+                });
+                observer.observe(document.body, { childList: true });
+                document.write('<span id="watched">z</span>');
+                observer.takeRecords().forEach((record) => {
+                  for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
+                });
+                return globalThis.__seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // before(), after() and replaceWith() all go through parent.insertBefore. replaceChild
+    // also goes there in the fragment branch. AGENTS.md requires whoever touches insertBefore
+    // to check them: the order of reference node versus parent nid is easy to break. The test
+    // also pins that every insertion is reported exactly once, not twice.
+    #[test]
+    fn child_node_methods_place_nodes_and_report_once() {
+        let mut rt = setup_runtime(r#"<html><body><p id="a"></p><p id="b"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const ids = () => Array.from(document.body.children).map((e) => e.id).join(',');
+                const make = (id) => { const e = document.createElement('span'); e.id = id; return e; };
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                const steps = {};
+
+                document.getElementById('b').before(make('x'));
+                steps.before = ids();
+                document.getElementById('b').after(make('y'));
+                steps.after = ids();
+                document.getElementById('y').replaceWith(make('z'));
+                steps.replaceWith = ids();
+                document.body.replaceChild(make('w'), document.getElementById('z'));
+                steps.replaceChild = ids();
+
+                const added = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.id));
+                observer.disconnect();
+                steps.added = added.join(',');
+                return JSON.stringify(steps);
+                "#,
+            )
+            .unwrap();
+        let steps: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("steps json");
+        assert_eq!(steps["before"], "a,x,b");
+        assert_eq!(steps["after"], "a,x,b,y");
+        assert_eq!(steps["replaceWith"], "a,x,b,z");
+        assert_eq!(steps["replaceChild"], "a,x,b,w");
+        // Every inserted node exactly once, in the order of insertion.
+        assert_eq!(steps["added"], "x,y,z,w");
+    }
+
+    // insertBefore reported no mutation at all, appendChild did.
+    #[test]
+    fn insert_before_reports_to_mutation_observers() {
+        let mut rt = setup_runtime("<html><body><p id=\"ref\"></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const observer = new MutationObserver(() => {});
+                observer.observe(document.body, { childList: true });
+                document.body.insertBefore(
+                  document.createElement('span'),
+                  document.getElementById('ref'),
+                );
+                const seen = observer.takeRecords()
+                  .flatMap((record) => Array.from(record.addedNodes).map((n) => n.nodeName));
+                observer.disconnect();
+                return seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    #[test]
+    fn document_write_registers_window_named_access() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                document.write('<img name="namedImage" src="x.png">');
+                return typeof window.namedImage;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("object"));
+    }
+
+    #[test]
+    fn document_write_keeps_call_order_at_the_insertion_point() {
+        let mut rt = setup_runtime(
+            r#"<html><head><script id="writer"></script></head><body></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+                document.write('<span id="one"></span>');
+                document.write('<span id="two"></span>');
+                return Array.from(document.head.children).map(e => e.id).join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("writer,one,two"));
+    }
+
+    /// #699: an unhandled rejection from a failed dynamic import is page-local
+    /// noise in a browser. The bounded event loop must report it and keep
+    /// driving later tasks instead of dying on the error and starving every
+    /// pending timer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unhandled_rejection_does_not_starve_later_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "(function() { \
+                import('http://192.0.0.1/unreachable-module.js'); \
+                globalThis.__t = false; \
+                setTimeout(() => { globalThis.__t = true; }, 5); \
+                return 'ok'; \
+            })()",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(2_000)
+            .await
+            .expect("the pump must survive a page-local rejection");
+        assert_eq!(
+            rt.evaluate("globalThis.__t").unwrap(),
+            serde_json::json!(true),
+            "the pending timer must still fire after a page task error"
+        );
+    }
+
+    /// #734: ICU inherits the host OS locale when no default is set, so
+    /// Intl.resolvedOptions() contradicted navigator.language on any host
+    /// whose OS locale is not en-US. The pinned default must win.
+    #[test]
+    fn intl_locale_matches_navigator_language_regardless_of_host() {
+        // nextest runs each test in its own process, so setting the process
+        // locale here cannot race another test's V8 init.
+        std::env::set_var("LC_ALL", "de-DE");
+        std::env::set_var("LANG", "de-DE");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "Intl.DateTimeFormat().resolvedOptions().locale + '|' + navigator.language",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("en-US|en-US"),
+            "Intl must not leak the host OS locale while navigator.language says en-US"
+        );
+    }
+
+    // Momentic POC / Playwright getByLabel: the label association getters must
+    // link <label for> to its control and expose element.labels, both for
+    // for-linked and wrapping labels.
+    #[test]
+    fn label_control_and_labels_link_labelable_elements() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+            <label for="name" id="l1">Name</label><input id="name">
+            <label id="l2">Age <input id="age"></label>
+            <input type="hidden" id="hid">
+            <div id="plain"></div>
+            </body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    var l1 = document.getElementById('l1');
+                    var l2 = document.getElementById('l2');
+                    var name = document.getElementById('name');
+                    var age = document.getElementById('age');
+                    var hid = document.getElementById('hid');
+                    var plain = document.getElementById('plain');
+                    return [
+                        l1.control === name,
+                        l2.control === age,
+                        name.labels.length,
+                        name.labels[0] === l1,
+                        age.labels.length,
+                        age.labels[0] === l2,
+                        hid.labels.length,
+                        plain.labels.length,
+                        plain.control === null,
+                    ].join(',');
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("true,true,1,true,1,true,0,0,true"),
+            "label association must follow the HTML labelable-element rules"
+        );
     }
 }

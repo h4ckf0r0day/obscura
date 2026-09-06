@@ -15,8 +15,12 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted',
-    '__obscura_registerLinkedStylesheet',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
+    '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
+    '__obscura_liveFrameIds', '__obscura_forgetFrame',
+    '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
+    '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
@@ -50,7 +54,7 @@
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -63,6 +67,14 @@
     try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
   }
 })();
+
+// Handoff for child frame realms. deno_core binds ops into the main context
+// only, so a realm restored from the snapshot arrives with its own empty
+// `Deno.core.ops`. The host reads this to take the main realm's bound op table
+// and to find each new realm's own table to fill, then deletes the global in
+// the same step, so page script never sees it (see runtime.rs
+// `take_ops_handoff` / `share_ops_with_realm`).
+globalThis.__obscura_core_handoff = Deno.core;
 
 globalThis.__obscura_errors = [];
 
@@ -95,14 +107,22 @@ const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
-  "set_fragment_html_executable",
+  "set_fragment_html_executable", "document_write",
 ]);
 const _DOM_TREE_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
+  "document_write",
 ]);
+// Which realm this bootstrap closure belongs to. Every wrapper's methods come
+// from its own realm's prototypes, so a DOM call names the document it belongs
+// to instead of letting the host guess from whoever is calling. That is what
+// makes `iframe.contentDocument.title` read the frame's document rather than
+// the caller's. Set by __obscura_init; 0 is the page.
+let _realmFrameId = 0;
+
 const _dom = (cmd, a1, a2) => {
-  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+  const result = Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
     // Resize observation is tied to rendering-invalidating DOM work. The
@@ -132,17 +152,22 @@ const _nativeFns = new Set();
 // or functions whose `.name` does not match the real builtin.
 const _nativeStr = new Map();
 const _origToString = Function.prototype.toString;
-Function.prototype.toString = function toString() {
-  if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-  if (_nativeFns.has(this)) {
-    return `function ${this.name || ''}() { [native code] }`;
-  }
-  return _origToString.call(this);
-};
+// Method syntax matches the native function's non-constructible shape and
+// does not add an own `prototype` property.
+const _functionToString = {
+  toString() {
+    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
+    if (_nativeFns.has(this)) {
+      return `function ${this.name || ''}() { [native code] }`;
+    }
+    return _origToString.call(this);
+  },
+}.toString;
+Function.prototype.toString = _functionToString;
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
-_nativeFns.add(Function.prototype.toString);
+_nativeFns.add(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from
@@ -301,7 +326,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -527,7 +552,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -674,9 +699,11 @@ function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
+globalThis._formIndeterminate = globalThis._formIndeterminate || {};
 const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
+const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
@@ -713,40 +740,100 @@ function _getElementsByClassName(root, classNames) {
   }
   return HTMLCollection._from(matched);
 }
+let _consoleOid = 0;
+const _consoleObjectId = (value) => {
+  const objectId = "console-" + (globalThis.__obscura_frameId >>> 0) + "-" + (++_consoleOid);
+  const store = globalThis.__obscura_objects || (globalThis.__obscura_objects = {});
+  store[objectId] = value;
+  return objectId;
+};
+const _consoleRemoteObject = (value) => {
+  const type = typeof value;
+  if (value === null) return { type: "object", subtype: "null", value: null, description: "null" };
+  if (type === "undefined") return { type: "undefined" };
+  if (type === "string" || type === "boolean") return { type, value, description: String(value) };
+  if (type === "number") {
+    if (Number.isNaN(value)) return { type, unserializableValue: "NaN", description: "NaN" };
+    if (value === Infinity) return { type, unserializableValue: "Infinity", description: "Infinity" };
+    if (value === -Infinity) return { type, unserializableValue: "-Infinity", description: "-Infinity" };
+    if (Object.is(value, -0)) return { type, unserializableValue: "-0", description: "-0" };
+    return { type, value, description: String(value) };
+  }
+  if (type === "bigint") {
+    const description = String(value) + "n";
+    return { type, unserializableValue: description, description };
+  }
+  if (type === "symbol") return { type, description: String(value) };
+  if (value instanceof Error) {
+    const _pst = Error.prepareStackTrace;
+    if (_pst !== undefined) Error.prepareStackTrace = undefined;
+    const description = value.stack || value.message || String(value);
+    if (_pst !== undefined) Error.prepareStackTrace = _pst;
+    return {
+      type: "object", subtype: "error",
+      className: (value.constructor && value.constructor.name) || "Error",
+      description, objectId: _consoleObjectId(value)
+    };
+  }
+  const className = type === "function"
+    ? "Function"
+    : ((value.constructor && value.constructor.name) || "Object");
+  const remote = { type, className, description: type === "function" ? String(value) : className };
+  if (Array.isArray(value)) {
+    remote.subtype = "array";
+    remote.description = "Array(" + value.length + ")";
+  } else if (type === "object" && typeof value._nid === "number") {
+    remote.subtype = "node";
+    remote.description = value.tagName ? value.tagName.toLowerCase() : (value.nodeName || "node");
+  }
+  remote.objectId = _consoleObjectId(value);
+  return remote;
+};
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
-    if (a === null) return "null";
-    if (a === undefined) return "undefined";
-    if (a instanceof Error) {
-      const _pst = Error.prepareStackTrace;
-      if (_pst !== undefined) Error.prepareStackTrace = undefined;
-      const _s = a.stack || a.message || String(a);
-      if (_pst !== undefined) Error.prepareStackTrace = _pst;
-      return _s;
-    }
-    if (typeof a === "object") {
-      try {
-        const s = JSON.stringify(a);
-        return s === "{}" && a.message ? a.message : s;
-      } catch { return String(a); }
-    }
-    return String(a);
-  }).join(" ")); } catch {}
+  try {
+    const text = args.map(a => {
+      if (a === null) return "null";
+      if (a === undefined) return "undefined";
+      if (a instanceof Error) {
+        const _pst = Error.prepareStackTrace;
+        if (_pst !== undefined) Error.prepareStackTrace = undefined;
+        const _s = a.stack || a.message || String(a);
+        if (_pst !== undefined) Error.prepareStackTrace = _pst;
+        return _s;
+      }
+      if (typeof a === "object") {
+        try {
+          const s = JSON.stringify(a);
+          return s === "{}" && a.message ? a.message : s;
+        } catch { return String(a); }
+      }
+      return String(a);
+    }).join(" ");
+    const eventArgs = Deno.core.ops.op_runtime_events_enabled()
+      ? JSON.stringify(args.map(a => {
+          try { return _consoleRemoteObject(a); }
+          catch { return { type: typeof a, description: "<unavailable>" }; }
+        }))
+      : "";
+    Deno.core.ops.op_console_msg(level, text, eventArgs);
+  } catch {}
 };
 
 globalThis.console = {
-  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
-  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
+  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warning", a),
+  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("info", a),
+  debug: (...a) => _consoleFn("debug", a), dir: (...a) => _consoleFn("dir", a),
+  trace: (...a) => _consoleFn("trace", a), table: (...a) => _consoleFn("table", a), group: () => {},
   groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
   timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
 
 let _tid = 0;
-const _clearedTimers = new Set();
 const _intervals = new Set();
 const _nativeTimerIds = new Map();
+const _timerStates = new Map();
+const _frameTimerStates = new Map();
 const __obscuraPendingTimeoutDeadlines = new Map();
 Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   value: function() {
@@ -761,6 +848,9 @@ Object.defineProperty(globalThis, '__obscura_nextPendingTimeoutDelay', {
   enumerable: false,
   configurable: false,
 });
+
+let _frameTimerSeq = 0;
+const _cancelledFrameTimers = new Set();
 
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
@@ -777,6 +867,28 @@ const _scheduleAfter = (delay, fn) => {
   if (!Deno.core.ops.op_async_runtime_available()) {
     return undefined;
   }
+  // A child frame realm cannot use deno_core's timer queue: op_timer_queue
+  // reads per-context state that only a deno_core-created context carries, and
+  // a realm restored from the snapshot has none, so queueing from a frame
+  // dereferences uninitialized memory. A host sleep does the same job, and
+  // because its continuation is an ordinary microtask, V8 reports the frame as
+  // the microtask context and the ops the callback makes still resolve against
+  // the frame's own document. Frame timer ids are negative so clearTimeout can
+  // tell the two queues apart. Keep cancellation state by native id and remove
+  // it on either fire or clear, so repeated clearTimeout calls do not grow a
+  // permanent set.
+  if (globalThis.__obscura_frameId) {
+    const frameTimerId = -(++_frameTimerSeq);
+    const state = { cancelled: false };
+    _frameTimerStates.set(frameTimerId, state);
+    Deno.core.ops.op_sleep(d).then(() => {
+      _frameTimerStates.delete(frameTimerId);
+      if (state.cancelled) return;
+      Deno.core.ops.op_begin_render_task?.();
+      fn();
+    });
+    return frameTimerId;
+  }
   // The callback runs only when the embedder pumps the event loop, after the
   // current microtask checkpoint.
   return Deno.core.queueUserTimer(0, false, d, () => {
@@ -786,6 +898,15 @@ const _scheduleAfter = (delay, fn) => {
     Deno.core.ops.op_begin_render_task?.();
     return fn();
   });
+};
+
+const _cancelScheduled = (nativeId) => {
+  if (nativeId < 0) {
+    const state = _frameTimerStates.get(nativeId);
+    if (state) state.cancelled = true;
+    _frameTimerStates.delete(nativeId);
+  }
+  else Deno.core.cancelTimer(nativeId);
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -807,30 +928,53 @@ const _coerceTimerFn = (fn) => {
   return typeof fn === "function" ? fn : null;
 };
 
+let _timerTaskNestingLevel = 0;
+const _timerDelayForNesting = (delay, nestingLevel) =>
+  nestingLevel > 5 ? Math.max(4, delay) : delay;
+const _runTimerTask = (nestingLevel, fn) => {
+  const previous = _timerTaskNestingLevel;
+  _timerTaskNestingLevel = nestingLevel;
+  try { return fn(); }
+  finally { _timerTaskNestingLevel = previous; }
+};
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
   const normalizedDelay = Math.max(0, Number(delay) || 0);
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
-    _nativeTimerIds.delete(id);
-    __obscuraPendingTimeoutDeadlines.delete(id);
-    if (_clearedTimers.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Timer error:", e); }
-  });
+  const parentNestingLevel = _timerTaskNestingLevel;
+  const taskNestingLevel = parentNestingLevel + 1;
+  const scheduledDelay = _timerDelayForNesting(normalizedDelay, parentNestingLevel);
+  const state = { cancelled: false };
+  const nativeId = _scheduleAfter(
+    scheduledDelay,
+    () => {
+      _timerStates.delete(id);
+      _nativeTimerIds.delete(id);
+      __obscuraPendingTimeoutDeadlines.delete(id);
+      if (state.cancelled) return;
+      _runTimerTask(taskNestingLevel, () => {
+        try { f(...args); } catch(e) { console.error("Timer error:", e); }
+      });
+    },
+  );
   if (nativeId !== undefined) {
+    _timerStates.set(id, state);
     _nativeTimerIds.set(id, nativeId);
-    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + scheduledDelay);
   }
   return id;
 };
 
 globalThis.clearTimeout = (id) => {
-  _clearedTimers.add(id);
+  const state = _timerStates.get(id);
+  if (state) state.cancelled = true;
+  _timerStates.delete(id);
   __obscuraPendingTimeoutDeadlines.delete(id);
   const nativeId = _nativeTimerIds.get(id);
   if (nativeId !== undefined) {
-    Deno.core.cancelTimer(nativeId);
+    _cancelScheduled(nativeId);
     _nativeTimerIds.delete(id);
   }
 };
@@ -839,15 +983,25 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const parentNestingLevel = _timerTaskNestingLevel;
+  let taskNestingLevel = parentNestingLevel + 1;
   _intervals.add(id);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    _runTimerTask(taskNestingLevel, () => {
+      try { f(...args); } catch(e) { console.error("Interval error:", e); }
+    });
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(delay, tick);
+    const nextDelay = _timerDelayForNesting(normalizedDelay, taskNestingLevel);
+    taskNestingLevel++;
+    const nativeId = _scheduleAfter(nextDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
-  const nativeId = _scheduleAfter(delay, tick);
+  const nativeId = _scheduleAfter(
+    _timerDelayForNesting(normalizedDelay, parentNestingLevel),
+    tick,
+  );
   if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   return id;
 };
@@ -960,39 +1114,66 @@ globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolv
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
 // which turns MessageChannel and scheduler chains into artificial latency.
-// Keep one shared priority/FIFO queue in JavaScript and use a yield-only async
-// op solely to wake one delivery. Scheduling the next wake after the callback
-// gives V8 a microtask checkpoint between every pair of posted tasks.
+// Keep one shared priority/FIFO queue in JavaScript and enqueue one callback on
+// deno_core's re-entrant-safe V8 task spawner. Scheduling the next wake after
+// the callback gives V8 a microtask checkpoint between every pair of tasks.
 const _browserPostedTaskQueues = Array.from({ length: 6 }, () => []);
 let _browserPostedTaskWakePending = false;
+const _invalidPostedTaskGeneration = -1;
+
+function _browserPostedTaskGeneration() {
+  return Deno.core.ops.op_posted_task_generation(_realmFrameId);
+}
+
+function _browserPostedTaskDiscardQueue(queue) {
+  const entries = queue.splice(0, queue.length);
+  for (const entry of entries) {
+    if (entry.discard) {
+      try { entry.discard(); } catch (_) {}
+    }
+  }
+}
 
 function _browserPostedTaskScheduleWake() {
   if (_browserPostedTaskWakePending) return;
   if (!Deno.core.ops.op_async_runtime_available()) return;
-  _browserPostedTaskWakePending = true;
-  Deno.core.ops.op_posted_task().then(
-    _browserPostedTaskRunOne,
-    () => {
-      _browserPostedTaskWakePending = false;
-      if (_browserPostedTaskQueues.some(queue => queue.length)) {
-        _scheduleAfter(0, _browserPostedTaskRunOne);
-      }
-    },
-  );
+  const generation = Deno.core.ops.op_posted_task(
+    _realmFrameId, _browserPostedTaskRunOne);
+  _browserPostedTaskWakePending = generation !== _invalidPostedTaskGeneration;
+  if (!_browserPostedTaskWakePending) {
+    for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
+  }
 }
 
-function _browserPostedTaskEnqueue(callback, priority) {
-  _browserPostedTaskQueues[priority].push(callback);
+function _browserPostedTaskEnqueue(
+  callback, priority, generation = _browserPostedTaskGeneration(), discard = null) {
+  _browserPostedTaskQueues[priority].push({ callback, generation, discard });
   _browserPostedTaskScheduleWake();
 }
 
-function _browserPostedTaskRunOne() {
+function _browserPostedTaskRunOne(currentGeneration = _invalidPostedTaskGeneration) {
+  // Document replacement and frame teardown are cancellation boundaries.
+  // Borrow contention is cancelled too: a browser task must not unwind through
+  // V8 or enter a realm whose native owner is unavailable.
   _browserPostedTaskWakePending = false;
+  if (currentGeneration === _invalidPostedTaskGeneration) {
+    for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
+    return;
+  }
   let callback = null;
   for (let priority = _browserPostedTaskQueues.length - 1; priority >= 0; priority--) {
     const queue = _browserPostedTaskQueues[priority];
+    let staleCount = 0;
+    while (staleCount < queue.length &&
+           queue[staleCount].generation !== currentGeneration) staleCount++;
+    const staleEntries = staleCount ? queue.splice(0, staleCount) : [];
+    for (const stale of staleEntries) {
+      if (stale.discard) {
+        try { stale.discard(); } catch (_) {}
+      }
+    }
     if (queue.length) {
-      callback = queue.shift();
+      callback = queue.shift().callback;
       break;
     }
   }
@@ -1024,7 +1205,11 @@ let _schedulerCurrentState = null;
 
 function _schedulerRemoveAbort(task) {
   if (task.signal && task.abortHandler) {
-    task.signal.removeEventListener("abort", task.abortHandler);
+    // Scheduler options accept only this realm's AbortSignal. Use its private
+    // listener store so page code cannot intercept teardown by overriding the
+    // public removeEventListener method.
+    const index = task.signal._listeners.indexOf(task.abortHandler);
+    if (index >= 0) task.signal._listeners.splice(index, 1);
     task.abortHandler = null;
   }
 }
@@ -1033,7 +1218,13 @@ function _schedulerEnqueue(task, continuation) {
   if (task.canceled) return;
   const effectivePriority = _schedulerPriorityRank[task.priority] * 2
     + (continuation ? 1 : 0);
-  _browserPostedTaskEnqueue(() => _schedulerRunTask(task), effectivePriority);
+  _browserPostedTaskEnqueue(
+    () => _schedulerRunTask(task), effectivePriority, task.documentGeneration,
+    () => {
+      task.canceled = true;
+      task.callback = null;
+      _schedulerRemoveAbort(task);
+    });
 }
 
 function _schedulerRunTask(task) {
@@ -1093,6 +1284,7 @@ function _schedulerNormalizeOptions(options) {
 function _schedulerCreateTask(callback, state, resolve, reject) {
   const task = {
     callback, state, resolve, reject,
+    documentGeneration: _browserPostedTaskGeneration(),
     priority: state.priority,
     signal: state.signal,
     abortHandler: null,
@@ -1109,7 +1301,8 @@ function _schedulerCreateTask(callback, state, resolve, reject) {
       _schedulerRemoveAbort(task);
       reject(task.signal.reason);
     };
-    task.signal.addEventListener("abort", task.abortHandler);
+    // See _schedulerRemoveAbort: the public method is intentionally bypassed.
+    task.signal._listeners.push(task.abortHandler);
   }
   return task;
 }
@@ -1221,6 +1414,7 @@ function _messagePortInstallEventHandler(port, type, callback) {
 function _messagePortScheduleDelivery(port) {
   const state = _messagePortStateFor(port);
   if (state.closed || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
+  const deliveryGeneration = state.messageQueue[0].generation;
   state.messageDeliveryPending = true;
   // User-visible ordinary rank. Scheduler continuations at the same priority
   // remain immediately above this task; FIFO holds across all ordinary tasks.
@@ -1229,7 +1423,7 @@ function _messagePortScheduleDelivery(port) {
     if (!current) return;
     current.messageDeliveryPending = false;
     if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
-    const data = current.messageQueue.shift();
+    const data = current.messageQueue.shift().data;
     const event = new MessageEvent("message", {
       data,
       origin: "",
@@ -1239,7 +1433,14 @@ function _messagePortScheduleDelivery(port) {
     });
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
-  }, _schedulerPriorityRank["user-visible"] * 2);
+  }, _schedulerPriorityRank["user-visible"] * 2, deliveryGeneration, () => {
+    const current = _messagePortState.get(port);
+    if (!current) return;
+    current.messageDeliveryPending = false;
+    current.messageQueue = current.messageQueue.filter(
+      entry => entry.generation !== deliveryGeneration);
+    _messagePortScheduleDelivery(port);
+  });
 }
 class MessagePort {
   constructor(key) {
@@ -1270,7 +1471,10 @@ class MessagePort {
     const target = state.entangled;
     const targetState = target && _messagePortState.get(target);
     if (state.closed || !targetState || targetState.closed) return;
-    targetState.messageQueue.push(cloned);
+    targetState.messageQueue.push({
+      data: cloned,
+      generation: _browserPostedTaskGeneration(),
+    });
     _messagePortScheduleDelivery(target);
   }
   start() {
@@ -1856,20 +2060,7 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
-    try {
-      const doc = globalThis.document;
-      const docUrl = (doc && doc.URL) || "";
-      const baseEl = (doc && doc.querySelector) ? doc.querySelector("base[href]") : null;
-      if (baseEl) {
-        const href = baseEl.getAttribute("href");
-        if (href) {
-          return docUrl ? new URL(href, docUrl).href : href;
-        }
-      }
-      return docUrl;
-    } catch (e) {
-      return "";
-    }
+    try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
@@ -2024,7 +2215,15 @@ class Node {
     _detachStyleSheetsInSubtree(oldChild);
     _registerWindowNamedTree(newChild);
     _reconcileWindowNamedProperties(removedWindowNames);
+    // As in appendChild and removeChild. A replacement is an insertion and a removal. An
+    // observer saw neither so far.
+    if (globalThis.__mutationObservers?.length) {
+      globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
+    }
     __prepareInsertedSubtree(newChild);
+    if (newChild instanceof Element && newChild.tagName === 'LINK') {
+      _loadLinkedStylesheet(newChild);
+    }
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -2055,7 +2254,13 @@ class Node {
     _seedUnchangedConnection(this, parentConnected);
     _seedInsertedTreeState(n, this, parentConnected);
     _registerWindowNamedTree(n);
+    // The same steps as in appendChild. Where a node is inserted does not decide whether an
+    // observer sees it and whether a <link> loads its stylesheet.
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
     __prepareInsertedSubtree(n);
+    if (n instanceof Element && n.tagName === 'LINK') {
+      _loadLinkedStylesheet(n);
+    }
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -2337,6 +2542,16 @@ class DOMTokenList {
   toString() { return this.value; }
 }
 
+const _domStringMapConstructionKey = {};
+class DOMStringMap {
+  constructor(key) {
+    if (key !== _domStringMapConstructionKey) {
+      throw new TypeError("Failed to construct 'DOMStringMap': Illegal constructor");
+    }
+  }
+  get [Symbol.toStringTag]() { return "DOMStringMap"; }
+}
+
 // CDATASection: a Text-derived node (nodeType 4) used only in XML documents.
 // Extends Text so data/length/textContent/childNodes reuse the working text
 // node machinery; only the type-identifying getters differ.
@@ -2404,10 +2619,25 @@ function _applyDocQueryEncoding(u) {
   return u;
 }
 
+// The base for relative URLs. <base href> overrides the document URL, so an app in a sub-path
+// requests "chunk-A.js" under its current route and gets 404.
+// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
+// Returns "" when there is no document, so each call site keeps its own fallback.
+function _documentBase() {
+  // history.pushState moves the document URL without reaching the Rust side. Then the base must
+  // be built here, or every relative URL resolves against the pre-routing address.
+  const virtual = globalThis.__virtualUrl;
+  if (virtual) {
+    const raw = _domParse("document_base_href");
+    if (!raw) return virtual;
+    try { return new URL(raw, virtual).href; } catch (e) { return virtual; }
+  }
+  return _domParse("document_base_url") || _domParse("document_url") || "";
+}
 // HTMLHyperlinkElementUtils helpers (the <a>/<area> URL-decomposition members).
 // The element's href attribute is parsed against the document base URL via the
 // WHATWG url op; component getters read it, setters rewrite the href attribute.
-function _anchorBase() { return _domParse("document_url") || "about:blank"; }
+function _anchorBase() { return _documentBase() || "about:blank"; }
 function _elemHrefURL(el) {
   const raw = el.getAttribute('href');
   if (raw === null || raw === undefined) return null;
@@ -2488,12 +2718,132 @@ function _htmlAttrName(el, n) {
 // A submit button per the HTML spec: a <button> whose type is submit — the
 // default, including when the type attribute is missing or invalid — or an
 // <input> of type submit/image. Used to validate requestSubmit's submitter.
+// The HTML "labeled control" of a <label>: the element referenced by its `for`
+// attribute, or the first labelable descendant. Labelable elements per spec are
+// button, input (excluding type=hidden), meter, output, progress, select,
+// textarea.
+const _LABELABLE = 'button,input:not([type=hidden]),meter,output,progress,select,textarea';
+function _labeledControl(label) {
+  if (!label || label.tagName !== 'LABEL') return null;
+  // A present `for` attribute means association by ID only; an empty value
+  // associates nothing (no fallback to a descendant).
+  const forId = label.getAttribute ? label.getAttribute('for') : null;
+  if (forId !== null && forId !== undefined) {
+    if (forId === '') return null;
+    const doc = label.ownerDocument || globalThis.document;
+    const el = doc && doc.getElementById ? doc.getElementById(forId) : null;
+    if (!el) return null;
+    return el.matches && el.matches(_LABELABLE) ? el : null;
+  }
+  return label.querySelector ? label.querySelector(_LABELABLE) : null;
+}
+
+// Run a label's activation behaviour once, and report whether it ran. The set
+// of labels currently forwarding is closure-private, so a control that clicks
+// its own label from a click handler cannot recurse and page script can neither
+// read nor forge the state. Marking the label itself would leave an enumerable
+// property on a DOM node. The CDP click path shares this guard through the
+// non-enumerable __obscura_activateLabel helper, so both click paths apply the
+// same rule.
+// Interactive content inside a label has its own activation behaviour and
+// swallows the label's, so only a click landing on ordinary content forwards.
+// This is the HTML interactive-content set, which is not the labelable set:
+// meter, output and progress are labelable but inert, while an <a> counts only
+// with an href.
+const _INTERACTIVE = 'a[href],audio[controls],button,details,embed,iframe,'
+  + 'img[usemap],input:not([type=hidden]),select,textarea,video[controls]';
+
+const _forwardingLabels = new WeakSet();
+// Passed to click() only by label activation on behalf of a real input event,
+// so the forwarded control events keep the trustedness of the click that
+// caused them, as they do in a real browser. The symbol itself is
+// closure-private, so click() cannot be called with it directly, but
+// __obscura_activateLabel below will supply it on request, exactly as
+// __obscura_markTrusted already does for any event.
+const _TRUSTED_ACTIVATION = Symbol('obscura.trustedActivation');
+
+// Only these elements can be actually disabled. A `disabled` attribute on
+// anything else, which component libraries do put on plain <div>s, has no
+// effect on event dispatch.
+const _DISABLEABLE = 'button,input,select,textarea,optgroup,option,fieldset';
+// Of those, only the listed form-associated ones inherit disabled from an
+// ancestor <fieldset>.
+const _FIELDSET_DISABLEABLE = 'button,input,select,textarea';
+
+// Disabled per the HTML spec: the element's own attribute, or any disabled
+// <fieldset> ancestor. Walking every ancestor rather than the nearest one
+// matters because the exemption is narrow: only the descendants of a disabled
+// fieldset's *first <legend> child* escape, so a control can sit in an inner
+// fieldset's legend and still be disabled by an outer fieldset. Checking the
+// first legend child, not the first legend descendant, keeps a legend wrapped
+// in a div from granting the exemption.
+function _isActuallyDisabled(el) {
+  if (!el || !el.matches || !el.matches(_DISABLEABLE)) return false;
+  if (el.disabled || (el.hasAttribute && el.hasAttribute('disabled'))) return true;
+  if (!el.matches(_FIELDSET_DISABLEABLE)) return false;
+  let child = el;
+  let parent = el.parentElement;
+  while (parent) {
+    if (parent.tagName === 'FIELDSET' && parent.hasAttribute('disabled')) {
+      let firstLegend = null;
+      for (let c = parent.firstElementChild; c; c = c.nextElementSibling) {
+        if (c.tagName === 'LEGEND') { firstLegend = c; break; }
+      }
+      if (child !== firstLegend) return true;
+    }
+    child = parent;
+    parent = parent.parentElement;
+  }
+  return false;
+}
+
+globalThis.__obscura_activateLabel = function(label, control, trusted) {
+  if (!label || !control || _forwardingLabels.has(label)) return false;
+  if (_isActuallyDisabled(control) || typeof control.click !== 'function') return false;
+  _forwardingLabels.add(label);
+  try { control.click(trusted ? _TRUSTED_ACTIVATION : undefined); }
+  finally { _forwardingLabels.delete(label); }
+  return true;
+};
+// The CDP click path runs its own JS snippet, so it reaches the same rules
+// through these helpers rather than restating the selectors.
+globalThis.__obscura_isDisabled = function(el) { return _isActuallyDisabled(el); };
+globalThis.__obscura_labeledControl = function(label) { return _labeledControl(label); };
+globalThis.__obscura_interactiveHost = function(el) {
+  return el && el.closest ? el.closest(_INTERACTIVE) : null;
+};
+// Frozen so page script can neither replace the helpers to suppress or fake
+// label activation, nor delete them and make later clicks throw.
+for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
+                     '__obscura_labeledControl', '__obscura_interactiveHost']) {
+  Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
+}
+
 function _isSubmitButton(el) {
   if (!el || typeof el.localName !== "string") return false;
   const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
   if (el.localName === "button") return type !== "reset" && type !== "button";
   if (el.localName === "input") return type === "submit" || type === "image";
   return false;
+}
+
+// The HTML labelable-elements list (hidden inputs excluded), shared by the
+// Element.labels and HTMLLabelElement.control getters.
+function _isLabelable(el) {
+  if (!el || typeof el.localName !== "string") return false;
+  switch (el.localName) {
+    case "button":
+    case "meter":
+    case "output":
+    case "progress":
+    case "select":
+    case "textarea":
+      return true;
+    case "input":
+      return (((el.getAttribute && el.getAttribute("type")) || "").toLowerCase()) !== "hidden";
+    default:
+      return false;
+  }
 }
 
 // Carry the context element's full qualified name into html5ever. Fragment
@@ -3103,6 +3453,10 @@ class Element extends Node {
       : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (n === "src" && this.localName === "iframe") {
+      if (value && value !== "about:blank") this._loadIframeSrc(value);
+      else this._resetIframeFrame();
+    }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
@@ -3115,6 +3469,11 @@ class Element extends Node {
       }
     }
     if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
+      _windowOnloadOverrideSet = false;
+      _windowOnloadOverride = null;
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
     if (this.localName === "source"
@@ -3155,6 +3514,11 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "onload" && _isWindowReflectingBodyElement(this)) {
+      _windowOnloadOverrideSet = false;
+      _windowOnloadOverride = null;
+      if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
@@ -3344,7 +3708,80 @@ class Element extends Node {
     return cache[name];
   }
   click() {
-    const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+    // A label activating this control on behalf of a real input event passes a
+    // private token so the forwarded events stay trusted. Read from arguments
+    // to keep click.length at 0, as in a real browser.
+    const _trusted = arguments[0] === _TRUSTED_ACTIVATION;
+    // Pre-click activation steps (HTML spec): a checkbox/radio flips BEFORE the
+    // click event dispatches, so listeners observe the new state, and the change
+    // is reverted if the event is cancelled. This mirrors the CDP mouse path in
+    // obscura-cdp/src/domains/input.rs, which already implements it; without it
+    // el.click() dispatched an event but never toggled the control.
+    const _tag = this.tagName;
+    const _type = ((this.getAttribute && this.getAttribute('type')) || '').toLowerCase();
+    const _checkable = _tag === 'INPUT' && (_type === 'checkbox' || _type === 'radio')
+      && !_isActuallyDisabled(this);
+    // A disabled form control has no activation behaviour and dispatches no
+    // click event at all.
+    if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
+      return;
+    }
+    let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
+    if (_checkable) {
+      _oldChecked = !!this.checked;
+      _oldIndeterminate = !!this.indeterminate;
+      if (_type === 'radio') {
+        const _name = this.getAttribute('name') || '';
+        if (_name) {
+          _radioStates = [];
+          const _all = (this.ownerDocument || globalThis.document).querySelectorAll('input');
+          for (let i = 0; i < _all.length; i++) {
+            const r = _all[i];
+            if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
+            if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
+            _radioStates.push([r, !!r.checked]);
+            if (r !== this) r.checked = false;
+          }
+        }
+        this.checked = true;
+      } else {
+        // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
+        // checkedness *and* drops indeterminateness. Clearing it here, not on
+        // `change`, is what lets the cancelled-activation path put the old
+        // flag back instead of leaving it stuck off.
+        this.checked = !_oldChecked;
+        this.indeterminate = false;
+      }
+    }
+    const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
+    if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
+    const cancelled = !this.dispatchEvent(_clickEvent);
+    if (cancelled) {
+      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
+      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
+      return;
+    }
+    if (_checkable && this.checked !== _oldChecked) {
+      for (const _type of ['input', 'change']) {
+        const _e = new Event(_type, {bubbles: true});
+        if (_trusted) globalThis.__obscura_markTrusted(_e);
+        try { this.dispatchEvent(_e); } catch (e) {}
+      }
+      return;
+    }
+    // Label activation behaviour (HTML spec): activating a label runs a
+    // synthetic click on its labeled control. The re-entrancy guard stops a
+    // control nested inside its own label from bouncing the click back.
+    const _label = _tag === 'LABEL'
+      ? this
+      : (this.closest && !this.matches(_INTERACTIVE) ? this.closest('label') : null);
+    if (_label && !(this.closest && this.closest(_INTERACTIVE) &&
+        _label.contains(this.closest(_INTERACTIVE)))) {
+      const control = _labeledControl(_label);
+      if (control && control !== this && globalThis.__obscura_activateLabel(_label, control)) {
+        return;
+      }
+    }
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
@@ -3572,17 +4009,18 @@ class Element extends Node {
     }
     if (tag === 'select') {
       // Set selected on matching option, clear on others. Puppeteer's
-      // page.select(selector, value) round-trips through this setter.
+      // page.select(selector, value) round-trips through this setter and
+      // dispatches its own input/change events in-page afterwards, like a
+      // real browser: a programmatic value assignment never fires change
+      // itself. Dispatching here fed pages that assign inside a change
+      // handler back into that handler in an infinite loop.
       const wanted = String(v);
       const opts = this.querySelectorAll('option');
-      let matched = false;
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
-        if (optVal === wanted) { opts[i].selected = true; matched = true; }
-        else { opts[i].selected = false; }
+        opts[i].selected = optVal === wanted;
       }
-      if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
       return;
     }
     _formValues[this._nid] = String(v);
@@ -3667,6 +4105,13 @@ class Element extends Node {
     return this.hasAttribute("checked");
   }
   set checked(v) { _formChecked[this._nid] = !!v; }
+  // `indeterminate` is IDL-only: it has no content attribute to reflect, so
+  // the property itself must exist on the prototype for `'indeterminate' in
+  // el` to be true on a freshly created element. It is node-keyed like
+  // `checked` because element wrappers are rebuilt on each lookup, so a
+  // per-instance field would not survive getElementById returning a new one.
+  get indeterminate() { return _formIndeterminate[this._nid] === true; }
+  set indeterminate(v) { _formIndeterminate[this._nid] = !!v; }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -3703,12 +4148,22 @@ class Element extends Node {
   }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
-  get type() { return this.getAttribute("type") || (this.localName === "input" ? "text" : ""); }
+  get type() {
+    // select and textarea report fixed IDL types, not the content attribute.
+    // jQuery's select valHook branches on type === "select-one" to decide
+    // scalar vs array .val(); "" here made every single select read as an
+    // array, so value comparisons against strings never matched.
+    if (this.localName === "select") return this.hasAttribute("multiple") ? "select-multiple" : "select-one";
+    if (this.localName === "textarea") return "textarea";
+    return this.getAttribute("type") || (this.localName === "input" ? "text" : "");
+  }
   set type(v) { this.setAttribute("type", v); }
   get name() { return this.getAttribute("name") || ""; }
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
+  get accept() { return this.getAttribute("accept") || ""; }
+  set accept(v) { this.setAttribute("accept", v); }
   // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
   // and what scrapers want). It uses op_url_resolve, which returns just the
   // resolved string, rather than the full-component op the decomposition
@@ -3731,6 +4186,15 @@ class Element extends Node {
       // Legacy-charset document: href must reflect the encoding-override query.
       if (!_docIsUtf8()) { const u = _elemHrefURL(this); return u ? u.href : raw; }
       const r = _urlResolveOp(raw, _anchorBase());
+      return r !== null ? r : raw;
+    }
+    if (ln === 'base') {
+      // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+      // Against the fallback base URL, not the document base URL: a base element is not affected
+      // by other base elements or itself. Applications read this to determine their own base.
+      const raw = this.getAttribute('href');
+      if (raw === null) return '';
+      const r = _urlResolveOp(raw, _domParse("document_url") || "about:blank");
       return r !== null ? r : raw;
     }
     return this.getAttribute("href") || "";
@@ -3780,26 +4244,57 @@ class Element extends Node {
     // value (issue #255). getAttribute("src") still returns the literal.
     const v = this.getAttribute("src");
     if (!v) return "";
-    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
+    try { return new URL(v, _documentBase() || "about:blank").href; }
     catch (e) { return v; }
   }
   set src(v) {
     this.setAttribute("src", v);
-    if (this.localName === 'iframe' && v && v !== 'about:blank') {
-      this._loadIframeSrc(v);
+  }
+  _resetIframeFrame() {
+    const oldId = this._frameId;
+    if (oldId) {
+      delete globalThis.__obscura_frameElements[oldId];
+      delete globalThis.__obscura_frameWindows[oldId];
     }
+    this._frameId = 0;
+    this._iframeLoadingUrl = null;
+    this._iframeDoc = new _IframeDocument(
+      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
+    // Both the src setter and the parser sweep in __obscura_init reach here, so
+    // a frame the page assigned before init must not be fetched a second time.
+    if (this._iframeLoadingUrl === fullUrl) return;
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = fullUrl;
     const el = this;
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
+      if (el._iframeLoadingUrl !== fullUrl) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
+        // Hand the document to the host, which gives this frame a realm of its
+        // own and runs the scripts that came with it (issue #600). The shim
+        // document below stays: it is what the parent reads through
+        // contentDocument.
+        const box = el.getBoundingClientRect();
+        el._frameId = Deno.core.ops.op_frame_document_ready(
+          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+        if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        // Bind the window to the realm the host just queued. This is what makes
+        // posting into the frame reach the frame's own listeners, and makes a
+        // message coming back out arrive with this window as its `source`.
+        if (el._frameId) {
+          el._iframeWin._frameId = el._frameId;
+          globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
+          globalThis.__obscura_frameElements[el._frameId] = el;
+        }
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
@@ -3810,6 +4305,7 @@ class Element extends Node {
       // directly bypasses listeners registered via addEventListener.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
+      if (el._iframeLoadingUrl !== fullUrl) return;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
 
@@ -3818,6 +4314,8 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    const real = _frameObjectsFor(this);
+    if (real?.document) return real.document;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
@@ -3834,6 +4332,10 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_frameObjectsFor(this)) {
+      const win = _frameWindowFor(this._frameId);
+      if (win) return win;
+    }
     if (!this._iframeWin) {
       if (this.parentNode === null) return null;
       this.contentDocument;
@@ -3841,8 +4343,9 @@ class Element extends Node {
     return this._iframeWin;
   }
   get action() {
+    // A missing action falls back to the document URL, a present one resolves against the base.
     const action = this.getAttribute("action") || _domParse("document_url") || "";
-    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+    try { return new URL(action, _documentBase() || "about:blank").href; } catch(e) { return action; }
   }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
@@ -3851,6 +4354,45 @@ class Element extends Node {
     let p = this.parentNode;
     while (p && p.localName !== 'form') p = p.parentNode;
     return p;
+  }
+  // Label association, per the HTML labelable-elements list. Playwright's
+  // getByLabel and its follow-label retargeting read these; without them a
+  // label-linked control is invisible to that engine.
+  get labels() {
+    if (!_isLabelable(this)) return _nodeList([]);
+    const doc = this.ownerDocument;
+    if (!doc || !doc.querySelectorAll) return _nodeList([]);
+    const out = [];
+    const id = this.getAttribute('id');
+    if (id) {
+      // Filter in JS rather than building a selector: an id containing a
+      // quote would break out of label[for="..."].
+      const all = doc.querySelectorAll('label');
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].getAttribute('for') === id) out.push(all[i]);
+      }
+    }
+    let p = this.parentNode;
+    while (p) {
+      if (p.localName === 'label') out.push(p);
+      p = p.parentNode;
+    }
+    return _nodeList(out);
+  }
+  get control() {
+    if (this.localName !== 'label') return null;
+    const doc = this.ownerDocument;
+    const forId = this.getAttribute('for');
+    if (forId) {
+      if (!doc || !doc.getElementById) return null;
+      const target = doc.getElementById(forId);
+      return target && _isLabelable(target) ? target : null;
+    }
+    const candidates = this.querySelectorAll('button, input, meter, output, progress, select, textarea');
+    for (let i = 0; i < candidates.length; i++) {
+      if (_isLabelable(candidates[i])) return candidates[i];
+    }
+    return null;
   }
   get options() {
     if (this.localName !== 'select') return [];
@@ -3878,7 +4420,9 @@ class Element extends Node {
     for (let i = 0; i < opts.length; i++) {
       if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
     }
-    return opts.length ? 0 : -1;
+    // Only a single select implicitly selects its first option; a multiple
+    // select with nothing chosen idles at -1 like a real browser.
+    return opts.length && !this.hasAttribute('multiple') ? 0 : -1;
   }
   set selectedIndex(v) {
     const opts = this.options;
@@ -3972,17 +4516,30 @@ class Element extends Node {
     const dataKeys = () => el.getAttributeNames()
       .filter((n) => n.startsWith("data-"))
       .map((n) => _cssKebabToCamel(n.slice(5)));
-    this._dataset = new Proxy({}, {
-      get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
-      set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
-      has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
-      deleteProperty(_, k) { if (typeof k === "string") el.removeAttribute(attrFor(k)); return true; },
+    this._dataset = new Proxy(new DOMStringMap(_domStringMapConstructionKey), {
+      get(target, k, receiver) {
+        if (typeof k === "string" && el.hasAttribute(attrFor(k))) return el.getAttribute(attrFor(k));
+        return Reflect.get(target, k, receiver);
+      },
+      set(target, k, v, receiver) {
+        if (typeof k !== "string") return Reflect.set(target, k, v, receiver);
+        el.setAttribute(attrFor(k), String(v));
+        return true;
+      },
+      has(target, k) {
+        return (typeof k === "string" && el.hasAttribute(attrFor(k))) || Reflect.has(target, k);
+      },
+      deleteProperty(target, k) {
+        if (typeof k !== "string") return Reflect.deleteProperty(target, k);
+        el.removeAttribute(attrFor(k));
+        return true;
+      },
       ownKeys() { return dataKeys(); },
-      getOwnPropertyDescriptor(_, k) {
+      getOwnPropertyDescriptor(target, k) {
         if (typeof k === "string" && el.hasAttribute(attrFor(k))) {
           return { value: el.getAttribute(attrFor(k)), writable: true, enumerable: true, configurable: true };
         }
-        return undefined;
+        return Reflect.getOwnPropertyDescriptor(target, k);
       },
     });
     return this._dataset;
@@ -4890,19 +5447,18 @@ class Document extends Node {
   // returned a generic Event for every type, which broke libraries that call
   // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
   createEvent(type) {
-    const normalized = String(type || '').toLowerCase();
-    if (normalized === 'promiserejectionevent') {
-      throw new DOMException(
-        "The provided event type ('PromiseRejectionEvent') is invalid",
-        'NotSupportedError'
-      );
-    }
+    const eventType = String(type || '');
+    const normalized = eventType.toLowerCase();
     const map = {
+      'event': Event, 'events': Event,
+      'htmlevents': Event, 'svgevents': Event,
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
       'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
       'focusevent': FocusEvent,
+      'hashchangeevent': HashChangeEvent,
       'inputevent': InputEvent,
+      'messageevent': MessageEvent,
       'uievent': UIEvent, 'uievents': UIEvent,
       'compositionevent': CompositionEvent,
       'wheelevent': WheelEvent,
@@ -4913,7 +5469,13 @@ class Document extends Node {
       'transitionevent': TransitionEvent,
       'storageevent': StorageEvent,
     };
-    const Cls = map[normalized] || Event;
+    const Cls = map[normalized];
+    if (!Cls) {
+      throw new DOMException(
+        `The provided event type ('${eventType}') is invalid`,
+        'NotSupportedError'
+      );
+    }
     return new Cls('');
   }
   createRange() { return new Range(); }
@@ -5210,16 +5772,52 @@ class Document extends Node {
     if (!v) return;
     Deno.core.ops.op_set_cookie(v);
   }
+  // Inserts into the document's input stream, which the host keeps alive across calls.
+  // Parsing each call on its own would lose every construct that spans two of them. This is
+  // exactly how the SAP UI5 cachebuster writes its bootstrap tags: one call for "<script",
+  // one per attribute, then ">".
+  // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
   write(...args) {
     var html = args.join('');
     if (!html) return;
     var body = this.body;
     if (!body) return;
-    var temp = this.createDocumentFragment();
-    _dom("set_fragment_html_executable", temp._nid, _fragmentContextPayload('body', html));
-    var children = Array.from(temp.childNodes);
-    for (var i = 0; i < children.length; i++) {
-      body.appendChild(children[i]);
+    // The host parses into the input stream and returns [[parent, node], …], parents first. The
+    // insertion stays here, because appendChild does more than append: it reports the
+    // mutation, registers window named access, and loads a written stylesheet.
+    var placements = _domParse("document_write", "", html) || [];
+    // The insertion point is the position of the running script. What it writes belongs
+    // behind it, not at the end of the body. The point moves along with every node placed,
+    // even across calls, so that a script's second call lands behind the first instead of
+    // directly behind the script again.
+    var scriptNid = globalThis.__currentScriptNid || 0;
+    var after = null;
+    if (scriptNid) {
+      var anchorNid = this._writeAnchorScript === scriptNid && this._writeAnchorNid
+        ? this._writeAnchorNid
+        : scriptNid;
+      var anchor = _wrap(anchorNid);
+      if (anchor && anchor.parentNode) after = anchor;
+    }
+    for (var i = 0; i < placements.length; i++) {
+      var parentNid = +placements[i][0];
+      var node = _wrap(+placements[i][1]);
+      if (!node) continue;
+      if (parentNid) {
+        var parent = _wrap(parentNid);
+        if (parent) parent.appendChild(node);
+        continue;
+      }
+      if (after) {
+        after.parentNode.insertBefore(node, after.nextSibling);
+        after = node;
+      } else {
+        body.appendChild(node);
+      }
+    }
+    if (scriptNid && after) {
+      this._writeAnchorScript = scriptNid;
+      this._writeAnchorNid = after._nid;
     }
   }
   writeln(...args) {
@@ -5228,6 +5826,10 @@ class Document extends Node {
   open() {
     var body = this.body;
     if (body) body.innerHTML = '';
+    // A new parse begins. Whatever the input stream still held is gone.
+    _dom("document_write_reset");
+    this._writeAnchorScript = 0;
+    this._writeAnchorNid = 0;
     return this;
   }
   close() {
@@ -5850,6 +6452,7 @@ function _elementClassFor(nid) {
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
@@ -5869,6 +6472,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -5904,9 +6508,10 @@ globalThis.self = globalThis;
 
 globalThis.document = null;
 function _resolveUrl(url) {
+  url = String(url);
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  try { return new URL(url, _documentBase() || "about:blank").href; } catch(e) { return url; }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -5981,6 +6586,48 @@ for (const _ev of [
     }
   }
 }
+
+let _windowOnloadOverrideSet = false;
+let _windowOnloadOverride = null;
+function _windowReflectingBodyElement() {
+  const document = globalThis.document;
+  return document && (document.body || document.querySelector('frameset'));
+}
+function _isWindowReflectingBodyElement(element) {
+  return element === _windowReflectingBodyElement();
+}
+Object.defineProperty(globalThis, 'onload', {
+  get() {
+    if (_windowOnloadOverrideSet) return _windowOnloadOverride;
+    const body = _windowReflectingBodyElement();
+    return body && body._resolveInlineHandler
+      ? body._resolveInlineHandler('onload')
+      : null;
+  },
+  set(value) {
+    _windowOnloadOverrideSet = true;
+    _windowOnloadOverride = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: true,
+});
+Object.defineProperty(Element.prototype, 'onload', {
+  get() {
+    if (_isWindowReflectingBodyElement(this)) {
+      return globalThis.onload;
+    }
+    return this.__onload || null;
+  },
+  set(value) {
+    if (_isWindowReflectingBodyElement(this)) {
+      globalThis.onload = value;
+      return;
+    }
+    this.__onload = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: false,
+});
 
 globalThis.Window = globalThis.Window || function Window() {};
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
@@ -6480,79 +7127,93 @@ function _formDataToMultipart(fd) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let bnd = '----WebKitFormBoundary';
   for (let i = 0; i < 16; i++) bnd += chars[Math.floor(Math.random() * chars.length)];
-  let out = '';
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let length = 0;
+  const append = (chunk) => {
+    const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : _bodyToUint8Array(chunk);
+    chunks.push(bytes);
+    length += bytes.byteLength;
+  };
   const entries = fd._d || [];
   for (let i = 0; i < entries.length; i++) {
     const k = entries[i][0], v = entries[i][1];
-    out += '--' + bnd + '\r\n';
+    append('--' + bnd + '\r\n');
     if (v != null && typeof v === 'object' && v._bytes != null) {
-      out += 'Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n';
-      out += 'Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
-      try { out += new TextDecoder().decode(v._bytes); } catch (e) {}
-      out += '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"; filename="' + (v.name || 'blob') + '"\r\n');
+      append('Content-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n');
+      append(v._bytes);
+      append('\r\n');
     } else {
-      out += 'Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n';
+      append('Content-Disposition: form-data; name="' + k + '"\r\n\r\n' + String(v) + '\r\n');
     }
   }
-  out += '--' + bnd + '--\r\n';
+  append('--' + bnd + '--\r\n');
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return { boundary: bnd, body: out };
 }
 
-// Coerce a fetch()/XHR body into the string op_fetch_url expects, attaching a
+// Coerce a fetch()/XHR body into the bytes op_fetch_url expects, attaching a
 // Content-Type header for body types that need one (FormData, URLSearchParams).
-function _serializeBody(initBody, headers) {
-  if (initBody == null || initBody === '') return '';
+function _serializeBody(initBody, headers, synthesizeContentType = true) {
+  if (initBody == null || initBody === '') return new Uint8Array(0);
   if (initBody instanceof FormData) {
     const mp = _formDataToMultipart(initBody);
-    headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
+    if (synthesizeContentType) headers['Content-Type'] = 'multipart/form-data; boundary=' + mp.boundary;
     return mp.body;
   }
   if (initBody instanceof URLSearchParams) {
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
     }
-    return initBody.toString();
+    return new TextEncoder().encode(initBody.toString());
   }
   if (typeof Blob !== 'undefined' && initBody instanceof Blob) {
-    if (initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
+    if (synthesizeContentType && initBody.type && !Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) {
       headers['Content-Type'] = initBody.type;
     }
-    return _bytesToBinaryString(_bodyToUint8Array(initBody));
+    return _bodyToUint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && initBody instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody);
   }
   if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(initBody) && initBody.buffer instanceof ArrayBuffer) {
-    const bytes = new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
-    let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return s;
+    return new Uint8Array(initBody.buffer, initBody.byteOffset, initBody.byteLength);
   }
-  return typeof initBody === 'string' ? initBody : String(initBody);
+  return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
 globalThis.fetch = async (input, init = {}) => {
   init = init || {};
+  const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
     ? input
-    : (input instanceof Request
-      ? input.url
+    : (request
+      ? request.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
-  if (url && !url.includes('://')) {
-    try {
-      const base = _domParse("document_url") || "about:blank";
-      url = new URL(url, base).href;
-    } catch(e) { /* keep as-is if URL resolution fails */ }
-  }
-  const method = init.method || (input instanceof Request ? input.method : "GET");
-  let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
-  const body = _serializeBody(init.body, _h);
+  // Always resolve: the URL parser, not a "://" substring search, decides
+  // whether the input is absolute. _resolveUrl leaves absolute URLs
+  // unchanged and keeps unparseable input as-is.
+  url = _resolveUrl(url);
+  const method = init.method || (request ? request.method : "GET");
+  const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
+  let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
+  const inheritsRequestBody = init.body === undefined && request !== null;
+  const initBody = init.body !== undefined
+    ? init.body
+    : (request ? request.body : undefined);
+  const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
+  const fetchMode = init.mode || (request ? request.mode : "cors");
+  const fetchRedirect = init.redirect || (request ? request.redirect : "follow");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
-    : (input instanceof Request ? input.credentials : "same-origin");
+    : (request ? request.credentials : "same-origin");
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
@@ -6568,15 +7229,16 @@ globalThis.fetch = async (input, init = {}) => {
   if (parsed.corsBlocked) {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
   const response = new Response(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
     type: respType,
-    url: parsed.url || url,
-    redirected: false,
+    url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
+    redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
@@ -6713,13 +7375,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     const xhr = this;
     this._fireEvent('loadstart');
 
-    let url = this._url;
-    if (url && !url.includes('://')) {
-      try {
-        const base = _domParse("document_url") || "about:blank";
-        url = new URL(url, base).href;
-      } catch(e) {}
-    }
+    // Same rule as fetch: always resolve through the URL parser.
+    let url = _resolveUrl(this._url);
 
     fetch(url, {
       method: this._method,
@@ -6740,8 +7397,21 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
-      const text = await resp.text();
+      // Read the body as bytes, ALWAYS. Going through resp.text() and then
+      // TextEncoder().encode() for the binary responseTypes is not a
+      // round-trip: the decode is lossy for anything that is not valid UTF-8,
+      // so bytes >= 0x80 come back re-encoded as the UTF-8 of whatever code
+      // point they decoded to, and the length changes with the content.
+      // Emscripten loaders fetch .wasm and data files this way, so they saw
+      // corrupted assets while fetch() was byte-correct.
+      const buffer = await resp.arrayBuffer();
       if (xhr._aborted) return;
+
+      const wantsText = xhr.responseType === '' || xhr.responseType === 'text'
+                     || xhr.responseType === 'json' || xhr.responseType === 'document';
+      // Decoding a multi-megabyte binary body into a string nobody reads is
+      // pure waste, and responseText is not defined for the binary types.
+      const text = wantsText ? new TextDecoder().decode(buffer) : '';
 
       xhr.responseText = text;
       xhr._setReadyState(3); // LOADING
@@ -6755,10 +7425,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
           xhr.response = text;
           break;
         case 'arraybuffer':
-          xhr.response = new TextEncoder().encode(text).buffer;
+          xhr.response = buffer;
           break;
         case 'blob':
-          xhr.response = new Blob([text]);
+          xhr.response = new Blob([buffer]);
           break;
         case 'document':
           xhr.response = text; // simplified
@@ -7015,11 +7685,49 @@ if (typeof Response === 'undefined') {
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      // #818: body/bodyUsed. A null-body response (null or no body passed)
+      // has body === null; every other body is a one-chunk stream, created
+      // lazily so merely touching .body does not copy the bytes.
+      this._bodyNull = body === null || body === undefined;
+      this._bodyStream = null;
+      this._bodyUsed = false;
     }
-    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
+    _consumeBody() {
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      this._bodyUsed = true;
+    }
+    get body() {
+      if (this._bodyNull) return null;
+      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      if (!this._bodyStream) {
+        this._bodyStream = new ReadableStream({
+          start: (controller) => {
+            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
+            controller.close();
+          },
+        });
+        // bodyUsed flips the moment the stream is locked for reading
+        // (spec: the body becomes "disturbed"), which no state probe can
+        // observe on a native ReadableStream, so hook getReader instead.
+        const response = this;
+        const stream = this._bodyStream;
+        const getReader = stream.getReader.bind(stream);
+        stream.getReader = function () {
+          response._bodyUsed = true;
+          return getReader();
+        };
+        stream.releaseLock = function () {
+          response._bodyUsed = true;
+          stream.locked = false;
+        };
+      }
+      return this._bodyStream;
+    }
+    get bodyUsed() { return this._bodyUsed; }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
     clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
@@ -8650,6 +9358,11 @@ let _intersectionDeliveryTaskPending = false;
 
 function _scheduleIntersectionObserverDelivery(observer) {
   if (!observer._connected || !observer._records.length) return;
+  const documentGeneration = _browserPostedTaskGeneration();
+  if (observer._documentGeneration !== documentGeneration) {
+    observer._records.length = 0;
+    return;
+  }
   _intersectionDeliveryObservers.add(observer);
   if (_intersectionDeliveryTaskPending) return;
   _intersectionDeliveryTaskPending = true;
@@ -8667,7 +9380,17 @@ function _scheduleIntersectionObserverDelivery(observer) {
       const records = current.takeRecords();
       try { current._callback(records, current); } catch (e) {}
     }
-  }, _schedulerPriorityRank["user-visible"] * 2);
+  }, _schedulerPriorityRank["user-visible"] * 2, documentGeneration, () => {
+    _intersectionDeliveryTaskPending = false;
+    const currentGeneration = _browserPostedTaskGeneration();
+    const current = [];
+    for (const pending of _intersectionDeliveryObservers) {
+      if (pending._documentGeneration === currentGeneration) current.push(pending);
+      else pending._records.length = 0;
+    }
+    _intersectionDeliveryObservers.clear();
+    for (const pending of current) _scheduleIntersectionObserverDelivery(pending);
+  });
 }
 
 function _scheduleIntersectionRenderCheckpoint() {
@@ -8811,6 +9534,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._targets = new Set();
     this._previous = new Map();
     this._records = [];
+    this._documentGeneration = _browserPostedTaskGeneration();
     this._connected = true;
     globalThis.__intersectionObservers.push(this);
   }
@@ -9001,6 +9725,11 @@ globalThis.IntersectionObserver = class IntersectionObserver {
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
+// Feature detection reads this static before deciding to observe anything;
+// absent it, supportedEntryTypes.includes(...) throws and instrumentation
+// bails. Report only types the engine can actually emit records for.
+PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
+_markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -9257,6 +9986,31 @@ globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
 };
 _markNative(globalThis.PromiseRejectionEvent);
 
+Deno.core.setUnhandledPromiseRejectionHandler((promise, reason) => {
+  const event = new PromiseRejectionEvent("unhandledrejection", {
+    promise,
+    reason,
+    cancelable: true,
+  });
+  globalThis.dispatchEvent(event);
+  if (typeof globalThis.onunhandledrejection === "function") {
+    try { globalThis.onunhandledrejection.call(globalThis, event); }
+    catch (error) { console.error(error); }
+  }
+  // Browsers report an unhandled rejection without terminating the page's
+  // event loop. Returning true tells deno_core that the host delivered it.
+  return true;
+});
+
+Deno.core.setHandledPromiseRejectionHandler((promise, reason) => {
+  const event = new PromiseRejectionEvent("rejectionhandled", { promise, reason });
+  globalThis.dispatchEvent(event);
+  if (typeof globalThis.onrejectionhandled === "function") {
+    try { globalThis.onrejectionhandled.call(globalThis, event); }
+    catch (error) { console.error(error); }
+  }
+});
+
 globalThis.StorageEvent = class StorageEvent extends Event {
   constructor(type, init = {}) {
     super(type, init);
@@ -9416,7 +10170,52 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
   }
   get [Symbol.toStringTag]() { return "File"; }
 };
-if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
+// A FormData value keeps Blob/File objects as-is (the multipart serializer reads
+// their bytes); every other value is coerced to a string per the Fetch spec.
+function _isFormBlob(v) {
+  return v != null && typeof v === "object" &&
+    (v._bytes !== undefined || (typeof Blob === "function" && v instanceof Blob));
+}
+if (typeof FormData === "undefined") globalThis.FormData = class FormData {
+  constructor(form) {
+    this._d = [];
+    // `new FormData(form)` reads the form's current successful controls (the
+    // spec's "constructing the entry list"): skip disabled controls, buttons,
+    // and unchecked checkboxes/radios; a checkbox with no value submits "on".
+    if (form === undefined || form === null) return;
+    const isForm = form.nodeType === 1 && String(form.tagName || "").toUpperCase() === "FORM";
+    if (!isForm) {
+      throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+    }
+    if (typeof form.querySelectorAll === "function") {
+      const controls = form.querySelectorAll("input,select,textarea");
+      for (let i = 0; i < controls.length; i++) {
+        const el = controls[i];
+        const name = el.getAttribute ? el.getAttribute("name") : el.name;
+        if (!name || el.disabled) continue;
+        const tag = (el.tagName || "").toLowerCase();
+        const type = (((el.getAttribute && el.getAttribute("type")) || el.type || "")).toLowerCase();
+        if (tag === "input" && (type === "checkbox" || type === "radio")) {
+          if (el.checked) this._d.push([name, el.value != null ? String(el.value) : "on"]);
+          continue;
+        }
+        if (type === "submit" || type === "reset" || type === "button" || type === "image" || type === "file") continue;
+        this._d.push([name, el.value != null ? String(el.value) : ""]);
+      }
+    }
+  }
+  append(k, v) { this._d.push([String(k), _isFormBlob(v) ? v : String(v)]); }
+  set(k, v) { k = String(k); this._d = this._d.filter(([a]) => a !== k); this._d.push([k, _isFormBlob(v) ? v : String(v)]); }
+  delete(k) { k = String(k); this._d = this._d.filter(([a]) => a !== k); }
+  get(k) { const e = this._d.find(([a]) => a === k); return e ? e[1] : null; }
+  getAll(k) { return this._d.filter(([a]) => a === k).map(([, v]) => v); }
+  has(k) { return this._d.some(([a]) => a === k); }
+  entries() { return this._d[Symbol.iterator](); }
+  keys() { return this._d.map(([k]) => k)[Symbol.iterator](); }
+  values() { return this._d.map(([, v]) => v)[Symbol.iterator](); }
+  forEach(cb) { this._d.forEach(([k, v]) => cb(v, k, this)); }
+  [Symbol.iterator]() { return this.entries(); }
+};
 // application/x-www-form-urlencoded serializer: like encodeURIComponent but
 // space -> '+' and also percent-encoding the chars encodeURIComponent leaves
 // bare ( ! ~ ' ( ) ), keeping the form-urlencoded safe set ( * - . _ ).
@@ -9488,6 +10287,61 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   [Symbol.iterator](){ return this.entries(); }
 };
 
+// Conservative XML well-formedness check for DOMParser. Only detects clear
+// errors (tag balance / single root); defaults to well-formed when unsure so
+// valid XML is never falsely flagged.
+const _checkXmlWellFormed = (html) => {
+  // Strip comments, CDATA sections, processing instructions, and DOCTYPE
+  // declarations — they may contain angle brackets.
+  const s = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!DOCTYPE\s[^>]*?>/gi, '');
+
+  const stack = [];
+  // Match open / close / self-closing tags.
+  // Group 1: tag name.  Group 2: optional '/' before '>'.
+  const tagRe = /<\/?([a-zA-Z_][\w.\-:]*)(?:\s[^>]*?)?(\/)?>/g;
+  let rootFound = false;
+  let match;
+
+  while ((match = tagRe.exec(s)) !== null) {
+    const fullTag = match[0];
+    const tagName = match[1];
+    const isClosing = fullTag.startsWith('</');
+    const isSelfClosing = match[2] === '/';
+
+    if (isClosing) {
+      if (stack.length === 0) {
+        return { wellFormed: false, error: 'error on line 1: extra closing tag </' + tagName + '>' };
+      }
+      const open = stack.pop();
+      if (open !== tagName) {
+        return { wellFormed: false, error: 'error on line 1: opening and ending tag mismatch: ' + open + ' and ' + tagName };
+      }
+      if (stack.length === 0) rootFound = true;
+    } else {
+      // Opening or self-closing tag. Check for extra content after root.
+      if (stack.length === 0 && rootFound) {
+        return { wellFormed: false, error: 'error on line 1: extra content after root element' };
+      }
+      if (isSelfClosing) {
+        // Self-closing: complete element, mark rootFound if at root level.
+        if (stack.length === 0) rootFound = true;
+      } else {
+        stack.push(tagName);
+      }
+    }
+  }
+
+  if (stack.length > 0) {
+    return { wellFormed: false, error: 'error on line 1: unclosed tag <' + stack[stack.length - 1] + '>' };
+  }
+
+  return { wellFormed: true };
+};
+
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
 // then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
@@ -9550,11 +10404,22 @@ globalThis.DOMParser = class DOMParser {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
-    // innerHTML parses children via html5ever fragment-parsing rules. Most
-    // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-    // fragment parser strips the outer `<html>` and emits its head+body
-    // children, which is what callers want.
-    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+
+    // For XML mime types, check well-formedness first (conservative: only
+    // clear errors like tag mismatch / extra root are flagged).  If the
+    // check fires, build a <parsererror> root so callers doing
+    // doc.querySelector('parsererror') get the same signal as in Chrome.
+    const xmlError = isXml ? _checkXmlWellFormed(html) : null;
+    const isParserError = xmlError && !xmlError.wellFormed;
+    if (isParserError) {
+      root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
+    } else {
+      // innerHTML parses children via html5ever fragment-parsing rules. Most
+      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
+      // fragment parser strips the outer `<html>` and emits its head+body
+      // children, which is what callers want.
+      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+    }
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
@@ -9584,7 +10449,12 @@ globalThis.DOMParser = class DOMParser {
       nodeName: "#document",
       nodeType: 9,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
-      get documentElement() { return root; },
+      get documentElement() {
+        // For XML parsererror docs, return the <parsererror> child, not the
+        // <html> wrapper — matches Chrome's behavior.
+        if (isParserError) return root.firstElementChild;
+        return root;
+      },
       get body() { return findByTagName("BODY"); },
       get head() { return findByTagName("HEAD"); },
       get title() {
@@ -9626,7 +10496,11 @@ globalThis.DOMParser = class DOMParser {
       get ownerDocument() { return null; },
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
-      querySelector(s) { return root.querySelector(s); },
+      querySelector(s) {
+        // For XML parsererror docs, check the root element as well —
+        // the <parsererror> is the documentElement, not a descendant.
+        return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
+      },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
@@ -10744,7 +11618,23 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
 };
 globalThis.HTMLSelectElement = Element;
-globalThis.HTMLTextAreaElement = Element;
+globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
+  // `rows`/`cols` reflect the content attributes and drive the control's
+  // intrinsic box (the renderer sizes a textarea from them). The attributes
+  // are limited to positive non-zero numbers; anything else falls back to the
+  // HTML defaults (rows=2, cols=20), which is what an unsized <textarea>
+  // measures against. (#685)
+  get rows() {
+    const v = parseInt(this.getAttribute('rows'), 10);
+    return Number.isFinite(v) && v > 0 ? v : 2;
+  }
+  set rows(v) { this.setAttribute('rows', String(v)); }
+  get cols() {
+    const v = parseInt(this.getAttribute('cols'), 10);
+    return Number.isFinite(v) && v > 0 ? v : 20;
+  }
+  set cols(v) { this.setAttribute('cols', String(v)); }
+};
 globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
@@ -10838,6 +11728,7 @@ globalThis.Document = Document;
 // undefined (so `el.style instanceof CSSStyleDeclaration` threw). Assigning here
 // only fills the value; the property stays enumerable:false, matching Chrome.
 globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+globalThis.DOMStringMap = DOMStringMap;
 globalThis.Animation = Animation;
 globalThis.KeyframeEffect = KeyframeEffect;
 globalThis.DocumentTimeline = DocumentTimeline;
@@ -11571,6 +12462,215 @@ const _iframeWindowProxyHandler = {
   },
 };
 
+// Cross-realm messaging.
+//
+// A realm cannot reach another realm's context on its own, so postMessage is
+// handed to the host, which delivers it into the target realm. These are
+// declared rather than assigned by the host so the snapshot-time hide list
+// picks them up; a global added later would stay enumerable on `window`.
+globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
+globalThis.__obscura_parentFrameId = 0;
+globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+// frame id -> the iframe element that owns it. The host uses this composed-tree
+// registry to retain frames inside closed shadow roots without keeping removed
+// elements alive after their browsing context is released.
+globalThis.__obscura_frameElements = Object.create(null);
+// frame id -> that frame's real window and document, filled by the host.
+// Declared here rather than created by the host at runtime: the hide list is
+// computed from this global at snapshot time, so a property the host adds later
+// would stay enumerable on `window` and be visible to any script that walks it.
+globalThis.__obscura_frameObjects = Object.create(null);
+// The frames of this realm whose element is still in the document.
+//
+// Liveness is asked of the element, not of a document query: an iframe inside
+// a shadow root is absent from `document.querySelectorAll('iframe')` — the
+// shape a challenge widget uses — while `isConnected` reports it correctly.
+// Treating it as gone would tear down a frame that is still in the page.
+globalThis.__obscura_liveFrameIds = function () {
+  const live = [];
+  for (const id in globalThis.__obscura_frameElements) {
+    const element = globalThis.__obscura_frameElements[id];
+    if (element && element.isConnected) live.push(id >>> 0);
+  }
+  return live;
+};
+
+// Drop everything this realm holds for a frame the host has discarded. One
+// place, so a registry added later cannot be missed by the discard path: any
+// surviving reference keeps the frame's context and DOM tree alive.
+globalThis.__obscura_forgetFrame = function (frameId) {
+  delete globalThis.__obscura_frameElements[frameId];
+  delete globalThis.__obscura_frameObjects[frameId];
+  delete globalThis.__obscura_frameWindows[frameId];
+};
+
+function _realmOrigin() {
+  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+}
+
+// Whether a postMessage restricted to `targetOrigin` may be delivered to a
+// realm whose current origin is `receiverOrigin`, given the sender's origin.
+// Mirrors the browser check done at delivery time: '*' (or an unspecified '')
+// allows any origin; '/' requires the receiver to be same-origin as the sender;
+// anything else must equal the receiver's own origin.
+function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
+  if (!targetOrigin || targetOrigin === '*') return true;
+  let expected;
+  if (targetOrigin === '/') {
+    expected = senderOrigin;
+  } else {
+    try { expected = new URL(targetOrigin).origin; } catch (_) { expected = targetOrigin; }
+  }
+  return receiverOrigin === expected;
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+  let json;
+  // Structured clone cannot cross realms here. JSON carries what postMessage is
+  // actually used for; anything else throws the same DataCloneError a browser
+  // throws for an unclonable value, rather than arriving silently as null.
+  try {
+    json = JSON.stringify({ v: data === undefined ? null : data });
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  if (json === undefined) json = '{"v":null}';
+  // An unspecified targetOrigin stays permissive (empty string); the receiver
+  // enforces a specified one against its own origin in __obscura_deliverMessage.
+  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
+  Deno.core.ops.op_post_frame_message(
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
+}
+
+// The frame's own window and document, when this page is allowed to touch
+// them. Same isolate, so these are the frame's real objects rather than a copy:
+// `contentWindow.someGlobal` reads the frame's global and `contentDocument` is
+// the document the frame's own scripts mutated.
+//
+// A free function, not a getter on Element.prototype: every own property of a
+// public interface is visible to anything that walks it, and real Chrome has no
+// such member.
+function _frameObjectsFor(element) {
+  const frameId = element._frameId;
+  if (!frameId) return null;
+  const entry = globalThis.__obscura_frameObjects[frameId];
+  return entry || null;
+}
+
+// The window object this realm uses to stand for frame `frameId`, built once
+// and reused so `event.source === iframe.contentWindow` holds.
+//
+// Once the host has published the frame's real global, that is the object,
+// wrapped only to keep `postMessage` meaning "send *into* the frame from
+// here". Calling the frame's own postMessage would make the frame both sender
+// and receiver, losing the sender's origin and source.
+function _frameWindowFor(frameId) {
+  if (!frameId) return null;
+  const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
+  const existing = globalThis.__obscura_frameWindows[frameId];
+  if (!real) return existing || null;
+  if (existing && existing.__obscura_wrapsRealm) return existing;
+
+  const post = _markNative(function (data, targetOrigin, _transfer) {
+    _sendRealmMessage(frameId, data, targetOrigin);
+  });
+  const win = new Proxy(real, {
+    get(target, prop) {
+      if (prop === 'postMessage') return post;
+      if (prop === '__obscura_wrapsRealm') return true;
+      // Not `receiver`: an accessor on a real global must run with the global
+      // itself as `this`, not with this proxy.
+      return Reflect.get(target, prop);
+    },
+    has(target, prop) {
+      return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
+    },
+  });
+  globalThis.__obscura_frameWindows[frameId] = win;
+  return win;
+}
+
+// The host calls this inside the target realm.
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+  // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
+  // origin, the same check a real browser does at delivery time. A mismatch
+  // drops the message silently.
+  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
+  let data = null;
+  try { data = JSON.parse(dataJson).v; } catch (_) {}
+  // Who to reply to: the frame above, or one of the frames below.
+  const source = (globalThis.__obscura_frameId !== 0
+                  && sourceFrameId === globalThis.__obscura_parentFrameId)
+    ? globalThis.parent
+    : _frameWindowFor(sourceFrameId);
+  try {
+    // Trusted, because the user agent delivers this event: the sender called
+    // postMessage, it did not dispatch this. Real embedders check the flag and
+    // drop anything untrusted, so an untrusted event is not merely suspicious,
+    // it is silently discarded and the widget waits forever.
+    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin, source })));
+  } catch (error) {
+    console.error('message listener failed:', error && error.message || error);
+  }
+};
+
+// A window in another browsing context, as seen from this one.
+//
+// Only the cross-origin surface is exposed: reaching synchronously into another
+// realm's DOM is not something this engine does, and a browser forbids it
+// across origins anyway. Widgets use postMessage regardless, which is what it
+// is for.
+class _RemoteWindow {
+  constructor(frameId) {
+    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
+  }
+  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
+  get self() { return this; }
+  get window() { return this; }
+  get frames() { return this; }
+  get parent() { return this; }
+  get top() { return this; }
+  get opener() { return null; }
+  get closed() { return false; }
+  get length() { return 0; }
+  focus() {}
+  blur() {}
+  close() {}
+}
+_markNative(_RemoteWindow.prototype.postMessage);
+
+const _remoteWindows = new Map();
+function _remoteWindow(frameId) {
+  let win = _remoteWindows.get(frameId);
+  if (!win) {
+    win = new _RemoteWindow(frameId);
+    _remoteWindows.set(frameId, win);
+  }
+  return win;
+}
+
+// Installs `parent` and `top` for a framed document. Called from
+// __obscura_init, before any of the document's own scripts run: `parent ===
+// window` is how a document decides it is top-level, and one script taking
+// that branch wrongly is enough to change everything after it.
+function _installFramingRelationships() {
+  if (!globalThis.__obscura_frameId) return; // the page really is the top
+  for (const [name, frameId] of [
+    ['parent', globalThis.__obscura_parentFrameId],
+    ['top', 0], // the top browsing context is always the page's realm
+  ]) {
+    try {
+      Object.defineProperty(globalThis, name, {
+        value: _remoteWindow(frameId),
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch (_) {}
+  }
+}
+
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
@@ -11614,15 +12714,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, origin) {
-    const event = new MessageEvent('message', {
-      data: data,
-      origin: this.location.origin,
-      source: this,
-    });
-    Promise.resolve().then(() => {
-      globalThis.dispatchEvent?.(event);
-    });
+  postMessage(data, targetOrigin, _transfer) {
+    // Into the frame's own realm, through the host. This used to dispatch the
+    // event on the *parent's* window, so a page could never actually talk to
+    // the document inside its iframe. A frame that has not loaded yet has no
+    // browsing context to receive anything.
+    if (!this._frameId) return;
+    _sendRealmMessage(this._frameId, data, targetOrigin);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -12518,8 +13616,36 @@ globalThis.Worker = class Worker {
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
-  if (blob) {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+  // Chrome mints blob:<document-origin>/<v4-uuid> (blob:null/<uuid> on an opaque
+  // origin) and throws a TypeError on missing/non-Blob input. The old code named
+  // the engine ("blob:obscura/") — a one-line anti-bot tell — used a base36 token
+  // no UUID parser accepts, and handed back a well-formed-looking string for
+  // invalid input so the caller only failed later at the fetch (issue #751).
+  if (arguments.length === 0) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
+  }
+  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid —
+  // Chrome throws for anything else. Duck-typing on `.text()` used to accept
+  // Response and other unrelated objects.
+  const isBlob = blob != null && typeof blob === 'object' &&
+    (blob._bytes !== undefined ||
+     (typeof Blob === 'function' && blob instanceof Blob));
+  if (!isBlob) {
+    throw new TypeError("Failed to execute 'createObjectURL' on 'URL': parameter 1 is not of type 'Blob'.");
+  }
+  {
+    let origin = 'null';
+    try { origin = new URL(location.href).origin || 'null'; } catch (e) {}
+    const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
+      ? crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          // CSPRNG, not Math.random() — blob IDs must not be predictable.
+          const b = new Uint8Array(1);
+          crypto.getRandomValues(b);
+          const r = b[0] & 0x0f;
+          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        });
+    const id = 'blob:' + origin + '/' + uuid;
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
@@ -12538,7 +13664,6 @@ URL.createObjectURL = function(blob) {
     }
     return id;
   }
-  return 'blob:obscura/fallback';
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
@@ -12616,7 +13741,33 @@ globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
-globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
+// `window.postMessage` targets this same window. It was a no-op, so a page
+// that posted to itself and waited for the `message` event waited forever.
+// Same realm, so this needs no host round trip; it is queued as a task because
+// postMessage never delivers synchronously.
+globalThis.postMessage = function(data, targetOrigin, _transfer) {
+  let clone = data;
+  // Match the cross-realm path: a value postMessage cannot carry is rejected
+  // at the call, not delivered as something else.
+  try {
+    clone = JSON.parse(JSON.stringify({ v: data === undefined ? null : data })).v;
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  const origin = _realmOrigin();
+  // A self-post honours targetOrigin too: sender and receiver are this realm,
+  // so a targetOrigin naming a different origin drops the message.
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
+  setTimeout(() => {
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+    } catch (error) {
+      console.error('message listener failed:', error && error.message || error);
+    }
+  }, 0);
+};
+_markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -13990,6 +15141,10 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 }
 
 globalThis.__obscura_init = function() {
+  // The host sets __obscura_frameId on a frame realm before calling this.
+  _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _browserPostedTaskWakePending = false;
+  for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
   // A real navigation just completed (this runs after set_url), so drop any
@@ -14035,7 +15190,9 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
+  // A navigation start precedes the wall clock, so skew into the past only: an
+  // origin ahead of it makes performance.now() and the rAF timestamp negative.
+  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
@@ -14049,6 +15206,21 @@ globalThis.__obscura_init = function() {
   // userAgentData brands and getHighEntropyValues now derive the Chrome
   // version from navigator.userAgent and read the platform from the page
   // globals, so every stealth surface agrees without a per-mode override.
+
+  // Before any of this document's own scripts run: `parent === window` is how
+  // a document decides it is top-level, and one script taking that branch
+  // wrongly changes everything after it.
+  _installFramingRelationships();
+
+  // A parser-created <iframe src> never went through the src setter, so
+  // nothing had started its load and the frame stayed empty (issue #600).
+  // This also runs inside a frame realm, so a frame nested in a frame loads
+  // by the same path, with op_frame_document_ready recording the caller as
+  // its parent.
+  for (const frame of globalThis.document.querySelectorAll('iframe')) {
+    const src = frame.getAttribute('src');
+    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+  }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

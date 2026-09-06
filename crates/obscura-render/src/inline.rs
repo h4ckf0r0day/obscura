@@ -45,6 +45,7 @@ static MONO_O: &[u8] = include_bytes!("../assets/liberation-mono-oblique.ttf");
 static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.ttf");
 static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
+static EMOJI_R: &[u8] = include_bytes!("../assets/noto-color-emoji.ttf");
 #[cfg(test)]
 static FALLBACK: &[u8] = SYSTEM_R;
 
@@ -52,6 +53,45 @@ const FAMILY: &str = "Liberation Sans";
 const SERIF_FAMILY: &str = "Liberation Serif";
 const MONO_FAMILY: &str = "Liberation Mono";
 const SYSTEM_FAMILY: &str = "DejaVu Sans";
+
+/// Whether text contains a code point that can request emoji presentation.
+/// Keep the color face out of ordinary render passes: its bitmap table is
+/// large, and loading it for every page would spend RSS and startup time even
+/// when no emoji can be shaped.
+pub(crate) fn text_may_need_emoji_font(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{00A9}' | '\u{00AE}' | '\u{203C}' | '\u{2049}' | '\u{2122}' | '\u{2139}'
+                | '\u{2194}'..='\u{2199}' | '\u{21A9}'..='\u{21AA}'
+                | '\u{231A}'..='\u{231B}' | '\u{2328}' | '\u{23CF}'
+                | '\u{23E9}'..='\u{23F3}' | '\u{23F8}'..='\u{23FA}' | '\u{24C2}'
+                | '\u{25AA}'..='\u{25AB}' | '\u{25B6}' | '\u{25C0}'
+                | '\u{25FB}'..='\u{25FE}' | '\u{2600}'..='\u{2604}' | '\u{2611}'
+                | '\u{2614}'..='\u{2615}' | '\u{2618}' | '\u{261D}' | '\u{2620}'
+                | '\u{2622}'..='\u{2623}' | '\u{2626}' | '\u{262A}'
+                | '\u{262E}'..='\u{262F}' | '\u{2638}'..='\u{263A}' | '\u{2640}'
+                | '\u{2642}' | '\u{2648}'..='\u{2653}' | '\u{265F}'..='\u{2660}'
+                | '\u{2663}' | '\u{2665}'..='\u{2666}' | '\u{2668}' | '\u{267B}'
+                | '\u{267E}'..='\u{267F}' | '\u{2692}'..='\u{2697}' | '\u{2699}'
+                | '\u{269B}'..='\u{269C}' | '\u{26A0}'..='\u{26A1}' | '\u{26A7}'
+                | '\u{26AA}'..='\u{26AB}' | '\u{26B0}'..='\u{26B1}'
+                | '\u{26BD}'..='\u{26BE}' | '\u{26C4}'..='\u{26C5}' | '\u{26C8}'
+                | '\u{26CE}'..='\u{26CF}' | '\u{26D1}' | '\u{26D3}'..='\u{26D4}'
+                | '\u{26E9}'..='\u{26EA}' | '\u{26F0}'..='\u{26F5}'
+                | '\u{26F7}'..='\u{26FA}' | '\u{26FD}' | '\u{2702}' | '\u{2705}'
+                | '\u{2708}'..='\u{270D}' | '\u{270F}' | '\u{2712}' | '\u{2714}'
+                | '\u{2716}' | '\u{271D}' | '\u{2721}' | '\u{2728}'
+                | '\u{2733}'..='\u{2734}' | '\u{2744}' | '\u{2747}' | '\u{274C}'
+                | '\u{274E}' | '\u{2753}'..='\u{2755}' | '\u{2757}'
+                | '\u{2763}'..='\u{2764}' | '\u{2795}'..='\u{2797}' | '\u{27A1}'
+                | '\u{27B0}' | '\u{27BF}' | '\u{2934}'..='\u{2935}'
+                | '\u{2B05}'..='\u{2B07}' | '\u{2B1B}'..='\u{2B1C}' | '\u{2B50}'
+                | '\u{2B55}' | '\u{3030}' | '\u{303D}' | '\u{3297}' | '\u{3299}'
+                | '\u{FE0F}' | '\u{1F000}'..='\u{1FAFF}'
+        )
+    })
+}
 
 /// Map a CSS `font-family` list to a bundled face the way Chromium resolves the
 /// generic families on this host. Chromium's Linux `system-ui` resolves to
@@ -945,6 +985,10 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts(fonts: &[WebFont]) -> Self {
+        Self::new_with_web_fonts_and_emoji(fonts, false)
+    }
+
+    pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
         // Build a database from embedded and page-provided faces. Never call
         // load_system_fonts: a host's font set would make layout differ
         // machine to machine and add a multi-millisecond startup scan.
@@ -955,6 +999,11 @@ impl TextEngine {
             MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
         ] {
             for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
+                declarations.push((id, None, None, None));
+            }
+        }
+        if load_emoji {
+            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
                 declarations.push((id, None, None, None));
             }
         }
@@ -4879,5 +4928,56 @@ gamma</div>"#,
         // A single-color list samples to that color everywhere.
         let flat = (0.0f32, vec![([7, 8, 9, 255], None)]);
         assert_eq!(sample_gradient(&flat, 3.0, 3.0, 20.0, 20.0), [7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn emoji_font_is_loaded_only_for_emoji_documents() {
+        assert!(!text_may_need_emoji_font("Plain text and arrows ->"));
+        assert!(text_may_need_emoji_font("Add ➕ or remove ➖"));
+        assert!(text_may_need_emoji_font("Launch 🚀"));
+
+        let plain = TextEngine::new_with_web_fonts_and_emoji(&[], false);
+        assert!(!plain.loaded_families.contains_key("noto color emoji"));
+
+        let mut engine = TextEngine::new_with_web_fonts_and_emoji(&[], true);
+        let emoji_ids: std::collections::HashSet<_> = engine.loaded_families["noto color emoji"]
+            .faces
+            .iter()
+            .filter_map(|face| face.font_id)
+            .collect();
+        let tree = obscura_dom::parse_html("<p id='copy'>➕ 😀 🚀</p>");
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(48.0),
+            line_height: Some(crate::LineHeight::Px(64.0)),
+            ..Default::default()
+        };
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        engine.finalize(item, (0.0, 0.0), 300.0, None);
+        let font_ids: std::collections::HashSet<_> = engine.items[item]
+            .buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| glyph.font_id)
+            .collect();
+        assert!(
+            !font_ids.is_disjoint(&emoji_ids),
+            "emoji clusters must shape with the bundled color face"
+        );
+        let mut pixmap = tiny_skia::Pixmap::new(300, 80).unwrap();
+        engine.paint_item(item, &mut pixmap, (0.0, 0.0));
+        let colors: std::collections::HashSet<_> = pixmap
+            .pixels()
+            .iter()
+            .filter(|pixel| pixel.alpha() != 0)
+            .map(|pixel| (pixel.red(), pixel.green(), pixel.blue()))
+            .collect();
+        assert!(
+            colors.len() > 20,
+            "the bundled CBDT face must rasterize as color, not a monochrome mask"
+        );
     }
 }

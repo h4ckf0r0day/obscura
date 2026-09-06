@@ -37,6 +37,11 @@ usvg = { version = "0.47", default-features = false, optional = true }
 url = { workspace = true, optional = true }
 cssparser = "0.34"
 wuff = { version = "0.2.7", optional = true }
+# Same `log` instance usvg emits glyph-fallback warnings through, so tests can
+# install a collector and assert on them.
+[dev-dependencies]
+log = "0.4"
+
 [lib]
 path = "src/lib.rs"
 

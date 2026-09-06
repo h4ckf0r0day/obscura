@@ -110,12 +110,20 @@ pub async fn handle(
             let page_id = ctx.create_page_in_context(context_id)?;
             let session_id = format!("{}-session", page_id);
 
-            if let Some(page) = ctx.get_page_mut(&page_id) {
+            let committed_document = if let Some(page) = ctx.get_page_mut(&page_id) {
                 if url == "about:blank" || url.is_empty() {
                     page.navigate_blank();
+                    None
                 } else {
-                    let _ = page.navigate(url).await;
+                    page.navigate(url).await.ok().map(|_| {
+                        (page.frame_id.clone(), page.url_string())
+                    })
                 }
+            } else {
+                None
+            };
+            if let Some((frame_id, origin)) = committed_document {
+                ctx.commit_default_context(&page_id, &frame_id, &origin);
             }
             // createTarget may have navigated the page: refresh its global
             // target entry so getTargets and /json/list report the real url.
@@ -297,15 +305,22 @@ pub async fn handle(
             {
                 return Err("Target not found".to_string());
             }
-            let session_id = format!("{}-session", target_id);
-
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.detachedFromTarget",
-                json!({
-                    "sessionId": session_id,
-                    "targetId": target_id,
-                }),
-            ));
+            let mut sessions = ctx
+                .sessions
+                .iter()
+                .filter(|(_, page_id)| page_id.as_str() == target_id)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            sessions.sort_unstable();
+            for session_id in sessions {
+                ctx.pending_events.push(CdpEvent::new(
+                    "Target.detachedFromTarget",
+                    json!({
+                        "sessionId": session_id,
+                        "targetId": target_id,
+                    }),
+                ));
+            }
             ctx.pending_events.push(CdpEvent::new(
                 "Target.targetDestroyed",
                 json!({ "targetId": target_id }),
@@ -401,7 +416,12 @@ pub async fn handle(
         // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+                let page_id = ctx.sessions.get(session_id).cloned();
                 ctx.sessions.remove(session_id);
+                ctx.runtime_enabled_sessions.remove(session_id);
+                if let Some(page_id) = page_id {
+                    ctx.refresh_runtime_event_collection(&page_id);
+                }
                 #[cfg(feature = "render")]
                 ctx.screencasts.remove(session_id);
             }
@@ -1081,6 +1101,41 @@ mod tests {
         .await
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn closing_target_detaches_every_actual_page_session() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let parent_session = Some("browser-session".to_string());
+        let first = handle(
+            "attachToTarget",
+            &json!({"targetId": page_id, "flatten": true}),
+            &mut ctx,
+            &parent_session,
+        ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let second = handle(
+            "attachToTarget",
+            &json!({"targetId": page_id, "flatten": true}),
+            &mut ctx,
+            &parent_session,
+        ).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        ctx.pending_events.clear();
+
+        handle(
+            "closeTarget",
+            &json!({"targetId": page_id}),
+            &mut ctx,
+            &None,
+        ).await.unwrap();
+
+        let detached = ctx.pending_events.iter()
+            .filter(|event| event.method == "Target.detachedFromTarget")
+            .map(|event| event.params["sessionId"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(detached, vec![first.as_str(), second.as_str()]);
+        let fabricated = format!("{page_id}-session");
+        assert!(!detached.contains(&fabricated.as_str()));
     }
 
     #[tokio::test]
