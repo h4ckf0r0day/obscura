@@ -1452,6 +1452,20 @@ impl Page {
         // client's user agent above. Reading it here rather than at the
         // override means a CDP locale change reaches the page on the next
         // navigation without this command having to touch the isolate.
+        //
+        // Seeding here moves the two navigator globals and nothing else. ICU's
+        // default locale stays where `ObscuraJsRuntime::new` pinned it (#734):
+        // it is process-global, so re-pinning it per navigation would let one
+        // page's override decide what `Intl` resolves to in a sibling page in
+        // the same process that has not read `Intl` yet, and V8 caches that
+        // resolution per isolate at first use.
+        //
+        // The cost is that Chrome applies an override to navigator.language
+        // immediately, while a page here keeps the previous value until it
+        // navigates. That is chosen, not missed: the clients that set a locale
+        // (Playwright's `newContext({ locale })`) set it before navigating, and
+        // a mid-session re-pin could not reach an already-cached `Intl`
+        // resolution anyway.
         if let Ok(accept_language) = self.http_client.accept_language.try_read() {
             rt.set_language(&accept_language);
         }
