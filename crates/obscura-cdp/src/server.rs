@@ -1234,7 +1234,11 @@ fn handle_fetch_resolution(
                     url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     headers: parse_cdp_headers(&req.params),
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    // postData is CDP `binary`, so it arrives base64-encoded --
+                    // the same wire type as fulfillRequest's `body` just below,
+                    // which is decoded. Passing it through raw sent the base64
+                    // text itself as the request body.
+                    body: req.params.get("postData").and_then(|v| v.as_str()).map(decode_base64),
                 },
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
@@ -1961,6 +1965,56 @@ mod tests {
             serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
         assert_eq!(response["id"], 17);
         assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
+    }
+
+    // #569 / #365 — postData is declared `binary` in the CDP domain, so a
+    // client sends it base64-encoded. Passing the encoded text straight through
+    // made the request body the base64 itself, which a server reads as neither
+    // the JSON nor the form the page meant to send.
+    #[test]
+    fn continue_request_decodes_a_base64_post_data() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        // base64 of {"a":1}
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"eyJhIjoxfQ=="}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some(r#"{"a":1}"#),
+            "the request body must be the bytes the client encoded, not the base64 text"
+        );
+    }
+
+    // An absent postData still means "leave the body alone", not "send empty".
+    #[test]
+    fn continue_request_without_post_data_leaves_the_body_alone() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert!(body.is_none(), "an absent postData must not become an empty body");
     }
 
     #[cfg(feature = "render")]
