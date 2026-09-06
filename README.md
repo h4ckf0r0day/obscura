@@ -158,6 +158,13 @@ curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura
 tar xzf obscura-x86_64-macos.tar.gz
 
 # Windows
+# One-time: point scoop at a bucket hosting this manifest (scoop/obscura.json),
+# then:
+scoop install obscura
+# Until a bucket exists, install the manifest directly:
+scoop install https://github.com/h4ckf0r0day/obscura/raw/main/scoop/obscura.json
+
+# Windows (manual)
 Download the `.zip` from the releases page and extract it manually.
 ```
 
