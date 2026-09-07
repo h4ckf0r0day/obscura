@@ -15193,7 +15193,16 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var top = this.elementFromPoint(x, y);
     if (!top) return [];
     var stack = __rankHitCandidates(__hitCandidatesAt(this, x, y));
-    if (!stack.length) return [top];
+    if (!stack.length) stack = [top];
+    // Chrome ends the stack with <body> then <html>: both paint a background
+    // and, the point having already been bounds-checked against the viewport,
+    // both contain it. They are deliberately kept out of the candidate set --
+    // they span the viewport, so ranking them would let them shadow every real
+    // descendant in elementFromPoint -- so they are appended here instead.
+    var roots = [this.body, this.documentElement];
+    for (var ri = 0; ri < roots.length; ri++) {
+      if (roots[ri] && stack.indexOf(roots[ri]) === -1) stack.push(roots[ri]);
+    }
     return stack;
   };
 }
