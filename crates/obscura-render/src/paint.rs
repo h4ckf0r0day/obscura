@@ -845,6 +845,21 @@ pub struct PreparedRender {
 }
 
 impl PreparedRender {
+    /// Every boxed element in this layout, front-to-back in paint order.
+    ///
+    /// Hit testing ranks overlapping candidates by their position here, so that
+    /// `elementFromPoint` resolves an overlap the way the page paints it rather
+    /// than the order the nodes happen to appear in the document. Derived from
+    /// layout alone, so asking costs no raster work.
+    pub fn paint_sequence(
+        &self,
+        tree: &DomTree,
+    ) -> Vec<obscura_dom::tree::NodeId> {
+        let mut out = Vec::new();
+        paint_sequence_into(tree, &self.layout, None, None, None, None, 0, &mut out);
+        out
+    }
+
     pub fn viewport(&self) -> (f32, f32) {
         self.viewport
     }
@@ -3356,6 +3371,158 @@ fn paint_canvas_background(
     }
 }
 
+/// The elements a paint pass over `paint_root` will reach, in the order it
+/// reaches them, together with the DOM-preorder set it considered.
+///
+/// Extracted from `paint_laid_dom_scrolled` so hit testing can ask the same
+/// question the painter answers. Hit testing must resolve overlaps in paint
+/// order, and recomputing z-order separately would drift from the painter the
+/// first time either side changed. This needs only layout, never a pixmap.
+fn stacking_band_order(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    paint_root: Option<obscura_dom::tree::NodeId>,
+    suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
+    suppress_stacking_for: Option<obscura_dom::tree::NodeId>,
+    suppress_transform_for: Option<obscura_dom::tree::NodeId>,
+) -> (Vec<obscura_dom::tree::NodeId>, Vec<obscura_dom::tree::NodeId>) {
+    let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
+    let mut float_layers: Vec<obscura_dom::tree::NodeId> = Vec::new();
+    let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
+    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
+        std::collections::HashSet::new();
+    let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
+    paint_nodes.extend(crate::dom::rendered_descendants(
+        tree,
+        paint_root.unwrap_or_else(|| tree.document()),
+    ));
+    for nid in paint_nodes.iter().copied() {
+        if consumed.contains(&nid) {
+            continue;
+        }
+        let is_opacity_root = suppress_opacity_for != Some(nid)
+            && laid
+                .styles
+                .get(&nid)
+                .and_then(|style| style.opacity)
+                .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
+        let is_transform_root = suppress_transform_for != Some(nid)
+            && laid.styles.get(&nid).is_some_and(has_authored_transform);
+        let z = (suppress_stacking_for != Some(nid))
+            .then(|| stacking_z_index(tree, laid, nid))
+            .flatten();
+        let is_float_root = paint_root != Some(nid) && is_effective_float(tree, laid, nid);
+        if is_opacity_root || is_transform_root {
+            let mut sub = vec![nid];
+            sub.extend(crate::dom::rendered_descendants(tree, nid));
+            for &member in &sub {
+                consumed.insert(member);
+            }
+            // An opacity effect is one atomic paint-order unit. Its internal
+            // z-order is resolved while painting its isolated surface.
+            match z {
+                Some(z) if z < 0 => neg_layers.push((z, vec![nid])),
+                Some(z) => pos_layers.push((z, vec![nid])),
+                None if is_float_root => float_layers.push(nid),
+                None => normal.push(nid),
+            }
+        } else if let Some(z) = z {
+            let mut sub = vec![nid];
+            sub.extend(crate::dom::rendered_descendants(tree, nid));
+            for &m in &sub {
+                consumed.insert(m);
+            }
+            if z < 0 {
+                neg_layers.push((z, vec![nid]));
+            } else {
+                pos_layers.push((z, vec![nid]));
+            }
+        } else if is_float_root {
+            consumed.insert(nid);
+            consumed.extend(crate::dom::rendered_descendants(tree, nid));
+            float_layers.push(nid);
+        } else {
+            normal.push(nid);
+        }
+    }
+    neg_layers.sort_by_key(|(z, _)| *z);
+    pos_layers.sort_by_key(|(z, _)| *z);
+    let paint_order: Vec<obscura_dom::tree::NodeId> = neg_layers
+        .into_iter()
+        .flat_map(|(_, sub)| sub)
+        .chain(normal)
+        .chain(float_layers)
+        .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
+        .collect();
+    (paint_order, paint_nodes)
+}
+
+/// Every boxed element under `paint_root`, in global paint order.
+///
+/// `stacking_band_order` orders one level and leaves each stacking unit, float
+/// and isolated surface as a single atomic entry, exactly as the painter does
+/// before recursing into it. This walks that same recursion so the result is a
+/// flat front-to-back sequence covering the whole subtree.
+pub(crate) fn paint_sequence_into(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    paint_root: Option<obscura_dom::tree::NodeId>,
+    suppress_opacity_for: Option<obscura_dom::tree::NodeId>,
+    suppress_stacking_for: Option<obscura_dom::tree::NodeId>,
+    suppress_transform_for: Option<obscura_dom::tree::NodeId>,
+    depth: u32,
+    out: &mut Vec<obscura_dom::tree::NodeId>,
+) {
+    // The painter's recursion is bounded by the box tree; this mirrors it, but
+    // a malformed layout must not be able to run the stack out.
+    if depth > 256 {
+        return;
+    }
+    let (paint_order, _) = stacking_band_order(
+        tree,
+        laid,
+        paint_root,
+        suppress_opacity_for,
+        suppress_stacking_for,
+        suppress_transform_for,
+    );
+    for nid in paint_order {
+        let is_stacking_unit =
+            suppress_stacking_for != Some(nid) && stacking_z_index(tree, laid, nid).is_some();
+        if is_stacking_unit {
+            // A stacking context is one structural paint item in its parent,
+            // re-entered with itself suppressed so its whole subtree finishes
+            // before the next sibling unit starts.
+            paint_sequence_into(
+                tree,
+                laid,
+                Some(nid),
+                suppress_opacity_for,
+                Some(nid),
+                suppress_transform_for,
+                depth + 1,
+                out,
+            );
+            continue;
+        }
+        if paint_root != Some(nid) && is_effective_float(tree, laid, nid) {
+            paint_sequence_into(
+                tree,
+                laid,
+                Some(nid),
+                suppress_opacity_for,
+                suppress_stacking_for,
+                suppress_transform_for,
+                depth + 1,
+                out,
+            );
+            continue;
+        }
+        out.push(nid);
+    }
+}
+
 fn paint_laid_dom_scrolled(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -3490,75 +3657,14 @@ fn paint_laid_dom_scrolled(
     // tree order). The unit is recursively painted at its sorted position,
     // preventing its backgrounds, replaced content, and shaped text from
     // leaking into different global paint phases.
-    let mut neg_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
-    let mut pos_layers: Vec<(i32, Vec<obscura_dom::tree::NodeId>)> = Vec::new();
-    let mut float_layers: Vec<obscura_dom::tree::NodeId> = Vec::new();
-    let mut normal: Vec<obscura_dom::tree::NodeId> = Vec::new();
-    let mut consumed: std::collections::HashSet<obscura_dom::tree::NodeId> =
-        std::collections::HashSet::new();
-    let mut paint_nodes = paint_root.into_iter().collect::<Vec<_>>();
-    paint_nodes.extend(crate::dom::rendered_descendants(
+    let (paint_order, paint_nodes) = stacking_band_order(
         tree,
-        paint_root.unwrap_or_else(|| tree.document()),
-    ));
-    for nid in paint_nodes.iter().copied() {
-        if consumed.contains(&nid) {
-            continue;
-        }
-        let is_opacity_root = suppress_opacity_for != Some(nid)
-            && laid
-                .styles
-                .get(&nid)
-                .and_then(|style| style.opacity)
-                .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
-        let is_transform_root = suppress_transform_for != Some(nid)
-            && laid.styles.get(&nid).is_some_and(has_authored_transform);
-        let z = (suppress_stacking_for != Some(nid))
-            .then(|| stacking_z_index(tree, laid, nid))
-            .flatten();
-        let is_float_root = paint_root != Some(nid) && is_effective_float(tree, laid, nid);
-        if is_opacity_root || is_transform_root {
-            let mut sub = vec![nid];
-            sub.extend(crate::dom::rendered_descendants(tree, nid));
-            for &member in &sub {
-                consumed.insert(member);
-            }
-            // An opacity effect is one atomic paint-order unit. Its internal
-            // z-order is resolved while painting its isolated surface.
-            match z {
-                Some(z) if z < 0 => neg_layers.push((z, vec![nid])),
-                Some(z) => pos_layers.push((z, vec![nid])),
-                None if is_float_root => float_layers.push(nid),
-                None => normal.push(nid),
-            }
-        } else if let Some(z) = z {
-            let mut sub = vec![nid];
-            sub.extend(crate::dom::rendered_descendants(tree, nid));
-            for &m in &sub {
-                consumed.insert(m);
-            }
-            if z < 0 {
-                neg_layers.push((z, vec![nid]));
-            } else {
-                pos_layers.push((z, vec![nid]));
-            }
-        } else if is_float_root {
-            consumed.insert(nid);
-            consumed.extend(crate::dom::rendered_descendants(tree, nid));
-            float_layers.push(nid);
-        } else {
-            normal.push(nid);
-        }
-    }
-    neg_layers.sort_by_key(|(z, _)| *z);
-    pos_layers.sort_by_key(|(z, _)| *z);
-    let paint_order: Vec<obscura_dom::tree::NodeId> = neg_layers
-        .into_iter()
-        .flat_map(|(_, sub)| sub)
-        .chain(normal)
-        .chain(float_layers)
-        .chain(pos_layers.into_iter().flat_map(|(_, sub)| sub))
-        .collect();
+        laid,
+        paint_root,
+        suppress_opacity_for,
+        suppress_stacking_for,
+        suppress_transform_for,
+    );
 
     // Generated boxes are anonymous layout children. ::before paints directly
     // after its host's own box; ::after paints after the host's last DOM

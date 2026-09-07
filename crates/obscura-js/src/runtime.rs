@@ -17312,6 +17312,182 @@ mod tests {
         assert_eq!(tag, serde_json::json!("BODY"));
     }
 
+    /// The repro from issue #738. A close button with a higher z-index that
+    /// precedes a lower-z overlay in the DOM used to lose the hit, because
+    /// candidates were ranked by node id — document order — and z-index never
+    /// entered the decision. CDP coordinate clicks resolve through this, so
+    /// automation clicked the buried overlay instead of the button.
+    ///
+    /// The styles are in a <style> block on purpose, not inline. Computed
+    /// style only surfaces inline values for z-index and position, so a
+    /// comparator that read z through getComputedStyle would pass this test
+    /// with inline styles and still rank everything as z:0 on a real page.
+    #[cfg(feature = "render")]
+    #[test]
+    fn test_element_from_point_ranks_by_paint_order_not_document_order() {
+        let mut rt = setup_runtime(r#"<html><head><style>
+              .dialog { position: fixed; top: 100px; left: 100px; width: 400px; height: 200px; z-index: 1000; }
+              .close-button { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; z-index: 1002; }
+              .loading-overlay { position: absolute; inset: 0; z-index: 1001; }
+            </style></head><body>
+              <div class="dialog">
+                <button class="close-button">x</button>
+                <div class="loading-overlay"></div>
+              </div>
+            </body></html>"#);
+
+        let hit = rt
+            .evaluate(
+                "(function(){ var b = document.querySelector('.close-button');
+                   var r = b.getBoundingClientRect();
+                   var e = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
+                   return e ? e.className : null; })()",
+            )
+            .unwrap();
+
+        assert_eq!(
+            hit,
+            serde_json::json!("close-button"),
+            "a z-index 1002 button must beat a z-index 1001 overlay that follows it in the DOM"
+        );
+    }
+
+    /// elementsFromPoint used to return the single elementFromPoint result in
+    /// a one-element array. Ranking every candidate gives the real stack for
+    /// free, so it now reports what is actually under the point.
+    ///
+    /// The expected sequence is Chrome's, measured on this exact markup in
+    /// headless Chrome rather than assumed:
+    ///
+    /// ```text
+    /// BUTTON.close-button | DIV.loading-overlay | DIV.dialog | BODY | HTML
+    /// ```
+    ///
+    /// <body> and <html> are appended rather than ranked. They span the
+    /// viewport, so letting them into the candidate set would shadow every
+    /// real descendant in elementFromPoint.
+    #[cfg(feature = "render")]
+    #[test]
+    fn test_elements_from_point_matches_chrome_front_to_back() {
+        let mut rt = setup_runtime(r#"<html><head><style>
+              .dialog { position: fixed; top: 100px; left: 100px; width: 400px; height: 200px; z-index: 1000; }
+              .close-button { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; z-index: 1002; }
+              .loading-overlay { position: absolute; inset: 0; z-index: 1001; }
+            </style></head><body>
+              <div class="dialog">
+                <button class="close-button">x</button>
+                <div class="loading-overlay"></div>
+              </div>
+            </body></html>"#);
+
+        let stack = rt
+            .evaluate(
+                "(function(){ var b = document.querySelector('.close-button');
+                   var r = b.getBoundingClientRect();
+                   var s = document.elementsFromPoint(r.left + r.width/2, r.top + r.height/2);
+                   return Array.prototype.map.call(s, function(e){
+                     return e.tagName + (e.className ? '.' + e.className : ''); }); })()",
+            )
+            .unwrap();
+
+        let stack = stack.as_array().expect("elementsFromPoint returns an array");
+        let names: Vec<&str> = stack.iter().filter_map(|v| v.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "BUTTON.close-button",
+                "DIV.loading-overlay",
+                "DIV.dialog",
+                "BODY",
+                "HTML",
+            ],
+            "stack must match Chrome front-to-back"
+        );
+    }
+
+    /// An element with `display: none` generates no box, so it cannot be hit
+    /// however high its z-index. It is filtered by the zero-size rect check
+    /// before ranking ever sees it; this pins that, because a boxless element
+    /// entering the ranking would win by accident.
+    #[cfg(feature = "render")]
+    #[test]
+    fn test_element_from_point_ignores_a_display_none_sibling() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style>
+              .dialog { position: fixed; top: 100px; left: 100px; width: 400px; height: 200px; z-index: 1000; }
+              .close-button { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; z-index: 1002; }
+              .ghost { display: none; position: absolute; inset: 0; z-index: 9999; }
+            </style></head><body>
+              <div class="dialog">
+                <button class="close-button">x</button>
+                <div class="ghost"></div>
+              </div>
+            </body></html>"#,
+        );
+
+        let hit = rt
+            .evaluate(
+                "(function(){ var b = document.querySelector('.close-button');
+                   var r = b.getBoundingClientRect();
+                   var e = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
+                   return e ? e.className : null; })()",
+            )
+            .unwrap();
+
+        assert_eq!(
+            hit,
+            serde_json::json!("close-button"),
+            "a display:none element generates no box and must never take the hit"
+        );
+    }
+
+    /// Paint slots are served from the same memoized PreparedRender that backs
+    /// op_layout_geometry, so a style mutation has to invalidate hit testing
+    /// exactly as it invalidates geometry. A stale memo would keep answering
+    /// with the old stacking order.
+    #[cfg(feature = "render")]
+    #[test]
+    fn test_hit_testing_follows_a_style_mutation() {
+        let mut rt = setup_runtime(r#"<html><head><style>
+              .dialog { position: fixed; top: 100px; left: 100px; width: 400px; height: 200px; z-index: 1000; }
+              .close-button { position: absolute; top: 10px; right: 10px; width: 32px; height: 32px; z-index: 1002; }
+              .loading-overlay { position: absolute; inset: 0; z-index: 1001; }
+            </style></head><body>
+              <div class="dialog">
+                <button class="close-button">x</button>
+                <div class="loading-overlay"></div>
+              </div>
+            </body></html>"#);
+
+        let before = rt
+            .evaluate(
+                "(function(){ var b = document.querySelector('.close-button');
+                   var r = b.getBoundingClientRect();
+                   window.__pt = [r.left + r.width/2, r.top + r.height/2];
+                   var e = document.elementFromPoint(window.__pt[0], window.__pt[1]);
+                   return e ? e.className : null; })()",
+            )
+            .unwrap();
+        assert_eq!(before, serde_json::json!("close-button"));
+
+        // Lift the overlay above the button and ask again at the same point.
+        let after = rt
+            .evaluate(
+                "(function(){
+                   document.querySelector('.loading-overlay').style.zIndex = '2000';
+                   var e = document.elementFromPoint(window.__pt[0], window.__pt[1]);
+                   return e ? e.className : null; })()",
+            )
+            .unwrap();
+
+        assert_eq!(
+            after,
+            serde_json::json!("loading-overlay"),
+            "raising the overlay's z-index must change the hit; a stale layout memo would not"
+        );
+    }
+
     #[test]
     fn test_element_from_point_out_of_viewport_returns_null() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -17325,13 +17501,27 @@ mod tests {
         assert_eq!(huge, serde_json::Value::Null);
     }
 
+    /// Expectation changed from 1 to 2 when elementsFromPoint began reporting
+    /// the real stack. On this markup headless Chrome answers
+    /// `LEN:2 -> BODY,HTML`, measured, so 2 is the correct count and the
+    /// previous 1 encoded the old single-element behaviour.
     #[test]
     fn test_elements_from_point_returns_array() {
         let mut rt = setup_runtime("<html><body></body></html>");
+        let tags = rt
+            .evaluate(
+                "Array.prototype.map.call(document.elementsFromPoint(10, 10),                  function(e){ return e.tagName; })",
+            )
+            .unwrap();
+        assert_eq!(
+            tags,
+            serde_json::json!(["BODY", "HTML"]),
+            "an empty page still stacks body then html, as Chrome does"
+        );
         let len_in = rt
             .evaluate("document.elementsFromPoint(10, 10).length")
             .unwrap();
-        assert_eq!(len_in.as_f64().unwrap() as i64, 1);
+        assert_eq!(len_in.as_f64().unwrap() as i64, 2);
         let len_out = rt
             .evaluate("document.elementsFromPoint(-1, -1).length")
             .unwrap();

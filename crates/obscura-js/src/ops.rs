@@ -4922,6 +4922,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
+        ops.push(op_paint_slots());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
@@ -5812,6 +5813,58 @@ fn clamp_scroll_offset_for_consumer(
         state.resolved_scroll = None;
     }
     state.scroll_offset
+}
+
+/// Paint-order slots for a set of nodes, from the same memoized layout that
+/// serves geometry.
+///
+/// Hit testing has to resolve overlapping candidates in paint order; document
+/// order puts a low `z-index` sibling on top whenever it happens to come later
+/// in the tree. Only the requested nodes are answered, and the reply is the
+/// slot each one occupies front-to-back. `-1` means the node paints no box.
+///
+/// Takes and returns comma-separated lists so the reply costs one string
+/// rather than a JSON object per candidate. Feature-gated: without rendering
+/// there is no layout to order, and the caller keeps its document-order
+/// fallback.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_paint_slots(state: &OpState, #[string] nids_str: String) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let requested: Vec<obscura_dom::tree::NodeId> = nids_str
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(|part| obscura_dom::tree::NodeId::new(part.parse::<u32>().unwrap_or(0)))
+        .collect();
+    if requested.is_empty() {
+        return String::new();
+    }
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
+        return String::new();
+    }
+    let Some(prepared) = gs.prepared_render.as_ref() else {
+        return String::new();
+    };
+    let Some(dom) = gs.dom.as_ref() else {
+        return String::new();
+    };
+    let slots: std::collections::HashMap<obscura_dom::tree::NodeId, usize> = prepared
+        .paint_sequence(dom)
+        .into_iter()
+        .enumerate()
+        .map(|(index, nid)| (nid, index))
+        .collect();
+    requested
+        .into_iter()
+        .map(|nid| match slots.get(&nid) {
+            Some(index) => index.to_string(),
+            None => String::from("-1"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Real border-box geometry for an element from the obscura-render layout
