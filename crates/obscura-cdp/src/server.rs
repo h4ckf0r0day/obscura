@@ -1223,43 +1223,66 @@ fn handle_fetch_resolution(
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
+        if intercepted_paused.contains_key(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
+            // Build the resolution before taking the pause. A malformed command
+            // is answered with an error and the request stays paused, so a
+            // corrected answer on the same requestId still drives the fetch --
+            // taking the pause first would wedge the request on a client typo.
             let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
+                "Fetch.continueRequest" => {
                     // Honor the client's overrides (Playwright route.continue,
                     // Puppeteer request.continue). op_fetch_url applies each and
                     // re-validates a rewritten URL through the SSRF gate. Leaving
                     // these None silently sent the request unmodified (issue #365).
-                    url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    headers: parse_cdp_headers(&req.params),
-                    // postData is CDP `binary`, so it arrives base64-encoded --
-                    // the same wire type as fulfillRequest's `body` just below,
-                    // which is decoded. Passing it through raw sent the base64
-                    // text itself as the request body.
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(decode_base64),
-                },
+                    match decode_optional_binary(&req.params, "postData", "continueRequest postData") {
+                        Ok(body) => Ok(obscura_js::ops::InterceptResolution::Continue {
+                            url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            headers: parse_cdp_headers(&req.params),
+                            body,
+                        }),
+                        Err(message) => Err(message),
+                    }
+                }
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-                    let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = decode_base64(raw_body);
                     let headers = req.params.get("responseHeaders")
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|h| {
                             Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
                         }).collect())
                         .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    match decode_optional_binary(&req.params, "body", "fulfillRequest body") {
+                        // The served body still crosses op_fetch_url's JSON reply as a
+                        // string, so it is lossy for a non-UTF-8 response; that end type
+                        // is a wider change than this one and is not made here.
+                        Ok(body) => Ok(obscura_js::ops::InterceptResolution::Fulfill {
+                            status,
+                            headers,
+                            body: String::from_utf8_lossy(&body.unwrap_or_default()).to_string(),
+                        }),
+                        Err(message) => Err(message),
+                    }
                 }
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
+                    Ok(obscura_js::ops::InterceptResolution::Fail { reason })
                 }
                 _ => return false,
             };
-            let _ = resolver.send(resolution);
-            let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
+            let resp = match resolution {
+                Ok(resolution) => {
+                    let resolver = intercepted_paused
+                        .remove(request_id)
+                        .expect("the pause was present a few lines above and nothing else can take it");
+                    let _ = resolver.send(resolution);
+                    crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
+                }
+                // -32602 is the invalid-params code; the pause is deliberately left
+                // in place so the client can answer this requestId again.
+                Err(message) => crate::types::CdpResponse::error(req.id, -32602, message, req.session_id),
+            };
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
             }
@@ -1580,7 +1603,33 @@ async fn process_cdp_message(
     }
 }
 
-fn decode_base64(input: &str) -> String {
+/// Read an optional CDP `binary` parameter as the bytes it encodes.
+///
+/// `Ok(None)` means the field was absent, which is "leave this alone" rather
+/// than "make it empty". An unparseable value is an error rather than a
+/// best-effort decode: base64 that is not base64 is a client mistake, and
+/// answering it silently is what let a raw-text `postData` reach the wire as
+/// mangled bytes with nothing anywhere saying so.
+fn decode_optional_binary(
+    params: &serde_json::Value,
+    field: &str,
+    what: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(raw) = params.get(field).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    match decode_base64_bytes(raw) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(why) => Err(format!("{what} is not valid base64: {why}")),
+    }
+}
+
+/// Decode standard base64 to bytes, rejecting what is not base64.
+///
+/// Padding may be omitted, since encoders differ on it and the length still
+/// determines the group, but a character outside the alphabet and a group left
+/// one symbol short are both refused.
+fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
@@ -1591,11 +1640,31 @@ fn decode_base64(input: &str) -> String {
             _ => None,
         }
     }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
+    let mut symbols: Vec<u8> = Vec::with_capacity(input.len());
+    let mut padding = 0usize;
+    for (index, c) in input.bytes().enumerate() {
+        if c == b'=' {
+            padding += 1;
+            continue;
+        }
+        if padding > 0 {
+            return Err(format!("character at byte {index} follows the padding"));
+        }
+        match val(c) {
+            Some(v) => symbols.push(v),
+            None => return Err(format!("byte {index} is not a base64 character")),
+        }
+    }
+    if padding > 2 {
+        return Err(format!("{padding} padding characters, at most 2 are valid"));
+    }
+    if symbols.len() % 4 == 1 {
+        return Err("the last group has one symbol, which encodes no byte".to_string());
+    }
+    let mut out = Vec::with_capacity(symbols.len() * 3 / 4);
+    for chunk in symbols.chunks(4) {
         let b = [
-            chunk.first().copied().unwrap_or(0),
+            chunk[0],
             chunk.get(1).copied().unwrap_or(0),
             chunk.get(2).copied().unwrap_or(0),
             chunk.get(3).copied().unwrap_or(0),
@@ -1604,7 +1673,7 @@ fn decode_base64(input: &str) -> String {
         if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
         if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
     }
-    String::from_utf8_lossy(&out).to_string()
+    Ok(out)
 }
 
 fn fast_path_response(text: &str) -> Option<String> {
@@ -1991,9 +2060,115 @@ mod tests {
         };
         assert_eq!(
             body.as_deref(),
-            Some(r#"{"a":1}"#),
+            Some(br#"{"a":1}"#.as_slice()),
             "the request body must be the bytes the client encoded, not the base64 text"
         );
+    }
+
+    // The body a client rewrites is not always text -- a protobuf, a gzip
+    // stream, a multipart file part. Carrying it through `String` replaced
+    // every non-UTF-8 sequence with U+FFFD before it reached the wire.
+    #[test]
+    fn continue_request_keeps_a_non_utf8_post_data_intact() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        // base64 of the three bytes 00 FF FE, which are not valid UTF-8
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"AP/+"}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some([0x00u8, 0xFF, 0xFE].as_slice()),
+            "a binary body must reach the wire byte for byte"
+        );
+    }
+
+    // Base64 that is not base64 is a client mistake. Answering it silently is
+    // how raw text reached the wire as mangled bytes; answering it with an
+    // error while keeping the pause lets the client correct itself.
+    #[test]
+    fn continue_request_rejects_post_data_that_is_not_base64_without_wedging_it() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":9,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"!!!not-base64"}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(rejected["id"], 9);
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("continueRequest postData is not valid base64"),
+            "the error must name the field, got {:?}",
+            rejected["error"]["message"]
+        );
+        assert!(
+            resolution_rx.try_recv().is_err(),
+            "a rejected command must not resolve the pause"
+        );
+        assert!(
+            paused.contains_key("request-1"),
+            "a rejected command must leave the request paused so it can be answered again"
+        );
+
+        // the same requestId, answered correctly, still drives the fetch
+        assert!(handle_fetch_resolution(
+            r#"{"id":10,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"eyJhIjoxfQ=="}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("the corrected continueRequest must resolve as Continue");
+        };
+        assert_eq!(body.as_deref(), Some(br#"{"a":1}"#.as_slice()));
+    }
+
+    // The same strictness on the other arm carrying a CDP `binary` field.
+    #[test]
+    fn fulfill_request_rejects_a_body_that_is_not_base64() {
+        let (resolution_tx, _resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":11,"method":"Fetch.fulfillRequest","params":{"requestId":"request-1","responseCode":200,"body":"<html>"}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("fulfillRequest body is not valid base64")
+        );
+        assert!(paused.contains_key("request-1"), "the request must stay paused");
     }
 
     // An absent postData still means "leave the body alone", not "send empty".
