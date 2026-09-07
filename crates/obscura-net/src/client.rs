@@ -760,10 +760,28 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+/// Read a `file://` URL.
+///
+/// `allow_file_access` is a required parameter, not a field read from
+/// somewhere convenient, because this function is a raw filesystem-read
+/// primitive: whoever calls it has to state that reading local files is
+/// intended. The gate previously lived only in the callers -- CDP's
+/// `Page.navigate` and `Target.createTarget` via `util::url_is_file_scheme`,
+/// and `subresource_allowed` in obscura-browser -- so the invariant held only
+/// as long as every future call site remembered it. That is the shape of
+/// GHSA-q55h-vfv9-qcr5 and of its incomplete-fix variant, and the same shape
+/// as the `validate_cors_response` gaps in this batch: a security decision
+/// enforced at N call sites is enforced at N-1 sooner or later.
 pub(crate) async fn fetch_file_url(
     url: &Url,
     max_response_bytes: usize,
+    allow_file_access: bool,
 ) -> Result<Response, ObscuraNetError> {
+    if !allow_file_access {
+        return Err(ObscuraNetError::Blocked(format!(
+            "file:// access is disabled: {url}. Enable it with --allow-file-access,              and only when the port is on a trusted network."
+        )));
+    }
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
@@ -914,6 +932,14 @@ pub struct ObscuraHttpClient {
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+    /// When true, this client may read `file://` URLs. Defaults to false.
+    ///
+    /// Interior mutability because the context assigns `allow_file_access`
+    /// after the client is already inside an `Arc`. Use
+    /// `BrowserContext::set_allow_file_access`, which sets the context flag and
+    /// this one together -- two copies of a security decision that can drift
+    /// apart is how the original gap arose.
+    allow_file_access: std::sync::atomic::AtomicBool,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1125,7 +1151,22 @@ impl ObscuraHttpClient {
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
+            allow_file_access: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether this client may read `file://` URLs.
+    pub fn allow_file_access(&self) -> bool {
+        self.allow_file_access
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Permit or refuse `file://` reads. Prefer
+    /// `BrowserContext::set_allow_file_access`, which keeps the context and the
+    /// client in step.
+    pub fn set_allow_file_access(&self, allow: bool) {
+        self.allow_file_access
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn get_client(&self) -> &Client {
@@ -1438,7 +1479,8 @@ impl ObscuraHttpClient {
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(url, request.max_response_bytes, self.allow_file_access())
+                .await;
         }
 
         let mut method = initial_method;

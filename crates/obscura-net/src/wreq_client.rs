@@ -177,6 +177,9 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// See `ObscuraHttpClient::allow_file_access`. Defaults to false so the
+    /// stealth transport cannot become the softer of the two.
+    pub allow_file_access: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "stealth")]
@@ -253,7 +256,15 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_file_access: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Permit or refuse `file://` reads on the stealth transport. Kept in step
+    /// with the default transport by `BrowserContext::set_allow_file_access`.
+    pub fn set_allow_file_access(&self, allow: bool) {
+        self.allow_file_access
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -287,7 +298,12 @@ impl StealthHttpClient {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(
+                url,
+                request.max_response_bytes,
+                self.allow_file_access.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await;
         }
 
         let mut current_url = url.clone();
@@ -634,6 +650,8 @@ mod tests {
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            // This test never touches file://; the default is the safe one.
+            allow_file_access: std::sync::atomic::AtomicBool::new(false),
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client

@@ -308,7 +308,9 @@ pub async fn start_with_serve_options_and_limit(
         storage_dir,
         allow_private_network,
     );
-    bctx.allow_file_access = allow_file_access;
+    // Sets the client's flag too, so the navigate gate and the filesystem
+    // primitive cannot disagree.
+    bctx.set_allow_file_access(allow_file_access);
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
     // Cookie deltas are merged here, but new connections always clone the
