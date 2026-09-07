@@ -97,6 +97,13 @@ enum Command {
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
 
+        /// Load fonts from a directory into the process-wide font database
+        /// once at startup, so pages that need those faces don't have to
+        /// inject a `document.fonts.add()` script just to get glyphs
+        /// (issue #879). Repeatable to load from multiple directories.
+        #[arg(long)]
+        font_dir: Vec<std::path::PathBuf>,
+
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
         #[arg(long)]
@@ -367,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             allow_file_access,
             storage_dir,
+            font_dir,
             quiet: _,
         }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
@@ -396,9 +404,32 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Stealth mode enabled (tracker blocking)");
             }
 
+            if !font_dir.is_empty() {
+                #[cfg(feature = "render")]
+                {
+                    for dir in &font_dir {
+                        tracing::info!("Font dir: {}", dir.display());
+                    }
+                    obscura_browser::configure_extra_font_directories(font_dir.clone());
+                }
+                #[cfg(not(feature = "render"))]
+                tracing::info!(
+                    "--font-dir has no effect in this build (compiled without the `render` feature)"
+                );
+            }
+
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(
+                    port,
+                    host,
+                    workers,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    font_dir,
+                )
+                .await?;
             } else {
                 obscura_cdp::start_with_serve_options_and_limit(
                     port,
@@ -540,6 +571,7 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    font_dir: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -560,6 +592,9 @@ async fn run_multi_worker_serve(
         }
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
+        }
+        for dir in &font_dir {
+            cmd.arg("--font-dir").arg(dir);
         }
         if stealth {
             cmd.arg("--stealth");
@@ -2202,6 +2237,53 @@ mod tests {
     #[test]
     fn no_subcommand_is_not_quiet() {
         assert!(!is_quiet_command(&None));
+    }
+
+    #[test]
+    fn parsed_serve_font_dir_single() {
+        let args = Args::try_parse_from(["obscura", "serve", "--font-dir", "/fonts/one"])
+            .expect("clap should accept --font-dir on serve");
+        match args.command {
+            Some(Command::Serve { font_dir, .. }) => {
+                assert_eq!(font_dir, vec![std::path::PathBuf::from("/fonts/one")]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn parsed_serve_font_dir_repeated_collects_into_vec() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--font-dir",
+            "/fonts/one",
+            "--font-dir",
+            "/fonts/two",
+        ])
+        .expect("clap should accept repeated --font-dir on serve");
+        match args.command {
+            Some(Command::Serve { font_dir, .. }) => {
+                assert_eq!(
+                    font_dir,
+                    vec![
+                        std::path::PathBuf::from("/fonts/one"),
+                        std::path::PathBuf::from("/fonts/two"),
+                    ]
+                );
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn parsed_serve_without_font_dir_is_empty() {
+        let args = Args::try_parse_from(["obscura", "serve"])
+            .expect("clap should accept serve without --font-dir");
+        match args.command {
+            Some(Command::Serve { font_dir, .. }) => assert!(font_dir.is_empty()),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
