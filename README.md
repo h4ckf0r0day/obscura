@@ -463,6 +463,7 @@ Start a CDP WebSocket server.
 | `--stealth` | off | Enable anti-detection + tracker blocking |
 | `--workers` | `1` | Number of parallel worker processes |
 | `--obey-robots` | off | Respect robots.txt |
+| `--font-dir` | — | Load fonts from a directory into the process-wide font database at startup, so pages don't need a `document.fonts.add()` script just to get glyphs (e.g. CJK). Repeatable for multiple directories; forwarded to worker processes when `--workers` > 1 |
 
 ### `obscura fetch <URL>`
 
