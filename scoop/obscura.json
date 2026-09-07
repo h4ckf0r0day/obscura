@@ -4,7 +4,7 @@
     "description": "Headless browser engine with a real DOM, CDP, and zero dependencies",
     "homepage": "https://github.com/h4ckf0r0day/obscura",
     "license": "Apache-2.0",
-    "notes": "obscura.exe and obscura-worker.exe are extracted together; keep them in the same directory for the parallel scrape command.",
+    "notes": "Default variant (rendering, no stealth); both binaries are installed with shims on PATH.",
     "url": "https://github.com/h4ckf0r0day/obscura/releases/download/v{{version}}/obscura-x86_64-windows.zip",
     "hash": "db5a3c951f7172eb8f25e6d71bd7120c7128f70f6daed55a6cc4caaabe1674d6",
     "files": [
