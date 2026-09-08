@@ -7354,6 +7354,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   open(method, url, async_) {
     this._method = method;
     this._url = url;
+    // `async` defaults to true and only an explicit false selects the
+    // synchronous mode. Ignoring it made every sync request resolve to
+    // status 0 after send() returned, so callers that read xhr.status on the
+    // next line saw a failure that never happened.
+    this._async = async_ === undefined ? true : !!async_;
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -7393,6 +7398,44 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
 
     // Same rule as fetch: always resolve through the URL parser.
     let url = _resolveUrl(this._url);
+
+    if (this._async === false) {
+      // Synchronous mode: the whole exchange must be finished before send()
+      // returns, so the transport runs off-loop and the result is applied here.
+      let raw;
+      try {
+        raw = Deno.core.ops.op_fetch_url_sync(
+          url, this._method || 'GET', JSON.stringify(this._headers || {}),
+          typeof body === 'string' ? body : (body ? String(body) : '')
+        );
+      } catch (e) {
+        xhr.status = 0;
+        xhr._setReadyState(4);
+        xhr._fireEvent('error');
+        xhr._fireEvent('loadend');
+        return;
+      }
+      let parsed = {};
+      try { parsed = JSON.parse(raw); } catch (e) { parsed = { status: 0 }; }
+      xhr.status = parsed.status || 0;
+      xhr.statusText = parsed.statusText || '';
+      xhr.responseURL = parsed.url || url;
+      if (parsed.headers) {
+        for (const k of Object.keys(parsed.headers)) xhr._responseHeaders[k] = parsed.headers[k];
+      }
+      xhr._setReadyState(2);
+      const text = parsed.body || '';
+      xhr.responseText = text;
+      if (xhr.responseType === '' || xhr.responseType === 'text') xhr.response = text;
+      else if (xhr.responseType === 'json') { try { xhr.response = JSON.parse(text); } catch (e) { xhr.response = null; } }
+      else xhr.response = text;
+      xhr._setReadyState(3);
+      xhr._setReadyState(4);
+      if (xhr.status === 0) { xhr._fireEvent('error'); }
+      else { xhr._fireEvent('load'); }
+      xhr._fireEvent('loadend');
+      return;
+    }
 
     fetch(url, {
       method: this._method,
