@@ -218,6 +218,39 @@ pub struct ObscuraState {
     #[cfg(feature = "render")]
     pub render_image_in_flight:
         HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
+    /// Page-transport loads for resources that cache-only layout or paint
+    /// missed. The owning page fetches them and sends the outcome here; the
+    /// runtime applies results at its own event-loop turns and at every
+    /// promise wait, so a script polling geometry sees them. `document_generation`
+    /// in each result fences a previous document's late answer.
+    #[cfg(feature = "render")]
+    pub render_resource_tx: tokio::sync::mpsc::UnboundedSender<RenderResourceLoad>,
+    #[cfg(feature = "render")]
+    pub render_resource_rx: tokio::sync::mpsc::UnboundedReceiver<RenderResourceLoad>,
+    /// Resources currently loading through the page transport, so repeated
+    /// misses never duplicate a request.
+    #[cfg(feature = "render")]
+    pub render_resource_in_flight: std::collections::HashSet<(String, Option<ImageRequestProfile>)>,
+    /// Applied transport responses the page still has to report as
+    /// Network events (recording needs the page, not the runtime).
+    #[cfg(feature = "render")]
+    pub render_resource_events: Vec<RenderResourceEvent>,
+    /// `Fetch.enable` URL patterns mirrored from the owning page, so the
+    /// renderer's resource loads follow the same interception policy as the
+    /// page's own subresource fetches (a matching URL is not fetched here).
+    #[cfg(feature = "render")]
+    pub intercept_block_patterns: Vec<String>,
+    /// Background transport tasks of this document, one page-wide
+    /// concurrency limit shared by all of them, a wake-up for waiters, and
+    /// requests that could not be started outside a Tokio context.
+    #[cfg(feature = "render")]
+    pub render_resource_tasks: Vec<tokio::task::JoinHandle<()>>,
+    #[cfg(feature = "render")]
+    pub render_resource_limiter: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "render")]
+    pub render_resource_notify: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "render")]
+    pub render_resource_backlog: Vec<(String, Option<ImageRequestProfile>)>,
     /// One exact-key compiled author stylesheet for this document. Connected
     /// mutations still discard `prepared_render`; the next prepare reuses only
     /// parsing/indexing when ordered CSS source and viewport remain identical.
@@ -294,6 +327,8 @@ pub struct PendingFrameMessage {
 
 impl ObscuraState {
     pub fn new() -> Self {
+        #[cfg(feature = "render")]
+        let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
@@ -349,6 +384,26 @@ impl ObscuraState {
             render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
             render_image_in_flight: HashMap::new(),
+            #[cfg(feature = "render")]
+            render_resource_tx,
+            #[cfg(feature = "render")]
+            render_resource_rx,
+            #[cfg(feature = "render")]
+            render_resource_in_flight: std::collections::HashSet::new(),
+            #[cfg(feature = "render")]
+            render_resource_events: Vec::new(),
+            #[cfg(feature = "render")]
+            intercept_block_patterns: Vec::new(),
+            #[cfg(feature = "render")]
+            render_resource_tasks: Vec::new(),
+            #[cfg(feature = "render")]
+            render_resource_limiter: Arc::new(tokio::sync::Semaphore::new(
+                RENDER_RESOURCE_CONCURRENCY,
+            )),
+            #[cfg(feature = "render")]
+            render_resource_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "render")]
+            render_resource_backlog: Vec::new(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
@@ -1026,6 +1081,72 @@ pub(crate) fn queue_retained_style_mutation(
     }
     pending.push(mutation);
     true
+}
+
+/// Page-wide limit on concurrent background render-resource requests: the
+/// bound the navigation warmup stream always had, now shared by every load
+/// of the document however many scans or layout misses queue them.
+#[cfg(feature = "render")]
+pub const RENDER_RESOURCE_CONCURRENCY: usize = 16;
+
+/// One finished page-transport load for the renderer cache.
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct RenderResourceLoad {
+    /// `document_generation` the request was made for.
+    pub generation: u64,
+    pub url: String,
+    pub profile: Option<ImageRequestProfile>,
+    /// Final URL, status, headers and body of the response; `None` when the
+    /// request failed or was blocked.
+    pub response: Option<RenderResourceResponse>,
+}
+
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct RenderResourceResponse {
+    pub url: String,
+    pub status: u16,
+    pub headers: std::collections::HashMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+/// A transport response the runtime applied; the page turns it into the
+/// Network events a client expects for a subresource.
+#[cfg(feature = "render")]
+#[derive(Debug)]
+pub struct RenderResourceEvent {
+    pub is_font: bool,
+    pub response: RenderResourceResponse,
+}
+
+/// Whether this runtime is owned by a page with an asynchronous transport.
+#[cfg(feature = "render")]
+pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
+    #[cfg(feature = "stealth")]
+    {
+        state.http_client.is_some() || state.stealth_client.is_some()
+    }
+    #[cfg(not(feature = "stealth"))]
+    {
+        state.http_client.is_some()
+    }
+}
+
+/// Build the renderer resource cache for this runtime. A runtime owned by a
+/// page must never let layout or paint open their own synchronous HTTP
+/// requests: the compatibility loader bypasses the page's proxy, cookies,
+/// interception and URL blocking, and it pins V8 for the full network
+/// latency of every unknown asset (retries included). Such runtimes start
+/// cache-only and are fed through the page transport; standalone render
+/// runtimes without a transport keep the compatibility loader.
+#[cfg(feature = "render")]
+pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::RenderResourceCache {
+    let mut cache = obscura_render::RenderResourceCache::default();
+    if has_page_transport(state) {
+        cache.set_sync_loading_enabled(false);
+    }
+    cache
 }
 
 /// Rebuild resource-dependent geometry while retaining the previous computed
@@ -3072,7 +3193,7 @@ async fn stealth_fetch_all(
     .to_string())
 }
 
-fn glob_match(pattern: &str, url: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -5505,8 +5626,9 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
 
 /// Compatibility path for standalone render runtimes which deliberately
 /// install an in-memory `RenderResourceLoader` but have no owning page
-/// transport. Browser pages always install `ObscuraHttpClient` before page
-/// script runs and never enter this synchronous loader.
+/// transport. Browser pages install their transport before page script runs;
+/// their caches are cache-only (`fresh_render_resources`), so neither this
+/// path nor layout/paint can open a synchronous request for them.
 #[cfg(feature = "render")]
 fn load_image_metadata_without_page_transport(gs: &mut ObscuraState, node_id: NodeId) -> String {
     let base_url = document_base_url(&gs);

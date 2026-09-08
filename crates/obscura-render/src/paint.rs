@@ -146,6 +146,11 @@ pub struct RenderResourceCache {
     #[cfg(test)]
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
+    /// Resources a cache-only lookup missed since the last `take_sync_misses`,
+    /// with the request identity layout used (image CORS profile or none).
+    /// Deduplicated so repeated layouts do not grow the list.
+    sync_misses: Vec<(String, Option<ImageRequestProfile>)>,
+    sync_miss_keys: HashSet<String>,
     loader: Box<dyn RenderResourceLoader>,
 }
 
@@ -185,6 +190,8 @@ impl RenderResourceCache {
             #[cfg(test)]
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
+            sync_misses: Vec::new(),
+            sync_miss_keys: HashSet::new(),
             loader: Box::new(loader),
         }
     }
@@ -195,6 +202,35 @@ impl RenderResourceCache {
     /// unknown and can still be fetched by a later navigation/settle warmup.
     pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
+    }
+
+    /// Whether layout and paint may still open synchronous compatibility
+    /// requests. Page-owned caches disable this permanently and are fed by
+    /// the page transport instead.
+    pub fn sync_loading_enabled(&self) -> bool {
+        self.sync_loading_enabled
+    }
+
+    /// Take the resources that cache-only layout or paint asked for and did
+    /// not have, exactly as they were resolved (network URL plus the image
+    /// request profile, or `None` for CSS images and fonts). The owning page
+    /// loads them through its asynchronous transport; nothing is
+    /// reconstructed from the DOM, so script-registered fonts, shadow roots
+    /// and every other renderer-only source are covered.
+    pub fn take_sync_misses(&mut self) -> Vec<(String, Option<ImageRequestProfile>)> {
+        self.sync_miss_keys.clear();
+        std::mem::take(&mut self.sync_misses)
+    }
+
+    /// Whether any cache-only miss is waiting to be taken.
+    pub fn has_sync_misses(&self) -> bool {
+        !self.sync_misses.is_empty()
+    }
+
+    fn record_sync_miss(&mut self, key: String, url: String, profile: Option<ImageRequestProfile>) {
+        if self.sync_miss_keys.insert(key) {
+            self.sync_misses.push((url, profile));
+        }
     }
 
     pub fn retained_entry_count(&self) -> usize {
@@ -418,6 +454,7 @@ impl RenderResourceCache {
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(url.clone(), url, None);
             return None;
         }
         self.remove(&url);
@@ -451,6 +488,7 @@ impl RenderResourceCache {
             }
         }
         if !self.sync_loading_enabled {
+            self.record_sync_miss(key, network_resource_url(url), Some(profile));
             return None;
         }
         self.remove(&key);
@@ -11717,6 +11755,45 @@ mod tests {
         cache.seed(url.to_string(), vec![9, 8, 7]);
         assert_eq!(cache.get_or_load(url).as_deref(), Some([9, 8, 7].as_slice()));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_only_misses_are_reported_with_their_request_identity() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| Some(vec![1, 2, 3]));
+        let font = "https://example.test/late.woff2";
+        let image = "https://example.test/late.png#fragment";
+        assert!(!cache.has_sync_misses());
+
+        cache.set_sync_loading_enabled(false);
+        assert!(cache.get_or_load(font).is_none());
+        assert!(cache.get_or_load(font).is_none(), "a repeated miss is reported once");
+        assert!(cache
+            .get_or_load_image(image, ImageRequestProfile::CorsInclude)
+            .is_none());
+        assert!(cache.has_sync_misses());
+        assert_eq!(
+            cache.take_sync_misses(),
+            vec![
+                (font.to_string(), None),
+                (
+                    "https://example.test/late.png".to_string(),
+                    Some(ImageRequestProfile::CorsInclude)
+                ),
+            ],
+            "misses carry the network URL and the image request profile"
+        );
+        assert!(!cache.has_sync_misses(), "take clears the report");
+
+        cache.seed(font.to_string(), vec![9]);
+        assert!(cache.get_or_load(font).is_some());
+        assert!(!cache.has_sync_misses(), "a hit is not a miss");
+
+        cache.set_sync_loading_enabled(true);
+        assert!(cache.get_or_load("https://example.test/other.png").is_some());
+        assert!(
+            !cache.has_sync_misses(),
+            "the synchronous compatibility loader never reports a miss"
+        );
     }
 
     #[test]
