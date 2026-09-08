@@ -3300,7 +3300,7 @@ impl Page {
         let main_is_binary = !is_text_like_content_type(response.content_type());
         self.record_network_event_with_body(
             url.as_str(),
-            "GET",
+            method,
             "Document",
             response.status,
             &response.headers,
