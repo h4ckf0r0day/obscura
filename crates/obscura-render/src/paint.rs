@@ -15088,6 +15088,62 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_functional_inline_size_survives_a_flex_ancestor() {
+        // #767: `width:calc(100% - 32px)` collapsed to 0 as soon as anything
+        // above it was a flex container. The size is cyclic there, so it is
+        // neutralized for the intrinsic pass and re-resolved afterwards, but
+        // the neutral value used was the expression evaluated at a *zero*
+        // percentage basis -- which clamps to `0px`. Every shrink-to-fit
+        // ancestor then wrapped that zero, and the basis re-sampled after flex
+        // sizing came back as the collapsed box's own padding rather than a
+        // containing block, so the second pass could not recover either.
+        //
+        // Chromium 147 on this markup: the shrink-to-fit wrapper takes the
+        // control's intrinsic width and the input resolves to wrapper - 32.
+        // The wrapper's own width still differs from Chromium's because our
+        // native text-control intrinsic width is ~24px wide (a separate
+        // issue), so the relationship is what is asserted here.
+        let tree = parse_html(
+            r#"<body style="margin:0;font:14px Arial">
+            <div style="display:flex;flex:1;width:1560px"><div id="wrap"><div><label><span>
+            <input id="control" style="width:calc(100% - 32px);padding-left:25px;
+              height:30px;margin:0;border:1px solid #999">
+            </span></label></div></div></div>
+            <div style="width:1560px"><div><div><label><span>
+            <input id="noflex" style="width:calc(100% - 32px);padding-left:25px;
+              height:30px;margin:0;border:1px solid #999">
+            </span></label></div></div></div>
+            <div style="display:flex;flex:1;width:1560px"><div id="textwrap"><div><span>
+            <div id="text" style="width:calc(100% - 32px);height:20px">hello world</div>
+            </span></div></div></div></body>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (1600.0, 900.0), None, &mut resources).expect("prepared render");
+        let width = |id: &str| {
+            prepared
+                .document_rect(tree.get_element_by_id(id).unwrap())
+                .expect("rect")
+                .width
+        };
+
+        // Without a flex ancestor the size was never cyclic; both engines
+        // already agreed on this one, and it must not move.
+        assert_eq!(width("noflex"), 1528.0);
+
+        // A native control keeps the intrinsic geometry it would have had with
+        // an auto width, so its wrapper has something to shrink-wrap around.
+        let wrap = width("wrap");
+        assert!(wrap > 100.0, "wrapper collapsed to {wrap}");
+        assert_eq!(width("control"), wrap - 32.0);
+
+        // A non-replaced box contributes its max-content width, the same as it
+        // would with `width:auto`. Chromium 147: 66.94 and 34.94.
+        assert_eq!(width("textwrap"), 67.0);
+        assert_eq!(width("text"), 35.0);
+    }
+
+    #[test]
     fn computed_style_exposes_float_and_clear() {
         let tree = parse_html(
             r#"<style>#left{float:left} #right{float:right;clear:both}</style>
