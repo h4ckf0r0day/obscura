@@ -233,13 +233,22 @@ pub async fn handle(
                         shift_key = shift_key,
                     );
                     page.evaluate(&code);
-                    let moved = page
-                        .process_pending_navigation()
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    // A document navigation the click scheduled (link, submit
+                    // button) stays pending here. Chrome answers mouseReleased
+                    // at once and loads the document afterwards; the connection
+                    // processor picks the pending navigation up after this
+                    // response and runs it through the interception loop, which
+                    // emits the frame events itself. The location setters also
+                    // preview the target in `__virtualUrl` before recording the
+                    // navigation, so the same-document sync below must not run
+                    // then: it would report an early Page.frameNavigated under
+                    // the old loader id and push history before any document
+                    // bytes arrived.
+                    //
                     // Fork: a single page app answers a click by routing itself,
                     // with no document fetch. The client still has to be told the
                     // frame moved, or the click looks like it did nothing.
+                    let moved = !page.has_pending_navigation() && page.sync_virtual_url();
                     if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();

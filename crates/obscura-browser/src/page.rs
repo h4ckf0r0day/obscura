@@ -2963,6 +2963,22 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        self.navigate_with_wait_post_referrer(url_str, wait_until, method, body, "")
+            .await
+    }
+
+    /// Like `navigate_with_wait_post`, with the `document.referrer` the new
+    /// document starts with. Automation navigations (Page.navigate) pass "";
+    /// navigations the outgoing document scheduled (link click, form submit,
+    /// `location.href`) pass `document_referrer_for(url)`.
+    pub async fn navigate_with_wait_post_referrer(
+        &mut self,
+        url_str: &str,
+        wait_until: crate::lifecycle::WaitUntil,
+        method: &str,
+        body: &str,
+        referrer: &str,
+    ) -> Result<(), PageError> {
         // Hard ceiling on a single end-to-end navigation. Without this a slow
         // primary fetch or a runaway settle loop can hold the V8 lock for
         // arbitrarily long (we've measured 60+ seconds on JS-heavy news
@@ -2977,7 +2993,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, referrer),
         )
         .await
         {
@@ -4422,6 +4438,26 @@ impl Page {
         }
     }
 
+    /// Whether the document has scheduled a navigation that nobody has taken
+    /// yet. Does not consume it.
+    pub fn has_pending_navigation(&self) -> bool {
+        self.js.as_ref().is_some_and(|js| js.has_pending_navigation())
+    }
+
+    /// The `document.referrer` a navigation from this document to `target_url`
+    /// carries (`strict-origin-when-cross-origin`). Empty when the page has no
+    /// URL or the target does not parse.
+    pub fn document_referrer_for(&self, target_url: &str) -> String {
+        self.url
+            .as_ref()
+            .and_then(|source| {
+                Url::parse(target_url)
+                    .ok()
+                    .map(|target| navigation_referrer(source, &target))
+            })
+            .unwrap_or_default()
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         if let Some(js) = &self.js {
             js.take_pending_binding_calls()
@@ -4504,34 +4540,15 @@ impl Page {
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
-            let source_url = self
-                .url
-                .as_ref()
-                .and_then(|source| {
-                    Url::parse(&url)
-                        .ok()
-                        .map(|target| navigation_referrer(source, &target))
-                })
-                .unwrap_or_default();
-            let nav_timeout = self.navigation_timeout();
-            let nav_timeout_ms = duration_millis_u64(nav_timeout);
-            let result = tokio::time::timeout(
-                nav_timeout,
-                self.navigate_with_wait_post_inner(
-                    &url,
-                    crate::lifecycle::WaitUntil::Load,
-                    &method,
-                    &body,
-                    &source_url,
-                ),
+            let referrer = self.document_referrer_for(&url);
+            self.navigate_with_wait_post_referrer(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                &method,
+                &body,
+                &referrer,
             )
-            .await
-            .map_err(|_| {
-                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
-                PageError::NetworkError(format!("navigation exceeded {nav_timeout_ms}ms deadline"))
-            })?;
-            result?;
-            self.push_history(self.url_string());
+            .await?;
             Ok(true)
         } else {
             // Fork: a page that routed itself through history has still

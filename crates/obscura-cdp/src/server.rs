@@ -914,13 +914,14 @@ async fn cdp_processor(
                         connection_reply_tx.as_ref(),
                         take_live_pending_navigation(&ctx),
                     ) {
-                        let navigation = json!({
-                            "id": 0,
-                            "method": "Page.navigate",
-                            "params": {"url": url, "__method": method, "__body": body},
-                            "sessionId": session_id,
-                        })
-                        .to_string();
+                        let referrer = ctx
+                            .sessions
+                            .get(&session_id)
+                            .and_then(|page_id| ctx.pages.iter().find(|p| &p.id == page_id))
+                            .map(|page| page.document_referrer_for(&url))
+                            .unwrap_or_default();
+                        let navigation =
+                            synthetic_navigation(&Some(session_id), &url, &method, &body, &referrer);
                         process_with_interception(
                             &navigation,
                             &mut ctx,
@@ -1010,7 +1011,15 @@ async fn cdp_processor(
                             &mut intercepted_paused,
                         );
                     if !fetch_was_resolved {
-                        process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                        let navigation =
+                            process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                        if let Some(navigation) = navigation {
+                            process_with_interception(
+                                &navigation, &mut ctx, &cdp_msg.reply_tx, &mut rx,
+                                &mut intercept_rx, &mut intercepted_paused,
+                                &mut deferred, false,
+                            ).await;
+                        }
                     }
                 }
             }
@@ -1144,6 +1153,25 @@ fn take_live_pending_navigation(
     Some((session_id, url, method, body))
 }
 
+/// The synthetic `Page.navigate` for a navigation the document scheduled.
+/// `__referrer` is what the outgoing document hands to the new one; automation
+/// `Page.navigate` calls have no such field and start with an empty referrer.
+fn synthetic_navigation(
+    session_id: &Option<String>,
+    url: &str,
+    method: &str,
+    body: &str,
+    referrer: &str,
+) -> String {
+    json!({
+        "id": 0,
+        "method": "Page.navigate",
+        "params": {"url": url, "__method": method, "__body": body, "__referrer": referrer},
+        "sessionId": session_id,
+    })
+    .to_string()
+}
+
 fn forward_pending_events(
     ctx: &mut CdpContext,
     reply_tx: Option<&mpsc::UnboundedSender<String>>,
@@ -1188,6 +1216,29 @@ async fn pump_and_forward_screencast_frames(
 // `Page.navigateToHistoryEntry` (goBack / goForward), which has no `url` param
 // and belongs to its own handler, or any other frame that merely embeds the
 // literal text (e.g. a `Runtime.evaluate` expression). See issue #363.
+// Input.* commands that only act on the current document. They are answered
+// immediately while a navigation is in flight, see `process_with_interception`.
+fn parse_input_event(text: &str) -> Option<CdpRequest> {
+    let req: CdpRequest = serde_json::from_str(text).ok()?;
+    matches!(
+        req.method.as_str(),
+        "Input.dispatchKeyEvent"
+            | "Input.dispatchMouseEvent"
+            | "Input.insertText"
+            | "Input.dispatchTouchEvent"
+    )
+    .then_some(req)
+}
+
+// Whether `session_id` is attached to the page `page_id`. During a navigation
+// the page is removed from `ctx.pages`, so only the session table can answer.
+fn session_targets_page(ctx: &CdpContext, session_id: &Option<String>, page_id: &str) -> bool {
+    session_id
+        .as_ref()
+        .and_then(|sid| ctx.sessions.get(sid))
+        .is_some_and(|pid| pid == page_id)
+}
+
 fn is_navigate_method(text: &str) -> bool {
     serde_json::from_str::<CdpRequest>(text)
         .map(|req| req.method == "Page.navigate")
@@ -1294,7 +1345,7 @@ async fn process_with_interception(
     let page_id = match page_id {
         Some(id) => id,
         None => {
-            process_cdp_message(text, ctx, reply_tx).await;
+            let _ = process_cdp_message(text, ctx, reply_tx).await;
             return;
         }
     };
@@ -1303,7 +1354,7 @@ async fn process_with_interception(
     let mut page = match page_index {
         Some(idx) => ctx.pages.remove(idx),
         None => {
-            process_cdp_message(text, ctx, reply_tx).await;
+            let _ = process_cdp_message(text, ctx, reply_tx).await;
             return;
         }
     };
@@ -1327,6 +1378,7 @@ async fn process_with_interception(
     let wait_until = crate::domains::page::parse_wait_until(&req.params);
     let nav_method = req.params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
     let nav_body = req.params.get("__body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let nav_referrer = req.params.get("__referrer").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
@@ -1353,12 +1405,12 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
-        let result = if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
-        } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
-        }
-        .map_err(|e| e.to_string());
+        // The method stays what the document asked for: a POST form without
+        // successful controls submits an empty body, not a GET.
+        let result = page
+            .navigate_with_wait_post_referrer(&url_owned, wait_until, &nav_method, &nav_body, &nav_referrer)
+            .await
+            .map_err(|e| e.to_string());
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
@@ -1431,6 +1483,27 @@ async fn process_with_interception(
                             // this side; the actual V8 work happens back on
                             // the nav task's thread.
                             handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
+                        } else if let Some(req) = parse_input_event(&msg.text)
+                            .filter(|req| session_targets_page(ctx, &req.session_id, &page_id))
+                        {
+                            // Input aimed at the navigating document only.
+                            // Chromium would still dispatch it to the outgoing
+                            // document and answer at once; Obscura cannot enter
+                            // V8 from this loop while the nav task owns the
+                            // page's isolate, so the event is acknowledged with
+                            // an empty result but not executed. That is a known
+                            // divergence scoped to this one session: an input
+                            // whose effect on the outgoing document mattered is
+                            // lost. Input for any other target stays on the
+                            // deferred path below and runs after the navigation.
+                            tracing::debug!(
+                                "INTERCEPTION: acknowledging {} (id={}) without executing it, its target is navigating",
+                                req.method, req.id
+                            );
+                            let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
+                            if let Ok(json) = serde_json::to_string(&resp) {
+                                let _ = msg.reply_tx.send(json);
+                            }
                         } else {
                             // UNSAFE during nav: would route through dispatch,
                             // which can `suspend_js` other pages and trip the
@@ -1526,16 +1599,22 @@ async fn process_with_interception(
     }
 }
 
+/// Dispatches one CDP command and returns the synthetic `Page.navigate`
+/// message for a navigation the command triggered from JS (form submit,
+/// `location.href`, link activation), if any. The caller runs it through
+/// `process_with_interception` so the connection keeps reading while the
+/// document loads; dispatching it inline here blocked every later command
+/// (typically the client's keyUp / mouseReleased) for the whole fetch.
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
-) {
+) -> Option<String> {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
             warn!("Invalid CDP: {}: {}", e, crate::util::truncate_on_char_boundary(text, 200));
-            return;
+            return None;
         }
     };
 
@@ -1559,21 +1638,10 @@ async fn process_cdp_message(
         let _ = reply_tx.send(json);
     }
 
-    if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
-        tracing::info!("JS-triggered nav: {} {} (body: {} bytes)", nav_method, nav_url, nav_body.len());
-        let nav_req = CdpRequest {
-            id: 0,
-            method: "Page.navigate".to_string(),
-            params: json!({"url": nav_url, "__method": nav_method, "__body": nav_body}),
-            session_id: req.session_id.clone(),
-        };
-        let _ = dispatch::dispatch(&nav_req, ctx).await;
-        for event in ctx.pending_events.drain(..) {
-            if let Ok(json) = serde_json::to_string(&event) {
-                let _ = reply_tx.send(json);
-            }
-        }
-    }
+    let (nav_url, nav_method, nav_body, nav_referrer) =
+        check_pending_navigation(ctx, &req.session_id)?;
+    tracing::info!("JS-triggered nav: {} {} (body: {} bytes)", nav_method, nav_url, nav_body.len());
+    Some(synthetic_navigation(&req.session_id, &nav_url, &nav_method, &nav_body, &nav_referrer))
 }
 
 fn decode_base64(input: &str) -> String {
@@ -1641,12 +1709,20 @@ fn fast_path_response(text: &str) -> Option<String> {
     }
 }
 
-fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
+/// Takes the navigation the session's document scheduled: url, method, body
+/// and the referrer the outgoing document passes on (computed before the page
+/// URL changes).
+fn check_pending_navigation(
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+) -> Option<(String, String, String, String)> {
     let page_id = session_id
         .as_ref()
         .and_then(|sid| ctx.sessions.get(sid))?;
     let page = ctx.pages.iter().find(|p| &p.id == page_id)?;
-    page.take_pending_navigation()
+    let (url, method, body) = page.take_pending_navigation()?;
+    let referrer = page.document_referrer_for(&url);
+    Some((url, method, body, referrer))
 }
 
 async fn handle_connection_ws(
@@ -1872,6 +1948,396 @@ mod tests {
                     .await
                     .expect("processor shutdown timeout")
                     .expect("processor task");
+            })
+            .await;
+    }
+
+    // Waits for the response with `id`, skipping events, and returns it
+    // together with the time it took to arrive.
+    async fn wait_for(
+        reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        id: u64,
+        timeout_secs: u64,
+    ) -> (serde_json::Value, std::time::Duration) {
+        wait_for_collecting(reply_rx, id, timeout_secs, &mut Vec::new()).await
+    }
+
+    // Like `wait_for`, but keeps every skipped message in `skipped`.
+    async fn wait_for_collecting(
+        reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        id: u64,
+        timeout_secs: u64,
+        skipped: &mut Vec<serde_json::Value>,
+    ) -> (serde_json::Value, std::time::Duration) {
+        let started = std::time::Instant::now();
+        loop {
+            let value: serde_json::Value = serde_json::from_str(
+                &tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    reply_rx.recv(),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("response {id} timeout"))
+                .expect("response channel"),
+            )
+            .unwrap();
+            if value["id"] == id {
+                return (value, started.elapsed());
+            }
+            skipped.push(value);
+        }
+    }
+
+    fn frame_navigated<'a>(
+        events: &'a [serde_json::Value],
+    ) -> impl Iterator<Item = &'a serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| e["method"] == "Page.frameNavigated")
+    }
+
+    type RequestLog = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    // Serves `html` for every path except `/slow`, which it answers only after
+    // 1.5 s, so a link or form submit gives the connection a navigation that is
+    // visibly in flight. Every request line (`METHOD /path`) lands in `log`.
+    async fn serve_slow(html: &'static str, log: RequestLog) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let log = log.clone();
+                tokio::task::spawn_local(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let line = req.lines().next().unwrap_or("").to_string();
+                    let line = line.rsplit_once(' ').map(|(l, _)| l.to_string()).unwrap_or(line);
+                    log.borrow_mut().push(line);
+                    let body = if req.starts_with("GET /slow") {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        "<html><body>slow</body></html>"
+                    } else {
+                        html
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    // One connection to a `cdp_processor`, driven through the internal
+    // `ServerMessage` channel like `page_runtime_advances_while_cdp_client_is_silent`.
+    struct Connection {
+        server_tx: Option<tokio::sync::mpsc::UnboundedSender<super::ServerMessage>>,
+        reply_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        reply_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        processor: tokio::task::JoinHandle<()>,
+    }
+
+    impl Connection {
+        async fn start() -> Self {
+            std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+            let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+            let default_context = crate::dispatch::CdpContext::new().default_context;
+            let processor = tokio::task::spawn_local(super::cdp_processor(
+                server_rx,
+                default_context,
+                shutdown,
+            ));
+            server_tx
+                .send(super::ServerMessage::NewConnection {
+                    reply_tx: reply_tx.clone(),
+                })
+                .unwrap();
+            let init = reply_rx.recv().await.expect("processor init");
+            assert!(init.contains("__init"));
+            Self { server_tx: Some(server_tx), reply_tx, reply_rx, processor }
+        }
+
+        fn send(&self, id: u64, method: &str, session_id: Option<&str>, params: serde_json::Value) {
+            let mut value = json!({"id": id, "method": method, "params": params});
+            if let Some(sid) = session_id {
+                value["sessionId"] = json!(sid);
+            }
+            self.server_tx
+                .as_ref()
+                .unwrap()
+                .send(super::ServerMessage::Cdp(super::CdpMessage {
+                    text: value.to_string(),
+                    reply_tx: self.reply_tx.clone(),
+                }))
+                .unwrap();
+        }
+
+        // Target.createTarget + the attached session, then Page.navigate to
+        // `url` (waitUntil load). Returns the session id and the loader id.
+        async fn open_page(&mut self, id: u64, url: &str) -> (String, String) {
+            self.send(id, "Target.createTarget", None, json!({"url": "about:blank"}));
+            let mut skipped = Vec::new();
+            wait_for_collecting(&mut self.reply_rx, id, 5, &mut skipped).await;
+            let session_id = skipped
+                .iter()
+                .find_map(|e| e["params"]["sessionId"].as_str().map(str::to_string))
+                .expect("attached page session");
+            self.send(
+                id + 1,
+                "Page.navigate",
+                Some(&session_id),
+                json!({"url": url, "waitUntil": "load"}),
+            );
+            let (navigate, _) = wait_for(&mut self.reply_rx, id + 1, 10).await;
+            assert!(navigate["error"].is_null(), "navigate failed: {navigate}");
+            let loader_id = navigate["result"]["loaderId"].as_str().unwrap().to_string();
+            (session_id, loader_id)
+        }
+
+        async fn evaluate(&mut self, id: u64, session_id: &str, expression: &str) -> serde_json::Value {
+            self.send(
+                id,
+                "Runtime.evaluate",
+                Some(session_id),
+                json!({"expression": expression, "returnByValue": true}),
+            );
+            let (value, _) = wait_for(&mut self.reply_rx, id, 10).await;
+            value["result"]["result"]["value"].clone()
+        }
+
+        // Centre of `selector`'s bounding box: real layout in render builds, the
+        // deterministic per-node cell otherwise. Either way it is what
+        // `document.elementFromPoint` hit-tests against.
+        async fn center_of(&mut self, id: u64, session_id: &str, selector: &str) -> (f64, f64) {
+            let xy = self
+                .evaluate(
+                    id,
+                    session_id,
+                    &format!(
+                        "(r => [r.left + r.width / 2, r.top + r.height / 2])(document.querySelector('{selector}').getBoundingClientRect())"
+                    ),
+                )
+                .await;
+            (xy[0].as_f64().unwrap(), xy[1].as_f64().unwrap())
+        }
+
+        // Native left click on `selector` (mousePressed + mouseReleased at its
+        // centre). Returns the events that arrived before the mouseReleased
+        // response and how long that response took.
+        async fn click(
+            &mut self,
+            id: u64,
+            session_id: &str,
+            selector: &str,
+        ) -> (Vec<serde_json::Value>, std::time::Duration) {
+            let (x, y) = self.center_of(id, session_id, selector).await;
+            let mouse = |t: &str| json!({"type": t, "x": x, "y": y, "button": "left", "clickCount": 1});
+            self.send(id + 1, "Input.dispatchMouseEvent", Some(session_id), mouse("mousePressed"));
+            self.send(id + 2, "Input.dispatchMouseEvent", Some(session_id), mouse("mouseReleased"));
+            let mut skipped = Vec::new();
+            let (release, elapsed) =
+                wait_for_collecting(&mut self.reply_rx, id + 2, 10, &mut skipped).await;
+            assert!(release["error"].is_null(), "mouseReleased failed: {release}");
+            (skipped, elapsed)
+        }
+
+        async fn finish(mut self) {
+            self.server_tx.take();
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.processor)
+                .await
+                .expect("processor shutdown timeout")
+                .expect("processor task");
+        }
+    }
+
+    const LINK_HTML: &str = r#"<html><body><a id="l" href="/slow">go</a></body></html>"#;
+
+    // A JS-triggered navigation (Enter submitting the focused form, or a click
+    // on a link) used to run inline on the connection processor, so the
+    // client's very next command, the matching keyUp / mouseReleased, was
+    // blocked until the document arrived. Chromium answers input during a
+    // navigation at once; the second event must come back long before the
+    // 1.5 s fixture responds, and the navigation still completes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_events_are_answered_while_js_triggered_navigation_is_in_flight() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let base = serve_slow(
+                    r#"<html><body><form method="get" action="/slow"><input id="q" name="q"></form></body></html>"#,
+                    RequestLog::default(),
+                )
+                .await;
+                let mut c = Connection::start().await;
+                let (sid, _) = c.open_page(1, &base).await;
+                c.evaluate(3, &sid, "document.getElementById('q').focus()").await;
+                let key = |t: &str| json!({"type": t, "key": "Enter", "code": "Enter"});
+                c.send(4, "Input.dispatchKeyEvent", Some(&sid), key("keyDown"));
+                c.send(5, "Input.dispatchKeyEvent", Some(&sid), key("keyUp"));
+                let (up, elapsed) = wait_for(&mut c.reply_rx, 5, 10).await;
+                assert!(up["error"].is_null(), "keyUp failed: {up}");
+                assert!(
+                    elapsed < std::time::Duration::from_millis(500),
+                    "keyUp was blocked behind the navigation for {elapsed:?}"
+                );
+                let href = c.evaluate(6, &sid, "location.href").await;
+                assert!(
+                    href.as_str().unwrap_or("").contains("/slow"),
+                    "submit navigation did not complete, location is {href}"
+                );
+                c.finish().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mouse_released_on_link_is_answered_while_navigation_is_in_flight() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let base = serve_slow(LINK_HTML, RequestLog::default()).await;
+                let mut c = Connection::start().await;
+                let (sid, _) = c.open_page(1, &base).await;
+                let (_, elapsed) = c.click(3, &sid, "#l").await;
+                assert!(
+                    elapsed < std::time::Duration::from_millis(500),
+                    "mouseReleased was blocked behind the navigation for {elapsed:?}"
+                );
+                let href = c.evaluate(6, &sid, "location.href").await;
+                assert!(
+                    href.as_str().unwrap_or("").contains("/slow"),
+                    "click navigation did not complete, location is {href}"
+                );
+                c.finish().await;
+            })
+            .await;
+    }
+
+    // The immediate `{}` answer for input during a navigation is scoped to the
+    // navigating target. A click in a second tab of the same connection while
+    // the first one loads a slow document must still run (after the load, on
+    // the deferred path): the server sees the GET for that tab's link.
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_for_another_target_runs_after_the_navigating_target_settles() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let log = RequestLog::default();
+                let base = serve_slow(
+                    r#"<html><body><a id="l" href="/target">go</a></body></html>"#,
+                    log.clone(),
+                )
+                .await;
+                let mut c = Connection::start().await;
+                let (a, _) = c.open_page(1, &base).await;
+                let (b, _) = c.open_page(3, &base).await;
+                let (x, y) = c.center_of(5, &b, "#l").await;
+                c.send(6, "Page.navigate", Some(&a), json!({"url": format!("{base}slow")}));
+                let mouse = |t: &str| json!({"type": t, "x": x, "y": y, "button": "left", "clickCount": 1});
+                c.send(7, "Input.dispatchMouseEvent", Some(&b), mouse("mousePressed"));
+                c.send(8, "Input.dispatchMouseEvent", Some(&b), mouse("mouseReleased"));
+                let (release, _) = wait_for(&mut c.reply_rx, 8, 10).await;
+                assert!(release["error"].is_null(), "mouseReleased in B failed: {release}");
+                let href = c.evaluate(9, &b, "location.href").await;
+                assert!(
+                    href.as_str().unwrap_or("").contains("/target"),
+                    "click in B did not navigate B, location is {href}"
+                );
+                assert!(
+                    log.borrow().iter().any(|l| l == "GET /target"),
+                    "server never saw B's link: {:?}",
+                    log.borrow()
+                );
+                let href_a = c.evaluate(10, &a, "location.href").await;
+                assert!(href_a.as_str().unwrap_or("").contains("/slow"), "A is at {href_a}");
+                c.finish().await;
+            })
+            .await;
+    }
+
+    // `location.assign` previews the target in `__virtualUrl` before recording
+    // the navigation. The mouseReleased handler must not report that preview
+    // as a same-document move: exactly one Page.frameNavigated, after the
+    // document arrived, under the new loader id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn link_click_emits_one_frame_navigated_with_the_new_loader_id() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let base = serve_slow(LINK_HTML, RequestLog::default()).await;
+                let mut c = Connection::start().await;
+                let (sid, first_loader) = c.open_page(1, &base).await;
+                let (before, _) = c.click(3, &sid, "#l").await;
+                assert_eq!(
+                    frame_navigated(&before).count(),
+                    0,
+                    "frameNavigated before any document bytes: {before:?}"
+                );
+                let mut after = Vec::new();
+                c.send(
+                    6,
+                    "Runtime.evaluate",
+                    Some(&sid),
+                    json!({"expression": "location.href", "returnByValue": true}),
+                );
+                let (href, _) = wait_for_collecting(&mut c.reply_rx, 6, 10, &mut after).await;
+                assert!(href["result"]["result"]["value"].as_str().unwrap_or("").contains("/slow"));
+                let navigated: Vec<_> = frame_navigated(&after).collect();
+                assert_eq!(navigated.len(), 1, "expected one frameNavigated: {navigated:?}");
+                let frame = &navigated[0]["params"]["frame"];
+                assert!(frame["url"].as_str().unwrap_or("").contains("/slow"), "{frame}");
+                assert_ne!(frame["loaderId"], json!(first_loader), "old loader id reused: {frame}");
+                assert_eq!(navigated[0]["sessionId"], json!(sid));
+                c.finish().await;
+            })
+            .await;
+    }
+
+    // A POST form without successful controls submits an empty body; the
+    // method must not fall back to GET because the body is empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_post_form_submitted_by_click_stays_post() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let log = RequestLog::default();
+                let base = serve_slow(
+                    r#"<html><body><form method="post" action="/submit-empty"><button id="s" type="submit">send</button></form></body></html>"#,
+                    log.clone(),
+                )
+                .await;
+                let mut c = Connection::start().await;
+                let (sid, _) = c.open_page(1, &base).await;
+                c.click(3, &sid, "#s").await;
+                let href = c.evaluate(6, &sid, "location.href").await;
+                assert!(href.as_str().unwrap_or("").contains("/submit-empty"), "location is {href}");
+                let log = log.borrow();
+                assert!(
+                    log.iter().any(|l| l == "POST /submit-empty"),
+                    "server did not see a POST: {log:?}"
+                );
+                assert!(!log.iter().any(|l| l == "GET /submit-empty"), "{log:?}");
+                c.finish().await;
+            })
+            .await;
+    }
+
+    // A navigation the outgoing document scheduled carries its referrer
+    // (strict-origin-when-cross-origin: the full URL for same-origin).
+    #[tokio::test(flavor = "current_thread")]
+    async fn link_click_navigation_carries_source_referrer() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let base = serve_slow(LINK_HTML, RequestLog::default()).await;
+                let mut c = Connection::start().await;
+                let (sid, _) = c.open_page(1, &base).await;
+                c.click(3, &sid, "#l").await;
+                let state = c.evaluate(6, &sid, "[location.href, document.referrer]").await;
+                assert!(state[0].as_str().unwrap_or("").contains("/slow"), "{state}");
+                assert_eq!(state[1], json!(base), "document.referrer after link click: {state}");
+                c.finish().await;
             })
             .await;
     }
