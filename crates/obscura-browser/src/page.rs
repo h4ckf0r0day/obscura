@@ -891,18 +891,6 @@ fn css_import_rule_len(css: &str) -> Option<usize> {
     None
 }
 
-fn render_resource_type(url: &url::Url) -> ResourceType {
-    let path = url.path().to_ascii_lowercase();
-    if [".woff", ".woff2", ".ttf", ".otf", ".eot"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
-    {
-        ResourceType::Font
-    } else {
-        ResourceType::Image
-    }
-}
-
 /// Pull leading `@import` rules out of a stylesheet. Returns each import target
 /// URL with its optional media condition plus the CSS with those `@import`
 /// statements removed. Browsers fetch media-gated imports even when they do
@@ -1865,6 +1853,8 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        #[cfg(feature = "render")]
+        rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
 
         if let Some(dom) = self.dom.take() {
@@ -3029,6 +3019,11 @@ impl Page {
                     let _ = js.run_event_loop_until_quiescent(remaining, 150).await;
                 }
             }
+            #[cfg(feature = "render")]
+            {
+                self.drain_render_resource_results();
+                self.queue_pending_render_resources();
+            }
             if !self.advance_frames().await {
                 break;
             }
@@ -3078,15 +3073,71 @@ impl Page {
     /// higher-priority automation commands.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
+        #[cfg(feature = "render")]
+        {
+            self.drain_render_resource_results();
+            self.queue_pending_render_resources();
+        }
         let reached_idle = match self.js.as_mut() {
-            Some(js) => js.run_autonomous_event_loop_turn().await,
-            None => Ok(true),
-        }?;
+            Some(js) => {
+                #[cfg(feature = "render")]
+                {
+                    // A finished transport load is page work too: wake up as
+                    // soon as it lands so the next layout, paint or lifecycle
+                    // read sees the real bytes instead of waiting for the next
+                    // protocol command. The runtime turn is cancel-safe (the
+                    // connection processor already races it against commands).
+                    // The waiter is registered before the pending check, so a
+                    // load finishing in between cannot be missed.
+                    let notify = js.render_resource_notify();
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let loads_pending = js.has_pending_render_resources();
+                    tokio::select! {
+                        biased;
+                        turn = js.run_autonomous_event_loop_turn() => turn?,
+                        _ = &mut notified, if loads_pending => false,
+                    }
+                }
+                #[cfg(not(feature = "render"))]
+                js.run_autonomous_event_loop_turn().await?
+            }
+            None => true,
+        };
         // Dynamic iframe fetches finish on the page event loop, but their
         // realms must be built by Page between turns. Keep the autonomous CDP
         // pump on the same generic frame path as settle(), so a client that
         // stays attached can observe and run child documents as they arrive.
         let frame_work = self.advance_frames().await;
+        #[cfg(feature = "render")]
+        {
+            if reached_idle && !frame_work && self.js.is_some() {
+                // The runtime may have nothing to do until a resource lands.
+                // Park on the next result instead of reporting "busy" (which
+                // would spin the connection pump). `notified` is cancel-safe,
+                // so the processor can still preempt this turn with a
+                // command. Register the waiter first, then service (a load
+                // that finished before this point is applied here; its wake
+                // is already past), then decide whether to park.
+                let notify = self.js.as_ref().unwrap().render_resource_notify();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                self.queue_pending_render_resources();
+                if self.has_pending_render_resources() {
+                    notified.await;
+                    self.drain_render_resource_results();
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            // Geometry this turn produced may have missed resources; start
+            // their loads now.
+            self.queue_pending_render_resources();
+            return Ok(reached_idle && !frame_work);
+        }
+        #[cfg(not(feature = "render"))]
         Ok(reached_idle && !frame_work)
     }
 
@@ -3205,6 +3256,8 @@ impl Page {
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
+        // The previous document's background loads end with the document.
+        self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
@@ -3544,6 +3597,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.retire_render_resources();
         self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
@@ -3570,180 +3624,245 @@ impl Page {
         self.dom.as_ref().map(f)
     }
 
-    /// Concurrently seed the synchronous renderer cache through the owning
-    /// page transport. This removes serial image/font HTTP from the first
-    /// screenshot while retaining cookies, proxy policy, interception, CORS,
-    /// response limits, and connection pooling.
+    /// Render resources the retained document references but the renderer
+    /// cache does not know yet, found by scanning the light DOM for `<img>`,
+    /// `<video poster>`, `<style>`, `style` attributes and `<use>`. This is
+    /// only the navigation warmup: everything layout or paint actually asks
+    /// for later is reported by the renderer itself (`take_render_resource_requests`).
+    /// Blocked or disallowed URLs come back separately so they can be
+    /// remembered as missing.
+    #[cfg(feature = "render")]
+    fn render_resource_candidates(
+        &self,
+    ) -> (
+        Vec<(String, Option<obscura_js::ImageRequestProfile>)>,
+        Vec<(String, Option<obscura_js::ImageRequestProfile>)>,
+    ) {
+        let Some(js) = &self.js else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(document_url) = self.url.clone() else {
+            return (Vec::new(), Vec::new());
+        };
+        let base_url = self
+            .resolve_base_url()
+            .unwrap_or_else(|| document_url.clone());
+        let mut candidates = std::collections::BTreeSet::new();
+
+        for (raw, profile) in js.pending_render_image_urls() {
+            if let Ok(mut url) = url::Url::parse(&raw) {
+                url.set_fragment(None);
+                candidates.insert((url.to_string(), Some(profile)));
+            }
+        }
+        let css_sources = js
+            .with_dom(|dom| {
+                let mut sources = Vec::new();
+                for id in dom.descendants(dom.document()) {
+                    let Some(node) = dom.get_node(id) else {
+                        continue;
+                    };
+                    if node
+                        .as_element()
+                        .is_some_and(|element| element.local.as_ref() == "style")
+                    {
+                        sources.push(dom.text_content(id));
+                    }
+                    if let Some(style) = node.get_attribute("style") {
+                        sources.push(style.to_string());
+                    }
+                    if node
+                        .as_element()
+                        .is_some_and(|element| element.local.as_ref() == "use")
+                    {
+                        if let Some(href) = node
+                            .get_attribute("href")
+                            .or_else(|| node.get_attribute("xlink:href"))
+                        {
+                            sources.push(format!("url({href})"));
+                        }
+                    }
+                }
+                sources
+            })
+            .unwrap_or_default();
+        for css in css_sources {
+            for raw in css_resource_urls(&css, &base_url) {
+                if let Ok(mut url) = url::Url::parse(&raw) {
+                    url.set_fragment(None);
+                    candidates.insert((url.to_string(), None));
+                }
+            }
+        }
+        candidates.retain(|(url, profile)| match profile {
+            Some(profile) => !js.render_image_resource_is_known(url, *profile),
+            None => !js.render_resource_is_known(url),
+        });
+
+        let mut loadable = Vec::new();
+        let mut rejected = Vec::new();
+        for (url, profile) in candidates {
+            if subresource_allowed(Some(&document_url), &url) && !self.should_block_url(&url) {
+                loadable.push((url, profile));
+            } else {
+                rejected.push((url, profile));
+            }
+        }
+        (loadable, rejected)
+    }
+
+    /// Abandon every background load of the current document. Navigation, a
+    /// blank reset, suspension and teardown call this so a response that
+    /// belongs to a previous document can neither seed the next document's
+    /// cache nor be mistaken for that document's own request of the same URL
+    /// (the runtime also fences results by document generation). Aborting
+    /// the tasks drops their in-progress HTTP requests.
+    #[cfg(feature = "render")]
+    pub fn retire_render_resources(&mut self) {
+        if let Some(js) = &self.js {
+            js.abandon_render_resources();
+        }
+    }
+
+    #[cfg(not(feature = "render"))]
+    pub fn retire_render_resources(&mut self) {}
+
+    /// Apply every finished background load without waiting and report the
+    /// responses as Network events. Returns the number of loads that stored
+    /// usable bytes. Successful image and font bytes invalidate the retained
+    /// geometry, so the next layout or paint observes the real intrinsic size.
+    #[cfg(feature = "render")]
+    pub fn drain_render_resource_results(&mut self) -> usize {
+        let Some(js) = self.js.as_mut() else {
+            return 0;
+        };
+        let loaded = js.apply_render_resource_results();
+        self.record_render_resource_events();
+        loaded
+    }
+
+    /// Report the responses of applied background loads as Network events
+    /// (recording needs the page, not the runtime).
+    #[cfg(feature = "render")]
+    fn record_render_resource_events(&mut self) {
+        let Some(js) = self.js.as_mut() else {
+            return;
+        };
+        let events = js.take_render_resource_events();
+        for event in events {
+            self.record_network_event_with_body(
+                &event.response.url,
+                "GET",
+                if event.is_font { "Font" } else { "Image" },
+                event.response.status,
+                &event.response.headers,
+                &event.response.body,
+                true,
+            );
+        }
+    }
+
+    #[cfg(not(feature = "render"))]
+    pub fn drain_render_resource_results(&mut self) -> usize {
+        0
+    }
+
+    /// Apply finished loads and start transport loads for the resources
+    /// cache-only layout or paint missed since the last call (the runtime's
+    /// own service step, plus the Network events). Returns the number of
+    /// loads that stored usable bytes.
+    #[cfg(feature = "render")]
+    pub fn queue_pending_render_resources(&mut self) -> usize {
+        let Some(js) = self.js.as_mut() else {
+            return 0;
+        };
+        let loaded = js.service_render_resources();
+        self.record_render_resource_events();
+        loaded
+    }
+
+    #[cfg(not(feature = "render"))]
+    pub fn queue_pending_render_resources(&mut self) -> usize {
+        0
+    }
+
+    /// Start loads for everything the light-DOM scan finds. Used by the
+    /// navigation warmups before any layout has run.
+    #[cfg(feature = "render")]
+    pub fn spawn_pending_render_resources(&mut self) -> usize {
+        if let Some(js) = &self.js {
+            // A runtime attached without `init_js` loads through the page
+            // transport all the same.
+            if !js.has_page_transport() {
+                js.set_http_client(self.http_client.clone());
+                js.set_callbacks(self.callbacks.clone());
+                #[cfg(feature = "stealth")]
+                if let Some(stealth) = &self.stealth_client {
+                    js.set_stealth_client(stealth.clone());
+                }
+            }
+        }
+        let (loadable, rejected) = self.render_resource_candidates();
+        let started = match &mut self.js {
+            Some(js) => {
+                for (url, profile) in rejected {
+                    match profile {
+                        Some(profile) => js.seed_render_image_resource(url, profile, None),
+                        None => js.seed_render_resource(url, None),
+                    }
+                }
+                let mut requests = js.mark_render_resources_in_flight(loadable);
+                requests.extend(js.take_render_resource_requests());
+                js.start_render_resource_loads(requests)
+            }
+            None => 0,
+        };
+        started
+    }
+
+    /// Whether background render-resource loads are still running.
+    #[cfg(feature = "render")]
+    pub fn has_pending_render_resources(&self) -> bool {
+        self.js
+            .as_ref()
+            .is_some_and(|js| js.has_pending_render_resources())
+    }
+
+    /// Seed the renderer cache through the owning page transport and wait up
+    /// to `max_ms` for the results. This removes serial image/font HTTP from
+    /// the first screenshot while retaining cookies, proxy policy,
+    /// interception, CORS, response limits, and connection pooling. Loads
+    /// that miss the deadline keep running in the background and are applied
+    /// by a later drain; they are neither cancelled nor negative-cached.
     #[cfg(feature = "render")]
     pub async fn prepare_screenshot_resources(&mut self, max_ms: u64) -> usize {
         let started = std::time::Instant::now();
         if max_ms == 0 || self.js.is_none() {
             return 0;
         }
-        let Some(document_url) = self.url.clone() else {
-            return 0;
-        };
-        let base_url = self
-            .resolve_base_url()
-            .unwrap_or_else(|| document_url.clone());
-        let mut candidates = std::collections::BTreeMap::new();
-
-        if let Some(js) = &self.js {
-            for (raw, profile) in js.pending_render_image_urls() {
-                if let Ok(mut url) = url::Url::parse(&raw) {
-                    url.set_fragment(None);
-                    candidates.insert((url.to_string(), Some(profile)), ResourceType::Image);
-                }
-            }
-            let css_sources = js
-                .with_dom(|dom| {
-                    let mut sources = Vec::new();
-                    for id in dom.descendants(dom.document()) {
-                        let Some(node) = dom.get_node(id) else {
-                            continue;
-                        };
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "style")
-                        {
-                            sources.push(dom.text_content(id));
-                        }
-                        if let Some(style) = node.get_attribute("style") {
-                            sources.push(style.to_string());
-                        }
-                        if node
-                            .as_element()
-                            .is_some_and(|element| element.local.as_ref() == "use")
-                        {
-                            if let Some(href) = node
-                                .get_attribute("href")
-                                .or_else(|| node.get_attribute("xlink:href"))
-                            {
-                                sources.push(format!("url({href})"));
-                            }
-                        }
-                    }
-                    sources
-                })
-                .unwrap_or_default();
-            for css in css_sources {
-                for raw in css_resource_urls(&css, &base_url) {
-                    if let Ok(mut url) = url::Url::parse(&raw) {
-                        let kind = render_resource_type(&url);
-                        url.set_fragment(None);
-                        candidates.insert((url.to_string(), None), kind);
-                    }
-                }
-            }
-            candidates.retain(|(url, profile), _| match profile {
-                Some(profile) => !js.render_image_resource_is_known(url, *profile),
-                None => !js.render_resource_is_known(url),
-            });
-        }
-
-        candidates.retain(|(url, _), _| {
-            subresource_allowed(Some(&document_url), url) && !self.should_block_url(url)
-        });
-        if candidates.len() > 128 {
-            candidates = candidates.into_iter().take(128).collect();
-        }
-        if candidates.is_empty() {
-            return 0;
-        }
-
-        let requested: Vec<(String, Option<obscura_js::ImageRequestProfile>, ResourceType)> =
-            candidates
-                .into_iter()
-                .map(|((url, profile), kind)| (url, profile, kind))
-                .collect();
-        let client = self.http_client.clone();
-        #[cfg(feature = "stealth")]
-        let stealth_client = self.stealth_client.clone();
-        let callbacks = self.callbacks.clone();
-        let initiator = document_url.clone();
-        use futures::StreamExt as _;
-        let requests = futures::stream::iter(requested.into_iter().map(|(raw, profile, kind)| {
-            let client = client.clone();
-            #[cfg(feature = "stealth")]
-            let stealth_client = stealth_client.clone();
-            let callbacks = callbacks.clone();
-            let initiator = initiator.clone();
-            async move {
-                let parsed = url::Url::parse(&raw).expect("validated render resource URL");
-                let mut request = ResourceRequest::subresource(kind, &initiator);
-                match profile {
-                    Some(obscura_js::ImageRequestProfile::CorsSameOrigin) => {
-                        request.mode = obscura_net::RequestMode::Cors;
-                        request.credentials = obscura_net::RequestCredentials::SameOrigin;
-                    }
-                    Some(obscura_js::ImageRequestProfile::CorsInclude) => {
-                        request.mode = obscura_net::RequestMode::Cors;
-                        request.credentials = obscura_net::RequestCredentials::Include;
-                    }
-                    _ => {}
-                }
-                #[cfg(feature = "stealth")]
-                let result = if let Some(stealth_client) = stealth_client {
-                    stealth_client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
-                        .await
-                } else {
-                    client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
-                        .await
-                };
-                #[cfg(not(feature = "stealth"))]
-                let result = client
-                    .fetch_resource_with_callbacks(&parsed, request, Some(&callbacks))
-                    .await;
-                (raw, profile, kind, result)
-            }
-        }))
-        .buffer_unordered(16);
-        futures::pin_mut!(requests);
+        let mut loaded = 0;
+        self.spawn_pending_render_resources();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_ms);
-        let mut loaded = 0usize;
+        let Some(notify) = self.js.as_ref().map(|js| js.render_resource_notify()) else {
+            return loaded;
+        };
         loop {
-            match tokio::time::timeout_at(deadline, requests.next()).await {
-                Ok(Some((raw, profile, kind, result))) => {
-                    let outcome = match result {
-                        Ok(response) => {
-                            self.record_network_event_with_body(
-                                response.url.as_str(),
-                                "GET",
-                                match kind {
-                                    ResourceType::Font => "Font",
-                                    _ => "Image",
-                                },
-                                response.status,
-                                &response.headers,
-                                &response.body,
-                                true,
-                            );
-                            if (200..300).contains(&response.status) {
-                                loaded += 1;
-                                Some(response.body)
-                            } else {
-                                None
-                            }
-                        }
-                        Err(_) => None,
-                    };
-                    if let Some(js) = &mut self.js {
-                        match profile {
-                            Some(profile) => {
-                                js.seed_render_image_resource(raw, profile, outcome)
-                            }
-                            None => js.seed_render_resource(raw, outcome),
-                        }
-                    }
-                }
-                Ok(None) | Err(_) => break,
+            // Register the waiter first, then apply what already arrived,
+            // then decide whether to wait: a load that finished after the
+            // scan (its wake is already past) is picked up by the drain, and
+            // one that finishes after the drain wakes the registered waiter.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            loaded += self.drain_render_resource_results();
+            if !self.has_pending_render_resources() {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                loaded += self.drain_render_resource_results();
+                break;
             }
         }
-        // A deadline drops unfinished futures without negative-caching them,
-        // so a later warmup can retry slow resources.
-        drop(requests);
         tracing::debug!(
             loaded,
             elapsed_ms = started.elapsed().as_millis(),
@@ -4369,6 +4488,12 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
+        if self.js.is_none() {
+            return;
+        }
+        // Suspension rebuilds the renderer cache on resume (`take_dom`), so
+        // results for the suspended realm would have nowhere to go.
+        self.retire_render_resources();
         let Some(js) = &mut self.js else {
             return;
         };
@@ -4554,6 +4679,10 @@ impl Page {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
+            // `Fetch.enable` assigns the patterns right before this call;
+            // the renderer's loads follow the same interception policy.
+            #[cfg(feature = "render")]
+            js.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         }
     }
 }
@@ -4587,6 +4716,14 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
     }
 
     pattern.ends_with('*') || remainder.is_empty()
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        // A closed target must not keep fetching for a document nobody can
+        // observe any more.
+        self.retire_render_resources();
+    }
 }
 
 #[cfg(test)]
@@ -7264,6 +7401,831 @@ mod tests {
                 .is_err(),
             "capture must not open a second synchronous renderer request"
         );
+    }
+
+    /// Serve one SVG for every request after `delay_ms`, for `seconds`.
+    /// Reports each request line so tests can count transport requests.
+    #[cfg(feature = "render")]
+    fn spawn_delayed_svg_server(
+        delay_ms: u64,
+        seconds: u64,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let seen_tx = seen_tx.clone();
+                        std::thread::spawn(move || {
+                            let mut request = [0u8; 2048];
+                            let read = stream.read(&mut request).unwrap_or(0);
+                            let first = String::from_utf8_lossy(&request[..read])
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
+                            let _ = seen_tx.send(first);
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(body);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (address, seen_rx)
+    }
+
+    /// A page with a transport and one `<img>`, wired the way `init_js` does
+    /// it (transport installed on the runtime before page script runs).
+    #[cfg(feature = "render")]
+    fn page_with_transport_and_image(id: &str, page_url: &str, image_url: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            id.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new(id.to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        let dom = parse_html(&format!(
+            r#"<html><body><img id="i" src="{image_url}"></body></html>"#
+        ));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url(page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.set_http_client(page.http_client.clone());
+        runtime.set_callbacks(page.callbacks.clone());
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(page_url).unwrap());
+        page
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_only_layout_never_blocks_on_a_slow_asset_and_late_bytes_update_geometry() {
+        let (address, seen_rx) = spawn_delayed_svg_server(1_200, 8);
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/slow.svg");
+        let mut page = page_with_transport_and_image("cache-only", &page_url, &asset_url);
+        assert!(
+            !page
+                .js
+                .as_ref()
+                .unwrap()
+                .render_resource_sync_loading_enabled(),
+            "a page-owned runtime must not own a synchronous loader"
+        );
+
+        // Layout must answer from placeholder geometry immediately instead of
+        // fetching the asset on the V8 thread.
+        let started = std::time::Instant::now();
+        let width = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('i').getBoundingClientRect().width")
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(600),
+            "layout query took {:?} while the asset needs 1.2 s",
+            started.elapsed()
+        );
+        // Chromium lays out a not-yet-loaded <img> without size attributes as
+        // an empty box; the intrinsic width must not be known yet either way.
+        assert!(width.is_number(), "layout answered: {width}");
+        assert_ne!(width.as_f64(), Some(20.0), "intrinsic size is not known yet");
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('i').naturalWidth")
+                .unwrap()
+                .as_f64(),
+            Some(0.0)
+        );
+
+        // The miss is queued through the page transport exactly once (the
+        // geometry read above already handed it to the transport).
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources());
+        page.queue_pending_render_resources();
+        // The load runs on the runtime, so yield to it instead of blocking the
+        // single test thread on the channel.
+        let mut first_request = None;
+        for _ in 0..40 {
+            if let Ok(line) = seen_rx.try_recv() {
+                first_request = Some(line);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            first_request
+                .as_deref()
+                .is_some_and(|line| line.starts_with("GET /slow.svg ")),
+            "transport request expected, got {first_request:?}"
+        );
+
+        // Waiting for the transport (here via the capture warmup) applies the
+        // late bytes: cache known, intrinsic size visible to script and layout.
+        assert_eq!(page.prepare_screenshot_resources(5_000).await, 1);
+        assert!(!page.has_pending_render_resources());
+        assert!(page.js.as_ref().unwrap().render_image_resource_is_known(
+            &asset_url,
+            obscura_js::ImageRequestProfile::NoCorsInclude
+        ));
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('i').naturalWidth")
+                .unwrap()
+                .as_f64(),
+            Some(20.0)
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('i').getBoundingClientRect().width")
+                .unwrap()
+                .as_f64(),
+            Some(20.0)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "neither layout nor capture may open a second request"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_render_resources_are_never_fetched_by_layout_or_transport() {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 4);
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/blocked.svg");
+        let mut page = page_with_transport_and_image("blocked", &page_url, &asset_url);
+        page.set_blocked_urls(vec!["*blocked.svg".to_string()]);
+
+        let started = std::time::Instant::now();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('i').getBoundingClientRect().width")
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(600));
+        assert_eq!(
+            page.queue_pending_render_resources(),
+            0,
+            "a blocked URL must not start a transport request"
+        );
+        assert!(
+            page.js.as_ref().unwrap().render_image_resource_is_known(
+                &asset_url,
+                obscura_js::ImageRequestProfile::NoCorsInclude
+            ),
+            "a blocked URL is remembered as missing so layout stops asking"
+        );
+        assert_eq!(page.prepare_screenshot_resources(200).await, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "Network.setBlockedURLs must also stop renderer-initiated loads"
+        );
+    }
+
+    /// Serve every request after `delay_ms` for `seconds`, tracking how many
+    /// connections are open at once. Bodies are a 20x10 SVG.
+    #[cfg(feature = "render")]
+    fn spawn_counting_svg_server(
+        delay_ms: u64,
+        seconds: u64,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let open = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (open_thread, peak_thread) = (open.clone(), peak.clone());
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let (open, peak, seen_tx) =
+                            (open_thread.clone(), peak_thread.clone(), seen_tx.clone());
+                        std::thread::spawn(move || {
+                            let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            let mut request = [0u8; 4096];
+                            let read = stream.read(&mut request).unwrap_or(0);
+                            let first = String::from_utf8_lossy(&request[..read])
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
+                            let _ = seen_tx.send(first);
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(body);
+                            open.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (address, peak, open, seen_rx)
+    }
+
+    /// A page with a transport and arbitrary body markup, wired like `init_js`.
+    #[cfg(feature = "render")]
+    fn page_with_transport_and_body(id: &str, page_url: &str, body: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            id.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new(id.to_string(), context);
+        page.set_viewport((400.0, 300.0));
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(&format!("<html><body>{body}</body></html>")));
+        runtime.set_url(page_url);
+        runtime.set_viewport(400.0, 300.0);
+        runtime.set_http_client(page.http_client.clone());
+        runtime.set_callbacks(page.callbacks.clone());
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.url = Some(url::Url::parse(page_url).unwrap());
+        page
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn renderer_misses_cover_script_fonts_and_shadow_root_styles() {
+        let (address, _peak, _open, seen_rx) = spawn_counting_svg_server(0, 6);
+        let page_url = format!("http://{address}/page");
+        let shadow_font = format!("http://{address}/shadow.ttf");
+        let dynamic_font = format!("http://{address}/dynamic.ttf");
+        let mut page = page_with_transport_and_body(
+            "misses",
+            &page_url,
+            r#"<div id="host"></div><p id="dyn" style="font-family:Dyn">dynamic</p>"#,
+        );
+        {
+            let js = page.js.as_mut().unwrap();
+            // Neither source is visible to a light-DOM scan: one lives in a
+            // shadow root, the other only in the script FontFaceSet.
+            js.evaluate(&format!(
+                r#"(function() {{
+                    const root = document.getElementById('host').attachShadow({{mode: 'open'}});
+                    root.innerHTML = '<style>@font-face {{ font-family: Shadow; src: url({shadow_font}); }}</style><p style="font-family:Shadow">shadow</p>';
+                    document.fonts.add(new FontFace('Dyn', 'url({dynamic_font})'));
+                    return true;
+                }})()"#
+            ))
+            .unwrap();
+            js.evaluate("document.getElementById('dyn').getBoundingClientRect().width")
+                .unwrap();
+        }
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources(), "layout misses must name both fonts");
+        page.prepare_screenshot_resources(3_000).await;
+        assert!(!page.has_pending_render_resources());
+        let mut lines = Vec::new();
+        while let Ok(line) = seen_rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(
+            lines.iter().any(|line| line.starts_with("GET /shadow.ttf ")),
+            "shadow-root font must be requested through the transport: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("GET /dynamic.ttf ")),
+            "script-registered font must be requested through the transport: {lines:?}"
+        );
+        let js = page.js.as_ref().unwrap();
+        assert!(js.render_resource_is_known(&shadow_font));
+        assert!(js.render_resource_is_known(&dynamic_font));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_bytes_apply_while_the_runtime_waits_for_a_promise() {
+        let (address, _peak, _open, _seen_rx) = spawn_counting_svg_server(1_200, 6);
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/late.svg");
+        let mut page = page_with_transport_and_image("promise-wait", &page_url, &asset_url);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('i').getBoundingClientRect().width")
+            .unwrap();
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources());
+
+        // No protocol command and no page pump runs here: only the runtime's
+        // own promise wait, as `Runtime.evaluate` with `awaitPromise` does.
+        let started = std::time::Instant::now();
+        let resolved = page
+            .js
+            .as_mut()
+            .unwrap()
+            .resolve_promises_until(
+                |js| {
+                    js.evaluate("document.getElementById('i').naturalWidth")
+                        .ok()
+                        .and_then(|value| value.as_f64())
+                        == Some(20.0)
+                },
+                4_000,
+            )
+            .await;
+        assert!(resolved, "the wait must observe the late bytes");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3_000),
+            "observed after {:?}, expected shortly after the 1.2 s response",
+            started.elapsed()
+        );
+    }
+
+    /// Serves one fixed body with one content type after `delay_ms`, for
+    /// `seconds`. Reports every request line.
+    #[cfg(feature = "render")]
+    fn spawn_delayed_bytes_server(
+        delay_ms: u64,
+        seconds: u64,
+        content_type: &'static str,
+        body: &'static [u8],
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let seen_tx = seen_tx.clone();
+                        std::thread::spawn(move || {
+                            let mut request = [0u8; 4096];
+                            let read = stream.read(&mut request).unwrap_or(0);
+                            let first = String::from_utf8_lossy(&request[..read])
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
+                            let _ = seen_tx.send(first);
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(body);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (address, seen_rx)
+    }
+
+    /// DejaVu Sans is much wider than the renderer's default Liberation
+    /// Sans, so a paragraph changes width once the served font applies.
+    #[cfg(feature = "render")]
+    static LATE_FONT: &[u8] = include_bytes!("../../obscura-render/assets/dejavu-sans.ttf");
+
+    /// A single awaited CDP expression creates the miss (a script-added
+    /// `@font-face`), and nothing but the runtime's own promise wait runs
+    /// until it resolves: the load must be started and its bytes applied
+    /// from inside that wait.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_miss_created_inside_an_awaited_expression_loads_during_the_wait() {
+        let (address, seen_rx) = spawn_delayed_bytes_server(1_200, 8, "font/ttf", LATE_FONT);
+        let page_url = format!("http://{address}/page");
+        let font_url = format!("http://{address}/late.ttf");
+        let mut page = page_with_transport_and_body(
+            "await-miss",
+            &page_url,
+            r#"<p><span id="t" style="font-size:20px">MMMMMMMMMMMMMMMMMMMM</span></p>"#,
+        );
+        let expression = format!(
+            r#"(async () => {{
+                const style = document.createElement('style');
+                style.textContent = '@font-face {{ font-family: Late; src: url({font_url}); }}';
+                document.head.appendChild(style);
+                const t = document.getElementById('t');
+                t.style.fontFamily = 'Late';
+                const before = t.getBoundingClientRect().width;
+                const started = Date.now();
+                while (Date.now() - started < 4000) {{
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                    const now = t.getBoundingClientRect().width;
+                    if (now !== before) return [before, now, Date.now() - started];
+                }}
+                return [before, t.getBoundingClientRect().width, -1];
+            }})()"#
+        );
+        let started = std::time::Instant::now();
+        let result = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate_for_cdp_with_timeout(&expression, true, true, 5_000)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let value = result.value.clone().unwrap_or_default();
+        let samples = value.as_array().cloned().unwrap_or_default();
+        assert_eq!(samples.len(), 3, "unexpected result {value}");
+        let (before, after, at_ms) = (
+            samples[0].as_f64().unwrap(),
+            samples[1].as_f64().unwrap(),
+            samples[2].as_f64().unwrap(),
+        );
+        let requests: Vec<String> = seen_rx.try_iter().collect();
+        assert!(
+            at_ms >= 0.0,
+            "the font must apply inside the awaited expression (before {before}, after {after}, requests {requests:?}, pending {})",
+            page.has_pending_render_resources()
+        );
+        assert!(after != before && after > 0.0, "before {before}, after {after}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(3_500),
+            "resolved after {elapsed:?}, expected shortly after the 1.2 s response"
+        );
+        assert!(
+            requests.iter().any(|line| line.starts_with("GET /late.ttf ")),
+            "the font is requested through the transport: {requests:?}"
+        );
+    }
+
+    /// Timer-driven page script inside one fixed-length wait
+    /// (`run_event_loop_for_duration`, the CLI `--wait` path) observes the
+    /// bytes that land during the wait; no external evaluate samples for it.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn timers_inside_a_fixed_wait_observe_bytes_that_land_during_it() {
+        let (address, _seen_rx) = spawn_delayed_bytes_server(1_200, 8, "font/ttf", LATE_FONT);
+        let page_url = format!("http://{address}/page");
+        let font_url = format!("http://{address}/late.ttf");
+        let mut page = page_with_transport_and_body(
+            "fixed-wait",
+            &page_url,
+            &format!(
+                r#"<style>@font-face {{ font-family: Late; src: url({font_url}); }}</style>
+                <p><span id="t" style="font-family:Late;font-size:20px">MMMMMMMMMMMMMMMMMMMM</span></p>"#
+            ),
+        );
+        {
+            let js = page.js.as_mut().unwrap();
+            js.evaluate(
+                r#"(function() {
+                    const t = document.getElementById('t');
+                    // The first geometry read records the miss; the timers
+                    // only sample.
+                    window.__samples = [[0, t.getBoundingClientRect().width]];
+                    const started = Date.now();
+                    setInterval(() => {
+                        window.__samples.push([Date.now() - started, t.getBoundingClientRect().width]);
+                    }, 20);
+                    return true;
+                })()"#,
+            )
+            .unwrap();
+        }
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources(), "the font is a layout miss");
+        page.js
+            .as_mut()
+            .unwrap()
+            .run_event_loop_for_duration(2_200)
+            .await
+            .unwrap();
+        let samples = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("JSON.stringify(window.__samples)")
+            .unwrap();
+        let samples: Vec<(f64, f64)> =
+            serde_json::from_str(samples.as_str().unwrap_or("[]")).unwrap();
+        assert!(samples.len() > 20, "timers must have run: {samples:?}");
+        let first = samples[0].1;
+        let changed = samples.iter().find(|(_, width)| *width != first);
+        assert!(
+            changed.is_some(),
+            "a sample inside the wait must show the applied font, all {first}: {samples:?}"
+        );
+        let (at_ms, _) = changed.unwrap();
+        assert!(*at_ms < 2_100.0, "observed only at {at_ms} ms: {samples:?}");
+    }
+
+    /// A load that finishes while the warmup scan runs (its wake is already
+    /// past when the wait is registered) must be applied without waiting for
+    /// the whole deadline. Two worker threads let the transport finish while
+    /// the page is busy scanning a large document.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_load_that_finished_during_the_scan_does_not_cost_the_deadline() {
+        let (address, _seen_rx) = spawn_delayed_bytes_server(1, 8, "font/ttf", LATE_FONT);
+        let page_url = format!("http://{address}/page");
+        let font_url = format!("http://{address}/quick.ttf");
+        // A large document makes the warmup's light-DOM scan take tens of
+        // milliseconds without any layout (nothing here reads geometry).
+        let filler: String = (0..200_000).map(|_| "<i></i>").collect();
+        let mut page = page_with_transport_and_body(
+            "scan-race",
+            &page_url,
+            &format!(
+                r#"<style>@font-face {{ font-family: Q; src: url({font_url}); }}</style>
+                <span id="t" style="font-family:Q">t</span>{filler}"#
+            ),
+        );
+        {
+            // The font is already in flight (as after a layout miss); it
+            // answers in about a millisecond, while the scan runs far longer.
+            let js = page.js.as_mut().unwrap();
+            let requests = js.mark_render_resources_in_flight(vec![(font_url.clone(), None)]);
+            assert_eq!(js.start_render_resource_loads(requests), 1);
+        }
+        assert!(page.has_pending_render_resources());
+        let started = std::time::Instant::now();
+        let loaded = page.prepare_screenshot_resources(1_000).await;
+        let elapsed = started.elapsed();
+        assert_eq!(loaded, 1);
+        assert!(!page.has_pending_render_resources());
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "prepare must return once the load is applied, took {elapsed:?}"
+        );
+    }
+
+    /// Renderer misses follow the page's `Fetch.enable` interception policy
+    /// like the warmup scan: an intercepted URL is not fetched behind the
+    /// client's back, other URLs still load.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn renderer_misses_honour_fetch_interception_patterns() {
+        let (address, _peak, _open, seen_rx) = spawn_counting_svg_server(0, 6);
+        let page_url = format!("http://{address}/page");
+        let intercepted = format!("http://{address}/intercepted.ttf");
+        let plain = format!("http://{address}/plain.ttf");
+        let mut page = page_with_transport_and_body(
+            "interception",
+            &page_url,
+            &format!(
+                r#"<style>@font-face {{ font-family: A; src: url({intercepted}); }}
+                @font-face {{ font-family: B; src: url({plain}); }}</style>
+                <p id="a" style="font-family:A">a</p><p id="b" style="font-family:B">b</p>"#
+            ),
+        );
+        // What `Fetch.enable` does: patterns first, then enable.
+        page.intercept_block_patterns = vec!["*intercepted.ttf".to_string()];
+        page.enable_intercept(true);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('a').getBoundingClientRect().width + document.getElementById('b').getBoundingClientRect().width")
+            .unwrap();
+        page.queue_pending_render_resources();
+        assert!(page.prepare_screenshot_resources(3_000).await <= 1);
+        assert!(!page.has_pending_render_resources());
+        let mut lines = Vec::new();
+        while let Ok(line) = seen_rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(
+            lines.iter().all(|line| !line.contains("/intercepted.ttf")),
+            "an intercepted URL must not be fetched: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("GET /plain.ttf ")),
+            "other URLs still load: {lines:?}"
+        );
+        let js = page.js.as_ref().unwrap();
+        assert!(js.render_resource_is_known(&intercepted), "intercepted URL is settled as missing");
+        assert!(js.render_resource_is_known(&plain));
+        // Disabling interception lifts the rule for later misses.
+        page.intercept_block_patterns.clear();
+        page.enable_intercept(false);
+        let late = format!("http://{address}/late-intercepted.ttf");
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(&format!(
+                r#"(function() {{
+                    document.fonts.add(new FontFace('C', 'url({late})'));
+                    const a = document.getElementById('a');
+                    a.style.fontFamily = 'C';
+                    return a.getBoundingClientRect().width;
+                }})()"#
+            ))
+            .unwrap();
+        page.queue_pending_render_resources();
+        page.prepare_screenshot_resources(3_000).await;
+        assert!(
+            seen_rx.try_iter().any(|line| line.starts_with("GET /late-intercepted.ttf ")),
+            "without interception the URL loads"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn render_resource_loads_share_one_page_wide_concurrency_limit() {
+        let (address, peak, _open, _seen_rx) = spawn_counting_svg_server(300, 8);
+        let page_url = format!("http://{address}/page");
+        let mut page = page_with_transport_and_body("limit", &page_url, "");
+        // Three groups added one after the other, each queued by its own
+        // paint miss while the previous group's loads are still running: all
+        // of them share one limiter. Every group must actually start loads.
+        for group in 0..3 {
+            let markup: String = (0..14)
+                .map(|index| {
+                    format!(
+                        r#"<div style="width:10px;height:10px;background-image:url(http://{address}/bg{group}-{index}.svg)"></div>"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(&format!(
+                    "document.body.insertAdjacentHTML('beforeend', {});",
+                    serde_json::to_string(&markup).unwrap()
+                ))
+                .unwrap();
+            page.screenshot(page.viewport);
+            page.queue_pending_render_resources();
+            assert!(
+                page.has_pending_render_resources(),
+                "group {group} must have started loads of its own"
+            );
+        }
+        assert_eq!(page.prepare_screenshot_resources(8_000).await, 42);
+        assert!(!page.has_pending_render_resources());
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= obscura_js::ops::RENDER_RESOURCE_CONCURRENCY,
+            "at most {} concurrent transport requests, observed {peak}",
+            obscura_js::ops::RENDER_RESOURCE_CONCURRENCY
+        );
+        assert!(peak >= 2, "loads still run concurrently, observed {peak}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_document_loads_never_seed_the_next_document() {
+        use std::io::{Read, Write};
+        // First request: slow, 20x10. Every later request: immediate, 30x10.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = hits.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::spawn(move || {
+                            let mut request = [0u8; 2048];
+                            let _ = stream.read(&mut request);
+                            let width = if index == 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(1_500));
+                                20
+                            } else {
+                                30
+                            };
+                            let body = format!(
+                                r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="10"><rect width="{width}" height="10" fill="#f00"/></svg>"##
+                            );
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(body.as_bytes());
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/shared.svg");
+        let mut page = page_with_transport_and_image("retire", &page_url, &asset_url);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('i').getBoundingClientRect().width")
+            .unwrap();
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources(), "document A requests the asset");
+        // Let A's request reach the server before the document changes; the
+        // slow response is still 1.5 s away.
+        for _ in 0..40 {
+            if hits.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "A's request is in flight");
+
+        // Document B replaces A before A's slow response arrives (what
+        // navigate_single does before loading the next document).
+        page.retire_render_resources();
+        assert!(!page.has_pending_render_resources());
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html(&format!(
+            r#"<html><body><img id="i" src="{asset_url}"></body></html>"#
+        )));
+        runtime.set_url(&page_url);
+        runtime.set_viewport(100.0, 80.0);
+        runtime.set_http_client(page.http_client.clone());
+        runtime.set_callbacks(page.callbacks.clone());
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("document.getElementById('i').getBoundingClientRect().width")
+            .unwrap();
+        page.queue_pending_render_resources();
+        assert!(
+            page.has_pending_render_resources(),
+            "document B must request the same URL itself despite A's abandoned load"
+        );
+        assert_eq!(page.prepare_screenshot_resources(3_000).await, 1);
+        let natural_width = |page: &mut super::Page| {
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('i').naturalWidth")
+                .unwrap()
+                .as_f64()
+        };
+        assert_eq!(natural_width(&mut page), Some(30.0), "B sees its own response");
+
+        // A's response would land now if its task were still alive; either
+        // way it must not replace B's bytes.
+        tokio::time::sleep(std::time::Duration::from_millis(1_800)).await;
+        page.drain_render_resource_results();
+        assert_eq!(natural_width(&mut page), Some(30.0), "A's stale response is discarded");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2, "one request per document");
     }
 
     #[cfg(feature = "render")]

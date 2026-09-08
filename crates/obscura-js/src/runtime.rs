@@ -8,6 +8,8 @@ use std::task::{Context, Poll};
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
+#[cfg(feature = "render")]
+use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
 /// isolate handle without taking a direct dependency on deno_core.
@@ -445,6 +447,13 @@ impl Drop for EnteredRuntime<'_> {
 
 impl Drop for ObscuraJsRuntime {
     fn drop(&mut self) {
+        // Background render-resource loads belong to this runtime's document;
+        // a dropped JoinHandle would only detach them (the page also calls
+        // `abandon_render_resources`, a directly embedded runtime may not).
+        #[cfg(feature = "render")]
+        for task in self.state.borrow_mut().render_resource_tasks.drain(..) {
+            task.abort();
+        }
         // Teardown needs the isolate current as much as any other V8 work:
         // deno_core's context cleanup clears the context's embedder slots, and
         // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
@@ -457,6 +466,15 @@ impl Drop for ObscuraJsRuntime {
             self.js_runtime.v8_isolate().enter();
         }
     }
+}
+
+/// Font resources are told apart by extension, like the page's warmup scan.
+#[cfg(feature = "render")]
+fn render_resource_is_font(url: &url::Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    [".woff", ".woff2", ".ttf", ".otf", ".eot"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
 }
 
 impl ObscuraJsRuntime {
@@ -867,6 +885,14 @@ impl ObscuraJsRuntime {
         {
             frame.stealth_client = parent.stealth_client.clone();
         }
+        // A frame realm shares the page transport, so its renderer cache must
+        // not open synchronous requests either. Frame geometry currently
+        // resolves against the main document's renderer state, so frame-scoped
+        // background loading is not wired up here.
+        #[cfg(feature = "render")]
+        if crate::ops::has_page_transport(&parent) {
+            frame.render_resources.set_sync_loading_enabled(false);
+        }
     }
 
     /// The origin of the document this runtime is running, or `"null"` for a
@@ -1063,7 +1089,12 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
-        self.state.borrow_mut().http_client = Some(client);
+        let mut state = self.state.borrow_mut();
+        state.http_client = Some(client);
+        // A page transport makes the renderer cache-only; see
+        // `ops::fresh_render_resources` for why layout must not fetch itself.
+        #[cfg(feature = "render")]
+        state.render_resources.set_sync_loading_enabled(false);
     }
 
     /// Install the owning page's passive on_request/on_response callback
@@ -1076,7 +1107,10 @@ impl ObscuraJsRuntime {
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
-        self.state.borrow_mut().stealth_client = Some(client);
+        let mut state = self.state.borrow_mut();
+        state.stealth_client = Some(client);
+        #[cfg(feature = "render")]
+        state.render_resources.set_sync_loading_enabled(false);
     }
 
     pub fn set_dom(&self, dom: DomTree) {
@@ -1096,8 +1130,21 @@ impl ObscuraJsRuntime {
             gs.animation_task_generation = 0;
             gs.animation_sampled_task_generation = 0;
             gs.pending_style_mutations.clear();
-            gs.render_resources = obscura_render::RenderResourceCache::default();
+            let render_resources = crate::ops::fresh_render_resources(&gs);
+            gs.render_resources = render_resources;
             gs.render_image_in_flight.clear();
+            for task in gs.render_resource_tasks.drain(..) {
+                task.abort();
+            }
+            gs.render_resource_in_flight.clear();
+            gs.render_resource_backlog.clear();
+            gs.render_resource_events.clear();
+            // A fresh channel: a load of the old document that is still
+            // finishing (abort is not a join) delivers into a dropped
+            // receiver, never into this document's results.
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            gs.render_resource_tx = tx;
+            gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
@@ -1280,6 +1327,13 @@ impl ObscuraJsRuntime {
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
+    }
+
+    /// `Fetch.enable` URL patterns of the owning page. Renderer resource
+    /// loads honour them like the page's own subresource fetches do.
+    #[cfg(feature = "render")]
+    pub fn set_intercept_block_patterns(&self, patterns: Vec<String>) {
+        self.state.borrow_mut().intercept_block_patterns = patterns;
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {
@@ -1812,6 +1866,348 @@ impl ObscuraJsRuntime {
         self.state.borrow().render_resources.has_live_outcome(url)
     }
 
+    /// Whether layout and paint may still open synchronous compatibility
+    /// requests. False for every runtime owned by a page transport.
+    #[cfg(feature = "render")]
+    pub fn render_resource_sync_loading_enabled(&self) -> bool {
+        self.state.borrow().render_resources.sync_loading_enabled()
+    }
+
+    /// Current document generation; page-transport loads carry it so a
+    /// previous document's late answer is discarded.
+    pub fn document_generation(&self) -> u64 {
+        self.state.borrow().document_generation
+    }
+
+    /// Resources cache-only layout or paint asked for and did not have, ready
+    /// for the page transport: blocked URLs are remembered as missing instead
+    /// of returned, URLs already loading are skipped, the rest are marked in
+    /// flight. Cheap when nothing was missed.
+    #[cfg(feature = "render")]
+    pub fn take_render_resource_requests(
+        &self,
+    ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>)> {
+        let mut state = self.state.borrow_mut();
+        if !state.render_resources.has_sync_misses() {
+            return Vec::new();
+        }
+        let misses = state.render_resources.take_sync_misses();
+        let mut requests = Vec::new();
+        for (url, profile) in misses {
+            // Same policy as `Page::should_block_url`: `Network.setBlockedURLs`
+            // patterns, and while `Fetch.enable` is active also its patterns
+            // (an intercepted subresource is not fetched behind the client's
+            // back). The matcher is the page's CDP pattern matcher.
+            let blocked = state
+                .blocked_urls
+                .iter()
+                .any(|pattern| crate::ops::glob_match(pattern, &url))
+                || (state.intercept_enabled
+                    && state
+                        .intercept_block_patterns
+                        .iter()
+                        .any(|pattern| crate::ops::glob_match(pattern, &url)));
+            let allowed = url::Url::parse(&url)
+                .map(|parsed| matches!(parsed.scheme(), "http" | "https"))
+                .unwrap_or(false);
+            if blocked || !allowed {
+                match profile {
+                    Some(profile) => state.render_resources.seed_image_missing(url, profile),
+                    None => state.render_resources.seed_missing(url),
+                }
+                continue;
+            }
+            if state.render_resource_in_flight.insert((url.clone(), profile)) {
+                requests.push((url, profile));
+            }
+        }
+        requests
+    }
+
+    /// Mark resources the page discovered itself (navigation warmup scan) as
+    /// loading, returning the ones that were not already in flight.
+    #[cfg(feature = "render")]
+    pub fn mark_render_resources_in_flight(
+        &self,
+        candidates: Vec<(String, Option<crate::ops::ImageRequestProfile>)>,
+    ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>)> {
+        let mut state = self.state.borrow_mut();
+        candidates
+            .into_iter()
+            .filter(|(url, profile)| state.render_resource_in_flight.insert((url.clone(), *profile)))
+            .collect()
+    }
+
+    /// Abort every background load of this document and discard results
+    /// that already arrived. The page calls this when the document goes away
+    /// (navigation, blank reset, suspension, teardown); `set_dom` and
+    /// `take_dom` do the same. Aborting drops the in-progress HTTP requests;
+    /// a load that is past the point of no return delivers into the old,
+    /// dropped channel.
+    #[cfg(feature = "render")]
+    pub fn abandon_render_resources(&self) {
+        let mut state = self.state.borrow_mut();
+        for task in state.render_resource_tasks.drain(..) {
+            task.abort();
+        }
+        state.render_resource_in_flight.clear();
+        state.render_resource_backlog.clear();
+        state.render_resource_events.clear();
+        // A fresh channel fences results that are still on their way (abort
+        // is not a join) even when this runtime survives, as after a failed
+        // navigation.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.render_resource_tx = tx;
+        state.render_resource_rx = rx;
+    }
+
+    /// Whether a page transport (plain or stealth client) is installed.
+    #[cfg(feature = "render")]
+    pub fn has_page_transport(&self) -> bool {
+        crate::ops::has_page_transport(&self.state.borrow())
+    }
+
+    /// Wake-up shared with the background loads: notified after every
+    /// finished load. Waiters must create and enable their `Notified`
+    /// before checking `has_pending_render_resources`, or a load finishing
+    /// in between is missed.
+    #[cfg(feature = "render")]
+    pub fn render_resource_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.state.borrow().render_resource_notify.clone()
+    }
+
+    /// Start page-transport loads for `requests` (already marked in flight).
+    /// Requests keep cookies, proxy policy, callbacks, CORS and response
+    /// limits of the page transport, share the page-wide concurrency limit,
+    /// run to completion in the background and deliver into this runtime's
+    /// result channel. Outside a Tokio context the requests are kept in a
+    /// backlog and started at the next event-loop turn. Returns the number
+    /// of requests started now.
+    #[cfg(feature = "render")]
+    pub fn start_render_resource_loads(
+        &self,
+        requests: Vec<(String, Option<crate::ops::ImageRequestProfile>)>,
+    ) -> usize {
+        if requests.is_empty() {
+            return 0;
+        }
+        let mut state = self.state.borrow_mut();
+        if tokio::runtime::Handle::try_current().is_err() {
+            state.render_resource_backlog.extend(requests);
+            return 0;
+        }
+        // The page transport is the plain client or, when installed, the
+        // stealth client; either one on its own is enough (`has_page_transport`).
+        let http_client = state.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = state.stealth_client.clone();
+        let initiator = url::Url::parse(&state.url).ok();
+        if !crate::ops::has_page_transport(&state) || initiator.is_none() {
+            // No transport or no document URL: nothing can be loaded; forget
+            // the in-flight marks so a later scan may retry.
+            for request in &requests {
+                state.render_resource_in_flight.remove(request);
+            }
+            return 0;
+        }
+        let initiator = initiator.expect("checked above");
+        let callbacks = state.callbacks.clone();
+        let generation = state.document_generation;
+        let tx = state.render_resource_tx.clone();
+        let limiter = state.render_resource_limiter.clone();
+        let notify = state.render_resource_notify.clone();
+        let started = requests.len();
+        let task = tokio::spawn(async move {
+            use deno_core::futures::StreamExt as _;
+            let loads = deno_core::futures::stream::iter(requests.into_iter().map(|(raw, profile)| {
+                let http_client = http_client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
+                let callbacks = callbacks.clone();
+                let initiator = initiator.clone();
+                let limiter = limiter.clone();
+                let fallback = (raw.clone(), profile);
+                let load = async move {
+                    // Every load of this page waits for the same permits, so
+                    // repeated scans cannot multiply the request rate.
+                    let _permit = limiter.acquire_owned().await.ok();
+                    let parsed = match url::Url::parse(&raw) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            return crate::ops::RenderResourceLoad {
+                                generation,
+                                url: raw,
+                                profile,
+                                response: None,
+                            }
+                        }
+                    };
+                    let kind = if render_resource_is_font(&parsed) {
+                        obscura_net::ResourceType::Font
+                    } else {
+                        obscura_net::ResourceType::Image
+                    };
+                    let mut request = ResourceRequest::subresource(kind, &initiator);
+                    match profile {
+                        Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
+                            request.mode = RequestMode::Cors;
+                            request.credentials = RequestCredentials::SameOrigin;
+                        }
+                        Some(crate::ops::ImageRequestProfile::CorsInclude) => {
+                            request.mode = RequestMode::Cors;
+                            request.credentials = RequestCredentials::Include;
+                        }
+                        _ => {}
+                    }
+                    #[cfg(feature = "stealth")]
+                    let response = match (stealth_client, http_client) {
+                        (Some(stealth_client), _) => stealth_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok(),
+                        (None, Some(http_client)) => http_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok(),
+                        (None, None) => None,
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let response = match http_client {
+                        Some(http_client) => http_client
+                            .fetch_resource_with_callbacks(&parsed, request, callbacks.as_deref())
+                            .await
+                            .ok(),
+                        None => None,
+                    };
+                    crate::ops::RenderResourceLoad {
+                        generation,
+                        url: raw,
+                        profile,
+                        response: response.map(|response| crate::ops::RenderResourceResponse {
+                            url: response.url.to_string(),
+                            status: response.status,
+                            headers: response.headers,
+                            body: response.body,
+                        }),
+                    }
+                };
+                // One failing load must not strand the rest of the batch: an
+                // in-flight entry without a result would keep waiters waiting.
+                use deno_core::futures::FutureExt as _;
+                std::panic::AssertUnwindSafe(load)
+                    .catch_unwind()
+                    .map(move |outcome| {
+                        outcome.unwrap_or_else(|_| crate::ops::RenderResourceLoad {
+                            generation,
+                            url: fallback.0,
+                            profile: fallback.1,
+                            response: None,
+                        })
+                    })
+            }))
+            .buffer_unordered(crate::ops::RENDER_RESOURCE_CONCURRENCY);
+            deno_core::futures::pin_mut!(loads);
+            while let Some(load) = loads.next().await {
+                tracing::debug!(
+                    url = %load.url,
+                    ok = load.response.is_some(),
+                    "render resource load finished"
+                );
+                if tx.send(load).is_err() {
+                    break;
+                }
+                notify.notify_waiters();
+            }
+            notify.notify_waiters();
+        });
+        state.render_resource_tasks.retain(|task| !task.is_finished());
+        state.render_resource_tasks.push(task);
+        tracing::debug!(started, generation, "started background render resource loads");
+        started
+    }
+
+    /// One service step for the renderer's resources: apply every finished
+    /// load, then start loads for everything layout or paint missed since
+    /// the last step. Runs at every event-loop turn and promise wait of this
+    /// runtime, so a script that creates a miss while a command is waiting
+    /// still gets its bytes without a further protocol round trip. Returns
+    /// the number of loads that stored usable bytes.
+    #[cfg(feature = "render")]
+    pub fn service_render_resources(&mut self) -> usize {
+        let loaded = self.apply_render_resource_results();
+        let mut requests = std::mem::take(&mut self.state.borrow_mut().render_resource_backlog);
+        requests.extend(self.take_render_resource_requests());
+        self.start_render_resource_loads(requests);
+        loaded
+    }
+
+    /// Whether page-transport loads are still running for this document.
+    #[cfg(feature = "render")]
+    pub fn has_pending_render_resources(&self) -> bool {
+        !self.state.borrow().render_resource_in_flight.is_empty()
+    }
+
+    /// Apply every finished page-transport load without waiting. Called at
+    /// the runtime's own event-loop turns and promise waits and by the page
+    /// around protocol commands, so late bytes reach layout, paint and the
+    /// lifecycle getters wherever the runtime is being driven. Returns the
+    /// number of loads that stored usable bytes.
+    #[cfg(feature = "render")]
+    pub fn apply_render_resource_results(&mut self) -> usize {
+        let loads = {
+            let mut state = self.state.borrow_mut();
+            let mut loads = Vec::new();
+            while let Ok(load) = state.render_resource_rx.try_recv() {
+                loads.push(load);
+            }
+            loads
+        };
+        let mut loaded = 0;
+        for load in loads {
+            let generation = self.state.borrow().document_generation;
+            if load.generation != generation {
+                // A previous document's response: no seed, no event, and it
+                // must not clear a same-URL request of the current document.
+                tracing::debug!(url = %load.url, "discarded render resource load of a retired document");
+                continue;
+            }
+            self.state
+                .borrow_mut()
+                .render_resource_in_flight
+                .remove(&(load.url.clone(), load.profile));
+            let is_font = load.profile.is_none()
+                && url::Url::parse(&load.url)
+                    .map(|parsed| render_resource_is_font(&parsed))
+                    .unwrap_or(false);
+            let bytes = match &load.response {
+                Some(response) if (200..300).contains(&response.status) => {
+                    loaded += 1;
+                    Some(response.body.clone())
+                }
+                _ => None,
+            };
+            tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
+            match load.profile {
+                Some(profile) => self.seed_render_image_resource(load.url, profile, bytes),
+                None => self.seed_render_resource(load.url, bytes),
+            }
+            if let Some(response) = load.response {
+                self.state
+                    .borrow_mut()
+                    .render_resource_events
+                    .push(crate::ops::RenderResourceEvent { is_font, response });
+            }
+        }
+        loaded
+    }
+
+    /// Applied transport responses the page has not reported as Network
+    /// events yet.
+    #[cfg(feature = "render")]
+    pub fn take_render_resource_events(&self) -> Vec<crate::ops::RenderResourceEvent> {
+        std::mem::take(&mut self.state.borrow_mut().render_resource_events)
+    }
+
     #[cfg(feature = "render")]
     pub fn render_image_resource_is_known(
         &self,
@@ -1847,6 +2243,8 @@ impl ObscuraJsRuntime {
     }
 
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let result = self
@@ -2882,6 +3280,8 @@ impl ObscuraJsRuntime {
     /// the watchdog terminates it. A well-behaved page returns as soon as the
     /// loop goes idle.
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         if budget_ms == 0 {
             return self.run_event_loop().await;
         }
@@ -2906,6 +3306,10 @@ impl ObscuraJsRuntime {
             if tokio::time::Instant::now() >= deadline {
                 break Ok(());
             }
+            // Timer-driven page script observes resources that landed during
+            // the interval, and misses it creates start loading right away.
+            #[cfg(feature = "render")]
+            self.service_render_resources();
 
             match tokio::time::timeout_at(deadline, self.run_cooperative_event_loop_tick()).await {
                 Ok(Ok(true)) => break Ok(()),
@@ -3009,6 +3413,8 @@ impl ObscuraJsRuntime {
         const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
             SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
 
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.begin_javascript_task();
 
         let checkpoint_watchdog = crate::cdp_watchdog::arm(
@@ -3073,6 +3479,8 @@ impl ObscuraJsRuntime {
     /// boolean is true only when deno_core reached full idle.
     #[doc(hidden)]
     pub async fn run_load_delaying_event_loop_tick(&mut self) -> Result<bool, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
         self.run_cooperative_event_loop_tick().await
     }
 
@@ -3118,6 +3526,8 @@ impl ObscuraJsRuntime {
         let mut generation = self.activity_generation();
         let mut quiet_since: Option<tokio::time::Instant> = None;
         let result = loop {
+            #[cfg(feature = "render")]
+            self.service_render_resources();
             let now = tokio::time::Instant::now();
             let Some(_remaining) = deadline.checked_duration_since(now) else {
                 break Ok(());
@@ -3274,6 +3684,8 @@ impl ObscuraJsRuntime {
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(max_total_ms);
         let mut tick_ms: u64 = 1;
         loop {
+            #[cfg(feature = "render")]
+            self.service_render_resources();
             self.begin_javascript_task();
             if done_check(self) {
                 return true;
@@ -3307,7 +3719,17 @@ impl ObscuraJsRuntime {
         {
             state.prepared_render = None;
             state.pending_style_mutations.clear();
-            state.render_resources = obscura_render::RenderResourceCache::default();
+            let render_resources = crate::ops::fresh_render_resources(&state);
+            state.render_resources = render_resources;
+            for task in state.render_resource_tasks.drain(..) {
+                task.abort();
+            }
+            state.render_resource_in_flight.clear();
+            state.render_resource_backlog.clear();
+            state.render_resource_events.clear();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.render_resource_tx = tx;
+            state.render_resource_rx = rx;
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
@@ -3715,6 +4137,117 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn page_transport_keeps_render_resources_cache_only_across_document_resets() {
+        let standalone = ObscuraJsRuntime::new();
+        assert!(
+            standalone.render_resource_sync_loading_enabled(),
+            "standalone render runtimes keep the compatibility loader"
+        );
+        standalone.set_dom(parse_html("<html><body></body></html>"));
+        assert!(standalone.render_resource_sync_loading_enabled());
+
+        let rt = ObscuraJsRuntime::new();
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        assert!(
+            !rt.render_resource_sync_loading_enabled(),
+            "installing a page transport must switch the cache to cache-only"
+        );
+        rt.set_dom(parse_html(
+            "<html><body><img src=\"https://example.test/a.png\"></body></html>",
+        ));
+        assert!(
+            !rt.render_resource_sync_loading_enabled(),
+            "set_dom rebuilds the cache and must keep it cache-only"
+        );
+        assert!(rt.take_dom().is_some());
+        assert!(
+            !rt.render_resource_sync_loading_enabled(),
+            "take_dom rebuilds the cache and must keep it cache-only"
+        );
+    }
+
+    /// A load that answers after the document was retired (abort is not a
+    /// join) must neither seed the surviving runtime nor clear a same-URL
+    /// request of the document that replaced it.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_channel_answer_of_a_retired_document_is_discarded() {
+        let url = "https://example.test/a.svg".to_string();
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
+        rt.set_url("https://example.test/page");
+        let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"></svg>"##.to_vec();
+        let answer = |generation, tx: &tokio::sync::mpsc::UnboundedSender<_>| {
+            tx.send(crate::ops::RenderResourceLoad {
+                generation,
+                url: url.clone(),
+                profile: None,
+                response: Some(crate::ops::RenderResourceResponse {
+                    url: url.clone(),
+                    status: 200,
+                    headers: Default::default(),
+                    body: body.clone(),
+                }),
+            })
+        };
+        // The old document's load holds the sender it was started with.
+        let old_tx = rt.state.borrow().render_resource_tx.clone();
+        let generation = rt.document_generation();
+        rt.mark_render_resources_in_flight(vec![(url.clone(), None)]);
+        rt.abandon_render_resources();
+        assert!(!rt.has_pending_render_resources());
+        assert!(answer(generation, &old_tx).is_err(), "retired channel is closed");
+        assert_eq!(rt.apply_render_resource_results(), 0);
+        assert!(!rt.render_resource_is_known(&url), "late bytes must not seed the runtime");
+
+        // The same runtime requests the URL again; a stale-generation answer
+        // that somehow reaches the live channel is fenced too.
+        let requests = rt.mark_render_resources_in_flight(vec![(url.clone(), None)]);
+        assert_eq!(requests.len(), 1);
+        let live_tx = rt.state.borrow().render_resource_tx.clone();
+        assert!(answer(generation.wrapping_sub(1), &live_tx).is_ok());
+        assert_eq!(rt.apply_render_resource_results(), 0);
+        assert!(rt.has_pending_render_resources(), "stale answer must not clear the live request");
+        assert!(!rt.render_resource_is_known(&url));
+        assert!(answer(generation, &live_tx).is_ok());
+        assert_eq!(rt.apply_render_resource_results(), 1);
+        assert!(!rt.has_pending_render_resources());
+        assert!(rt.render_resource_is_known(&url));
+    }
+
+    /// A runtime with only the stealth client installed has a page transport
+    /// (`has_page_transport`, cache-only renderer) and must load through it.
+    #[cfg(all(feature = "render", feature = "stealth"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_only_transport_starts_render_resource_loads() {
+        let url = "http://127.0.0.1:9/a.svg".to_string();
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+            None,
+            true,
+        )));
+        assert!(rt.has_page_transport());
+        assert!(!rt.render_resource_sync_loading_enabled());
+        rt.set_dom(parse_html(&format!("<html><body><img src=\"{url}\"></body></html>")));
+        rt.set_url("http://127.0.0.1:9/page");
+        let requests = rt.mark_render_resources_in_flight(vec![(url.clone(), None)]);
+        assert_eq!(rt.start_render_resource_loads(requests), 1, "stealth client is a transport");
+        assert!(rt.has_pending_render_resources());
+        // The unreachable origin answers with a failed load, which settles it.
+        for _ in 0..200 {
+            if rt.apply_render_resource_results() > 0 || !rt.has_pending_render_resources() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!rt.has_pending_render_resources(), "the load must finish through the stealth client");
+        assert!(rt.render_resource_is_known(&url));
     }
 
     // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
