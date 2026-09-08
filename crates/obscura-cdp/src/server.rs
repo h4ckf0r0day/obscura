@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpStream;
@@ -1223,10 +1224,31 @@ fn handle_fetch_resolution(
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
-            tracing::info!("INTERCEPTION resolved: {}", request_id);
-            let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
+        if !intercepted_paused.contains_key(request_id) {
+            return false;
+        }
+
+        let resolution = match method {
+            "Fetch.continueRequest" => {
+                let body = match req.params.get("postData") {
+                    Some(value) => match value.as_str().map(decode_base64) {
+                        Some(Ok(body)) => Some(body),
+                        _ => {
+                            let resp = crate::types::CdpResponse::error(
+                                req.id,
+                                -32602,
+                                "Invalid base64 postData".to_string(),
+                                req.session_id,
+                            );
+                            if let Ok(json) = serde_json::to_string(&resp) {
+                                let _ = reply_tx.send(json);
+                            }
+                            return true;
+                        }
+                    },
+                    None => None,
+                };
+                obscura_js::ops::InterceptResolution::Continue {
                     // Honor the client's overrides (Playwright route.continue,
                     // Puppeteer request.continue). op_fetch_url applies each and
                     // re-validates a rewritten URL through the SSRF gate. Leaving
@@ -1234,26 +1256,44 @@ fn handle_fetch_resolution(
                     url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     headers: parse_cdp_headers(&req.params),
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                },
-                "Fetch.fulfillRequest" => {
-                    let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-                    let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = decode_base64(raw_body);
-                    let headers = req.params.get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+                    body,
                 }
-                "Fetch.failRequest" => {
-                    let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
-                }
-                _ => return false,
-            };
+            }
+            "Fetch.fulfillRequest" => {
+                let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+                let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                let body = match decode_base64(raw_body) {
+                    Ok(body) => body,
+                    Err(_) => {
+                        let resp = crate::types::CdpResponse::error(
+                            req.id,
+                            -32602,
+                            "Invalid base64 body".to_string(),
+                            req.session_id,
+                        );
+                        if let Ok(json) = serde_json::to_string(&resp) {
+                            let _ = reply_tx.send(json);
+                        }
+                        return true;
+                    }
+                };
+                let headers = req.params.get("responseHeaders")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|h| {
+                        Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
+                    }).collect())
+                    .unwrap_or_default();
+                obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
+            }
+            "Fetch.failRequest" => {
+                let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
+                obscura_js::ops::InterceptResolution::Fail { reason }
+            }
+            _ => return false,
+        };
+
+        if let Some(resolver) = intercepted_paused.remove(request_id) {
+            tracing::info!("INTERCEPTION resolved: {}", request_id);
             let _ = resolver.send(resolution);
             let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
             if let Ok(json) = serde_json::to_string(&resp) {
@@ -1576,31 +1616,8 @@ async fn process_cdp_message(
     }
 }
 
-fn decode_base64(input: &str) -> String {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
-    }
-    String::from_utf8_lossy(&out).to_string()
+fn decode_base64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::STANDARD.decode(input)
 }
 
 fn fast_path_response(text: &str) -> Option<String> {
@@ -1941,26 +1958,72 @@ mod tests {
     }
 
     #[test]
-    fn fetch_resolution_is_handled_once_by_the_outer_processor() {
+    fn continue_resolution_preserves_non_utf8_body_and_replies_once() {
+        let expected = [0, 255, 128, 195, 40];
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut ctx = crate::dispatch::CdpContext::new();
 
         assert!(handle_fetch_resolution(
-            r#"{"id":17,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
+            r#"{"id":17,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"AP+Awyg="}}"#,
             &mut ctx,
             &reply_tx,
             &mut paused,
         ));
-        assert!(matches!(
-            resolution_rx.try_recv(),
-            Ok(obscura_js::ops::InterceptResolution::Continue { .. })
-        ));
+        let resolution = resolution_rx.try_recv().expect("continue resolution");
+        let obscura_js::ops::InterceptResolution::Continue { body, .. } = resolution else {
+            panic!("expected continue resolution");
+        };
+        assert_eq!(body, Some(expected.to_vec()));
         let response: serde_json::Value =
             serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
         assert_eq!(response["id"], 17);
         assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
+    }
+
+    #[test]
+    fn fulfill_resolution_preserves_non_utf8_body_bytes() {
+        let expected = [0, 255, 128, 195, 40];
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("binary-response".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":18,"method":"Fetch.fulfillRequest","params":{"requestId":"binary-response","responseCode":200,"body":"AP+Awyg="}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let resolution = resolution_rx.try_recv().expect("fulfill resolution");
+        let obscura_js::ops::InterceptResolution::Fulfill { body, .. } = resolution else {
+            panic!("expected fulfill resolution");
+        };
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn invalid_base64_does_not_resolve_the_paused_request() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("invalid-body".to_string(), resolution_tx)]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut ctx = crate::dispatch::CdpContext::new();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":19,"method":"Fetch.continueRequest","params":{"requestId":"invalid-body","postData":"not base64"}}"#,
+            &mut ctx,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        assert!(resolution_rx.try_recv().is_err());
+        assert!(paused.contains_key("invalid-body"));
+        let response: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("invalid params response")).unwrap();
+        assert_eq!(response["id"], 19);
+        assert_eq!(response["error"]["code"], -32602);
     }
 
     #[cfg(feature = "render")]
