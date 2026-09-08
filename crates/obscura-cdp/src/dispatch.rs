@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use obscura_browser::lifecycle::LifecycleState;
 use obscura_browser::{BrowserContext, Page};
 use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
@@ -60,6 +61,8 @@ pub struct CdpContext {
     /// events when the client attaches; Page.enable emits them once per page
     /// so clients waiting on the initial load (chromiumoxide, #833) unblock.
     pub nav_events_emitted: std::collections::HashSet<String>,
+    pub(crate) emitted_document_lifecycle: HashMap<String, LifecycleState>,
+    pub(crate) navigation_sessions: HashMap<String, Option<String>>,
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
@@ -174,6 +177,8 @@ impl CdpContext {
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
+            emitted_document_lifecycle: HashMap::new(),
+            navigation_sessions: HashMap::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
@@ -295,7 +300,6 @@ impl CdpContext {
         if self.browser_contexts.remove(id).is_none() {
             return Err(format!("Browser context not found: {}", id));
         }
-
         let page_ids: Vec<String> = self
             .pages
             .iter()
@@ -336,6 +340,9 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.nav_events_emitted.remove(id);
+        self.emitted_document_lifecycle.remove(id);
+        self.navigation_sessions.remove(id);
         self.announced_frames.remove(id);
         #[cfg(feature = "render")]
         {
@@ -502,6 +509,81 @@ impl CdpContext {
         sessions
     }
 
+    /// Destroy a target through the single ownership-cleanup path used by both
+    /// ordinary Target commands and navigation cancellation. A task-owned page
+    /// is temporarily absent from `pages`, but its sessions still identify it.
+    pub(crate) fn destroy_target(&mut self, id: &str) -> bool {
+        let removed_sessions: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, page_id)| page_id.as_str() == id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        let existed = !removed_sessions.is_empty() || self.pages.iter().any(|page| page.id == id);
+        if !existed {
+            return false;
+        }
+        for session_id in &removed_sessions {
+            self.pending_events.push(CdpEvent::new(
+                "Target.detachedFromTarget",
+                json!({"sessionId": session_id, "targetId": id}),
+            ));
+        }
+        self.pending_events.push(CdpEvent::new(
+            "Target.targetDestroyed",
+            json!({"targetId": id}),
+        ));
+        self.remove_page(id);
+        true
+    }
+
+    /// Dispose a context, including a page currently owned by an in-flight
+    /// navigation task and therefore absent from `pages`.
+    pub(crate) fn destroy_browser_context(
+        &mut self,
+        id: &str,
+        task_owned_page: Option<&str>,
+    ) -> Result<(), String> {
+        let mut page_ids: Vec<String> = self
+            .pages
+            .iter()
+            .filter(|page| page.context.id == id)
+            .map(|page| page.id.clone())
+            .collect();
+        if let Some(page_id) = task_owned_page {
+            if self.pages.iter().any(|page| page.id == page_id)
+                || self.sessions.values().any(|owner| owner == page_id)
+            {
+                page_ids.push(page_id.to_string());
+            }
+        }
+        page_ids.sort_unstable();
+        page_ids.dedup();
+        let removed_sessions: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter(|(_, owner)| page_ids.contains(owner))
+            .map(|(session, owner)| (session.clone(), owner.clone()))
+            .collect();
+        self.dispose_browser_context(id)?;
+        if let Some(page_id) = task_owned_page {
+            self.remove_page(page_id);
+        }
+        for (session_id, page_id) in removed_sessions {
+            self.pending_events.push(CdpEvent::new(
+                "Target.detachedFromTarget",
+                json!({"sessionId": session_id, "targetId": page_id}),
+            ));
+        }
+        for page_id in page_ids {
+            self.pending_events.push(CdpEvent::new(
+                "Target.targetDestroyed",
+                json!({"targetId": page_id}),
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "render")]
     pub(crate) fn next_screencast_session(&mut self) -> i64 {
         // Never wrap a delayed acknowledgement onto a replacement stream.
@@ -557,6 +639,11 @@ mod context_ownership_tests {
                 &format!("world-{cycle}"),
                 true,
             );
+            ctx.nav_events_emitted.insert(page_id.clone());
+            ctx.emitted_document_lifecycle
+                .insert(page_id.clone(), LifecycleState::Loaded);
+            ctx.navigation_sessions
+                .insert(page_id.clone(), Some(session_id));
             ctx.remove_page(&page_id);
 
             assert!(ctx.execution_contexts.is_empty());
@@ -565,6 +652,9 @@ mod context_ownership_tests {
             assert!(ctx.valid_context_ids.is_empty());
             assert!(ctx.runtime_enabled_sessions.is_empty());
             assert!(ctx.sessions.is_empty());
+            assert!(ctx.nav_events_emitted.is_empty());
+            assert!(ctx.emitted_document_lifecycle.is_empty());
+            assert!(ctx.navigation_sessions.is_empty());
         }
     }
 
