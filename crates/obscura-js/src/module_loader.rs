@@ -149,6 +149,50 @@ fn io_err(msg: String) -> ModuleLoaderError {
     std::io::Error::new(std::io::ErrorKind::Other, msg).into()
 }
 
+/// Decode a `data:` URL payload. Mirrors the classic-script decoder in
+/// obscura-browser: literal, percent-encoded, and base64 bodies are all valid
+/// module sources, and a `data:` module never opens a socket.
+fn decode_data_url_module(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    let bytes = if meta.split(';').any(|t| t.eq_ignore_ascii_case("base64")) {
+        let cleaned: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, cleaned).ok()?
+    } else {
+        percent_decode_module(payload)
+    };
+    String::from_utf8(bytes).ok()
+}
+
+fn percent_decode_module(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_val_module(b[i + 1]), hex_val_module(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val_module(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 impl ModuleLoader for ObscuraModuleLoader {
     fn resolve(
         &self,
@@ -191,6 +235,48 @@ impl ModuleLoader for ObscuraModuleLoader {
         _requested_module_type: RequestedModuleType,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        // A data: module carries its own source; there is nothing to fetch.
+        // Routing it through the HTTP client made every `import("data:...")`
+        // fail the scheme gate, which strands bundlers that emit inline
+        // bootstrap modules (webpack/Vite code-splitting).
+        // A blob: module is backed by an object URL minted in this realm, so
+        // there is nothing to fetch either. JS mirrors script-typed blobs into
+        // the page state when createObjectURL runs; read the source from there.
+        if url.starts_with("blob:") {
+            let source = self.page_state.as_ref().and_then(|weak| {
+                let state = weak.upgrade()?;
+                let state = state.try_borrow().ok()?;
+                state.blob_module_sources.get(&url).cloned()
+            });
+            self.loaded_specifiers.borrow_mut().push(url.clone());
+            return match source {
+                Some(code) => ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    module_specifier,
+                    None,
+                ))),
+                None => ModuleLoadResponse::Sync(Err(io_err(format!(
+                    "blob: module {} is not registered in this realm",
+                    url
+                )))),
+            };
+        }
+        if url.starts_with("data:") {
+            self.loaded_specifiers.borrow_mut().push(url.clone());
+            return match decode_data_url_module(&url) {
+                Some(code) => ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    module_specifier,
+                    None,
+                ))),
+                None => ModuleLoadResponse::Sync(Err(io_err(format!(
+                    "Invalid data: module URL {}",
+                    url
+                )))),
+            };
+        }
         // Module-graph CORS and same-origin credentials are relative to the
         // owning document, not to the importing module. The importer remains
         // the HTTP referrer for a dependency; keeping these URLs distinct

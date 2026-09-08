@@ -110,6 +110,11 @@ pub struct ObscuraState {
     /// navigations set it to the source document URL.
     pub referrer: String,
     pub blocked_urls: Vec<String>,
+    /// Sources behind `blob:` object URLs that hold JavaScript. The store
+    /// lives in the JS realm, so the module loader cannot reach it; JS
+    /// mirrors script-typed blobs here when `URL.createObjectURL` mints them
+    /// and drops them on `revokeObjectURL`.
+    pub blob_module_sources: HashMap<String, String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
@@ -301,6 +306,7 @@ impl ObscuraState {
             title: String::new(),
             referrer: String::new(),
             blocked_urls: Vec::new(),
+            blob_module_sources: HashMap::new(),
             cookie_jar: None,
             http_client: None,
             callbacks: None,
@@ -2300,6 +2306,138 @@ fn cors_response_allows(
     }
 }
 
+/// Synchronous XHR (`xhr.open(..., false)`). The spec still allows it outside
+/// a Worker and real pages use it for bootstrap configuration, so returning
+/// status 0 without ever issuing the request silently changes app behaviour.
+///
+/// deno_core ops cannot block the isolate on the page's own event loop, so the
+/// request runs on a dedicated thread with its own current-thread runtime and
+/// this op waits for that thread. Nothing on the page loop is polled while it
+/// waits, which is exactly the observable semantics of a sync XHR.
+#[op2]
+#[string]
+fn op_fetch_url_sync(
+    state: &mut OpState,
+    #[string] url: String,
+    #[string] method: String,
+    #[string] headers_json: String,
+    #[string] body: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    let parsed = match url::Url::parse(&url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {},
+                "error": format!("Invalid URL: {}", e),
+            })
+            .to_string())
+        }
+    };
+
+    // data: never reaches the network; answer it here like the async path.
+    if parsed.scheme() == "data" {
+        return Ok(match decode_data_url_bytes(&url) {
+            Some((mime, bytes)) => serde_json::json!({
+                "status": 200,
+                "statusText": "OK",
+                "body": String::from_utf8_lossy(&bytes),
+                "url": url,
+                "headers": { "content-type": mime },
+            })
+            .to_string(),
+            None => serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {},
+                "error": "Invalid data: URL",
+            })
+            .to_string(),
+        });
+    }
+
+    let allow_private_network = {
+        let gs = state.borrow::<SharedState>().clone();
+        let gs = gs.borrow();
+        for pattern in &gs.blocked_urls {
+            if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
+                return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": url, "headers": {}, "blocked": true,
+                })
+                .to_string());
+            }
+        }
+        gs.http_client
+            .as_ref()
+            .is_some_and(|c| c.allow_private_network)
+    };
+
+    if let Err(e) = validate_fetch_url(&parsed, allow_private_network) {
+        return Ok(serde_json::json!({
+            "status": 0, "body": "", "url": url, "headers": {},
+            "blocked": true, "error": e,
+        })
+        .to_string());
+    }
+
+    let headers: HashMap<String, String> =
+        serde_json::from_str(&headers_json).unwrap_or_default();
+    let method_owned = method.clone();
+    let url_owned = url.clone();
+    let body_owned = body;
+
+    // Own thread + own runtime: the page's event loop must not be re-entered
+    // while the isolate is blocked here.
+    let joined = std::thread::spawn(move || -> Result<(u16, String, HashMap<String, String>), String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let m = reqwest::Method::from_bytes(method_owned.to_uppercase().as_bytes())
+                .unwrap_or(reqwest::Method::GET);
+            let mut req = client.request(m, &url_owned);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            if !body_owned.is_empty() {
+                req = req.body(body_owned);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status().as_u16();
+            let mut hdrs = HashMap::new();
+            for (k, v) in resp.headers().iter() {
+                if let Ok(val) = v.to_str() {
+                    hdrs.insert(k.as_str().to_string(), val.to_string());
+                }
+            }
+            let text = resp.text().await.unwrap_or_default();
+            Ok((status, text, hdrs))
+        })
+    })
+    .join();
+
+    Ok(match joined {
+        Ok(Ok((status, text, hdrs))) => serde_json::json!({
+            "status": status,
+            "statusText": "",
+            "body": text,
+            "url": url,
+            "headers": hdrs,
+        })
+        .to_string(),
+        Ok(Err(e)) => serde_json::json!({
+            "status": 0, "body": "", "url": url, "headers": {}, "error": e,
+        })
+        .to_string(),
+        Err(_) => serde_json::json!({
+            "status": 0, "body": "", "url": url, "headers": {},
+            "error": "sync fetch thread panicked",
+        })
+        .to_string(),
+    })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2391,6 +2529,34 @@ async fn op_fetch_url(
             .to_string());
         }
     }
+    // A data: URL carries its own payload, so answer it here instead of handing
+    // it to the HTTP client (which cannot build a request for a schemeless
+    // host and fails with "builder error"). Chrome resolves fetch("data:...")
+    // to a 200 with the decoded body.
+    if url.starts_with("data:") {
+        return Ok(match decode_data_url_bytes(&url) {
+            Some((mime, bytes)) => serde_json::json!({
+                "status": 200,
+                "statusText": "OK",
+                "body": String::from_utf8_lossy(&bytes),
+                "bodyBase64": BASE64.encode(&bytes),
+                "url": url,
+                "headers": { "content-type": mime },
+                "ok": true,
+            })
+            .to_string(),
+            None => serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "headers": {},
+                "blocked": true,
+                "error": "Invalid data: URL",
+            })
+            .to_string(),
+        });
+    }
+
     struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageInFlightGuard {
         fn drop(&mut self) {
@@ -3309,6 +3475,23 @@ mod tests {
         assert!(validate_fetch_url(&loopback, true).is_ok());
     }
 
+    // data: and blob: never touch the network, so the SSRF gate must not
+    // reject them. Chrome resolves both from fetch()/XHR.
+    #[test]
+    fn fetch_url_validation_allows_data_and_blob_schemes() {
+        for raw in [
+            "data:text/plain,hello",
+            "data:text/javascript;base64,ZXhwb3J0IGRlZmF1bHQgNDI=",
+            "blob:https://example.com/3c3c1665-f27a-4f4e-9c2c-2b0a0d1f9a11",
+        ] {
+            let url = url::Url::parse(raw).unwrap();
+            assert!(
+                validate_fetch_url(&url, false).is_ok(),
+                "{raw} must pass the fetch scheme gate without private-network access"
+            );
+        }
+    }
+
     // SEC-005 / #708 — fetch() must not accept file:// (deny-by-default, matching
     // Page.navigate / Target.createTarget). The transports can't fetch it, but
     // it should be rejected up front rather than short-circuiting the gate.
@@ -3838,8 +4021,59 @@ mod tests {
     }
 }
 
+/// Decode a `data:` URL into its MIME type and bytes. Literal,
+/// percent-encoded, and base64 payloads are all valid.
+fn decode_data_url_bytes(url: &str) -> Option<(String, Vec<u8>)> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    let is_base64 = meta.split(';').any(|t| t.eq_ignore_ascii_case("base64"));
+    let mime = meta
+        .split(';')
+        .next()
+        .filter(|m| !m.is_empty())
+        .unwrap_or("text/plain;charset=US-ASCII")
+        .to_string();
+    let bytes = if is_base64 {
+        let cleaned: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+        BASE64.decode(cleaned).ok()?
+    } else {
+        percent_decode_bytes(payload)
+    };
+    Some((mime, bytes))
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
+    // data: and blob: carry their payload in-process and never open a socket,
+    // so the SSRF gate below has nothing to protect: there is no host to
+    // resolve and no request to smuggle onto the loopback interface. Chrome
+    // resolves both from fetch()/XHR, and rejecting them here breaks any page
+    // that reads an inline payload or an object URL it just created.
+    if scheme == "data" || scheme == "blob" {
+        return Ok(());
+    }
     // file:// is denied by default here, matching Page.navigate /
     // Target.createTarget (which gate it behind --allow-file-access). The
     // transports cannot fetch file:// anyway, so a page never reaches the
@@ -3906,6 +4140,20 @@ fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
         Err(_) => return String::new(),
     };
     jar.get_js_visible_cookies(&url)
+}
+
+#[op2(fast)]
+fn op_register_blob_module(state: &OpState, #[string] url: &str, #[string] source: &str) {
+    if let Some(page) = state.try_borrow::<Rc<RefCell<ObscuraState>>>() {
+        if let Ok(mut page) = page.try_borrow_mut() {
+            if source.is_empty() {
+                page.blob_module_sources.remove(url);
+            } else {
+                page.blob_module_sources
+                    .insert(url.to_string(), source.to_string());
+            }
+        }
+    }
 }
 
 #[op2(fast)]
@@ -4886,6 +5134,8 @@ pub fn build_extension() -> Extension {
         op_fetch_url(),
         op_get_cookies(),
         op_set_cookie(),
+        op_register_blob_module(),
+        op_fetch_url_sync(),
         op_navigate(),
         op_frame_document_ready(),
         op_post_frame_message(),

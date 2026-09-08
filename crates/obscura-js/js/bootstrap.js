@@ -324,6 +324,12 @@ async function __fetchDynClassicScript(task) {
   let body;
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
+  } else if (task.url.startsWith('blob:')) {
+    // Same as data:, the source is already in this realm — the object-URL
+    // store holds it and no transport can retrieve it.
+    const stored = globalThis.__blobStore?.[task.url];
+    if (typeof stored !== 'string') throw new Error('blob URL is not registered');
+    body = stored;
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
       task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
@@ -7200,6 +7206,16 @@ globalThis.fetch = async (input, init = {}) => {
   // whether the input is absolute. _resolveUrl leaves absolute URLs
   // unchanged and keeps unparseable input as-is.
   url = _resolveUrl(url);
+  // A blob: URL only exists in this realm's object-URL store, so there is
+  // nothing for the transport to fetch. Chrome resolves fetch(blobURL) to a
+  // 200 with the stored bytes; serve it from the store instead of failing.
+  if (typeof url === 'string' && url.startsWith('blob:')) {
+    const stored = globalThis.__blobStore?.[url];
+    if (typeof stored === 'string') {
+      return new Response(stored, { status: 200, statusText: 'OK', headers: { 'content-type': 'text/plain' } });
+    }
+    throw new TypeError('Failed to fetch');
+  }
   const method = init.method || (request ? request.method : "GET");
   const headers = init.headers !== undefined ? init.headers : (request ? request.headers : undefined);
   let _h = headers instanceof Headers ? Object.fromEntries(headers.entries()) : (headers || {});
@@ -7338,6 +7354,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   open(method, url, async_) {
     this._method = method;
     this._url = url;
+    // `async` defaults to true and only an explicit false selects the
+    // synchronous mode. Ignoring it made every sync request resolve to
+    // status 0 after send() returned, so callers that read xhr.status on the
+    // next line saw a failure that never happened.
+    this._async = async_ === undefined ? true : !!async_;
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -7377,6 +7398,44 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
 
     // Same rule as fetch: always resolve through the URL parser.
     let url = _resolveUrl(this._url);
+
+    if (this._async === false) {
+      // Synchronous mode: the whole exchange must be finished before send()
+      // returns, so the transport runs off-loop and the result is applied here.
+      let raw;
+      try {
+        raw = Deno.core.ops.op_fetch_url_sync(
+          url, this._method || 'GET', JSON.stringify(this._headers || {}),
+          typeof body === 'string' ? body : (body ? String(body) : '')
+        );
+      } catch (e) {
+        xhr.status = 0;
+        xhr._setReadyState(4);
+        xhr._fireEvent('error');
+        xhr._fireEvent('loadend');
+        return;
+      }
+      let parsed = {};
+      try { parsed = JSON.parse(raw); } catch (e) { parsed = { status: 0 }; }
+      xhr.status = parsed.status || 0;
+      xhr.statusText = parsed.statusText || '';
+      xhr.responseURL = parsed.url || url;
+      if (parsed.headers) {
+        for (const k of Object.keys(parsed.headers)) xhr._responseHeaders[k] = parsed.headers[k];
+      }
+      xhr._setReadyState(2);
+      const text = parsed.body || '';
+      xhr.responseText = text;
+      if (xhr.responseType === '' || xhr.responseType === 'text') xhr.response = text;
+      else if (xhr.responseType === 'json') { try { xhr.response = JSON.parse(text); } catch (e) { xhr.response = null; } }
+      else xhr.response = text;
+      xhr._setReadyState(3);
+      xhr._setReadyState(4);
+      if (xhr.status === 0) { xhr._fireEvent('error'); }
+      else { xhr._fireEvent('load'); }
+      xhr._fireEvent('loadend');
+      return;
+    }
 
     fetch(url, {
       method: this._method,
@@ -13672,8 +13731,9 @@ URL.createObjectURL = function(blob) {
       let text = '';
       try { text = new TextDecoder().decode(blob._bytes); } catch (e) {}
       globalThis.__blobStore[id] = text;
+      __mirrorBlobModule(id, text);
     } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { globalThis.__blobStore[id] = text; });
+      blob.text().then(text => { globalThis.__blobStore[id] = text; __mirrorBlobModule(id, text); });
     } else {
       globalThis.__blobStore[id] = '';
     }
@@ -13682,7 +13742,14 @@ URL.createObjectURL = function(blob) {
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
+  __mirrorBlobModule(url, '');
 };
+// The module loader runs in Rust and cannot see __blobStore, so mirror the
+// source across for import(blobURL). Non-script blobs are never imported and
+// would only grow the map, so only mirror JavaScript-ish content.
+function __mirrorBlobModule(id, text) {
+  try { Deno.core.ops.op_register_blob_module(id, text || ''); } catch (e) {}
+}
 
 // Window-level scrolling (issue #468). #431 gave elements functional
 // scrollTop/scrollLeft plus scroll methods, but left these three as no-ops, so
