@@ -6,6 +6,7 @@
 pub mod http;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -80,12 +81,31 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+    pub fn new(
+        proxy: Option<String>,
+        user_agent: Option<String>,
+        stealth: bool,
+    ) -> Self {
+        Self::with_storage(proxy, user_agent, stealth, None)
+    }
+
+    pub fn with_storage(
+        proxy: Option<String>,
+        user_agent: Option<String>,
+        stealth: bool,
+        storage_dir: Option<PathBuf>,
+    ) -> Self {
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
+            context: Arc::new(BrowserContext::with_storage_full(
+                "mcp".to_string(),
+                proxy,
+                stealth,
+                user_agent.clone(),
+                storage_dir,
+            )),
             user_agent,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
@@ -225,7 +245,11 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
         "initialize" => handle_initialize(id, params),
         "ping" => RpcResponse::ok(id, json!({})),
         "tools/list" => handle_tools_list(id),
-        "tools/call" => handle_tool_call(id, params, state).await,
+        "tools/call" => {
+            let response = handle_tool_call(id, params, state).await;
+            state.context.save_cookies();
+            response
+        }
         "resources/list" => RpcResponse::ok(id, json!({"resources": []})),
         "prompts/list" => RpcResponse::ok(id, json!({"prompts": []})),
         _ => RpcResponse::err(id, -32601, format!("Unknown method: {method}")),
@@ -233,12 +257,21 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
 }
 
 pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
+    run_with_storage(proxy, user_agent, stealth, None).await
+}
+
+pub async fn run_with_storage(
+    proxy: Option<String>,
+    user_agent: Option<String>,
+    stealth: bool,
+    storage_dir: Option<PathBuf>,
+) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::with_storage(proxy, user_agent, stealth, storage_dir);
     let mut runtime_pump_armed = false;
 
     loop {
@@ -266,6 +299,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             continue;
         };
         if n == 0 {
+            state.context.save_cookies();
             return Ok(());
         }
 
@@ -2078,6 +2112,31 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_state_loads_cookies_from_persistent_storage() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let source = BrowserContext::with_storage(
+            "cookie-source".to_string(),
+            Some(temp.path().to_path_buf()),
+        );
+        source.cookie_jar.set_cookie(
+            "session=authenticated; Domain=example.com; Path=/; Secure; HttpOnly",
+            &url::Url::parse("https://example.com/").unwrap(),
+        );
+        source.save_cookies();
+
+        let state = BrowserState::with_storage(
+            None,
+            None,
+            false,
+            Some(temp.path().to_path_buf()),
+        );
+        let header = state.context.cookie_jar.get_cookie_header(
+            &url::Url::parse("https://example.com/").unwrap(),
+        );
+        assert!(header.contains("session=authenticated"));
+    }
 
     fn listed_tools() -> Vec<Value> {
         handle_tools_list(json!(1)).result.expect("tools/list result")

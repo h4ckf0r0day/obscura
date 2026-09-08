@@ -516,9 +516,23 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run_with_storage(
+                    host,
+                    port,
+                    mcp_proxy,
+                    user_agent,
+                    stealth,
+                    args.storage_dir,
+                )
+                .await?;
             } else {
-                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::run_with_storage(
+                    mcp_proxy,
+                    user_agent,
+                    stealth,
+                    args.storage_dir,
+                )
+                .await?;
             }
         }
         None => {
