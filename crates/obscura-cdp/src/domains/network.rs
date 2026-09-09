@@ -50,7 +50,11 @@ pub async fn handle(
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map).await;
+                    page.http_client.set_extra_headers(header_map.clone()).await;
+                    #[cfg(feature = "stealth")]
+                    if let Some(stealth_client) = &page.stealth_client {
+                        stealth_client.set_extra_headers(header_map).await;
+                    }
                 }
             }
             Ok(json!({}))
