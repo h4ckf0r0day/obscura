@@ -427,7 +427,7 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
     }
 }
 
-pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
+pub fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
     let source = request
         .referrer
         .as_ref()

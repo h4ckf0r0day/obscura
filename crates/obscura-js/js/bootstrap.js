@@ -326,7 +326,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", ""
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -552,7 +552,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", ""
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -7217,8 +7217,21 @@ globalThis.fetch = async (input, init = {}) => {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
+  // Default Referer (issue #875): init.referrer wins, then the input
+  // Request's referrer, then about:client resolved to the document URL.
+  // An explicit empty string selects no-referrer. The op applies the
+  // same-origin policy (origin-only cross-origin, no https downgrade).
+  const rawReferrer = init.referrer !== undefined
+    ? init.referrer
+    : (request ? request.referrer : 'about:client');
+  const fetchReferrer = (function() {
+    if (rawReferrer === '' || rawReferrer === 'no-referrer') return '';
+    const docUrl = _domParse("document_url") || "about:blank";
+    try { return new URL(rawReferrer === 'about:client' ? docUrl : String(rawReferrer), docUrl).href; }
+    catch (e) { return ''; }
+  })();
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, fetchReferrer);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -7634,7 +7647,9 @@ if (typeof Request === 'undefined') {
         throw new TypeError("Failed to construct 'Request': '" + this.credentials + "' is not a valid RequestCredentials value");
       }
       this.redirect = init.redirect || 'follow';
-      this.referrer = init.referrer || '';
+      // Spec default is about:client, resolved to the document URL at fetch
+      // time. An empty init.referrer selects no-referrer explicitly.
+      this.referrer = init.referrer !== undefined ? init.referrer : 'about:client';
       this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
       this.cache = init.cache || 'default';
     }

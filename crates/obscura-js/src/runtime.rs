@@ -6899,6 +6899,109 @@ mod tests {
         );
     }
 
+    /// Fixture for the fetch() default-Referer tests (issue #875): a raw TCP
+    /// server that captures each request's bytes and answers 200 "ok".
+    fn fetch_referer_fixture(
+        expected_requests: usize,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 8192];
+                let length = stream.read(&mut request).unwrap();
+                requests_tx
+                    .send(String::from_utf8_lossy(&request[..length]).to_string())
+                    .unwrap();
+                let body = "ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), requests_rx)
+    }
+
+    fn fetch_referer_runtime(origin: &str) -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("{origin}/page?q=1#frag"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_default_referer_is_document_url() {
+        let (origin, requests) = fetch_referer_fixture(1);
+        let mut rt = fetch_referer_runtime(&origin);
+        rt.execute_script(
+            "fetch-default-referer",
+            "fetch('/echo').then(response => response.text()).then(text => {\
+                 globalThis.__echo = text;\
+             });",
+        )
+        .unwrap();
+        rt.run_event_loop_until_quiescent(3_000, 150)
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__echo").unwrap(),
+            serde_json::json!("ok"),
+        );
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fixture fetch was not issued");
+        // Same-origin default: document URL with credentials and fragment
+        // stripped, query kept (matches Headless Chrome 152, issue #875).
+        assert!(
+            request.contains(&format!("\r\nreferer: {origin}/page?q=1\r\n")),
+            "{request}",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_explicit_referrer_overrides_default() {
+        let (origin, requests) = fetch_referer_fixture(1);
+        let mut rt = fetch_referer_runtime(&origin);
+        rt.execute_script(
+            "fetch-explicit-referrer",
+            &format!(
+                "fetch('/echo', {{ referrer: '{origin}/custom/path' }})\
+                 .then(response => response.text()).then(text => {{\
+                     globalThis.__echo = text;\
+                 }});",
+            ),
+        )
+        .unwrap();
+        rt.run_event_loop_until_quiescent(3_000, 150)
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__echo").unwrap(),
+            serde_json::json!("ok"),
+        );
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fixture fetch was not issued");
+        assert!(
+            request.contains(&format!("\r\nreferer: {origin}/custom/path\r\n")),
+            "{request}",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn quiescent_event_loop_bounds_a_hanging_page_request() {
         let (mut rt, accepted) = delayed_fetch_runtime(std::time::Duration::from_secs(3));
