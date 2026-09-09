@@ -2753,6 +2753,9 @@ function _labeledControl(label) {
 const _INTERACTIVE = 'a[href],audio[controls],button,details,embed,iframe,'
   + 'img[usemap],input:not([type=hidden]),select,textarea,video[controls]';
 
+// Elements with a click currently dispatching, so a handler cannot re-enter
+// click() on its own element.
+const _clickInProgress = new WeakSet();
 const _forwardingLabels = new WeakSet();
 // Passed to click() only by label activation on behalf of a real input event,
 // so the forwarded control events keep the trustedness of the click that
@@ -3726,85 +3729,96 @@ class Element extends Node {
     if (_isActuallyDisabled(this) && _tag !== 'LABEL') {
       return;
     }
-    let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
-    if (_checkable) {
-      _oldChecked = !!this.checked;
-      _oldIndeterminate = !!this.indeterminate;
-      if (_type === 'radio') {
-        const _name = this.getAttribute('name') || '';
-        if (_name) {
-          _radioStates = [];
-          const _all = (this.ownerDocument || globalThis.document).querySelectorAll('input');
-          for (let i = 0; i < _all.length; i++) {
-            const r = _all[i];
-            if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
-            if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
-            _radioStates.push([r, !!r.checked]);
-            if (r !== this) r.checked = false;
+    // The HTML click in progress flag, checked after the disabled return and
+    // before pre-click activation so a suppressed re-entrant call cannot
+    // leave a flipped checked state behind.
+    if (_clickInProgress.has(this)) {
+      return;
+    }
+    _clickInProgress.add(this);
+    try {
+      let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
+      if (_checkable) {
+        _oldChecked = !!this.checked;
+        _oldIndeterminate = !!this.indeterminate;
+        if (_type === 'radio') {
+          const _name = this.getAttribute('name') || '';
+          if (_name) {
+            _radioStates = [];
+            const _all = (this.ownerDocument || globalThis.document).querySelectorAll('input');
+            for (let i = 0; i < _all.length; i++) {
+              const r = _all[i];
+              if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
+              if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
+              _radioStates.push([r, !!r.checked]);
+              if (r !== this) r.checked = false;
+            }
           }
+          this.checked = true;
+        } else {
+          // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
+          // checkedness *and* drops indeterminateness. Clearing it here, not on
+          // `change`, is what lets the cancelled-activation path put the old
+          // flag back instead of leaving it stuck off.
+          this.checked = !_oldChecked;
+          this.indeterminate = false;
         }
-        this.checked = true;
-      } else {
-        // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
-        // checkedness *and* drops indeterminateness. Clearing it here, not on
-        // `change`, is what lets the cancelled-activation path put the old
-        // flag back instead of leaving it stuck off.
-        this.checked = !_oldChecked;
-        this.indeterminate = false;
       }
-    }
-    const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
-    if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
-    const cancelled = !this.dispatchEvent(_clickEvent);
-    if (cancelled) {
-      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
-      return;
-    }
-    if (_checkable && this.checked !== _oldChecked) {
-      for (const _type of ['input', 'change']) {
-        const _e = new Event(_type, {bubbles: true});
-        if (_trusted) globalThis.__obscura_markTrusted(_e);
-        try { this.dispatchEvent(_e); } catch (e) {}
-      }
-      return;
-    }
-    // Label activation behaviour (HTML spec): activating a label runs a
-    // synthetic click on its labeled control. The re-entrancy guard stops a
-    // control nested inside its own label from bouncing the click back.
-    const _label = _tag === 'LABEL'
-      ? this
-      : (this.closest && !this.matches(_INTERACTIVE) ? this.closest('label') : null);
-    if (_label && !(this.closest && this.closest(_INTERACTIVE) &&
-        _label.contains(this.closest(_INTERACTIVE)))) {
-      const control = _labeledControl(_label);
-      if (control && control !== this && globalThis.__obscura_activateLabel(_label, control)) {
+      const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
+      if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
+      const cancelled = !this.dispatchEvent(_clickEvent);
+      if (cancelled) {
+        if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
+        else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
         return;
       }
-    }
-    if (!cancelled) {
-      const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
-      if (link) {
-        const href = link.getAttribute('href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-          location.assign(href);
+      if (_checkable && this.checked !== _oldChecked) {
+        for (const _type of ['input', 'change']) {
+          const _e = new Event(_type, {bubbles: true});
+          if (_trusted) globalThis.__obscura_markTrusted(_e);
+          try { this.dispatchEvent(_e); } catch (e) {}
+        }
+        return;
+      }
+      // Label activation behaviour (HTML spec): activating a label runs a
+      // synthetic click on its labeled control. The re-entrancy guard stops a
+      // control nested inside its own label from bouncing the click back.
+      const _label = _tag === 'LABEL'
+        ? this
+        : (this.closest && !this.matches(_INTERACTIVE) ? this.closest('label') : null);
+      if (_label && !(this.closest && this.closest(_INTERACTIVE) &&
+          _label.contains(this.closest(_INTERACTIVE)))) {
+        const control = _labeledControl(_label);
+        if (control && control !== this && globalThis.__obscura_activateLabel(_label, control)) {
           return;
         }
       }
-      // Same predicate requestSubmit validates against, so an internal click
-      // can never hand it a submitter it would reject. Also matches the CDP
-      // click path in input.rs, which already treats <input type=image> as a
-      // submit button.
-      if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
-        // A real submit-button click fires the cancelable submit event, so use
-        // requestSubmit() (not the plain submit() method, which now bypasses it).
-        if (form && typeof form.requestSubmit === 'function') {
-          form.requestSubmit(this);
-        } else if (form && typeof form.submit === 'function') {
-          form.submit(this);
+      if (!cancelled) {
+        const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
+        if (link) {
+          const href = link.getAttribute('href');
+          if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+            location.assign(href);
+            return;
+          }
+        }
+        // Same predicate requestSubmit validates against, so an internal click
+        // can never hand it a submitter it would reject. Also matches the CDP
+        // click path in input.rs, which already treats <input type=image> as a
+        // submit button.
+        if (_isSubmitButton(this)) {
+          const form = this.closest ? this.closest('form') : null;
+          // A real submit-button click fires the cancelable submit event, so use
+          // requestSubmit() (not the plain submit() method, which now bypasses it).
+          if (form && typeof form.requestSubmit === 'function') {
+            form.requestSubmit(this);
+          } else if (form && typeof form.submit === 'function') {
+            form.submit(this);
+          }
         }
       }
+    } finally {
+      _clickInProgress.delete(this);
     }
   }
   focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
