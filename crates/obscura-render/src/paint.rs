@@ -1346,6 +1346,58 @@ impl PreparedRender {
             .to_string(),
         );
         out.insert(
+            "vertical-align",
+            match style.vertical_align {
+                Some(crate::VerticalAlign::Top) => "top",
+                Some(crate::VerticalAlign::Middle) => "middle",
+                Some(crate::VerticalAlign::Bottom) => "bottom",
+                None => "baseline",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "text-transform",
+            match style.text_transform {
+                Some(crate::TextTransform::Uppercase) => "uppercase",
+                Some(crate::TextTransform::Lowercase) => "lowercase",
+                Some(crate::TextTransform::Capitalize) => "capitalize",
+                Some(crate::TextTransform::None) | None => "none",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "list-style-type",
+            match style.list_style {
+                Some(crate::ListStyle::Disc) => "disc",
+                Some(crate::ListStyle::Circle) => "circle",
+                Some(crate::ListStyle::Square) => "square",
+                Some(crate::ListStyle::Decimal) => "decimal",
+                Some(crate::ListStyle::None) => "none",
+                // The initial value is `disc`; the UA sheet only sets a marker
+                // on list items, so an unstyled element still reports it.
+                None => "disc",
+            }
+            .to_string(),
+        );
+        out.insert(
+            "border-collapse",
+            if style.border_collapse == Some(true) {
+                "collapse"
+            } else {
+                "separate"
+            }
+            .to_string(),
+        );
+        out.insert(
+            "table-layout",
+            if style.table_layout_fixed {
+                "fixed"
+            } else {
+                "auto"
+            }
+            .to_string(),
+        );
+        out.insert(
             "clear",
             match style.clear {
                 Some(crate::Clear::Left) => "left",
@@ -15108,6 +15160,43 @@ mod tests {
         assert_eq!(computed("right")["clear"], "both");
         assert_eq!(computed("plain")["float"], "none");
         assert_eq!(computed("plain")["clear"], "none");
+    }
+
+    /// `vertical-align`, `text-transform`, `list-style-type`, `border-collapse`
+    /// and `table-layout` are cascaded and used by layout, but were never put
+    /// in the computed-style snapshot, so `getComputedStyle()` returned `''`
+    /// for them even when the page declared them explicitly. Chromium 147
+    /// values are asserted for both the declared and the initial case.
+    #[test]
+    fn computed_style_exposes_table_list_and_text_longhands() {
+        let tree = parse_html(
+            r#"<style>#set{vertical-align:middle;list-style-type:square;
+                 border-collapse:collapse;table-layout:fixed;text-transform:uppercase}</style>
+               <table id="set"><tr><td>x</td></tr></table>
+               <div id="unset">a</div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        let set = computed("set");
+        assert_eq!(set["vertical-align"], "middle");
+        assert_eq!(set["list-style-type"], "square");
+        assert_eq!(set["border-collapse"], "collapse");
+        assert_eq!(set["table-layout"], "fixed");
+        assert_eq!(set["text-transform"], "uppercase");
+
+        let unset = computed("unset");
+        assert_eq!(unset["vertical-align"], "baseline");
+        assert_eq!(unset["list-style-type"], "disc");
+        assert_eq!(unset["border-collapse"], "separate");
+        assert_eq!(unset["table-layout"], "auto");
+        assert_eq!(unset["text-transform"], "none");
     }
 
     #[test]
