@@ -2300,6 +2300,74 @@ fn cors_response_allows(
     }
 }
 
+/// A request's `Content-Type` value is CORS-safelisted only when its essence is
+/// one of these (Fetch spec). Any other value (e.g. `application/json`) makes
+/// the request non-simple and requires a preflight.
+fn is_cors_safelisted_content_type(value: &str) -> bool {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+    )
+}
+
+/// Whether a request header is CORS-safelisted (does not by itself force a
+/// preflight). `Content-Type` is safelisted only for safelisted values.
+fn is_cors_safelisted_request_header(name: &str, value: &str) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        "accept" | "accept-language" | "content-language" => true,
+        "content-type" => is_cors_safelisted_content_type(value),
+        _ => false,
+    }
+}
+
+/// Whether a cross-origin CORS-mode request needs a preflight: a non-safelisted
+/// method or any non-safelisted header makes it non-simple.
+fn cors_request_needs_preflight(
+    method: &reqwest::Method,
+    headers: &HashMap<String, String>,
+) -> bool {
+    let non_simple_method = !matches!(method.as_str(), "GET" | "HEAD" | "POST");
+    let non_simple_header = headers
+        .iter()
+        .any(|(k, v)| !is_cors_safelisted_request_header(k, v));
+    non_simple_method || non_simple_header
+}
+
+/// After a preflight, whether the actual method is authorized by
+/// `Access-Control-Allow-Methods`. CORS-safelisted methods are always allowed;
+/// `*` is a wildcard only for non-credentialed requests.
+fn preflight_allows_method(
+    method: &reqwest::Method,
+    allow_methods: &str,
+    credentialed: bool,
+) -> bool {
+    if matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+        return true;
+    }
+    allow_methods.split(',').map(str::trim).any(|entry| {
+        entry.eq_ignore_ascii_case(method.as_str()) || (entry == "*" && !credentialed)
+    })
+}
+
+/// After a preflight, whether a non-safelisted request header is authorized by
+/// `Access-Control-Allow-Headers`. `*` is a wildcard only for non-credentialed
+/// requests and never covers `authorization` (Fetch spec).
+fn preflight_allows_header(name: &str, allow_headers: &str, credentialed: bool) -> bool {
+    let n = name.to_ascii_lowercase();
+    allow_headers.split(',').map(str::trim).any(|entry| {
+        entry.eq_ignore_ascii_case(&n)
+            // `*` is a wildcard only for non-credentialed requests, and never
+            // covers `authorization` (Fetch spec).
+            || (entry == "*" && !credentialed && n != "authorization")
+    })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2535,16 +2603,7 @@ async fn op_fetch_url(
 
     let needs_preflight = is_cross_origin
         && mode == "cors"
-        && (req_method != reqwest::Method::GET
-            && req_method != reqwest::Method::HEAD
-            && req_method != reqwest::Method::POST
-            || custom_headers.keys().any(|k| {
-                let kl = k.to_lowercase();
-                kl != "accept"
-                    && kl != "accept-language"
-                    && kl != "content-language"
-                    && kl != "content-type"
-            }));
+        && cors_request_needs_preflight(&req_method, &custom_headers);
 
     if needs_preflight {
         let preflight = client
@@ -2582,6 +2641,39 @@ async fn op_fetch_url(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
             )));
+        }
+
+        // The origin passing is not enough: the preflight must also authorize
+        // the actual method and every non-safelisted request header, or a
+        // server that only echoes Allow-Origin would still receive a DELETE /
+        // an Authorization header it never opted into (Fetch spec 4.8).
+        let credentialed = credentials == FetchCredentials::Include;
+        let allow_methods = preflight
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !preflight_allows_method(&req_method, allow_methods, credentialed) {
+            return Err(deno_error::JsErrorBox::generic(format!(
+                "CORS preflight: method '{}' not allowed by Access-Control-Allow-Methods '{}'",
+                req_method, allow_methods
+            )));
+        }
+        let allow_headers = preflight
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        for (name, value) in &custom_headers {
+            if is_cors_safelisted_request_header(name, value) {
+                continue;
+            }
+            if !preflight_allows_header(name, allow_headers, credentialed) {
+                return Err(deno_error::JsErrorBox::generic(format!(
+                    "CORS preflight: request header '{}' not allowed by Access-Control-Allow-Headers '{}'",
+                    name, allow_headers
+                )));
+            }
         }
     }
 
@@ -3104,10 +3196,66 @@ mod tests {
     use super::{
         cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
     };
+    use super::{
+        cors_request_needs_preflight, is_cors_safelisted_content_type, preflight_allows_header,
+        preflight_allows_method,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
+
+    // #942 — CORS preflight enforcement. Content-Type is safelisted only for the
+    // three form/text essences; a JSON POST must preflight; and after a preflight
+    // the method and non-safelisted headers must be authorized by
+    // Access-Control-Allow-Methods / -Allow-Headers.
+
+    #[test]
+    fn json_content_type_is_not_cors_safelisted() {
+        assert!(!is_cors_safelisted_content_type("application/json"));
+        assert!(is_cors_safelisted_content_type("text/plain;charset=utf-8"));
+        assert!(is_cors_safelisted_content_type("application/x-www-form-urlencoded"));
+        assert!(is_cors_safelisted_content_type("multipart/form-data; boundary=x"));
+    }
+
+    #[test]
+    fn json_post_needs_preflight_but_form_post_does_not() {
+        let mut json = HashMap::new();
+        json.insert("Content-Type".to_string(), "application/json".to_string());
+        assert!(
+            cors_request_needs_preflight(&reqwest::Method::POST, &json),
+            "a cross-origin application/json POST must preflight"
+        );
+
+        let mut form = HashMap::new();
+        form.insert("Content-Type".to_string(), "text/plain".to_string());
+        assert!(
+            !cors_request_needs_preflight(&reqwest::Method::POST, &form),
+            "a text/plain POST is a simple request"
+        );
+    }
+
+    #[test]
+    fn preflight_method_must_be_allowed() {
+        assert!(!preflight_allows_method(&reqwest::Method::DELETE, "GET, POST", false));
+        assert!(preflight_allows_method(&reqwest::Method::DELETE, "GET, DELETE", false));
+        assert!(preflight_allows_method(&reqwest::Method::DELETE, "*", false));
+        // `*` is not a wildcard for credentialed requests.
+        assert!(!preflight_allows_method(&reqwest::Method::DELETE, "*", true));
+        // CORS-safelisted methods never require listing.
+        assert!(preflight_allows_method(&reqwest::Method::POST, "", false));
+    }
+
+    #[test]
+    fn preflight_header_must_be_allowed() {
+        assert!(!preflight_allows_header("authorization", "content-type", false));
+        assert!(preflight_allows_header("authorization", "authorization, content-type", false));
+        assert!(preflight_allows_header("x-custom", "*", false));
+        // `*` never covers authorization, and is not a wildcard when credentialed.
+        assert!(!preflight_allows_header("authorization", "*", false));
+        assert!(!preflight_allows_header("x-custom", "*", true));
+    }
 
     #[cfg(feature = "render")]
     use super::{
