@@ -1,6 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
@@ -122,6 +126,11 @@ fn with_sync_render_loading_disabled<R>(
 
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
+    /// True when this object is a value that was thrown or that a promise
+    /// rejected with, rather than the evaluation result. CDP reports those
+    /// through `exceptionDetails` on a successful reply, so the difference
+    /// has to survive the trip out of the runtime.
+    pub thrown: bool,
     pub js_type: String,
     pub subtype: Option<String>,
     pub class_name: String,
@@ -130,10 +139,24 @@ pub struct RemoteObjectInfo {
     pub value: Option<serde_json::Value>,
 }
 
+/// CDP remote objects that can be rebuilt when a page's V8 runtime is
+/// temporarily replaced during tab switching.
+///
+/// Obscura currently keeps one entered isolate per connection. Switching tabs
+/// therefore rebuilds the target page's runtime, but CDP clients reasonably
+/// expect handles returned by `Runtime.evaluate` to remain usable. Retaining
+/// the originating expressions lets the page restore a handle on demand under
+/// the same id without retaining a second isolate.
+#[derive(Default)]
+pub struct CdpObjectState {
+    object_counter: u64,
+    evaluation_recipes: HashMap<String, String>,
+}
+
 pub struct ObscuraJsRuntime {
-    runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
+    evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
@@ -165,6 +188,10 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    // Keep the runtime last: custom `Drop` enters its isolate, then every
+    // V8-backed field above is released before `OwnedIsolate` performs the
+    // matching exit and disposes the isolate.
+    js_runtime: JsRuntime,
 }
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
@@ -184,6 +211,15 @@ pub struct PreparedModule {
     description: String,
     entry_specifier: Option<String>,
     graph_specifiers: Vec<String>,
+}
+
+/// Embed a string as a JS string literal — double-quoted, with backslash,
+/// quotes, and control characters (newline, CR, NUL) escaped — for safe
+/// interpolation into generated script. Mirrors `object_id_literal` in
+/// obscura-cdp; a hand-rolled `replace('\'', ...)` misses backslashes and
+/// control chars, which either breaks out of the literal or SyntaxErrors.
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
@@ -252,10 +288,10 @@ pub fn spawn_watchdog(handle: IsolateHandle, budget: std::time::Duration) -> Wat
 }
 
 impl WatchdogToken {
-    /// Stop the watchdog. Returns true if it had already fired (terminated the
-    /// isolate). The caller must then clear the termination flag via
-    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
-    pub fn stop(mut self) -> bool {
+    fn cancel_and_join(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
         {
             let (lock, cvar) = &*self.pair;
             *lock.lock().unwrap() = true;
@@ -264,7 +300,23 @@ impl WatchdogToken {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+
+    /// Stop the watchdog. Returns true if it had already fired (terminated the
+    /// isolate). The caller must then clear the termination flag via
+    /// [`ObscuraJsRuntime::cancel_termination`] before the next eval.
+    pub fn stop(mut self) -> bool {
+        self.cancel_and_join();
         self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WatchdogToken {
+    fn drop(&mut self) {
+        // Futures which own a watchdog may be cancelled while parked on I/O.
+        // Dropping the token must not leave a detached thread which later
+        // terminates an isolate that has already moved on to another task.
+        self.cancel_and_join();
     }
 }
 
@@ -274,7 +326,152 @@ impl WatchdogToken {
 const SYNCHRONOUS_TASK_FLOOR_MS: u64 = 5_000;
 const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 
+/// A [`JsRuntime`] whose isolate is entered for the duration of one operation.
+///
+/// V8 requires the isolate that owns a context to be the thread's *current*
+/// one whenever that context is entered or left, and rusty_v8's scopes do not
+/// arrange that themselves -- they only ever pass the isolate explicitly. What
+/// made it work by accident was rusty_v8 entering an isolate when it is
+/// constructed and leaving it entered for life: with a single page, that page's
+/// isolate is trivially the current one.
+///
+/// With two pages it is not. The isolates form a stack, only the newest is
+/// current, and the consequences were both immediate and fatal:
+///
+/// - running any script on the *older* page aborted the process
+///   (`Check failed: heap->isolate() == Isolate::TryGetCurrent()`), so a second
+///   page effectively disabled the first;
+/// - dropping either page aborted too, because rusty_v8 requires isolates to
+///   be dropped in reverse construction order -- a contract an embedder holding
+///   independent `Page` objects cannot keep (#756).
+///
+/// So the isolate is exited once construction finishes and entered again only
+/// around work that touches V8. Entries are then properly nested no matter how
+/// many pages exist or what order they are used and dropped in.
+struct EnteredRuntime<'a>(&'a mut JsRuntime);
+
+/// Enters an isolate only while an async deno_core operation is being polled.
+/// Holding an entry across `.await` would let interleaved page futures violate
+/// V8's per-thread isolate stack.
+struct EnteredRuntimeFuture<F> {
+    isolate: *mut deno_core::v8::Isolate,
+    future: Option<Pin<Box<F>>>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+struct IsolateEntry(*mut deno_core::v8::Isolate);
+
+impl IsolateEntry {
+    unsafe fn new(isolate: *mut deno_core::v8::Isolate) -> Self {
+        unsafe { (&mut *isolate).enter() };
+        Self(isolate)
+    }
+}
+
+impl Drop for IsolateEntry {
+    fn drop(&mut self) {
+        unsafe { (&mut *self.0).exit() };
+    }
+}
+
+impl<F: Future> Future for EnteredRuntimeFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: construction ties the pointer and future to the same
+        // borrowed JsRuntime, which cannot move or drop while this exists.
+        let this = unsafe { self.get_unchecked_mut() };
+        let _entry = unsafe { IsolateEntry::new(this.isolate) };
+        this.future
+            .as_mut()
+            .expect("entered runtime future polled after drop")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<F> Drop for EnteredRuntimeFuture<F> {
+    fn drop(&mut self) {
+        // deno_core futures can own V8 handles, so drop them while their
+        // isolate is current too.
+        let _entry = unsafe { IsolateEntry::new(self.isolate) };
+        drop(self.future.take());
+    }
+}
+
+fn entered_runtime_future<'a, F>(
+    runtime: &'a mut JsRuntime,
+    make_future: impl FnOnce(&'a mut JsRuntime) -> F,
+) -> EnteredRuntimeFuture<F>
+where
+    F: Future,
+{
+    let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
+    let entry = unsafe { IsolateEntry::new(isolate) };
+    let future = Box::pin(make_future(runtime));
+    drop(entry);
+    EnteredRuntimeFuture {
+        isolate,
+        future: Some(future),
+        _not_send: PhantomData,
+    }
+}
+
+impl std::ops::Deref for EnteredRuntime<'_> {
+    type Target = JsRuntime;
+
+    fn deref(&self) -> &JsRuntime {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for EnteredRuntime<'_> {
+    fn deref_mut(&mut self) -> &mut JsRuntime {
+        self.0
+    }
+}
+
+impl Drop for EnteredRuntime<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this isolate was entered by the matching `runtime()` call
+        // and, entries being a per-thread stack, is the current one: any
+        // isolate entered since belongs to a nested operation that has already
+        // exited it.
+        unsafe {
+            self.0.v8_isolate().exit();
+        }
+    }
+}
+
+impl Drop for ObscuraJsRuntime {
+    fn drop(&mut self) {
+        // Teardown needs the isolate current as much as any other V8 work:
+        // deno_core's context cleanup clears the context's embedder slots, and
+        // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
+        // when `js_runtime` is dropped, immediately after this returns, and
+        // that `OwnedIsolate::drop` performs the matching exit.
+        //
+        // SAFETY: `enter` only pushes this isolate onto the current thread's
+        // entry stack; the pop is guaranteed by the drop that follows.
+        unsafe {
+            self.js_runtime.v8_isolate().enter();
+        }
+    }
+}
+
 impl ObscuraJsRuntime {
+    /// The V8 runtime, with its isolate entered for as long as the returned
+    /// guard lives. Every path that touches V8 goes through here; see
+    /// [`EnteredRuntime`] for why.
+    fn runtime(&mut self) -> EnteredRuntime<'_> {
+        // SAFETY: entering is always sound -- it pushes this isolate onto the
+        // current thread's entry stack -- and the guard's `Drop` pops it.
+        unsafe {
+            self.js_runtime.v8_isolate().enter();
+        }
+        EnteredRuntime(&mut self.js_runtime)
+    }
+
     /// Freeze the document timeline for one JavaScript task. Browser timelines
     /// update at task/rendering boundaries, not on each forced style or layout
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
@@ -299,6 +496,9 @@ impl ObscuraJsRuntime {
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        // A runtime is about to initialize the V8 platform; from here on a
+        // set_v8_flags call must be refused rather than aborting the process.
+        crate::v8_flags::mark_platform_started();
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
         let import_map = state.borrow().import_map.clone();
@@ -364,9 +564,9 @@ impl ObscuraJsRuntime {
         };
 
         let mut instance = ObscuraJsRuntime {
-            runtime,
             state,
             object_store: HashMap::new(),
+            evaluation_recipes: HashMap::new(),
             object_counter: 0,
             import_map,
             module_load_activity,
@@ -376,10 +576,22 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         instance.ops_handoff = instance.take_ops_handoff();
+
+        // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
+        // entered for life. Leave the thread's entry stack empty instead; every
+        // operation enters for its own duration. See `EnteredRuntime`.
+        //
+        // SAFETY: this isolate is the current one -- it was entered above and
+        // nothing on this thread has entered another since.
+        unsafe {
+            instance.js_runtime.v8_isolate().exit();
+        }
+
         instance
     }
 
@@ -398,7 +610,8 @@ impl ObscuraJsRuntime {
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
         let context = {
-            let isolate = self.runtime.v8_isolate();
+            let mut entered = self.runtime();
+            let isolate = entered.v8_isolate();
             let scope = &mut deno_core::v8::HandleScope::new(isolate);
             let context = deno_core::v8::Context::from_snapshot(
                 scope,
@@ -426,8 +639,9 @@ impl ObscuraJsRuntime {
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, main);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -453,6 +667,44 @@ impl ObscuraJsRuntime {
     /// ops table, and its bootstrap captured that exact object, so filling the
     /// `ops` table on it is enough to give every shim in that realm a working
     /// op surface. The functions are shared, not copied: same isolate.
+    /// deno_core's isolate-global promise-reject and dynamic-`import()`
+    /// callbacks read per-context state from V8's `ContextState` and
+    /// `ModuleMap` embedder-data slots in the *current* context. A
+    /// snapshot-created frame realm leaves those slots null, so a promise
+    /// rejection or dynamic import inside a frame null-dereferenced in
+    /// deno_core's `clone_rc_raw` and segfaulted the whole process (#850, #841).
+    /// Alias the main context's slot pointers into the frame context so those
+    /// callbacks resolve to the main realm's state instead of crashing.
+    ///
+    /// Safe: the frame context only *borrows* these pointers. The callbacks
+    /// `clone_rc_raw` (increment then drop) them — net-zero on the strong count
+    /// — and obscura never tears a frame context down through deno_core's
+    /// `Rc::from_raw` destroy path (only the main realm owns and frees the Rc),
+    /// so no double-free is possible.
+    pub(crate) fn share_deno_context_state_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::{v8, CONTEXT_STATE_SLOT_INDEX, MODULE_MAP_SLOT_INDEX};
+
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let main_ctx = v8::Local::new(scope, main);
+        let realm_ctx = v8::Local::new(scope, realm);
+        // SAFETY: these slots on the main context are `Rc::into_raw` pointers
+        // set by deno_core at runtime construction; they outlive every frame
+        // realm. We only copy (alias) them and never reconstruct the Rc from
+        // the frame.
+        unsafe {
+            let cs = main_ctx.get_aligned_pointer_from_embedder_data(CONTEXT_STATE_SLOT_INDEX);
+            let mm = main_ctx.get_aligned_pointer_from_embedder_data(MODULE_MAP_SLOT_INDEX);
+            realm_ctx.set_aligned_pointer_in_embedder_data(CONTEXT_STATE_SLOT_INDEX, cs);
+            realm_ctx.set_aligned_pointer_in_embedder_data(MODULE_MAP_SLOT_INDEX, mm);
+        }
+    }
+
     pub(crate) fn share_ops_with_realm(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
@@ -462,7 +714,8 @@ impl ObscuraJsRuntime {
         let Some(ops) = self.ops_handoff.clone() else {
             return false;
         };
-        let isolate = self.runtime.v8_isolate();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -522,7 +775,8 @@ impl ObscuraJsRuntime {
     ) -> Result<String, String> {
         use deno_core::v8;
 
-        let isolate = self.runtime.v8_isolate();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -562,8 +816,9 @@ impl ObscuraJsRuntime {
             "__obscura_geo_lon",
         ];
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
         let main_context = v8::Local::new(scope, main);
@@ -638,8 +893,9 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
         let main = v8::Local::new(scope, main);
         let realm = v8::Local::new(scope, realm);
@@ -663,8 +919,9 @@ impl ObscuraJsRuntime {
     ) -> bool {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
-        let isolate = self.runtime.v8_isolate();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
         // Read the frame's globals first, then install them in the page realm.
@@ -719,7 +976,8 @@ impl ObscuraJsRuntime {
 
     /// The table ops consult to find the calling realm's document.
     pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
-        self.runtime
+        // `op_state` is a plain Rust-side table; no V8 access, no guard.
+        self.js_runtime
             .op_state()
             .borrow()
             .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
@@ -754,18 +1012,16 @@ impl ObscuraJsRuntime {
             return false;
         }
 
-        self.runtime.v8_isolate().cancel_terminate_execution();
+        self.runtime().v8_isolate().cancel_terminate_execution();
         let restore_limit = self
             .heap_limit_state
             .restore_limit
             .swap(0, std::sync::atomic::Ordering::SeqCst);
-        self.runtime
+        self.runtime()
             .remove_near_heap_limit_callback(restore_limit);
-        install_heap_limit_guard(
-            &mut self.runtime,
-            self.isolate_handle.clone(),
-            self.heap_limit_state.clone(),
-        );
+        let isolate_handle = self.isolate_handle.clone();
+        let heap_limit_state = self.heap_limit_state.clone();
+        install_heap_limit_guard(&mut *self.runtime(), isolate_handle, heap_limit_state);
         tracing::warn!("V8 heap limit reached: terminated the current JavaScript task");
         true
     }
@@ -784,7 +1040,7 @@ impl ObscuraJsRuntime {
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
         let result = self
-            .runtime
+            .runtime()
             .execute_script(name, source)
             .map_err(|error| error.to_string());
         self.finish_heap_checked(result)
@@ -1027,22 +1283,20 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_user_agent(&mut self, ua: &str) {
-        let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
         let _ = self.execute_runtime_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
         );
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
-        let p = platform.replace('\'', "\\'");
-        let uap = ua_platform.replace('\'', "\\'");
-        let uapv = ua_platform_version.replace('\'', "\\'");
         let _ = self.execute_runtime_script(
             "<set-platform>",
             format!(
-                "globalThis.__obscura_platform='{}';globalThis.__obscura_ua_platform='{}';globalThis.__obscura_ua_platform_version='{}';",
-                p, uap, uapv
+                "globalThis.__obscura_platform={};globalThis.__obscura_ua_platform={};globalThis.__obscura_ua_platform_version={};",
+                js_string_literal(platform),
+                js_string_literal(ua_platform),
+                js_string_literal(ua_platform_version),
             ),
         );
     }
@@ -1623,33 +1877,40 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        if !await_promise && return_by_value {
-            let val = self.evaluate(expression)?;
-            return Ok(Self::info_from_json(&val));
-        }
+        // Every shape of this command now travels the same path. The
+        // by-value sync case used to short-circuit through `evaluate`,
+        // whose wrapper answers an exception with `null` — indistinguishable
+        // from an expression that really evaluated to null (#746).
         self.begin_javascript_task();
 
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
 
-        // Same trailing-semicolon trim as wrap_expression — Playwright's
-        // utility-script eval ends with `})();`, and `({expr})` would
-        // otherwise become `(...;)` which is a parse-time SyntaxError.
-        let cleaned_expr = expression
-            .trim()
-            .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
-
-        // Puppeteer / Playwright bundles end with a `//# sourceURL=...`
-        // line comment. If we put `{expr})` on a single line the comment
-        // swallows the closing paren and our wrapper breaks. A newline
-        // before the `)` terminates any trailing line comment so the
-        // parens close on their own line.
+        // The expression travels as a *string* into an indirect eval rather
+        // than being pasted into a wrapper. Pasting forced two workarounds
+        // that only half worked: a trailing `;` had to be trimmed or
+        // `(expr;)` failed to parse, and a trailing `//# sourceURL=` comment
+        // (Puppeteer and Playwright both append one) would swallow the
+        // closing paren unless it sat on its own line. Neither can happen to
+        // a string literal.
+        //
+        // It also makes statements legal. `Runtime.evaluate` is specified to
+        // take a script, not an expression, so `throw new Error('x')` and
+        // `var x = 1; x * 2` are both valid input; wrapped in parentheses the
+        // first was a parse-time SyntaxError, which is not catchable, and the
+        // second returned the wrapper's own `undefined` instead of the
+        // completion value Chrome reports (#746).
+        //
+        // `(0, eval)` rather than `eval` so the script runs at global scope,
+        // where `var` lands on `globalThis` the way it does in Chrome, and
+        // cannot see this wrapper's `__result`.
+        let source_literal = serde_json::Value::String(expression.to_string());
         let done_counter = self.object_counter;
         let meta_code = if await_promise {
             format!(
                 "(async function() {{\n\
                     try {{\n\
-                        var __result = await (\n{expr}\n);\n\
+                        var __result = await (0, eval)({src});\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
                         globalThis.__obscura_await_rejected = false;\n\
@@ -1660,23 +1921,38 @@ impl ObscuraJsRuntime {
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
-                expr = cleaned_expr,
+                src = source_literal,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = Self::meta_extract_js("e"),
                 done_counter = done_counter,
             )
         } else {
+            // The synchronous half writes the same two globals as the await
+            // half above, so one outcome protocol covers both and the reply
+            // builder does not have to care which path produced the value.
+            // Before this, a throw here became `__result = undefined`: the
+            // command answered successfully with `undefined`, so a page error
+            // was indistinguishable from an expression with no value.
             format!(
                 "(function() {{\n\
                     var __result;\n\
-                    try {{ __result = (\n{expr}\n); }} catch(e) {{ __result = undefined; }}\n\
+                    try {{\n\
+                        __result = (0, eval)({src});\n\
+                    }} catch(e) {{\n\
+                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
+                        return globalThis.__obscura_await_meta;\n\
+                    }}\n\
                     globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    globalThis.__obscura_await_rejected = false;\n\
                     return {meta_fn};\n\
                 }})()",
-                expr = cleaned_expr,
+                src = source_literal,
                 oid = oid,
                 meta_fn = Self::meta_extract_js("__result"),
+                err_meta_fn = Self::meta_extract_js("e"),
             )
         };
 
@@ -1717,25 +1993,28 @@ impl ObscuraJsRuntime {
                     preview,
                 );
             }
-            let rejected = self
-                .execute_runtime_script(
-                    "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.execute_runtime_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
-                    .map_err(|e| format!("JS error: {}", e))?;
-                return Err(format!(
-                    "Promise rejected: {}",
-                    self.v8_to_json(err)?.as_str().unwrap_or("")
-                ));
-            }
             self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
         };
+
+        // Neither a rejection nor a synchronous throw is a protocol failure.
+        // CDP answers the command and puts the value in `exceptionDetails`,
+        // which is what a client rebuilds the page error from, so it travels
+        // back as a remote object flagged `thrown`. It is reported by
+        // reference even when the caller asked for a value:
+        // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
+        // would throw the message away.
+        let thrown = self
+            .execute_runtime_script(
+                "<readRejected>",
+                "globalThis.__obscura_await_rejected".to_string(),
+            )
+            .map_err(|e| format!("JS error: {}", e))?;
+        if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
+            return self.thrown_info(&oid);
+        }
         let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
             serde_json::from_str(s).unwrap_or(meta_str)
@@ -1746,8 +2025,14 @@ impl ObscuraJsRuntime {
             oid.clone(),
             format!("globalThis.__obscura_objects['{}']", oid),
         );
+        if !return_by_value {
+            // The eval-based wrapper above parses the raw expression as
+            // statements, so no trailing-semicolon trim is needed here.
+            self.evaluation_recipes
+                .insert(oid.clone(), expression.to_string());
+        }
 
-        if await_promise && return_by_value {
+        if return_by_value {
             let read = self
                 .execute_runtime_script(
                     "<readResult>",
@@ -1809,10 +2094,12 @@ impl ObscuraJsRuntime {
                         __result = await __fn.call(__this, {args});\n\
                         globalThis.__obscura_objects['{oid}'] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
+                        globalThis.__obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
                         globalThis.__obscura_objects['{oid}'] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
+                        globalThis.__obscura_await_rejected = true;\n\
                     }} finally {{\n\
                         globalThis.__obscura_done_{done_counter} = true;\n\
                     }}\n\
@@ -1861,6 +2148,22 @@ impl ObscuraJsRuntime {
                     __dt.as_millis(),
                     preview,
                 );
+            }
+
+            // Same rule as evaluate: a rejected call is answered, not failed,
+            // and the value is never serialized by value. Without this the
+            // wrapper stored the error under the object id a success uses, so
+            // a rejection came back as an ordinary result: an Error as `{}`,
+            // and `Promise.reject({code: 42})` as `{code: 42}`, which is
+            // indistinguishable from resolving with it.
+            let rejected = self
+                .execute_runtime_script(
+                    "<readRejected>",
+                    "globalThis.__obscura_await_rejected".to_string(),
+                )
+                .map_err(|e| format!("JS error: {}", e))?;
+            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
+                return self.thrown_info(&oid);
             }
 
             if return_by_value {
@@ -2008,6 +2311,7 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object(&mut self, object_id: &str) {
+        self.evaluation_recipes.remove(object_id);
         if self.object_store.remove(object_id).is_some() {
             let frame_id = object_id
                 .strip_prefix("console-")
@@ -2044,6 +2348,19 @@ impl ObscuraJsRuntime {
         }
         let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
+        self.evaluation_recipes.clear();
+    }
+
+    pub fn take_cdp_object_state(&mut self) -> CdpObjectState {
+        CdpObjectState {
+            object_counter: self.object_counter,
+            evaluation_recipes: std::mem::take(&mut self.evaluation_recipes),
+        }
+    }
+
+    pub fn restore_cdp_object_state(&mut self, state: CdpObjectState) {
+        self.object_counter = self.object_counter.max(state.object_counter);
+        self.evaluation_recipes = state.evaluation_recipes;
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
@@ -2074,12 +2391,10 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
-        let module_id = match tokio::time::timeout(
-            budget,
-            self.runtime.load_side_es_module(&specifier),
-        )
-        .await
-        {
+        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.load_side_es_module(&specifier)
+        });
+        let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
             Err(_) => {
@@ -2135,14 +2450,18 @@ impl ObscuraJsRuntime {
         // observable when mod_evaluate checks V8's private module status, so
         // contain that dependency assertion at this boundary as well.
         let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runtime.mod_evaluate(module_id)
+            self.runtime().mod_evaluate(module_id)
         }));
         let result = match evaluation {
             Ok(result) => result,
             Err(payload) => {
                 let message = panic_payload_message(payload.as_ref());
                 let outcome = if message.contains("Module already evaluated") {
-                    Ok(())
+                    self
+                        .runtime()
+                        .get_module_namespace(module_id)
+                        .map(|_| ())
+                        .map_err(|error| format!("{} eval error: {}", what, error))
                 } else {
                     Err(format!("{} evaluation panicked: {}", what, message))
                 };
@@ -2152,21 +2471,25 @@ impl ObscuraJsRuntime {
         };
         tokio::pin!(result);
 
-        let outcome = tokio::time::timeout(budget, async {
-            let event_loop = self
-                .runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default());
-            tokio::pin!(event_loop);
-            tokio::select! {
-                biased;
-                e = &mut event_loop => { e?; (&mut result).await }
-                r = &mut result => r,
-            }
-        })
+        let outcome = tokio::time::timeout(
+            budget,
+            std::future::poll_fn(|cx| {
+                let mut entered = self.runtime();
+                match entered.poll_event_loop(cx, deno_core::PollEventLoopOptions::default()) {
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => result.as_mut().poll(cx),
+                    Poll::Pending => result.as_mut().poll(cx),
+                }
+            }),
+        )
         .await;
 
         let outcome = match outcome {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => self
+                .runtime()
+                .get_module_namespace(module_id)
+                .map(|_| ())
+                .map_err(|error| format!("{} eval error: {}", what, error)),
             Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
             Err(_) => Err(format!(
                 "{} evaluation timed out after {}ms",
@@ -2213,15 +2536,13 @@ impl ObscuraJsRuntime {
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
-        let module_id = match tokio::time::timeout(
-            budget,
-            self.runtime.load_side_es_module_from_code(
+        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.load_side_es_module_from_code(
                 &specifier,
                 deno_core::ModuleCodeString::from(code.to_string()),
-            ),
-        )
-        .await
-        {
+            )
+        });
+        let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
             Err(_) => {
@@ -2306,7 +2627,8 @@ impl ObscuraJsRuntime {
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
         let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
-            let scope = &mut self.runtime.handle_scope();
+            let mut entered = self.runtime();
+            let scope = &mut entered.handle_scope();
             let source = deno_core::v8::String::new(scope, source)
                 .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
             let name = deno_core::v8::String::new(scope, name)
@@ -2394,7 +2716,7 @@ impl ObscuraJsRuntime {
             return self.execute_classic_script(name, source);
         }
 
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
+        let isolate_handle = self.runtime().v8_isolate().thread_safe_handle();
 
         let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let pair_clone = pair.clone();
@@ -2449,13 +2771,14 @@ impl ObscuraJsRuntime {
         // pending, leaving an already-resolved Promise continuation stranded
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
-        let result = self
-            .runtime
-            .run_event_loop(deno_core::PollEventLoopOptions::default())
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
+        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+        });
+        let result = event_loop
             .await
             .map_err(|e| format!("Event loop error: {}", e));
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         self.finish_heap_checked(result)
     }
 
@@ -2523,7 +2846,7 @@ impl ObscuraJsRuntime {
     /// `budget` elapses, forcing V8 to throw an uncatchable error and hand
     /// control back. Always balance with [`Self::disarm_watchdog`].
     pub fn arm_watchdog(&mut self, budget: std::time::Duration) -> WatchdogToken {
-        spawn_watchdog(self.runtime.v8_isolate().thread_safe_handle(), budget)
+        spawn_watchdog(self.runtime().v8_isolate().thread_safe_handle(), budget)
     }
 
     /// Stop a watchdog armed by [`Self::arm_watchdog`]. If it had already fired
@@ -2532,7 +2855,7 @@ impl ObscuraJsRuntime {
     pub fn disarm_watchdog(&mut self, token: WatchdogToken) -> bool {
         let fired = token.stop();
         if fired {
-            self.runtime.v8_isolate().cancel_terminate_execution();
+            self.runtime().v8_isolate().cancel_terminate_execution();
             tracing::warn!("V8 watchdog fired: terminated a synchronous overrun");
         }
         fired
@@ -2549,7 +2872,7 @@ impl ObscuraJsRuntime {
     /// isolate handle) fired, so the isolate is usable for the next command.
     /// No-op when the isolate is not terminating.
     pub fn cancel_termination(&mut self) {
-        self.runtime.v8_isolate().cancel_terminate_execution();
+        self.runtime().v8_isolate().cancel_terminate_execution();
     }
 
     /// Drive the event loop for at most `budget_ms`, bounded against BOTH async
@@ -2591,7 +2914,7 @@ impl ObscuraJsRuntime {
                     // queued from them belongs to a subsequent cooperative
                     // turn. Yield so the wall deadline remains observable even
                     // when every turn immediately schedules another one.
-                    self.runtime.v8_isolate().perform_microtask_checkpoint();
+                    self.runtime().v8_isolate().perform_microtask_checkpoint();
                     tokio::task::yield_now().await;
                 }
                 Ok(Err(error)) => {
@@ -2646,11 +2969,11 @@ impl ObscuraJsRuntime {
     /// adaptive settle loop does not poll at a fixed frequency.
     async fn run_cooperative_event_loop_tick(&mut self) -> Result<bool, String> {
         self.begin_javascript_task();
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let tick = self
-                .runtime
+                .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -2692,7 +3015,7 @@ impl ObscuraJsRuntime {
             self.isolate_handle(),
             std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
         );
-        self.runtime.v8_isolate().perform_microtask_checkpoint();
+        self.runtime().v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
             return Err("autonomous microtask checkpoint exceeded its task budget".into());
@@ -2709,11 +3032,11 @@ impl ObscuraJsRuntime {
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
             );
             let tick = self
-                .runtime
+                .runtime()
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
-                self.runtime.v8_isolate().cancel_terminate_execution();
+                self.runtime().v8_isolate().cancel_terminate_execution();
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
@@ -2864,7 +3187,7 @@ impl ObscuraJsRuntime {
             if tick_fired {
                 break Ok(());
             }
-            self.runtime.v8_isolate().perform_microtask_checkpoint();
+            self.runtime().v8_isolate().perform_microtask_checkpoint();
             match tick {
                 Ok(Ok(true)) => break Ok(()),
                 Ok(Ok(false)) | Err(_) => {}
@@ -2898,7 +3221,7 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime.execute_script("<eval>", wrapped);
+        let result = self.runtime().execute_script("<eval>", wrapped);
         let fired = self.disarm_watchdog(token);
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".to_string());
@@ -2920,12 +3243,10 @@ impl ObscuraJsRuntime {
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            self.runtime
-                .run_event_loop(deno_core::PollEventLoopOptions::default()),
-        )
-        .await;
+        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+        });
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_loop).await;
         self.recover_heap_limit();
     }
 
@@ -2962,10 +3283,12 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
+                runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
+            });
             let _ = tokio::time::timeout(
                 tokio::time::Duration::from_millis(tick_ms),
-                self.runtime
-                    .run_event_loop(deno_core::PollEventLoopOptions::default()),
+                event_loop,
             )
             .await;
             if self.recover_heap_limit() {
@@ -3114,6 +3437,12 @@ impl ObscuraJsRuntime {
                     cn = 'Function';
                     desc = v.name ? 'function ' + v.name + '()' : 'function()';
                 }}
+                else if (t === 'object' && v instanceof Error) {{
+                    st = 'error';
+                    cn = (v.constructor && v.constructor.name) || 'Error';
+                    desc = (typeof v.stack === 'string' && v.stack) ? v.stack
+                         : (cn + (v.message ? ': ' + v.message : ''));
+                }}
                 else if (t === 'object') {{
                     cn = (v.constructor && v.constructor.name) || 'Object';
                     desc = cn;
@@ -3125,11 +3454,27 @@ impl ObscuraJsRuntime {
         )
     }
 
-    fn resolve_this(&self, object_id: Option<&str>) -> String {
+    fn resolve_remote_object(&mut self, object_id: &str) -> Option<String> {
+        if let Some(retrieval) = self.object_store.get(object_id) {
+            return Some(retrieval.clone());
+        }
+        let expression = self.evaluation_recipes.get(object_id)?.clone();
+        let object_id_literal = js_string_literal(object_id);
+        let code = format!(
+            "globalThis.__obscura_objects[{object_id_literal}] = (\n{expression}\n);"
+        );
+        self.execute_runtime_script("<restore-cdp-object>", code).ok()?;
+        let retrieval = format!("globalThis.__obscura_objects[{object_id_literal}]");
+        self.object_store
+            .insert(object_id.to_string(), retrieval.clone());
+        Some(retrieval)
+    }
+
+    fn resolve_this(&mut self, object_id: Option<&str>) -> String {
         match object_id {
             Some(oid) => {
-                if let Some(retrieval) = self.object_store.get(oid) {
-                    retrieval.clone()
+                if let Some(retrieval) = self.resolve_remote_object(oid) {
+                    retrieval
                 } else if oid.starts_with("node-") {
                     let nid = oid.strip_prefix("node-").unwrap_or("0");
                     format!(
@@ -3149,7 +3494,7 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn build_args(&self, arguments: &[serde_json::Value]) -> (String, String) {
+    fn build_args(&mut self, arguments: &[serde_json::Value]) -> (String, String) {
         let mut setup_lines = Vec::new();
         let mut arg_names = Vec::new();
 
@@ -3160,7 +3505,7 @@ impl ObscuraJsRuntime {
                     serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
                 setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
-                if let Some(retrieval) = self.object_store.get(oid) {
+                if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
@@ -3180,7 +3525,8 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
-        let scope = &mut self.runtime.handle_scope();
+        let mut entered = self.runtime();
+        let scope = &mut entered.handle_scope();
         let local = deno_core::v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
@@ -3226,6 +3572,7 @@ impl ObscuraJsRuntime {
     fn info_from_json(value: &serde_json::Value) -> RemoteObjectInfo {
         match value {
             serde_json::Value::Null => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: Some("null".into()),
                 class_name: String::new(),
@@ -3234,6 +3581,7 @@ impl ObscuraJsRuntime {
                 value: Some(serde_json::Value::Null),
             },
             serde_json::Value::Bool(b) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "boolean".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3242,6 +3590,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Number(n) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "number".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3250,6 +3599,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::String(s) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "string".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -3258,6 +3608,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Array(arr) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: Some("array".into()),
                 class_name: "Array".into(),
@@ -3266,6 +3617,7 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
             serde_json::Value::Object(_) => RemoteObjectInfo {
+                thrown: false,
                 js_type: "object".into(),
                 subtype: None,
                 class_name: "Object".into(),
@@ -3274,6 +3626,33 @@ impl ObscuraJsRuntime {
                 value: Some(value.clone()),
             },
         }
+    }
+
+    /// Build the remote object for a value that was thrown, or that a promise
+    /// rejected with.
+    ///
+    /// Both wrappers have already stored the value under `oid` and put its
+    /// metadata in `__obscura_await_meta`, so this reads them back and marks
+    /// the result. The mark is what lets the CDP layer answer the command with
+    /// `exceptionDetails` rather than fail it or, worse, present the value as
+    /// the evaluation result.
+    fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
+        let meta = self
+            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            .map_err(|e| format!("JS error: {}", e))?;
+        let meta = self.v8_to_json(meta)?;
+        let meta_json = if let serde_json::Value::String(text) = &meta {
+            serde_json::from_str(text).unwrap_or_else(|_| meta.clone())
+        } else {
+            meta
+        };
+        self.object_store.insert(
+            oid.to_string(),
+            format!("globalThis.__obscura_objects['{}']", oid),
+        );
+        let mut info = Self::info_from_meta(&meta_json, Some(oid.to_string()));
+        info.thrown = true;
+        Ok(info)
     }
 
     fn info_from_meta(meta: &serde_json::Value, object_id: Option<String>) -> RemoteObjectInfo {
@@ -3306,6 +3685,7 @@ impl ObscuraJsRuntime {
         };
 
         RemoteObjectInfo {
+            thrown: false,
             js_type,
             subtype,
             class_name,
@@ -3335,6 +3715,66 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    // SEC-503 / #820 — createObjectURL must reject non-Blob input (an object
+    // that merely has a .text() method, e.g. Response) with a TypeError, as
+    // Chrome does; a real Blob is still accepted.
+    #[test]
+    fn create_object_url_rejects_non_blob_input() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        // A real Blob is accepted and yields a blob: URL.
+        let ok = rt
+            .evaluate("URL.createObjectURL(new Blob(['hello'])).startsWith('blob:')")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!(true), "a real Blob must be accepted");
+
+        // A non-Blob object with only .text() must be rejected.
+        let rejected = rt
+            .evaluate(
+                "(function(){ try { URL.createObjectURL({ text: () => Promise.resolve('x') }); return false; }\
+                   catch (e) { return !!(e && e.name === 'TypeError'); } })()",
+            )
+            .unwrap();
+        assert_eq!(
+            rejected,
+            serde_json::json!(true),
+            "createObjectURL must throw TypeError for non-Blob input"
+        );
+    }
+
+    // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
+    // set_platform must not allow a backslash-before-quote to break out of the
+    // JS string literal (injection), and set_user_agent must not silently fail
+    // on a control character; both must store the value verbatim.
+    #[test]
+    fn profile_setters_escape_backslash_and_control_characters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("globalThis.__pwned = 0;").unwrap();
+
+        // SEC-301: `Win\';...` — the trailing backslash used to escape our own
+        // closing quote, letting the rest run as JS.
+        rt.set_platform("Win\\';globalThis.__pwned=1;//", "px", "pv");
+        assert_ne!(
+            rt.evaluate("globalThis.__pwned").unwrap().as_f64(),
+            Some(1.0),
+            "set_platform must not execute JS injected via the platform value"
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__obscura_platform").unwrap(),
+            serde_json::json!("Win\\';globalThis.__pwned=1;//"),
+            "the platform value must be stored verbatim"
+        );
+
+        // SEC-302: a UA with a literal newline used to SyntaxError into a silent
+        // no-op, leaving the wrong UA.
+        rt.set_user_agent("Mozilla/5.0 line1\nline2");
+        assert_eq!(
+            rt.evaluate("globalThis.__obscura_ua").unwrap(),
+            serde_json::json!("Mozilla/5.0 line1\nline2"),
+            "the UA must be stored verbatim, including control characters"
+        );
     }
 
     #[test]
@@ -3731,6 +4171,294 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_onmessage_bindings_do_not_mutate_window() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-onmessage-bindings", r#"
+            globalThis.__workerReplies = {};
+            const originalHandler = window.onmessage;
+            const sources = {
+                bare: 'onmessage = function(event) { postMessage([event.data, this === self]); };',
+                declared: 'var onmessage = function(event) { postMessage([event.data, this === self]); };',
+                strict: '"use strict"; onmessage = function(event) { postMessage([event.data, this === self]); };',
+            };
+            for (const [name, source] of Object.entries(sources)) {
+                const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+                const worker = new Worker(url);
+                worker.onmessage = event => {
+                    __workerReplies[name] = event.data;
+                    worker.terminate();
+                    URL.revokeObjectURL(url);
+                };
+                worker.postMessage(name);
+            }
+            globalThis.__workerWindowUnchanged = () => window.onmessage === originalHandler;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!({
+                "bare": ["bare", true], "declared": ["declared", true], "strict": ["strict", true],
+            })
+        );
+        assert_eq!(
+            rt.evaluate("__workerWindowUnchanged()").unwrap(),
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_initializes_once_and_retains_message_state() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-persistent-state", r#"
+            globalThis.__workerReplies = [];
+            const source = 'let count = 0; postMessage("ready"); self.onmessage = () => postMessage(++count);';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                if (event.data === 2) {
+                    worker.terminate();
+                    URL.revokeObjectURL(url);
+                }
+            };
+            worker.postMessage(null);
+            worker.postMessage(null);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["ready", 1, 2])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scopes_keep_counters_and_handlers_independent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-independent-scopes",
+            r#"
+            globalThis.__workerReplies = [[], []];
+            const source = 'let count = 0; onmessage = () => postMessage(++count);';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const workers = [new Worker(url), new Worker(url)];
+            workers.forEach((worker, index) => {
+                worker.onmessage = event => __workerReplies[index].push(event.data);
+            });
+            workers[0].postMessage(null);
+            workers[1].postMessage(null);
+            workers[0].postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([[1, 2], [1]])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "workers.forEach(worker => worker.terminate()); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_delivers_to_handler_and_listener_without_reinitializing() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-handler-and-listener",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                let count = 0;
+                self.onmessage = event => postMessage(['handler', ++count]);
+                addEventListener('message', function(event) {
+                    postMessage(['listener', count, this === self]);
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage(null);
+            worker.postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([
+                ["handler", 1],
+                ["listener", 1, true],
+                ["handler", 2],
+                ["listener", 2, true],
+            ])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_queues_messages_while_source_is_loading() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-queued-messages", r#"
+            globalThis.__workerReplies = [];
+            const originalFetch = globalThis.fetch;
+            let finishSource;
+            globalThis.fetch = async () => ({ text: () => new Promise(resolve => { finishSource = resolve; }) });
+            const worker = new Worker('https://example.com/worker.js');
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage('first');
+            worker.postMessage('second');
+            setTimeout(() => {
+                globalThis.fetch = originalFetch;
+                finishSource('let count = 0; onmessage = event => postMessage([++count, event.data]);');
+            }, 0);
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([[1, "first"], [2, "second"]])
+        );
+        rt.execute_script("worker-cleanup", "worker.terminate();")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_termination_discards_queued_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-terminated-messages",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = 'postMessage("started"); onmessage = () => postMessage("reply");';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage('queued');
+            worker.terminate();
+            worker.postMessage('after termination');
+            URL.revokeObjectURL(url);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_source_preserves_strict_mode_in_message_closures() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-strict-closure",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                'use strict';
+                onmessage = () => {
+                    try { workerUndeclaredVariable = 1; postMessage('unexpected assignment'); }
+                    catch (error) { postMessage(error.name); }
+                };
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["ReferenceError"])
+        );
+        assert_eq!(
+            rt.evaluate("typeof workerUndeclaredVariable").unwrap(),
+            serde_json::json!("undefined")
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_initialization_error_does_not_rerun_source() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-initialization-error",
+            r#"
+            globalThis.__workerReplies = [];
+            globalThis.__workerErrors = [];
+            const source = 'postMessage("started"); throw new Error("initialization failed");';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.onerror = error => __workerErrors.push(error.message);
+            worker.postMessage(null);
+            worker.postMessage(null);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["started"])
+        );
+        assert_eq!(
+            rt.evaluate("__workerErrors").unwrap(),
+            serde_json::json!(["initialization failed"])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_startup_reply_does_not_overtake_queued_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-startup-order",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = 'postMessage("ready"); onmessage = event => postMessage(event.data);';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            let replied = false;
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                if (event.data === 'ready' && !replied) {
+                    replied = true;
+                    worker.postMessage(3);
+                }
+            };
+            worker.postMessage(1);
+            worker.postMessage(2);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!(["ready", 1, 2, 3])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn self_requeueing_message_channel_yields_to_timers() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -3833,6 +4561,36 @@ mod tests {
         assert_eq!(
             rt.evaluate("__messagePortOrder").unwrap(),
             serde_json::json!(["message-1", "microtask-1", "message-2", "microtask-2",])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn message_port_drops_old_document_payloads_before_fresh_delivery() {
+        let mut rt = setup_runtime("<html><body data-document='old'></body></html>");
+        rt.execute_script(
+            "message-port-old-document",
+            r#"
+                globalThis.__replacementPortOrder = [];
+                globalThis.__replacementChannel = new MessageChannel();
+                __replacementChannel.port2.onmessage = event => {
+                    __replacementPortOrder.push(event.data);
+                };
+                __replacementChannel.port1.postMessage("old");
+            "#,
+        )
+        .unwrap();
+
+        rt.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        rt.execute_script(
+            "message-port-new-document",
+            r#"__replacementChannel.port1.postMessage("fresh");"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            rt.evaluate("__replacementPortOrder").unwrap(),
+            serde_json::json!(["fresh"]),
         );
     }
 
@@ -5776,6 +6534,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn zero_delay_interval_created_by_timer_yields_to_embedder() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "nested-zero-interval",
+            "globalThis.__outerTimerRan = false;\
+             globalThis.__zeroIntervalTicks = 0;\
+             setTimeout(() => {\
+               globalThis.__outerTimerRan = true;\
+               globalThis.__zeroInterval = setInterval(\
+                 () => __zeroIntervalTicks++, 0);\
+             }, 0);",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "a repeating timer must yield between ticks; elapsed={elapsed:?}",
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__outerTimerRan").unwrap(),
+            serde_json::json!(true),
+        );
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        for _ in 0..5 {
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__zeroIntervalTicks").unwrap(),
+            serde_json::json!(6.0),
+            "the repeating timer must make one tick of progress per event-loop turn",
+        );
+        rt.execute_script("clear-zero-interval", "clearInterval(globalThis.__zeroInterval)")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn top_level_zero_delay_interval_clamps_after_six_ticks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "top-level-zero-interval",
+            "globalThis.__nestedTimerDelays = [];\
+             globalThis.__topInterval = setInterval(\
+               () => {\
+                 const nested = setTimeout(() => {}, 0);\
+                 __nestedTimerDelays.push(__obscura_nextPendingTimeoutDelay());\
+                 clearTimeout(nested);\
+               }, 0);",
+        )
+        .unwrap();
+
+        for _ in 0..7 {
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__nestedTimerDelays.length")
+                .unwrap(),
+            serde_json::json!(7.0),
+            "the interval must continue yielding and making progress",
+        );
+        let observed = rt.evaluate("globalThis.__nestedTimerDelays").unwrap();
+        let delays = observed.as_array().unwrap();
+        assert!(
+            delays[0].as_f64().unwrap() < 2.0,
+            "a shallow nested timer must remain unclamped: {delays:?}",
+        );
+        assert!(
+            delays[4].as_f64().unwrap() < 2.0,
+            "the fifth-level parent must remain below the clamp boundary: {delays:?}",
+        );
+        assert!(
+            delays[5].as_f64().unwrap() >= 2.0,
+            "a timer nested from the sixth interval task must receive the four-millisecond clamp: {delays:?}",
+        );
+        rt.execute_script("clear-top-interval", "clearInterval(globalThis.__topInterval)")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deeply_nested_interval_inherits_the_timer_task_nesting() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "deep-zero-interval",
+            "globalThis.__deepIntervalTicks = 0;\
+             function installDeepInterval(depth) {\
+               if (depth === 0) {\
+                 globalThis.__deepInterval = setInterval(\
+                   () => __deepIntervalTicks++, 0);\
+               } else {\
+                 setTimeout(() => installDeepInterval(depth - 1), 0);\
+               }\
+             }\
+             installDeepInterval(6);",
+        )
+        .unwrap();
+
+        for _ in 0..8 {
+            if rt.evaluate("globalThis.__deepInterval !== undefined")
+                .unwrap()
+                == serde_json::json!(true)
+            {
+                break;
+            }
+            rt.run_autonomous_event_loop_turn().await.unwrap();
+        }
+        assert_eq!(
+            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
+            serde_json::json!(0.0),
+            "an interval installed by a level-six timer must clamp before its first tick",
+        );
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__deepIntervalTicks").unwrap(),
+            serde_json::json!(1.0),
+        );
+        rt.execute_script(
+            "clear-deep-interval",
+            "clearInterval(globalThis.__deepInterval)",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn short_observation_deadline_does_not_terminate_the_active_task() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -5898,6 +6782,18 @@ mod tests {
             serde_json::json!("usable"),
             "the per-turn watchdog must leave the isolate reusable",
         );
+    }
+
+    #[test]
+    fn dropping_a_watchdog_cannot_terminate_later_work() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        {
+            let _cancelled = rt.arm_watchdog(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10472,6 +11368,45 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn intersection_delivery_recovers_across_document_replacement() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.run_page_init();
+        rt.execute_script(
+            "old-intersection-delivery",
+            r#"
+                globalThis.__intersectionReplacementOrder = [];
+                const oldObserver = new IntersectionObserver(() => {
+                    __intersectionReplacementOrder.push("old");
+                });
+                oldObserver._records.push({ old: true });
+                oldObserver._check([], false, new Map());
+            "#,
+        )
+        .unwrap();
+
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.execute_script(
+            "fresh-intersection-delivery",
+            r#"
+                const freshObserver = new IntersectionObserver(() => {
+                    __intersectionReplacementOrder.push("fresh");
+                });
+                freshObserver._records.push({ fresh: true });
+                freshObserver._check([], false, new Map());
+            "#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__intersectionReplacementOrder").unwrap(),
+            serde_json::json!(["fresh"]),
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn intersection_observer_element_root_uses_live_padding_box_and_scroll() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -13719,6 +14654,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_exposes_stream_and_consumption_state() {
+        // #818: a non-null Response body must expose a ReadableStream through
+        // .body, a boolean .bodyUsed, and a working getReader(); consuming
+        // the body marks it used and a second consumption throws.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const r = new Response("hello");
+                    const meta = {
+                        bodyType: r.body === null ? "null" : typeof r.body,
+                        bodyUsed: r.bodyUsed,
+                        hasReader: !!(r.body && r.body.getReader),
+                    };
+                    const reader = r.body.getReader();
+                    const first = await reader.read();
+                    const second = await reader.read();
+                    const chunkText = first.value ? new TextDecoder().decode(first.value) : "";
+                    const consumed = r.bodyUsed;
+                    let doubleThrew = false;
+                    try { await r.text(); } catch (e) { doubleThrew = true; }
+                    return { meta, chunkText, done: second.done, consumed, doubleThrew, nullBody: new Response(null).body === null };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .expect("evaluation must succeed");
+        let out = result.value.unwrap();
+        assert_eq!(out["meta"]["bodyType"], "object");
+        assert_eq!(out["meta"]["bodyUsed"], false);
+        assert_eq!(out["meta"]["hasReader"], true);
+        assert_eq!(out["chunkText"], "hello");
+        assert_eq!(out["done"], true);
+        assert_eq!(out["consumed"], true);
+        assert_eq!(out["doubleThrew"], true);
+        assert_eq!(out["nullBody"], true);
+    }
+
     #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -13915,14 +14890,188 @@ mod tests {
         assert_eq!(result.value.unwrap().as_str().unwrap(), "async-ok");
     }
 
+    // This test used to assert that a rejection came back as `Err`. It does
+    // not any more, and the old expectation was the defect: CDP answers the
+    // command and reports the rejected value through `exceptionDetails`, so
+    // failing the command loses the page error rather than delivering it.
     #[tokio::test(flavor = "current_thread")]
     async fn test_evaluate_for_cdp_reports_promise_rejection() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let err = rt
+        let info = rt
             .evaluate_for_cdp("Promise.reject(new Error('boom'))", true, true)
             .await
-            .unwrap_err();
-        assert!(err.contains("boom"));
+            .expect("a rejection is answered, not failed");
+        assert!(info.thrown, "the rejected value must be marked as thrown");
+        assert_eq!(info.js_type, "object");
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert_eq!(info.class_name, "Error");
+        assert!(
+            info.description.contains("boom"),
+            "the description is what a client rebuilds the error from: {}",
+            info.description
+        );
+        // Reported by reference, never serialized: an Error has no own
+        // enumerable properties, so by value it would be `{}`.
+        assert!(info.value.is_none());
+        assert!(info.object_id.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_marks_a_rejection_instead_of_returning_it() {
+        // The reported shape: returnByValue on a rejected call answered
+        // successfully with `{}`, because the wrapper stored the error under
+        // the object id a success uses and nothing said which branch ran.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .call_function_on_for_cdp("() => Promise.reject(new Error('boom'))", None, &[], true, true)
+            .await
+            .expect("a rejection is answered, not failed");
+        assert!(info.thrown, "expected a thrown value, got {:?}", info.value);
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert!(info.description.contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_separates_a_rejected_object_from_a_resolved_one() {
+        // The sharper half of the same defect: rejecting with a plain object
+        // produced a reply byte-identical to resolving with it, so no client
+        // could tell the two apart.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let resolved = rt
+            .call_function_on_for_cdp("() => Promise.resolve({code: 42})", None, &[], true, true)
+            .await
+            .unwrap();
+        let rejected = rt
+            .call_function_on_for_cdp("() => Promise.reject({code: 42})", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(!resolved.thrown);
+        assert!(rejected.thrown);
+        assert_eq!(resolved.value, Some(serde_json::json!({"code": 42})));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_synchronous_throw_is_reported_instead_of_swallowed() {
+        // The sync wrapper answered a throw with `__result = undefined`, so the
+        // command succeeded and the page error vanished. A client cannot tell
+        // that from an expression that genuinely has no value.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("undefined_variable_xyz", false, false)
+            .await
+            .expect("a page error is not a protocol failure");
+        assert!(info.thrown, "a ReferenceError must come back flagged thrown");
+        assert_eq!(info.subtype.as_deref(), Some("error"));
+        assert!(
+            info.description.contains("ReferenceError"),
+            "the description is what a client rebuilds the error from: {:?}",
+            info.description
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_synchronous_throw_is_reported_when_a_value_was_asked_for() {
+        // returnByValue took a different route entirely, through `evaluate`,
+        // whose wrapper answers an exception with null. That is the shape a
+        // Puppeteer `page.evaluate` uses most, and it reported success.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("undefined_variable_xyz", true, false)
+            .await
+            .expect("a page error is not a protocol failure");
+        assert!(info.thrown, "a ReferenceError must not serialize to null");
+        assert!(info.description.contains("ReferenceError"));
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_throw_statement_is_run_as_a_script_not_wrapped_in_parentheses() {
+        // `Runtime.evaluate` takes a script. Pasted into `(...)` a throw is a
+        // parse-time SyntaxError, which no catch can see, so the whole command
+        // failed at the protocol level instead of reporting the page's error.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("throw new Error('boom')", false, false)
+            .await
+            .expect("a throw statement must be evaluated, not rejected as invalid");
+        assert!(info.thrown);
+        assert!(
+            info.description.contains("boom"),
+            "the thrown error must survive: {:?}",
+            info.description
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_statement_bundle_yields_its_completion_value() {
+        // Chrome reports the completion value of the script. The old wrapper
+        // put statement bundles in a function body with no `return`, so every
+        // one of them evaluated to the wrapper's own undefined.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("var completion_x = 1; completion_x * 2", true, false)
+            .await
+            .expect("statement bundles are valid input");
+        assert!(!info.thrown);
+        // Compared as a number rather than against a literal: the engine
+        // boxes every number as f64, so `json!(2)` would not match `2.0`.
+        // That spelling is its own defect and does not belong to this test.
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(2.0),
+            "the bundle's completion value, not the wrapper's undefined"
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_trailing_semicolon_and_source_url_still_parse() {
+        // Both were handled by hand before: the semicolon had to be trimmed or
+        // `(expr;)` failed to parse, and the sourceURL comment had to be closed
+        // by a newline or it swallowed the wrapper's own paren. Passing the
+        // script as a string removes the class, so these pin that it stays gone.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let info = rt
+            .evaluate_for_cdp("(() => 7)();", true, false)
+            .await
+            .expect("a trailing semicolon is legal");
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(7.0)
+        );
+    
+        let info = rt
+            .evaluate_for_cdp("(() => 8)()\n//# sourceURL=__puppeteer_evaluation_script__", true, false)
+            .await
+            .expect("a trailing sourceURL comment is legal");
+        assert_eq!(
+            info.value.as_ref().and_then(serde_json::Value::as_f64),
+            Some(8.0)
+        );
+    }
+    
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejection_does_not_leak_into_the_next_call() {
+        // `__obscura_await_rejected` is a global, so the success branch has to
+        // clear it. Without that the first rejection would mark every later
+        // call on the same runtime as thrown.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let rejected = rt
+            .call_function_on_for_cdp("() => Promise.reject(new Error('first'))", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(rejected.thrown);
+        let after = rt
+            .call_function_on_for_cdp("() => Promise.resolve(7)", None, &[], true, true)
+            .await
+            .unwrap();
+        assert!(!after.thrown, "a later success was still marked as thrown");
+        assert_eq!(after.value.unwrap().as_f64(), Some(7.0));
+
+        let evaluated = rt
+            .evaluate_for_cdp("Promise.resolve(8)", true, true)
+            .await
+            .unwrap();
+        assert!(!evaluated.thrown);
+        assert_eq!(evaluated.value.unwrap().as_f64(), Some(8.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15198,7 +16347,10 @@ mod tests {
             }
         });
 
-        let origin = format!("http://{address}");
+        redirect_runtime_for_origin(&format!("http://{address}"))
+    }
+
+    fn redirect_runtime_for_origin(origin: &str) -> ObscuraJsRuntime {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url(&format!("{origin}/page"));
@@ -15211,6 +16363,74 @@ mod tests {
         ));
         rt.run_page_init();
         rt
+    }
+
+    fn redirect_method_runtime(
+        status: u16,
+    ) -> (
+        ObscuraJsRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_capture = requests.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 2048];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                requests_capture
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_string());
+                let response = if request.contains(" /start ") {
+                    format!(
+                        "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        (
+            redirect_runtime_for_origin(&format!("http://{address}")),
+            requests,
+        )
+    }
+
+    fn cross_origin_redirect_runtime() -> ObscuraJsRuntime {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = target.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        });
+
+        let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source_address = source.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = source.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        redirect_runtime_for_origin(&format!("http://{source_address}"))
     }
 
     /// HTTP-redirect fetch returns a network error as soon as the
@@ -15233,6 +16453,248 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.value.unwrap(), serde_json::json!("arrived"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_response_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(3);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    const direct = await fetch("/hop/0");
+                    return {
+                        url: response.url,
+                        redirected: response.redirected,
+                        cloneUrl: response.clone().url,
+                        directRedirected: direct.redirected,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert!(
+            value["url"].as_str().unwrap_or_default().ends_with("/hop/0"),
+            "Response.url did not report the final URL: {value}"
+        );
+        assert_eq!(value["redirected"], true);
+        assert_eq!(value["cloneUrl"], value["url"]);
+        assert_eq!(value["directRedirected"], false);
+
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].url.ends_with("/hop/0"),
+            "network response event did not report the final URL: {:?}",
+            events[0].url
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_fetch_response_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(2);
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                obscura_net::CookieJar::new(),
+            )),
+        ));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1");
+                    return { url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.unwrap();
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/hop/0"));
+        assert_eq!(value["redirected"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xhr_response_url_reports_the_final_redirect_url() {
+        let mut rt = redirect_chain_runtime(2);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/hop/1");
+                    xhr.onload = () => resolve(xhr.responseURL);
+                    xhr.onerror = reject;
+                    xhr.send();
+                })"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .value
+                .unwrap()
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("/hop/0")
+        );
+    }
+
+    async fn assert_post_redirect_method(status: u16, expected_method: &str) {
+        let (mut rt, wire_requests) = redirect_method_runtime(status);
+        let request_callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response_callbacks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let request_capture = request_callbacks.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            request_capture
+                .lock()
+                .unwrap()
+                .push((request.method.clone(), request.url.path().to_string()));
+        }));
+        let response_capture = response_callbacks.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, response| {
+            response_capture.lock().unwrap().push((
+                request.method.clone(),
+                request.url.path().to_string(),
+                response.url.path().to_string(),
+                response.redirected_from.len(),
+            ));
+        }));
+        rt.set_callbacks(callbacks);
+
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { method: "POST", body: "payload" });
+                    return { url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/final"));
+        assert_eq!(value["redirected"], true);
+        assert_eq!(
+            *request_callbacks.lock().unwrap(),
+            vec![("POST".to_string(), "/start".to_string())]
+        );
+        assert_eq!(
+            *response_callbacks.lock().unwrap(),
+            vec![(
+                expected_method.to_string(),
+                "/final".to_string(),
+                "/final".to_string(),
+                1,
+            )]
+        );
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, expected_method);
+        assert!(events[0].url.ends_with("/final"));
+        let wire_requests = wire_requests.lock().unwrap();
+        assert!(wire_requests[0].starts_with("POST /start "));
+        assert!(wire_requests[1].starts_with(&format!("{expected_method} /final ")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_302_response_uses_the_final_get_method() {
+        assert_post_redirect_method(302, "GET").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_307_response_preserves_the_post_method() {
+        assert_post_redirect_method(307, "POST").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_no_cors_redirect_keeps_response_identity() {
+        let mut rt = redirect_chain_runtime(2);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/hop/1", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.unwrap();
+        assert_eq!(value["type"], "basic");
+        assert!(value["url"].as_str().unwrap_or_default().ends_with("/hop/0"));
+        assert_eq!(value["redirected"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_no_cors_redirect_filters_response_identity() {
+        let mut rt = cross_origin_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cross_origin_no_cors_filters_response_identity() {
+        let mut rt = cross_origin_redirect_runtime();
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::new(std::sync::Arc::new(
+                obscura_net::CookieJar::new(),
+            )),
+        ));
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const response = await fetch("/start", { mode: "no-cors" });
+                    return { type: response.type, url: response.url, redirected: response.redirected };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+        );
     }
 
     /// The other end of the same pair: the twenty-first redirect must
@@ -17576,6 +19038,47 @@ mod tests {
             "Intl must not leak the host OS locale while navigator.language says en-US"
         );
     }
+
+    // Momentic POC / Playwright getByLabel: the label association getters must
+    // link <label for> to its control and expose element.labels, both for
+    // for-linked and wrapping labels.
+    #[test]
+    fn label_control_and_labels_link_labelable_elements() {
+        let mut rt = setup_runtime(
+            r#"<html><body>
+            <label for="name" id="l1">Name</label><input id="name">
+            <label id="l2">Age <input id="age"></label>
+            <input type="hidden" id="hid">
+            <div id="plain"></div>
+            </body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    var l1 = document.getElementById('l1');
+                    var l2 = document.getElementById('l2');
+                    var name = document.getElementById('name');
+                    var age = document.getElementById('age');
+                    var hid = document.getElementById('hid');
+                    var plain = document.getElementById('plain');
+                    return [
+                        l1.control === name,
+                        l2.control === age,
+                        name.labels.length,
+                        name.labels[0] === l1,
+                        age.labels.length,
+                        age.labels[0] === l2,
+                        hid.labels.length,
+                        plain.labels.length,
+                        plain.control === null,
+                    ].join(',');
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("true,true,1,true,1,true,0,0,true"),
+            "label association must follow the HTML labelable-element rules"
+        );
+    }
 }
-
-

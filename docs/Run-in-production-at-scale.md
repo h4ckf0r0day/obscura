@@ -1,6 +1,10 @@
 ## Docker
 
 ```bash
+# The container runs as uid 65532, so a mounted storage dir must be writable
+# by it. Without this the cookie jar silently fails to persist.
+sudo install -d -o 65532 -g 65532 /srv/obscura/data
+
 docker run -d \
   --name obscura \
   --restart unless-stopped \
@@ -11,6 +15,38 @@ docker run -d \
 ```
 
 The image runs `obscura serve` by default. Override with arguments after the image name.
+
+### The container does not run as root
+
+The image is built on `gcr.io/distroless/cc-debian12:nonroot` and runs as
+uid/gid **65532**. Obscura executes untrusted page JavaScript in-process through
+V8, so a V8 exploit lands with the process's privileges — there is no reason for
+those to be root's.
+
+Two consequences worth knowing:
+
+- **A mounted `--storage-dir` must be writable by uid 65532**, as above. This is
+  the one thing that breaks quietly rather than loudly. Verified: with an
+  unwritable storage dir Obscura completes the run, exits `0`, and prints no
+  warning — the cookie jar simply never persists. Check that
+  `{storage-dir}/cookies.json` exists after your first run rather than assuming
+  it does.
+- **Nothing in the image needs a privileged operation.** It binds an
+  unprivileged port, reads the CA bundle, and writes only to the storage dir and
+  a temp dir. Verified in the non-root image: an HTTPS fetch succeeds, so the CA
+  bundle is readable, and a writable storage dir is populated.
+
+### Why the in-container bind is `0.0.0.0`
+
+A container-loopback bind is unreachable through `-p`, so `--host 0.0.0.0` is
+required for the published port to work at all. Publish to **host loopback**
+(`-p 127.0.0.1:9222:9222`, as above) rather than `-p 9222:9222`: the latter
+exposes the port on every host interface, and Docker's iptables rules bypass
+most host firewalls.
+
+The CDP control plane has no authentication of its own: anything that can reach
+the port can drive the browser. See [Authentication](#authentication) for the
+controls that actually gate it.
 
 ## Systemd
 

@@ -1110,9 +1110,14 @@ async fn fetch_original_response(
     if stealth && url.scheme() != "file" {
         #[cfg(feature = "stealth")]
         {
+            // `false` matches the reqwest path below (`with_options`); the
+            // CLI mirrors --allow-private-network into
+            // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
+            // honours.
             let client = obscura_net::StealthHttpClient::with_proxy(
                 Arc::new(obscura_net::CookieJar::new()),
                 proxy.as_deref(),
+                false,
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
@@ -1396,6 +1401,28 @@ fn dump_markdown(page: &mut Page) -> String {
     result.as_str().unwrap_or_default().to_string()
 }
 
+fn is_html_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+fn append_readable_text_segment(result: &mut String, pending_space: &mut bool, contents: &str) {
+    let trimmed = contents.trim_matches(is_html_whitespace);
+    if trimmed.is_empty() {
+        if contents.chars().any(is_html_whitespace) {
+            *pending_space = true;
+        }
+        return;
+    }
+
+    let begins_with_space = contents.chars().next().is_some_and(is_html_whitespace);
+    let result_ends_with_space = result.chars().next_back().is_some_and(char::is_whitespace);
+    if (*pending_space || begins_with_space) && !result.is_empty() && !result_ends_with_space {
+        result.push(' ');
+    }
+    result.push_str(trimmed);
+    *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
+}
+
 fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
@@ -1415,6 +1442,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
     const MAX_NODES: usize = 5_000_000;
 
     let mut result = String::new();
+    let mut pending_space = false;
     let mut stack: Vec<Work> = vec![Work::Visit(node_id)];
     let mut visited = 0usize;
 
@@ -1422,6 +1450,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
         let id = match work {
             Work::Newline => {
                 result.push('\n');
+                pending_space = false;
                 continue;
             }
             Work::Visit(id) => id,
@@ -1439,10 +1468,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
 
         match &node.data {
             NodeData::Text { contents } => {
-                let trimmed = contents.trim();
-                if !trimmed.is_empty() {
-                    result.push_str(trimmed);
-                }
+                append_readable_text_segment(&mut result, &mut pending_space, contents);
             }
             NodeData::Element { name, .. } => {
                 let tag = name.local.as_ref();
@@ -1495,6 +1521,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
 
                 if is_block {
                     result.push('\n');
+                    pending_space = false;
                     // Processed after all children (stack is LIFO): the trailing newline.
                     stack.push(Work::Newline);
                 }

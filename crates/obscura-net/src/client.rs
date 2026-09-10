@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -242,7 +242,13 @@ impl ResourceRequest {
             referrer: Some(referrer.clone()),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
-            max_response_bytes: 32 * 1024 * 1024,
+            // OBSCURA_FETCH_MAX_BODY_BYTES (the fetch()/XHR override from #581)
+            // also raises this cap: a large SPA bundle otherwise dies silently
+            // at 32 MiB while fetch() of the same URL succeeds (#849).
+            max_response_bytes: std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32 * 1024 * 1024),
         }
     }
 
@@ -573,18 +579,43 @@ pub fn env_allows_private_network() -> bool {
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()
+                || o[0] == 0
+                // std's is_private() covers only RFC1918, so add the IANA
+                // special-purpose ranges that also host internal services and
+                // are common SSRF targets:
+                //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
+                //                  Alibaba 100.100.100.200) lives here.
+                //   198.18.0.0/15  benchmarking / RFC2544.
+                //   192.88.99.0/24 6to4 relay anycast / RFC7526.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+                // Most of 192.0.0.0/24 is special-purpose and not globally
+                // reachable. Keep the two globally reachable PCP anycast
+                // assignments usable rather than blocking the entire /24.
+                || (o[0] == 192
+                    && o[1] == 0
+                    && o[2] == 0
+                    && o[3] != 9
+                    && o[3] != 10)
+                // 240.0.0.0/4 is reserved (255.255.255.255 was already
+                // covered by is_broadcast()).
+                || o[0] >= 240
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || v6.is_multicast()
             {
                 return true;
             }
@@ -594,7 +625,40 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                 return is_forbidden_ip(IpAddr::V4(v4));
             }
-            false
+
+            let s = v6.segments();
+            // IPv4/IPv6 translation prefix (RFC 6052). Only /96 has a fixed
+            // embedded-address position; the local-use /48 is therefore
+            // blocked outright below.
+            if s[0] == 0x64
+                && s[1] == 0xff9b
+                && s[2] == 0
+                && s[3] == 0
+                && s[4] == 0
+                && s[5] == 0
+            {
+                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    s[6] as u8,
+                    (s[7] >> 8) as u8,
+                    s[7] as u8,
+                )));
+            }
+            // 6to4 carries its IPv4 endpoint in bits 16..48.
+            if s[0] == 0x2002 {
+                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    s[1] as u8,
+                    (s[2] >> 8) as u8,
+                    s[2] as u8,
+                )));
+            }
+
+            // Discard-only, local-use NAT64, and documentation prefixes.
+            (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
         }
     }
 }
@@ -1396,11 +1460,16 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
+        // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
+        // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
+        // (the initial one plus 20 hops), so the 20th redirect is still followed
+        // and only the 21st fails. The old `0..max_redirects` made 20 requests
+        // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
-        for _redirect_count in 0..max_redirects {
+        for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
@@ -1721,6 +1790,67 @@ mod ssrf_tests {
         }
     }
 
+    // SEC-401 / #810 — std's is_private() only covers RFC1918, so CGNAT and
+    // other IANA special-purpose ranges (which host cloud metadata) must be
+    // blocked explicitly, including their IPv4-mapped IPv6 forms.
+    #[test]
+    fn ipv4_cgnat_and_iana_special_ranges_are_forbidden() {
+        for s in [
+            "100.64.0.1",             // CGNAT / RFC 6598 start
+            "100.100.100.200",        // Alibaba Cloud metadata (CGNAT)
+            "100.127.255.255",        // CGNAT end
+            "198.18.0.1",             // benchmarking / RFC 2544 start
+            "198.19.255.255",         // benchmarking end
+            "192.88.99.1",            // 6to4 relay anycast / RFC 7526
+            "::ffff:100.100.100.200", // v4-mapped CGNAT
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+    }
+
+    // Addresses just outside those prefixes must stay allowed (no over-block).
+    #[test]
+    fn ipv4_addresses_adjacent_to_special_ranges_stay_allowed() {
+        for s in [
+            "100.63.255.255", // just below 100.64.0.0/10
+            "100.128.0.0",    // just above 100.127.255.255
+            "198.17.255.255", // just below 198.18.0.0/15
+            "198.20.0.0",     // just above 198.19.255.255
+            "192.88.98.255",  // just below 192.88.99.0/24
+            "192.88.100.0",   // just above 192.88.99.0/24
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn remaining_non_global_ipv4_ranges_are_forbidden_without_blocking_exceptions() {
+        for s in [
+            "0.1.2.3",
+            "192.0.0.8",
+            "192.0.0.192",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.254",
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+
+        // IANA marks these specific protocol anycast addresses and these
+        // special-purpose /24s globally reachable. Blocking them would be a
+        // network compatibility regression, not an SSRF hardening win.
+        for s in [
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.175.48.1",
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
     #[test]
     fn ipv6_loopback_ula_linklocal_and_mapped_are_forbidden() {
         for s in [
@@ -1738,7 +1868,45 @@ mod ssrf_tests {
 
     #[test]
     fn public_ipv6_is_allowed() {
-        assert!(!is_forbidden_ip(ip("2606:4700:4700::1111"))); // cloudflare dns
+        for s in [
+            "2606:4700:4700::1111", // Cloudflare DNS
+            "3ffe::1",               // below 3fff::/20
+            "3fff:1000::1",          // above 3fff:fff::/20
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_translation_cannot_hide_forbidden_ipv4() {
+        for s in [
+            "2002:7f00:1::",       // 6to4 loopback
+            "2002:a9fe:a9fe::",    // 6to4 link-local metadata
+            "2002:6464:64c8::",    // 6to4 CGNAT metadata
+            "64:ff9b::7f00:1",     // NAT64 loopback
+            "64:ff9b::a9fe:a9fe",  // NAT64 link-local metadata
+            "64:ff9b::6464:64c8",  // NAT64 CGNAT metadata
+            "64:ff9b:1::1",        // local-use translation prefix
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+
+        for s in ["2002:808:808::", "64:ff9b::808:808"] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn native_non_global_ipv6_ranges_are_forbidden() {
+        for s in [
+            "100::1",       // discard-only
+            "2001:db8::1",  // documentation
+            "3fff::1",      // documentation
+            "ff02::1",      // link-local multicast
+            "ff0e::1",      // global-scope multicast
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
     }
 
     #[test]
@@ -1747,6 +1915,16 @@ mod ssrf_tests {
         assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false).is_err());
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), false).is_err());
         assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
+        assert!(
+            validate_url(&Url::parse("http://[64:ff9b::7f00:1]/").unwrap(), false).is_err()
+        );
+        assert!(
+            validate_url(&Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(), false).is_err()
+        );
+        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), false).is_ok());
+        assert!(
+            validate_url(&Url::parse("http://[64:ff9b::808:808]/").unwrap(), false).is_ok()
+        );
         // The allow flag bypasses the guard (local-dev escape hatch).
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
     }
@@ -1860,6 +2038,36 @@ mod ssrf_tests {
         )
     }
 
+    fn redirect_to_self() -> String {
+        "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
+    // followed, the 21st must fail. Guards the `0..=max_redirects` boundary in
+    // fetch_with_profile_uncached; `0..max_redirects` regressed this to 19.
+    #[tokio::test]
+    async fn navigation_follows_twenty_redirects_but_not_twenty_one() {
+        let mut pass: Vec<String> = (0..20).map(|_| redirect_to_self()).collect();
+        pass.push(ok_response("", "arrived"));
+        let (target, _rx) = http_fixture(pass).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("the 20th redirect must be followed");
+        assert_eq!(response.body, b"arrived");
+
+        let fail: Vec<String> = (0..21).map(|_| redirect_to_self()).collect();
+        let (target, _rx) = http_fixture(fail).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let err = client
+            .fetch(&target)
+            .await
+            .expect_err("the 21st redirect must be too many");
+        assert!(matches!(err, ObscuraNetError::TooManyRedirects(_)), "got {err:?}");
+    }
+
     #[tokio::test]
     async fn cross_origin_font_sends_origin_and_omits_cross_origin_cookies() {
         let (target, mut received) = http_fixture(vec![ok_response(
@@ -1887,6 +2095,37 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-dest: font\r\n"));
         assert!(!request.contains("cookie:"));
         assert_eq!(jar.get_cookie_header(&target), "seed=1");
+    }
+
+    // #849 — the OBSCURA_FETCH_MAX_BODY_BYTES override #581 gave fetch()/XHR
+    // must also reach the module-script cap; a large SPA bundle otherwise dies
+    // silently at a hardcoded 32 MiB while fetch() of the same URL succeeds.
+    // (nextest runs each test in its own process, so set_var cannot race.)
+    #[test]
+    fn module_script_cap_honours_the_fetch_body_env_override() {
+        let u = Url::parse("https://example.com/app.mjs").unwrap();
+
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+            "default module cap stays 32 MiB"
+        );
+
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "134217728");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            128 * 1024 * 1024,
+            "the env override must reach the module-script cap"
+        );
+
+        // Garbage stays on the default rather than panicking.
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "not-a-number");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+        );
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
     }
 
     #[tokio::test]

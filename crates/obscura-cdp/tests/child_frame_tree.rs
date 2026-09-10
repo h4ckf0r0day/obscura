@@ -183,3 +183,141 @@ async fn get_frame_tree_reports_nested_child_frames() {
         .count();
     assert_eq!(repeats, 0, "the same frame was announced twice");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn isolated_worlds_are_owned_by_their_exact_frame() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url}), &session).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let target = ctx.sessions[&session].clone();
+    let attached = dispatch(
+        &CdpRequest {
+            id: 3,
+            method: "Target.attachToTarget".to_string(),
+            params: json!({"targetId": target, "flatten": true}),
+            session_id: None,
+        },
+        &mut ctx,
+    ).await.result.unwrap();
+    let second_session = attached["sessionId"].as_str().unwrap().to_string();
+    for runtime_session in [&session, &second_session] {
+        cdp(&mut ctx, 3, "Runtime.enable", json!({}), runtime_session).await;
+    }
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let main_id = tree["frameTree"]["frame"]["id"].as_str().unwrap().to_string();
+    let child_id = tree["frameTree"]["childFrames"][0]["frame"]["id"]
+        .as_str().unwrap().to_string();
+    let grandchild_id = tree["frameTree"]["childFrames"][0]["childFrames"][0]["frame"]["id"]
+        .as_str().unwrap().to_string();
+
+    let main_world = cdp(
+        &mut ctx, 5, "Page.createIsolatedWorld",
+        json!({"frameId": main_id.clone(), "worldName": "utility"}), &session,
+    ).await["executionContextId"].as_i64().unwrap();
+    let child_world = cdp(
+        &mut ctx, 6, "Page.createIsolatedWorld",
+        json!({"frameId": child_id.clone(), "worldName": "utility"}), &session,
+    ).await["executionContextId"].as_i64().unwrap();
+    let grandchild_world = cdp(
+        &mut ctx, 7, "Page.createIsolatedWorld",
+        json!({"frameId": grandchild_id.clone(), "worldName": "utility"}), &session,
+    ).await["executionContextId"].as_i64().unwrap();
+    assert_ne!(main_world, child_world);
+    assert_ne!(child_world, grandchild_world);
+
+    let unknown = dispatch(
+        &CdpRequest {
+            id: 8,
+            method: "Page.createIsolatedWorld".to_string(),
+            params: json!({"frameId": "missing-frame", "worldName": "utility"}),
+            session_id: Some(session.clone()),
+        },
+        &mut ctx,
+    ).await;
+    assert!(unknown.error.unwrap().message.contains("No frame with given id"));
+
+    ctx.pending_events.clear();
+    cdp(
+        &mut ctx,
+        9,
+        "Runtime.evaluate",
+        json!({"expression": "document.querySelector('iframe').remove()"}),
+        &session,
+    ).await;
+    for _ in 0..3 {
+        ctx.get_session_page_mut(&Some(session.clone()))
+            .unwrap()
+            .run_autonomous_event_loop_turn()
+            .await
+            .unwrap();
+    }
+    cdp(&mut ctx, 10, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+
+    for (frame_id, context_id) in [
+        (&child_id, child_world),
+        (&grandchild_id, grandchild_world),
+    ] {
+        for runtime_session in [&session, &second_session] {
+            let destroyed = ctx.pending_events.iter().position(|event| {
+                event.method == "Runtime.executionContextDestroyed"
+                    && event.session_id.as_deref() == Some(runtime_session.as_str())
+                    && event.params["executionContextId"] == context_id
+            }).unwrap_or_else(|| panic!(
+                "missing executionContextDestroyed for {frame_id}/{context_id}: {:?}",
+                ctx.pending_events.iter().map(|event| (
+                    event.method.as_str(),
+                    event.session_id.as_deref(),
+                    event.params.clone(),
+                )).collect::<Vec<_>>(),
+            ));
+            let detached = ctx.pending_events.iter().position(|event| {
+                event.method == "Page.frameDetached"
+                    && event.session_id.as_deref() == Some(runtime_session.as_str())
+                    && event.params["frameId"] == frame_id.as_str()
+            }).expect("missing frameDetached");
+            assert!(destroyed < detached, "context must be destroyed before its frame detaches");
+        }
+    }
+
+    let main_still_routes = dispatch(
+        &CdpRequest {
+            id: 11,
+            method: "Runtime.evaluate".to_string(),
+            params: json!({"expression": "1", "contextId": main_world}),
+            session_id: Some(session.clone()),
+        },
+        &mut ctx,
+    ).await;
+    assert!(main_still_routes.error.is_none());
+    for (id, stale_context) in [(12, child_world), (13, grandchild_world)] {
+        let stale = dispatch(
+            &CdpRequest {
+                id,
+                method: "Runtime.evaluate".to_string(),
+                params: json!({"expression": "1", "contextId": stale_context}),
+                session_id: Some(session.clone()),
+            },
+            &mut ctx,
+        ).await;
+        assert!(stale.error.unwrap().message.contains("Cannot find context"));
+    }
+
+    ctx.pending_events.clear();
+    cdp(
+        &mut ctx, 14, "Page.navigate",
+        json!({"url": "data:text/html,<p>replacement</p>", "waitUntil": "load"}),
+        &session,
+    ).await;
+    let recreated = ctx.pending_events.iter().filter(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["name"] == "utility"
+    }).collect::<Vec<_>>();
+    assert_eq!(recreated.len(), 1, "only the main-frame world should persist");
+    assert_eq!(recreated[0].params["context"]["auxData"]["frameId"], main_id);
+
+}

@@ -4661,6 +4661,48 @@ fn paint_laid_dom_scrolled(
                 .unwrap_or(false)
                 || (name.local.as_ref() == "textarea"
                     && !tree.text_content(nid).is_empty());
+            // A text `<input>`'s value is not a DOM text node either, so it
+            // needs painting from the attribute the same way. Without this the
+            // control renders empty however it was filled in — from markup,
+            // from script, or by typing — while its `value` reads back
+            // correctly, so only a screenshot or PDF shows anything wrong.
+            // `<textarea>` is unaffected: its value *is* a text node.
+            if has_value && name.local.as_ref() == "input" {
+                if let Some(value) = node.get_attribute("value") {
+                    if !value.is_empty() {
+                        let fsize = style.font_size.unwrap_or(16.0);
+                        let text_x = rect.x + style.padding.left + style.border.left;
+                        let text_y = rect.y + style.padding.top + style.border.top;
+                        let color = style.color.unwrap_or([0, 0, 0, 255]);
+                        let masked;
+                        let shown = if node
+                            .get_attribute("type")
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+                        {
+                            masked = "\u{2022}".repeat(value.chars().count());
+                            masked.as_str()
+                        } else {
+                            value
+                        };
+                        if color[3] != 0 {
+                            draw_text(
+                                &mut pixmap,
+                                shown,
+                                text_x,
+                                text_y,
+                                color,
+                                fsize,
+                                false,
+                                style.font_family.as_deref(),
+                                style.letter_spacing.unwrap_or(0.0),
+                                clip,
+                                element_clip_mask,
+                                raster_scale,
+                            );
+                        }
+                    }
+                }
+            }
             if !has_value {
                 if let Some(placeholder) = node.get_attribute("placeholder") {
                     if !placeholder.is_empty() {
@@ -11634,10 +11676,21 @@ mod tests {
             "the authored placeholder color must reach glyph paint"
         );
         assert_eq!(non_white(60), 0, "opacity:0 must suppress placeholder glyphs");
-        assert_eq!(
-            non_white(90),
-            0,
-            "a non-empty control value must suppress placeholder glyphs"
+        // `#filled` carries `value="actual"`, so the placeholder is suppressed
+        // and the value paints in its place — Chromium 147 renders the value
+        // here too. Assert glyphs are present *and* that they are the value's
+        // near-black text rather than the grey `rgb(117,117,117)` placeholder,
+        // so this still fails if the placeholder leaks through.
+        assert!(
+            non_white(90) > 10,
+            "a control's value must paint where its placeholder is suppressed"
+        );
+        assert!(
+            (90..120).any(|y| (0..180).any(|x| {
+                let pixel = pixmap.pixel(x, y).unwrap();
+                pixel.red() < 60 && pixel.green() < 60 && pixel.blue() < 60
+            })),
+            "the painted glyphs must be the value's color, not the grey placeholder"
         );
     }
 
@@ -14997,6 +15050,41 @@ mod tests {
             computed.get("word-break").map(String::as_str),
             Some("keep-all")
         );
+    }
+
+    /// A text `<input>`'s value has no DOM text node, so it needs painting from
+    /// the attribute the way the placeholder does. Without it the control
+    /// rendered empty while `value` read back correctly — visible only in a
+    /// screenshot or PDF. `type=password` masks with bullets.
+    #[test]
+    fn input_values_paint_like_placeholders() {
+        let tree = parse_html(
+            r#"<html><head><style>
+                 body{margin:0;background:#fff}
+                 input{display:block;width:180px;height:30px;border:0;padding:0;font-size:16px}
+               </style></head><body>
+                 <input id="filled" value="ABC">
+                 <input id="empty">
+                 <input id="secret" type="password" value="ABC">
+               </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let mut prepared = prepare_dom(&tree, (200.0, 120.0), None, &mut resources)
+            .expect("input layout");
+        let pixmap = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("input paint");
+        let ink = |top: u32| {
+            (top..top + 30)
+                .flat_map(|y| (0..180).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = pixmap.pixel(x, y).unwrap();
+                    pixel.red() < 200 || pixel.green() < 200 || pixel.blue() < 200
+                })
+                .count()
+        };
+        assert!(ink(0) > 10, "a value from markup must paint");
+        assert_eq!(ink(30), 0, "an empty control paints nothing");
+        assert!(ink(60) > 10, "a password value must paint as bullets");
     }
 
     #[test]

@@ -65,6 +65,10 @@ impl FrameRealm {
             return None;
         }
         parent.copy_identity_to_realm(&context);
+        // A snapshot-created realm has null deno_core per-context state slots, so
+        // a promise rejection or dynamic import() in the frame would segfault in
+        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
+        parent.share_deno_context_state_with_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -135,9 +139,10 @@ impl FrameRealm {
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              globalThis.__documentReadyState__ = 'complete';\
              try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
-             if (typeof window.onload === 'function') { try { window.onload(); } catch (_) {} }\
-             try { window.dispatchEvent(new Event('load', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}",
+             try { const loadEvent = new Event('load', \
+                 { bubbles: false, cancelable: false }); \
+                 if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
+                 try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
         )
     }
 
@@ -559,6 +564,161 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_posted_task_runs_in_its_creation_realm() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            "<html><body><output id='result'>pending</output></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.__obscura_frameId = 0;\
+                 scheduler.postTask(() => {\
+                   document.getElementById('result').textContent = location.origin;\
+                 });",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "document.getElementById('result').textContent",
+                )
+                .unwrap(),
+            serde_json::json!("https://child.example"),
+        );
+        assert_eq!(
+            parent.evaluate("document.body.innerHTML").unwrap(),
+            serde_json::json!("")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_frame_cancels_its_queued_posted_task() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body data-owner='parent'></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/child",
+            "<html><body data-owner='frame'></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "const staleController = new AbortController();\
+                 globalThis.__staleController = staleController;\
+                 staleController.signal.removeEventListener = () => {\
+                   document.body.setAttribute('data-stale-cleanup', 'ran');\
+                   parent.postMessage('stale-cleanup', '*');\
+                 };\
+                 scheduler.postTask(() => {\
+                   document.body.setAttribute('data-stale-task', 'ran');\
+                   parent.postMessage('stale-posted-task', '*');\
+                 }, { signal: staleController.signal });\
+                 setTimeout(() => scheduler.postTask(() => {\
+                   document.body.setAttribute('data-delayed-stale-task', 'ran');\
+                   parent.postMessage('delayed-stale-posted-task', '*');\
+                 }), 1);",
+            )
+            .unwrap();
+        drop(frame);
+        parent.run_event_loop_bounded(100).await.unwrap();
+
+        assert!(
+            parent.take_pending_frame_messages().is_empty(),
+            "a posted task from the detached frame still executed",
+        );
+
+        assert_eq!(
+            parent.evaluate("document.body.getAttribute('data-owner')").unwrap(),
+            serde_json::json!("parent"),
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-delayed-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-stale-cleanup')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            parent
+                .evaluate(
+                    "(function(){\
+                       const window = globalThis.__obscura_frameObjects[1]?.window;\
+                       const controller = window?.__staleController;\
+                       return [typeof window, typeof controller,\
+                         controller?.signal?._listeners?.length];\
+                     })()",
+                )
+                .unwrap(),
+            serde_json::json!(["object", "object", 0]),
+            "the retained frame realm did not discard its scheduler listener",
+        );
+    }
+
+    #[test]
+    fn frame_body_onload_content_attribute_reflects_to_window() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            r#"<html><body onload="
+                globalThis.__frameBodyOnload = [this === window, event.type];
+                throw new Error('frame body onload failure');
+            "><script>
+                globalThis.__frameBodyOnload = null;
+                globalThis.__frameLoadListenerCalls = 0;
+                window.addEventListener('load', () => __frameLoadListenerCalls++);
+            </script></body></html>"#,
+        )
+        .expect("frame realm");
+
+        assert!(frame
+            .run_document_scripts(&mut parent, |_| None)
+            .is_empty());
+        frame
+            .dispatch_load_events(&mut parent)
+            .expect("frame load events");
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[globalThis.__frameBodyOnload, globalThis.__frameLoadListenerCalls]",
+                )
+                .unwrap(),
+            serde_json::json!([[true, "load"], 1]),
+        );
+    }
+
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
@@ -756,6 +916,46 @@ mod tests {
                 .unwrap(),
             serde_json::json!("https://child.example/"),
         );
+    }
+
+    // #850 / #841 — a promise rejection or dynamic import() inside a frame realm
+    // used to null-deref deno_core's global callbacks (which read per-context
+    // state from V8 embedder slots) and segfault the whole process. The realm
+    // must now alias the main realm's state so these run without crashing.
+    #[test]
+    fn a_frame_rejection_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        // Reaching this line at all (no SIGSEGV) is the regression check.
+        frame
+            .execute_script(&mut parent, "Promise.reject(new Error('boom')); 'ok'")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_frame_dynamic_import_does_not_crash_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(
+                &mut parent,
+                "import('data:text/javascript,export default 1').catch(() => {}); 'ok'",
+            )
+            .unwrap();
     }
 
     /// A frame posting to `parent` must reach the page, arrive trusted, and

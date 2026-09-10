@@ -41,16 +41,32 @@ RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
 
 # ---
 
-# distroless/cc: glibc + libgcc + CA certs only — no shell, no package manager
-FROM gcr.io/distroless/cc-debian12
+# distroless/cc: glibc + libgcc + CA certs only — no shell, no package manager.
+#
+# `:nonroot` runs as uid/gid 65532 instead of root. Obscura executes untrusted
+# page JavaScript in-process through V8, so a V8 exploit lands with the
+# process's privileges; there is no reason for those to be root's. The image
+# needs no privileged operation: it binds an unprivileged port, reads the CA
+# bundle, and writes only to the storage dir and a temp dir.
+#
+# The tag is deliberately not pinned to a digest. distroless is rebuilt often
+# with base-layer security patches, and tracking the tag picks those up; a
+# digest pin would freeze them until someone remembers to bump it, which for a
+# *base* image trades a real ongoing risk for a theoretical one.
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /build/target/release/obscura /obscura
 COPY --from=builder /build/target/release/obscura-worker /obscura-worker
 
 EXPOSE 9222
 
-# Bind to 0.0.0.0 so the port is reachable via `docker run -p 9222:9222`.
-# Native binary still defaults to 127.0.0.1 (loopback only) — this override
-# is just for the container.
+# Bind to 0.0.0.0 *inside the container*: a container-loopback bind is
+# unreachable through `-p`, so this is required for the port to work at all.
+# It is not a licence to expose the port — publish to host loopback
+# (`-p 127.0.0.1:9222:9222`) unless something in front of it enforces auth.
+# The native binary still defaults to 127.0.0.1.
+#
+# The CDP control plane has no authentication: anything that can reach this
+# port can drive the browser. Network isolation is the control.
 ENTRYPOINT ["/obscura"]
 CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]

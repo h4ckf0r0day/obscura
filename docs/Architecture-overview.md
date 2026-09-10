@@ -93,6 +93,16 @@ Adding a Web API usually means:
 
 Worked example: [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md).
 
+## Classic Web Workers
+
+The JavaScript shim executes each classic Worker source once and retains its
+message handlers and lexical state. Bare `onmessage` assignments target the
+worker scope, and messages posted before the source loads are queued until
+initialization finishes. Terminating a worker discards pending messages.
+
+Workers remain emulated within the page runtime, not separate V8 isolates or
+OS threads. This is not a complete WorkerGlobalScope implementation.
+
 ## CDP session model
 
 Each CDP client connection gets attached to one or more targets.

@@ -173,6 +173,7 @@ async fn send_get_with_connection_reset_retry(
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
+    allow_private_network: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -181,10 +182,14 @@ pub struct StealthHttpClient {
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None)
+        Self::with_proxy(cookie_jar, None, false)
     }
 
-    pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+    pub fn with_proxy(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+    ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -193,10 +198,11 @@ impl StealthHttpClient {
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
             .timeout(Duration::from_secs(30))
-            // SSRF guard: reject hostnames that resolve to a private/loopback IP.
-            // `false` mirrors the `validate_url(url, false)` calls below; the
+            // SSRF guard: reject hostnames that resolve to a private/loopback
+            // IP. Use the same opt-in as the `validate_url` calls below so
+            // `--allow-private-network` reaches this transport (#793); the
             // resolver still honours OBSCURA_ALLOW_PRIVATE_NETWORK on its own.
-            .dns_resolver(Arc::new(SsrfGuardResolver::new(false)))
+            .dns_resolver(Arc::new(SsrfGuardResolver::new(allow_private_network)))
             .redirect(wreq::redirect::Policy::none());
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
@@ -243,6 +249,7 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
+            allow_private_network,
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -277,7 +284,7 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, false)?;
+        validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes).await;
@@ -302,7 +309,9 @@ impl StealthHttpClient {
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
-        for _ in 0..20 {
+        // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
+        // 21 requests, so the 20th hop is followed and only the 21st fails.
+        for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
 
@@ -395,7 +404,7 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, false)?;
+                    validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -621,6 +630,7 @@ mod tests {
         let (port, server) = reset_fixture(false);
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
+            allow_private_network: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -677,5 +687,24 @@ mod tests {
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
+
+    // #793: the opt-in must reach the DNS resolver. `validate_url` already
+    // honours it for the localhost host, so a hostname target exercises the
+    // resolver itself; before the fix the resolver was pinned to block and
+    // refused loopback hostnames even with the flag set. Only the allowed
+    // leg is asserted: CI sets OBSCURA_ALLOW_PRIVATE_NETWORK, which also
+    // lifts the default block.
+    #[tokio::test]
+    async fn stealth_client_honors_allow_private_network_for_loopback_hostnames() {
+        let port = gzip_fixture().await;
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("http://localhost:{port}/")).unwrap();
+
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("loopback hostname must be reachable with the opt-in");
+        assert_eq!(resp.status, 200);
     }
 }

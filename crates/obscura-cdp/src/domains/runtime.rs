@@ -4,6 +4,29 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+pub(crate) fn execution_context_created_event(
+    context: &crate::dispatch::ExecutionContextRecord,
+    session_id: Option<String>,
+) -> crate::types::CdpEvent {
+    crate::types::CdpEvent {
+        method: "Runtime.executionContextCreated".to_string(),
+        params: json!({
+            "context": {
+                "id": context.id,
+                "origin": context.origin,
+                "name": context.world_name,
+                "uniqueId": context.unique_id,
+                "auxData": {
+                    "isDefault": context.is_default,
+                    "type": if context.is_default { "default" } else { "isolated" },
+                    "frameId": context.frame_id,
+                }
+            }
+        }),
+        session_id,
+    }
+}
+
 /// Whether a binding name is a plain JS identifier and therefore safe to
 /// interpolate into the generated shim / teardown scripts. Chromium bindings
 /// are identifiers; anything else (quotes, brackets, spaces, operators) could
@@ -72,36 +95,21 @@ pub async fn handle(
             // a context appears. Returning "No page" here breaks the standard
             // puppeteer connect/newPage flow. If there's no session, succeed
             // silently — the next Target.attachToTarget will set things up.
-            match ctx.get_session_page(session_id) {
-                Some(page) => {
-                    let origin = page.url_string();
-                    let page_id = page.id.clone();
-                    let frame_id = page.frame_id.clone();
-                    if let Some(session_id) = session_id {
-                        ctx.runtime_enabled_sessions.insert(session_id.clone());
-                    }
-                    ctx.refresh_runtime_event_collection(&page_id);
-                    let event = crate::types::CdpEvent {
-                        method: "Runtime.executionContextCreated".to_string(),
-                        params: json!({
-                            "context": {
-                                "id": 1,
-                                "origin": origin,
-                                "name": "",
-                                "uniqueId": format!("ctx-{}", page_id),
-                                "auxData": {
-                                    "isDefault": true,
-                                    "type": "default",
-                                    "frameId": frame_id,
-                                }
-                            }
-                        }),
-                        session_id: session_id.clone(),
-                    };
-                    ctx.pending_events.push(event);
-                }
-                None => {
-                    // No session attached yet — that's fine. Just ack.
+            if let Some(page_id) = session_id.as_ref()
+                .and_then(|session| ctx.sessions.get(session)).cloned()
+            {
+                let newly_enabled = session_id.as_ref().is_some_and(|session| {
+                    ctx.runtime_enabled_sessions.insert(session.clone())
+                });
+                ctx.refresh_runtime_event_collection(&page_id);
+                ctx.ensure_default_context(&page_id);
+                if newly_enabled {
+                    let events = ctx.contexts_for_page(&page_id)
+                        .map(|context| execution_context_created_event(
+                            context, session_id.clone(),
+                        ))
+                        .collect::<Vec<_>>();
+                    ctx.pending_events.extend(events);
                 }
             }
             Ok(json!({}))
@@ -126,7 +134,7 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            validate_context_id(params, "contextId", ctx, "evaluate")?;
+            validate_context(params, "contextId", ctx, session_id, "evaluate")?;
 
             let await_promise = params
                 .get("awaitPromise")
@@ -166,7 +174,7 @@ pub async fn handle(
             };
             emit_post_eval_nav(ctx, session_id).await?;
 
-            Ok(json!({ "result": remote_object_from_info(&info) }))
+            Ok(evaluation_reply(&info))
         }
         "callFunctionOn" => {
             let function_declaration = params
@@ -191,9 +199,9 @@ pub async fn handle(
             // #51: validate executionContextId the same way Runtime.evaluate
             // does. CDP names this field `executionContextId` on
             // callFunctionOn (not `contextId`); a request may omit it when
-            // `objectId` is supplied — in that case validate_context_id is a
+            // `objectId` is supplied — in that case context validation is a
             // no-op and the default context is used.
-            validate_context_id(params, "executionContextId", ctx, "callFunctionOn")?;
+            validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
 
             // Keep awaitPromise alive for the same command budget as evaluate.
             // Playwright implements waits with callFunctionOn on some utility
@@ -230,7 +238,7 @@ pub async fn handle(
             };
             emit_post_eval_nav(ctx, session_id).await?;
 
-            Ok(json!({ "result": remote_object_from_info(&info) }))
+            Ok(evaluation_reply(&info))
         }
         "getProperties" => {
             // Puppeteer's $$() flow:
@@ -444,32 +452,80 @@ pub async fn handle(
 }
 
 /// Reject `Runtime.{evaluate,callFunctionOn}` calls that target an execution
-/// context Obscura has not advertised. Returns `Ok(())` when the parameter is
-/// absent (defaulting to the page's default context) or when the id matches
-/// one of `ctx.valid_context_ids`. Logs a debug trace on accept for #51.
-fn validate_context_id(
+/// context Obscura has not advertised for the attached page. An absent identity
+/// uses the page's default context. Direct embedders retain the compatibility
+/// path for ids reserved through `next_isolated_context`.
+fn validate_context(
     params: &Value,
     field: &str,
     ctx: &crate::dispatch::CdpContext,
+    session_id: &Option<String>,
     method: &str,
 ) -> Result<(), String> {
-    let Some(id) = params.get(field).and_then(|v| v.as_i64()) else {
-        return Ok(());
-    };
-    if !ctx.valid_context_ids.contains(&id) {
+    let id = params.get(field).and_then(|value| value.as_i64());
+    let unique_id = params.get("uniqueContextId").and_then(|value| value.as_str());
+    if id.is_some() && unique_id.is_some() {
         return Err(format!(
-            "Cannot find context with specified id: {}",
-            id
+            "Runtime.{method} cannot specify both {field} and uniqueContextId"
         ));
     }
-    tracing::debug!(
-        target: "obscura_cdp::runtime",
-        "Runtime.{}: {}={} (single-isolate routing)",
-        method,
-        field,
-        id
-    );
+    if id.is_none() && unique_id.is_none() {
+        return Ok(());
+    }
+    let record = id.and_then(|id| ctx.context_by_id(id))
+        .or_else(|| unique_id.and_then(|id| ctx.context_by_unique_id(id)));
+    if let Some(record) = record {
+        let owner = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
+        if owner == Some(&record.page_id) {
+            // This registry currently validates ownership/routing only. A
+            // named isolated context still executes in the owning page's
+            // current V8 runtime/global; it is not a separate V8 realm yet.
+            return Ok(());
+        }
+    } else if session_id.is_none() && unique_id.is_none()
+        && id.is_some_and(|id| ctx.valid_context_ids.contains(&id))
+    {
+        // Direct embedders can still reserve an id through the existing public
+        // next_isolated_context API. Attached sessions require page ownership.
+        return Ok(());
+    }
+    let identity = id.map(|id| id.to_string())
+        .or_else(|| unique_id.map(str::to_string))
+        .unwrap_or_default();
+    if record.is_none() || session_id.is_some() {
+        return Err(format!(
+            "Cannot find context with specified id: {}",
+            identity
+        ));
+    }
     Ok(())
+}
+
+/// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.
+///
+/// A thrown value, or the value a promise rejected with, is not a protocol
+/// failure: the command succeeds and reports it through `exceptionDetails`,
+/// which is what a client rebuilds the page error from. The value is repeated
+/// in `result` the way Chrome does, so a client that reads only `result` sees
+/// the error object rather than a success that never happened.
+///
+/// `exceptionId` is a fixed 1 because nothing here correlates exceptions
+/// across commands; clients key off the presence of the field, not its id.
+fn evaluation_reply(info: &RemoteObjectInfo) -> Value {
+    let remote = remote_object_from_info(info);
+    if !info.thrown {
+        return json!({ "result": remote });
+    }
+    json!({
+        "result": remote.clone(),
+        "exceptionDetails": {
+            "exceptionId": 1,
+            "text": "Uncaught",
+            "lineNumber": 0,
+            "columnNumber": 0,
+            "exception": remote,
+        }
+    })
 }
 
 fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
@@ -552,28 +608,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_accepts_default_context_id_one() {
-        // Runtime.enable advertises contextId=1 — that must be accepted as
-        // valid input to evaluate, regardless of whether a page is attached.
-        // (Without a page we get an Err("No page") AFTER the contextId check,
-        // which proves validation passed for id=1.)
-        let mut ctx = CdpContext::new();
-        let result = handle(
-            "evaluate",
-            &json!({ "expression": "1 + 1", "contextId": 1 }),
-            &mut ctx,
-            &None,
-        )
-        .await;
-        match result {
-            Ok(_) => {} // accepted + executed (would happen if a page is attached)
-            Err(e) => assert!(
-                !e.contains("Cannot find context"),
-                "contextId=1 must be accepted, got: {e}"
-            ),
+    async fn evaluate_rejects_unadvertised_compatibility_context_ids() {
+        for context_id in [1, 2] {
+            let mut ctx = CdpContext::new();
+            let error = handle(
+                "evaluate",
+                &json!({ "expression": "1 + 1", "contextId": context_id }),
+                &mut ctx,
+                &None,
+            )
+            .await
+            .expect_err("an unadvertised compatibility id must not route");
+            assert!(error.contains("Cannot find context"));
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_reports_a_rejection_through_exception_details() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "evaluate-rejection".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let reply = handle(
+            "evaluate",
+            &json!({
+                "expression": "Promise.reject(new Error('boom'))",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 3000,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect("a rejection is answered, not failed at the protocol level");
+
+        let details = reply
+            .get("exceptionDetails")
+            .expect("a thrown value is reported through exceptionDetails");
+        assert_eq!(details["text"], json!("Uncaught"));
+        assert_eq!(details["exception"]["subtype"], json!("error"));
+        assert_eq!(details["exception"]["className"], json!("Error"));
+        assert!(
+            details["exception"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("boom"),
+            "the description carries the page message: {details}"
+        );
+        // Chrome repeats the exception in `result`, so a client that reads
+        // only that field still sees the error rather than a stale success.
+        assert_eq!(reply["result"], details["exception"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_function_on_reports_a_rejection_through_exception_details() {
+        // This is the path Puppeteer's page.evaluate(fn) takes. It used to
+        // answer successfully with `{}` for a rejected Error, so the caller
+        // could not tell a failure from an empty object.
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "call-rejection".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let reply = handle(
+            "callFunctionOn",
+            &json!({
+                "functionDeclaration": "() => Promise.reject(new Error('boom'))",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 3000,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .expect("a rejection is answered, not failed at the protocol level");
+
+        let details = reply
+            .get("exceptionDetails")
+            .expect("a rejected call is reported through exceptionDetails");
+        assert_eq!(details["exception"]["subtype"], json!("error"));
+        assert!(reply["result"]["value"].is_null(), "the error must not be serialized by value: {reply}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolved_evaluation_carries_no_exception_details() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "evaluate-resolved".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let reply = handle(
+            "evaluate",
+            &json!({
+                "expression": "Promise.resolve(2)",
+                "returnByValue": true,
+                "awaitPromise": true,
+                "timeout": 3000,
+            }),
+            &mut ctx,
+            &Some(session_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["value"], json!(2.0));
+        assert!(reply.get("exceptionDetails").is_none());
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_await_promise_reports_the_requested_timeout() {
         let mut ctx = CdpContext::new();

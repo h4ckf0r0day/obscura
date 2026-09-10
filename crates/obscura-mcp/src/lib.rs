@@ -304,7 +304,9 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
         },
         "serverInfo": {
             "name": "obscura-mcp",
-            "version": env!("CARGO_PKG_VERSION")
+            // Same build version the CLI reports (tag-derived at release time),
+            // so MCP clients see the version the binary was actually cut from.
+            "version": env!("OBSCURA_BUILD_VERSION")
         }
     }))
 }
@@ -1825,52 +1827,94 @@ fn tool_tab_close(args: &Value, state: &mut BrowserState) -> Result<String, Stri
     Ok(summary)
 }
 
+fn is_html_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+fn append_text_segment(result: &mut String, pending_space: &mut bool, contents: &str) {
+    let trimmed = contents.trim_matches(is_html_whitespace);
+    if trimmed.is_empty() {
+        if contents.chars().any(is_html_whitespace) {
+            *pending_space = true;
+        }
+        return;
+    }
+
+    let begins_with_space = contents.chars().next().is_some_and(is_html_whitespace);
+    let result_ends_with_space = result.chars().next_back().is_some_and(char::is_whitespace);
+    if (*pending_space || begins_with_space) && !result.is_empty() && !result_ends_with_space {
+        result.push(' ');
+    }
+    result.push_str(trimmed);
+    *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
+}
+
 fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
     use obscura_dom::NodeData;
 
+    enum Work {
+        Visit(obscura_dom::NodeId),
+        Newline,
+    }
+
+    const MAX_NODES: usize = 5_000_000;
+
     let mut result = String::new();
-    let node = match dom.get_node(node_id) {
-        Some(n) => n,
-        None => return result,
-    };
+    let mut pending_space = false;
+    let mut stack = vec![Work::Visit(node_id)];
+    let mut visited = 0usize;
 
-    match &node.data {
-        NodeData::Text { contents } => {
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                result.push_str(trimmed);
-                result.push(' ');
-            }
-        }
-        NodeData::Element { name, .. } => {
-            let tag = name.local.as_ref();
-            if matches!(tag, "script" | "style" | "noscript") {
-                return result;
-            }
-
-            let is_block = matches!(
-                tag,
-                "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "li" | "tr" | "br" | "hr" | "section" | "article"
-                    | "header" | "footer" | "nav" | "main" | "aside"
-                    | "blockquote" | "pre" | "ul" | "ol" | "table"
-            );
-
-            if is_block {
+    while let Some(work) = stack.pop() {
+        let id = match work {
+            Work::Newline => {
                 result.push('\n');
+                pending_space = false;
+                continue;
             }
+            Work::Visit(id) => id,
+        };
 
-            for child in dom.children(node_id) {
-                result.push_str(&extract_text(dom, child));
-            }
-
-            if is_block {
-                result.push('\n');
-            }
+        visited += 1;
+        if visited > MAX_NODES {
+            break;
         }
-        _ => {
-            for child in dom.children(node_id) {
-                result.push_str(&extract_text(dom, child));
+
+        let node = match dom.get_node(id) {
+            Some(node) => node,
+            None => continue,
+        };
+
+        match &node.data {
+            NodeData::Text { contents } => {
+                append_text_segment(&mut result, &mut pending_space, contents);
+            }
+            NodeData::Element { name, .. } => {
+                let tag = name.local.as_ref();
+                if matches!(tag, "script" | "style" | "noscript") {
+                    continue;
+                }
+
+                let is_block = matches!(
+                    tag,
+                    "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                        | "li" | "tr" | "br" | "hr" | "section" | "article"
+                        | "header" | "footer" | "nav" | "main" | "aside"
+                        | "blockquote" | "pre" | "ul" | "ol" | "table"
+                );
+
+                if is_block {
+                    result.push('\n');
+                    pending_space = false;
+                    stack.push(Work::Newline);
+                }
+                for child in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child));
+                }
+            }
+            _ => {
+                for child in dom.children(id).into_iter().rev() {
+                    stack.push(Work::Visit(child));
+                }
             }
         }
     }

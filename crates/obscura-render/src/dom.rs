@@ -6309,10 +6309,59 @@ fn layout_dom_once(
                     }
                 }
             }
+            // CSS 2.1 10.1: the initial containing block is a rectangle with
+            // the dimensions of the VIEWPORT, and the root element is laid out
+            // inside it. Taffy resolves an out-of-flow box against its parent
+            // box, and out-of-flow boxes were parented to the root element,
+            // whose used height is the *document* height. So `position: fixed`
+            // and ICB-relative `position: absolute` resolved percentage insets,
+            // `bottom` and `right` against the document instead of the viewport
+            // (issue #675: on a 3020px document in a 720px viewport `top: 50%`
+            // landed at 1510 instead of 360, `bottom: 0` at 3000 instead of
+            // 700; issue #740 is the same bug seen through a centered dialog).
+            //
+            // Model the ICB explicitly: a viewport-sized box that owns the root
+            // element, and hang the out-of-flow boxes off it. It sits at the
+            // origin and the root element sits at (0, 0) inside it, so every
+            // descendant keeps the absolute coordinates it had before.
+            // The ICB is an out-of-flow, viewport-sized box anchored at the
+            // root element's origin. Out-of-flow, rather than a parent of the
+            // root: the root element establishes a block formatting context
+            // (CSS 2.1 9.4.1) and its margins do not collapse (8.3.1), so
+            // making it an ordinary in-flow child of a wrapper would collapse
+            // the body's margins out of it and shrink the document. As an
+            // absolutely positioned sibling box the ICB contributes nothing to
+            // the root's content size, and taffy still resolves the boxes
+            // parented to it against its viewport-sized rect.
+            let initial_containing_block = {
+                let style = taffy::Style {
+                    display: taffy::style::Display::Block,
+                    position: taffy::Position::Absolute,
+                    inset: taffy::Rect {
+                        top: taffy::style::LengthPercentageAuto::length(0.0),
+                        left: taffy::style::LengthPercentageAuto::length(0.0),
+                        right: taffy::style::LengthPercentageAuto::auto(),
+                        bottom: taffy::style::LengthPercentageAuto::auto(),
+                    },
+                    size: taffy::Size {
+                        width: taffy::Dimension::length(initial_cb_width),
+                        height: taffy::Dimension::length(viewport.1),
+                    },
+                    ..Default::default()
+                };
+                match taffy_tree.new_leaf(style) {
+                    Ok(node) => {
+                        let _ = taffy_tree.add_child(taffy_root, node);
+                        node
+                    }
+                    Err(_) => taffy_root,
+                }
+            };
+
             let static_position_candidates = reparent_inset_positioned_nodes(
                 tree,
                 &mut taffy_tree,
-                taffy_root,
+                initial_containing_block,
                 &id_map,
                 &styles,
             );
@@ -14810,6 +14859,44 @@ mod tests {
             !laid.rects.contains_key(&unslotted),
             "unmatched light DOM must not generate a layout box"
         );
+    }
+
+    #[test]
+    fn out_of_flow_boxes_resolve_against_the_viewport_sized_initial_containing_block() {
+        // CSS 2.1 10.1: the initial containing block has the dimensions of the
+        // viewport. A `fixed` box always resolves against the viewport, and an
+        // `absolute` box with no positioned ancestor resolves against the ICB,
+        // so neither may follow the document height. Regression cover for the
+        // case where both followed the root element box instead: on a 3000px
+        // document `bottom: 0` landed at the end of the document and
+        // `top: 50%` at half of it.
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+                <div style="height:3000px"></div>
+                <div id="fixed-bottom" style="position:fixed;bottom:0;left:0;width:10px;height:20px"></div>
+                <div id="fixed-mid" style="position:fixed;top:50%;left:0;width:10px;height:20px"></div>
+                <div id="abs-bottom" style="position:absolute;bottom:0;left:0;width:10px;height:20px"></div>
+                <div id="rel" style="position:relative;height:400px;width:100px">
+                    <div id="abs-in-rel" style="position:absolute;top:50%;width:10px;height:10px"></div>
+                </div>
+            </body></html>"#,
+        );
+        let fixed_bottom = tree.get_element_by_id("fixed-bottom").unwrap();
+        let fixed_mid = tree.get_element_by_id("fixed-mid").unwrap();
+        let abs_bottom = tree.get_element_by_id("abs-bottom").unwrap();
+        let rel = tree.get_element_by_id("rel").unwrap();
+        let abs_in_rel = tree.get_element_by_id("abs-in-rel").unwrap();
+
+        let laid = layout_dom(&tree, (200.0, 200.0));
+
+        // Viewport is 200 tall and the boxes are 20 tall: `bottom: 0` sits at
+        // 180 and `top: 50%` at 100, however long the document is.
+        assert_eq!(laid.rects[&fixed_bottom].y, 180.0);
+        assert_eq!(laid.rects[&fixed_mid].y, 100.0);
+        assert_eq!(laid.rects[&abs_bottom].y, 180.0);
+        // An absolute box with a positioned ancestor keeps resolving against
+        // that ancestor, not the viewport.
+        assert_eq!(laid.rects[&abs_in_rel].y, laid.rects[&rel].y + 200.0);
     }
 
     #[test]

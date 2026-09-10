@@ -164,3 +164,52 @@ async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
         "a newline sent as a char must reach the field, not be dropped by a malformed snippet"
     );
 }
+
+// #577: Playwright's fill() focuses the field in page and then types the whole
+// value with one Input.insertText call. The method must exist and drive the
+// same snippet the key-event text path uses, so quotes, backslashes, and
+// newlines survive intact.
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_types_into_the_focused_field() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({"expression": "document.getElementById('i').focus()", "returnByValue": true}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.insertText",
+        json!({"text": "he'll\\o\nbye"}),
+        session_id,
+    )
+    .await;
+
+    let v = cdp(
+        &mut ctx,
+        4,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify(document.getElementById('i').value)",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(
+        v["result"]["value"].as_str().unwrap_or_default(),
+        r#""he'll\\o\nbye""#,
+        "insertText must type the full text with quotes, backslashes, and newlines intact"
+    );
+}

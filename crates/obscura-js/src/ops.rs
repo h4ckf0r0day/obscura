@@ -542,6 +542,22 @@ async fn read_body_capped(
     Ok(buf)
 }
 
+/// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
+/// `fetch()`/XHR and grow it without bound on the process heap (where V8's
+/// heap-limit guard never sees it). It only feeds the CLI's `--dump assets`
+/// listing, so keeping a bounded most-recent window is enough.
+const MAX_FETCHED_URLS: usize = 16384;
+
+/// Push `item` onto `list`, evicting the oldest entries so it never holds more
+/// than `max`. Mirrors the front-drain used for `js_network_events`.
+fn push_capped(list: &mut Vec<String>, item: String, max: usize) {
+    list.push(item);
+    if list.len() > max {
+        let overflow = list.len() - max;
+        list.drain(0..overflow);
+    }
+}
+
 pub type SharedState = Rc<RefCell<ObscuraState>>;
 
 /// Which document belongs to which realm.
@@ -2322,7 +2338,7 @@ async fn op_fetch_url(
         // Record the resource the page pulled in via fetch()/XHR so `--dump
         // assets` can list it (issue #301). URL is already absolute here, since
         // reqwest needs an absolute URL to send the request.
-        gs.fetched_urls.push(url.clone());
+        push_capped(&mut gs.fetched_urls, url.clone(), MAX_FETCHED_URLS);
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         // #139: thread the configured proxy through to the per-request
@@ -2605,6 +2621,8 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
+    let mut crossed_origin = is_cross_origin;
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -2613,6 +2631,7 @@ async fn op_fetch_url(
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
+        crossed_origin |= current_is_cross_origin;
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
         }
@@ -2734,9 +2753,11 @@ async fn op_fetch_url(
             current_body.clear();
         }
 
+        redirected_from.push(base);
         current_url = next_url.to_string();
     };
 
+    let redirected = redirects_followed > 0;
     let status = response.status().as_u16();
 
     let resp_headers: std::collections::HashMap<String, String> = response
@@ -2783,10 +2804,16 @@ async fn op_fetch_url(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
+            let resp = fetch_response(
+                current_url.as_str(),
+                status,
+                resp_headers.clone(),
+                resp_bytes.to_vec(),
+                redirected_from,
+            );
             let info = RequestInfo {
                 url: resp.url.clone(),
-                method: method.clone(),
+                method: current_method.as_str().to_string(),
                 headers: resp_headers.clone(),
                 resource_type: ResourceType::Fetch,
             };
@@ -2826,8 +2853,8 @@ async fn op_fetch_url(
             .as_secs_f64();
         gs.js_network_events.push(JsNetworkEvent {
             request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
+            url: current_url.clone(),
+            method: current_method.as_str().to_string(),
             status,
             response_headers: resp_headers.clone(),
             body_size: resp_bytes.len(),
@@ -2853,7 +2880,9 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
+        "redirected": redirected,
+        "opaque": mode == "no-cors" && crossed_origin,
         "headers": resp_headers,
     })
     .to_string())
@@ -2867,13 +2896,14 @@ fn fetch_response(
     status: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    redirected_from: Vec<url::Url>,
 ) -> Response {
     Response {
         url: url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://0.0.0.0/").unwrap()),
         status,
         headers,
         body,
-        redirected_from: Vec::new(),
+        redirected_from,
     }
 }
 
@@ -2900,6 +2930,10 @@ async fn stealth_fetch_all(
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    let mut redirected_from = Vec::new();
+    let mut crossed_origin = request_origin(&current_url)
+        .map(|request_origin| request_origin != page_origin)
+        .unwrap_or(false);
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -2914,6 +2948,7 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
+        crossed_origin |= current_is_cross_origin;
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
@@ -2968,6 +3003,7 @@ async fn stealth_fetch_all(
             current_method = "GET".to_string();
             current_body.clear();
         }
+        redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
 
@@ -3007,7 +3043,13 @@ async fn stealth_fetch_all(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
+            let resp = fetch_response(
+                current_url.as_str(),
+                status,
+                resp_headers.clone(),
+                resp_bytes.clone(),
+                redirected_from,
+            );
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: current_method.clone(),
@@ -3022,7 +3064,9 @@ async fn stealth_fetch_all(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
+        "redirected": redirects_followed > 0,
+        "opaque": mode == "no-cors" && crossed_origin,
         "headers": resp_headers,
     })
     .to_string())
@@ -3057,21 +3101,40 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cors_response_allows, glob_match, validate_fetch_url, FetchCredentials};
+    use super::{
+        cors_response_allows, glob_match, validate_fetch_url, FetchCredentials, ObscuraState,
+    };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[cfg(feature = "render")]
     use super::{
         ensure_prepared_geometry, ensure_prepared_render, node_is_connected,
         queue_retained_style_mutation, retained_style_mutation,
-        shadow_including_connected_nodes, ObscuraState, MAX_PENDING_STYLE_MUTATIONS,
+        shadow_including_connected_nodes, MAX_PENDING_STYLE_MUTATIONS,
     };
     #[cfg(feature = "render")]
     use obscura_dom::ShadowRootMode;
 
     use super::read_body_capped;
-    use super::{pbkdf2_derive, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+    use super::{pbkdf2_derive, push_capped, PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES};
+
+    // SEC-002 / #705 — fetched_urls (and the like) must not grow without bound.
+    #[test]
+    fn push_capped_bounds_the_list_and_keeps_the_newest() {
+        let mut list = Vec::new();
+        for i in 0..10 {
+            push_capped(&mut list, format!("u{i}"), 4);
+        }
+        assert_eq!(list.len(), 4, "the list must be capped at max");
+        assert_eq!(
+            list,
+            vec!["u6", "u7", "u8", "u9"],
+            "the newest entries must be kept, oldest evicted",
+        );
+    }
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
     // caps, a huge iteration count pins the single-threaded runtime and a huge
@@ -3386,6 +3449,157 @@ mod tests {
                 "message-2-microtask",
                 "background",
             ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bulk_posted_task_batch_completes() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-bulk");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-bulk",
+                r#"
+                    globalThis.__bulkPosted = { count: 0 };
+                    const tasks = [];
+                    for (let i = 0; i < 4096; i++) {
+                        tasks.push(scheduler.postTask(() => __bulkPosted.count++));
+                    }
+                    Promise.all(tasks);
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(500).await.unwrap();
+        let result = runtime.evaluate("__bulkPosted").unwrap();
+        assert_eq!(result["count"].as_f64(), Some(4096.0));
+    }
+
+    /// A network-op Promise reaction can schedule browser work while
+    /// deno_core is dispatching an async-op result batch. Posted tasks must not
+    /// recursively submit another async op through that borrowed driver.
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_from_async_op_resolution_avoids_driver_submission() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body></body></html>"));
+        runtime.set_url("http://example.com/posted-task-from-async-op");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-from-op-resolution",
+                r#"
+                    globalThis.__postedFromOp = 0;
+                    Deno.core.ops.op_sleep(0).then(() => {
+                        const rearm = () => scheduler.postTask(() => {
+                            __postedFromOp++;
+                            if (__postedFromOp < 250) rearm();
+                        });
+                        rearm();
+                    });
+                "#,
+            )
+            .unwrap();
+
+        runtime.run_event_loop_bounded(300).await.unwrap();
+        assert_eq!(
+            runtime.evaluate("__postedFromOp").unwrap(),
+            serde_json::json!(250.0),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn posted_task_is_cancelled_when_its_document_is_replaced() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
+        runtime.set_url("http://example.com/posted-task-old-document");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "posted-task-old-document",
+                "const staleController = new AbortController();\
+                 scheduler.postTask(\
+                   () => document.body.setAttribute('data-stale-task', 'ran'),\
+                   { signal: staleController.signal });",
+            )
+            .unwrap();
+
+        runtime.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        runtime
+            .execute_script(
+                "posted-task-new-document",
+                "scheduler.postTask(() => document.body.setAttribute('data-fresh-task', 'ran'));",
+            )
+            .unwrap();
+        runtime.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-document')")
+                .unwrap(),
+            serde_json::json!("new"),
+        );
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-fresh-task')")
+                .unwrap(),
+            serde_json::json!("ran"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_posted_task_keeps_its_creation_document_generation() {
+        let mut runtime = ObscuraJsRuntime::new();
+        runtime.set_dom(parse_html("<html><body data-document='old'></body></html>"));
+        runtime.set_url("http://example.com/delayed-posted-task-old-document");
+        runtime.run_page_init();
+        runtime
+            .execute_script(
+                "delayed-posted-task-old-document",
+                "scheduler.postTask(\
+                   () => document.body.setAttribute('data-delayed-stale-task', 'ran'),\
+                   { delay: 1 });",
+            )
+            .unwrap();
+
+        runtime.set_dom(parse_html("<html><body data-document='new'></body></html>"));
+        runtime.run_event_loop_bounded(100).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .evaluate("document.body.getAttribute('data-delayed-stale-task')")
+                .unwrap(),
+            serde_json::Value::Null,
+        );
+    }
+
+    #[test]
+    fn posted_task_owner_contention_is_panic_safe() {
+        let owner = Rc::new(RefCell::new(ObscuraState::new()));
+        let weak = Rc::downgrade(&owner);
+        let generation = owner.borrow().document_generation;
+
+        let held = owner.borrow_mut();
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Busy,
+        );
+        drop(held);
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Generation(generation),
+        );
+        drop(owner);
+        assert_eq!(
+            super::posted_task_owner_status(&weak),
+            super::PostedTaskOwnerStatus::Gone,
         );
     }
 
@@ -3857,14 +4071,87 @@ fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
-/// Wake one browser posted task without routing through Tokio's timer wheel.
-/// `yield_now` guarantees the op cannot settle in the initiating JavaScript
-/// turn, while avoiding the roughly one-millisecond floor of a zero-duration
-/// timer. The bootstrap owns task priority, FIFO order, and one-at-a-time
-/// delivery; this op supplies only the event-loop wake boundary.
-#[op2(async)]
-async fn op_posted_task() {
-    tokio::task::yield_now().await;
+/// Queue one browser posted-task delivery on deno_core's engine-local V8 task
+/// spawner. It is safe to call from an async-op reaction and wakes the event
+/// loop without Tokio's timer-wheel floor or another async-op registration.
+#[op2]
+fn op_posted_task(
+    state: &OpState,
+    frame_id: u32,
+    #[global] callback: v8::Global<v8::Function>,
+) -> f64 {
+    let Some(owner) = posted_task_owner(state, frame_id) else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let Ok(owner_state) = owner.try_borrow() else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let document_generation = owner_state.document_generation;
+    drop(owner_state);
+    let owner = Rc::downgrade(&owner);
+    let spawner = state.borrow::<deno_core::V8TaskSpawner>().clone();
+    spawner.spawn(move |scope| {
+        let current_generation = match posted_task_owner_status(&owner) {
+            PostedTaskOwnerStatus::Gone | PostedTaskOwnerStatus::Busy => {
+                INVALID_POSTED_TASK_GENERATION
+            }
+            PostedTaskOwnerStatus::Generation(generation) => generation as f64,
+        };
+        let scope = &mut v8::TryCatch::new(scope);
+        let callback = v8::Local::new(scope, callback);
+        let receiver = v8::undefined(scope).into();
+        let current_generation = v8::Number::new(scope, current_generation);
+        if callback.call(scope, receiver, &[current_generation.into()]).is_none() {
+            let message = scope
+                .exception()
+                .map(|exception| exception.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "execution terminated".to_string());
+            tracing::warn!("posted-task delivery failed: {message}");
+        }
+    });
+    document_generation as f64
+}
+
+const INVALID_POSTED_TASK_GENERATION: f64 = -1.0;
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostedTaskOwnerStatus {
+    Gone,
+    Busy,
+    Generation(u64),
+}
+
+fn posted_task_owner_status(
+    owner: &std::rc::Weak<RefCell<ObscuraState>>,
+) -> PostedTaskOwnerStatus {
+    let Some(owner) = owner.upgrade() else {
+        return PostedTaskOwnerStatus::Gone;
+    };
+    let Ok(owner) = owner.try_borrow() else {
+        return PostedTaskOwnerStatus::Busy;
+    };
+    PostedTaskOwnerStatus::Generation(owner.document_generation)
+}
+
+#[op2(fast)]
+fn op_posted_task_generation(state: &OpState, frame_id: u32) -> f64 {
+    let Some(owner) = posted_task_owner(state, frame_id) else {
+        return INVALID_POSTED_TASK_GENERATION;
+    };
+    let generation = owner
+        .try_borrow()
+        .map(|owner| owner.document_generation as f64)
+        .unwrap_or(INVALID_POSTED_TASK_GENERATION);
+    generation
+}
+
+fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 {
+        return Some(state.borrow::<SharedState>().clone());
+    }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.clone();
+    let owner = registry.try_borrow().ok()?.by_frame_id(frame_id);
+    owner
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -4605,6 +4892,7 @@ pub fn build_extension() -> Extension {
         op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),
+        op_posted_task_generation(),
         op_binding_called(),
         op_subtle_digest(),
         op_subtle_hmac(),

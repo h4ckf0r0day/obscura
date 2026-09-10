@@ -16,6 +16,12 @@ const QUEUED_NAVIGATION_SELECTOR: &str = "#queued";
 const QUEUED_NAVIGATION_TITLE: &str = "queued-task-finished";
 const TIMER_TEST_INITIAL_PAGE: &str = "data:text/html,<title>initial</title>";
 const TIMER_TEST_TIMEOUT_SECONDS: u64 = 1;
+const INLINE_TEXT_URL: &str = "data:text/html,\
+<html><body>\
+<h1><span>H</span><span>e</span><span>l</span><span>l</span><span>o</span>%20\
+<span>w</span><span>o</span><span>r</span><span>l</span><span>d</span><span>.</span></h1>\
+<p><span>Hello</span><span>,</span>%20<span>world</span><span>!</span></p>\
+</body></html>";
 
 /// A loopback fixture keeps protocol tests independent of public-site bot
 /// policy, DNS, and content changes. The previous example.com dependency can
@@ -200,6 +206,27 @@ fn test_initialize() {
     );
     assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
     assert_eq!(resp["result"]["serverInfo"]["name"], "obscura-mcp");
+}
+
+#[test]
+fn snapshot_preserves_whitespace_between_inline_spans() {
+    let mut client = McpClient::spawn();
+    let navigation = client.tool(
+        "browser_navigate",
+        serde_json::json!({ "url": INLINE_TEXT_URL }),
+    );
+    assert!(
+        navigation.get("error").is_none(),
+        "navigation failed: {navigation}"
+    );
+
+    let snapshot = client.tool("browser_snapshot", serde_json::json!({}));
+    let text = content_text(&snapshot);
+    assert!(
+        text.contains("Hello world.\n\nHello, world!"),
+        "snapshot mangled inline text: {text}"
+    );
+    assert!(!text.contains("H e l l o"), "snapshot inserted spaces: {text}");
 }
 
 #[test]

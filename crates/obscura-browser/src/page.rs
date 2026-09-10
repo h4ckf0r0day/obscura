@@ -214,6 +214,34 @@ struct DeviceMetricsBaseline {
     device_scale_factor: f32,
 }
 
+enum PendingFrameWork {
+    Unattached(obscura_js::ops::PendingFrame),
+    Attached {
+        frame_id: u32,
+        parent_frame_id: u32,
+        frame_url: String,
+        urls: Vec<String>,
+        next_url: usize,
+        sources: std::collections::HashMap<String, String>,
+    },
+}
+
+impl PendingFrameWork {
+    fn frame_id(&self) -> u32 {
+        match self {
+            Self::Unattached(frame) => frame.frame_id,
+            Self::Attached { frame_id, .. } => *frame_id,
+        }
+    }
+
+    fn parent_frame_id(&self) -> u32 {
+        match self {
+            Self::Unattached(frame) => frame.parent_frame_id,
+            Self::Attached { parent_frame_id, .. } => *parent_frame_id,
+        }
+    }
+}
+
 pub struct Page {
     pub id: String,
     pub frame_id: String,
@@ -288,10 +316,15 @@ pub struct Page {
     /// Page-owned so the subscription survives replacement of the JS runtime
     /// during navigation.
     runtime_events_enabled: std::cell::Cell<bool>,
+    pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
     suspended_started_script_ids: Vec<u32>,
+    /// Re-creatable CDP handles retained while tab switching replaces this
+    /// page's V8 runtime. Chromium keeps these handles alive with the target;
+    /// preserving them avoids order-dependent failures in concurrent clients.
+    suspended_cdp_object_state: obscura_js::runtime::CdpObjectState,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -1094,6 +1127,7 @@ impl Page {
             Some(Arc::new(StealthHttpClient::with_proxy(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                context.allow_private_network,
             )))
         } else {
             None
@@ -1133,7 +1167,9 @@ impl Page {
             intercept_tx: None,
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
+            pending_frame_work: std::collections::VecDeque::new(),
             suspended_started_script_ids: Vec::new(),
+            suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -1181,14 +1217,17 @@ impl Page {
         false
     }
 
-    /// Gives every frame document the page has fetched a realm of its own, and
-    /// runs the scripts that came with it (issue #600).
-    ///
-    /// Building a realm needs the whole runtime, which an op cannot reach, so
-    /// the JS side queues the fetched document and this drains the queue between
-    /// event loop turns. Reports whether anything was attached, so a caller can
-    /// settle and come back for frames that these frames created.
-    async fn attach_pending_frames(&mut self) -> bool {
+    /// Moves fetched frame documents into Page ownership without doing work
+    /// that can be cancelled. Realms are still created one at a time, in the
+    /// same sibling order as before this queue existed.
+    fn queue_pending_frames(&mut self) -> bool {
+        // Keep exactly one bounded batch in Page ownership. Additional frame
+        // documents remain in the runtime's existing 64-document/32 MiB queue
+        // until this batch finishes, so repeated cancellation cannot multiply
+        // the configured retention ceiling.
+        if !self.pending_frame_work.is_empty() {
+            return false;
+        }
         let pending = match self.js.as_ref() {
             Some(js) => js.take_pending_frames(),
             None => return false,
@@ -1197,7 +1236,20 @@ impl Page {
             return false;
         }
 
-        for frame in pending {
+        self.pending_frame_work
+            .extend(pending.into_iter().map(PendingFrameWork::Unattached));
+        true
+    }
+
+    /// Creates, fetches, and runs the front frame. The record remains Page-
+    /// owned at each await, so cancellation resumes the current URL and leaves
+    /// every untouched sibling in order.
+    async fn run_next_pending_frame(&mut self) -> bool {
+        if matches!(self.pending_frame_work.front(), Some(PendingFrameWork::Unattached(_))) {
+            let Some(PendingFrameWork::Unattached(frame)) = self.pending_frame_work.pop_front()
+            else {
+                return false;
+            };
             // A realm is a live v8::Context plus a DOM tree, and the page realm
             // holds its window and document, so nothing here can be collected
             // while the document lives. Frames are released when the document
@@ -1212,7 +1264,7 @@ impl Page {
                     cap,
                 );
                 self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
-                continue;
+                return true;
             }
             let realm = match self.js.as_mut().and_then(|js| {
                 FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
@@ -1221,33 +1273,15 @@ impl Page {
                 None => {
                     tracing::warn!("could not build a realm for frame {}", frame.url);
                     self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
-                    continue;
+                    return true;
                 }
             };
-
-            // A frame's scripts resolve and are fetched against the frame's own
-            // URL, so they need fetching before run_document_scripts, which
-            // resolves sources synchronously.
-            let wanted = match self.js.as_mut() {
+            // Discover author scripts before preload code can mutate the frame
+            // DOM, preserving the existing preparation order.
+            let urls = match self.js.as_mut() {
                 Some(js) => realm.external_script_urls(js),
                 None => Vec::new(),
             };
-            let mut sources: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for url in wanted {
-                let Ok(parsed) = Url::parse(&url) else { continue };
-                if self.should_block_url(&url) {
-                    continue;
-                }
-                match self.do_fetch(&parsed).await {
-                    Ok(response) => {
-                        sources.insert(url, String::from_utf8_lossy(&response.body).into_owned());
-                    }
-                    Err(error) => {
-                        tracing::warn!("frame script {} failed: {}", url, error);
-                    }
-                }
-            }
 
             if let Some(js) = self.js.as_mut() {
                 if let Err(error) = realm.set_viewport(
@@ -1257,26 +1291,105 @@ impl Page {
                 ) {
                     tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
                 }
-                // Page.addScriptToEvaluateOnNewDocument applies to every new
-                // document, including child frames. Debug hooks and browser
-                // automation setup must be present before frame scripts run.
+                // New-document scripts must be installed before the published
+                // child context can be observed, including while its external
+                // scripts are still loading.
                 for source in &self.preload_scripts {
                     if let Err(error) = realm.execute_script(js, source) {
                         tracing::debug!("frame {} preload failed: {error}", frame.url);
                     }
                 }
-                for problem in realm.run_document_scripts(js, |url| sources.get(url).cloned()) {
-                    tracing::debug!("frame {}: {}", frame.url, problem);
-                }
-                // The frame's scripts have run, so its document is loaded. Say
-                // so: everything a widget defers to DOMContentLoaded or load
-                // hangs on this, which is most of its interface.
-                if let Err(error) = realm.dispatch_load_events(js) {
-                    tracing::debug!("frame {} load events failed: {error}", frame.url);
-                }
             }
+            let frame_id = frame.frame_id;
+            let parent_frame_id = frame.parent_frame_id;
+            let frame_url = frame.url;
             self.frames.push(realm);
+            self.pending_frame_work.push_front(PendingFrameWork::Attached {
+                frame_id,
+                parent_frame_id,
+                frame_url,
+                urls,
+                next_url: 0,
+                sources: std::collections::HashMap::new(),
+            });
         }
+
+        while let Some((frame_id, url)) = self.pending_frame_work.front().and_then(|pending| {
+            let PendingFrameWork::Attached {
+                frame_id,
+                urls,
+                next_url,
+                ..
+            } = pending
+            else {
+                return None;
+            };
+            urls.get(*next_url).cloned().map(|url| (*frame_id, url))
+        }) {
+            let source = if self.should_block_url(&url) {
+                None
+            } else if let Ok(parsed) = Url::parse(&url) {
+                match self.do_fetch(&parsed).await {
+                    Ok(response) => Some(String::from_utf8_lossy(&response.body).into_owned()),
+                    Err(error) => {
+                        tracing::warn!("frame script {} failed: {}", url, error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let Some(PendingFrameWork::Attached {
+                frame_id: pending_frame_id,
+                urls,
+                next_url,
+                sources,
+                ..
+            }) = self.pending_frame_work.front_mut()
+            else {
+                return false;
+            };
+            if *pending_frame_id != frame_id || urls.get(*next_url) != Some(&url) {
+                continue;
+            }
+            if let Some(source) = source {
+                sources.insert(url, source);
+            }
+            *next_url += 1;
+        }
+
+        let Some(PendingFrameWork::Attached {
+            frame_id,
+            frame_url,
+            sources,
+            ..
+        }) = self.pending_frame_work.front_mut()
+        else {
+            return false;
+        };
+        let frame_id = *frame_id;
+        let frame_url = frame_url.clone();
+        let sources = std::mem::take(sources);
+        let Some(index) = self
+            .frames
+            .iter()
+            .position(|frame| frame.frame_id() == frame_id)
+        else {
+            self.pending_frame_work.pop_front();
+            return true;
+        };
+        if let Some(js) = self.js.as_mut() {
+            for problem in self.frames[index]
+                .run_document_scripts(js, |url| sources.get(url).cloned())
+            {
+                tracing::debug!("frame {}: {}", frame_url, problem);
+            }
+            if let Err(error) = self.frames[index].dispatch_load_events(js) {
+                tracing::debug!("frame {} load events failed: {error}", frame_url);
+            }
+        }
+        self.pending_frame_work.pop_front();
         true
     }
 
@@ -1396,10 +1509,10 @@ impl Page {
     /// object, so a page that replaces an iframe repeatedly would otherwise
     /// accumulate contexts and DOM trees for the life of the document.
     ///
-    /// A frame nested inside a discarded frame is reached on a later pass,
-    /// once its own parent is gone.
+    /// Descendants are discarded in the same pass so none can run after their
+    /// owner has left the document.
     fn release_detached_frames(&mut self) {
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.pending_frame_work.is_empty() {
             return;
         }
         // Each realm reports its own frames whose element is still connected.
@@ -1435,16 +1548,58 @@ impl Page {
                 }
             }
         }
+        let mut discarded_ids: std::collections::HashSet<u32> = self
+            .frames
+            .iter()
+            .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
+            .filter(|(id, _)| !live.contains(id))
+            .map(|(id, _)| id)
+            .chain(
+                self.pending_frame_work
+                    .iter()
+                    .filter(|pending| !live.contains(&pending.frame_id()))
+                    .map(PendingFrameWork::frame_id),
+            )
+            .collect();
+        loop {
+            let before = discarded_ids.len();
+            let descendants: Vec<u32> = self
+                .frames
+                .iter()
+                .filter(|frame| discarded_ids.contains(&frame.parent_frame_id()))
+                .map(FrameRealm::frame_id)
+                .chain(
+                    self.pending_frame_work
+                        .iter()
+                        .filter(|pending| discarded_ids.contains(&pending.parent_frame_id()))
+                        .map(PendingFrameWork::frame_id),
+                )
+                .collect();
+            discarded_ids.extend(descendants);
+            if discarded_ids.len() == before {
+                break;
+            }
+        }
+        if discarded_ids.is_empty() {
+            return;
+        }
 
         let discarded: Vec<(u32, u32)> = self
             .frames
             .iter()
             .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
-            .filter(|(id, _)| !live.contains(id))
+            .chain(
+                self.pending_frame_work
+                    .iter()
+                    .filter_map(|pending| match pending {
+                        PendingFrameWork::Unattached(_) => {
+                            Some((pending.frame_id(), pending.parent_frame_id()))
+                        }
+                        PendingFrameWork::Attached { .. } => None,
+                    }),
+            )
+            .filter(|(id, _)| discarded_ids.contains(id))
             .collect();
-        if discarded.is_empty() {
-            return;
-        }
 
         // Clean owner realms before dropping any parent. This matters for a
         // nested child whose iframe registry lives in a parent that is also
@@ -1452,7 +1607,10 @@ impl Page {
         for &(frame_id, parent_frame_id) in &discarded {
             self.forget_frame_references(frame_id, parent_frame_id);
         }
-        self.frames.retain(|frame| live.contains(&frame.frame_id()));
+        self.frames
+            .retain(|frame| !discarded_ids.contains(&frame.frame_id()));
+        self.pending_frame_work
+            .retain(|pending| !discarded_ids.contains(&pending.frame_id()));
         tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
     }
 
@@ -1463,10 +1621,20 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
-        let attached = self.attach_pending_frames().await;
+        let mut queued_new = self.queue_pending_frames();
+        self.release_detached_frames();
+        if self.pending_frame_work.is_empty() && self.queue_pending_frames() {
+            queued_new = true;
+            self.release_detached_frames();
+        }
+        let queued = self.pending_frame_work.len();
+        let mut scripts_ran = false;
+        for _ in 0..queued {
+            scripts_ran |= self.run_next_pending_frame().await;
+        }
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
-        attached || delivered
+        queued_new || scripts_ran || delivered
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -1594,7 +1762,12 @@ impl Page {
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            // Pass the page callbacks so CDP Network events and
+            // page.on('request'/'response') observers fire for stealth-mode
+            // navigations too, matching the non-stealth path below.
+            return stealth
+                .fetch_with_callbacks(url, Some(&self.callbacks))
+                .await;
         }
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
@@ -1606,6 +1779,7 @@ impl Page {
         // same DomTree is installed; a navigation must never inherit IDs from
         // a suspended prior document whose allocator may reuse them.
         self.suspended_started_script_ids.clear();
+        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
         // Drop any existing runtime so the JS realm starts clean on
         // every navigation. The old code reused the V8 isolate and
         // only re-bound `globalThis.document`, leaving window.onload,
@@ -1613,6 +1787,7 @@ impl Page {
         // page in place. That made it possible for a page to set
         // attacker-controlled state, trigger a navigation, and then
         // run code in the next document's context.
+        self.pending_frame_work.clear();
         if self.js.is_some() {
             // Every frame realm holds a V8 handle into this isolate, so the
             // frames of the outgoing document must go before the runtime does.
@@ -2745,8 +2920,13 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}",
+                 try {\n\
+                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
+                   if (typeof window.onload === 'function') {\n\
+                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
+                   }\n\
+                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
+                 } catch(e) {}",
             );
         }
         if let Some(token) = exec_wd {
@@ -3364,6 +3544,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
@@ -3876,6 +4057,7 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
+                        thrown: false,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -3888,6 +4070,7 @@ impl Page {
         } else {
             let val = self.evaluate(expression);
             obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: match &val {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3921,6 +4104,7 @@ impl Page {
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: match &value {
                     serde_json::Value::String(_) => "string".into(),
                     serde_json::Value::Number(_) => "number".into(),
@@ -3959,6 +4143,7 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
                     obscura_js::runtime::RemoteObjectInfo {
+                        thrown: false,
                         js_type: "undefined".into(),
                         subtype: None,
                         class_name: String::new(),
@@ -3970,6 +4155,7 @@ impl Page {
             }
         } else {
             obscura_js::runtime::RemoteObjectInfo {
+                thrown: false,
                 js_type: "undefined".into(),
                 subtype: None,
                 class_name: String::new(),
@@ -4183,10 +4369,11 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
-        let Some(js) = &self.js else {
+        let Some(js) = &mut self.js else {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.suspended_cdp_object_state = js.take_cdp_object_state();
         let dom = js.take_dom();
         if let Some(dom) = dom {
             self.dom = Some(dom);
@@ -4199,6 +4386,7 @@ impl Page {
         // document. Suspending is a teardown of the realm the frames live in,
         // and a realm cannot be suspended and resumed the way the page's DOM
         // can, so they are rebuilt when the page next loads a document.
+        self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
     }
@@ -4208,9 +4396,11 @@ impl Page {
             return;
         }
         let started_script_ids = std::mem::take(&mut self.suspended_started_script_ids);
+        let cdp_object_state = std::mem::take(&mut self.suspended_cdp_object_state);
         self.init_js();
-        if let Some(js) = &self.js {
+        if let Some(js) = &mut self.js {
             js.restore_started_script_ids(&started_script_ids);
+            js.restore_cdp_object_state(cdp_object_state);
         }
     }
 
@@ -4406,7 +4596,7 @@ mod tests {
         materialize_stylesheet_graph, navigation_chain_limit_from_env_value, navigation_referrer,
         navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
         script_response_is_executable, split_css_imports, truncate_on_char_boundary,
-        url_matches_cdp_pattern, LoadedStylesheet, StylesheetImport,
+        url_matches_cdp_pattern, LoadedStylesheet, PendingFrameWork, StylesheetImport,
         DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
     #[cfg(feature = "render")]
@@ -5426,6 +5616,377 @@ mod tests {
         format!("http://{addr}/")
     }
 
+    async fn spawn_slow_frame_script_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let slow_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server_slow_seen = slow_seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let requests = server_requests.clone();
+                let slow_seen = server_slow_seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    requests.lock().unwrap().push(path.clone());
+                    let (content_type, body) = if path == "/slow.js" {
+                        slow_seen.notify_waiters();
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        (
+                            "application/javascript",
+                            "globalThis.__order.push('second'); globalThis.__childReady = true;",
+                        )
+                    } else if path == "/first.js" {
+                        (
+                            "application/javascript",
+                            "globalThis.__order.push('first');",
+                        )
+                    } else {
+                        (
+                            "text/html",
+                            "<html><body><script src=/first.js></script><script src=/slow.js></script></body></html>",
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests, slow_seen)
+    }
+
+    async fn page_with_fetched_slow_frames(
+        name: &str,
+        frame_count: usize,
+    ) -> (
+        super::Page,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (base, requests, slow_seen) = spawn_slow_frame_script_server().await;
+        let iframes = (0..frame_count)
+            .map(|_| "<iframe src=/child.html></iframe>")
+            .collect::<String>();
+        let html = format!("<html><body>{iframes}</body></html>");
+        let mut page = import_map_test_page(name, &base, &html);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .expect("frame documents did not finish fetching")
+        .unwrap();
+        (page, requests, slow_seen)
+    }
+
+    async fn spawn_nested_pending_frame_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let requests = server_requests.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    requests.lock().unwrap().push(path.clone());
+                    let (content_type, body) = match path.as_str() {
+                        "/parent.html" => (
+                            "text/html",
+                            "<html><body><script>const child = document.createElement('iframe'); child.src = '/grandchild.html'; document.body.appendChild(child);</script></body></html>",
+                        ),
+                        "/grandchild.html" => (
+                            "text/html",
+                            "<html><body><script src=/grandchild-slow.js></script></body></html>",
+                        ),
+                        _ => ("application/javascript", "globalThis.__mustNotRun = true;"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_frame_script_fetch_keeps_all_siblings_resumable() {
+        let (mut page, requests, slow_seen) =
+            page_with_fetched_slow_frames("cancel-frame-scripts", 2).await;
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        assert!(page.queue_pending_frames());
+        let expected_viewport = match &page.pending_frame_work[0] {
+            PendingFrameWork::Unattached(frame) => {
+                (frame.viewport_width, frame.viewport_height)
+            }
+            PendingFrameWork::Attached { .. } => panic!("frame work started before advancement"),
+        };
+        let slow_request = slow_seen.notified();
+        let mut advance = Box::pin(page.advance_frames());
+        tokio::select! {
+            _ = advance.as_mut() => panic!("frame advance completed before the slow request"),
+            _ = slow_request => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("frame advance never reached the slow request")
+            }
+        }
+        drop(advance);
+        assert_eq!(page.frames.len(), 1);
+        let observable = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){ const w = document.querySelector('iframe').contentWindow; \
+                 return { order: w.__order, width: w.innerWidth, height: w.innerHeight }; })()",
+            )
+            .unwrap();
+        assert_eq!(
+            observable,
+            serde_json::json!({
+                "order": ["preload"],
+                "width": expected_viewport.0,
+                "height": expected_viewport.1,
+            }),
+            "a published loading frame was observable before new-document initialization",
+        );
+        assert_eq!(page.pending_frame_work.len(), 2);
+        assert!(matches!(
+            page.pending_frame_work[0],
+            PendingFrameWork::Attached { next_url: 1, .. }
+        ));
+        assert!(matches!(page.pending_frame_work[1], PendingFrameWork::Unattached(_)));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.advance_frames())
+            .await
+            .expect("resumed frame script fetch timed out");
+        assert!(page.pending_frame_work.is_empty());
+        for index in 0..2 {
+            assert_eq!(
+                page.evaluate_in_frame(index, "globalThis.__childReady").unwrap(),
+                serde_json::json!(true),
+            );
+            assert_eq!(
+                page.evaluate_in_frame(index, "globalThis.__order").unwrap(),
+                serde_json::json!(["preload", "first", "second"]),
+            );
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/first.js")
+                .count(),
+            2,
+            "a completed source was fetched again after cancellation",
+        );
+        let script_order: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with(".js"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            script_order,
+            ["/first.js", "/slow.js", "/slow.js", "/first.js", "/slow.js"],
+            "sibling script fetches were interleaved or reordered",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_frame_discards_queued_script_work_before_fetching() {
+        let (mut page, _, slow_seen) = page_with_fetched_slow_frames("detach-frame-scripts", 2).await;
+        let slow_request = slow_seen.notified();
+        let mut advance = Box::pin(page.advance_frames());
+        tokio::select! {
+            _ = advance.as_mut() => panic!("frame advance completed before the slow request"),
+            _ = slow_request => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("frame advance never reached the slow request")
+            }
+        }
+        drop(advance);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+
+        page.release_detached_frames();
+        assert!(page.frames.is_empty());
+        assert_eq!(page.pending_frame_work.len(), 1);
+        assert!(matches!(page.pending_frame_work[0], PendingFrameWork::Unattached(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_unattached_frame_is_discarded_before_realm_or_script_work() {
+        let (mut page, requests, _) =
+            page_with_fetched_slow_frames("detach-unattached-frame", 1).await;
+        assert!(page.queue_pending_frames());
+        assert!(page.frames.is_empty());
+        assert!(matches!(page.pending_frame_work[0], PendingFrameWork::Unattached(_)));
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+
+        assert!(page.frames.is_empty());
+        assert!(page.pending_frame_work.is_empty());
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with(".js")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pruning_an_old_batch_does_not_strand_a_new_runtime_batch() {
+        let (mut page, _, slow_seen) =
+            page_with_fetched_slow_frames("replace-frame-work-batch", 1).await;
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        let slow_request = slow_seen.notified();
+        let mut advance = Box::pin(page.advance_frames());
+        tokio::select! {
+            _ = advance.as_mut() => panic!("frame advance completed before the slow request"),
+            _ = slow_request => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                panic!("frame advance never reached the slow request")
+            }
+        }
+        drop(advance);
+        assert_eq!(page.pending_frame_work.len(), 1);
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){ const next = document.createElement('iframe'); next.src = '/child.html'; document.body.appendChild(next); return 1; })()",
+            )
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), page.advance_frames())
+            .await
+            .expect("new runtime batch was stranded after old batch cleanup");
+        assert_eq!(page.frames.len(), 1);
+        assert!(page.pending_frame_work.is_empty());
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__childReady").unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_teardown_discards_queued_frame_script_work() {
+        let (mut suspended, _, _) = page_with_fetched_slow_frames("suspend-frame-scripts", 1).await;
+        assert!(suspended.queue_pending_frames());
+        suspended.suspend_js();
+        assert!(suspended.frames.is_empty());
+        assert!(suspended.pending_frame_work.is_empty());
+
+        let (mut replaced, _, _) = page_with_fetched_slow_frames("replace-frame-scripts", 1).await;
+        assert!(replaced.queue_pending_frames());
+        replaced.navigate_blank();
+        assert!(replaced.frames.is_empty());
+        assert!(replaced.pending_frame_work.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detaching_a_parent_discards_its_queued_descendant_work() {
+        let (base, requests) = spawn_nested_pending_frame_server().await;
+        let mut page = import_map_test_page(
+            "detach-nested-frame-work",
+            &base,
+            "<html><body><iframe src=/parent.html></iframe></body></html>",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(page.queue_pending_frames());
+        assert!(page.run_next_pending_frame().await);
+        assert_eq!(page.frames.len(), 1);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            page.js.as_mut().unwrap().run_event_loop(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(page.queue_pending_frames());
+        assert_eq!(page.pending_frame_work.len(), 1);
+        assert_eq!(
+            page.pending_frame_work[0].parent_frame_id(),
+            page.frames[0].frame_id(),
+        );
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+        assert!(page.frames.is_empty());
+        assert!(page.pending_frame_work.is_empty());
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/grandchild-slow.js"));
+    }
+
     /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
     /// why `init_js` clears the frames before it drops the runtime. `suspend_js`
     /// drops the same runtime and has to honour the same order, otherwise the
@@ -5616,6 +6177,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, serde_json::json!(["1", "1", "0"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn suspend_resume_preserves_cdp_evaluation_handles() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "cdp-handle-suspend".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("cdp-handle-suspend".to_string(), context);
+        page.url = Some(url::Url::parse("http://example.com/").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+
+        let object = page
+            .evaluate_for_cdp_with_timeout("({ increment(value) { return value + 1; } })", false, false, 1_000)
+            .await
+            .unwrap();
+        let object_id = object.object_id.expect("remote evaluation returned no handle");
+
+        page.suspend_js();
+        page.resume_js();
+
+        let result = page
+            .call_function_on_for_cdp_with_timeout(
+                "function(value) { return this.increment(value); }",
+                Some(&object_id),
+                &[serde_json::json!({ "value": 41 })],
+                true,
+                false,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(42.0)));
     }
 
     #[test]
@@ -5967,6 +6566,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn body_onload_content_attribute_reflects_to_window() {
+        let mut page = import_map_test_page(
+            "body-onload-content-attribute",
+            "http://127.0.0.1:9",
+            r#"<html><head></head><body onload="
+                globalThis.__bodyOnloadCalls++;
+                globalThis.__bodyOnloadThisIsWindow = this === window;
+                globalThis.__bodyOnloadEventType = event && event.type;
+                throw new Error('body onload failure');
+            "><script>
+                globalThis.__bodyOnloadCalls = 0;
+                globalThis.__bodyOnloadThisIsWindow = false;
+                globalThis.__bodyOnloadEventType = null;
+                globalThis.__bodyOnloadReflectedBeforeLoad =
+                    typeof document.body.onload === 'function' &&
+                    document.body.onload === window.onload;
+                globalThis.__windowLoadListenerCalls = 0;
+                window.addEventListener('load', () => __windowLoadListenerCalls++);
+            </script></body></html>"#,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"[
+                        __bodyOnloadCalls,
+                        __bodyOnloadThisIsWindow,
+                        __bodyOnloadEventType,
+                        __bodyOnloadReflectedBeforeLoad,
+                        __windowLoadListenerCalls
+                    ]"#,
+                )
+                .unwrap(),
+            serde_json::json!([1, true, "load", true, 1]),
+        );
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    r#"(function() {
+                        const fromBody = function fromBody() {};
+                        document.body.onload = fromBody;
+                        const bodySetsWindow = window.onload === fromBody;
+                        const fromWindow = function fromWindow() {};
+                        window.onload = fromWindow;
+                        const windowSetsBody = document.body.onload === fromWindow;
+                        document.body.setAttribute('onload', 'globalThis.__bodyOnloadFromAttribute = true');
+                        const attributeReplacesWindow = document.body.onload !== fromWindow
+                            && document.body.onload === window.onload;
+                        const reflected = window.onload;
+                        const detachedBody = document.createElement('body');
+                        detachedBody.onload = function detachedBodyOnload() {};
+                        const detachedBodyStaysLocal = window.onload === reflected
+                            && detachedBody.onload !== window.onload;
+                        return bodySetsWindow && windowSetsBody && attributeReplacesWindow
+                            && detachedBodyStaysLocal;
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn preload_dynamic_script_delays_load_but_not_dom_content_loaded() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(150),
@@ -6135,6 +6804,73 @@ mod tests {
                 .unwrap(),
             "/slow-dynamic.js",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_delaying_script_driver_survives_a_page_script_exception() {
+        // An exception from an async page callback reaches the pump as an
+        // event-loop error, and the pump used to answer it by abandoning every
+        // still-pending load-delaying script. The error is transient: measured
+        // against this runtime, the tick carrying it fails and the following
+        // ticks poll clean, so the pending script below was dropped over a
+        // condition that had already cleared, and dropped silently, since the
+        // script simply never arrives.
+        //
+        // The throw is deferred through a timer so it lands on a pump tick.
+        // Thrown during the installing script's own microtask drain it would
+        // clear the pending-script bookkeeping before the fetch even starts,
+        // which is a different bug from the one under test here.
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(150),
+            "globalThis.__lateDynamicRan = true;",
+        );
+        let mut page = import_map_test_page(
+            "load-delayer-throws",
+            "http://127.0.0.1:9",
+            "<html><head></head><body></body></html>",
+        );
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "install-load-delayer",
+                &format!(
+                    "globalThis.__documentReadyState__ = 'loading'; \
+                     const script = document.createElement('script'); \
+                     script.src = '{base}/slow-dynamic.js'; \
+                     document.head.appendChild(script); \
+                     setTimeout(() => {{ \
+                         queueMicrotask(() => {{ throw new Error('page script boom'); }}); \
+                     }}, 0);",
+                ),
+            )
+            .unwrap();
+        assert!(page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completed =
+            super::Page::drive_load_delaying_scripts(page.js.as_mut().unwrap(), deadline).await;
+
+        assert!(
+            completed,
+            "the throw must not end the pump while a script is still pending"
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/slow-dynamic.js",
+            "the pending script must still be fetched"
+        );
+        assert!(!page
+            .js
+            .as_mut()
+            .unwrap()
+            .has_pending_load_delaying_scripts());
     }
 
     #[tokio::test(flavor = "current_thread")]

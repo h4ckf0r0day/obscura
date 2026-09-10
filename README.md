@@ -114,26 +114,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br></b>
       Better proxies. Fewer blocks. More scalable automation.
     </td>
-    </tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://www.thordata.com/?ls=dob&lk=dob" target="_blank">
-        <img alt="Thordata" src="/assets/sponsors/thordatalogo.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      🚀 <b>Obscura × Thordata</b><br>
-      Need more stable proxies for automation, public web scraping, SEO, or ad verification? Power your workflow with <a href="https://www.thordata.com/?ls=dob&lk=dob"><b>Thordata</b></a>.<br><br>
-      <b>🌍 Residential Proxies: 100M+ real residential IPs in 190+ countries<br>
-      ♾️ Unlimited Proxies: for heavy traffic and high concurrency<br>
-      ✨ Recently upgraded residential IP pool<br>
-      ✨ Unlimited Concurrent Sessions<br>
-      🔁 Rotating & Sticky Sessions<br>
-      📍 Flexible GEO targeting<br>
-      ⚡ Stable HTTP(S) connections<br><br>
-      🎁 Use code <b>obscura</b> for <b>10% off</b>.<br><br></b>
-      Get started with a 3-day free trial and test Thordata with your own workflow.
-    </td>
-  </tr>
  <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
@@ -201,7 +181,7 @@ usable on common LTS servers with glibc 2.35+.
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc`, no shell, no package manager, ~57 MB compressed.
+Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc:nonroot` — no shell, no package manager, runs as uid 65532, ~57 MB compressed. A mounted `--storage-dir` must be writable by uid 65532. Publish to host loopback as above; `-p 9222:9222` exposes the port on every interface.
 
 ### Build from source
 

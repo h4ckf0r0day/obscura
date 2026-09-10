@@ -1608,7 +1608,7 @@ fn fast_path_response(text: &str) -> Option<String> {
 
     let result = match req.method.as_str() {
         "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
+        "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
         "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
         "Performance.enable" | "Log.enable" | "Security.enable" |
         "Emulation.setTouchEmulationEnabled" |
