@@ -61,6 +61,9 @@
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
+    'IDBRequest', 'IDBOpenDBRequest', 'IDBTransaction', 'IDBDatabase',
+    'IDBObjectStore', 'IDBIndex', 'IDBCursor', 'IDBCursorWithValue',
+    'IDBVersionChangeEvent',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -13335,7 +13338,33 @@ globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candida
 // the first `get` because their request's `onsuccess` is never called. Fire
 // `onsuccess` asynchronously with `null` so reads complete-but-empty, which
 // most libraries treat as a cache miss and fall back to the network.
-function _idbRequest(produceResult) {
+//
+// The interface constructors below must exist on the global even though the
+// shim never calls them directly: libraries commonly feature-detect IndexedDB
+// with `typeof IDBRequest !== 'undefined'` or narrow an event with
+// `event.target instanceof IDBRequest`. Without these, that check throws a
+// ReferenceError, which some libraries (observed with Firebase's persistence
+// layer) handle by retrying in a tight microtask loop -- a storm that never
+// reaches a macrotask, so it pins the V8 thread until the eval watchdog kills
+// the whole module (issue: quackr.io module eval killed by watchdog after
+// "IDBRequest is not defined").
+globalThis.IDBRequest = class IDBRequest {};
+globalThis.IDBOpenDBRequest = class IDBOpenDBRequest extends IDBRequest {};
+globalThis.IDBTransaction = class IDBTransaction {};
+globalThis.IDBDatabase = class IDBDatabase {};
+globalThis.IDBObjectStore = class IDBObjectStore {};
+globalThis.IDBIndex = class IDBIndex {};
+globalThis.IDBCursor = class IDBCursor {};
+globalThis.IDBCursorWithValue = class IDBCursorWithValue extends IDBCursor {};
+globalThis.IDBVersionChangeEvent = class IDBVersionChangeEvent extends Event {
+  constructor(type, init) {
+    super(type, init);
+    this.oldVersion = init && init.oldVersion != null ? init.oldVersion : 0;
+    this.newVersion = init && init.newVersion != null ? init.newVersion : null;
+  }
+};
+
+function _idbRequest(produceResult, ctor) {
   const req = {
     result: undefined,
     error: null,
@@ -13347,6 +13376,7 @@ function _idbRequest(produceResult) {
     addEventListener(type, fn) { req['on' + type] = fn; },
     removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
   };
+  Object.setPrototypeOf(req, (ctor || IDBRequest).prototype);
   Promise.resolve().then(() => {
     try {
       req.result = produceResult();
@@ -13364,9 +13394,30 @@ function _idbRequest(produceResult) {
   return req;
 }
 
-function _idbObjectStore(name) {
-  const data = new Map();
-  return {
+// Per-name registry so object stores created via `onupgradeneeded` are still
+// there on the next `open()` call within this process. Without this, every
+// open() looks like a brand-new empty database, so a library that checks
+// `db.objectStoreNames.contains(x)` after opening and re-opens with a bumped
+// version when it's missing (the standard IndexedDB upgrade pattern) loops
+// forever -- each iteration allocates a fresh database/request/closures and
+// never converges, which pins V8 in an allocation storm until it exhausts the
+// heap (observed on quackr.io: `main-NGKWHMOU.js` never stopped allocating
+// inside `indexedDB.open`).
+const _idbDatabaseRegistry = new Map();
+
+function _idbRegistryEntry(name) {
+  let entry = _idbDatabaseRegistry.get(name);
+  if (!entry) {
+    entry = { version: 0, stores: new Map() };
+    _idbDatabaseRegistry.set(name, entry);
+  }
+  return entry;
+}
+
+function _idbObjectStore(entry, name) {
+  let data = entry.stores.get(name);
+  if (!data) { data = new Map(); entry.stores.set(name, data); }
+  const store = {
     name,
     keyPath: null,
     autoIncrement: false,
@@ -13383,25 +13434,27 @@ function _idbObjectStore(name) {
     count() { return _idbRequest(() => data.size); },
     openCursor() { return _idbRequest(() => null); },
     openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
+    createIndex() { return Object.setPrototypeOf({ name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }, IDBIndex.prototype); },
+    index() { return Object.setPrototypeOf({ get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }, IDBIndex.prototype); },
     deleteIndex() {},
   };
+  return Object.setPrototypeOf(store, IDBObjectStore.prototype);
 }
 
-function _idbTransaction(storeNames) {
-  const stores = new Map();
+function _idbTransaction(entry, storeNames, db) {
   const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
   const tx = {
-    db: null,
+    db: db || null,
     mode: 'readonly',
-    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
+    objectStoreNames: {
+      contains: (n) => entry.stores.has(String(n)),
+      get length() { return entry.stores.size; },
+      item(i) { return Array.from(entry.stores.keys())[i] ?? null; },
+    },
     onabort: null, oncomplete: null, onerror: null,
     error: null,
     objectStore(name) {
-      let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
+      const s = _idbObjectStore(entry, String(name));
       s.transaction = tx;
       return s;
     },
@@ -13410,23 +13463,35 @@ function _idbTransaction(storeNames) {
     addEventListener(type, fn) { tx['on' + type] = fn; },
     removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
   };
-  Promise.resolve().then(() => {
-    if (typeof tx.oncomplete === 'function') {
-      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
-    }
-  });
+  Object.setPrototypeOf(tx, IDBTransaction.prototype);
+  if (names[0] != null) {
+    Promise.resolve().then(() => {
+      if (typeof tx.oncomplete === 'function') {
+        try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
+      }
+    });
+  }
   return tx;
 }
 
-function _idbDatabase(name, version) {
-  return {
+function _idbDatabase(entry, name) {
+  const db = {
     name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
+    get version() { return entry.version; },
+    objectStoreNames: {
+      contains(n) { return entry.stores.has(String(n)); },
+      get length() { return entry.stores.size; },
+      item(i) { return Array.from(entry.stores.keys())[i] ?? null; },
+    },
+    createObjectStore(n, options) {
+      const store = _idbObjectStore(entry, String(n));
+      if (options && options.keyPath != null) store.keyPath = options.keyPath;
+      if (options && options.autoIncrement) store.autoIncrement = true;
+      return store;
+    },
+    deleteObjectStore(n) { entry.stores.delete(String(n)); },
     transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
+      const tx = _idbTransaction(entry, storeNames, db);
       tx.mode = mode || 'readonly';
       return tx;
     },
@@ -13434,14 +13499,66 @@ function _idbDatabase(name, version) {
     onversionchange: null, onabort: null, onerror: null, onclose: null,
     addEventListener() {}, removeEventListener() {},
   };
+  return Object.setPrototypeOf(db, IDBDatabase.prototype);
 }
 
 globalThis.indexedDB = {
   open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
+    const entry = _idbRegistryEntry(name);
+    const requestedVersion = version || entry.version || 1;
+    const needsUpgrade = requestedVersion > entry.version;
+    const oldVersion = entry.version;
+    const req = {
+      result: undefined,
+      error: null,
+      source: null,
+      transaction: null,
+      readyState: 'pending',
+      onsuccess: null,
+      onerror: null,
+      onupgradeneeded: null,
+      onblocked: null,
+      addEventListener(type, fn) { req['on' + type] = fn; },
+      removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
+    };
+    Object.setPrototypeOf(req, IDBOpenDBRequest.prototype);
+    Promise.resolve().then(() => {
+      try {
+        if (needsUpgrade) {
+          entry.version = requestedVersion;
+          const db = _idbDatabase(entry, name);
+          req.result = db;
+          req.transaction = _idbTransaction(entry, Array.from(entry.stores.keys()), db);
+          req.transaction.mode = 'versionchange';
+          if (typeof req.onupgradeneeded === 'function') {
+            const evt = new IDBVersionChangeEvent('upgradeneeded', { oldVersion, newVersion: requestedVersion });
+            Object.defineProperty(evt, 'target', { value: req, configurable: true });
+            try { req.onupgradeneeded(evt); } catch (e) {}
+          }
+        }
+        req.result = _idbDatabase(entry, name);
+        req.readyState = 'done';
+        if (typeof req.onsuccess === 'function') {
+          try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
+        }
+      } catch (e) {
+        req.error = e; req.readyState = 'done';
+        if (typeof req.onerror === 'function') {
+          try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
+        }
+      }
+    });
+    return req;
   },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
+  deleteDatabase(name) {
+    _idbDatabaseRegistry.delete(name);
+    return _idbRequest(() => undefined);
+  },
+  databases() {
+    return Promise.resolve(
+      Array.from(_idbDatabaseRegistry.entries()).map(([name, entry]) => ({ name, version: entry.version }))
+    );
+  },
   cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
 };
 globalThis.IDBKeyRange = {
