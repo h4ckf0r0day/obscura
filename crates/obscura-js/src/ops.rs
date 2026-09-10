@@ -16,7 +16,8 @@ use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
-    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    request_referrer, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType,
+    Response,
 };
 use tokio::sync::Mutex;
 
@@ -2300,6 +2301,18 @@ fn cors_response_allows(
     }
 }
 
+/// Default Referer for scripted fetch()/XHR (issue #875). The JS layer
+/// resolves about:client to the document URL and forwards explicit
+/// init.referrer, so `referrer` here is an absolute URL or empty
+/// (no-referrer). The shared request_referrer policy decides the header
+/// value: document URL same-origin, origin-only cross-origin, none on a
+/// https-to-http downgrade.
+fn default_fetch_referer(referrer: &str, target: &url::Url) -> Option<String> {
+    let source = url::Url::parse(referrer).ok()?;
+    let request = obscura_net::ResourceRequest::subresource(obscura_net::ResourceType::Fetch, &source);
+    request_referrer(&request, target)
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -2311,6 +2324,7 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] referrer: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let body = body.to_vec();
     tracing::debug!(
@@ -2608,6 +2622,7 @@ async fn op_fetch_url(
                 credentials,
                 callbacks.clone(),
                 allow_private_network,
+                referrer.clone(),
             )
             .await;
         }
@@ -2659,6 +2674,20 @@ async fn op_fetch_url(
                 "User-Agent",
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
             );
+        }
+        // Default Referer (issue #875): the JS layer resolves about:client to
+        // the document URL and passes explicit init.referrer through, so this
+        // only applies the same-origin policy via the shared request_referrer
+        // plumbing. An explicit Referer header always wins.
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("referer"))
+        {
+            if let Ok(target) = url::Url::parse(&current_url) {
+                if let Some(value) = default_fetch_referer(&referrer, &target) {
+                    req = req.header(reqwest::header::REFERER, value);
+                }
+            }
         }
 
         for (k, v) in &custom_headers {
@@ -2925,6 +2954,7 @@ async fn stealth_fetch_all(
     credentials: FetchCredentials,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    referrer: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -2954,6 +2984,14 @@ async fn stealth_fetch_all(
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
+        }
+        // Default Referer (issue #875), mirroring the non-stealth loop below:
+        // an explicit Referer header wins, otherwise the shared
+        // request_referrer policy derives one from the JS-resolved referrer.
+        if !req_headers.contains_key("referer") {
+            if let Some(value) = default_fetch_referer(&referrer, &parsed_current) {
+                req_headers.insert("referer".to_string(), value);
+            }
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
