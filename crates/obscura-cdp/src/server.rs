@@ -756,6 +756,24 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
     PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
 }
 
+/// The request target from a raw request head: the middle field of the request
+/// line, e.g. `/devtools/page/page-1` from `GET /devtools/page/page-1 HTTP/1.1`.
+///
+/// Returns `None` for anything that is not a well-formed request line, so a
+/// malformed head falls through to the WebSocket path and tungstenite rejects
+/// it, rather than being routed by whatever its bytes happen to contain.
+fn request_target(head: &str) -> Option<&str> {
+    let line = head.split("\r\n").next()?;
+    let mut parts = line.split(' ');
+    let _method = parts.next()?;
+    let target = parts.next()?;
+    if !target.starts_with('/') {
+        return None;
+    }
+    parts.next()?; // require an HTTP version
+    Some(target)
+}
+
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
 /// The connection's request head has already been peeked by the accept loop
@@ -769,15 +787,21 @@ fn accept_dispatch(
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
 ) -> anyhow::Result<()> {
-    let endpoint = if head.contains("/json/version") {
-        Some("version")
-    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
-        Some("list")
-    } else if head.contains("/json/protocol") {
-        Some("protocol")
-    } else {
-        None
-    };
+    // Route on the request target, not on a substring of the entire head. The
+    // old form matched anywhere, including inside a *header value*, so
+    // `GET /devtools/page/page-1` carrying a header that happened to contain
+    // `/json/list` was served as the JSON target list instead of being handed
+    // to the WebSocket path. Nothing exploitable was found -- the
+    // JSON endpoints expose no more than they already do -- but routing on
+    // attacker-influenced bytes anywhere in the head is the wrong shape.
+    let endpoint = request_target(head).and_then(|target| {
+        match target.split('?').next().unwrap_or(target).trim_end_matches('/') {
+            "/json/version" => Some("version"),
+            "/json" | "/json/list" => Some("list"),
+            "/json/protocol" => Some("protocol"),
+            _ => None,
+        }
+    });
 
     if let Some(ep) = endpoint {
         // The request head is already sitting in the kernel receive buffer;
