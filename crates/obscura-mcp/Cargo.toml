@@ -21,3 +21,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
