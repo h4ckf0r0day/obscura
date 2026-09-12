@@ -137,6 +137,13 @@ pub use paint::{
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
 #[cfg(feature = "paint")]
 pub mod inline;
+// Process-wide font caching (dynamic/authored web-font byte cache, extra
+// `--font-dir` directories) backing `inline::TextEngine`. See
+// `font_cache.rs` for the full rationale (fix for #879).
+#[cfg(feature = "paint")]
+mod font_cache;
+#[cfg(feature = "paint")]
+pub use font_cache::configure_extra_font_directories;
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -157,6 +164,12 @@ pub mod inline {
     pub(crate) fn text_may_need_emoji_font(_text: &str) -> bool {
         false
     }
+
+    /// Layout-only builds have no shaper and never load any fonts, bundled
+    /// or otherwise, so there is no base database for these directories to
+    /// join. Kept as a no-op purely so callers never need a `cfg(feature =
+    /// "paint")` guard around the call site.
+    pub fn configure_extra_font_directories(_dirs: Vec<std::path::PathBuf>) {}
 
     impl TextEngine {
         pub fn new() -> Self {
@@ -378,6 +391,9 @@ pub mod inline {
         taffy::Size { width, height }
     }
 }
+
+#[cfg(not(feature = "paint"))]
+pub use inline::configure_extra_font_directories;
 
 /// An axis-aligned rectangle in CSS pixels, relative to the containing block.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

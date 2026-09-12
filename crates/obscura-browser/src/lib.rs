@@ -11,6 +11,7 @@ pub use lifecycle::{LifecycleState, WaitUntil};
 pub use obscura_js::HTML_TO_MARKDOWN_JS;
 #[cfg(feature = "render")]
 pub use obscura_js::{
+    configure_extra_font_directories,
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
     CaptureError, CaptureRegion,
 };

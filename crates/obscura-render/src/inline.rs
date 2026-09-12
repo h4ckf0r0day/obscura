@@ -960,6 +960,115 @@ pub(crate) fn constrained_auto_replaced_size(
     })
 }
 
+/// One face pending family/weight/italic resolution: the id it was loaded
+/// under plus its declared `@font-face`/`FontFace` descriptor overrides
+/// (`None` for the embedded/emoji/directory faces, which use whatever the
+/// font's own name table declares).
+type FontDeclaration = (
+    cosmic_text::fontdb::ID,
+    Option<String>,
+    Option<(u16, u16)>,
+    Option<bool>,
+);
+
+/// Resolve each declaration's family/weight/italic/metrics against `db` and
+/// fold the result into `loaded_families`. Shared by the once-per-process
+/// base database build and every per-document page-font merge so both paths
+/// stay byte-for-byte identical.
+fn record_face_declarations(
+    db: &cosmic_text::fontdb::Database,
+    declarations: Vec<FontDeclaration>,
+    loaded_families: &mut HashMap<String, LoadedFamily>,
+) {
+    for (id, declared_family, declared_weight, declared_italic) in declarations {
+        let Some(face) = db.face(id) else { continue };
+        let names = face.families.clone();
+        let internal_name = names
+            .first()
+            .map(|(name, _)| Arc::<str>::from(name.as_str()))
+            .unwrap_or_else(|| Arc::from(FAMILY));
+        let shape_weight = face.weight.0;
+        let metrics = font_metrics(db, id)
+            .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
+        let italic = declared_italic
+            .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
+        let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
+        let declared_names: Vec<String> = declared_family
+            .map(|name| vec![name])
+            .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
+        for name in declared_names {
+            let family = loaded_families
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() });
+            family.faces.push(LoadedFace {
+                name: Arc::clone(&internal_name),
+                font_id: Some(id),
+                metrics,
+                min_weight: weight.0,
+                max_weight: weight.1,
+                italic,
+            });
+        }
+    }
+}
+
+/// Build the embedded/emoji/extra-directory base once. Called only from
+/// [`base_font_database`]'s `OnceLock::get_or_init`, never directly.
+fn build_base_font_database(
+    load_emoji: bool,
+) -> (cosmic_text::fontdb::Database, HashMap<String, LoadedFamily>) {
+    let mut db = cosmic_text::fontdb::Database::new();
+    let mut declarations = Vec::new();
+    for bytes in [
+        SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
+        MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
+    ] {
+        for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
+            declarations.push((id, None, None, None));
+        }
+    }
+    if load_emoji {
+        for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
+            declarations.push((id, None, None, None));
+        }
+    }
+    // Directories registered via `configure_extra_font_directories` before
+    // this database's first build (see that function's doc comment for the
+    // "must be called before the first render" ordering requirement).
+    let extra_dirs = crate::font_cache::configured_extra_font_directories();
+    for id in crate::font_cache::load_extra_font_directories(&mut db, extra_dirs) {
+        declarations.push((id, None, None, None));
+    }
+    let mut loaded_families = HashMap::new();
+    record_face_declarations(&db, declarations, &mut loaded_families);
+    db.set_sans_serif_family(FAMILY);
+    (db, loaded_families)
+}
+
+/// The 14 embedded bundled faces, plus the emoji face when `load_emoji`, plus
+/// any `--font-dir` directories, parsed exactly once per process and shared
+/// (cheaply cloned) by every [`TextEngine`]. Mirrors `svg_font_database`
+/// (`paint.rs`), which solves the identical problem for the SVG-text
+/// database; two locks (rather than one keyed by `bool`) because there are
+/// only ever two possible bases.
+fn base_font_database(
+    load_emoji: bool,
+) -> &'static (cosmic_text::fontdb::Database, HashMap<String, LoadedFamily>) {
+    static BASE_NO_EMOJI: std::sync::OnceLock<(
+        cosmic_text::fontdb::Database,
+        HashMap<String, LoadedFamily>,
+    )> = std::sync::OnceLock::new();
+    static BASE_WITH_EMOJI: std::sync::OnceLock<(
+        cosmic_text::fontdb::Database,
+        HashMap<String, LoadedFamily>,
+    )> = std::sync::OnceLock::new();
+    if load_emoji {
+        BASE_WITH_EMOJI.get_or_init(|| build_base_font_database(true))
+    } else {
+        BASE_NO_EMOJI.get_or_init(|| build_base_font_database(false))
+    }
+}
+
 impl Default for TextEngine {
     fn default() -> Self {
         Self::new()
@@ -989,63 +1098,26 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
-        // Build a database from embedded and page-provided faces. Never call
-        // load_system_fonts: a host's font set would make layout differ
-        // machine to machine and add a multi-millisecond startup scan.
-        let mut db = cosmic_text::fontdb::Database::new();
+        // The embedded/emoji/extra-directory base is parsed exactly once per
+        // process (see `base_font_database`) and cloned here: `Database::clone`
+        // shares each Arc-backed binary source instead of re-parsing, the
+        // same trick `svg_font_database` (`paint.rs`) uses for the SVG-text
+        // database. Never call load_system_fonts: a host's font set would
+        // make layout differ machine to machine and add a startup scan.
+        let (base_db, base_families) = base_font_database(load_emoji);
+        let mut db = base_db.clone();
+        let mut loaded_families = base_families.clone();
         let mut declarations = Vec::new();
-        for bytes in [
-            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
-            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
-        ] {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
-                declarations.push((id, None, None, None));
-            }
-        }
-        if load_emoji {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
-                declarations.push((id, None, None, None));
-            }
-        }
         for font in fonts {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
-                font.data.clone(),
-            ))) {
+            // Page-provided bytes (authored `@font-face` + dynamic
+            // `FontFace`) go through the cross-document cache: identical
+            // bytes across documents/contexts are pushed without
+            // re-parsing (`font_cache::load_cached_web_font`).
+            for id in crate::font_cache::load_cached_web_font(&mut db, &font.data) {
                 declarations.push((id, font.family.clone(), font.weight, font.italic));
             }
         }
-        let mut loaded_families = HashMap::new();
-        for (id, declared_family, declared_weight, declared_italic) in declarations {
-            let Some(face) = db.face(id) else { continue };
-            let names = face.families.clone();
-            let internal_name = names
-                .first()
-                .map(|(name, _)| Arc::<str>::from(name.as_str()))
-                .unwrap_or_else(|| Arc::from(FAMILY));
-            let shape_weight = face.weight.0;
-            let metrics = font_metrics(&db, id)
-                .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
-            let italic = declared_italic
-                .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
-            let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
-            let declared_names: Vec<String> = declared_family
-                .map(|name| vec![name])
-                .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
-            for name in declared_names {
-                let family = loaded_families
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
-                family.faces.push(LoadedFace {
-                    name: Arc::clone(&internal_name),
-                    font_id: Some(id),
-                    metrics,
-                    min_weight: weight.0,
-                    max_weight: weight.1,
-                    italic,
-                });
-            }
-        }
-        db.set_sans_serif_family(FAMILY);
+        record_face_declarations(&db, declarations, &mut loaded_families);
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
@@ -4299,6 +4371,160 @@ mod tests {
         assert!(
             space_advance > 5.0,
             "setting wght and opsz must not repeatedly remap avar coordinates and collapse the space advance: {space_advance}"
+        );
+    }
+
+    /// Cross-document cache for `fonts: &[WebFont]` (#879): identical bytes
+    /// across two `TextEngine` constructions must be parsed at most once.
+    ///
+    /// This asserts an absolute per-hash miss count, not a before/after
+    /// delta on a single shared counter: `cargo test`'s default harness runs
+    /// every `#[test]` in this binary concurrently, and other tests here
+    /// build `TextEngine`s from their own (different) `WebFont` bytes, which
+    /// would land in between this test's own two calls and make a shared,
+    /// non-hash-scoped counter's delta flaky. Scoping by content hash makes
+    /// this deterministic regardless of test order/concurrency: unrelated
+    /// tests touch different hash buckets, and this exact content's bucket
+    /// is guaranteed to reach exactly 1 (never more) because the whole
+    /// cache-miss path in `font_cache::load_cached_web_font` runs under one
+    /// mutex. See `font_cache::test_support` for the full rationale.
+    #[test]
+    fn identical_dynamic_font_bytes_are_parsed_at_most_once() {
+        let noto = include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf").to_vec();
+        let variable = variable_font_fixture();
+        let noto_hash = crate::font_cache::hash_font_bytes(&noto);
+        let variable_hash = crate::font_cache::hash_font_bytes(&variable);
+        assert_ne!(noto_hash, variable_hash);
+
+        let noto_font = || WebFont {
+            data: noto.clone(),
+            family: Some("Parse Count Noto".to_string()),
+            weight: None,
+            italic: None,
+        };
+        let _first = TextEngine::new_with_web_fonts(&[noto_font()]);
+        let _second = TextEngine::new_with_web_fonts(&[noto_font()]);
+        assert_eq!(
+            crate::font_cache::test_support::miss_count(noto_hash),
+            1,
+            "identical font bytes must be parsed at most once per process"
+        );
+
+        let _third = TextEngine::new_with_web_fonts(&[WebFont {
+            data: variable.clone(),
+            family: Some("Parse Count Variable".to_string()),
+            weight: None,
+            italic: None,
+        }]);
+        assert_eq!(
+            crate::font_cache::test_support::miss_count(variable_hash),
+            1,
+            "different font bytes must still be parsed (once each)"
+        );
+    }
+
+    /// Two distinct `WebFont` byte buffers must be independently cached: a
+    /// cache bug that conflated `FaceInfo`s by, say, insertion order rather
+    /// than content hash would leak one document's page font into another's.
+    #[test]
+    fn distinct_dynamic_fonts_are_not_conflated_by_the_shared_cache() {
+        let noto_engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf").to_vec(),
+            family: Some("Conflation Test Noto".to_string()),
+            weight: None,
+            italic: None,
+        }]);
+        let variable_engine = TextEngine::new_with_web_fonts(&[WebFont {
+            data: variable_font_fixture(),
+            family: Some("Conflation Test Variable".to_string()),
+            weight: None,
+            italic: None,
+        }]);
+
+        assert!(noto_engine
+            .loaded_families
+            .contains_key("conflation test noto"));
+        assert!(!noto_engine
+            .loaded_families
+            .contains_key("conflation test variable"));
+        assert!(variable_engine
+            .loaded_families
+            .contains_key("conflation test variable"));
+        assert!(!variable_engine
+            .loaded_families
+            .contains_key("conflation test noto"));
+
+        let noto_face = &noto_engine.loaded_families["conflation test noto"].faces[0];
+        let variable_face =
+            &variable_engine.loaded_families["conflation test variable"].faces[0];
+        assert_ne!(
+            noto_face.name, variable_face.name,
+            "two distinct byte buffers must resolve to distinct cached face metadata"
+        );
+    }
+
+    /// The pure directory-scanning core behind `configure_extra_font_directories`
+    /// (#879's `--font-dir`), exercised directly against a fresh `Database`
+    /// rather than through the process-wide base-database `OnceLock`.
+    ///
+    /// The full `configure_extra_font_directories` -> `TextEngine` path is
+    /// deliberately not covered end-to-end here: the base database is a
+    /// process-wide `OnceLock` built at most once per test binary, so
+    /// whichever test (of the many in this file) triggers it first wins, and
+    /// `cargo test`'s default harness gives no ordering guarantee between
+    /// `#[test]` functions. Testing the directory-loading logic as a
+    /// standalone function that takes its `Database` and directory list as
+    /// plain arguments (no global state) sidesteps that hazard entirely.
+    #[test]
+    fn load_extra_font_directories_loads_valid_fonts_from_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "obscura-render-font-dir-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp font directory");
+        std::fs::write(dir.join("liberation-sans.ttf"), SANS_R)
+            .expect("write fixture font into temp directory");
+
+        let mut db = cosmic_text::fontdb::Database::new();
+        let ids = crate::font_cache::load_extra_font_directories(&mut db, &[dir.clone()]);
+
+        assert_eq!(ids.len(), 1, "one font file must load to exactly one face");
+        let face = db.face(ids[0]).expect("pushed face id resolves");
+        assert!(
+            face.families.iter().any(|(name, _)| name == "Liberation Sans"),
+            "the copied fixture's family must be discoverable after a directory load"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_extra_font_directories_skips_a_missing_directory_without_panicking() {
+        let mut db = cosmic_text::fontdb::Database::new();
+        let missing =
+            std::env::temp_dir().join("obscura-render-font-dir-test-does-not-exist-at-all");
+        let ids = crate::font_cache::load_extra_font_directories(&mut db, &[missing]);
+        assert!(ids.is_empty());
+    }
+
+    /// The "configured too late" no-op path in `configure_extra_font_directories`,
+    /// tested against a locally-owned `OnceLock` instead of the process-global
+    /// one so it does not depend on this test binary's (unpredictable) test
+    /// execution order.
+    #[test]
+    fn set_extra_font_directories_is_a_no_op_once_already_initialized() {
+        let store: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+        assert!(crate::font_cache::set_extra_font_directories(
+            &store,
+            vec![std::path::PathBuf::from("/tmp/obscura-font-dir-a")]
+        ));
+        assert!(!crate::font_cache::set_extra_font_directories(
+            &store,
+            vec![std::path::PathBuf::from("/tmp/obscura-font-dir-b")]
+        ));
+        assert_eq!(
+            store.get(),
+            Some(&vec![std::path::PathBuf::from("/tmp/obscura-font-dir-a")])
         );
     }
 
