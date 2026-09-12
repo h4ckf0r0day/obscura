@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Word spacing advances measured and painted text</title>
+<style>
+@font-face {
+  font-family: "Liberation Mono";
+  src: url("../crates/obscura-render/assets/liberation-mono.ttf");
+}
+body { margin:20px; color:black; background:white }
+.row { height:80px; font:40px/60px "Liberation Mono", monospace; white-space:nowrap }
+.positive { word-spacing:30px }
+.relative { word-spacing:.75em }
+.negative { word-spacing:-10px }
+.normal { word-spacing:normal }
+</style>
+<div class="row">A B C</div>
+<div class="row positive">A B C</div>
+<div class="row relative"><span>A B C</span></div>
+<div class="row positive"><span class="normal">A B C</span></div>
+<div class="row negative">A B C</div>

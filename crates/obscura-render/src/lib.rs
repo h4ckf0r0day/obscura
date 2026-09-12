@@ -1239,6 +1239,10 @@ pub struct LayoutStyle {
     /// Keeping this provenance distinguishes an explicit zero from the
     /// `normal` initial value while resolving the inherited property.
     pub letter_spacing_non_normal: Option<bool>,
+    /// Additional advance per word separator, resolved to CSS pixels before inheritance.
+    pub word_spacing: Option<f32>,
+    /// Relative length retained until the element's font size is resolved.
+    pub word_spacing_raw: Option<Dimension>,
     /// Specified CSS font weight during cascade (`1..1000`, `bolder`, or
     /// `lighter`), normalized to its numeric computed value by the inheritance
     /// pass before layout and shaping.

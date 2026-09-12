@@ -1164,6 +1164,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             apply_font_size(style, value);
         }
         "letter-spacing" => apply_letter_spacing(style, value),
+        "word-spacing" => apply_word_spacing(style, value),
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
             let lower = value.trim().to_ascii_lowercase();
@@ -2062,6 +2063,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "color-scheme"
             | "font-size"
             | "letter-spacing"
+            | "word-spacing"
             | "font"
             | "font-weight"
             | "font-family"
@@ -2904,6 +2906,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
     };
     match name {
         "width" | "inline-size" => lower == "fit-content" || dimension(value, true),
+        "word-spacing" => lower == "normal" || parse_word_spacing_length(value).is_some(),
         "height" | "block-size" | "min-width" | "min-inline-size" | "min-height"
         | "min-block-size" | "max-width" | "max-inline-size" | "max-height" | "max-block-size"
         | "flex-basis" => dimension(value, true),
@@ -6975,6 +6978,50 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
             style.font_size = None;
             style.font_size_raw = Some(rel);
         }
+    }
+}
+
+fn apply_word_spacing(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "inherit" | "unset" | "revert" | "revert-layer") {
+        style.word_spacing = None;
+        style.word_spacing_raw = None;
+        return;
+    }
+    if matches!(lower.as_str(), "normal" | "initial") {
+        style.word_spacing = Some(0.0);
+        style.word_spacing_raw = None;
+        return;
+    }
+    // Invalid declarations must not replace an earlier cascade winner.
+    match parse_word_spacing_length(value) {
+        Some(crate::Dimension::Px(pixels)) => {
+            style.word_spacing = Some(pixels);
+            style.word_spacing_raw = None;
+        }
+        Some(relative) => {
+            style.word_spacing = None;
+            style.word_spacing_raw = Some(relative);
+        }
+        None => {}
+    }
+}
+
+fn parse_word_spacing_length(value: &str) -> Option<crate::Dimension> {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let length = match parser.next().ok()? {
+        cssparser::Token::Number { value, .. } if *value == 0.0 => crate::Dimension::Px(0.0),
+        cssparser::Token::Dimension { value, unit, .. } if value.is_finite() => {
+            dimension_value(&format!("{value}{unit}"))
+        }
+        _ => return None,
+    };
+    if !parser.is_exhausted() { return None; }
+    match length.resolve(16.0, 16.0, 1.0, 1.0) {
+        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(length),
+        _ => None,
     }
 }
 
