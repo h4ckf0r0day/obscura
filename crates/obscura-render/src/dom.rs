@@ -14,6 +14,11 @@ use taffy::prelude::*;
 
 use crate::{to_taffy_style, Rect};
 
+pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
+    if spacing == 0.0 { return 0.0; }
+    text.chars().filter(|c| matches!(c, ' ' | '\u{00a0}')).count() as f32 * spacing
+}
+
 /// Text width for layout. With the `paint` feature this is exact (real glyph
 /// metrics from the embedded font, shared with rasterization). Without it
 /// (layout-only builds, e.g. for `getBoundingClientRect`), fall back to a
@@ -28,9 +33,11 @@ fn text_width(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
 ) -> f32 {
     crate::paint::measure_text(text, size, is_bold, family)
         + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
+        + word_spacing_advance(text, word_spacing)
 }
 
 #[cfg(not(feature = "paint"))]
@@ -40,6 +47,7 @@ fn text_width(
     is_bold: bool,
     _family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
 ) -> f32 {
     const AVG_CHAR_WIDTH_EM: f32 = 0.55;
     let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
@@ -49,6 +57,7 @@ fn text_width(
     } else {
         glyph_width
     }) + chars * letter_spacing
+        + word_spacing_advance(text, word_spacing)
 }
 
 #[derive(Default)]
@@ -4802,6 +4811,7 @@ fn layout_dom_once(
             font_optical_sizing: crate::FontOpticalSizing,
             font_variation_settings: Vec<crate::FontVariationSetting>,
             letter_spacing: f32,
+            word_spacing: f32,
             letter_spacing_non_normal: bool,
             container_type: crate::ContainerType,
             container_names: Vec<String>,
@@ -4854,6 +4864,7 @@ fn layout_dom_once(
                     font_optical_sizing: crate::FontOpticalSizing::Auto,
                     font_variation_settings: Vec::new(),
                     letter_spacing: 0.0,
+                    word_spacing: 0.0,
                     letter_spacing_non_normal: false,
                     container_type: crate::ContainerType::Normal,
                     container_names: Vec::new(),
@@ -4962,6 +4973,9 @@ fn layout_dom_once(
                     }
                     if let Some(spacing) = style.letter_spacing {
                         inh.letter_spacing = spacing;
+                    }
+                    if let Some(spacing) = style.word_spacing {
+                        inh.word_spacing = spacing;
                     }
                     if let Some(non_normal) = style.letter_spacing_non_normal {
                         inh.letter_spacing_non_normal = non_normal;
@@ -5177,6 +5191,16 @@ fn layout_dom_once(
                 match style.letter_spacing {
                     Some(spacing) if spacing.is_finite() => inh.letter_spacing = spacing,
                     _ => style.letter_spacing = Some(inh.letter_spacing),
+                }
+                if let Some(raw) = style.word_spacing_raw {
+                    style.word_spacing = match raw.resolve(em_px, root_fs, vw, vh) {
+                        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(pixels),
+                        _ => None,
+                    };
+                }
+                match style.word_spacing {
+                    Some(spacing) if spacing.is_finite() => inh.word_spacing = spacing,
+                    _ => style.word_spacing = Some(inh.word_spacing),
                 }
                 match style.letter_spacing_non_normal {
                     Some(non_normal) => inh.letter_spacing_non_normal = non_normal,
@@ -5557,6 +5581,7 @@ fn layout_dom_once(
                 // now-final computed style.
                 let host_color = style.color;
                 let host_font_size = style.font_size.unwrap_or(parent_fs);
+                let host_word_spacing = style.word_spacing.unwrap_or(0.0);
                 let host_letter_spacing = style.letter_spacing.unwrap_or(0.0);
                 let host_letter_spacing_non_normal =
                     style.letter_spacing_non_normal.unwrap_or(false);
@@ -5671,6 +5696,14 @@ fn layout_dom_once(
                         };
                     } else if pseudo.letter_spacing.is_none() {
                         pseudo.letter_spacing = Some(host_letter_spacing);
+                    }
+                    if let Some(raw) = pseudo.word_spacing_raw {
+                        pseudo.word_spacing = match raw.resolve(pseudo_em, root_fs, vw, vh) {
+                            crate::Dimension::Px(pixels) if pixels.is_finite() => Some(pixels),
+                            _ => None,
+                        };
+                    } else if pseudo.word_spacing.is_none() {
+                        pseudo.word_spacing = Some(host_word_spacing);
                     }
                     if pseudo.letter_spacing_non_normal.is_none() {
                         pseudo.letter_spacing_non_normal = Some(host_letter_spacing_non_normal);
@@ -5936,6 +5969,7 @@ fn layout_dom_once(
                     bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                 );
                 content_width += intrinsic_content
                     .map(|content| content.atomic_width)
@@ -6006,6 +6040,7 @@ fn layout_dom_once(
                             bold,
                             style.font_family.as_deref(),
                             style.letter_spacing.unwrap_or(0.0),
+                            style.word_spacing.unwrap_or(0.0),
                         )
                     })
                     .fold(0.0f32, f32::max);
@@ -9789,6 +9824,7 @@ fn build_text_words(
     let mut line_height = fsize * 1.2;
     let mut transform = crate::TextTransform::None;
     let mut letter_spacing = 0.0;
+    let mut word_spacing = 0.0;
     if let Some(parent_id) = rendered_parent(tree, id) {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
@@ -9797,6 +9833,7 @@ fn build_text_words(
             line_height = crate::inline::used_line_height(p_style);
             transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
             letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
+            word_spacing = p_style.word_spacing.unwrap_or(0.0);
         }
     }
     if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
@@ -9823,6 +9860,7 @@ fn build_text_words(
         is_bold,
         family,
         letter_spacing,
+        word_spacing,
         taffy_tree,
         words,
     )
@@ -9926,13 +9964,14 @@ fn build_word_leaves(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
 ) -> Vec<taffy::NodeId> {
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold, family, letter_spacing);
+            let width = text_width(&token, fsize, is_bold, family, letter_spacing, word_spacing);
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
@@ -9987,6 +10026,7 @@ fn build_pseudo_content(
         is_bold,
         style.font_family.as_deref(),
         style.letter_spacing.unwrap_or(0.0),
+        style.word_spacing.unwrap_or(0.0),
         taffy_tree,
         words,
     )

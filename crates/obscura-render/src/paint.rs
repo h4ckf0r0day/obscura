@@ -4488,6 +4488,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 None,
                                 0.0,
+                                0.0,
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -4621,6 +4622,7 @@ fn paint_laid_dom_scrolled(
                     false,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -4660,6 +4662,7 @@ fn paint_laid_dom_scrolled(
                     is_bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -4686,6 +4689,7 @@ fn paint_laid_dom_scrolled(
                     crate::style::used_font_weight(style) >= 600,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     Some(visible_rect),
                     element_clip_mask,
                     raster_scale,
@@ -4760,6 +4764,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
+                                style.word_spacing.unwrap_or(0.0),
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -4794,6 +4799,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
+                                style.word_spacing.unwrap_or(0.0),
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -6790,6 +6796,7 @@ fn paint_text_node(
             is_bold,
             style.font_family.as_deref(),
             style.letter_spacing.unwrap_or(0.0),
+            style.word_spacing.unwrap_or(0.0),
             clip,
             clip_mask.as_ref(),
             raster_scale,
@@ -6875,6 +6882,7 @@ fn draw_text(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
     clip: Option<crate::Rect>,
     clip_mask: Option<&tiny_skia::Mask>,
     raster_scale: f32,
@@ -6981,11 +6989,13 @@ fn draw_text(
             // each word is its own independently-positioned box.
             caret.x += scaled_font.h_advance(id)
                 + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale;
+                + letter_spacing * raster_scale
+                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         } else {
             caret.x += scaled_font.h_advance(id)
                 + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale;
+                + letter_spacing * raster_scale
+                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         }
     }
 }
