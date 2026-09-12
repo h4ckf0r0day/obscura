@@ -241,35 +241,72 @@ pub async fn handle(
                     // with no document fetch. The client still has to be told the
                     // frame moved, or the click looks like it did nothing.
                     if moved {
+                        page.sync_js_network_events();
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        Some((page.id.clone(), frame_id, url))
+                        let network_events = page.network_events.drain(..).collect::<Vec<_>>();
+                        let reached_network_idle = page.lifecycle.is_network_idle();
+                        Some((
+                            page.id.clone(),
+                            frame_id,
+                            url,
+                            network_events,
+                            reached_network_idle,
+                        ))
                     } else {
                         None
                     }
                 } else {
                     None
                 };
-                if let Some((page_id, frame_id, url)) = moved_frame {
-                    let loader_id = ctx
-                        .current_loader_ids
-                        .get(&page_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                    ctx.pending_events.push(crate::types::CdpEvent {
-                        method: "Page.frameNavigated".into(),
-                        params: json!({
-                            "frame": crate::domains::page::frame_value(
-                                &frame_id,
-                                None,
-                                &loader_id,
-                                &url,
-                                "text/html",
-                            ),
-                            "type": "Navigation",
-                        }),
-                        session_id: Some(session_id.clone().unwrap_or_default()),
-                    });
+                if let Some((page_id, frame_id, url, network_events, reached_network_idle)) =
+                    moved_frame
+                {
+                    let is_document_navigation = network_events
+                        .iter()
+                        .any(|event| event.resource_type == "Document" && event.url == url);
+                    if !is_document_navigation {
+                        let loader_id = ctx
+                            .current_loader_ids
+                            .get(&page_id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                        crate::domains::page::emit_runtime_network_events(
+                            ctx,
+                            session_id,
+                            &frame_id,
+                            &url,
+                            &page_id,
+                            &network_events,
+                        );
+                        ctx.pending_events.push(crate::types::CdpEvent {
+                            method: "Page.frameNavigated".into(),
+                            params: json!({
+                                "frame": crate::domains::page::frame_value(
+                                    &frame_id,
+                                    None,
+                                    &loader_id,
+                                    &url,
+                                    "text/html",
+                                ),
+                                "type": "Navigation",
+                            }),
+                            session_id: Some(session_id.clone().unwrap_or_default()),
+                        });
+                    } else {
+                        let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+                        crate::domains::page::emit_navigation_events(
+                            ctx,
+                            session_id,
+                            &frame_id,
+                            &loader_id,
+                            &url,
+                            &page_id,
+                            &network_events,
+                            obscura_browser::lifecycle::WaitUntil::Load,
+                            reached_network_idle,
+                        );
+                    }
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);

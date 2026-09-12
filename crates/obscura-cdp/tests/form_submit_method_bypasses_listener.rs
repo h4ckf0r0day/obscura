@@ -10,6 +10,7 @@ use obscura_cdp::types::CdpRequest;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 // Serves a form whose `submit` listener always calls preventDefault().
 async fn serve_form() -> String {
@@ -47,6 +48,48 @@ document.getElementById('f').addEventListener('submit', function(e) { e.preventD
         }
     });
     format!("http://{addr}/")
+}
+
+// Serves an uncancelled POST form so the CDP event stream produced by a
+// native submit-button click can be checked independently of the HTTP server.
+async fn serve_post_form() -> (String, oneshot::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (body_tx, body_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut body_tx = Some(body_tx);
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let (status, body) = if req.starts_with("POST /submitted") {
+                let submitted_body = req
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or_default()
+                    .to_string();
+                body_tx.take().unwrap().send(submitted_body).unwrap();
+                ("200 OK", "<html><body>submitted</body></html>")
+            } else {
+                (
+                    "200 OK",
+                    r#"<html><body>
+<form id="f" method="POST" action="/submitted">
+  <input type="hidden" name="q" value="1">
+  <button id="b" type="submit">Go</button>
+</form>
+</body></html>"#,
+                )
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        }
+    });
+    (format!("http://{addr}/"), body_rx)
 }
 
 async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session_id: &str) -> Value {
@@ -189,6 +232,112 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
         page.url.as_ref().unwrap().path(),
         "/submitted",
         "a CDP click on a submit button must fire the cancelable submit event and be vetoable"
+    );
+}
+
+// Regression for #886: a native form navigation triggered through CDP input
+// must publish the same Network and Page lifecycle events as Page.navigate.
+#[tokio::test(flavor = "current_thread")]
+async fn cdp_click_form_post_emits_navigation_and_network_events() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let (url, submitted_body) = serve_post_form().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-886";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    navigate(&mut ctx, &url, session_id).await;
+    ctx.pending_events.clear();
+
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({"expression": "document.elementFromPoint = function() { return document.getElementById('b'); }"}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mousePressed", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        4,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mouseReleased", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        session_id,
+    )
+    .await;
+
+    let submitted_url = format!("{}submitted", url);
+    let event_names = ctx
+        .pending_events
+        .iter()
+        .map(|event| event.method.as_str())
+        .collect::<Vec<_>>();
+    let request_event = ctx.pending_events.iter().find(|event| {
+        event.method == "Network.requestWillBeSent"
+            && event.params["request"]["url"] == submitted_url
+    });
+    assert_eq!(
+        request_event.and_then(|event| event.params["request"]["method"].as_str()),
+        Some("POST"),
+        "native form POST must emit requestWillBeSent; saw {event_names:?}"
+    );
+    let request_id = request_event
+        .and_then(|event| event.params["requestId"].as_str())
+        .expect("requestWillBeSent must carry a requestId");
+    let response_event = ctx.pending_events.iter().find(|event| {
+        event.method == "Network.responseReceived"
+            && event.params["response"]["url"] == submitted_url
+    });
+    assert_eq!(
+        response_event.and_then(|event| event.params["requestId"].as_str()),
+        Some(request_id),
+        "native form POST must emit responseReceived; saw {event_names:?}"
+    );
+    let request_position = ctx
+        .pending_events
+        .iter()
+        .position(|event| std::ptr::eq(event, request_event.unwrap()))
+        .unwrap();
+    let frame_position = ctx
+        .pending_events
+        .iter()
+        .position(|event| event.method == "Page.frameNavigated")
+        .expect("frameNavigated must be present");
+    assert!(
+        request_position < frame_position,
+        "document request must precede frameNavigated; saw {event_names:?}"
+    );
+    let frame_event = &ctx.pending_events[frame_position];
+    assert_eq!(
+        frame_event.params["frame"]["url"], submitted_url,
+        "native form POST must emit frameNavigated; saw {event_names:?}"
+    );
+    assert_eq!(
+        frame_event.params["frame"]["loaderId"], request_id,
+        "the document request id must identify the navigation loader"
+    );
+    assert!(
+        ctx.pending_events.iter().any(|event| {
+            event.method == "Page.lifecycleEvent" && event.params["name"] == "load"
+        }),
+        "native form POST must emit the load lifecycle event; saw {event_names:?}"
+    );
+    assert!(
+        event_names.contains(&"Page.frameStoppedLoading"),
+        "native form POST must stop loading; saw {event_names:?}"
+    );
+    assert_eq!(
+        submitted_body.await.unwrap(),
+        "q=1",
+        "native form POST must preserve the submitted fields"
     );
 }
 
