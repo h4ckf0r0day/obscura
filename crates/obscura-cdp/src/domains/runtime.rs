@@ -52,8 +52,19 @@ async fn emit_post_eval_nav(
     let page = ctx
         .get_session_page_mut(session_id)
         .ok_or("No page")?;
+    let document_navigation = page.has_pending_navigation();
     let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
     if !did_navigate {
+        return Ok(());
+    }
+    if !document_navigation {
+        let frame_id = page.frame_id.clone();
+        let url = page.url_string();
+        ctx.pending_events.push(crate::types::CdpEvent {
+            method: "Page.navigatedWithinDocument".into(),
+            params: json!({"frameId": frame_id, "url": url, "navigationType": "historyApi"}),
+            session_id: session_id.clone(),
+        });
         return Ok(());
     }
     let (frame_id, page_url, page_id, network_events, reached_idle) = {

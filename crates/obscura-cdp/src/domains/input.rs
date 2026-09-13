@@ -233,6 +233,7 @@ pub async fn handle(
                         shift_key = shift_key,
                     );
                     page.evaluate(&code);
+                    let is_document_navigation = page.has_pending_navigation();
                     let moved = page
                         .process_pending_navigation()
                         .await
@@ -252,6 +253,7 @@ pub async fn handle(
                             url,
                             network_events,
                             reached_network_idle,
+                            is_document_navigation,
                         ))
                     } else {
                         None
@@ -259,18 +261,10 @@ pub async fn handle(
                 } else {
                     None
                 };
-                if let Some((page_id, frame_id, url, network_events, reached_network_idle)) =
+                if let Some((page_id, frame_id, url, network_events, reached_network_idle, is_document_navigation)) =
                     moved_frame
                 {
-                    let is_document_navigation = network_events
-                        .iter()
-                        .any(|event| event.resource_type == "Document" && event.url == url);
                     if !is_document_navigation {
-                        let loader_id = ctx
-                            .current_loader_ids
-                            .get(&page_id)
-                            .cloned()
-                            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
                         crate::domains::page::emit_runtime_network_events(
                             ctx,
                             session_id,
@@ -280,18 +274,13 @@ pub async fn handle(
                             &network_events,
                         );
                         ctx.pending_events.push(crate::types::CdpEvent {
-                            method: "Page.frameNavigated".into(),
+                            method: "Page.navigatedWithinDocument".into(),
                             params: json!({
-                                "frame": crate::domains::page::frame_value(
-                                    &frame_id,
-                                    None,
-                                    &loader_id,
-                                    &url,
-                                    "text/html",
-                                ),
-                                "type": "Navigation",
+                                "frameId": frame_id,
+                                "url": url,
+                                "navigationType": "historyApi",
                             }),
-                            session_id: Some(session_id.clone().unwrap_or_default()),
+                            session_id: session_id.clone(),
                         });
                     } else {
                         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
