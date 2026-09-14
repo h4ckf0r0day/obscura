@@ -1983,6 +1983,7 @@ dependencies = [
  "obscura-net",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
