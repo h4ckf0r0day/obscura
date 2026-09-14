@@ -14,6 +14,30 @@ OBSCURA_ALLOW_PRIVATE_NETWORK=1 obscura fetch http://localhost:8080
 
 Per-process equivalent: `--allow-private-network` on any subcommand.
 
+### `OBSCURA_ALLOW_NETWORK`
+
+Comma-separated CIDR prefixes or bare addresses that may be reached even though
+they are in the SSRF deny-set. Everything else stays denied.
+
+Prefer this over `OBSCURA_ALLOW_PRIVATE_NETWORK` when testing an internal
+application. That variable disables the deny-set **entirely**, including the
+cloud metadata endpoints (`169.254.169.254`, `100.100.100.200`), so any page you
+load gets an unrestricted internal pivot. This one opens only what you name.
+
+```bash
+OBSCURA_ALLOW_NETWORK="10.20.0.0/16" obscura fetch http://10.20.5.5/
+OBSCURA_ALLOW_NETWORK="127.0.0.1/32,192.168.1.0/24" obscura serve
+```
+
+Equivalent to the repeatable `--allow-network` flag. A malformed prefix is a
+startup error rather than a silent skip: a typo must not leave you with a policy
+that denies what you meant to allow. A `/0` prefix is accepted but logs a
+warning, since it disables the guard for that address family.
+
+A hostname such as `localhost` carries no address, so the decision is made by the
+DNS guard against whatever the name resolves to — `--allow-network 127.0.0.1/32`
+does reach `http://localhost:8080`.
+
 ### `OBSCURA_NAV_TIMEOUT_MS`
 
 Hard ceiling on a single navigation. Default 30000 (30 seconds). Applies to `Page.navigate` and the CLI `fetch` command.
