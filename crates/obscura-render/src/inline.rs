@@ -1459,6 +1459,7 @@ impl TextEngine {
             font_size: context.font_size,
             line_height: context.line_height,
             letter_spacing: context.letter_spacing,
+            word_spacing: context.word_spacing,
             letter_spacing_non_normal: context.letter_spacing_non_normal,
             weight: context.weight,
             optical_sizing: context.optical_sizing,
@@ -2077,6 +2078,7 @@ struct SpanAttrs {
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    word_spacing: f32,
     letter_spacing_non_normal: bool,
     weight: u16,
     optical_sizing: crate::FontOpticalSizing,
@@ -2140,6 +2142,9 @@ impl SpanAttrs {
         if self.synthetic_italic {
             a = a.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
         }
+        if self.word_spacing.is_finite() && self.word_spacing != 0.0 {
+            a = a.word_spacing(self.word_spacing / self.font_size.max(1.0));
+        }
         if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
             a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
         }
@@ -2197,6 +2202,7 @@ struct SpanCtx {
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    word_spacing: f32,
     letter_spacing_non_normal: bool,
     color: [u8; 4],
     weight: u16,
@@ -2340,6 +2346,7 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         font_size: base.font_size.unwrap_or(16.0),
         line_height,
         letter_spacing: base.letter_spacing.unwrap_or(0.0),
+        word_spacing: base.word_spacing.unwrap_or(0.0),
         letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight: crate::style::used_font_weight(base),
@@ -2395,6 +2402,7 @@ fn collect_node_spans(
                 font_size: ctx.font_size,
                 line_height: ctx.line_height,
                 letter_spacing: ctx.letter_spacing,
+                word_spacing: ctx.word_spacing,
                 letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                 weight: ctx.weight,
                 optical_sizing: ctx.optical_sizing,
@@ -2427,6 +2435,7 @@ fn collect_node_spans(
                         font_size: ctx.font_size,
                         line_height: ctx.line_height,
                         letter_spacing: ctx.letter_spacing,
+                        word_spacing: ctx.word_spacing,
                         letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                         weight: ctx.weight,
                         optical_sizing: ctx.optical_sizing,
@@ -2497,6 +2506,9 @@ fn collect_node_spans(
                 letter_spacing: style
                     .and_then(|style| style.letter_spacing)
                     .unwrap_or(ctx.letter_spacing),
+                word_spacing: style
+                    .and_then(|style| style.word_spacing)
+                    .unwrap_or(ctx.word_spacing),
                 letter_spacing_non_normal: style
                     .and_then(|style| style.letter_spacing_non_normal)
                     .unwrap_or(ctx.letter_spacing_non_normal),
@@ -4402,6 +4414,7 @@ mod tests {
             font_size: 16.0,
             line_height: 18.0,
             letter_spacing: 0.0,
+            word_spacing: 0.0,
             letter_spacing_non_normal: false,
             weight: 400,
             optical_sizing: crate::FontOpticalSizing::Auto,
@@ -4482,6 +4495,7 @@ mod tests {
             font_size: 20.0,
             line_height: 24.0,
             letter_spacing: 2.0,
+            word_spacing: 0.0,
             letter_spacing_non_normal: true,
             weight: 400,
             optical_sizing: crate::FontOpticalSizing::Auto,

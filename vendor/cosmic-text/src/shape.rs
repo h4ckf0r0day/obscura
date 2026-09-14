@@ -272,7 +272,16 @@ fn shape_fallback(
             }
             _ => 0.0,
         };
-        let x_advance = pos.x_advance as f32 / font_scale + letter_spacing;
+        let word_spacing = attrs.word_spacing_opt.map_or(0.0, |spacing| {
+            let cluster_end = glyph_infos.get(glyph_index + 1)
+                .map_or(true, |next| next.cluster != info.cluster);
+            if cluster_end && matches!(line[start_glyph..].chars().next(), Some(' ' | '\u{00a0}')) {
+                spacing.0
+            } else {
+                0.0
+            }
+        });
+        let x_advance = pos.x_advance as f32 / font_scale + letter_spacing + word_spacing;
         let y_advance = pos.y_advance as f32 / font_scale;
         let x_offset = pos.x_offset as f32 / font_scale;
         let y_offset = pos.y_offset as f32 / font_scale;
@@ -590,7 +599,11 @@ fn shape_skip(
             .char_indices()
             .map(|(chr_idx, codepoint)| {
                 let glyph_id = charmap.map(codepoint);
-                let x_advance = glyph_metrics.advance_width(glyph_id)
+                let word_attrs = attrs_list.get_span(start_run + chr_idx);
+                let word_spacing = if matches!(codepoint, ' ' | '\u{00a0}') {
+                    word_attrs.word_spacing_opt.map_or(0.0, |spacing| spacing.0)
+                } else { 0.0 };
+                let x_advance = word_spacing + glyph_metrics.advance_width(glyph_id)
                     + attrs.letter_spacing_opt.map_or(0.0, |spacing| spacing.0);
                 let attrs = attrs_list.get_span(start_run + chr_idx);
 
