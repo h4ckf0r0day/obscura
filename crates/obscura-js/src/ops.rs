@@ -38,19 +38,12 @@ pub enum InterceptResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
         headers: HashMap<String, String>,
-        /// Lossy UTF-8 view of the fulfilled body, for text consumers.
-        body: String,
-        /// The exact fulfilled body as standard base64. CDP delivers the
-        /// fulfillRequest body base64-encoded; carrying it through unchanged
-        /// lets the bootstrap fetch layer reconstruct the exact bytes
-        /// (`_base64ToUint8Array`) instead of a `from_utf8_lossy` corruption
-        /// of any non-UTF-8 payload (image, font, protobuf). See #912.
-        body_base64: String,
+        body: Vec<u8>,
     },
     Fail {
         reason: String,
@@ -2658,14 +2651,13 @@ fn preflight_allows_header(name: &str, allowed: &[&str], credentialed: bool) -> 
 fn intercept_fulfill_response(
     status: u16,
     headers: HashMap<String, String>,
-    body: &str,
-    body_base64: &str,
+    body: &[u8],
     url: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "status": status,
-        "body": body,
-        "bodyBase64": body_base64,
+        "body": String::from_utf8_lossy(body),
+        "bodyBase64": BASE64.encode(body),
         "url": url,
         "headers": headers,
     })
@@ -2796,9 +2788,8 @@ async fn op_fetch_url(
                     status,
                     headers: h,
                     body: b,
-                    body_base64: bb,
                 }) => {
-                    return Ok(intercept_fulfill_response(status, h, &b, &bb, &url).to_string());
+                    return Ok(intercept_fulfill_response(status, h, &b, &url).to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
                     return Ok(serde_json::json!({
@@ -2820,7 +2811,7 @@ async fn op_fetch_url(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body.map(String::into_bytes);
+                    override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
@@ -3666,13 +3657,10 @@ mod tests {
     #[test]
     fn intercept_fulfill_carries_binary_body_as_base64() {
         let raw = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00];
-        let b64 = FULFILL_BASE64.encode(raw);
-        let lossy = String::from_utf8_lossy(&raw).to_string();
         let result = intercept_fulfill_response(
             200,
             std::collections::HashMap::new(),
-            &lossy,
-            &b64,
+            &raw,
             "https://example.test/",
         );
         let out_b64 = result["bodyBase64"]
