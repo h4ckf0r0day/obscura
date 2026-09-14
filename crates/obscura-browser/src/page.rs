@@ -326,6 +326,11 @@ pub struct Page {
     /// page's V8 runtime. Chromium keeps these handles alive with the target;
     /// preserving them avoids order-dependent failures in concurrent clients.
     suspended_cdp_object_state: obscura_js::runtime::CdpObjectState,
+    /// Console messages drained from the runtime when the page is suspended for
+    /// tab switching, so they are not lost when the runtime is dropped (#971).
+    /// Retrieved (and cleared) alongside the live messages by
+    /// `take_pending_console_messages`.
+    suspended_console_messages: Vec<String>,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -1167,6 +1172,7 @@ impl Page {
             pending_frame_work: std::collections::VecDeque::new(),
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
+            suspended_console_messages: Vec::new(),
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -4509,6 +4515,9 @@ impl Page {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        // Preserve console messages logged before suspension: dropping the
+        // runtime below would otherwise lose any not yet drained (#971).
+        let pending_console = js.take_pending_console_messages();
         self.suspended_cdp_object_state = js.take_cdp_object_state();
         let dom = js.take_dom();
         if let Some(dom) = dom {
@@ -4524,6 +4533,7 @@ impl Page {
         // can, so they are rebuilt when the page next loads a document.
         self.pending_frame_work.clear();
         self.frames.clear();
+        self.suspended_console_messages.extend(pending_console);
         self.js = None;
     }
 
@@ -4575,10 +4585,13 @@ impl Page {
     }
 
     pub fn take_pending_console_messages(&mut self) -> Vec<String> {
-        self.js
-            .as_ref()
-            .map(ObscuraJsRuntime::take_pending_console_messages)
-            .unwrap_or_default()
+        // Buffered messages from any suspended runtime come first, then the
+        // live runtime's messages (#971).
+        let mut messages = std::mem::take(&mut self.suspended_console_messages);
+        if let Some(js) = &self.js {
+            messages.extend(js.take_pending_console_messages());
+        }
+        messages
     }
 
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
@@ -5105,6 +5118,40 @@ mod tests {
         assert_eq!(
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
+        );
+    }
+
+    // #971: a tab switch suspends other tabs (drops their runtime). Console
+    // messages logged before suspension must be preserved, not lost.
+    #[tokio::test(flavor = "current_thread")]
+    async fn suspend_js_preserves_pending_console_messages() {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "console-suspend".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("console-suspend".to_string(), context);
+        page.navigate("data:text/html,<html><body></body></html>")
+            .await
+            .unwrap();
+
+        page.set_console_messages_enabled(true);
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("console.log('important-message')")
+            .unwrap();
+
+        // Switching away suspends this tab and drops its runtime.
+        page.suspend_js();
+
+        let messages = page.take_pending_console_messages();
+        assert!(
+            messages.iter().any(|m| m.contains("important-message")),
+            "console messages logged before suspend_js must survive it, got: {messages:?}"
         );
     }
 
