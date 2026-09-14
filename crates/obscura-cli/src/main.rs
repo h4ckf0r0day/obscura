@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use obscura_browser::{BrowserContext, Page};
+use obscura_net::StealthPlatform;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
@@ -31,6 +32,15 @@ struct Args {
     /// Global: applies to fetch, serve, scrape, and mcp.
     #[arg(long, global = true)]
     stealth: bool,
+
+    /// The OS family the stealth identity claims (windows, macos, or linux).
+    /// Defaults to the host OS: the kernel the traffic exits from is what
+    /// detectors see, so claiming a different family is itself a signal.
+    /// Global: applies to fetch, serve, scrape, mcp, and the bare CDP
+    /// command. In non-stealth builds it is accepted but inert, like
+    /// --stealth itself.
+    #[arg(long, value_name = "PLATFORM", global = true)]
+    platform: Option<String>,
 
     /// Respect robots.txt before navigating to an HTTP(S) URL.
     /// Global: applies to fetch and scrape.
@@ -385,6 +395,13 @@ async fn main() -> anyhow::Result<()> {
     let global_proxy = args.proxy.clone();
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
+    let stealth_platform = match args.platform.as_deref() {
+        Some(raw) => raw
+            .trim()
+            .parse::<obscura_net::StealthPlatform>()
+            .map_err(|e| anyhow::anyhow!("invalid --platform value: {e}"))?,
+        None => obscura_net::StealthPlatform::host(),
+    };
 
     match args.command {
         Some(Command::Serve {
@@ -440,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
                     stealth,
                     user_agent,
                     font_dirs,
+                    stealth_platform,
                 )
                 .await?;
             } else {
@@ -453,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    stealth_platform,
                 )
                 .await?;
             }
@@ -473,6 +492,12 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             screenshot,
         }) => {
+            if stealth && user_agent.is_some() {
+                tracing::warn!(
+                    "--user-agent is ignored in stealth mode; the wire identity is set by --platform ({})",
+                    stealth_platform.name()
+                );
+            }
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -497,7 +522,8 @@ async fn main() -> anyhow::Result<()> {
                     global_proxy,
                     output,
                     quiet,
-                    stealth
+                    stealth,
+                    stealth_platform,
                 )
                 .await?;
             } else {
@@ -517,6 +543,7 @@ async fn main() -> anyhow::Result<()> {
                     &wait_until,
                     user_agent,
                     stealth,
+                    stealth_platform,
                     eval,
                     output,
                     quiet,
@@ -547,6 +574,7 @@ async fn main() -> anyhow::Result<()> {
                 global_proxy,
                 stealth,
                 obey_robots,
+                stealth_platform,
             )
             .await?;
         }
@@ -559,9 +587,10 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth, stealth_platform)
+                    .await?;
             } else {
-                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::run(mcp_proxy, user_agent, stealth, stealth_platform).await?;
             }
         }
         None => {
@@ -569,7 +598,19 @@ async fn main() -> anyhow::Result<()> {
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, stealth).await?;
+            obscura_cdp::start_with_serve_options_and_limit(
+                args.port,
+                "127.0.0.1",
+                args.proxy,
+                stealth,
+                None,
+                false,
+                None,
+                false,
+                obscura_cdp::DEFAULT_MAX_CONNECTIONS,
+                stealth_platform,
+            )
+            .await?;
         }
     }
 
@@ -584,6 +625,7 @@ async fn run_multi_worker_serve(
     stealth: bool,
     user_agent: Option<String>,
     font_dirs: Vec<std::path::PathBuf>,
+    platform: StealthPlatform,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -611,6 +653,7 @@ async fn run_multi_worker_serve(
         if stealth {
             cmd.arg("--stealth");
         }
+        cmd.arg("--platform").arg(platform.name());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
 
@@ -733,6 +776,7 @@ async fn run_fetch(
     wait_until: &str,
     user_agent: Option<String>,
     stealth: bool,
+    platform: StealthPlatform,
     eval: Option<String>,
     output: Option<std::path::PathBuf>,
     quiet: bool,
@@ -759,6 +803,7 @@ async fn run_fetch(
             user_agent.clone(),
             timeout_secs,
             stealth,
+            platform,
         )
         .await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
@@ -774,6 +819,7 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    context.stealth_platform = platform;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -1142,6 +1188,8 @@ async fn fetch_original_response(
     user_agent: Option<String>,
     timeout_secs: u64,
     stealth: bool,
+    #[allow(unused_variables)]
+    platform: StealthPlatform,
 ) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
@@ -1165,6 +1213,7 @@ async fn fetch_original_response(
                 Arc::new(obscura_net::CookieJar::new()),
                 proxy.as_deref(),
                 false,
+                platform,
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
@@ -1195,9 +1244,10 @@ async fn fetch_original_bytes(
     user_agent: Option<String>,
     timeout_secs: u64,
     stealth: bool,
+    platform: StealthPlatform,
 ) -> anyhow::Result<Vec<u8>> {
     Ok(
-        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth)
+        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth, platform)
             .await?
             .body,
     )
@@ -1240,6 +1290,7 @@ async fn run_batch_fetch(
     output: Option<std::path::PathBuf>,
     quiet: bool,
     stealth: bool,
+    platform: StealthPlatform,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     if total == 0 {
@@ -1273,6 +1324,7 @@ async fn run_batch_fetch(
                 (*user_agent).clone(),
                 timeout_secs,
                 stealth,
+                platform,
             )
             .await;
             let elapsed_ms = task_start.elapsed().as_millis();
@@ -1598,6 +1650,7 @@ async fn run_parallel_scrape(
     proxy: Option<String>,
     stealth: bool,
     obey_robots: bool,
+    platform: StealthPlatform,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1656,6 +1709,7 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
+                .env("OBSCURA_STEALTH_PLATFORM", platform.name())
                 .spawn()
             {
                 Ok(c) => c,
@@ -1998,6 +2052,7 @@ mod tests {
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
         merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
         write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        StealthPlatform,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -2115,9 +2170,16 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5, false)
-            .await
-            .expect("fetch_original_bytes should round-trip the file body");
+        let bytes = fetch_original_bytes(
+            &file_url,
+            None,
+            None,
+            5,
+            false,
+            StealthPlatform::host(),
+        )
+        .await
+        .expect("fetch_original_bytes should round-trip the file body");
 
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -2151,9 +2213,16 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5, true)
-            .await
-            .expect("fetch_original_bytes should still round-trip file:// with stealth=true");
+        let bytes = fetch_original_bytes(
+            &file_url,
+            None,
+            None,
+            5,
+            true,
+            StealthPlatform::host(),
+        )
+        .await
+        .expect("fetch_original_bytes should still round-trip file:// with stealth=true");
 
         let _ = tokio::fs::remove_file(&path).await;
 

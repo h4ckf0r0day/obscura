@@ -4353,6 +4353,7 @@ mod tests {
             std::sync::Arc::new(obscura_net::CookieJar::new()),
             None,
             true,
+            obscura_net::StealthPlatform::Windows,
         )));
         assert!(rt.has_page_transport());
         assert!(!rt.render_resource_sync_loading_enabled());

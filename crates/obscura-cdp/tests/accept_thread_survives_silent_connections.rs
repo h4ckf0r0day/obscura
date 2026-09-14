@@ -24,6 +24,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use obscura_net::StealthPlatform;
 
 const SILENT_CONNECTIONS: usize = 4;
 
@@ -55,6 +56,7 @@ fn accept_thread_survives_silent_connections() {
                 None,
                 true,
                 128,
+                StealthPlatform::host(),
             )
             .await;
         });

@@ -1124,6 +1124,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
+                context.stealth_platform,
             )))
         } else {
             None
@@ -1807,12 +1808,13 @@ impl Page {
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
+            let p = self.context.stealth_platform;
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(p.user_agent());
             rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
+                p.navigator_platform(),
+                p.ua_platform(),
+                p.ua_platform_version(),
             );
         } else {
             if let Ok(ua) = self.http_client.user_agent.try_read() {

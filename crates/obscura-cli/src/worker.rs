@@ -57,8 +57,20 @@ async fn main() {
     let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    let stealth_platform = std::env::var("OBSCURA_STEALTH_PLATFORM")
+        .ok()
+        .and_then(|v| {
+            let raw = v.trim();
+            if raw.is_empty() {
+                None
+            } else {
+                raw.parse::<obscura_net::StealthPlatform>().ok()
+            }
+        })
+        .unwrap_or_else(obscura_net::StealthPlatform::host);
     let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
     context.obey_robots = obey_robots;
+    context.stealth_platform = stealth_platform;
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
 

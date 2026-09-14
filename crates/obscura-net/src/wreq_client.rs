@@ -17,6 +17,8 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
+use crate::stealth_platform::StealthPlatform;
+#[cfg(feature = "stealth")]
 use crate::client::{
     CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver, cors_required, env_allows_private_network,
@@ -56,21 +58,6 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
         })
     }
 }
-
-#[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
-// UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
-// same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
-// site cross-checks the mismatch as a bot signal.
-#[cfg(feature = "stealth")]
-pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
-#[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM: &str = "Windows";
-#[cfg(feature = "stealth")]
-pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
 #[cfg(feature = "stealth")]
 fn wreq_response_header_value<'a>(
@@ -182,17 +169,18 @@ pub struct StealthHttpClient {
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None, false)
+        Self::with_proxy(cookie_jar, None, false, StealthPlatform::host())
     }
 
     pub fn with_proxy(
         cookie_jar: Arc<CookieJar>,
         proxy_url: Option<&str>,
         allow_private_network: bool,
+        platform: StealthPlatform,
     ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
-            .platform(wreq_util::Platform::Windows)
+            .platform(platform.wreq())
             .build();
 
         let mut builder = wreq::Client::builder()
@@ -538,6 +526,7 @@ mod tests {
     use super::{StealthHttpClient, send_get_with_connection_reset_retry};
     use crate::client::{ObscuraNetError, SsrfGuardResolver};
     use crate::cookies::CookieJar;
+    use crate::stealth_platform::StealthPlatform;
     use wreq::dns::{Name, Resolve};
 
     // Mirrors client::ssrf_tests::resolver_blocks_hostname_that_resolves_to_loopback.
@@ -701,7 +690,8 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_honors_allow_private_network_for_loopback_hostnames() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let client =
+            StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true, StealthPlatform::Windows);
         let url = Url::parse(&format!("http://localhost:{port}/")).unwrap();
 
         let resp = client
