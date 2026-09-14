@@ -615,10 +615,11 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 // are common SSRF targets:
                 //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
                 //                  Alibaba 100.100.100.200) lives here.
-                //   198.18.0.0/15  benchmarking / RFC2544.
                 //   192.88.99.0/24 6to4 relay anycast / RFC7526.
+                // 198.18.0.0/15 (RFC2544 benchmarking) is deliberately NOT here:
+                // nothing internal lives there by convention, and Clash fake-ip
+                // / WSL2 NAT hand it out for ordinary virtual IPs (#852).
                 || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99)
                 // Most of 192.0.0.0/24 is special-purpose and not globally
                 // reachable. Keep the two globally reachable PCP anycast
@@ -1852,8 +1853,6 @@ mod ssrf_tests {
             "100.64.0.1",             // CGNAT / RFC 6598 start
             "100.100.100.200",        // Alibaba Cloud metadata (CGNAT)
             "100.127.255.255",        // CGNAT end
-            "198.18.0.1",             // benchmarking / RFC 2544 start
-            "198.19.255.255",         // benchmarking end
             "192.88.99.1",            // 6to4 relay anycast / RFC 7526
             "::ffff:100.100.100.200", // v4-mapped CGNAT
         ] {
@@ -1862,13 +1861,23 @@ mod ssrf_tests {
     }
 
     // Addresses just outside those prefixes must stay allowed (no over-block).
+    // #852 — 198.18.0.0/15 (RFC2544 benchmarking) must NOT be in the SSRF
+    // deny-set: no cloud metadata or internal service lives there by
+    // convention, and Clash fake-ip / WSL2 NAT hand it out for ordinary virtual
+    // IPs, so hard-blocking it breaks legitimate fetches. (CGNAT 100.64/10 and
+    // 6to4 anycast 192.88.99/24 stay blocked — those do host metadata.)
+    #[test]
+    fn benchmarking_range_198_18_is_allowed() {
+        for s in ["198.18.0.1", "198.18.1.206", "198.19.255.255"] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
     #[test]
     fn ipv4_addresses_adjacent_to_special_ranges_stay_allowed() {
         for s in [
             "100.63.255.255", // just below 100.64.0.0/10
             "100.128.0.0",    // just above 100.127.255.255
-            "198.17.255.255", // just below 198.18.0.0/15
-            "198.20.0.0",     // just above 198.19.255.255
             "192.88.98.255",  // just below 192.88.99.0/24
             "192.88.100.0",   // just above 192.88.99.0/24
         ] {
