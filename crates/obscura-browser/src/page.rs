@@ -3663,39 +3663,9 @@ impl Page {
                 candidates.insert((url.to_string(), Some(profile), false));
             }
         }
-        let css_sources = js
-            .with_dom(|dom| {
-                let mut sources = Vec::new();
-                for id in dom.descendants(dom.document()) {
-                    let Some(node) = dom.get_node(id) else {
-                        continue;
-                    };
-                    if node
-                        .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "style")
-                    {
-                        sources.push(dom.text_content(id));
-                    }
-                    if let Some(style) = node.get_attribute("style") {
-                        sources.push(style.to_string());
-                    }
-                    if node
-                        .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "use")
-                    {
-                        if let Some(href) = node
-                            .get_attribute("href")
-                            .or_else(|| node.get_attribute("xlink:href"))
-                        {
-                            sources.push(format!("url({href})"));
-                        }
-                    }
-                }
-                sources
-            })
-            .unwrap_or_default();
-        for css in css_sources {
-            for raw in css_resource_urls(&css, &base_url) {
+        for (css, source_base) in js.render_css_sources() {
+            let source_base = url::Url::parse(&source_base).unwrap_or_else(|_| base_url.clone());
+            for raw in css_resource_urls(&css, &source_base) {
                 if let Ok(mut url) = url::Url::parse(&raw) {
                     url.set_fragment(None);
                     let is_font = render_resource_is_font(&url);
