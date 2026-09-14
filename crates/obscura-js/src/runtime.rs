@@ -1200,6 +1200,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().blocked_urls = patterns;
     }
 
+    pub fn has_pending_navigation(&self) -> bool {
+        self.state.borrow().pending_navigation.is_some()
+    }
+
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
         self.state.borrow_mut().pending_navigation.take()
     }

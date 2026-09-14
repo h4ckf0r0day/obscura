@@ -216,14 +216,16 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         Some(&session_id),
     )
     .await;
-    let route_frame = &ctx.pending_events[route_event_start..]
+    let route_event = &ctx.pending_events[route_event_start..]
         .iter()
         .find(|event| {
-            event.method == "Page.frameNavigated" && event.params["frame"]["id"] == page_id
+            event.method == "Page.navigatedWithinDocument" && event.params["frameId"] == page_id
         })
         .expect("same-document navigation event was not emitted")
-        .params["frame"];
-    assert_frame_contract(route_frame);
-    assert_eq!(route_frame["loaderId"], loader_id);
-    assert!(route_frame["url"].as_str().unwrap().ends_with("/next"));
+        .params;
+    assert_eq!(route_event["navigationType"], "historyApi");
+    assert!(route_event["url"].as_str().unwrap().ends_with("/next"));
+    let routed_tree = cdp(&mut ctx, 10, "Page.getFrameTree", json!({}), Some(&session_id)).await;
+    assert_frame_contract(&routed_tree["frameTree"]["frame"]);
+    assert_eq!(routed_tree["frameTree"]["frame"]["loaderId"], loader_id);
 }
