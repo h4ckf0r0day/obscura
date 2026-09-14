@@ -197,10 +197,26 @@ impl BrowserContext {
     /// Called during graceful shutdown.
     pub fn save_cookies(&self) {
         if let Some(ref dir) = self.storage_dir {
-            let _ = std::fs::create_dir_all(dir);
+            // Was `let _ = create_dir_all(dir)`: an unwritable storage dir
+            // (a root-owned bind mount under the non-root container image, say)
+            // produced a run that completed, exited 0, and never persisted a
+            // cookie. Report it instead of discarding it.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::error!(
+                    "Cannot create storage dir {}: {e}. Cookies will NOT be persisted.",
+                    dir.display()
+                );
+                return;
+            }
             let cookie_path = dir.join("cookies.json");
             if let Err(e) = self.cookie_jar.save_to_file(&cookie_path) {
-                tracing::warn!("Failed to save cookies to {}: {}", cookie_path.display(), e);
+                // error!, not warn!: losing session persistence silently is the
+                // failure mode operators actually hit, and it looks like
+                // success until a later run has no session.
+                tracing::error!(
+                    "Failed to save cookies to {}: {e}. Cookies will NOT be persisted.",
+                    cookie_path.display()
+                );
             } else {
                 tracing::info!("Saved cookies to {}", cookie_path.display());
             }

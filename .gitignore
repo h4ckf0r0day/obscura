@@ -1,2 +1,6 @@
 target/
 .DS_Store
+
+# Build transcripts. build.log was committed once and carried the maintainer's
+# absolute build path (/root/obscura2/merge471) into the public repo.
+*.log
