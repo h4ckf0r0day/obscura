@@ -57,16 +57,6 @@ async fn emit_post_eval_nav(
     if !did_navigate {
         return Ok(());
     }
-    if !document_navigation {
-        let frame_id = page.frame_id.clone();
-        let url = page.url_string();
-        ctx.pending_events.push(crate::types::CdpEvent {
-            method: "Page.navigatedWithinDocument".into(),
-            params: json!({"frameId": frame_id, "url": url, "navigationType": "historyApi"}),
-            session_id: session_id.clone(),
-        });
-        return Ok(());
-    }
     let (frame_id, page_url, page_id, network_events, reached_idle) = {
         let p = ctx.get_session_page_mut(session_id).ok_or("No page")?;
         (
@@ -77,6 +67,17 @@ async fn emit_post_eval_nav(
             p.lifecycle.is_network_idle(),
         )
     };
+    if !document_navigation {
+        super::page::emit_runtime_network_events(
+            ctx, session_id, &frame_id, &page_url, &page_id, &network_events,
+        );
+        ctx.pending_events.push(crate::types::CdpEvent {
+            method: "Page.navigatedWithinDocument".into(),
+            params: json!({"frameId": frame_id, "url": page_url, "navigationType": "historyApi"}),
+            session_id: session_id.clone(),
+        });
+        return Ok(());
+    }
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
     super::page::emit_navigation_events(
         ctx,
