@@ -20009,6 +20009,129 @@ mod tests {
         );
     }
 
+    // Each HTML element interface is its own brand: `div instanceof
+    // HTMLIFrameElement` is false in a browser. While the interfaces were
+    // aliases of Element every one of the negative cases below answered true.
+    #[test]
+    fn html_element_interfaces_have_distinct_brands() {
+        let mut rt = setup_runtime(
+            "<html><head><style></style></head><body><div id=\"d\"></div><input><select></select><iframe></iframe><form></form><textarea></textarea><h3></h3></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const el = (sel) => document.querySelector(sel);
+                return JSON.stringify({
+                  divIsDiv: el('div') instanceof HTMLDivElement,
+                  headIsHead: document.head instanceof HTMLHeadElement,
+                  styleIsStyle: el('style') instanceof HTMLStyleElement,
+                  inputIsInput: el('input') instanceof HTMLInputElement,
+                  iframeIsIframe: el('iframe') instanceof HTMLIFrameElement,
+                  h3IsHeading: el('h3') instanceof HTMLHeadingElement,
+                  // Negative brands — all of these used to be true.
+                  headIsNotIframe: document.head instanceof HTMLIFrameElement,
+                  divIsNotIframe: el('div') instanceof HTMLIFrameElement,
+                  divIsNotAnchor: el('div') instanceof HTMLAnchorElement,
+                  inputIsNotSelect: el('input') instanceof HTMLSelectElement,
+                  styleIsNotIframe: el('style') instanceof HTMLIFrameElement,
+                  // HTMLElement still matches any HTML element.
+                  divIsHtmlElement: el('div') instanceof HTMLElement,
+                  // Interfaces with a real subclass are untouched.
+                  formIsForm: el('form') instanceof HTMLFormElement,
+                  textareaIsTextarea: el('textarea') instanceof HTMLTextAreaElement,
+                  divIsNotForm: el('div') instanceof HTMLFormElement,
+                  // Prototype identity is preserved: patching the interface
+                  // prototype must still reach real elements.
+                  prototypePatchReaches: (() => {
+                    HTMLDivElement.prototype.__brandProbe = 42;
+                    const seen = el('div').__brandProbe;
+                    delete Element.prototype.__brandProbe;
+                    return seen;
+                  })(),
+                  constructThrows: (() => {
+                    try { new HTMLDivElement(); return false } catch (e) { return e instanceof TypeError }
+                  })(),
+                });
+                "#,
+            )
+            .unwrap();
+        let brands: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("brand json");
+        for positive in [
+            "divIsDiv",
+            "headIsHead",
+            "styleIsStyle",
+            "inputIsInput",
+            "iframeIsIframe",
+            "h3IsHeading",
+            "divIsHtmlElement",
+            "formIsForm",
+            "textareaIsTextarea",
+            "constructThrows",
+        ] {
+            assert_eq!(brands[positive], true, "{positive} must hold");
+        }
+        for negative in [
+            "headIsNotIframe",
+            "divIsNotIframe",
+            "divIsNotAnchor",
+            "inputIsNotSelect",
+            "styleIsNotIframe",
+            "divIsNotForm",
+        ] {
+            assert_eq!(brands[negative], false, "{negative} must not hold");
+        }
+        assert_eq!(brands["prototypePatchReaches"], 42);
+    }
+
+    // style-loader/lib/addStyles.js resolves its insert target and then checks
+    // `styleTarget instanceof window.HTMLIFrameElement`. With every interface
+    // aliased to Element that check matched <head>, so it read
+    // head.contentDocument.head, threw, cached null, and reported
+    // "Couldn't find a style target" — no webpack-built app could install a
+    // stylesheet. This reproduces that path; it throws on an unbranded build.
+    #[test]
+    fn style_loader_insert_target_is_not_mistaken_for_an_iframe() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const memo = {};
+                const getElement = (selector) => {
+                  if (typeof memo[selector] === 'undefined') {
+                    let styleTarget = document.querySelector(selector);
+                    if (styleTarget instanceof window.HTMLIFrameElement) {
+                      try { styleTarget = styleTarget.contentDocument.head }
+                      catch (e) { styleTarget = null }
+                    }
+                    memo[selector] = styleTarget;
+                  }
+                  return memo[selector];
+                };
+                const target = getElement('head');
+                if (!target) {
+                  throw new Error("Couldn't find a style target. This probably means that the value for the 'insertInto' parameter is invalid.");
+                }
+                const style = document.createElement('style');
+                style.appendChild(document.createTextNode('.probe{color:red}'));
+                target.appendChild(style);
+                return JSON.stringify({
+                  targetTag: target.tagName,
+                  installed: document.head.contains(style),
+                  rules: style.sheet?.cssRules?.length ?? 0,
+                });
+                "#,
+            )
+            .unwrap();
+        let installed: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("style-loader json");
+        assert_eq!(installed["targetTag"], "HEAD");
+        assert_eq!(installed["installed"], true);
+        assert_eq!(installed["rules"], 1);
+    }
+
     // Writing goes through the same insertion steps as any other insertion.
     #[test]
     fn document_write_reports_to_mutation_observers() {
