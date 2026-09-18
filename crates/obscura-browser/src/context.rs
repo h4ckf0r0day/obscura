@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
+use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache, StealthPlatform};
 
 pub struct BrowserContext {
     pub id: String,
@@ -11,6 +11,7 @@ pub struct BrowserContext {
     pub platform: String,
     pub ua_platform: String,
     pub ua_platform_version: String,
+    pub stealth_platform: StealthPlatform,
     pub proxy_url: Option<String>,
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
@@ -126,6 +127,7 @@ impl BrowserContext {
             platform,
             ua_platform,
             ua_platform_version,
+            stealth_platform: StealthPlatform::host(),
             proxy_url,
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
@@ -183,6 +185,7 @@ impl BrowserContext {
             platform: self.platform.clone(),
             ua_platform: self.ua_platform.clone(),
             ua_platform_version: self.ua_platform_version.clone(),
+            stealth_platform: self.stealth_platform,
             proxy_url: self.proxy_url.clone(),
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: self.obey_robots,

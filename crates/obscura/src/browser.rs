@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use obscura_browser::BrowserContext;
 use obscura_net::CookieJar;
+use obscura_net::StealthPlatform;
 
 use crate::config::BrowserConfig;
 use crate::cookie::CookieStore;
@@ -23,7 +24,7 @@ impl Browser {
     }
 
     pub fn build(config: BrowserConfig) -> Result<Self, Error> {
-        let context = if let Some(ref dir) = config.storage_dir {
+        let mut context = if let Some(dir) = &config.storage_dir {
             BrowserContext::with_storage_full(
                 "api".to_string(),
                 config.proxy,
@@ -39,6 +40,8 @@ impl Browser {
                 config.user_agent,
             )
         };
+        context.stealth_platform =
+            config.stealth_platform.unwrap_or_else(StealthPlatform::host);
 
         let context = Arc::new(context);
         let cookie_jar = context.cookie_jar.clone();
@@ -87,6 +90,12 @@ impl BrowserBuilder {
     }
     pub fn storage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.config.storage_dir = Some(dir.into());
+        self
+    }
+    /// The OS family the stealth identity claims (`StealthPlatform::Windows`,
+    /// `MacOS`, or `Linux`). Omitted keeps the host OS default.
+    pub fn stealth_platform(mut self, platform: StealthPlatform) -> Self {
+        self.config.stealth_platform = Some(platform);
         self
     }
     pub fn build(self) -> Result<Browser, Error> {

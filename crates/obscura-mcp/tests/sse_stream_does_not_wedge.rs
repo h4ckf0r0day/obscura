@@ -28,7 +28,15 @@ async fn open_sse_stream_does_not_block_other_requests() {
     let local = LocalSet::new();
 
     let server = local.spawn_local(async move {
-        let _ = obscura_mcp::http::run("127.0.0.1".to_string(), port, None, None, false).await;
+        let _ = obscura_mcp::http::run(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            None,
+            false,
+            obscura_net::StealthPlatform::host(),
+        )
+        .await;
     });
 
     local

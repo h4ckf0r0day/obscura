@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use obscura_net::StealthPlatform;
+
 /// Configuration for launching a Browser instance.
 pub struct BrowserConfig {
     /// Proxy URL (e.g., "socks5://127.0.0.1:1080")
@@ -10,6 +12,9 @@ pub struct BrowserConfig {
     pub user_agent: Option<String>,
     /// Directory for persistent cookie storage
     pub storage_dir: Option<PathBuf>,
+    /// The OS family the stealth identity claims. `None` means the host OS
+    /// (`StealthPlatform::host()`); honored only when `stealth` is enabled.
+    pub stealth_platform: Option<StealthPlatform>,
 }
 
 impl Default for BrowserConfig {
@@ -19,6 +24,7 @@ impl Default for BrowserConfig {
             stealth: false,
             user_agent: None,
             storage_dir: None,
+            stealth_platform: None,
         }
     }
 }
@@ -52,6 +58,13 @@ impl BrowserConfigBuilder {
 
     pub fn storage_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.storage_dir = Some(dir.into());
+        self
+    }
+
+    /// The OS family the stealth identity claims (`StealthPlatform::Windows`,
+    /// `MacOS`, or `Linux`). `None` keeps the host OS default.
+    pub fn stealth_platform(mut self, platform: StealthPlatform) -> Self {
+        self.config.stealth_platform = Some(platform);
         self
     }
 

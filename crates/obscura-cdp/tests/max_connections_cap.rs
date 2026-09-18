@@ -23,6 +23,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use obscura_net::StealthPlatform;
 
 const LIMIT: usize = 2;
 
@@ -111,6 +112,7 @@ fn max_connections_refuses_then_recovers() {
                 None,
                 true,
                 LIMIT,
+                StealthPlatform::host(),
             )
             .await;
         });
