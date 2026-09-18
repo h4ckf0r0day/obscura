@@ -11812,6 +11812,88 @@ globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
+
+// Every HTML element interface has its own brand: `div instanceof
+// HTMLIFrameElement` is false in a browser. Most interfaces above are aliases of
+// Element, so with `HTMLIFrameElement === Element` every element was an instance
+// of every interface, and a feature guard keyed on a brand took the wrong
+// branch. style-loader's addStyles does
+// `styleTarget instanceof window.HTMLIFrameElement` on its insert target,
+// concluded <head> was an iframe, read `head.contentDocument.head`, threw,
+// cached null and reported "Couldn't find a style target. This probably means
+// that the value for the 'insertInto' parameter is invalid." — so no
+// webpack-built application could install any stylesheet. This is the class of
+// bug the HTMLSlotElement comment above describes, for the rest of the surface.
+//
+// An interface that needs *behaviour* gets a real subclass plus an entry in
+// _elementClassFor (HTMLFormElement, HTMLTextAreaElement, HTMLSlotElement, …).
+// These need only *identity*, so they keep Element.prototype as their prototype
+// — patching HTMLDivElement.prototype must still reach the element prototype —
+// and answer instanceof from the tag name. Element construction is untouched:
+// _elementClassFor still hands out Element, and nothing re-wraps existing nodes.
+//
+// Interfaces already backed by a real subclass are skipped by the
+// `=== Element` test, so this stays correct if one of them grows behaviour later.
+(function _brandHtmlElementInterfaces() {
+  const XHTML = 'http://www.w3.org/1999/xhtml';
+  // HTMLElement and HTMLUnknownElement are deliberately absent: the first
+  // matches every HTML element (Element is the closer approximation we have),
+  // and the second matches exactly the tags no other interface claims, which
+  // needs the full known-element list rather than a tag list of its own.
+  const TAGS = {
+    HTMLAnchorElement: ['A'],
+    HTMLBRElement: ['BR'],
+    HTMLBodyElement: ['BODY'],
+    HTMLButtonElement: ['BUTTON'],
+    HTMLCanvasElement: ['CANVAS'],
+    HTMLDataListElement: ['DATALIST'],
+    HTMLDetailsElement: ['DETAILS'],
+    HTMLDialogElement: ['DIALOG'],
+    HTMLDivElement: ['DIV'],
+    HTMLFieldSetElement: ['FIELDSET'],
+    HTMLHRElement: ['HR'],
+    HTMLHeadElement: ['HEAD'],
+    HTMLHeadingElement: ['H1', 'H2', 'H3', 'H4', 'H5', 'H6'],
+    HTMLHtmlElement: ['HTML'],
+    HTMLIFrameElement: ['IFRAME'],
+    HTMLInputElement: ['INPUT'],
+    HTMLLIElement: ['LI'],
+    HTMLLabelElement: ['LABEL'],
+    HTMLLegendElement: ['LEGEND'],
+    HTMLLinkElement: ['LINK'],
+    HTMLMetaElement: ['META'],
+    HTMLOListElement: ['OL'],
+    HTMLOptionElement: ['OPTION'],
+    HTMLParagraphElement: ['P'],
+    HTMLPreElement: ['PRE'],
+    HTMLProgressElement: ['PROGRESS'],
+    HTMLScriptElement: ['SCRIPT'],
+    HTMLSelectElement: ['SELECT'],
+    HTMLSpanElement: ['SPAN'],
+    HTMLStyleElement: ['STYLE'],
+    HTMLTableElement: ['TABLE'],
+    HTMLTemplateElement: ['TEMPLATE'],
+    HTMLUListElement: ['UL'],
+  };
+  for (const name of Object.keys(TAGS)) {
+    if (globalThis[name] !== Element) { continue; }
+    const brand = new Set(TAGS[name]);
+    const Interface = function () { throw new TypeError('Illegal constructor'); };
+    try { Object.defineProperty(Interface, 'name', { value: name, configurable: true }); } catch (e) {}
+    // Shared with Element so `HTMLDivElement.prototype.foo = …` still patches
+    // the prototype real elements use, exactly as the alias did.
+    Interface.prototype = Element.prototype;
+    Object.defineProperty(Interface, Symbol.hasInstance, {
+      value: (value) =>
+        value instanceof Element &&
+        value.namespaceURI === XHTML &&
+        brand.has(value.tagName),
+      configurable: true,
+    });
+    globalThis[name] = Interface;
+  }
+})();
+
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
