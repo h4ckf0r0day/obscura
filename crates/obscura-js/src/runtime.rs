@@ -17148,6 +17148,19 @@ mod tests {
         String,
         std::sync::mpsc::Receiver<String>,
     ) {
+        cors_preflight_runtime_with_response(
+            "HTTP/1.1 204 No Content\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Access-Control-Allow-Headers: content-type\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+    }
+
+    fn cors_preflight_runtime_with_response(preflight_response: &'static str) -> (
+        ObscuraJsRuntime,
+        String,
+        std::sync::mpsc::Receiver<String>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let target = format!("http://{address}/resource");
@@ -17164,11 +17177,7 @@ mod tests {
                 let request = String::from_utf8_lossy(&request[..length]).to_string();
                 requests_tx.send(request.clone()).unwrap();
                 let response = if request.starts_with("OPTIONS ") {
-                    "HTTP/1.1 204 No Content\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Access-Control-Allow-Headers: content-type\r\n\
-                     Content-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_string()
+                    preflight_response.to_string()
                 } else {
                     "HTTP/1.1 200 OK\r\n\
                      Access-Control-Allow-Origin: *\r\n\
@@ -17188,6 +17197,47 @@ mod tests {
             ),
         ));
         (rt, target, requests_rx)
+    }
+
+    async fn assert_preflight_status_precedes_cors_headers(stealth: bool) {
+        // A failed OPTIONS without CORS headers must report its HTTP status,
+        // rather than a missing permission header, in either transport mode.
+        let (mut rt, target, requests) = cors_preflight_runtime_with_response(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        if stealth {
+            #[cfg(feature = "stealth")]
+            rt.set_stealth_client(std::sync::Arc::new(
+                obscura_net::StealthHttpClient::with_proxy(
+                    std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+                ),
+            ));
+            #[cfg(not(feature = "stealth"))]
+            panic!("the stealth preflight test requires the stealth feature");
+        }
+        let result = rt.call_function_on_for_cdp(
+            &format!(r#"async () => fetch({target:?}, {{ method: "DELETE" }})
+                .then(() => "resolved", error => error.message)"#),
+            None, &[], true, true,
+        ).await.unwrap();
+        let value = result.value.unwrap();
+        let message = value.as_str().expect("preflight rejection message");
+        assert!(message.contains("CORS preflight returned HTTP 403"), "{message}");
+        let request = requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(request.starts_with("OPTIONS /resource "), "{request}");
+        assert!(requests.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "the denied DELETE request reached the server");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preflight_status_precedes_cors_headers() {
+        assert_preflight_status_precedes_cors_headers(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_preflight_status_precedes_cors_headers() {
+        assert_preflight_status_precedes_cors_headers(true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17619,7 +17669,23 @@ mod tests {
     // if the final destination would authorize the request.
     #[tokio::test(flavor = "current_thread")]
     async fn cors_mode_blocks_unauthorized_cross_origin_redirect_hop() {
-        let (mut rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        let (rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        assert_cors_blocks_unauthorized_redirect(rt, redirector).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_cors_mode_blocks_unauthorized_cross_origin_redirect_hop() {
+        let (rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        rt.set_stealth_client(std::sync::Arc::new(
+            obscura_net::StealthHttpClient::with_proxy(
+                std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+            ),
+        ));
+        assert_cors_blocks_unauthorized_redirect(rt, redirector).await;
+    }
+
+    async fn assert_cors_blocks_unauthorized_redirect(mut rt: ObscuraJsRuntime, redirector: String) {
         let result = rt
             .call_function_on_for_cdp(
                 &format!(
