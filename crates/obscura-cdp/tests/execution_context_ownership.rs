@@ -188,6 +188,14 @@ async fn navigation_context_events_preserve_order_for_every_runtime_attachment()
     for (id, session) in [(10, &first), (11, &second)] {
         cdp(&mut ctx, id, "Runtime.enable", json!({}), Some(session)).await;
     }
+    cdp(&mut ctx, 20, "Page.enable", json!({}), Some(&first)).await;
+    cdp(
+        &mut ctx,
+        21,
+        "Page.setLifecycleEventsEnabled",
+        json!({"enabled": true}),
+        Some(&first),
+    ).await;
     cdp(
         &mut ctx, 12, "Page.createIsolatedWorld",
         json!({"worldName": "utility"}), Some(&first),
