@@ -576,6 +576,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Port for worker `index` (0-based). Workers bind `base+1 ..= base+workers`;
+/// the balancer listens on `base`.
+fn worker_port(base: u16, index: u16) -> anyhow::Result<u16> {
+    base.checked_add(1)
+        .and_then(|p| p.checked_add(index))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worker port {base}+1+{index} exceeds 65535; lower --port or --workers"
+            )
+        })
+}
+
 async fn run_multi_worker_serve(
     port: u16,
     host: String,
@@ -592,7 +604,7 @@ async fn run_multi_worker_serve(
     let mut children = Vec::new();
 
     for i in 0..workers {
-        let worker_port = port + 1 + i;
+        let worker_port = worker_port(port, i)?;
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
         if let Some(ref p) = proxy {
@@ -633,7 +645,7 @@ async fn run_multi_worker_serve(
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
+        let worker_port = worker_port(port, next_worker % workers)?;
         next_worker = next_worker.wrapping_add(1);
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
@@ -1993,6 +2005,18 @@ fn dump_assets(page: &Page) -> String {
 
 #[cfg(test)]
 mod tests {
+    // #1017: worker ports must not wrap past 65535.
+    #[test]
+    fn worker_port_computes_and_guards_overflow() {
+        assert_eq!(super::worker_port(8000, 0).unwrap(), 8001);
+        assert_eq!(super::worker_port(8000, 3).unwrap(), 8004);
+        assert_eq!(super::worker_port(65533, 1).unwrap(), 65535);
+        assert!(
+            super::worker_port(65534, 1).is_err(),
+            "a worker port past 65535 must error, not wrap"
+        );
+    }
+
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
