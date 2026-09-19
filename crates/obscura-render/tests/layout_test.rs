@@ -4522,3 +4522,39 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+/// An ordinary block whose only in-flow children are floats has no line box,
+/// so its auto height is zero and the floats overflow it. A block that does
+/// establish a BFC must still contain them.
+///
+/// The float-only case used to decline taffy's native float band (which
+/// requires in-flow content, a clear box or a scroll container after the
+/// floats) and fall back to the legacy zone, where floats are ordinary
+/// children and grow the parent. Bootstrap's `.navbar-container` holds nothing
+/// but floated headers, so it reported 120px against Chromium's 60px and
+/// pushed every following section down the page.
+#[test]
+fn block_with_only_floats_has_no_auto_height() {
+    let style = "<style>body{margin:0;font:14px sans-serif}\
+        .f{float:left;width:200px;height:60px}</style>";
+    // Two floats are needed: a single float already declined the zone path.
+    let height = |css: &str| {
+        let html = format!(
+            "{style}<div id=b style='width:800px;{css}'><div class=f>a</div><div class=f>b</div></div>"
+        );
+        let tree = parse_html(&html);
+        let layout = layout_dom(&tree, (1600.0, 1000.0));
+        layout.rects[&tree.get_element_by_id("b").unwrap()].height
+    };
+    // Chromium 147: 0 for the plain block, 60 for either BFC form.
+    assert!(height("").abs() < 0.01, "plain block: got {}", height(""));
+    assert!(
+        (height("overflow:hidden") - 60.0).abs() < 0.01,
+        "overflow BFC must contain its float: got {}",
+        height("overflow:hidden")
+    );
+    assert!(
+        (height("display:flow-root") - 60.0).abs() < 0.01,
+        "flow-root must contain its float: got {}",
+        height("display:flow-root")
+    );
+}
