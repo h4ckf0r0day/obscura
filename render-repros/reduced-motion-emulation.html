@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Reduced-motion emulation</title>
+<style>
+  html, body { margin: 0; background: white; }
+  body { padding: 16px; min-height: 900px; font: 16px sans-serif; }
+  #probe { width: 100px; height: 30px; background: #22aa66; }
+  @media (prefers-reduced-motion: reduce) { #probe { width: 40px; } }
+</style>
+<h1>Reduced-motion emulation</h1>
+<p>The green bar is 100px normally, 40px when reduced motion is emulated.</p>
+<div id="probe"></div>

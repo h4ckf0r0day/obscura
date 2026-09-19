@@ -1799,6 +1799,7 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+const _eventTargetListenerChanged = new WeakMap();
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1830,6 +1831,7 @@ function _eventTargetAdd(target, type, callback, options) {
     abortHandler: null,
   };
   listeners.push(entry);
+  _eventTargetListenerChanged.get(target)?.();
   if (signal && typeof signal.addEventListener === "function") {
     entry.abortHandler = () => _eventTargetRemove(target, type, callback, capture);
     signal.addEventListener("abort", entry.abortHandler, { once: true });
@@ -1853,6 +1855,7 @@ function _eventTargetRemove(target, type, callback, options) {
   }
   if (listeners.length === 0) byType.delete(type);
   if (byType.size === 0) _eventTargetListeners.delete(target);
+  _eventTargetListenerChanged.get(target)?.();
 }
 function _eventTargetDispatch(target, event) {
   if (!event || typeof event.type === "undefined") {
@@ -8383,7 +8386,7 @@ function _evaluateMediaFeature(raw) {
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
   if (match) return match[1] === 'light';
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
-  if (match) return match[1] === 'no-preference';
+  if (match) return match[1] === (globalThis.__obscura_reduced_motion ? 'reduce' : 'no-preference');
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
@@ -8438,17 +8441,28 @@ function _evaluateMediaQueryList(query) {
 
 globalThis.matchMedia = _markNative(function matchMedia(q) {
   const media = q == null ? '' : String(q);
-  return {
-    get matches() { return _evaluateMediaQueryList(media); },
-    media,
-    onchange: null,
-    addListener(){},
-    removeListener(){},
-    addEventListener(){},
-    removeEventListener(){},
-    dispatchEvent(){return true;}
-  };
+  return new MediaQueryList(_mediaQueryToken, media);
 });
+const _mediaQueryToken = {};
+const _mediaQueries = new Set();
+// A document keeps query lists with change listeners alive even when author
+// code does not retain the object returned from matchMedia().
+const _activeMediaQueries = new Set();
+const _mediaQueryState = new WeakMap();
+globalThis.__obscura_recompute_media_queries = () => {
+  for (const ref of _mediaQueries) {
+    const query = ref.deref();
+    if (!query) { _mediaQueries.delete(ref); continue; }
+    const state = _mediaQueryState.get(query);
+    const matches = query.matches;
+    if (matches === state.matches) continue;
+    state.matches = matches;
+    // Capture the value at this rendering change, not at eventual delivery.
+    setTimeout(() => query.dispatchEvent(new MediaQueryListEvent('change', {
+      matches, media: query.media,
+    })), 0);
+  }
+};
 // getComputedStyle() returns a fresh declaration object, but those objects all
 // observe the same computed style for an element until the document mutates.
 // Share the immutable native snapshot behind them. Frameworks routinely call
@@ -14791,12 +14805,49 @@ if (typeof BroadcastChannel === 'undefined') {
   Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
 }
 
-if (typeof MediaQueryList === 'undefined') {
-  globalThis.MediaQueryList = class MediaQueryList {
-    constructor(q) { this.media = q || ''; this.matches = false; }
-    addListener() {} removeListener() {} addEventListener() {} removeEventListener() {}
-  };
-}
+globalThis.MediaQueryListEvent = class MediaQueryListEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    Object.defineProperties(this, {
+      matches: { value: !!init.matches, enumerable: true },
+      media: { value: String(init.media ?? ''), enumerable: true },
+    });
+  }
+};
+globalThis.MediaQueryList = class MediaQueryList {
+  constructor(token, media) {
+    if (token !== _mediaQueryToken) throw new TypeError('Illegal constructor');
+    _mediaQueryState.set(this, { media, matches: _evaluateMediaQueryList(media), onchange: null });
+    _mediaQueries.add(new WeakRef(this));
+    _eventTargetListenerChanged.set(this, () => {
+      if (_eventTargetListeners.get(this)?.get('change')?.length) _activeMediaQueries.add(this);
+      else _activeMediaQueries.delete(this);
+    });
+  }
+  get media() { return _mediaQueryState.get(this).media; }
+  get matches() { return _evaluateMediaQueryList(this.media); }
+  get onchange() { return _mediaQueryState.get(this).onchange; }
+  set onchange(value) {
+    const state = _mediaQueryState.get(this);
+    state.onchange = typeof value === 'function' ? value : null;
+    // The event-handler slot is independent of an explicitly registered
+    // callback, and replacing its value preserves its position in the list.
+    if (state.onchange && !state.onchangeListener) {
+      state.onchangeListener = event => state.onchange?.call(this, event);
+      this.addEventListener('change', state.onchangeListener);
+    } else if (!state.onchange && state.onchangeListener) {
+      this.removeEventListener('change', state.onchangeListener);
+      state.onchangeListener = null;
+    }
+  }
+  addListener(callback) { this.addEventListener('change', callback); }
+  removeListener(callback) { this.removeEventListener('change', callback); }
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  get [Symbol.toStringTag]() { return 'MediaQueryList'; }
+};
+Object.setPrototypeOf(MediaQueryList.prototype, EventTarget.prototype);
 
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
