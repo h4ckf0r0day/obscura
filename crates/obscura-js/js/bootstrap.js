@@ -13065,11 +13065,12 @@ class _Canvas2D {
     }
   }
   fillRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    const style = this._resolvePaint(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
       for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        this._setPixel(px, py, r, g, b, a);
+        const c = style.at(px, py);
+        this._setPixel(px, py, c[0], c[1], c[2], c[3]);
       }
     }
     this._markPaintDamage();
@@ -13085,13 +13086,17 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.strokeStyle);
+    const style = this._resolvePaint(this.strokeStyle);
+    const put = (px, py) => {
+      const c = style.at(px, py);
+      this._setPixel(px, py, c[0], c[1], c[2], c[3]);
+    };
     const lw = this.lineWidth;
     for (let px = Math.round(x); px < Math.round(x+w); px++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(px, Math.round(y)+l, r,g,b,a); this._setPixel(px, Math.round(y+h)-1-l, r,g,b,a); }
+      for (let l = 0; l < lw; l++) { put(px, Math.round(y)+l); put(px, Math.round(y+h)-1-l); }
     }
     for (let py = Math.round(y); py < Math.round(y+h); py++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(Math.round(x)+l, py, r,g,b,a); this._setPixel(Math.round(x+w)-1-l, py, r,g,b,a); }
+      for (let l = 0; l < lw; l++) { put(Math.round(x)+l, py); put(Math.round(x+w)-1-l, py); }
     }
     this._markPaintDamage();
   }
@@ -13182,7 +13187,7 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   beginPath() { this._path = []; }
-  closePath() {}
+  closePath() { if (this._path && this._path.length) this._path.push({t:'Z'}); }
   moveTo(x, y) { if (this._path) this._path.push({t:'M',x,y}); }
   lineTo(x, y) { if (this._path) this._path.push({t:'L',x,y}); }
   bezierCurveTo() {} quadraticCurveTo() {}
@@ -13191,14 +13196,42 @@ class _Canvas2D {
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
     if (!this._path) return;
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    const style = this._resolvePaint(this.fillStyle);
+    const put = (px, py) => {
+      const c = style.at(px, py);
+      this._setPixel(px, py, c[0], c[1], c[2], c[3]);
+    };
+    // Polygon fill: the old code only handled arcs, so a path built from
+    // moveTo/lineTo (area charts, wedges, any closed shape) filled nothing.
+    // Even-odd scanline over the M/L vertices, arcs still handled below.
+    const poly = this._path.filter((s) => s.t === 'M' || s.t === 'L');
+    if (poly.length >= 3) {
+      let minY = Infinity, maxY = -Infinity;
+      for (const p of poly) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
+      minY = Math.max(0, Math.round(minY)); maxY = Math.min(this._h - 1, Math.round(maxY));
+      for (let py = minY; py <= maxY; py++) {
+        const xs = [];
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          const a = poly[i], b = poly[j];
+          if ((a.y > py) !== (b.y > py)) {
+            xs.push(a.x + ((py - a.y) / (b.y - a.y)) * (b.x - a.x));
+          }
+        }
+        xs.sort((m, n) => m - n);
+        for (let k = 0; k + 1 < xs.length; k += 2) {
+          const from = Math.max(0, Math.round(xs[k]));
+          const to = Math.min(this._w - 1, Math.round(xs[k+1]));
+          for (let px = from; px <= to; px++) put(px, py);
+        }
+      }
+    }
     for (const seg of this._path) {
       if (seg.t === 'A') {
         const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
         const r2 = rad * rad;
         for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
           for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
-            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) this._setPixel(px, py, r, g, b, a);
+            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) put(px, py);
           }
         }
       }
@@ -13206,14 +13239,113 @@ class _Canvas2D {
     this._path = [];
     this._markPaintDamage();
   }
-  stroke() {}
+  // Draw the accumulated path. Was a no-op, so every line chart, sparkline and
+  // axis rendered as blank space while bar charts (fillRect) came out fine --
+  // the shape most dashboards actually use was the one that disappeared.
+  // Bresenham per segment, thickened perpendicular to the run so lineWidth is
+  // honoured; arcs are stroked as a circle outline of the same width.
+  stroke() {
+    if (!this._path || this._path.length === 0) return;
+    const style = this._resolvePaint(this.strokeStyle);
+    const lw = Math.max(1, Math.round(this.lineWidth || 1));
+    const half = (lw - 1) / 2;
+    const dot = (px, py) => {
+      const c = style.at(px, py);
+      this._setPixel(px, py, c[0], c[1], c[2], c[3]);
+    };
+    const thick = (px, py, steep) => {
+      for (let o = -Math.floor(half); o <= Math.ceil(half); o++) {
+        if (steep) dot(px + o, py); else dot(px, py + o);
+      }
+    };
+    const segment = (x0, y0, x1, y1) => {
+      x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+      const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+      const steep = dy > dx;
+      const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+      let err = dx - dy;
+      for (;;) {
+        thick(x0, y0, steep);
+        if (x0 === x1 && y0 === y1) break;
+        const e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+      }
+    };
+    let cur = null, sub = null;
+    for (const seg of this._path) {
+      if (seg.t === 'M') { cur = seg; sub = seg; }
+      else if (seg.t === 'L') { if (cur) segment(cur.x, cur.y, seg.x, seg.y); cur = seg; }
+      else if (seg.t === 'A') {
+        const steps = Math.max(24, Math.round(seg.r * 8));
+        let prev = null;
+        for (let i = 0; i <= steps; i++) {
+          const a = (i / steps) * Math.PI * 2;
+          const p = { x: seg.x + Math.cos(a) * seg.r, y: seg.y + Math.sin(a) * seg.r };
+          if (prev) segment(prev.x, prev.y, p.x, p.y);
+          prev = p;
+        }
+        cur = seg;
+      } else if (seg.t === 'Z') { if (cur && sub) segment(cur.x, cur.y, sub.x, sub.y); cur = sub; }
+    }
+    this._markPaintDamage();
+  }
   clip() {}
   save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
   restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
-  createLinearGradient(x0,y0,x1,y1) { return { addColorStop(){}, _x0:x0,_y0:y0,_x1:x1,_y1:y1 }; }
-  createRadialGradient() { return { addColorStop(){} }; }
+  // Gradients used to swallow their colour stops (addColorStop was a no-op), so
+  // any fillStyle set to a gradient painted nothing at all. Keep the stops and
+  // let _resolvePaint interpolate them per pixel.
+  createLinearGradient(x0,y0,x1,y1) {
+    const stops = [];
+    return { _kind:'linear', _stops:stops, _x0:x0,_y0:y0,_x1:x1,_y1:y1,
+             addColorStop(o,c){ stops.push({o:+o, c}); } };
+  }
+  createRadialGradient(x0,y0,r0,x1,y1,r1) {
+    const stops = [];
+    return { _kind:'radial', _stops:stops, _x0:x0,_y0:y0,_r0:r0,_x1:x1,_y1:y1,_r1:r1,
+             addColorStop(o,c){ stops.push({o:+o, c}); } };
+  }
+  /** Turn a fillStyle/strokeStyle into { at(x,y) -> [r,g,b,a] }. A plain colour
+   *  resolves once; a gradient interpolates its stops along its axis. */
+  _resolvePaint(style) {
+    if (style && typeof style === 'object' && Array.isArray(style._stops)) {
+      const stops = style._stops.slice().sort((a, b) => a.o - b.o);
+      if (stops.length === 0) return { at: () => [0,0,0,0] };
+      const cols = stops.map((s) => ({ o: s.o, c: this._parseColor(s.c) }));
+      const lerp = (t) => {
+        if (t <= cols[0].o) return cols[0].c;
+        if (t >= cols[cols.length-1].o) return cols[cols.length-1].c;
+        for (let i = 1; i < cols.length; i++) {
+          if (t <= cols[i].o) {
+            const a = cols[i-1], b = cols[i];
+            const span = b.o - a.o;
+            const k = span <= 0 ? 0 : (t - a.o) / span;
+            return [0,1,2,3].map((j) => Math.round(a.c[j] + (b.c[j] - a.c[j]) * k));
+          }
+        }
+        return cols[cols.length-1].c;
+      };
+      if (style._kind === 'radial') {
+        const r1 = style._r1 || 0;
+        return { at: (x, y) => {
+          const d = Math.hypot(x - style._x1, y - style._y1);
+          return lerp(r1 <= 0 ? 1 : Math.min(1, Math.max(0, d / r1)));
+        } };
+      }
+      const dx = style._x1 - style._x0, dy = style._y1 - style._y0;
+      const len2 = dx*dx + dy*dy;
+      return { at: (x, y) => {
+        if (len2 <= 0) return lerp(0);
+        const t = ((x - style._x0) * dx + (y - style._y0) * dy) / len2;
+        return lerp(Math.min(1, Math.max(0, t)));
+      } };
+    }
+    const c = this._parseColor(style);
+    return { at: () => c };
+  }
   createPattern() { return {}; }
   isPointInPath() { return false; }
   isPointInStroke() { return false; }
