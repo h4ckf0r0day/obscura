@@ -1,4 +1,7 @@
 {
+  "iframe-document-geometry": [
+    {"name": "child element and range probes completed", "color": "#22aa66", "width": 240, "height": 24, "count": 2}
+  ],
   "abs-fill": [
     {"name": "blue fill", "color": "#0000ff", "width": 400, "height": 100},
     {"name": "teal fill", "color": "#008080", "width": 400, "height": 100},
