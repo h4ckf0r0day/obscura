@@ -24,6 +24,34 @@ fn cookie_jar_for<'a>(ctx: &'a CdpContext, session_id: &Option<String>) -> &'a A
         .unwrap_or(&ctx.default_context.cookie_jar)
 }
 
+/// Apply a `setUserAgentOverride` call to a session's HTTP client.
+///
+/// Chrome exposes this command on both `Network` (deprecated) and
+/// `Emulation` (current), and clients are split across the two spellings,
+/// so both dispatch here rather than each growing its own copy.
+///
+/// Only the fields the caller actually sent are applied. The user agent
+/// previously defaulted to the empty string, which was harmless while this
+/// command carried nothing else, but would now let a locale-only call blank
+/// the user agent as a side effect.
+pub(crate) async fn apply_user_agent_override(
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) {
+    let Some(page) = ctx.get_session_page(session_id) else {
+        return;
+    };
+    if let Some(ua) = params.get("userAgent").and_then(|v| v.as_str()) {
+        page.http_client.set_user_agent(ua).await;
+    }
+    if let Some(language) = params.get("acceptLanguage").and_then(|v| v.as_str()) {
+        if !language.trim().is_empty() {
+            page.http_client.set_accept_language(language).await;
+        }
+    }
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -56,10 +84,7 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page(session_id) {
-                page.http_client.set_user_agent(ua).await;
-            }
+            apply_user_agent_override(params, ctx, session_id).await;
             Ok(json!({}))
         }
         "getCookies" | "getAllCookies" => {
@@ -157,6 +182,35 @@ mod tests {
             same_site: String::new(),
             expires: None,
         }
+    }
+
+    #[tokio::test]
+    async fn set_user_agent_override_applies_accept_language() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("ua-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        handle(
+            "setUserAgentOverride",
+            &json!({ "userAgent": "UA/1.0", "acceptLanguage": "de-DE,de;q=0.9" }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("setUserAgentOverride must succeed");
+
+        let page = ctx.get_session_page(&session_id).expect("page");
+        assert_eq!(
+            *page.http_client.user_agent.read().await,
+            "UA/1.0",
+            "userAgent must reach the client"
+        );
+        assert_eq!(
+            *page.http_client.accept_language.read().await,
+            "de-DE,de;q=0.9",
+            "acceptLanguage must reach the client"
+        );
     }
 
     #[tokio::test]

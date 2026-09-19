@@ -124,6 +124,14 @@ pub async fn handle(
         // Touch emulation does not affect layout yet, but acknowledging it is
         // compatible with clients that pair it with a metrics override.
         "setTouchEmulationEnabled" => Ok(json!({})),
+        // The current spelling of setUserAgentOverride; Network's is the
+        // deprecated one. Without this arm it reached the catch-all below and
+        // was acknowledged without being applied, so a client that set a user
+        // agent or a locale here was told it worked and got neither.
+        "setUserAgentOverride" => {
+            super::network::apply_user_agent_override(params, ctx, session_id).await;
+            Ok(json!({}))
+        }
         _ => Ok(json!({})),
     }
 }
@@ -131,6 +139,72 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn emulation_set_user_agent_override_is_applied() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("emu-ua-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        handle(
+            "setUserAgentOverride",
+            &json!({ "userAgent": "UA/2.0", "acceptLanguage": "fr-FR,fr;q=0.9" }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("Emulation.setUserAgentOverride must succeed");
+
+        let page = ctx.get_session_page(&session_id).expect("page");
+        assert_eq!(
+            *page.http_client.user_agent.read().await,
+            "UA/2.0",
+            "Emulation.setUserAgentOverride must apply the user agent"
+        );
+        assert_eq!(
+            *page.http_client.accept_language.read().await,
+            "fr-FR,fr;q=0.9",
+            "Emulation.setUserAgentOverride must apply the locale"
+        );
+    }
+
+    #[tokio::test]
+    async fn emulation_user_agent_override_leaves_unsent_fields_alone() {
+        // A locale-only call must not blank the user agent, which is what the
+        // previous unwrap_or("") would have done once this command started
+        // carrying more than one field.
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("emu-partial".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        let before = ctx
+            .get_session_page(&session_id)
+            .expect("page")
+            .http_client
+            .user_agent
+            .read()
+            .await
+            .clone();
+
+        handle(
+            "setUserAgentOverride",
+            &json!({ "acceptLanguage": "ja-JP" }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("a locale-only override must succeed");
+
+        let page = ctx.get_session_page(&session_id).expect("page");
+        assert_eq!(
+            *page.http_client.user_agent.read().await,
+            before,
+            "an unsent userAgent must be left as it was"
+        );
+        assert_eq!(*page.http_client.accept_language.read().await, "ja-JP");
+    }
 
     #[tokio::test]
     async fn device_metrics_override_updates_page_and_window_viewport() {
