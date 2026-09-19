@@ -1189,15 +1189,11 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
-                .await
-                .map_err(|e| e.to_string())?;
-        } else {
-            page.navigate_with_wait(url, wait_until)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+        // A POST form with no successful controls submits an empty body; the
+        // method must not depend on the body length.
+        page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let reached_network_idle = page.lifecycle.is_network_idle();
         // Fold in script-initiated requests (fetch/XHR/dynamic resource) so they
