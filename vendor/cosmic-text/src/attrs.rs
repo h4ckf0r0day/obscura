@@ -392,6 +392,8 @@ pub struct Attrs<'a> {
     pub metrics_opt: Option<CacheMetrics>,
     /// Letter spacing (tracking) in EM
     pub letter_spacing_opt: Option<LetterSpacing>,
+    /// Additional word-separator advance in EM.
+    pub word_spacing_opt: Option<LetterSpacing>,
     pub font_features: FontFeatures,
     pub font_variations: FontVariations,
     /// Optional browser-grade line-breaking policy for this text span.
@@ -417,6 +419,7 @@ impl<'a> Attrs<'a> {
             cache_key_flags: CacheKeyFlags::empty(),
             metrics_opt: None,
             letter_spacing_opt: None,
+            word_spacing_opt: None,
             font_features: FontFeatures::new(),
             font_variations: FontVariations::new(),
             css_line_break: None,
@@ -497,6 +500,13 @@ impl<'a> Attrs<'a> {
         self.letter_spacing_opt = Some(LetterSpacing(letter_spacing));
         self
     }
+
+    /// Set additional word-separator advance in EM.
+    pub fn word_spacing(mut self, word_spacing: f32) -> Self {
+        self.word_spacing_opt = Some(LetterSpacing(word_spacing));
+        self
+    }
+
 
     /// Set [`FontFeatures`]
     pub fn font_features(mut self, font_features: FontFeatures) -> Self {
@@ -581,6 +591,8 @@ pub struct AttrsOwned {
     pub metrics_opt: Option<CacheMetrics>,
     /// Letter spacing (tracking) in EM
     pub letter_spacing_opt: Option<LetterSpacing>,
+    /// Additional word-separator advance in EM.
+    pub word_spacing_opt: Option<LetterSpacing>,
     pub font_features: FontFeatures,
     pub font_variations: FontVariations,
     pub css_line_break: Option<CssLineBreak>,
@@ -602,6 +614,7 @@ impl AttrsOwned {
             cache_key_flags: attrs.cache_key_flags,
             metrics_opt: attrs.metrics_opt,
             letter_spacing_opt: attrs.letter_spacing_opt,
+            word_spacing_opt: attrs.word_spacing_opt,
             font_features: attrs.font_features.clone(),
             font_variations: attrs.font_variations.clone(),
             css_line_break: attrs.css_line_break,
@@ -623,6 +636,7 @@ impl AttrsOwned {
             cache_key_flags: self.cache_key_flags,
             metrics_opt: self.metrics_opt,
             letter_spacing_opt: self.letter_spacing_opt,
+            word_spacing_opt: self.word_spacing_opt,
             font_features: self.font_features.clone(),
             font_variations: self.font_variations.clone(),
             css_line_break: self.css_line_break,

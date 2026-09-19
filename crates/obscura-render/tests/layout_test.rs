@@ -7,6 +7,146 @@ use obscura_dom::tree_sink::parse_html;
 use obscura_render::{layout_dom, layout_dom_with_images};
 use std::collections::HashMap;
 
+#[test]
+fn word_spacing_changes_intrinsic_width() {
+    let tree = parse_html(r#"<style>
+        span { display:inline-block; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        </style><span id="normal">A B C</span><span id="spaced">A B C</span>"#);
+    let layout = layout_dom(&tree, (600.0, 200.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    assert!((width("spaced") - width("normal") - 60.0).abs() < 0.1);
+}
+
+#[test]
+fn word_spacing_rejects_invalid_and_unsupported_lengths() {
+    for value in ["bogus", "30", "10%", "3 px", "min(30px,bogus)", "calc(30px) bogus",
+        "calc(30)", "calc(2px * 3px)", "min(1px,max(2px,bogus))", "1px 2px", "1e99px"]
+    {
+        let tree = parse_html(&format!("<div id='copy' style='word-spacing:3px;word-spacing:{value}'>A B</div>"));
+        let layout = layout_dom(&tree, (400.0, 200.0));
+        assert_eq!(layout.styles[&tree.get_element_by_id("copy").unwrap()].word_spacing, Some(3.0), "{value}");
+        assert!(!obscura_render::style::supports_declaration("word-spacing", value), "{value}");
+    }
+    for value in ["normal", "0", "-3px", ".75em", "2rem"] {
+        assert!(obscura_render::style::supports_declaration("word-spacing", value), "{value}");
+    }
+}
+
+#[test]
+fn word_spacing_resolves_before_inheritance_and_preserves_cascade() {
+    let tree = parse_html(r#"<style>
+        section { font-size:20px; word-spacing:1.5em }
+        span { display:inline-block; font-size:40px; white-space:nowrap }
+        #normal { word-spacing:normal }
+        #inherit { word-spacing:3px; word-spacing:inherit }
+        #unset { word-spacing:3px; word-spacing:unset }
+        #invalid { word-spacing:3px; word-spacing:bogus; word-spacing:calc(bogus) }
+        #negative { word-spacing:-.25em }
+        #revert { word-spacing:3px; word-spacing:revert }
+        </style><section>
+        <span id="inherited">A B C</span><span id="normal">A B C</span>
+        <span id="inherit">A B C</span><span id="unset">A B C</span>
+        <span id="invalid">A B C</span><span id="negative">A B C</span>
+        <span id="revert">A B C</span></section>"#);
+    let layout = layout_dom(&tree, (1800.0, 300.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    for (id, spacing) in [("inherited", 30.0), ("normal", 0.0), ("inherit", 30.0),
+        ("unset", 30.0), ("invalid", 3.0), ("negative", -10.0), ("revert", 30.0)]
+    {
+        assert_eq!(layout.styles[&tree.get_element_by_id(id).unwrap()].word_spacing, Some(spacing), "{id}");
+        assert!((width(id) - width("normal") - 2.0 * spacing).abs() <= 1.0, "{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_changes_wrapping_and_native_control_widths() {
+    let tree = parse_html(r#"<style>
+        div { width:140px; font:40px/60px monospace }
+        .spaced { word-spacing:30px }
+        button, select { font:40px/60px monospace }
+        </style><div id="normal">A B C</div><div id="spaced" class="spaced">A B C</div>
+        <button id="button">A B C</button><button id="button-spaced" class="spaced">A B C</button>
+        <select id="select"><option>A B C</option></select>
+        <select id="select-spaced" class="spaced"><option>A B C</option></select>"#);
+    let layout = layout_dom(&tree, (1000.0, 500.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    assert_eq!(rect("normal").height, 60.0);
+    assert_eq!(rect("spaced").height, 120.0);
+    for (normal, spaced) in [("button", "button-spaced"), ("select", "select-spaced")] {
+        assert!((rect(spaced).width - rect(normal).width - 60.0).abs() <= 1.0,
+            "{normal}: {:?} -> {:?}", rect(normal), rect(spaced));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_handles_whitespace_nested_spans_and_generated_content() {
+    for (content, extra_css, delta) in [
+        ("  A   B  C  ", "", 60.0),
+        ("A&nbsp;B&nbsp;C", "", 60.0),
+        ("A  B", "white-space:pre", 60.0),
+        ("A\tB", "white-space:pre", 0.0),
+        ("A B C", "letter-spacing:2px", 60.0),
+        ("A<span> B</span> C", "", 60.0),
+        ("אב גד", "direction:rtl", 30.0),
+    ] {
+        let tree = parse_html(&format!(r#"<style>
+            div {{ display:inline-block; font:40px/60px monospace; white-space:nowrap; {extra_css} }}
+            #spaced {{ word-spacing:30px }}
+            </style><div id="normal">{content}</div><div id="spaced">{content}</div>"#));
+        let layout = layout_dom(&tree, (1000.0, 300.0));
+        let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+        assert!((width("spaced") - width("normal") - delta).abs() <= 1.0, "{content:?}, {extra_css}");
+    }
+    let tree = parse_html(r#"<style>
+        div { display:inline-block; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        div::before { content:'A B C'; font-size:20px }
+        div::after { content:'A B C'; word-spacing:normal }
+        </style><div id="normal"></div><div id="spaced"></div>"#);
+    let layout = layout_dom(&tree, (1000.0, 300.0));
+    let id = tree.get_element_by_id("spaced").unwrap();
+    assert_eq!(layout.styles[&id].before_pseudo.as_ref().unwrap().word_spacing, Some(30.0));
+    assert_eq!(layout.styles[&id].after_pseudo.as_ref().unwrap().word_spacing, Some(0.0));
+    let normal = layout.rects[&tree.get_element_by_id("normal").unwrap()].width;
+    assert!((layout.rects[&id].width - normal - 60.0).abs() <= 1.0);
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_moves_painted_glyphs() {
+    let tree = parse_html(r#"<style>
+        body { margin:0; background:white; color:black }
+        div { height:80px; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        </style><div>A B C</div><div id="spaced">A B C</div>"#);
+    let png = obscura_render::screenshot_png(&tree, (400.0, 180.0), None).unwrap();
+    let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+    let starts = |top: usize| {
+        let mut result = Vec::new();
+        let mut previous = false;
+        for x in 0..400 {
+            let ink = (top..top + 70).any(|y| {
+                let pixel = pixmap.pixels()[y * 400 + x];
+                pixel.red() < 128 && pixel.green() < 128 && pixel.blue() < 128
+            });
+            if ink && !previous { result.push(x as i32); }
+            previous = ink;
+        }
+        result
+    };
+    let normal = starts(0);
+    let spaced = starts(80);
+    assert_eq!(normal.len(), 3, "normal glyph columns: {normal:?}");
+    assert_eq!(spaced.len(), 3, "spaced glyph columns: {spaced:?}");
+    for i in 0..3 {
+        assert!((spaced[i] - normal[i] - i as i32 * 30).abs() <= 1,
+            "painted positions: {normal:?} -> {spaced:?}");
+    }
+}
+
 const HN_HTML: &str = r##"
     <table border="0" cellpadding="0" cellspacing="0" width="85%" bgcolor="#f6f6ef">
         <tr>
