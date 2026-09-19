@@ -6933,8 +6933,64 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
     FONT_BYTES
 }
 
+/// CJK fallback: the embedded Liberation/DejaVu fonts have no CJK glyphs, so
+/// any CJK codepoint rendered as tofu. Load a system TrueType CJK font once
+/// (DroidSansFallbackFull covers Simplified/Traditional Chinese, Japanese,
+/// Korean) and use it for runs containing CJK. ab_glyph only supports glyf
+/// outlines, so CFF/OTTO faces (Noto CJK .ttc) cannot be used here.
+fn cjk_fallback_font_bytes() -> Option<&'static [u8]> {
+    static CJK: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+    *CJK.get_or_init(|| {
+        const CJK_CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/wqy/wqy-zenhei.ttc",
+        ];
+        for path in CJK_CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                // Only a bare TrueType (glyf) face works with ab_glyph; skip
+                // collections and CFF outlines.
+                if bytes.len() > 4 && (bytes[..4] == [0x00, 0x01, 0x00, 0x00] || bytes[..4] == *b"true") {
+                    // Leak the bytes so the font lives for the process lifetime.
+                    let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                    return Some(leaked);
+                }
+            }
+        }
+        None
+    })
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c,
+            '\u{2E80}'..='\u{2EFF}'   // CJK Radicals Supplement
+            | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
+            | '\u{3040}'..='\u{30FF}' // Hiragana + Katakana
+            | '\u{3100}'..='\u{312F}' // Bopomofo
+            | '\u{31C0}'..='\u{31EF}' // CJK Strokes
+            | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+            | '\u{FF00}'..='\u{FFEF}' // Halfwidth/Fullwidth Forms
+        )
+    })
+}
+
+fn font_bytes_for_text(text: &str, family: Option<&str>) -> &'static [u8] {
+    // A CJK run needs the CJK font even when the family names a Latin font,
+    // because no embedded face carries those glyphs. Latin-only runs keep the
+    // existing family resolution (and its metrics) untouched.
+    if contains_cjk(text) {
+        if let Some(cjk) = cjk_fallback_font_bytes() {
+            return cjk;
+        }
+    }
+    fallback_font_bytes(family)
+}
+
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
+    let font = FontRef::try_from_slice(font_bytes_for_text(text, family)).unwrap();
     let scale = PxScale::from(size);
     let scaled_font = font.as_scaled(scale);
     let mut width = 0.0;
@@ -6971,7 +7027,7 @@ fn draw_text(
             return;
         }
     }
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
+    let font = FontRef::try_from_slice(font_bytes_for_text(text, family)).unwrap();
     let scale = PxScale::from(size * raster_scale);
     let scaled_font = font.as_scaled(scale);
     let mut caret = ab_glyph::point(x * raster_scale, y * raster_scale + scaled_font.ascent());

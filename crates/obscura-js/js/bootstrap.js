@@ -6523,6 +6523,17 @@ function _elementClassFor(nid) {
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
+  // Table / selection family: OPTION, SELECT, TABLE, TABLE_SECTION vars below.
+  if (tag === "OPTION" && globalThis.HTMLOptionElement) return globalThis.HTMLOptionElement;
+  if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
+  if (tag === "TABLE" && globalThis.HTMLTableElement) return globalThis.HTMLTableElement;
+  if (tag === "TBODY" && globalThis.HTMLTableSectionElement) return globalThis.HTMLTableSectionElement;
+  if (tag === "THEAD" && globalThis.HTMLTableSectionElement) return globalThis.HTMLTableSectionElement;
+  if (tag === "TFOOT" && globalThis.HTMLTableSectionElement) return globalThis.HTMLTableSectionElement;
+  if (tag === "TR" && globalThis.HTMLTableRowElement) return globalThis.HTMLTableRowElement;
+  if (tag === "TD" && globalThis.HTMLTableCellElement) return globalThis.HTMLTableCellElement;
+  if (tag === "TH" && globalThis.HTMLTableCellElement) return globalThis.HTMLTableCellElement;
+  if (tag === "CAPTION" && globalThis.HTMLTableCaptionElement) return globalThis.HTMLTableCaptionElement;
   return Element;
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
@@ -6544,6 +6555,16 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
+    if (tag === "OPTION" && globalThis.HTMLOptionElement) return globalThis.HTMLOptionElement;
+    if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
+    if (tag === "TABLE" && globalThis.HTMLTableElement) return globalThis.HTMLTableElement;
+    if (tag === "TBODY" && globalThis.HTMLTableSectionElement) return globalThis.HTMLTableSectionElement;
+    if (tag === "THEAD" && globalThis.HTMLTableSectionElement) return globalThis.HTMLTableSectionElement;
+    if (tag === "TFOOT" && globalThis.HTMLTableSectionElement) return globalThis.HTMLTableSectionElement;
+    if (tag === "TR" && globalThis.HTMLTableRowElement) return globalThis.HTMLTableRowElement;
+    if (tag === "TD" && globalThis.HTMLTableCellElement) return globalThis.HTMLTableCellElement;
+    if (tag === "TH" && globalThis.HTMLTableCellElement) return globalThis.HTMLTableCellElement;
+    if (tag === "CAPTION" && globalThis.HTMLTableCaptionElement) return globalThis.HTMLTableCaptionElement;
   }
   return Element;
 }
@@ -11719,7 +11740,75 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
+globalThis.HTMLSelectElement = class HTMLSelectElement extends Element {
+  get options() {
+    const c = HTMLOptionsCollection._from(this.querySelectorAll("option"));
+    c._select = this;
+    return c;
+  }
+  get length() { return this.options.length; }
+  set length(v) {
+    const n = Number(v);
+    const opts = this.options;
+    if (n < opts.length) {
+      for (let i = opts.length - 1; i >= n; i--) this.removeChild(opts[i]);
+    } else {
+      for (let i = opts.length; i < n; i++) this.appendChild(document.createElement("option"));
+    }
+  }
+  get selectedIndex() {
+    const opts = this.options;
+    for (let i = 0; i < opts.length; i++) {
+      if (opts[i].selected) return i;
+    }
+    return opts.length > 0 && this.multiple ? 0 : -1;
+  }
+  set selectedIndex(v) {
+    const opts = this.options;
+    const idx = Number(v);
+    for (let i = 0; i < opts.length; i++) opts[i].selected = (i === idx);
+  }
+  get value() {
+    const o = this.selectedOptions && this.selectedOptions.length ? this.selectedOptions[0] : null;
+    return o ? (o.value || o.text) : "";
+  }
+  set value(v) {
+    const opts = this.options;
+    for (let i = 0; i < opts.length; i++) {
+      if ((opts[i].value || opts[i].text) === String(v)) { opts[i].selected = true; return; }
+    }
+  }
+  get selectedOptions() {
+    const opts = this.options;
+    const out = [];
+    for (let i = 0; i < opts.length; i++) if (opts[i].selected) out.push(opts[i]);
+    if (out.length === 0 && opts.length > 0 && !this.multiple) out.push(opts[0]);
+    return HTMLCollection._from(out);
+  }
+  get multiple() { return this.hasAttribute("multiple"); }
+  set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
+  get size() { const n = parseInt(this.getAttribute("size"), 10); return Number.isFinite(n) && n > 0 ? n : 0; }
+  set size(v) { this.setAttribute("size", String(v)); }
+  add(item, before) {
+    if (!item) return;
+    if (before === undefined || before === null) { this.appendChild(item); return; }
+    this.insertBefore(item, before);
+  }
+  remove(index) {
+    const opts = this.options;
+    const idx = Number(index);
+    if (idx >= 0 && idx < opts.length) this.removeChild(opts[idx]);
+  }
+  item(i) { return this.options[i] || null; }
+  namedItem(name) {
+    const opts = this.options;
+    for (let i = 0; i < opts.length; i++) {
+      const id = opts[i].id, nm = opts[i].getAttribute("name");
+      if (id === name || nm === name) return opts[i];
+    }
+    return null;
+  }
+};
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   // `rows`/`cols` reflect the content attributes and drive the control's
   // intrinsic box (the renderer sizes a textarea from them). The attributes
@@ -11738,7 +11827,98 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
 globalThis.HTMLLabelElement = Element;
-globalThis.HTMLTableElement = Element;
+// Table family. Obscura's DOM shim originally exposed these tags as plain
+// Element aliases, so a page calling table.insertRow() / row.insertCell() got
+// "is not a function" — Sina's news frontend trips exactly this in its
+// TabSwitchController. The table APIs are pure DOM manipulation built on
+// createElement + appendChild/insertBefore, which the shim already provides,
+// so implement them here rather than in Rust. insertRow/insertCell follow the
+// "index >= length appends" rule from the WHATWG HTML spec, and deleteRow /
+// deleteCell clamp out-of-range to a no-op.
+globalThis.HTMLTableCaptionElement = Element;
+globalThis.HTMLTableRowElement = class HTMLTableRowElement extends Element {
+  get cells() { return HTMLCollection._from(this.querySelectorAll("td, th")); }
+  get rowIndex() {
+    const p = this.parentNode;
+    return p ? Array.prototype.indexOf.call(p.children || [], this) : -1;
+  }
+  get sectionRowIndex() {
+    const p = this.parentNode;
+    if (!p) return -1;
+    let i = 0;
+    for (const c of p.children || []) { if (c.localName === "tr") i++; }
+    return i - 1;
+  }
+  insertCell(index) {
+    const idx = Number.isInteger(index) && index >= 0 ? index : this.cells.length;
+    const cell = document.createElement("td");
+    const ref = idx < this.cells.length ? this.cells[idx] : null;
+    if (ref) this.insertBefore(cell, ref); else this.appendChild(cell);
+    return cell;
+  }
+  deleteCell(index) {
+    const cells = this.cells;
+    if (index < 0 || index >= cells.length) return;
+    this.removeChild(cells[index]);
+  }
+};
+globalThis.HTMLTableCellElement = class HTMLTableCellElement extends Element {
+  get cellIndex() {
+    const p = this.parentNode;
+    if (!p) return -1;
+    const cells = p.localName === "tr" ? p.cells : null;
+    return cells ? Array.prototype.indexOf.call(cells, this) : -1;
+  }
+};
+globalThis.HTMLTableSectionElement = class HTMLTableSectionElement extends Element {
+  get rows() { return HTMLCollection._from(this.querySelectorAll("tr")); }
+  insertRow(index) {
+    const idx = Number.isInteger(index) && index >= 0 ? index : this.rows.length;
+    const row = document.createElement("tr");
+    const ref = idx < this.rows.length ? this.rows[idx] : null;
+    if (ref) this.insertBefore(row, ref); else this.appendChild(row);
+    return row;
+  }
+  deleteRow(index) {
+    const rows = this.rows;
+    if (index < 0 || index >= rows.length) return;
+    this.removeChild(rows[index]);
+  }
+};
+globalThis.HTMLTableElement = class HTMLTableElement extends Element {
+  get tHead() { const h = this.querySelector("thead"); return h || null; }
+  set tHead(v) { this.deleteTHead(); if (v) this.appendChild(v); }
+  get tFoot() { const f = this.querySelector("tfoot"); return f || null; }
+  set tFoot(v) { this.deleteTFoot(); if (v) this.appendChild(v); }
+  get tBodies() { return HTMLCollection._from(this.querySelectorAll("tbody")); }
+  get rows() { return HTMLCollection._from(this.querySelectorAll("tr")); }
+  get caption() { const c = this.querySelector("caption"); return c || null; }
+  set caption(v) {
+    const cur = this.caption; if (cur) this.removeChild(cur);
+    if (v) this.insertBefore(v, this.firstChild);
+  }
+  createCaption() { return document.createElement("caption"); }
+  deleteCaption() { const c = this.caption; if (c) this.removeChild(c); }
+  createTHead() { return document.createElement("thead"); }
+  deleteTHead() { const h = this.tHead; if (h) this.removeChild(h); }
+  createTFoot() { return document.createElement("tfoot"); }
+  deleteTFoot() { const f = this.tFoot; if (f) this.removeChild(f); }
+  createTBody() { return document.createElement("tbody"); }
+  // insertRow / deleteRow operate on the first tbody, matching the spec:
+  // "if no tbody exists, the table has no element children and create one".
+  insertRow(index) {
+    const bodies = this.tBodies;
+    let section = bodies.length > 0 ? bodies[0] : null;
+    if (!section) { section = this.createTBody(); this.appendChild(section); }
+    const idx = Number.isInteger(index) && index >= 0 ? index : section.rows.length;
+    return section.insertRow(idx);
+  }
+  deleteRow(index) {
+    const bodies = this.tBodies;
+    if (bodies.length === 0) return;
+    bodies[0].deleteRow(index);
+  }
+};
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
@@ -11805,7 +11985,34 @@ globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
   assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
   assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
 };
-globalThis.HTMLOptionElement = Element;
+globalThis.HTMLOptionElement = class HTMLOptionElement extends Element {
+  // No custom constructor: Element's constructor takes the native nid and
+  // backs it with a real nodeType-1 node, which is exactly what
+  // createElement("option") needs. A custom constructor here must NOT build
+  // another native node (that would orphan the outer nid the shim allocated,
+  // so querySelectorAll returns a different wrapper than the one appended).
+  get value() { return this.getAttribute("value") || this.text; }
+  set value(v) { this.setAttribute("value", v === undefined || v === null ? "" : String(v)); }
+  get text() { return this.textContent; }
+  set text(v) { this.textContent = v === undefined || v === null ? "" : String(v); }
+  get selected() { return this.hasAttribute("selected"); }
+  set selected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
+  get defaultSelected() { return this.hasAttribute("selected"); }
+  get form() {
+    let p = this.parentNode;
+    while (p && p.localName !== "form") p = p.parentNode;
+    return p;
+  }
+  get index() {
+    const sel = this.parentNode;
+    if (!sel) return -1;
+    const opts = sel.options;
+    for (let i = 0; i < opts.length; i++) if (opts[i] === this) return i;
+    return -1;
+  }
+  get label() { return this.getAttribute("label") || this.text; }
+  set label(v) { if (v) this.setAttribute("label", v); else this.removeAttribute("label"); }
+};
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
@@ -11935,6 +12142,37 @@ globalThis.HTMLCollection = class HTMLCollection extends Array {
 };
 _markNative(HTMLCollection.prototype.item);
 _markNative(HTMLCollection.prototype.namedItem);
+// HTMLOptionsCollection: the live collection a select's `.options` returns.
+// It augments HTMLCollection with add/remove so `select.options.add(option)`
+// (used by Sina and many widgets) works. It owns no state: add/remove read the
+// backing select that this collection was built from.
+globalThis.HTMLOptionsCollection = class HTMLOptionsCollection extends HTMLCollection {
+  static _from(arr) {
+    const c = new HTMLOptionsCollection();
+    if (arr) for (let i = 0; i < arr.length; i++) { if (arr[i]) c[c.length] = arr[i]; }
+    return new Proxy(c, _htmlCollectionProxy);
+  }
+  add(item, before) {
+    if (!item) return;
+    const sel = this._select;
+    if (!sel) return;
+    if (before === undefined || before === null) { sel.appendChild(item); return; }
+    if (typeof before === 'number') {
+      const ref = this[before] || null;
+      sel.insertBefore(item, ref);
+    } else {
+      sel.insertBefore(item, before);
+    }
+  }
+  remove(index) {
+    const sel = this._select;
+    if (!sel) return;
+    const i = Number(index);
+    if (i >= 0 && i < this.length) sel.removeChild(this[i]);
+  }
+};
+_markNative(HTMLOptionsCollection.prototype.add);
+_markNative(HTMLOptionsCollection.prototype.remove);
 // Shared (allocated once) Proxy traps for HTMLCollection named access. Indices,
 // length, and inherited methods resolve normally via Reflect; only an unknown
 // non-numeric string key falls back to namedItem(), so item/namedItem and the
@@ -14512,6 +14750,19 @@ if (typeof Image === 'undefined') {
     return img;
   };
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
+}
+
+// `Option` is a constructor global, not the interface-name global.
+if (typeof Option === 'undefined') {
+  globalThis.Option = function Option(text, value, defaultSelected, selected) {
+    const opt = document.createElement('option');
+    if (text !== undefined) opt.text = String(text);
+    if (value !== undefined) opt.value = String(value);
+    if (defaultSelected) opt.setAttribute('selected', '');
+    if (selected) opt.selected = true;
+    return opt;
+  };
+  globalThis.Option.prototype = globalThis.HTMLOptionElement.prototype;
 }
 
 if (typeof Audio === 'undefined') {
