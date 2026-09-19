@@ -1069,14 +1069,17 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
 
     let target = match selector {
         Some(sel) => format!("document.querySelector({})", serde_json::to_string(sel).unwrap()),
-        None => "document".to_string(),
+        None => "document.activeElement || document.body".to_string(),
     };
 
     let js = format!(
         r#"(function(){{
             var t = {target};
             if (!t) return "error:element not found";
-            t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));
+            if (!globalThis.__obscura_inputAllowed(t)) return "error:element is inert";
+            var event = new KeyboardEvent("keydown", {{key:{key},bubbles:true,cancelable:true}});
+            t.dispatchEvent(event);
+            globalThis.__obscura_keyDefault(event);
             t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
             return "ok";
         }})()"#,
@@ -1084,7 +1087,10 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
         key = serde_json::to_string(key).unwrap()
     );
 
-    state.page_mut().evaluate(&js);
+    let result = state.page_mut().evaluate(&js);
+    if let Some(error) = result.as_str().and_then(|value| value.strip_prefix("error:")) {
+        return Err(error.to_string());
+    }
     state.settle_synthetic_navigation().await?;
     Ok(format!("Pressed key '{key}'"))
 }

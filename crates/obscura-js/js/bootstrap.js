@@ -1799,6 +1799,53 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+const _modalDialogs = [];
+function _activeModal(doc) {
+  for (let i = _modalDialogs.length - 1; i >= 0; i--) {
+    const dialog = _modalDialogs[i];
+    if (!dialog.isConnected || !dialog.open || !dialog._dialogModal) {
+      _modalDialogs.splice(i, 1);
+    } else if (dialog.ownerDocument === doc) return dialog;
+  }
+  return null;
+}
+function __obscuraInputAllowed(target) {
+  if (!target) return false;
+  const modal = _activeModal(target.ownerDocument || document);
+  if (modal && target !== modal && !modal.contains(target)) return false;
+  for (let node = target; node && node.nodeType === 1; node = node.parentElement) {
+    if (node.hasAttribute('inert')) return false;
+    if (node === modal) break;
+  }
+  return true;
+}
+function _dialogFocusable(dialog) {
+  return Array.from(dialog.querySelectorAll('button,input,select,textarea,a[href],[tabindex],[contenteditable]'))
+    .filter(el => {
+      if (!__obscuraInputAllowed(el) || globalThis.__obscura_isDisabled(el)
+          || el.getAttribute('type') === 'hidden' || el.tabIndex < 0) return false;
+      for (let node = el; node && node !== dialog; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (node.hidden || style.display === 'none' || style.visibility === 'hidden') return false;
+      }
+      return true;
+    }).sort((a, b) => (a.tabIndex > 0 ? a.tabIndex : Infinity) - (b.tabIndex > 0 ? b.tabIndex : Infinity));
+}
+globalThis.__obscura_inputAllowed = __obscuraInputAllowed;
+globalThis.__obscura_keyDefault = event => {
+  if (event.defaultPrevented) return;
+  const modal = _activeModal(document);
+  if (!modal) return;
+  if (event.key === 'Escape' && modal.closedBy !== 'none') modal.requestClose();
+  if (event.key === 'Tab') {
+    const candidates = _dialogFocusable(modal);
+    if (!candidates.length) { modal.focus(); return; }
+    const current = candidates.indexOf(document.activeElement);
+    const next = current < 0 ? (event.shiftKey ? candidates.length - 1 : 0)
+      : (current + (event.shiftKey ? -1 : 1) + candidates.length) % candidates.length;
+    candidates[next].focus();
+  }
+};
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -3849,7 +3896,10 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
+  focus() {
+    if (!__obscuraInputAllowed(this)) return;
+    globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this;
+  }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -3943,9 +3993,8 @@ class Element extends Node {
     }
   }
   // HTMLDialogElement members (live on Element.prototype like popover/input;
-  // meaningful only when localName === 'dialog'). Modal top-layer/focus/render
-  // is layout (out of scope); the open state, returnValue, and beforetoggle/
-  // toggle/close/cancel events are JS-observable and implemented here.
+  // meaningful only when localName === 'dialog'). Input uses the same modal
+  // stack as focusing; synthetic dispatchEvent does not gain default actions.
   get open() { return this.hasAttribute('open'); }
   set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
@@ -3965,18 +4014,28 @@ class Element extends Node {
     const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   showModal() {
-    if (this.hasAttribute('open')) throw new DOMException("The dialog is already open.", "InvalidStateError");
+    if (this.hasAttribute('open')) {
+      if (this._dialogModal) return;
+      throw new DOMException("The dialog is already open.", "InvalidStateError");
+    }
     if (!this.isConnected) throw new DOMException("The dialog is not connected to a document.", "InvalidStateError");
     const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
     if (!this.dispatchEvent(before)) return;
     if (this.hasAttribute('open')) return;
+    this._dialogPreviousFocus = this.ownerDocument.activeElement;
     this.setAttribute('open', ''); this._dialogModal = true;
+    _modalDialogs.push(this);
+    const focusable = _dialogFocusable(this);
+    (focusable.find(el => el.hasAttribute('autofocus')) || focusable[0] || this).focus();
     const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   _dialogClose(result, fireClose) {
     if (!this.hasAttribute('open')) return;
     this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
     this.removeAttribute('open'); this._dialogModal = false;
+    const previous = this._dialogPreviousFocus;
+    this._dialogPreviousFocus = null;
+    if (previous && previous.isConnected) previous.focus();
     if (result !== undefined) this._returnValue = String(result);
     const self = this;
     setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
