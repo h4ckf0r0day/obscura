@@ -3385,7 +3385,57 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  // innerText is the RENDERED text, not the source text. Aliasing it to
+  // textContent leaked everything the user cannot see: the body of every
+  // <script> and <style>, plus display:none / hidden subtrees. On
+  // github.com/topics that returned 1.3 MB where a browser returns 5.5 KB --
+  // most of it JavaScript source. Anything piping innerText into an LLM paid
+  // for that difference in tokens.
+  //
+  // This walks the tree instead: skips never-rendered elements, honours
+  // display:none / visibility:hidden / [hidden], and inserts the line breaks
+  // block boundaries imply, which is what makes innerText readable in the
+  // first place. Layout-aware details (text-transform, overflow clipping) are
+  // still out of scope -- this is the CSS the engine already knows.
+  get innerText() {
+    const NEVER_RENDERED = new Set([
+      'SCRIPT', 'STYLE', 'HEAD', 'TITLE', 'META', 'LINK', 'BASE',
+      'NOSCRIPT', 'TEMPLATE', 'CANVAS', 'IFRAME', 'OBJECT', 'PARAM', 'SOURCE', 'TRACK',
+    ]);
+    const BLOCKISH = new Set([
+      'ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','DD','DETAILS','DIALOG','DIV','DL','DT',
+      'FIELDSET','FIGCAPTION','FIGURE','FOOTER','FORM','H1','H2','H3','H4','H5','H6',
+      'HEADER','HR','LI','MAIN','NAV','OL','P','PRE','SECTION','SUMMARY','TABLE',
+      'TBODY','TD','TFOOT','TH','THEAD','TR','UL','BODY','HTML','OPTION','LABEL','BUTTON',
+    ]);
+    const hidden = (el) => {
+      if (el.hasAttribute && el.hasAttribute('hidden')) return true;
+      let cs = null;
+      try { cs = getComputedStyle(el); } catch { return false; }
+      if (!cs) return false;
+      return cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse';
+    };
+    const out = [];
+    const walk = (node) => {
+      const type = node.nodeType;
+      if (type === 3) { out.push(node.data ?? ''); return; }
+      if (type !== 1) return; // comments, CDATA, processing instructions
+      const tag = (node.tagName || '').toUpperCase();
+      if (NEVER_RENDERED.has(tag)) return;
+      if (hidden(node)) return;
+      if (tag === 'BR') { out.push('\n'); return; }
+      const block = BLOCKISH.has(tag);
+      if (block) out.push('\n');
+      const kids = node.childNodes;
+      for (let i = 0; i < kids.length; i++) walk(kids[i]);
+      if (block) out.push('\n');
+    };
+    walk(this);
+    return out.join('')
+      .replace(/[ \t\f\r]+/g, ' ')      // collapse runs of inline whitespace
+      .replace(/ *\n[ \n]*/g, '\n')     // one break per block boundary
+      .replace(/^\n+|\n+$/g, '');       // no leading/trailing blank lines
+  }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
