@@ -106,7 +106,7 @@ tokio::spawn(async move {
             InterceptResolution::Fulfill {
                 status: 200,
                 headers: Default::default(),
-                body: r#"{"newDashboard":true}"#.into(),
+                body: br#"{"newDashboard":true}"#.to_vec(),
             }
         } else {
             // Pass through, or rewrite by setting url/method/headers/body.
@@ -121,6 +121,7 @@ page.settle(2000).await;
 ```
 
 A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
+`Continue.body` and `Fulfill.body` are raw bytes (`Vec<u8>`), so binary request and response bodies are preserved without UTF-8 conversion.
 
 ### Preload scripts
 
