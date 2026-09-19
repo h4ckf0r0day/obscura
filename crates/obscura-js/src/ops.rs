@@ -462,6 +462,7 @@ pub struct RuntimeExceptionEvent {
 pub enum RuntimeEvent {
     Console(RuntimeConsoleEvent),
     Exception(RuntimeExceptionEvent),
+    DocumentLifecycle { name: String, timestamp: f64 },
 }
 
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
@@ -1352,6 +1353,18 @@ fn op_dom(
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "document_lifecycle" {
+        let mut state = shared.borrow_mut();
+        if state.runtime_events_enabled && matches!(arg1.as_str(), "init" | "DOMContentLoaded" | "load") {
+            if state.pending_runtime_events.len() >= 1_024 {
+                state.pending_runtime_events.pop_front();
+            }
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            state.pending_runtime_events.push_back(RuntimeEvent::DocumentLifecycle { name: arg1, timestamp });
+        }
+        return "true".into();
+    }
     {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,

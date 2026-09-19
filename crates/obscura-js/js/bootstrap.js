@@ -5883,16 +5883,39 @@ class Document extends Node {
     this.write(args.join('') + '\n');
   }
   open() {
+    if (this.head) this.head.innerHTML = '';
     var body = this.body;
     if (body) body.innerHTML = '';
     // A new parse begins. Whatever the input stream still held is gone.
     _dom("document_write_reset");
     this._writeAnchorScript = 0;
     this._writeAnchorNid = 0;
+    this._writeGeneration = (this._writeGeneration || 0) + 1;
+    this._writeOpen = true;
+    globalThis.__documentReadyState__ = 'loading';
+    _dom('document_lifecycle', 'init');
     return this;
   }
   close() {
-    return;
+    if (!this._writeOpen) return;
+    this._writeOpen = false;
+    const generation = this._writeGeneration;
+    setTimeout(() => {
+      if (generation !== this._writeGeneration) return;
+      globalThis.__documentReadyState__ = 'interactive';
+      this.dispatchEvent(new Event('readystatechange'));
+      this.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+      _dom('document_lifecycle', 'DOMContentLoaded');
+      const complete = () => {
+        if (generation !== this._writeGeneration) return;
+        if (__dynLoadDelayingPending > 0) { setTimeout(complete, 1); return; }
+        globalThis.__documentReadyState__ = 'complete';
+        this.dispatchEvent(new Event('readystatechange'));
+        globalThis.dispatchEvent(new Event('load'));
+        _dom('document_lifecycle', 'load');
+      };
+      complete();
+    }, 0);
   }
   hasFocus() { return true; }
   execCommand() { return false; }
