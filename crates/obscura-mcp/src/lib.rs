@@ -1952,17 +1952,64 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
             .unwrap_or_default()
     }).unwrap_or_default();
 
-    let haystack = if case_sensitive { body.clone() } else { body.to_lowercase() };
+    let out = search_body(&body, query, case_sensitive, context, limit);
+    if out.is_empty() {
+        Ok(format!("No matches for {query:?}."))
+    } else {
+        Ok(format!("{} match(es). {}", out.len(),
+            out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")))
+    }
+}
+
+/// Case-(in)sensitive substring search returning `{offset, snippet}` per match,
+/// where `offset` is a byte offset into `body` and the snippet has `context`
+/// bytes of surrounding text snapped to word boundaries.
+fn search_body(
+    body: &str,
+    query: &str,
+    case_sensitive: bool,
+    context: usize,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    // Build the case-folded haystack and, for the case-insensitive path, a map
+    // from each haystack byte offset back to the corresponding byte offset in
+    // `body`. to_lowercase() can change byte length (e.g. "İ" U+0130 -> "i̇"),
+    // so a haystack byte offset is not a valid index into the original body.
+    let (haystack, offset_map) = if case_sensitive {
+        (body.to_string(), None)
+    } else {
+        let mut hs = String::with_capacity(body.len());
+        let mut map: Vec<usize> = Vec::with_capacity(body.len() + 1);
+        for (byte_idx, ch) in body.char_indices() {
+            for lc in ch.to_lowercase() {
+                let mut buf = [0u8; 4];
+                let encoded = lc.encode_utf8(&mut buf);
+                for _ in 0..encoded.len() {
+                    map.push(byte_idx);
+                }
+                hs.push_str(encoded);
+            }
+        }
+        map.push(body.len());
+        (hs, Some(map))
+    };
     let needle = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+    let to_body = |hs_off: usize| -> usize {
+        match &offset_map {
+            Some(map) => map.get(hs_off).copied().unwrap_or(body.len()),
+            None => hs_off,
+        }
+    };
 
     let mut out = Vec::new();
     let mut idx = 0;
     while let Some(pos) = haystack[idx..].find(&needle) {
-        let abs = idx + pos;
-        let mut start = abs.saturating_sub(context);
-        let mut end = (abs + needle.len() + context).min(body.len());
-        // start/end are byte offsets derived from char counts and needle.len(),
-        // so they can land inside a multi-byte (CJK) character. Snap to char
+        let hs_abs = idx + pos;
+        let match_start = to_body(hs_abs);
+        let match_end = to_body(hs_abs + needle.len());
+        let mut start = match_start.saturating_sub(context);
+        let mut end = (match_end + context).min(body.len());
+        // start/end can land inside a multi-byte character; snap to char
         // boundaries before slicing or body[..start] panics (#257).
         while start > 0 && !body.is_char_boundary(start) { start -= 1; }
         while end < body.len() && !body.is_char_boundary(end) { end += 1; }
@@ -1975,18 +2022,13 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
         }
         let snippet = body.get(start..end).unwrap_or("").trim().replace('\n', " ");
         out.push(json!({
-            "offset": abs,
+            "offset": match_start,
             "snippet": snippet,
         }));
-        idx = abs + needle.len();
+        idx = hs_abs + needle.len();
         if out.len() >= limit { break; }
     }
-    if out.is_empty() {
-        Ok(format!("No matches for {query:?}."))
-    } else {
-        Ok(format!("{} match(es). {}", out.len(),
-            out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")))
-    }
+    out
 }
 
 /// Export full session state: cookies + localStorage + sessionStorage
@@ -2089,6 +2131,31 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1015: case-folding can change byte length (Turkish "İ" -> "i̇"), so a
+    // match offset found in the lowercased haystack must be translated back to
+    // the original body's byte offset.
+    #[test]
+    fn search_body_maps_offsets_through_unicode_lowercasing() {
+        let body = "İstanbul hava durumu";
+        let results = search_body(body, "HAVA", false, 5, 10);
+        assert_eq!(results.len(), 1, "should find one match");
+        let offset = results[0]["offset"].as_u64().unwrap() as usize;
+        assert_eq!(
+            offset,
+            body.find("hava").unwrap(),
+            "offset must be the byte position of the match in the original body"
+        );
+        assert!(
+            results[0]["snippet"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("hava"),
+            "snippet must contain the match, got {}",
+            results[0]["snippet"]
+        );
+    }
 
     fn listed_tools() -> Vec<Value> {
         handle_tools_list(json!(1)).result.expect("tools/list result")
