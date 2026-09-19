@@ -2501,6 +2501,30 @@ impl Stylesheet {
         &self.invalidation_map
     }
 
+    /// Whether any rule in this stylesheet declares a `url(...)` value.
+    /// The render-warmup cascade uses this to skip a whole-document style
+    /// pass when no stylesheet can produce an image/mask/content URL at
+    /// all. `@font-face` src lists are deliberately excluded: they are not
+    /// parsed into rules and the page transport collects them separately.
+    pub(crate) fn may_have_resource_urls(&self) -> bool {
+        let decl_has_url = |s: &str| {
+            s.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"url("))
+        };
+        for rule in &self.rules {
+            if decl_has_url(&rule.normal_decls) || decl_has_url(&rule.important_decls) {
+                return true;
+            }
+        }
+        for map in [&self.before_rules, &self.after_rules, &self.placeholder_rules] {
+            for rule in &map.rules {
+                if decl_has_url(&rule.normal_decls) || decl_has_url(&rule.important_decls) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Until Stage B supplies completed container geometry, preserved
     /// conditional rules remain inactive rather than using viewport geometry.
     fn container_condition_is_active(
