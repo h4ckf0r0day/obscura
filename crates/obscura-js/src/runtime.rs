@@ -4337,6 +4337,37 @@ mod tests {
         rt
     }
 
+    // #1039: removing a subtree containing a <link> stylesheet must release the
+    // native external_stylesheets entry, not leak it.
+    #[test]
+    fn removing_a_subtree_releases_native_linked_stylesheets() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const parent = document.createElement('div');
+                    document.body.appendChild(parent);
+                    const link = document.createElement('link');
+                    link.setAttribute('rel', 'stylesheet');
+                    parent.appendChild(link);
+                    const nid = link._nid;
+                    const frame = globalThis.__obscura_frameId || 0;
+                    __obscura_test_ops.op_external_stylesheet_set(nid, 'body{color:red}', 'http://x/a.css', true, frame);
+                    globalThis.__obscura_registerLinkedStylesheet(link, 'http://x/a.css');
+                    const before = __obscura_test_ops.op_external_stylesheet_get(nid, frame);
+                    parent.innerHTML = '';
+                    const after = __obscura_test_ops.op_external_stylesheet_get(nid, frame);
+                    return [before !== 'null', after === 'null'];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true]),
+            "the native stylesheet entry must be released when the <link>'s subtree is removed"
+        );
+    }
+
     #[test]
     fn page_script_cannot_reach_deno_core_or_bootstrap_handoff() {
         let mut rt = setup_runtime("<html><body><p id='value'>safe</p></body></html>");
