@@ -653,10 +653,13 @@ async function _loadLinkedStylesheet(c) {
   try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
   try {
     const loaded = await _fetchLinkedCss(fullUrl, pageOrigin);
-    __obscuraCore.ops.op_external_stylesheet_set(
+    const changed = __obscuraCore.ops.op_external_stylesheet_set(
       c._nid, loaded.css, loaded.responseUrl, loaded.originClean,
       globalThis.__obscura_frameId || 0
     );
+    // Private CSS does not mutate a DOM node. Invalidate live style snapshots
+    // and detached iframe layouts even if they were read before this load.
+    if (changed) _domMutationEpoch++;
     _registerLinkedStylesheet(c, loaded.responseUrl);
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
@@ -4720,9 +4723,7 @@ class Element extends Node {
   _renderClientMetrics() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
-      if (!raw) return { width: 0, height: 0 };
-      const geometry = JSON.parse(raw);
+      const geometry = this._renderBoxGeometry();
       if (geometry
           && Number.isFinite(geometry.clientWidth)
           && Number.isFinite(geometry.clientHeight)) {
@@ -4745,7 +4746,10 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const child = _iframeLayoutForNode(this, false);
+      const raw = child === undefined
+        ? __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId)
+        : child;
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -8053,7 +8057,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8571,7 +8575,10 @@ globalThis.getComputedStyle = (el) => {
     snapshot.rendered = null;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0));
+        const child = _iframeLayoutForNode(el, true);
+        const raw = child === undefined
+          ? __obscuraCore.ops.op_computed_style(String(el._nid | 0), _realmFrameId)
+          : child;
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
@@ -12535,6 +12542,27 @@ _markNative(globalThis.Selection);
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
+const _iframeDocumentsByRoot = new WeakMap();
+let _hasIframeDocuments = false;
+
+// Synchronous about:blank/srcdoc frames retain their own detached HTML tree.
+// Only registered documents get layout: an ordinary detached element still
+// has no associated CSS box. Nested frames resolve the embedding viewport in
+// their parent document before measuring the child.
+function _iframeLayoutForNode(el, style) {
+  if (!_hasIframeDocuments) return undefined;
+  const root = el.getRootNode({ composed: true });
+  const doc = _iframeDocumentsByRoot.get(root);
+  if (!doc) return undefined;
+  const host = doc._iframeEl?._renderBoxGeometry();
+  if (!host || typeof __obscuraCore.ops.op_subdocument_layout !== 'function') return '';
+  return __obscuraCore.ops.op_subdocument_layout(JSON.stringify({
+    root: root._nid, host: doc._iframeEl._nid, node: el._nid, epoch: _domMutationEpoch,
+    width: host.clientWidth, height: host.clientHeight,
+    url: doc._url.startsWith('about:') ? document.baseURI : doc._url, style,
+  }), _realmFrameId);
+}
+
 class _IframeDocument {
   constructor(html, url, iframeEl) {
     this._url = url;
@@ -12548,6 +12576,8 @@ class _IframeDocument {
     this.hidden = false;
 
     this._root = document.createElement('html');
+    _iframeDocumentsByRoot.set(this._root, this);
+    _hasIframeDocuments = true;
     this._head = document.createElement('head');
     this._body = document.createElement('body');
     this._root.appendChild(this._head);

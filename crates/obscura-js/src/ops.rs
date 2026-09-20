@@ -222,6 +222,10 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
+    /// Isolated layouts for synchronous iframe documents, keyed by their
+    /// detached DOM root. Never include child styles in the parent's cascade.
+    #[cfg(feature = "render")]
+    pub(crate) subdocument_layouts: HashMap<NodeId, SubdocumentLayout>,
     /// Waiters sharing an asynchronous HTMLImageElement request. The key keeps
     /// navigation identity and request credentials separate so neither stale
     /// pages nor incompatible CORS profiles share a completion.
@@ -398,6 +402,8 @@ impl ObscuraState {
             pending_style_mutations: Vec::new(),
             #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
+            #[cfg(feature = "render")]
+            subdocument_layouts: HashMap::new(),
             #[cfg(feature = "render")]
             render_image_in_flight: HashMap::new(),
             #[cfg(feature = "render")]
@@ -632,6 +638,17 @@ fn push_capped(list: &mut Vec<String>, item: String, max: usize) {
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
 
+#[cfg(feature = "render")]
+pub(crate) struct SubdocumentLayout {
+    document_generation: u64,
+    mutation_epoch: u64,
+    pub(crate) host: NodeId,
+    pub(crate) viewport: (f32, f32),
+    pub(crate) base_url: String,
+    nodes: HashMap<NodeId, NodeId>,
+    prepared: Option<obscura_render::PreparedRender>,
+}
+
 /// Which document belongs to which realm.
 ///
 /// An op has to read the state of the realm that *called* it. Making a realm
@@ -656,15 +673,47 @@ impl RealmStates {
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
-        self.entries.retain(|(known, _, _)| known != context);
+        self.entries.retain(|(known, _, _frame)| {
+            if known == context {
+                #[cfg(feature = "render")]
+                abandon_state_render_resources(&mut _frame.borrow_mut());
+                false
+            } else {
+                true
+            }
+        });
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    #[cfg(feature = "render")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn states(&self) -> Vec<SharedState> {
+        self.entries.iter().map(|(_, _, state)| state.clone()).collect()
+    }
+
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
     }
+}
+
+/// Cancel this document's loads and fence answers that raced cancellation.
+#[cfg(feature = "render")]
+pub(crate) fn abandon_state_render_resources(state: &mut ObscuraState) {
+    for task in state.render_resource_tasks.drain(..) {
+        task.abort();
+    }
+    state.render_resource_in_flight.clear();
+    state.render_resource_backlog.clear();
+    state.render_resource_events.clear();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    state.render_resource_tx = tx;
+    state.render_resource_rx = rx;
 }
 
 /// The document of the realm a DOM call came from, named rather than inferred.
@@ -1186,7 +1235,15 @@ pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::Re
 /// Coalescing this marker also makes one shared image response invalidate once
 /// rather than once for every HTMLImageElement waiter.
 #[cfg(feature = "render")]
+pub(crate) fn invalidate_subdocument_resource_geometry(state: &mut ObscuraState) {
+    for layout in state.subdocument_layouts.values_mut() {
+        layout.prepared = None;
+    }
+}
+
+#[cfg(feature = "render")]
 pub(crate) fn invalidate_render_resource_geometry(state: &mut ObscuraState) {
+    invalidate_subdocument_resource_geometry(state);
     if state.prepared_render.is_some()
         && !queue_retained_style_mutation(
             &mut state.pending_style_mutations,
@@ -6050,6 +6107,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
+        ops.push(op_subdocument_layout());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
@@ -6955,8 +7013,8 @@ fn clamp_scroll_offset_for_consumer(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7002,6 +7060,111 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
         .to_string();
     }
     String::new()
+}
+
+/// Render a synchronous iframe's detached document in its own viewport. The
+/// parent resource cache retains the configured native transport and cookies.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_subdocument_layout(state: &OpState, #[string] request: &str, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        subdocument_layout(state, request, frame_id)
+    })).unwrap_or_default()
+}
+
+#[cfg(feature = "render")]
+fn subdocument_layout(state: &OpState, request: &str, frame_id: u32) -> String {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        root: u32,
+        host: u32,
+        node: u32,
+        epoch: u64,
+        width: f32,
+        height: f32,
+        url: String,
+        style: bool,
+    }
+    let Ok(request) = serde_json::from_str::<Request>(request) else {
+        return String::new();
+    };
+    if !request.width.is_finite() || !request.height.is_finite() {
+        return String::new();
+    }
+    let root = NodeId::new(request.root);
+    let node = NodeId::new(request.node);
+    let viewport = (request.width.max(0.0), request.height.max(0.0));
+    let shared = frame_state(state, frame_id);
+    let mut gs = shared.borrow_mut();
+    let generation = gs.document_generation;
+    let fresh = gs.subdocument_layouts.get(&root).is_some_and(|cached| {
+        cached.prepared.is_some() && cached.document_generation == generation && cached.mutation_epoch == request.epoch
+            && cached.viewport == viewport && cached.base_url == request.url
+    });
+    if !fresh {
+        let Some(source) = gs.dom.as_ref() else { return String::new(); };
+        let Some(root_node) = source.get_node(root) else { return String::new(); };
+        if root_node.parent.is_some() || !root_node.is_element() {
+            return String::new();
+        }
+        let tree = obscura_dom::DomTree::new();
+        tree.set_quirks(source.is_quirks());
+        let Some(cloned_root) = tree.import_node_from(tree.document(), source, root) else {
+            return String::new();
+        };
+        let nodes: HashMap<_, _> = std::iter::once(root).chain(source.descendants(root))
+            .zip(std::iter::once(cloned_root).chain(tree.descendants(cloned_root))).collect();
+        // Host-fetched linked CSS is not serialized into the DOM. Transfer
+        // its private registry when cloning a frame for isolated layout.
+        for (&owner, &cloned_owner) in &nodes {
+            if let Some(sheet) = source.external_stylesheet(owner) {
+                for css in sheet.sources {
+                    tree.append_external_stylesheet(cloned_owner, css.to_string(), sheet.origin_clean);
+                }
+            }
+        }
+        // Geometry must not open HTTP through the renderer's compatibility
+        // client. Page resource preparation populates this shared cache using
+        // the native cookie/proxy/CORS-aware transport, then invalidates layout.
+        let prepared = crate::runtime::with_sync_render_loading_disabled(&mut gs, |gs| {
+            obscura_render::prepare_dom(&tree, viewport, Some(&request.url), &mut gs.render_resources)
+        });
+        let Some(prepared) = prepared else { return String::new(); };
+        // Bound retention when a page repeatedly creates and removes frames.
+        if gs.subdocument_layouts.len() >= 8 && !gs.subdocument_layouts.contains_key(&root) {
+            gs.subdocument_layouts.clear();
+        }
+        gs.subdocument_layouts.insert(root, SubdocumentLayout {
+            document_generation: generation, mutation_epoch: request.epoch,
+            host: NodeId::new(request.host), viewport, base_url: request.url, nodes,
+            prepared: Some(prepared),
+        });
+    }
+    let Some(cached) = gs.subdocument_layouts.get(&root) else { return String::new(); };
+    let Some(&node) = cached.nodes.get(&node) else { return String::new(); };
+    let Some(prepared) = cached.prepared.as_ref() else { return String::new(); };
+    if request.style {
+        let Some(snapshot) = prepared.computed_style(node) else { return String::new(); };
+        let mut object = serde_json::Map::new();
+        for (name, value) in snapshot {
+            object.insert(name.to_string(), serde_json::Value::String(value));
+        }
+        for (name, value) in prepared.computed_custom_properties(node).unwrap_or_default() {
+            object.insert(name, serde_json::Value::String(value));
+        }
+        return serde_json::Value::Object(object).to_string();
+    }
+    let Some(rect) = prepared.viewport_rect(node, (0.0, 0.0)) else { return String::new(); };
+    let Some((cw, ch)) = prepared.client_size(node) else { return String::new(); };
+    let rects = prepared.viewport_client_rects(node, (0.0, 0.0)).unwrap_or_default()
+        .into_iter().map(|r| serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height}))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "x":rect.x,"y":rect.y,"width":rect.width,"height":rect.height,
+        "clientWidth":cw,"clientHeight":ch,"clientRects":rects,
+        "viewportFixed":prepared.viewport_fixed_nodes().contains(&node),
+    }).to_string()
 }
 
 /// Measure every target in one ResizeObserver rendering opportunity.
@@ -7141,8 +7304,8 @@ fn op_intersection_observer_measurements(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_computed_style(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();

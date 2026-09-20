@@ -7183,35 +7183,39 @@ fn collect_web_fonts(
     let mut rules = Vec::new();
 
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        let Some(node) = tree.get_node(nid) else {
-            continue;
-        };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "style")
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let css = tree.text_content(nid);
-        for face in font_face_blocks(&css) {
-            if !font_face_covers_ascii(face) {
-                continue;
-            }
-            let sources: Vec<_> = font_face_urls(face)
-                .into_iter()
-                .filter(|src| font_source_may_be_supported(src))
-                .map(|src| (font_resource_key(&src, base_url), src))
-                .collect();
-            if sources.is_empty() {
-                continue;
-            }
-            rules.push(FontRule {
-                sources,
-                family: font_face_family(face),
-                weight: font_face_weight(face),
-                italic: font_face_italic(face),
+        let Some(node) = tree.get_node(nid) else { continue; };
+        let Some(element) = node.as_element() else { continue; };
+        let inline = element.local.as_ref() == "style";
+        let linked = element.local.as_ref() == "link"
+            && node.get_attribute("disabled").is_none()
+            && node.get_attribute("rel").is_some_and(|rel| {
+                rel.split_ascii_whitespace().any(|part| part.eq_ignore_ascii_case("stylesheet"))
             });
+        if !inline && !linked { continue; }
+        // Linked CSS lives in the private host registry, including cross-origin
+        // sheets. Its font misses must enter the same native resource queue.
+        let mut sources = tree.external_stylesheet(nid).map(|sheet| sheet.sources).unwrap_or_default();
+        if inline { sources.push(Arc::from(tree.text_content(nid))); }
+        for css in sources {
+            for face in font_face_blocks(&css) {
+                if !font_face_covers_ascii(face) {
+                    continue;
+                }
+                let sources: Vec<_> = font_face_urls(face)
+                    .into_iter()
+                    .filter(|src| font_source_may_be_supported(src))
+                    .map(|src| (font_resource_key(&src, base_url), src))
+                    .collect();
+                if sources.is_empty() {
+                    continue;
+                }
+                rules.push(FontRule {
+                    sources,
+                    family: font_face_family(face),
+                    weight: font_face_weight(face),
+                    italic: font_face_italic(face),
+                });
+            }
         }
     }
     for face in dynamic_fonts {
@@ -15736,6 +15740,24 @@ mod tests {
         let face = font_face_blocks(css)[0];
         assert!(font_face_covers_ascii(face));
         assert_eq!(font_face_urls(face), vec!["example.otf"]);
+    }
+
+    #[test]
+    fn private_linked_font_faces_schedule_native_loads_and_use_seeded_bytes() {
+        let tree = parse_html("<head><link rel='stylesheet' href='https://assets.test/style.css'></head><body>font probe</body>");
+        let owner = tree.query_selector("link").unwrap().unwrap();
+        tree.replace_external_stylesheet(owner,
+            "@font-face{font-family:Private;src:url(https://assets.test/font.ttf)}".into(), false);
+        let mut cache = RenderResourceCache::with_loader(|_: &str| panic!("layout must not open synchronous HTTP"));
+        cache.set_sync_loading_enabled(false);
+        assert!(collect_web_fonts(&tree, Some("https://page.test/"), &mut cache, &[]).is_empty());
+        assert_eq!(cache.take_sync_misses(), vec![("https://assets.test/font.ttf".into(), None, true)]);
+        cache.seed("https://assets.test/font.ttf".into(), SERIF_FONT_BYTES.to_vec());
+        let fonts = collect_web_fonts(&tree, Some("https://page.test/"), &mut cache, &[]);
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(fonts[0].family.as_deref(), Some("Private"));
+        assert_eq!(fonts[0].data.as_slice(), SERIF_FONT_BYTES);
+        assert!(!tree.text_content(tree.document()).contains("@font-face"));
     }
 
     #[test]

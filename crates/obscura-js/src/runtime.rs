@@ -149,7 +149,28 @@ pub fn is_fatal_event_loop_error(error: &str) -> bool {
 }
 
 #[cfg(feature = "render")]
-fn with_sync_render_loading_disabled<R>(
+fn render_document_roots(state: &ObscuraState) -> Vec<(NodeId, (f32, f32), Option<String>)> {
+    let Some(dom) = state.dom.as_ref() else { return Vec::new(); };
+    let mut roots = vec![(dom.document(), state.viewport, document_base_url(state))];
+    for (&root, layout) in &state.subdocument_layouts {
+        let mut host = layout.host;
+        // Nested synchronous frames belong to another detached document.
+        // Follow at most the bounded number of retained frame layouts.
+        for _ in 0..=state.subdocument_layouts.len() {
+            if dom.is_connected(host) {
+                roots.push((root, layout.viewport, Some(layout.base_url.clone())));
+                break;
+            }
+            let host_root = dom.ancestors(host).last().copied().unwrap_or(host);
+            let Some(parent) = state.subdocument_layouts.get(&host_root) else { break; };
+            host = parent.host;
+        }
+    }
+    roots
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
     capture: impl FnOnce(&mut ObscuraState) -> R,
 ) -> R {
@@ -497,9 +518,7 @@ impl Drop for ObscuraJsRuntime {
         // a dropped JoinHandle would only detach them (the page also calls
         // `abandon_render_resources`, a directly embedded runtime may not).
         #[cfg(feature = "render")]
-        for task in self.state.borrow_mut().render_resource_tasks.drain(..) {
-            task.abort();
-        }
+        self.abandon_render_resources();
         // Teardown needs the isolate current as much as any other V8 work:
         // deno_core's context cleanup clears the context's embedder slots, and
         // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
@@ -956,13 +975,16 @@ impl ObscuraJsRuntime {
         {
             frame.stealth_client = parent.stealth_client.clone();
         }
-        // A frame realm shares the page transport, so its renderer cache must
-        // not open synchronous requests either. Frame geometry currently
-        // resolves against the main document's renderer state, so frame-scoped
-        // background loading is not wired up here.
+        // Frame caches retain their own origin and document lifetime, while
+        // all background loads share the page's wake-up and concurrency bound.
         #[cfg(feature = "render")]
-        if crate::ops::has_page_transport(&parent) {
-            frame.render_resources.set_sync_loading_enabled(false);
+        {
+            frame.intercept_block_patterns = parent.intercept_block_patterns.clone();
+            frame.render_resource_limiter = parent.render_resource_limiter.clone();
+            frame.render_resource_notify = parent.render_resource_notify.clone();
+            if crate::ops::has_page_transport(&parent) {
+                frame.render_resources.set_sync_loading_enabled(false);
+            }
         }
     }
 
@@ -1185,6 +1207,8 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_dom(&self, dom: DomTree) {
+        #[cfg(feature = "render")]
+        self.abandon_render_resources();
         let mut gs = self.state.borrow_mut();
         gs.dom = Some(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
@@ -1203,6 +1227,7 @@ impl ObscuraJsRuntime {
             gs.pending_style_mutations.clear();
             let render_resources = crate::ops::fresh_render_resources(&gs);
             gs.render_resources = render_resources;
+            gs.subdocument_layouts.clear();
             gs.render_image_in_flight.clear();
             for task in gs.render_resource_tasks.drain(..) {
                 task.abort();
@@ -1846,6 +1871,38 @@ impl ObscuraJsRuntime {
         })
     }
 
+    /// CSS sources from the main document and measured synchronous frames.
+    /// The browser consumes these through its existing native resource warmup.
+    #[cfg(feature = "render")]
+    pub fn render_css_sources(&self) -> Vec<(String, String)> {
+        let state = self.state.borrow();
+        let Some(dom) = state.dom.as_ref() else { return Vec::new(); };
+        let mut sources = Vec::new();
+        for (root, _, base) in render_document_roots(&state) {
+            let base = base.unwrap_or_else(|| state.url.clone());
+            for id in dom.descendants(root) {
+                let Some(node) = dom.get_node(id) else { continue; };
+                if node.as_element().is_some_and(|element| element.local.as_ref() == "style") {
+                    sources.push((dom.text_content(id), base.clone()));
+                }
+                // Linked CSS is private host state. Include its resources for
+                // this document without exposing cross-origin bytes in the DOM.
+                if let Some(sheet) = dom.external_stylesheet(id) {
+                    sources.extend(sheet.sources.iter().map(|css| (css.to_string(), base.clone())));
+                }
+                if let Some(style) = node.get_attribute("style") {
+                    sources.push((style.to_string(), base.clone()));
+                }
+                if node.as_element().is_some_and(|element| element.local.as_ref() == "use") {
+                    if let Some(href) = node.get_attribute("href").or_else(|| node.get_attribute("xlink:href")) {
+                        sources.push((format!("url({href})"), base.clone()));
+                    }
+                }
+            }
+        }
+        sources
+    }
+
     /// Return the exact responsive candidates selected for live `<img>`
     /// elements and `<video poster>` resources without loading them. The
     /// browser layer can then fetch them concurrently through the page-owned
@@ -1853,12 +1910,12 @@ impl ObscuraJsRuntime {
     #[cfg(feature = "render")]
     pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
         let state = self.state.borrow();
-        let base_url = document_base_url(&state);
         let Some(dom) = state.dom.as_ref() else {
             return Vec::new();
         };
         let mut urls = Vec::new();
-        for id in dom.descendants(dom.document()) {
+        for (root, viewport, base_url) in render_document_roots(&state) {
+          for id in dom.descendants(root) {
             let Some(node) = dom.get_node(id) else {
                 continue;
             };
@@ -1868,7 +1925,7 @@ impl ObscuraJsRuntime {
             let candidate = match element.local.as_ref() {
                 "img" => state
                     .render_resources
-                    .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
+                    .cached_image_element_metadata(dom, id, viewport, base_url.as_deref())
                     .map(|(url, _, known, _)| {
                         let profile = match node
                             .get_attribute("crossorigin")
@@ -1895,6 +1952,7 @@ impl ObscuraJsRuntime {
             if !known && !url.starts_with("data:") {
                 urls.push((url, profile));
             }
+          }
         }
         urls.sort();
         urls.dedup();
@@ -1908,16 +1966,16 @@ impl ObscuraJsRuntime {
     /// retained layout/scroll.
     #[cfg(feature = "render")]
     pub fn seed_render_resource(&mut self, url: String, bytes: Option<Vec<u8>>) {
-        self.seed_shared_render_resource(url, bytes.map(std::sync::Arc::from));
+        Self::seed_shared_render_resource(&self.state, url, bytes.map(std::sync::Arc::from));
     }
 
     #[cfg(feature = "render")]
     fn seed_shared_render_resource(
-        &mut self,
+        shared: &crate::ops::SharedState,
         url: String,
         bytes: Option<std::sync::Arc<[u8]>>,
     ) {
-        let mut state = self.state.borrow_mut();
+        let mut state = shared.borrow_mut();
         match bytes {
             Some(bytes) => {
                 state.render_resources.seed_shared(url, bytes);
@@ -1934,17 +1992,17 @@ impl ObscuraJsRuntime {
         profile: crate::ops::ImageRequestProfile,
         bytes: Option<Vec<u8>>,
     ) {
-        self.seed_shared_render_image_resource(url, profile, bytes.map(std::sync::Arc::from));
+        Self::seed_shared_render_image_resource(&self.state, url, profile, bytes.map(std::sync::Arc::from));
     }
 
     #[cfg(feature = "render")]
     fn seed_shared_render_image_resource(
-        &mut self,
+        shared: &crate::ops::SharedState,
         url: String,
         profile: crate::ops::ImageRequestProfile,
         bytes: Option<std::sync::Arc<[u8]>>,
     ) {
-        let mut state = self.state.borrow_mut();
+        let mut state = shared.borrow_mut();
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
                 let needs_geometry = match (&state.prepared_render, &state.dom) {
@@ -1959,6 +2017,10 @@ impl ObscuraJsRuntime {
                 state.activity_generation = state.activity_generation.wrapping_add(1);
                 if needs_geometry {
                     crate::ops::invalidate_render_resource_geometry(&mut state);
+                } else {
+                    // An image used only by a detached child document is not
+                    // present in the retained parent's geometry dependency set.
+                    crate::ops::invalidate_subdocument_resource_geometry(&mut state);
                 }
             }
             _ => state.render_resources.seed_image_missing(url, profile),
@@ -1990,8 +2052,30 @@ impl ObscuraJsRuntime {
     pub fn take_render_resource_requests(
         &self,
     ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
-        let mut state = self.state.borrow_mut();
-        if !state.render_resources.has_sync_misses() {
+        Self::take_state_render_resource_requests(&self.state, self.render_resource_capacity())
+    }
+
+    #[cfg(feature = "render")]
+    fn render_resource_states(&self) -> Vec<crate::ops::SharedState> {
+        let mut states = self.realm_states().borrow().states();
+        states.insert(0, self.state.clone());
+        states
+    }
+
+    #[cfg(feature = "render")]
+    fn render_resource_capacity(&self) -> usize {
+        let pending: usize = self.render_resource_states().iter()
+            .map(|state| state.borrow().render_resource_in_flight.len()).sum();
+        MAX_PENDING_RENDER_RESOURCES.saturating_sub(pending)
+    }
+
+    #[cfg(feature = "render")]
+    fn take_state_render_resource_requests(
+        shared: &crate::ops::SharedState,
+        available: usize,
+    ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        let mut state = shared.borrow_mut();
+        if available == 0 || !state.render_resources.has_sync_misses() {
             return Vec::new();
         }
         let misses = state.render_resources.take_sync_misses();
@@ -2018,7 +2102,7 @@ impl ObscuraJsRuntime {
                 }
                 continue;
             }
-            if state.render_resource_in_flight.len() >= MAX_PENDING_RENDER_RESOURCES {
+            if requests.len() >= available {
                 continue;
             }
             if state
@@ -2038,18 +2122,18 @@ impl ObscuraJsRuntime {
         &self,
         candidates: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
     ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        let available = self.render_resource_capacity();
         let mut state = self.state.borrow_mut();
-        let available = MAX_PENDING_RENDER_RESOURCES
-            .saturating_sub(state.render_resource_in_flight.len());
-        candidates
-            .into_iter()
-            .filter(|(url, profile, is_font)| {
-                state
-                    .render_resource_in_flight
-                    .insert((url.clone(), *profile, *is_font))
-            })
-            .take(available)
-            .collect()
+        let mut requests = Vec::new();
+        for candidate in candidates {
+            if requests.len() >= available {
+                break;
+            }
+            if state.render_resource_in_flight.insert(candidate.clone()) {
+                requests.push(candidate);
+            }
+        }
+        requests
     }
 
     /// Abort every background load of this document and discard results
@@ -2060,19 +2144,9 @@ impl ObscuraJsRuntime {
     /// dropped channel.
     #[cfg(feature = "render")]
     pub fn abandon_render_resources(&self) {
-        let mut state = self.state.borrow_mut();
-        for task in state.render_resource_tasks.drain(..) {
-            task.abort();
+        for state in self.render_resource_states() {
+            crate::ops::abandon_state_render_resources(&mut state.borrow_mut());
         }
-        state.render_resource_in_flight.clear();
-        state.render_resource_backlog.clear();
-        state.render_resource_events.clear();
-        // A fresh channel fences results that are still on their way (abort
-        // is not a join) even when this runtime survives, as after a failed
-        // navigation.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        state.render_resource_tx = tx;
-        state.render_resource_rx = rx;
     }
 
     /// Whether a page transport (plain or stealth client) is installed.
@@ -2102,10 +2176,18 @@ impl ObscuraJsRuntime {
         &self,
         requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
     ) -> usize {
+        Self::start_state_render_resource_loads(&self.state, requests)
+    }
+
+    #[cfg(feature = "render")]
+    fn start_state_render_resource_loads(
+        shared: &crate::ops::SharedState,
+        requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
+    ) -> usize {
         if requests.is_empty() {
             return 0;
         }
-        let mut state = self.state.borrow_mut();
+        let mut state = shared.borrow_mut();
         if tokio::runtime::Handle::try_current().is_err() {
             state.render_resource_backlog.extend(requests);
             return 0;
@@ -2251,7 +2333,8 @@ impl ObscuraJsRuntime {
     /// the number of loads that stored usable bytes.
     #[cfg(feature = "render")]
     pub fn service_render_resources(&mut self) -> usize {
-        {
+        // Keep the ordinary idle page path allocation-free.
+        if self.realm_states().borrow().is_empty() {
             let state = self.state.borrow();
             if state.render_resource_rx.is_empty()
                 && state.render_resource_backlog.is_empty()
@@ -2260,17 +2343,43 @@ impl ObscuraJsRuntime {
                 return 0;
             }
         }
-        let loaded = self.apply_render_resource_results();
-        let mut requests = std::mem::take(&mut self.state.borrow_mut().render_resource_backlog);
-        requests.extend(self.take_render_resource_requests());
-        self.start_render_resource_loads(requests);
+        let states = self.render_resource_states();
+        let mut available = MAX_PENDING_RENDER_RESOURCES.saturating_sub(states.iter()
+            .map(|state| state.borrow().render_resource_in_flight.len()).sum());
+        let mut loaded = 0;
+        for shared in states {
+            {
+                let state = shared.borrow();
+                if state.render_resource_rx.is_empty()
+                    && state.render_resource_backlog.is_empty()
+                    && !state.render_resources.has_sync_misses()
+                {
+                    continue;
+                }
+            }
+            // CDP blocking/interception policy may change after frame creation.
+            if !Rc::ptr_eq(&shared, &self.state) {
+                let parent = self.state.borrow();
+                let mut frame = shared.borrow_mut();
+                frame.blocked_urls.clone_from(&parent.blocked_urls);
+                frame.intercept_enabled = parent.intercept_enabled;
+                frame.intercept_block_patterns.clone_from(&parent.intercept_block_patterns);
+            }
+            loaded += Self::apply_state_render_resource_results(&shared);
+            let mut requests = std::mem::take(&mut shared.borrow_mut().render_resource_backlog);
+            let fresh = Self::take_state_render_resource_requests(&shared, available);
+            available = available.saturating_sub(fresh.len());
+            requests.extend(fresh);
+            Self::start_state_render_resource_loads(&shared, requests);
+        }
         loaded
     }
 
     /// Whether page-transport loads are still running for this document.
     #[cfg(feature = "render")]
     pub fn has_pending_render_resources(&self) -> bool {
-        !self.state.borrow().render_resource_in_flight.is_empty()
+        self.render_resource_states().iter()
+            .any(|state| !state.borrow().render_resource_in_flight.is_empty())
     }
 
     /// Apply every finished page-transport load without waiting. Called at
@@ -2280,8 +2389,14 @@ impl ObscuraJsRuntime {
     /// number of loads that stored usable bytes.
     #[cfg(feature = "render")]
     pub fn apply_render_resource_results(&mut self) -> usize {
+        self.render_resource_states().iter()
+            .map(Self::apply_state_render_resource_results).sum()
+    }
+
+    #[cfg(feature = "render")]
+    fn apply_state_render_resource_results(shared: &crate::ops::SharedState) -> usize {
         let loads = {
-            let mut state = self.state.borrow_mut();
+            let mut state = shared.borrow_mut();
             let mut loads = Vec::new();
             while let Ok(load) = state.render_resource_rx.try_recv() {
                 loads.push(load);
@@ -2290,14 +2405,14 @@ impl ObscuraJsRuntime {
         };
         let mut loaded = 0;
         for load in loads {
-            let generation = self.state.borrow().document_generation;
+            let generation = shared.borrow().document_generation;
             if load.generation != generation {
                 // A previous document's response: no seed, no event, and it
                 // must not clear a same-URL request of the current document.
                 tracing::debug!(url = %load.url, "discarded render resource load of a retired document");
                 continue;
             }
-            self.state
+            shared
                 .borrow_mut()
                 .render_resource_in_flight
                 .remove(&(load.url.clone(), load.profile, load.is_font));
@@ -2311,11 +2426,11 @@ impl ObscuraJsRuntime {
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
             match load.profile {
-                Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
-                None => self.seed_shared_render_resource(load.url, bytes),
+                Some(profile) => Self::seed_shared_render_image_resource(shared, load.url, profile, bytes),
+                None => Self::seed_shared_render_resource(shared, load.url, bytes),
             }
             if let Some(response) = load.response {
-                self.state
+                shared
                     .borrow_mut()
                     .render_resource_events
                     .push(crate::ops::RenderResourceEvent { is_font, response });
@@ -2328,7 +2443,8 @@ impl ObscuraJsRuntime {
     /// events yet.
     #[cfg(feature = "render")]
     pub fn take_render_resource_events(&self) -> Vec<crate::ops::RenderResourceEvent> {
-        std::mem::take(&mut self.state.borrow_mut().render_resource_events)
+        self.render_resource_states().iter().flat_map(|state|
+            std::mem::take(&mut state.borrow_mut().render_resource_events)).collect()
     }
 
     #[cfg(feature = "render")]
@@ -3862,6 +3978,8 @@ impl ObscuraJsRuntime {
         }
     }
     pub fn take_dom(&self) -> Option<DomTree> {
+        #[cfg(feature = "render")]
+        self.abandon_render_resources();
         let mut state = self.state.borrow_mut();
         #[cfg(feature = "render")]
         {
@@ -3869,6 +3987,7 @@ impl ObscuraJsRuntime {
             state.pending_style_mutations.clear();
             let render_resources = crate::ops::fresh_render_resources(&state);
             state.render_resources = render_resources;
+            state.subdocument_layouts.clear();
             for task in state.render_resource_tasks.drain(..) {
                 task.abort();
             }
@@ -20620,4 +20739,265 @@ mod tests {
             "label association must follow the HTML labelable-element rules"
         );
     }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod subdocument_resource_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    #[test]
+    fn private_linked_css_resources_include_synchronous_iframes() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><head><link id='main' rel='stylesheet' href='main.css'></head><body></body>"));
+        rt.set_url("https://example.com/parent/");
+        rt.run_page_init();
+        let ids = rt.evaluate(r#"(() => {
+            const f = document.createElement('iframe'); document.body.appendChild(f);
+            const d = f.contentDocument;
+            d.head.innerHTML = '<link id="child" rel="stylesheet" href="child.css">';
+            d.body.innerHTML = '<div style="width:100px;height:20px">child</div>';
+            if (d.querySelector('div').getBoundingClientRect().width !== 100) throw Error('child layout missing');
+            if (typeof Deno !== 'undefined') throw Error('native bridge exposed');
+            return [document.querySelector('#main')._nid, d.querySelector('#child')._nid];
+        })()"#).unwrap();
+        {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            for (index, name) in ["main", "child"].iter().enumerate() {
+                let owner = NodeId::new(ids[index].as_u64().unwrap() as u32);
+                assert!(dom.replace_external_stylesheet(owner, format!("@font-face{{font-family:{name};src:url({name}.woff2)}}.probe{{width:123px;height:45px}}"), false));
+            }
+        }
+        let sources = rt.render_css_sources();
+        for name in ["main", "child"] {
+            let base = "https://example.com/parent/";
+            assert!(sources.iter().any(|(css, url)| css.contains(&format!("{name}.woff2")) && url == base), "{sources:?}");
+        }
+        assert_eq!(rt.evaluate("(() => { const el=document.querySelector('iframe').contentDocument.querySelector('div'); el.removeAttribute('style'); el.className='probe'; const r=el.getBoundingClientRect(); return [r.width,r.height]; })()").unwrap(), serde_json::json!([123,45]));
+        assert_eq!(rt.evaluate("document.documentElement.outerHTML.includes('main.woff2') || document.querySelector('iframe').contentDocument.documentElement.outerHTML.includes('child.woff2')").unwrap(), serde_json::json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_layout_observes_a_stylesheet_loaded_after_its_first_read() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
+        rt.set_url("http://example.com/test");
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const original = __obscura_test_ops.op_fetch_url;
+            const frame = document.createElement('iframe');
+            frame.style.cssText = 'width:300px;height:150px';
+            document.body.appendChild(frame);
+            try {
+                let finish;
+                __obscura_test_ops.op_fetch_url = url => new Promise(resolve => {
+                    finish = () => resolve(JSON.stringify({status:200, headers:{}, url,
+                        body:'.probe{width:123px;height:45px}'}));
+                });
+                const doc = frame.contentDocument;
+                doc.body.innerHTML = '<div class="probe"></div>';
+                const box = doc.querySelector('div');
+                const link = doc.createElement('link');
+                link.rel = 'stylesheet'; link.href = 'http://example.com/late.css';
+                const loaded = new Promise(resolve => link.addEventListener('load', resolve));
+                doc.head.appendChild(link);
+                const live = getComputedStyle(box);
+                const read = () => {
+                    const r = box.getBoundingClientRect();
+                    return [r.width, r.height, live.width];
+                };
+                const before = read();
+                finish(); await loaded;
+                const after = read();
+                const privateCss = !doc.documentElement.outerHTML.includes('width:123px');
+                link.remove();
+                return [before[0] !== 123, after, read()[0] === before[0], privateCss];
+            } finally {
+                __obscura_test_ops.op_fetch_url = original;
+                frame.remove();
+            }
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.as_ref().unwrap_or_else(|| panic!("{result:?}")), &serde_json::json!([
+            true, [123,45,"123px"], true, true
+        ]));
+    }
+
+    #[test]
+    fn iframe_geometry_never_opens_the_synchronous_compatibility_transport() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
+        rt.set_url("https://example.com/");
+        rt.run_page_init();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        rt.state.borrow_mut().render_resources = obscura_render::RenderResourceCache::with_loader(move |_: &str| {
+            count.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let result = rt.evaluate(r#"(() => {
+            const f = document.createElement('iframe'); document.body.appendChild(f);
+            const d = f.contentDocument;
+            d.body.innerHTML = '<style>@font-face{font-family:Remote;src:url(https://example.com/cold.woff2)}div{width:100px;height:20px;font-family:Remote}</style><div>cold font</div>';
+            return d.querySelector('div').getClientRects()[0].width;
+        })()"#).unwrap();
+        assert_eq!(result.as_f64(), Some(100.0));
+        assert_eq!(calls.load(Ordering::SeqCst), 0,
+            "iframe geometry must wait for page-native resource preparation");
+        assert!(rt.render_css_sources().iter().any(|(css, _)| css.contains("cold.woff2")));
+    }
+    async fn child_resources_finish_through_page_transport(stealth: bool, native: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut chunk = [0; 2048];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let (mime, bytes): (&str, &[u8]) = if request.starts_with("GET /child/font.ttf ") {
+                    ("font/ttf", include_bytes!("../../obscura-render/assets/liberation-mono.ttf"))
+                } else {
+                    assert!(request.starts_with("GET /child/image.svg "), "{request}");
+                    ("image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" width="37" height="19"></svg>"#)
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+                socket.write_all(bytes).await.unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let mut rt = ObscuraJsRuntime::new();
+        let cookies = Arc::new(obscura_net::CookieJar::new());
+        if stealth {
+            #[cfg(feature = "stealth")]
+            rt.set_stealth_client(Arc::new(obscura_net::StealthHttpClient::with_proxy(cookies, None, true)));
+            #[cfg(not(feature = "stealth"))]
+            panic!("stealth test requires stealth feature");
+        } else {
+            rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(cookies, None, true)));
+        }
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
+        rt.set_url(&format!("{origin}/parent"));
+        rt.run_page_init();
+        let html = format!(r#"<!doctype html><body><style>
+            @font-face{{font-family:ChildRemote;src:url({origin}/child/font.ttf)}}
+            #sample{{display:inline-block;width:max-content;font:40px ChildRemote,serif}}
+            </style><span id="sample">WWWWiiii</span><img src="{origin}/child/image.svg">"#);
+        let _frame = if native {
+            Some(crate::frame::FrameRealm::new(&mut rt, 1, 0, &format!("{origin}/child/page"), &html).unwrap())
+        } else {
+            rt.evaluate(&format!("(() => {{ const f=document.createElement('iframe');document.body.appendChild(f);f.contentDocument.body.innerHTML={}; }})()", serde_json::to_string(&html).unwrap())).unwrap();
+            None
+        };
+        let document = if native { "globalThis.__obscura_frameObjects[1].document" }
+            else { "document.querySelector('iframe').contentDocument" };
+        let measure = format!("(() => {{ const d={document}, r=d.querySelector('#sample').getBoundingClientRect(), i=d.querySelector('img').getBoundingClientRect(); return [r.width,i.width,i.height]; }})()");
+        let before = rt.evaluate(&measure).unwrap();
+        rt.service_render_resources();
+        assert!(rt.has_pending_render_resources(), "measurement must schedule cold resources");
+        // Drive the same notification/service contract as Page's resource wait.
+        // There need not be pending V8 work while native requests are in flight.
+        let notify = rt.render_resource_notify();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                rt.service_render_resources();
+                if !rt.has_pending_render_resources() { break; }
+                notified.await;
+            }
+        }).await.expect("page resource service must settle child resources without a deadline override");
+        let after = rt.evaluate(&measure).unwrap();
+        assert_ne!(before[0], after[0], "loaded font must invalidate the fallback geometry");
+        assert_eq!(&after.as_array().unwrap()[1..], &[serde_json::json!(37), serde_json::json!(19)]);
+        let events = rt.take_render_resource_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events.iter().filter(|event| event.is_font).count(), 1);
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+        let referer = if native { format!("referer: {origin}/child/page") }
+            else { format!("referer: {origin}/parent") };
+        assert!(requests.iter().all(|request| request.to_lowercase().contains(&referer)),
+            "resource requests retain the child's document initiator: {requests:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_frame_resources_settle_with_default_page_transport() {
+        child_resources_finish_through_page_transport(false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_iframe_resources_settle_with_default_page_transport() {
+        child_resources_finish_through_page_transport(false, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_frame_resources_settle_with_default_stealth_transport() {
+        child_resources_finish_through_page_transport(true, true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_iframe_resources_settle_with_default_stealth_transport() {
+        child_resources_finish_through_page_transport(true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn removed_native_frames_cancel_loads_and_release_the_page_budget() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<body></body>"));
+        rt.set_url("https://example.test/");
+        rt.run_page_init();
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "https://example.test/child", "<body></body>").unwrap();
+        let state = rt.realm_states().borrow().states().pop().unwrap();
+        assert!(Arc::ptr_eq(&state.borrow().render_resource_limiter, &rt.state.borrow().render_resource_limiter));
+        assert!(Arc::ptr_eq(&state.borrow().render_resource_notify, &rt.state.borrow().render_resource_notify));
+        let old_tx = state.borrow().render_resource_tx.clone();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        {
+            let mut child = state.borrow_mut();
+            child.render_resource_tasks.push(task);
+            child.render_resource_in_flight.extend((0..MAX_PENDING_RENDER_RESOURCES)
+                .map(|n| (format!("https://example.test/{n}.png"), None, false)));
+        }
+        assert!(rt.has_pending_render_resources());
+        assert!(rt.mark_render_resources_in_flight(vec![("https://example.test/extra".into(),None,false)]).is_empty());
+        drop(frame);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "frame removal must cancel its load tasks");
+        assert!(old_tx.is_closed(), "answers racing removal cannot seed retired layout");
+        assert!(!rt.has_pending_render_resources());
+        assert_eq!(rt.mark_render_resources_in_flight(vec![("https://example.test/extra".into(),None,false)]).len(), 1);
+    }
+
+    #[test]
+    fn iframe_image_completion_refreshes_child_geometry_with_a_retained_parent() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body><div id=parent style='width:200px'></div></body>"));
+        rt.set_url("https://example.test/");
+        rt.run_page_init();
+        rt.evaluate("(() => {const f=document.createElement('iframe');document.body.appendChild(f);f.contentDocument.body.innerHTML='<img src=https://example.test/child.svg>';document.getElementById('parent').getBoundingClientRect();})()").unwrap();
+        let measure = "(() => {const r=document.querySelector('iframe').contentDocument.querySelector('img').getBoundingClientRect();return [r.width,r.height]})()";
+        let before = rt.evaluate(measure).unwrap();
+        assert!(rt.state.borrow().prepared_render.is_some());
+        rt.seed_render_image_resource("https://example.test/child.svg".into(),
+            crate::ops::ImageRequestProfile::NoCorsInclude,
+            Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="37" height="19"></svg>"#.to_vec()));
+        let after = rt.evaluate(measure).unwrap();
+        assert_eq!(after, serde_json::json!([37,19]));
+        assert_ne!(before, after);
+    }
+
 }

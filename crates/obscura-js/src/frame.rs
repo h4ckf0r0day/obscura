@@ -187,6 +187,20 @@ impl FrameRealm {
         } else {
             150.0
         };
+        #[cfg(feature = "render")]
+        if let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) {
+            let mut state = state.borrow_mut();
+            let viewport = (width as f32, height as f32);
+            if state.viewport != viewport {
+                // Geometry ops use this realm's native state, not the
+                // JavaScript globals updated below. Resizing invalidates any
+                // layout prepared against the previous embedding viewport.
+                state.viewport = viewport;
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+                state.resolved_scroll = None;
+            }
+        }
         self.execute_script(
             parent,
             &format!(
@@ -471,6 +485,31 @@ mod tests {
                 .unwrap(),
             serde_json::json!([300, 65, 300, 65]),
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_layout_uses_embedding_viewport_and_invalidates_on_resize() {
+        let html = "<html><body><div id='box' style='position:fixed;inset:0;width:100vw;height:100vh'></div></body></html>";
+        let mut parent = page("https://parent.example/page", html);
+        parent.set_viewport(800.0, 600.0);
+        let frame = FrameRealm::new(
+            &mut parent, 1, 0, "https://child.example/frame", html,
+        ).expect("frame realm");
+        let dimensions = "(() => { const r = document.getElementById('box').getBoundingClientRect(); return [r.width, r.height]; })()";
+
+        for (width, height) in [(300, 65), (200, 90)] {
+            frame.set_viewport(&mut parent, width as f64, height as f64).unwrap();
+            assert_eq!(
+                frame.evaluate(&mut parent, dimensions).unwrap(),
+                serde_json::json!([width, height]),
+            );
+            assert_eq!(
+                parent.evaluate(dimensions).unwrap(),
+                serde_json::json!([800, 600]),
+                "resizing a frame must not change the host layout",
+            );
+        }
     }
 
     /// A frame must not look like a different browser than its parent. Anti-bot

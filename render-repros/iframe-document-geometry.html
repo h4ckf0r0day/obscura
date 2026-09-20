@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Iframe element and range geometry</title>
+<style>
+body { margin: 24px; font: 16px sans-serif; }
+.result { width: 240px; height: 24px; margin-bottom: 12px; background: #cc2222; }
+iframe { position: absolute; left: -10000px; width: 300px; height: 150px; }
+</style>
+<h1>Iframe element and range geometry</h1>
+<p>Two green bars mean the child element and range measurements completed.</p>
+<div class="result" id="element"></div>
+<div class="result" id="range"></div>
+<pre id="report"></pre>
+<script>
+(() => {
+  const results = {};
+  const check = (id, predicate) => {
+    try { results[id] = !!predicate(); } catch (error) { results[id] = String(error); }
+    if (results[id] === true) document.getElementById(id).style.background = '#22aa66';
+  };
+  const f = document.createElement('iframe'); document.body.appendChild(f);
+  const d = f.contentDocument;
+  d.body.innerHTML = '<style>body{margin:8px}.box{width:100px;height:20px}</style><div class="box"></div>';
+  const el = d.querySelector('.box');
+  check('element', () => {
+    const r = el.getClientRects()[0];
+    return r.x === 8 && r.y === 8 && r.width === 100 && r.height === 20 && r.bottom === 28;
+  });
+  check('range', () => {
+    const range = d.createRange(); range.selectNode(el);
+    return range.getClientRects()[0].bottom === 28;
+  });
+  f.remove();
+  document.getElementById('report').textContent = JSON.stringify(results, null, 2);
+})();
+</script>

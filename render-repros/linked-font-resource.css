@@ -1,0 +1,5 @@
+@font-face {
+  font-family: LinkedProbe;
+  src: url(../crates/obscura-render/assets/liberation-mono.ttf) format("truetype");
+}
+.probe { display: inline-block; font: 40px LinkedProbe, serif; }

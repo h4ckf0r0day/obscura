@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Font discovery from a linked stylesheet</title>
+<link rel="stylesheet" href="linked-font-resource.css">
+<style>
+body { margin: 24px; font: 16px sans-serif; }
+#fallback { display: inline-block; font: 40px serif; }
+#result { position: absolute; left: 24px; top: 200px; width: 240px; height: 24px; background: #cc2222; }
+</style>
+<h1>Linked stylesheet font</h1>
+<span id="wide" class="probe">WWWW</span>
+<span id="narrow" class="probe">iiii</span>
+<span id="fallback">WWWW</span>
+<p>A green bar means the linked monospace font replaced the proportional fallback.</p>
+<div id="result"></div>
+<script>
+const timer = setInterval(() => {
+  const width = id => document.getElementById(id).getBoundingClientRect().width;
+  if (Math.abs(width('wide') - width('narrow')) < 0.1 && Math.abs(width('wide') - width('fallback')) > 20) {
+    document.getElementById('result').style.background = '#22aa66';
+    clearInterval(timer);
+  }
+}, 30);
+</script>
