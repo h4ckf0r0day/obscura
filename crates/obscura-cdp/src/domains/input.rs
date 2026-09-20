@@ -138,7 +138,7 @@ pub async fn handle(
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
+                            if (!globalThis.__obscura_inputAllowed(target)) return;\
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
@@ -161,7 +161,7 @@ pub async fn handle(
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
+                            if (!globalThis.__obscura_inputAllowed(target)) {{ globalThis.__obscura_mouse_down = null; return; }}\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
@@ -171,7 +171,7 @@ pub async fn handle(
                             while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
                                 clickTarget = clickTarget.parentElement;\
                             }}\
-                            if (!clickTarget) return;\
+                            if (!globalThis.__obscura_inputAllowed(clickTarget)) return;\
                             var tag = clickTarget.tagName;\
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
                             if (globalThis.__obscura_isDisabled(clickTarget)) return;\
@@ -348,14 +348,17 @@ pub async fn handle(
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
                     "keyDown" | "rawKeyDown" => {
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
+                                globalThis.__obscura_keyDefault(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
