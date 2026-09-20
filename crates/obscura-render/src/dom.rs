@@ -2193,16 +2193,24 @@ fn resolve_clip_rects(
     // This node's own translate joins the accumulation for its box and its
     // whole subtree (percentages resolve against its own border box).
     let (own_tx, own_ty) = styles.get(&id).map_or((0.0, 0.0), |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
-        resolved_own_translate(style, &rect, root_font_size, viewport)
+        if style.ignores_used_box_sizes() {
+            (0.0, 0.0)
+        } else {
+            let rect = rects.get(&id).copied().unwrap_or_default();
+            resolved_own_translate(style, &rect, root_font_size, viewport)
+        }
     });
     let (tx, ty) = (tx + own_tx, ty + own_ty);
     if tx != 0.0 || ty != 0.0 {
         translates.insert(id, (tx, ty));
     }
     let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
-        resolved_transform_matrix(style, &rect, root_font_size, viewport)
+        if style.ignores_used_box_sizes() {
+            crate::Affine2::IDENTITY
+        } else {
+            let rect = rects.get(&id).copied().unwrap_or_default();
+            resolved_transform_matrix(style, &rect, root_font_size, viewport)
+        }
     });
     let transform = parent_transform.then(own_transform);
     if !transform.is_identity() {
