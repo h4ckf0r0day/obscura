@@ -124,6 +124,11 @@ impl CookieJar {
             }
         }
 
+        // RFC 6265bis §4.1.3: enforce __Secure-/__Host- name prefixes (#1034).
+        if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), &path) {
+            return;
+        }
+
         // Validate Domain against the response origin (RFC 6265): an unrelated
         // or public-suffix Domain rejects the cookie so a response from attacker.test
         // cannot scope a cookie to victim.test (GHSA-f22c-8v6q-v6h6).
@@ -439,6 +444,11 @@ impl CookieJar {
             }
         }
 
+        // RFC 6265bis §4.1.3: enforce __Secure-/__Host- name prefixes (#1034).
+        if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), &path) {
+            return;
+        }
+
         let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
             Some(d) => d,
             None => return,
@@ -660,6 +670,19 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     Ok(days_total * 86400 + hour * 3600 + minute * 60 + second)
 }
 
+/// RFC 6265bis §4.1.3 cookie name prefixes. `__Secure-` requires the `Secure`
+/// attribute; `__Host-` additionally requires no `Domain` attribute (host-only)
+/// and `Path=/`. Returns false when the cookie must be rejected.
+fn cookie_prefix_allows(name: &str, secure: bool, has_domain_attr: bool, path: &str) -> bool {
+    if name.starts_with("__Secure-") && !secure {
+        return false;
+    }
+    if name.starts_with("__Host-") && (!secure || has_domain_attr || path != "/") {
+        return false;
+    }
+    true
+}
+
 /// Resolve the storage domain and host-only flag for a cookie being set from
 /// `origin_host` (RFC 6265 §5.2/§5.3). With no Domain attribute the cookie is
 /// host-only: scoped to the exact origin host. A Domain attribute is honored
@@ -794,6 +817,51 @@ mod tests {
 
         let header = jar.get_cookie_header_same_site(&url);
         assert!(header.contains("session=abc123"));
+    }
+
+    // RFC 6265bis §4.1.3: __Host- cookies must be Secure, host-only (no Domain),
+    // and Path=/. See #1034.
+    #[test]
+    fn host_prefix_cookie_enforces_secure_host_only_root_path() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+
+        jar.set_cookie("__Host-a=x; Secure; Path=/; Domain=example.com", &url);
+        jar.set_cookie("__Host-b=x; Secure; Path=/admin", &url);
+        jar.set_cookie("__Host-c=x; Path=/", &url);
+        assert!(
+            !jar.get_cookie_header(&url).contains("__Host-a"),
+            "__Host- with a Domain attribute must be rejected"
+        );
+        assert!(
+            !jar.get_cookie_header(&Url::parse("https://example.com/admin").unwrap())
+                .contains("__Host-b"),
+            "__Host- with a non-root Path must be rejected"
+        );
+        assert!(
+            !jar.get_cookie_header(&url).contains("__Host-c"),
+            "__Host- without Secure must be rejected"
+        );
+
+        jar.set_cookie("__Host-ok=1; Secure; Path=/", &url);
+        assert!(
+            jar.get_cookie_header(&url).contains("__Host-ok=1"),
+            "a valid __Host- cookie must be accepted"
+        );
+    }
+
+    // __Secure- cookies must have the Secure attribute. See #1034.
+    #[test]
+    fn secure_prefix_cookie_requires_secure_attribute() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("__Secure-a=x; Path=/", &url);
+        assert!(
+            !jar.get_cookie_header(&url).contains("__Secure-a"),
+            "__Secure- without Secure must be rejected"
+        );
+        jar.set_cookie("__Secure-ok=1; Secure; Path=/", &url);
+        assert!(jar.get_cookie_header(&url).contains("__Secure-ok=1"));
     }
 
     // RFC 6265 §5.3: document.cookie (a non-HTTP API) must not overwrite or
