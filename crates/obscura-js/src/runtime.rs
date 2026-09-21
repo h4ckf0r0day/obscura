@@ -5783,6 +5783,38 @@ mod tests {
         assert_eq!(path, serde_json::json!("/a"));
     }
 
+    // #1055: pushState/replaceState must reject a cross-origin (or file:) URL
+    // with a SecurityError rather than adopting it. Otherwise a page can spoof
+    // its own URL, which the host adopts as page.url via sync_virtual_url.
+    #[test]
+    fn push_and_replace_state_reject_cross_origin_urls() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    function attempt(fn) {
+                        try { fn(); return 'no-throw'; }
+                        catch (e) { return e && e.name; }
+                    }
+                    return {
+                        push_cross: attempt(() => history.pushState({}, '', 'http://evil.example/x')),
+                        push_file: attempt(() => history.pushState({}, '', 'file:///etc/passwd')),
+                        replace_cross: attempt(() => history.replaceState({}, '', 'https://evil.example/x')),
+                        // Same-origin routing still works.
+                        same_origin: attempt(() => history.pushState({}, '', '/dashboard')),
+                        href: location.href,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["push_cross"], serde_json::json!("SecurityError"));
+        assert_eq!(result["push_file"], serde_json::json!("SecurityError"));
+        assert_eq!(result["replace_cross"], serde_json::json!("SecurityError"));
+        assert_eq!(result["same_origin"], serde_json::json!("no-throw"));
+        // The rejected cross-origin URLs never became the page URL.
+        assert_eq!(result["href"], serde_json::json!("http://example.com/dashboard"));
+    }
+
     #[test]
     fn history_exposes_the_web_platform_constructor_and_prototype() {
         let mut rt = setup_runtime("<html><body></body></html>");
