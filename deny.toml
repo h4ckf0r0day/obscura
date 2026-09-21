@@ -8,6 +8,9 @@
 ignore = [
     "RUSTSEC-2025-0057", # fxhash unmaintained, transitive via selectors
     "RUSTSEC-2024-0436", # paste unmaintained, transitive via v8
+    # Still required by the renderer after the deno_core/V8 upgrade.
+    "RUSTSEC-2026-0206", # rustybuzz, transitive via cosmic-text and usvg
+    "RUSTSEC-2026-0192", # ttf-parser, transitive via rendering dependencies
 ]
 
 [bans]
