@@ -637,6 +637,11 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     if parts.len() < 5 { return Err(()); }
 
     let day: u64 = parts[1].parse().map_err(|_| ())?;
+    // Reject an out-of-range day-of-month; day 0 would underflow `day - 1`
+    // below into a garbage far-future timestamp (#1036).
+    if !(1..=31).contains(&day) {
+        return Err(());
+    }
     let month = months.iter().position(|m| parts[2].to_lowercase().starts_with(m))
         .ok_or(())? as u64 + 1;
     let year: u64 = parts[3].parse().map_err(|_| ())?;
@@ -785,6 +790,15 @@ fn domain_matches(host: &str, domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1036: a day-of-month of 0 (or out of range) must be rejected, not
+    // underflow `day - 1` into a garbage far-future timestamp.
+    #[test]
+    fn parse_http_date_rejects_out_of_range_day() {
+        assert!(parse_http_date("Sat, 00 Jan 2020 00:00:00 GMT").is_err());
+        assert!(parse_http_date("Sat, 32 Jan 2020 00:00:00 GMT").is_err());
+        assert!(parse_http_date("Sat, 01 Jan 2020 00:00:00 GMT").is_ok());
+    }
 
     #[test]
     fn test_set_and_get_cookie() {
