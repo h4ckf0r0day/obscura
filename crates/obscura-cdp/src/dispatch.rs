@@ -219,7 +219,7 @@ impl CdpContext {
             storage_dir,
             allow_private_network,
         );
-        ctx.allow_file_access = allow_file_access;
+        ctx.set_allow_file_access(allow_file_access);
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
