@@ -7735,6 +7735,30 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
+/// Largest intermediate raster, in pixels, that painting one image or mask may
+/// allocate (256 MiB of RGBA, the same budget as a canvas surface). CSS sizes
+/// the destination box, so without a cap a 1x1 image styled 30000px square
+/// allocated ~3.6 GB in the resize.
+const MAX_IMAGE_RASTER_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// The raster size for a `w`x`h` destination: unchanged within the budget,
+/// otherwise scaled down uniformly (each side at least 1px) so the caller can
+/// scale it back up on draw. Real images are far below the budget and stay
+/// pixel-exact.
+fn bounded_raster_size(w: u32, h: u32) -> (u32, u32) {
+    let area = w as u64 * h as u64;
+    if area <= MAX_IMAGE_RASTER_PIXELS {
+        return (w, h);
+    }
+    let scale = (MAX_IMAGE_RASTER_PIXELS as f64 / area as f64).sqrt();
+    let rw = ((w as f64 * scale).floor() as u32).clamp(1, w);
+    let rh = ((h as f64 * scale).floor() as u32).clamp(1, h);
+    // A side clamped up to 1px must not let the other side overrun the budget.
+    let rw = rw.min((MAX_IMAGE_RASTER_PIXELS / rh as u64).max(1) as u32);
+    let rh = rh.min((MAX_IMAGE_RASTER_PIXELS / rw as u64).max(1) as u32);
+    (rw, rh)
+}
+
 /// Decode raster image bytes (GIF/JPEG/PNG/WebP) to a premultiplied-alpha pixmap
 /// resized to `w`x`h`.
 fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
@@ -9891,10 +9915,13 @@ fn paint_image(
         dest.width.round().max(1.0) as u32,
         dest.height.round().max(1.0) as u32,
     );
+    // CSS sizes the destination; rasterize within the budget and scale the
+    // result up on draw when the destination is larger.
+    let (rw, rh) = bounded_raster_size(dw, dh);
     let content = if svg {
-        render_svg(&bytes, dw, dh)
+        render_svg(&bytes, rw, rh)
     } else {
-        raster_to_pixmap(&bytes, dw, dh)
+        raster_to_pixmap(&bytes, rw, rh)
     };
     let Some(content) = content else { return false };
 
@@ -9946,25 +9973,37 @@ fn paint_image(
             _ => {}
         }
     }
-    pixmap.draw_pixmap(
-        dest.x as i32,
-        dest.y as i32,
-        content.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        transform
-            .map(|transform| {
-                Transform::from_row(
-                    transform.a,
-                    transform.b,
-                    transform.c,
-                    transform.d,
-                    transform.e,
-                    transform.f,
-                )
-            })
-            .unwrap_or_else(Transform::identity),
-        clip.as_ref(),
-    );
+    let base = transform
+        .map(|transform| {
+            Transform::from_row(
+                transform.a,
+                transform.b,
+                transform.c,
+                transform.d,
+                transform.e,
+                transform.f,
+            )
+        })
+        .unwrap_or_else(Transform::identity);
+    if (rw, rh) == (dw, dh) {
+        pixmap.draw_pixmap(
+            dest.x as i32,
+            dest.y as i32,
+            content.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            base,
+            clip.as_ref(),
+        );
+    } else {
+        let paint = tiny_skia::PixmapPaint {
+            quality: tiny_skia::FilterQuality::Bilinear,
+            ..tiny_skia::PixmapPaint::default()
+        };
+        let scaled = base
+            .pre_translate(dest.x as i32 as f32, dest.y as i32 as f32)
+            .pre_scale(dw as f32 / rw as f32, dh as f32 / rh as f32);
+        pixmap.draw_pixmap(0, 0, content.as_ref(), &paint, scaled, clip.as_ref());
+    }
     true
 }
 
@@ -11516,10 +11555,12 @@ fn paint_mask(
     let (tile_width, tile_height) = mask_size
         .map(|(width, height)| (width.max(1.0).ceil() as u32, height.max(1.0).ceil() as u32))
         .unwrap_or((box_width, box_height));
+    // CSS sizes the tile; rasterize it within the budget and sample it scaled.
+    let (mask_width, mask_height) = bounded_raster_size(tile_width, tile_height);
     let mask = if is_svg(&bytes) {
-        render_svg(&bytes, tile_width, tile_height)
+        render_svg(&bytes, mask_width, mask_height)
     } else {
-        raster_to_pixmap(&bytes, tile_width, tile_height)
+        raster_to_pixmap(&bytes, mask_width, mask_height)
     };
     let Some(mask) = mask else { return false };
 
@@ -11531,20 +11572,44 @@ fn paint_mask(
     let normalized_linear = linear_gradient.map(|(_, stops)| normalized_stops(stops));
     let normalized_conic = conic_gradient.map(|(_, _, stops)| normalized_stops(stops));
     let normalized_radial = radial_gradient.map(|(_, stops)| normalized_stops(stops));
-    let Some(mut recolored) = Pixmap::new(box_width, box_height) else {
+    // The recolored box is drawn untransformed, so only its part inside the
+    // paint surface can show. Recolor just that window instead of the whole
+    // CSS-sized box.
+    let origin_x = rect.x.floor() as i64;
+    let origin_y = rect.y.floor() as i64;
+    let x0 = (-origin_x).clamp(0, box_width as i64) as u32;
+    let x1 = (pixmap.width() as i64 - origin_x).clamp(0, box_width as i64) as u32;
+    let y0 = (-origin_y).clamp(0, box_height as i64) as u32;
+    let y1 = (pixmap.height() as i64 - origin_y).clamp(0, box_height as i64) as u32;
+    if x0 >= x1 || y0 >= y1 {
+        return false;
+    }
+    let window_width = x1 - x0;
+    let Some(mut recolored) = Pixmap::new(window_width, y1 - y0) else {
         return false;
     };
-    for y in 0..box_height {
+    let scale_to_mask = |tile: u32, tile_len: u32, mask_len: u32| {
+        if mask_len == tile_len {
+            tile
+        } else {
+            (tile as u64 * mask_len as u64 / tile_len as u64) as u32
+        }
+    };
+    for y in y0..y1 {
         if !repeat.1 && y >= tile_height {
             continue;
         }
         let tile_y = if repeat.1 { y % tile_height } else { y };
-        for x in 0..box_width {
+        let mask_y = scale_to_mask(tile_y, tile_height, mask_height);
+        for x in x0..x1 {
             if !repeat.0 && x >= tile_width {
                 continue;
             }
             let tile_x = if repeat.0 { x % tile_width } else { x };
-            let coverage = mask.pixels()[(tile_y * tile_width + tile_x) as usize].alpha() as u32;
+            let mask_x = scale_to_mask(tile_x, tile_width, mask_width);
+            let coverage = mask.pixels()
+                [mask_y as usize * mask_width as usize + mask_x as usize]
+                .alpha() as u32;
             if coverage == 0 {
                 continue;
             }
@@ -11576,7 +11641,8 @@ fn paint_mask(
                 fill
             };
             color[3] = ((color[3] as u32 * coverage) / 255) as u8;
-            recolored.pixels_mut()[(y * box_width + x) as usize] = premultiplied(color);
+            recolored.pixels_mut()[((y - y0) * window_width + (x - x0)) as usize] =
+                premultiplied(color);
         }
     }
     let mut clip = extra_clip.cloned();
@@ -11598,8 +11664,8 @@ fn paint_mask(
         }
     }
     pixmap.draw_pixmap(
-        rect.x.floor() as i32,
-        rect.y.floor() as i32,
+        (origin_x + x0 as i64) as i32,
+        (origin_y + y0 as i64) as i32,
         recolored.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         Transform::identity(),
@@ -11632,6 +11698,63 @@ mod tests {
             pixmap.is_some(),
             "a pathological transform layer must not abort the entire page paint"
         );
+    }
+
+    // A 1x1 opaque black PNG.
+    const BLACK_PIXEL_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+
+    // CSS sizes an image's destination box, so the intermediate raster must not
+    // scale with it: a huge destination is rasterized within the budget.
+    #[test]
+    fn bounded_raster_size_caps_css_sized_destinations() {
+        assert_eq!(bounded_raster_size(640, 480), (640, 480));
+        for (w, h) in [(30_000, 30_000), (u32::MAX, 1), (1, u32::MAX), (200_000, 3)] {
+            let (rw, rh) = bounded_raster_size(w, h);
+            assert!(rw >= 1 && rh >= 1 && rw <= w && rh <= h, "{w}x{h} -> {rw}x{rh}");
+            assert!(
+                rw as u64 * rh as u64 <= MAX_IMAGE_RASTER_PIXELS,
+                "{w}x{h} -> {rw}x{rh} exceeds the raster budget"
+            );
+        }
+        // A square destination stays square.
+        let (rw, rh) = bounded_raster_size(30_000, 30_000);
+        assert_eq!(rw, rh);
+    }
+
+    #[test]
+    fn huge_image_destination_still_paints_its_visible_part() {
+        let tree = parse_html(&format!(
+            r#"<html><body style="margin:0;background:white">
+                <img src="{BLACK_PIXEL_PNG}" style="display:block;width:30000px;height:30000px">
+            </body></html>"#
+        ));
+        let pixmap = paint_dom(&tree, (64.0, 64.0), None).expect("paint");
+        let px = pixmap.pixel(10, 10).unwrap();
+        assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn huge_mask_box_still_paints_its_visible_part() {
+        // The mask tile is transparent on its left half, so the mask path (not a
+        // plain background fill) decides every visible pixel of the huge box.
+        let tree = parse_html(
+            r#"<html><head><style>
+                body { margin:0; background:white }
+                #masked {
+                  width:30000px; height:30000px; background-color:rgb(255,0,0);
+                  mask-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3Crect%20x='5'%20width='5'%20height='10'%20fill='white'/%3E%3C/svg%3E");
+                  mask-size:10px 10px; mask-repeat:repeat;
+                }
+            </style></head><body><div id="masked"></div></body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (64.0, 64.0), None).expect("paint");
+        let rgba = |x, y| {
+            let px = pixmap.pixel(x, y).unwrap();
+            (px.red(), px.green(), px.blue(), px.alpha())
+        };
+        assert_eq!(rgba(2, 2), (255, 255, 255, 255), "masked-out column");
+        assert_eq!(rgba(7, 2), (255, 0, 0, 255), "masked-in column");
+        assert_eq!(rgba(57, 42), (255, 0, 0, 255), "repeats across the window");
     }
 
     #[test]
