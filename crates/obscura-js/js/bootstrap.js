@@ -3539,8 +3539,13 @@ class Element extends Node {
     const previousWindowNames = _windowNamedNamesInTree(this);
     // Native fragment replacement bypasses Node.removeChild. Disassociate
     // descendant style sheets before the backing nodes leave the document so
-    // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
+    // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes, and
+    // release each removed <link>'s native external_stylesheets entry (#1039).
     for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
+    for (const link of this.querySelectorAll('link[rel~="stylesheet"]')) {
+      _detachLinkedStyleSheet(link);
+      _removeNativeLinkedStylesheet(link);
+    }
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
@@ -9202,14 +9207,30 @@ function _detachLinkedStyleSheet(link) {
   sheet._sourceNode = null;
   _linkElementSheets.delete(link);
 }
+// Release a <link>'s native external_stylesheets entry when it leaves the
+// document. Only removeChild's direct-node path did this before, so subtree
+// removals (innerHTML, textContent, removeChild of an ancestor) leaked the
+// native CSS state (#1039).
+function _removeNativeLinkedStylesheet(link) {
+  if (_linkedStylesheetNodes.has(link)) {
+    __obscuraCore.ops.op_external_stylesheet_remove(
+      link._nid, globalThis.__obscura_frameId || 0
+    );
+    _linkedStylesheetNodes.delete(link);
+  }
+}
 function _detachStyleSheetsInSubtree(root) {
   if (!root) return;
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
-  if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
+  if (root.nodeType === 1 && root.localName === "link") {
+    _detachLinkedStyleSheet(root);
+    _removeNativeLinkedStylesheet(root);
+  }
   if (!root.querySelectorAll) return;
   for (const style of root.querySelectorAll("style")) _detachStyleSheet(style);
   for (const link of root.querySelectorAll('link[rel~="stylesheet"]')) {
     _detachLinkedStyleSheet(link);
+    _removeNativeLinkedStylesheet(link);
   }
 }
 
