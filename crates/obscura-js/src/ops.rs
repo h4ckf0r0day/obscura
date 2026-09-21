@@ -3072,24 +3072,21 @@ async fn op_fetch_url(
     // Apply interception overrides (shadow the params for the rest of the op).
     // A Continue rewrite of the URL must pass the same SSRF / private-network
     // gate as the original request (checked above) and as redirects (checked
-    // below). Without this re-validation a rewrite to an internal address would
-    // bypass validate_fetch_url entirely.
-    let url = if let Some(new_url) = override_url {
-        if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
-                return Ok(serde_json::json!({
-                    "status": 0,
-                    "body": "",
-                    "url": new_url,
-                    "blocked": true,
-                    "error": format!("Intercept rewrite to forbidden URL blocked: {}", reason),
-                })
-                .to_string());
-            }
+    // below), and must fail closed if it cannot even be parsed. Without this a
+    // rewrite to an internal (or unparseable) address would bypass
+    // validate_fetch_url entirely.
+    let url = match resolve_intercept_override(override_url, url, allow_private_network) {
+        OverrideResolution::Use(u) => u,
+        OverrideResolution::Blocked { url, error } => {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "blocked": true,
+                "error": error,
+            })
+            .to_string());
         }
-        new_url
-    } else {
-        url
     };
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
@@ -4392,6 +4389,53 @@ mod tests {
         );
     }
 
+    // #1056: a Continue interception URL override must stay behind the SSRF
+    // gate. In particular a URL that fails to parse must fail closed instead of
+    // being sent as a raw, unvalidated string.
+    #[test]
+    fn intercept_override_stays_behind_the_ssrf_gate() {
+        use super::{resolve_intercept_override, OverrideResolution};
+
+        // Unparseable override: blocked, not used.
+        match resolve_intercept_override(
+            Some("not-a-url".to_string()),
+            "http://ok.example/".to_string(),
+            false,
+        ) {
+            OverrideResolution::Blocked { url, error } => {
+                assert_eq!(url, "not-a-url");
+                assert!(error.contains("unparseable"), "{error}");
+            }
+            OverrideResolution::Use(u) => panic!("unparseable override was not blocked: {u}"),
+        }
+
+        // Forbidden (loopback) override: blocked.
+        assert!(matches!(
+            resolve_intercept_override(
+                Some("http://127.0.0.1/".to_string()),
+                "http://ok.example/".to_string(),
+                false,
+            ),
+            OverrideResolution::Blocked { .. }
+        ));
+
+        // Valid public override: used.
+        match resolve_intercept_override(
+            Some("https://example.com/x".to_string()),
+            "http://ok.example/".to_string(),
+            false,
+        ) {
+            OverrideResolution::Use(u) => assert_eq!(u, "https://example.com/x"),
+            OverrideResolution::Blocked { error, .. } => panic!("valid override blocked: {error}"),
+        }
+
+        // No override: the original URL is kept unchanged.
+        match resolve_intercept_override(None, "http://ok.example/".to_string(), false) {
+            OverrideResolution::Use(u) => assert_eq!(u, "http://ok.example/"),
+            OverrideResolution::Blocked { .. } => panic!("absent override must not block"),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn posted_task_chains_complete_without_zero_delay_timer_floor() {
         let mut runtime = ObscuraJsRuntime::new();
@@ -4904,6 +4948,44 @@ mod tests {
         let width = geometry.document_rect(box_node).unwrap().width;
         assert!((width - 60.0).abs() < 0.1, "sampled width was {width}");
     }
+}
+
+/// Outcome of resolving a `Continue` interception URL override.
+enum OverrideResolution {
+    /// Use this URL for the request (the original, or a validated rewrite).
+    Use(String),
+    /// Reject the request; `url` is the attempted target, `error` the reason.
+    Blocked { url: String, error: String },
+}
+
+/// Resolve a `Continue` interception URL override, keeping it behind the SSRF
+/// gate. A rewrite must parse and pass `validate_fetch_url` just like the
+/// original request and redirects; a URL that fails to parse fails closed rather
+/// than being sent unvalidated (#1056).
+fn resolve_intercept_override(
+    override_url: Option<String>,
+    original_url: String,
+    allow_private_network: bool,
+) -> OverrideResolution {
+    let Some(new_url) = override_url else {
+        return OverrideResolution::Use(original_url);
+    };
+    let parsed = match url::Url::parse(&new_url) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return OverrideResolution::Blocked {
+                error: format!("Intercept rewrite to unparseable URL blocked: {}", new_url),
+                url: new_url,
+            };
+        }
+    };
+    if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+        return OverrideResolution::Blocked {
+            error: format!("Intercept rewrite to forbidden URL blocked: {}", reason),
+            url: new_url,
+        };
+    }
+    OverrideResolution::Use(new_url)
 }
 
 fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
