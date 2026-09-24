@@ -856,6 +856,10 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    // The browser layer refuses file:// unless the context opts in. A local
+    // user running `obscura fetch file://...` on their own files is the
+    // intended case; only network-facing servers (serve, mcp) keep it off.
+    context.allow_file_access = true;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI

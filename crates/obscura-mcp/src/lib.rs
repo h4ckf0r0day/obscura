@@ -2200,6 +2200,58 @@ mod tests {
         assert!(error.contains("file:// navigation is disabled"));
     }
 
+    // Every MCP route that navigates must refuse local files, not only
+    // browser_navigate: the browser layer enforces it for all of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_tab_new_rejects_local_files() {
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_tab_new(&json!({"url": "file:///etc/passwd"}), &mut state)
+            .await
+            .expect_err("browser_tab_new must not expose local files");
+        assert!(error.contains("file://"), "{error}");
+        assert!(!state.page_mut().url_string().starts_with("file:"));
+    }
+
+    // An untrusted page must not be able to pull a local file into the agent's
+    // context by planting a file:// link for the agent to click.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_click_cannot_follow_a_link_into_file_scheme() {
+        let path = std::env::temp_dir().join(format!("obscura-mcp-file-link-{}.html", std::process::id()));
+        std::fs::write(&path, "<p>local-secret</p>").expect("write fixture");
+        let file_url = url::Url::from_file_path(&path).expect("file url").to_string();
+
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&format!("data:text/html,<a id=l href='{file_url}'>go</a>"))
+            .await
+            .expect("web page");
+        let web_url = state.page_mut().url_string();
+
+        let click = handle_tool_call(
+            json!(1),
+            &json!({"name": "browser_click", "arguments": {"selector": "#l"}}),
+            &mut state,
+        )
+        .await
+        .result
+        .expect("click response");
+        assert_ne!(click["isError"], true, "{click}");
+        assert_eq!(state.page_mut().url_string(), web_url);
+
+        let snapshot = handle_tool_call(
+            json!(2),
+            &json!({"name": "browser_snapshot", "arguments": {}}),
+            &mut state,
+        )
+        .await
+        .result
+        .expect("snapshot response");
+        assert!(!snapshot.to_string().contains("local-secret"), "{snapshot}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn render_tools_are_advertised_with_flat_schemas() {
