@@ -17180,6 +17180,44 @@ mod tests {
     }
 
     #[test]
+    fn push_state_rejects_cross_origin_urls() {
+        // HTML "shared history push/replace state steps": the new URL must be
+        // same origin with the document or the call throws a SecurityError.
+        // Without it a page relabels itself as any origin, or as file://, in
+        // location.href, page.url and every CDP Page/Target payload.
+        let mut rt = setup_runtime_at_deep_url("<html><body></body></html>");
+        let length_before = rt.evaluate("history.length").unwrap();
+        for (method, url) in [
+            ("pushState", "https://evil.test/x"),
+            ("replaceState", "https://evil.test/x"),
+            ("pushState", "file:///etc/passwd"),
+            ("replaceState", "http://example.com:8443/x"),
+            ("pushState", "https://example.com/deep/page"),
+        ] {
+            let outcome = rt
+                .evaluate(&format!(
+                    "(function(){{ try {{ history.{method}({{}}, '', '{url}'); return 'allowed'; }} catch (e) {{ return e.name; }} }})()"
+                ))
+                .unwrap();
+            assert_eq!(outcome, serde_json::json!("SecurityError"), "{method} to {url}");
+        }
+        assert_eq!(
+            rt.evaluate("location.href").unwrap(),
+            serde_json::json!("http://example.com/deep/page")
+        );
+        assert_eq!(rt.evaluate("history.length").unwrap(), length_before);
+
+        // Same-origin stays allowed: a path, a query, a hash, an absolute URL.
+        rt.evaluate("history.pushState({}, '', '/other?q=1#h')").unwrap();
+        rt.evaluate("history.replaceState({}, '', 'http://example.com/again')")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("location.href").unwrap(),
+            serde_json::json!("http://example.com/again")
+        );
+    }
+
+    #[test]
     fn a_relative_base_href_resolves_against_the_push_state_url() {
         let mut rt = setup_runtime_at_deep_url(
             r#"<html><head><base href="assets/"></head><body>
