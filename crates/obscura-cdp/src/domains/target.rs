@@ -91,6 +91,9 @@ pub async fn handle(
             let committed_document = if let Some(page) = ctx.get_page_mut(&page_id) {
                 if url == "about:blank" || url.is_empty() {
                     page.navigate_blank();
+                    // Chrome keeps the new tab's about:blank as the first
+                    // session history entry, so history.back() can return to it.
+                    page.push_history(page.url_string());
                     None
                 } else {
                     page.navigate(url).await.ok().map(|_| {

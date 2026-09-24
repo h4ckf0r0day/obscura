@@ -274,6 +274,13 @@ pub struct Page {
     /// Pushed on every successful navigation; truncated on goBack -> new nav.
     pub history: Vec<String>,
     pub history_index: usize,
+    /// Index of the current document's first history entry. Entries after it
+    /// up to `history_index` are its same-document (pushState) URLs.
+    document_history_start: usize,
+    /// Entry a page-initiated `history.go()` is traversing to, taken with the
+    /// pending navigation that loads it. Committing that load moves the cursor
+    /// to the entry instead of appending a new one.
+    pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
@@ -1090,6 +1097,8 @@ impl Page {
             navigation_chain_limit: None,
             history: Vec::new(),
             history_index: 0,
+            document_history_start: 0,
+            pending_history_traversal: std::sync::Mutex::new(None),
             network_events: Vec::new(),
             response_bodies: std::collections::HashMap::new(),
             response_body_order: std::collections::VecDeque::new(),
@@ -1741,6 +1750,8 @@ impl Page {
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
+        let (session_history, session_index) = self.predicted_session_history();
+        rt.set_session_history(session_history, session_index, session_index);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
@@ -3153,18 +3164,79 @@ impl Page {
     /// entries past the cursor (matches real Chrome: navigating after a
     /// goBack clobbers the forward history).
     pub fn push_history(&mut self, url: String) {
+        self.push_history_entry(url, true);
+    }
+
+    /// Record a URL the current document reached through pushState or
+    /// replaceState. It stays part of the same document's entries.
+    pub(crate) fn push_same_document_history(&mut self, url: String) {
+        self.push_history_entry(url, false);
+    }
+
+    fn push_history_entry(&mut self, url: String, new_document: bool) {
         if url.is_empty() {
             return;
         }
-        // Don't dupe consecutive entries (Page.reload would otherwise pile up).
+        let traversal = if new_document {
+            self.pending_history_traversal.lock().ok().and_then(|mut index| index.take())
+        } else {
+            None
+        };
+        if let Some(index) = traversal.filter(|&index| self.history.get(index) == Some(&url)) {
+            self.history_index = index;
+        } else if self.history.get(self.history_index) != Some(&url) {
+            // Consecutive duplicates are skipped so Page.reload does not pile up entries.
+            if !self.history.is_empty() && self.history_index < self.history.len() - 1 {
+                self.history.truncate(self.history_index + 1);
+            }
+            self.history.push(url);
+            self.history_index = self.history.len() - 1;
+        }
+        if new_document {
+            self.document_history_start = self.history_index;
+        }
+        self.sync_js_session_history();
+    }
+
+    /// Replace the history and cursor, treating the current document as the
+    /// entry at `index`. Page.navigateToHistoryEntry and
+    /// Page.resetNavigationHistory rewrite history through this.
+    pub fn set_history(&mut self, history: Vec<String>, index: usize) {
+        self.history = history;
+        self.history_index = index;
+        self.document_history_start = index;
+        self.sync_js_session_history();
+    }
+
+    /// Give the document's `window.history` the page's session history, so
+    /// `history.length` and cross-document `history.go()` see every entry.
+    pub fn sync_js_session_history(&self) {
+        if let Some(js) = &self.js {
+            js.set_session_history(
+                self.history.clone(),
+                self.document_history_start,
+                self.history_index,
+            );
+        }
+    }
+
+    /// The session history as it will be once the document being created
+    /// commits through `push_history`: the entry a traversal targets, the
+    /// current entry on a reload, or a new entry replacing the forward ones.
+    fn predicted_session_history(&self) -> (Vec<String>, usize) {
+        let url = self.url_string();
+        let traversal = self.pending_history_traversal.lock().ok().and_then(|index| *index);
+        if let Some(index) = traversal.filter(|&index| self.history.get(index) == Some(&url)) {
+            return (self.history.clone(), index);
+        }
         if self.history.get(self.history_index) == Some(&url) {
-            return;
+            return (self.history.clone(), self.history_index);
         }
-        if !self.history.is_empty() && self.history_index < self.history.len() - 1 {
-            self.history.truncate(self.history_index + 1);
-        }
-        self.history.push(url);
-        self.history_index = self.history.len() - 1;
+        let mut urls: Vec<String> =
+            self.history.iter().take(self.history_index + 1).cloned().collect();
+        urls.push(url);
+        let index = urls.len() - 1;
+        (urls, index)
     }
 
     /// Move the history cursor without re-navigating; used by
@@ -4557,11 +4629,12 @@ impl Page {
     }
 
     pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
-        if let Some(js) = &self.js {
-            js.take_pending_navigation()
-        } else {
-            None
+        let js = self.js.as_ref()?;
+        let navigation = js.take_pending_navigation()?;
+        if let Ok(mut traversal) = self.pending_history_traversal.lock() {
+            *traversal = js.take_pending_history_traversal();
         }
+        Some(navigation)
     }
 
     pub fn has_pending_navigation(&self) -> bool {
@@ -5213,6 +5286,62 @@ mod tests {
         let page = page_without_chain_limit("chain-from-environment");
 
         assert_eq!(page.navigation_chain_limit(), 17);
+    }
+
+    /// Issue #1068: page script sees the tab's session history. history.length
+    /// counts earlier documents, and history.back()/forward() load them while
+    /// moving the history cursor instead of appending entries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_history_traverses_across_documents() {
+        let one = "data:text/html,<title>one</title>";
+        let two = "data:text/html,<title>two</title>";
+        let mut page = page_without_chain_limit("history-across-documents");
+        page.navigate(one).await.unwrap();
+        page.navigate(two).await.unwrap();
+        assert_eq!(page.evaluate("history.length"), serde_json::json!(2.0));
+
+        page.evaluate("history.back()");
+        assert!(page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), one);
+        assert_eq!((page.history.len(), page.history_index), (2, 0));
+        assert_eq!(page.evaluate("history.length"), serde_json::json!(2.0));
+
+        page.evaluate("history.go(1)");
+        assert!(page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), two);
+        assert_eq!((page.history.len(), page.history_index), (2, 1));
+
+        // Out-of-range traversal stays put.
+        page.evaluate("history.go(5)");
+        assert!(!page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), two);
+    }
+
+    /// Same-document entries sit between the documents: a push drops the
+    /// forward documents, and back() past the document's own entries loads
+    /// the previous document.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_history_counts_same_document_entries_once() {
+        let one = "data:text/html,<title>one</title>";
+        let two = "data:text/html,<title>two</title>";
+        let mut page = page_without_chain_limit("history-same-document");
+        page.navigate(one).await.unwrap();
+        page.navigate(two).await.unwrap();
+        page.evaluate("history.back()");
+        page.process_pending_navigation().await.unwrap();
+        assert_eq!(page.url_string(), one);
+
+        page.evaluate("history.pushState(null, '', '#a')");
+        assert_eq!(page.evaluate("history.length"), serde_json::json!(2.0));
+        // Recording the pushState URL on the page must not double count it.
+        page.sync_virtual_url();
+        assert_eq!(page.evaluate("history.length"), serde_json::json!(2.0));
+
+        page.evaluate("history.go(-2)");
+        assert!(!page.process_pending_navigation().await.unwrap());
+        page.evaluate("history.back()");
+        assert!(!page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.evaluate("location.hash"), serde_json::json!(""));
     }
 
     #[test]

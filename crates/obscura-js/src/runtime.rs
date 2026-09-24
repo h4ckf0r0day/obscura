@@ -1261,6 +1261,20 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().pending_navigation.take()
     }
 
+    /// Session history index that accompanies the pending navigation when
+    /// page script traversed to another document with `history.go()`.
+    pub fn take_pending_history_traversal(&self) -> Option<usize> {
+        self.state.borrow_mut().pending_history_traversal.take()
+    }
+
+    pub fn set_session_history(&self, urls: Vec<String>, document_start: usize, current: usize) {
+        self.state.borrow_mut().session_history = crate::ops::SessionHistory {
+            urls,
+            document_start,
+            current,
+        };
+    }
+
     pub fn has_pending_navigation(&self) -> bool {
         self.state.borrow().pending_navigation.is_some()
     }

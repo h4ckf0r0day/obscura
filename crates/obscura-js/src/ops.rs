@@ -130,6 +130,15 @@ pub struct ObscuraState {
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
     pub pending_navigation: Option<(String, String, String)>,
+    /// The tab's session history as the owning page sees it: entry URLs, the
+    /// index of this document's first entry, and the current index. Empty
+    /// for frames and for runtimes outside a page, where `history` only
+    /// covers the document's own same-document entries.
+    pub session_history: SessionHistory,
+    /// Session history index a cross-document `history.go()` asked for. It
+    /// travels with `pending_navigation`, which carries the entry's URL, so
+    /// the page can move its cursor instead of appending an entry.
+    pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
@@ -356,6 +365,8 @@ impl ObscuraState {
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
+            session_history: SessionHistory::default(),
+            pending_history_traversal: None,
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
@@ -5048,6 +5059,39 @@ fn op_set_cookie(scope: &mut v8::PinScope, state: &OpState, #[string] cookie_str
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionHistory {
+    pub urls: Vec<String>,
+    pub document_start: usize,
+    pub current: usize,
+}
+
+/// `"documentStart,current,length"` of the session history; length is 0 when
+/// this realm has none.
+#[op2]
+#[string]
+fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let history = &gs.session_history;
+    format!("{},{},{}", history.document_start, history.current, history.urls.len())
+}
+
+/// Queue a traversal to another document's session history entry. Returns
+/// false when the index is out of range.
+#[op2(fast)]
+fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) -> bool {
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    let index = index as usize;
+    let Some(url) = gs.session_history.urls.get(index).cloned() else {
+        return false;
+    };
+    gs.pending_navigation = Some((url, "GET".to_string(), String::new()));
+    gs.pending_history_traversal = Some(index);
+    true
+}
+
 // A frame that navigates itself must not move the top document. Recording the
 // navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
@@ -6080,6 +6124,8 @@ pub fn build_extension() -> Extension {
         op_get_cookies(),
         op_set_cookie(),
         op_navigate(),
+        op_session_history(),
+        op_history_traverse(),
         op_frame_document_ready(),
         op_post_frame_message(),
         op_sleep(),

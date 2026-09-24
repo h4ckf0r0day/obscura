@@ -11239,6 +11239,21 @@ globalThis.atob = globalThis.atob || ((s) => {
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
+  // The page owns the tab's session history. `stack` covers only this
+  // document's entries; entries before it and after the current one come
+  // from the page, and a push drops the forward ones as the page will.
+  let forwardCleared = false;
+  const session = () => {
+    try {
+      const [start, current, length] = String(__obscuraCore.ops.op_session_history())
+        .split(",").map(Number);
+      if (length > 0) {
+        return {start, current, before: start,
+          after: forwardCleared ? 0 : Math.max(0, length - 1 - current)};
+      }
+    } catch (e) {}
+    return {start: 0, current: 0, before: 0, after: 0};
+  };
   const historyToken = Symbol("History");
   const resolveOrFallback = (url) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
@@ -11267,7 +11282,10 @@ globalThis.atob = globalThis.atob || ((s) => {
     constructor(token) {
       if (token !== historyToken) throw new TypeError("Illegal constructor");
     }
-    get length() { return stack.length; }
+    get length() {
+      const {before, after} = session();
+      return before + stack.length + after;
+    }
     get state() { return stack[idx].state; }
     get scrollRestoration() { return this._scrollRestoration || "auto"; }
     set scrollRestoration(value) {
@@ -11284,6 +11302,7 @@ globalThis.atob = globalThis.atob || ((s) => {
       stack.length = idx + 1;
       stack.push({state: state ?? null, url: resolved});
       idx = stack.length - 1;
+      forwardCleared = true;
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
     }
@@ -11297,8 +11316,18 @@ globalThis.atob = globalThis.atob || ((s) => {
     go(n) {
       n = (n | 0);
       if (n === 0) return; // real spec: go(0) reloads. We don't reload SPAs.
-      const next = Math.max(0, Math.min(stack.length - 1, idx + n));
-      if (next === idx) return;
+      const target = idx + n;
+      if (target < 0 || target >= stack.length) {
+        // Another document's entry: the page loads it and moves its cursor.
+        const {start, current, before, after} = session();
+        if (target < 0 && -target <= before) {
+          __obscuraCore.ops.op_history_traverse(start + target);
+        } else if (target >= stack.length && target - (stack.length - 1) <= after) {
+          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1));
+        }
+        return;
+      }
+      const next = target;
       const prevUrl = __currentUrl();
       idx = next;
       applyVirtual();
