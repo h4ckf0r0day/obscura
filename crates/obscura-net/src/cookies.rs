@@ -646,6 +646,18 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     let minute: u64 = time_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let second: u64 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
 
+    // RFC 6265 5.1.1 field ranges. Bounding the year also bounds the calendar
+    // walk below: any server can send `Expires=Thu, 01 Jan 99999999999 ...`,
+    // which otherwise spins this parser for hours with no JS involved.
+    if !(1..=31).contains(&day)
+        || !(1601..=9999).contains(&year)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(());
+    }
+
     let mut days_total: u64 = 0;
     for y in 1970..year {
         days_total += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
@@ -681,6 +693,12 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
         return None;
     }
     if is_public_suffix(&dom) {
+        return (dom == origin).then_some((origin, true));
+    }
+    // RFC 6265 5.1.3: an IP address domain-matches only itself. The dotted
+    // suffix rule below would otherwise let a server at 192.168.1.100 set
+    // Domain=168.1.100 and have the cookie sent to 10.168.1.100.
+    if host_is_ip_address(&origin) || host_is_ip_address(&dom) {
         return (dom == origin).then_some((origin, true));
     }
     (dom == origin
@@ -779,7 +797,19 @@ fn domain_matches(host: &str, domain: &str) -> bool {
     if prefix_len < 1 { return false; }
     if !host.is_char_boundary(prefix_len) { return false; }
     if host.as_bytes()[prefix_len - 1] != b'.' { return false; }
-    host[prefix_len..].eq_ignore_ascii_case(domain)
+    if !host[prefix_len..].eq_ignore_ascii_case(domain) { return false; }
+    // Only a would-be match pays for the parse: an IP address never
+    // suffix-matches (RFC 6265 5.1.3), whatever the jar stored it under.
+    !host_is_ip_address(host) && !host_is_ip_address(domain)
+}
+
+/// True for a dotted IPv4 or a (bracketed or bare) IPv6 literal, the forms
+/// `Url::host_str` and a Domain attribute can carry.
+fn host_is_ip_address(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -1348,6 +1378,67 @@ mod tests {
         assert!(!jar
             .get_cookie_header_same_site(&attacker)
             .contains("sid=attacker"));
+    }
+
+    #[test]
+    fn expires_with_out_of_range_fields_is_rejected_quickly() {
+        // A hostile Set-Cookie can name any year. The parser must bound the
+        // field before it walks the calendar year by year.
+        let started = std::time::Instant::now();
+        assert!(parse_http_date("Thu, 01 Jan 99999999999 00:00:00 GMT").is_err());
+        assert!(parse_http_date("Thu, 00 Jan 2030 00:00:00 GMT").is_err());
+        assert!(parse_http_date("Thu, 32 Jan 2030 00:00:00 GMT").is_err());
+        assert!(parse_http_date("Thu, 01 Jan 2030 24:00:00 GMT").is_err());
+        assert!(parse_http_date("Thu, 01 Jan 2030 00:60:00 GMT").is_err());
+        assert!(parse_http_date("Thu, 01 Jan 2030 00:00:60 GMT").is_err());
+        assert!(parse_http_date("Thu, 01 Jan 1600 00:00:00 GMT").is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "rejecting a bad date must not cost a calendar walk"
+        );
+        assert!(parse_http_date("Thu, 01 Jan 2030 00:00:00 GMT").is_ok());
+        assert!(parse_http_date("Thu, 01-Jan-2030 23:59:59 GMT").is_ok());
+
+        // Through the public path the cookie degrades to a session cookie.
+        let jar = CookieJar::new();
+        let url = Url::parse("http://example.test/").unwrap();
+        jar.set_cookie("sid=abc; Expires=Thu, 01 Jan 99999999999 00:00:00 GMT", &url);
+        assert!(jar.get_cookie_header_same_site(&url).contains("sid=abc"));
+    }
+
+    #[test]
+    fn ip_address_origin_cannot_set_a_cookie_for_a_numeric_suffix() {
+        // RFC 6265 5.1.3: an IP address domain-matches only itself. Dotted
+        // suffix matching would let a server at 192.168.1.100 plant a cookie
+        // that is then sent to 10.168.1.100.
+        let jar = CookieJar::new();
+        let server = Url::parse("http://192.168.1.100/").unwrap();
+        jar.set_cookie("sid=planted; Domain=168.1.100; Path=/", &server);
+        let victim = Url::parse("http://10.168.1.100/").unwrap();
+        assert!(
+            !jar.get_cookie_header_same_site(&victim).contains("sid=planted"),
+            "cookie leaked to an unrelated address: {}",
+            jar.get_cookie_header_same_site(&victim)
+        );
+        assert!(
+            !jar.get_cookie_header_same_site(&server).contains("sid=planted"),
+            "an invalid Domain attribute rejects the cookie"
+        );
+
+        // The address itself is a valid Domain attribute and stays host-only.
+        jar.set_cookie("sid=own; Domain=192.168.1.100; Path=/", &server);
+        assert!(jar.get_cookie_header_same_site(&server).contains("sid=own"));
+        assert!(!jar.get_cookie_header_same_site(&victim).contains("sid=own"));
+    }
+
+    #[test]
+    fn domain_matches_never_suffix_matches_an_ip_address() {
+        assert!(domain_matches("192.168.1.100", "192.168.1.100"));
+        assert!(!domain_matches("10.168.1.100", "168.1.100"));
+        assert!(!domain_matches("10.168.1.100", ".168.1.100"));
+        assert!(!domain_matches("[::ffff:10.0.0.1]", "0.0.1"));
+        // Names keep working as before.
+        assert!(domain_matches("sub.example.com", "example.com"));
     }
 
     #[test]
