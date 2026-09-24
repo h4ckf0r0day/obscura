@@ -1344,6 +1344,40 @@ impl PreparedRender {
     }
 
     /// Whether hit testing must ignore this element's generated box.
+    /// CSSOM View `checkVisibility()` over the retained cascade. An element
+    /// without a style, with `display: contents`, or under a `display: none`
+    /// flattened-tree ancestor has no box. `content-visibility: hidden` is
+    /// not implemented by the renderer, which paints that content, so it is
+    /// not consulted here either.
+    pub fn check_visibility(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        check_opacity: bool,
+        check_visibility_css: bool,
+    ) -> bool {
+        let Some(style) = self.layout.styles.get(&id) else {
+            return false;
+        };
+        if style.display_contents || (check_visibility_css && style.visibility_hidden_computed) {
+            return false;
+        }
+        let document = tree.document();
+        let mut current = Some(id);
+        while let Some(node) = current.filter(|&node| node != document) {
+            let Some(style) = self.layout.styles.get(&node) else {
+                return false;
+            };
+            if style.display == crate::Display::None
+                || (check_opacity && style.opacity.is_some_and(|value| value <= 0.0))
+            {
+                return false;
+            }
+            current = crate::dom::rendered_parent(tree, node);
+        }
+        true
+    }
+
     pub fn pointer_events_none(&self, id: obscura_dom::tree::NodeId) -> bool {
         self.layout
             .styles
@@ -1554,7 +1588,7 @@ impl PreparedRender {
         );
         out.insert(
             "visibility",
-            if style.visibility_hidden.unwrap_or(false) {
+            if style.visibility_hidden_computed {
                 "hidden"
             } else {
                 "visible"
@@ -13172,6 +13206,57 @@ mod tests {
         assert_eq!((rect.width, rect.height), (40.0, 20.0));
         assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
         assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
+    }
+
+    #[test]
+    fn computed_visibility_reports_inherited_value() {
+        let tree = parse_html(
+            r#"<html><head><style>.h{visibility:hidden}</style></head><body>
+                <div class="h"><span id="inherited">a</span>
+                <span id="restored" style="visibility:visible">b</span></div>
+                <span id="plain">c</span></body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (80.0, 50.0), None, &mut resources).unwrap();
+        let visibility = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .unwrap()["visibility"]
+                .clone()
+        };
+        assert_eq!(visibility("inherited"), "hidden");
+        assert_eq!(visibility("restored"), "visible");
+        assert_eq!(visibility("plain"), "visible");
+    }
+
+    #[test]
+    fn check_visibility_uses_ancestor_display_opacity_and_computed_visibility() {
+        let tree = parse_html(
+            r#"<html><head><style>.n{display:none}.h{visibility:hidden}.o{opacity:0}
+                .c{display:contents}</style></head><body>
+                <div class="n"><span id="under-none">a</span></div>
+                <div class="h"><span id="under-hidden">b</span></div>
+                <div class="o"><span id="under-transparent">c</span></div>
+                <span id="contents" class="c">d</span>
+                <span id="plain">e</span></body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (80.0, 50.0), None, &mut resources).unwrap();
+        let check = |id, opacity, visibility| {
+            prepared.check_visibility(
+                &tree,
+                tree.get_element_by_id(id).unwrap(),
+                opacity,
+                visibility,
+            )
+        };
+        assert!(!check("under-none", false, false));
+        assert!(check("under-hidden", false, false));
+        assert!(!check("under-hidden", false, true));
+        assert!(check("under-transparent", false, false));
+        assert!(!check("under-transparent", true, false));
+        assert!(!check("contents", false, false));
+        assert!(check("plain", true, true));
     }
 
     #[test]

@@ -1043,6 +1043,7 @@ impl DomLayout {
             };
             let visibility_hidden = style.visibility_hidden.unwrap_or(parent_state.0);
             let opacity_zero = parent_state.1 || style.opacity.is_some_and(|value| value <= 0.0);
+            style.visibility_hidden_computed = visibility_hidden;
             style.effectively_invisible = visibility_hidden || opacity_zero;
             if let Some(pseudo) = style.before_pseudo.as_deref_mut() {
                 pseudo.effectively_invisible = style.effectively_invisible;
@@ -5539,6 +5540,7 @@ fn layout_dom_once(
                     None => style.text_indent = Some(inh.text_indent),
                 }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
+                style.visibility_hidden_computed = inh.visibility_hidden;
                 match style.pointer_events_none {
                     Some(value) => inh.pointer_events_none = value,
                     None => style.pointer_events_none = Some(inh.pointer_events_none),
