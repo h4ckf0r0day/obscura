@@ -7724,6 +7724,12 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let seen_tx = seen_tx.clone();
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes, but bound a stalled fixture client.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let mut request = [0u8; 2048];
                             let read = stream.read(&mut request).unwrap_or(0);
                             let first = String::from_utf8_lossy(&request[..read])
@@ -8023,6 +8029,12 @@ mod tests {
                         let (open, peak, seen_tx) =
                             (open_thread.clone(), peak_thread.clone(), seen_tx.clone());
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes before sending the delayed body.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let now = open.fetch_add(1, Ordering::SeqCst) + 1;
                             peak.fetch_max(now, Ordering::SeqCst);
                             let mut request = [0u8; 4096];
@@ -8189,6 +8201,12 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let seen_tx = seen_tx.clone();
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes, but bound a stalled fixture client.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let mut request = [0u8; 4096];
                             let read = stream.read(&mut request).unwrap_or(0);
                             let first = String::from_utf8_lossy(&request[..read])
@@ -8491,8 +8509,22 @@ mod tests {
                 "group {group} must have started loads of its own"
             );
         }
-        assert_eq!(page.prepare_screenshot_resources(8_000).await, 42);
+        page.prepare_screenshot_resources(8_000).await;
         assert!(!page.has_pending_render_resources());
+        // Earlier evaluate/queue steps may already have applied responses.
+        // The final wait returns only its own drain count, not the page total.
+        // Check every successful response across all three groups instead.
+        assert_eq!(page.network_events.len(), 42);
+        for group in 0..3 {
+            for index in 0..14 {
+                let url = format!("http://{address}/bg{group}-{index}.svg");
+                let response = page.network_events.iter()
+                    .find(|event| event.url == url)
+                    .unwrap_or_else(|| panic!("missing applied response: {url}"));
+                assert_eq!(response.status, 200, "{url}");
+                assert!(response.body_size > 0, "empty response: {url}");
+            }
+        }
         let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             peak <= obscura_js::ops::RENDER_RESOURCE_CONCURRENCY,

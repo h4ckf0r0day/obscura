@@ -2735,7 +2735,10 @@ fn cascade_node_style(
             .and_then(|root| shadow_sheets.get(&root));
         let mut slotted_scopes = Vec::new();
         let mut assigned_slot = tree.assigned_slot(id);
-        for _ in 0..tree.len() {
+        // len() counts live arena entries. Avoid scanning the entire document
+        // for every ordinary, unslotted element in the cascade.
+        let slot_limit = if assigned_slot.is_some() { tree.len() } else { 0 };
+        for _ in 0..slot_limit {
             let Some(slot) = assigned_slot else { break };
             let Some(root) = tree.containing_shadow_root(slot) else {
                 break;

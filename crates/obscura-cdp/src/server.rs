@@ -683,9 +683,9 @@ fn release_idle_connection_memory() {
     }
 }
 
-/// Run one WebSocket connection on its own OS thread: a `current_thread` tokio
-/// runtime + `LocalSet` hosting this connection's `cdp_processor` (with its own
-/// `CdpContext` and pages) and its frame reader. Confining a connection's pages
+/// Run each connection's `cdp_processor` (with its own `CdpContext` and pages)
+/// on a dedicated `current_thread` Tokio runtime and `LocalSet`. A second thread
+/// handles WebSocket I/O independently. Confining a connection's pages
 /// to one thread is what removes the #430 abort; the interception handshake and
 /// the nav `spawn_local` all stay on this one thread, so no cross-thread V8
 /// plumbing is needed.
@@ -735,29 +735,70 @@ fn run_connection(
                     return;
                 }
             };
+            // Socket I/O must not share the renderer's LocalSet: a synchronous
+            // V8/layout task otherwise delays even replies already queued by a
+            // completed navigation. Keep all page/isolate work on this thread,
+            // and move only Send protocol strings and the socket to an I/O thread.
+            let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+            let (io_stop_tx, io_stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let (io_done_tx, io_done_rx) = tokio::sync::oneshot::channel::<()>();
+            let io_thread = match std::thread::Builder::new()
+                .name("obscura-cdp-io".into())
+                .spawn(move || {
+                    // Dropping this sender also signals early setup failures.
+                    let _io_done = io_done_tx;
+                    let io_rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all().build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            error!("connection I/O runtime build failed: {error}");
+                            return;
+                        }
+                    };
+                    let io_local = tokio::task::LocalSet::new();
+                    io_local.block_on(&io_rt, async move {
+                        let stream = match TcpStream::from_std(std_stream) {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                error!("TcpStream::from_std failed: {error}");
+                                return;
+                            }
+                        };
+                        tokio::select! {
+                            result = handle_connection_ws(stream, msg_tx) => {
+                                if let Err(error) = result {
+                                    error!("WebSocket connection error: {error}");
+                                }
+                            }
+                            _ = io_stop_rx => {}
+                        }
+                    });
+                })
+            {
+                Ok(thread) => thread,
+                Err(error) => {
+                    error!("connection I/O thread spawn failed: {error}");
+                    return;
+                }
+            };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                let tokio_stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("TcpStream::from_std failed: {}", e);
-                        return;
-                    }
-                };
-                let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
-                let processor = tokio::task::spawn_local(cdp_processor(
-                    msg_rx,
-                    default_context,
-                    shutdown_notify,
+                let mut processor = tokio::task::spawn_local(cdp_processor(
+                    msg_rx, default_context, shutdown_notify,
                 ));
-                if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
-                    error!("WebSocket connection error: {}", e);
+                tokio::select! {
+                    _ = &mut processor => {}
+                    _ = io_done_rx => {
+                        // A disconnected client must cancel an in-flight
+                        // navigation/evaluation rather than wait its deadline.
+                        processor.abort();
+                        let _ = processor.await;
+                    }
                 }
-                // Connection closed (or shutting down): stop this connection's
-                // processor so the thread can exit.
-                processor.abort();
-                let _ = processor.await;
             });
+            let _ = io_stop_tx.send(());
+            let _ = io_thread.join();
 
             // `LocalSet` owns any detached local navigation tasks, and the
             // runtime owns their scheduler allocations. Drop both before the
@@ -2125,6 +2166,63 @@ mod tests {
 
         let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
         assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_replies_are_not_blocked_by_renderer_tasks() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::time::{Duration, Instant};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(1));
+        let live_server = live.clone();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let context = crate::dispatch::CdpContext::new().default_context;
+            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+        accept.await.unwrap();
+        ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+        let mut session = None;
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = msg {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if let Some(sid) = value["params"]["sessionId"].as_str() { session = Some(sid.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+        }
+        let started = Instant::now();
+        ws.send(Message::Text(json!({"id":2,"method":"Runtime.evaluate","sessionId":session.as_ref().unwrap(),
+            "params":{"expression":"setTimeout(() => { const end=Date.now()+600; while(Date.now()<end){} },0); { const end=Date.now()+30; while(Date.now()<end){} }; 'armed'","returnByValue":true}}).to_string().into())).await.unwrap();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = msg {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 2 {
+                    assert!(value.get("error").is_none(), "{value}");
+                    break;
+                }
+            }
+        }
+        assert!(started.elapsed() < Duration::from_millis(300),
+            "a completed reply was trapped behind unrelated renderer work: {:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        ws.send(Message::Text(json!({"id":3,"method":"Runtime.evaluate","sessionId":session.as_ref().unwrap(),
+            "params":{"expression":"new Promise(() => {})","awaitPromise":true}}).to_string().into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("connection and I/O threads must stop on socket close");
     }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
