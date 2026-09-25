@@ -7724,6 +7724,12 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let seen_tx = seen_tx.clone();
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes, but bound a stalled fixture client.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let mut request = [0u8; 2048];
                             let read = stream.read(&mut request).unwrap_or(0);
                             let first = String::from_utf8_lossy(&request[..read])
@@ -8189,6 +8195,12 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let seen_tx = seen_tx.clone();
                         std::thread::spawn(move || {
+                            // Accepted sockets inherit nonblocking mode on macOS.
+                            // Wait for request bytes, but bound a stalled fixture client.
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                                .unwrap();
                             let mut request = [0u8; 4096];
                             let read = stream.read(&mut request).unwrap_or(0);
                             let first = String::from_utf8_lossy(&request[..read])
