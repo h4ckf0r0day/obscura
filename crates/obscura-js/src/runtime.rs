@@ -3826,6 +3826,14 @@ impl ObscuraJsRuntime {
             #[cfg(feature = "render")]
             self.service_render_resources();
             self.begin_javascript_task();
+            // An already-resolved evaluation only needs its promise reactions.
+            // Polling the whole event loop first also executes unrelated ready
+            // timers/rendering callbacks, which can delay a trivial CDP read by
+            // seconds. Keep those tasks for the autonomous browser pump.
+            self.runtime().v8_isolate().perform_microtask_checkpoint();
+            if self.recover_heap_limit() {
+                return false;
+            }
             if done_check(self) {
                 return true;
             }
@@ -3834,14 +3842,23 @@ impl ObscuraJsRuntime {
             }
             // Pump for a short slice. If the loop returns idle in <tick_ms,
             // run_event_loop returns Ok and we check the predicate again.
+            let slice_deadline = (tokio::time::Instant::now()
+                + tokio::time::Duration::from_millis(tick_ms)).min(deadline);
             let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
                 runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
             });
-            let _ =
-                tokio::time::timeout(tokio::time::Duration::from_millis(tick_ms), event_loop).await;
+            let _ = tokio::time::timeout_at(slice_deadline, event_loop).await;
             if self.recover_heap_limit() {
                 return false;
             }
+            if done_check(self) {
+                return true;
+            }
+            // An idle event loop can return immediately while an unresolvable
+            // promise remains pending. Yield here so connection shutdown can
+            // cancel the evaluation, and actually back off instead of spinning.
+            // Reuse the slice deadline so a busy poll does not pay twice.
+            tokio::time::sleep_until(slice_deadline).await;
             // Backoff so a hung promise doesn't burn CPU. Caps at 50ms;
             // worst case we miss the result by <50ms.
             if tick_ms < 50 {
@@ -16126,6 +16143,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value.unwrap().as_f64().unwrap() as i64, 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_promise_wait_yields_to_other_tasks() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let turns = Arc::new(AtomicUsize::new(0));
+        let observed = turns.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!rt.resolve_promises_until(|_| false, 80).await);
+        heartbeat.abort();
+        assert!(turns.load(Ordering::Relaxed) > 1,
+            "an idle promise wait must yield instead of spinning until its deadline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolved_cdp_promise_does_not_run_unrelated_ready_timer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("ready-timer", "globalThis.timerRan = false; setTimeout(() => timerRan = true, 0);").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let result = rt.evaluate_for_cdp("Promise.resolve(42)", true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!(42.0));
+        assert_eq!(rt.evaluate("timerRan").unwrap(), serde_json::json!(false),
+            "an already-resolved CDP promise must not drain unrelated tasks");
+        rt.run_autonomous_event_loop_turn().await.unwrap();
+        assert_eq!(rt.evaluate("timerRan").unwrap(), serde_json::json!(true),
+            "the timer must still run on the autonomous pump");
     }
 
     #[tokio::test(flavor = "current_thread")]

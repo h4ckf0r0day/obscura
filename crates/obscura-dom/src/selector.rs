@@ -322,10 +322,8 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn parent_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let parent_id = node.parent?;
-        let parent = self.tree.get_node(parent_id)?;
-        if parent.is_element() {
+        let parent_id = self.tree.with_node(self.node_id, |node| node.parent)??;
+        if self.tree.with_node(parent_id, |parent| parent.is_element())? {
             Some(DomElement::new(self.tree, parent_id))
         } else {
             None
@@ -354,40 +352,40 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.prev_sibling;
+        let mut current = self.tree.with_node(self.node_id, |node| node.prev_sibling)?;
         while let Some(sibling_id) = current {
-            let sibling = self.tree.get_node(sibling_id)?;
-            if sibling.is_element() {
+            let (element, previous) = self.tree.with_node(sibling_id,
+                |sibling| (sibling.is_element(), sibling.prev_sibling))?;
+            if element {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
-            current = sibling.prev_sibling;
+            current = previous;
         }
         None
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.next_sibling;
+        let mut current = self.tree.with_node(self.node_id, |node| node.next_sibling)?;
         while let Some(sibling_id) = current {
-            let sibling = self.tree.get_node(sibling_id)?;
-            if sibling.is_element() {
+            let (element, next) = self.tree.with_node(sibling_id,
+                |sibling| (sibling.is_element(), sibling.next_sibling))?;
+            if element {
                 return Some(DomElement::new(self.tree, sibling_id));
             }
-            current = sibling.next_sibling;
+            current = next;
         }
         None
     }
 
     fn first_element_child(&self) -> Option<Self> {
-        let node = self.tree.get_node(self.node_id)?;
-        let mut current = node.first_child;
+        let mut current = self.tree.with_node(self.node_id, |node| node.first_child)?;
         while let Some(child_id) = current {
-            let child = self.tree.get_node(child_id)?;
-            if child.is_element() {
+            let (element, next) = self.tree.with_node(child_id,
+                |child| (child.is_element(), child.next_sibling))?;
+            if element {
                 return Some(DomElement::new(self.tree, child_id));
             }
-            current = child.next_sibling;
+            current = next;
         }
         None
     }
@@ -1272,6 +1270,40 @@ mod tests {
     use crate::tree_sink::parse_html;
 
     use super::{DomElement, SelectorKey};
+
+    #[test]
+    fn borrowed_selector_traversal_preserves_links_and_shadow_boundaries() {
+        let payload = "x".repeat(4096);
+        let tree = parse_html(&format!(
+            "<main id='parent' data-payload='{payload}'>text<!--gap--><i id='a'></i>text<!--gap--><b id='b'></b></main><div id='host'></div>"
+        ));
+        let parent = tree.get_element_by_id("parent").unwrap();
+        let a = tree.get_element_by_id("a").unwrap();
+        let b = tree.get_element_by_id("b").unwrap();
+        let element = |id| DomElement::new(&tree, id);
+        assert_eq!(element(parent).first_element_child(), Some(element(a)));
+        assert_eq!(element(a).next_sibling_element(), Some(element(b)));
+        assert_eq!(element(b).prev_sibling_element(), Some(element(a)));
+        assert_eq!(element(b).parent_element(), Some(element(parent)));
+        assert!(tree.matches_selector(b, "main:has(> i) > i + b:nth-child(2)").unwrap());
+        tree.detach(a);
+        assert_eq!(element(a).parent_element(), None);
+        assert_eq!(element(a).next_sibling_element(), None);
+        assert_eq!(element(parent).first_element_child(), Some(element(b)));
+        assert_eq!(element(b).prev_sibling_element(), None);
+        assert!(tree.matches_selector(b, "main > b:first-child").unwrap());
+        let host = tree.get_element_by_id("host").unwrap();
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        tree.append_child(root, a);
+        assert_eq!(element(a).parent_element(), None);
+        assert!(element(a).parent_node_is_shadow_root());
+        assert_eq!(element(a).containing_shadow_host(), Some(element(host)));
+        tree.remove(a);
+        assert_eq!(element(a).parent_element(), None);
+        assert_eq!(element(a).first_element_child(), None);
+        assert_eq!(element(a).next_sibling_element(), None);
+        assert_eq!(element(a).prev_sibling_element(), None);
+    }
 
     fn shadow_element(
         tree: &crate::tree::DomTree,
