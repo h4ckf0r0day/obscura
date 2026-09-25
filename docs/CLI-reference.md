@@ -34,6 +34,7 @@ Load a URL and print its content or an evaluated expression.
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
 -s, --screenshot <FILE>      Capture the settled page as PNG (single URL)
+    --font-dir <DIR>         Recursively load fonts for rendering (repeatable; render build)
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```

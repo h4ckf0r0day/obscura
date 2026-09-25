@@ -495,6 +495,7 @@ Fetch and render a single page.
 | `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
 | `--selector` | — | Wait for CSS selector |
 | `-s`, `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
+| `--font-dir` | — | Recursively load fonts for rendering, e.g. system fonts (repeatable; render build) |
 | `--stealth` | off | Anti-detection mode |
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |

@@ -6277,6 +6277,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_rendered_text_styles());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
@@ -7392,6 +7393,39 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
     }
     for (name, value) in custom {
         object.insert(name, serde_json::Value::String(value));
+    }
+    serde_json::Value::Object(object).to_string()
+}
+
+/// `display|visibility|white-space` for `root` and every element below it,
+/// keyed by node id, from the same cascade paint uses. Backs `innerText`,
+/// which needs these for a whole subtree in one call.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_rendered_text_styles(state: &OpState, root: u32) -> String {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    let root = obscura_dom::tree::NodeId::new(root);
+    let ids: Vec<obscura_dom::tree::NodeId> = match gs.dom.as_ref() {
+        Some(dom) => std::iter::once(root)
+            .chain(dom.descendants(root))
+            .filter(|id| dom.with_node(*id, |n| n.is_element()).unwrap_or(false))
+            .collect(),
+        None => return String::new(),
+    };
+    let Some(prepared) = ensure_prepared_render(&mut gs) else {
+        return String::new();
+    };
+    let mut object = serde_json::Map::with_capacity(ids.len());
+    for id in ids {
+        if let Some((display, visible, white_space)) = prepared.text_style(id) {
+            let visibility = if visible { "visible" } else { "hidden" };
+            object.insert(
+                id.index().to_string(),
+                serde_json::Value::String(format!("{display}|{visibility}|{white_space}")),
+            );
+        }
     }
     serde_json::Value::Object(object).to_string()
 }

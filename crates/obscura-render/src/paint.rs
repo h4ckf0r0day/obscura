@@ -1472,6 +1472,28 @@ impl PreparedRender {
         best.map(|(_, _, _, id)| id)
     }
 
+    /// `display`, whether the element is visible, and `white-space`: the
+    /// three properties `innerText` needs, without building a full snapshot.
+    pub fn text_style(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<(&'static str, bool, &'static str)> {
+        let style = self.layout.styles.get(&id)?;
+        let white_space = match style.white_space.unwrap_or_default() {
+            crate::WhiteSpace::Normal => "normal",
+            crate::WhiteSpace::NoWrap => "nowrap",
+            crate::WhiteSpace::Pre => "pre",
+            crate::WhiteSpace::PreWrap => "pre-wrap",
+            crate::WhiteSpace::PreLine => "pre-line",
+            crate::WhiteSpace::BreakSpaces => "break-spaces",
+        };
+        Some((
+            css_display_name(style),
+            !style.visibility_hidden.unwrap_or(false),
+            white_space,
+        ))
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,
@@ -1484,33 +1506,7 @@ impl PreparedRender {
         let rect = self.layout.rects.get(&id);
         let mut out = HashMap::new();
 
-        let active_webkit_clamp = style.webkit_box_display.is_some()
-            && style.webkit_box_orient_vertical
-            && style.webkit_line_clamp.is_some();
-        let display = if style.display_contents {
-            "contents"
-        } else if style.display == crate::Display::None {
-            "none"
-        } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
-            "flow-root"
-        } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
-            "-webkit-box"
-        } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
-            "-webkit-inline-box"
-        } else if style.internal_flex_container {
-            "block"
-        } else {
-            match (style.display, style.is_inline_block) {
-                (crate::Display::Flex, true) => "inline-flex",
-                (crate::Display::Grid, true) => "inline-grid",
-                (crate::Display::Block, true) => "inline-block",
-                (crate::Display::Flex, false) => "flex",
-                (crate::Display::Grid, false) => "grid",
-                (crate::Display::Inline, true) => "inline-block",
-                (crate::Display::Inline, false) => "inline",
-                _ => "block",
-            }
-        };
+        let display = css_display_name(style);
         out.insert("display", display.to_string());
         out.insert(
             "float",
@@ -17596,5 +17592,36 @@ mod tests {
         assert_eq!(at_end.layout.styles[&overlay].visibility_hidden, Some(true));
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
+    }
+}
+
+/// CSS `display` keyword for a computed style, as `getComputedStyle` reports it.
+fn css_display_name(style: &crate::LayoutStyle) -> &'static str {
+    let active_webkit_clamp = style.webkit_box_display.is_some()
+        && style.webkit_box_orient_vertical
+        && style.webkit_line_clamp.is_some();
+    if style.display_contents {
+        "contents"
+    } else if style.display == crate::Display::None {
+        "none"
+    } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
+        "flow-root"
+    } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
+        "-webkit-box"
+    } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
+        "-webkit-inline-box"
+    } else if style.internal_flex_container {
+        "block"
+    } else {
+        match (style.display, style.is_inline_block) {
+            (crate::Display::Flex, true) => "inline-flex",
+            (crate::Display::Grid, true) => "inline-grid",
+            (crate::Display::Block, true) => "inline-block",
+            (crate::Display::Flex, false) => "flex",
+            (crate::Display::Grid, false) => "grid",
+            (crate::Display::Inline, true) => "inline-block",
+            (crate::Display::Inline, false) => "inline",
+            _ => "block",
+        }
     }
 }

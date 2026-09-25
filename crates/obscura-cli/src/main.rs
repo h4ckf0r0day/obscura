@@ -181,6 +181,12 @@ enum Command {
         /// Capture the settled page as a PNG. Requires the `render` feature.
         #[arg(long, short = 's', value_name = "FILE", conflicts_with = "file")]
         screenshot: Option<std::path::PathBuf>,
+
+        /// Recursively load TTF, TTC, OTF, and OTC files from this directory,
+        /// as on `serve`, so screenshots can use system fonts. Repeat for
+        /// multiple directories. Requires a render-enabled build.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
     },
 
     Scrape {
@@ -513,7 +519,9 @@ async fn run_cli() -> anyhow::Result<()> {
             file,
             concurrency,
             screenshot,
+            font_dirs,
         }) => {
+            configure_font_directories(&font_dirs)?;
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -2678,6 +2686,7 @@ mod tests {
             output: None,
             storage_dir: None,
             screenshot: None,
+            font_dirs: vec![],
         });
         assert!(is_quiet_command(&cmd));
     }

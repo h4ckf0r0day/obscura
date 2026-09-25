@@ -35,6 +35,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
+    '_innerText', '_setInnerText', '_itStyles', '_itInfo',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
     '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
@@ -179,6 +180,134 @@ const _functionToString = {
   },
 }.toString;
 Function.prototype.toString = _functionToString;
+// HTML "rendered text collection" for innerText/outerText. Hidden subtrees
+// (display:none, <script>, <style>, <template>, ...) contribute nothing,
+// white-space collapses per the element's white-space, blocks are separated
+// by one newline, <p> by two, table cells by tabs and rows by newlines.
+// Render builds read display/visibility/white-space from the real cascade in
+// one native call; other builds fall back to HTML's default display per tag.
+const _itNever = new Set(['script', 'style', 'template', 'head', 'title', 'meta', 'link', 'base', 'noscript', 'noembed', 'noframes', 'datalist', 'param', 'source', 'track', 'area', 'map', 'rp']);
+const _itBlock = new Set(['address', 'article', 'aside', 'blockquote', 'body', 'center', 'dd', 'details', 'dialog', 'dir', 'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'html', 'legend', 'li', 'listing', 'main', 'menu', 'nav', 'ol', 'optgroup', 'option', 'p', 'plaintext', 'pre', 'search', 'section', 'summary', 'ul', 'xmp', 'caption', 'table', 'thead', 'tbody', 'tfoot']);
+const _itPre = new Set(['pre', 'textarea', 'listing', 'xmp', 'plaintext']);
+function _itStyles(root) {
+  if (typeof __obscuraCore.ops.op_rendered_text_styles !== 'function' || root._nid == null) return null;
+  try {
+    const raw = __obscuraCore.ops.op_rendered_text_styles(root._nid | 0);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_e) { return null; }
+}
+function _itInfo(el, styles, parentWs) {
+  const tag = el.localName || '';
+  let display, visibility = 'visible', ws = parentWs;
+  const native = styles && styles[el._nid];
+  if (native) {
+    const parts = native.split('|');
+    display = parts[0] || 'inline';
+    visibility = parts[1] || 'visible';
+    ws = parts[2] || parentWs;
+    // The renderer reports table parts and list items as plain blocks; keep
+    // their table/list roles unless CSS hid them.
+    const role = tag === 'td' || tag === 'th' ? 'table-cell' : tag === 'tr' ? 'table-row' : tag === 'li' ? 'list-item' : null;
+    if (role && display !== 'none' && (display === 'block' || display === 'inline')) display = role;
+  } else {
+    display = _itNever.has(tag) || el.hasAttribute?.('hidden') ? 'none'
+      : tag === 'table' ? 'table' : tag === 'tr' ? 'table-row'
+      : (tag === 'td' || tag === 'th') ? 'table-cell'
+      : tag === 'li' ? 'list-item'
+      : _itBlock.has(tag) ? 'block' : 'inline';
+    const inline = el.style && el.style.display;
+    if (inline) display = inline;
+    if (el.style && el.style.visibility) visibility = el.style.visibility;
+    if (_itPre.has(tag)) ws = 'pre';
+    if (el.style && el.style.whiteSpace) ws = el.style.whiteSpace;
+  }
+  if (_itNever.has(tag) && tag !== 'noscript') display = 'none';
+  return { tag, display, visibility, ws };
+}
+function _innerText(el) {
+  if (!el.isConnected) return el.textContent;
+  const styles = _itStyles(el);
+  const self = _itInfo(el, styles, 'normal');
+  if (self.display === 'none') return el.textContent;
+  // Items: strings (with whitespace mode) and required line-break counts.
+  const items = [];
+  const walk = (node, ws, visible) => {
+    if (node.nodeType === 3) {
+      if (!visible) return;
+      let t = node.data || '';
+      if (ws === 'pre' || ws === 'pre-wrap' || ws === 'break-spaces') items.push({ t, pre: true });
+      else if (ws === 'pre-line') items.push({ t: t.replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n'), pre: true, line: true });
+      else items.push({ t: t.replace(/[ \t\n\r\f]+/g, ' '), pre: false });
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    const info = _itInfo(node, styles, ws);
+    if (info.display === 'none') return;
+    const vis = info.visibility !== 'hidden' && info.visibility !== 'collapse';
+    const tag = info.tag;
+    if (tag === 'br') { if (vis) items.push({ t: '\n', pre: true }); return; }
+    const d = info.display;
+    const isP = tag === 'p';
+    const isBlock = !isP && (d === 'block' || d === 'flex' || d === 'grid' || d === 'list-item' || d === 'table' || d === 'flow-root' || d === 'table-caption' || d.startsWith('-webkit-box'));
+    if (isP) items.push(2); else if (isBlock) items.push(1);
+    const kids = node.childNodes || [];
+    for (let i = 0; i < kids.length; i++) walk(kids[i], info.ws, vis);
+    if (d === 'table-cell') {
+      let next = node.nextSibling;
+      while (next && next.nodeType !== 1) next = next.nextSibling;
+      if (next) items.push({ t: '\t', pre: true });
+    } else if (d === 'table-row') {
+      let next = node.nextElementSibling;
+      if (!next) {
+        // The last row of one section still breaks before the next section.
+        let sec = node.parentNode && node.parentNode.nextElementSibling;
+        next = sec;
+      }
+      if (next) items.push(1);
+    }
+    if (isP) items.push(2); else if (isBlock) items.push(1);
+  };
+  const kids = el.childNodes || [];
+  for (let i = 0; i < kids.length; i++) walk(kids[i], self.ws, self.visibility !== 'hidden');
+  // Assemble: collapse spaces across item boundaries, drop spaces at line
+  // edges, and turn runs of break counts into max(count) newlines. Linear:
+  // only the last chunk is ever trimmed.
+  const parts = [];
+  let last = '';
+  let pending = 0;
+  const trimTail = () => {
+    while (parts.length) {
+      const p = parts[parts.length - 1];
+      const t = p.replace(/ +$/, '');
+      if (t.length) { parts[parts.length - 1] = t; last = t[t.length - 1]; return; }
+      parts.pop();
+    }
+    last = '';
+  };
+  for (const it of items) {
+    if (typeof it === 'number') { if (parts.length) pending = Math.max(pending, it); continue; }
+    let t = it.t;
+    if (!it.pre && (pending || last === '' || last === ' ' || last === '\n' || last === '\t')) t = t.replace(/^ /, '');
+    if (t === '') continue;
+    if (pending) { trimTail(); parts.push('\n'.repeat(pending)); pending = 0; }
+    parts.push(t);
+    last = t[t.length - 1];
+  }
+  return parts.join('').replace(/ +(?=\n)/g, '').replace(/ +$/, '');
+}
+function _setInnerText(el, v) {
+  v = v === null ? '' : String(v);
+  if (!/[\r\n]/.test(v)) { el.textContent = v; return; }
+  // Line breaks become <br>, as in browsers.
+  el.textContent = '';
+  const parts = v.replace(/\r\n?/g, '\n').split('\n');
+  const doc = el.ownerDocument || document;
+  parts.forEach((part, i) => {
+    if (i) el.appendChild(doc.createElement('br'));
+    if (part) el.appendChild(doc.createTextNode(part));
+  });
+}
+
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
@@ -3565,8 +3694,9 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
-  set innerText(v) { this.textContent = v; }
+  get innerText() { return _innerText(this); }
+  set innerText(v) { _setInnerText(this, v); }
+  get outerText() { return _innerText(this); }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
     return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
