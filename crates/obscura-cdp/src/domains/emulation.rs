@@ -65,6 +65,19 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "setEmulatedMedia" => {
+            let features = params.get("features").and_then(Value::as_array);
+            if let Some(features) = features {
+                let value = features.iter().find(|feature| feature["name"] == "prefers-reduced-motion")
+                    .and_then(|feature| feature["value"].as_str()).unwrap_or("");
+                if !matches!(value, "" | "reduce" | "no-preference") {
+                    return Err("Invalid prefers-reduced-motion value".into());
+                }
+                ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                    .set_reduced_motion(value == "reduce");
+            }
+            Ok(json!({}))
+        }
         "setDeviceMetricsOverride" => {
             let width = metric_dimension(params, "width")?;
             let height = metric_dimension(params, "height")?;

@@ -25,6 +25,23 @@ pub enum CssMediaType {
     #[default]
     Screen,
     Print,
+    ScreenReducedMotion,
+    PrintReducedMotion,
+}
+
+impl CssMediaType {
+    pub fn with_reduced_motion(self, reduce: bool) -> Self {
+        match (self, reduce) {
+            (Self::Print | Self::PrintReducedMotion, false) => Self::Print,
+            (Self::Print | Self::PrintReducedMotion, true) => Self::PrintReducedMotion,
+            (_, false) => Self::Screen,
+            (_, true) => Self::ScreenReducedMotion,
+        }
+    }
+
+    pub fn reduced_motion(self) -> bool {
+        matches!(self, Self::ScreenReducedMotion | Self::PrintReducedMotion)
+    }
 }
 
 /// The part of the tree whose selector match may change when a dependency on
@@ -6850,8 +6867,8 @@ fn single_media_query_applies_for_viewport(
     let medium = compact.split_once("and").map_or(compact, |(medium, _)| medium);
     let medium_matches = match medium {
         "all" => true,
-        "screen" => media_type == CssMediaType::Screen,
-        "print" => media_type == CssMediaType::Print,
+        "screen" => matches!(media_type, CssMediaType::Screen | CssMediaType::ScreenReducedMotion),
+        "print" => matches!(media_type, CssMediaType::Print | CssMediaType::PrintReducedMotion),
         medium if medium.starts_with('(') => true,
         // Unknown named media such as `speech` do not match either visual
         // rendering mode.
@@ -6869,7 +6886,8 @@ fn single_media_query_applies_for_viewport(
         return false;
     }
     // Reduced-motion / high-contrast / inverted: default (no preference).
-    if compact.contains("prefers-reduced-motion:reduce")
+    if (compact.contains("prefers-reduced-motion:reduce") && !media_type.reduced_motion())
+        || (compact.contains("prefers-reduced-motion:no-preference") && media_type.reduced_motion())
         || compact.contains("prefers-contrast:more")
         || compact.contains("prefers-contrast:less")
         || compact.contains("inverted-colors:inverted")

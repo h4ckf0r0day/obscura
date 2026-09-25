@@ -365,6 +365,9 @@
     {"name": "height media query uses the screenshot viewport", "color": "#1971c2", "x": 10, "y": 110, "width": 200, "height": 80},
     {"name": "page JavaScript sees the screenshot viewport", "color": "#7048e8", "x": 10, "y": 210, "width": 200, "height": 80}
   ],
+  "reduced-motion-emulation": [
+    {"name": "normal motion keeps the default width", "color": "#22aa66", "width": 100, "height": 30}
+  ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},
     {"name": "negative layer", "color": "#ffa500", "width": 260, "height": 110}
