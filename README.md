@@ -1,5 +1,6 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
+<img width="1200" height="630" alt="memory" src="https://github.com/user-attachments/assets/94eba4cb-0ba0-4a07-b891-b12ac2d42790" />
+
 </p>
 <h2 align="center">Obscura</h2>
 <p align="center">
