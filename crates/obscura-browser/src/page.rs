@@ -6960,6 +6960,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn document_close_waits_for_written_parser_blocking_scripts() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(75),
+            "globalThis.__closeOrder.push('external');",
+        );
+        let mut page = import_map_test_page(
+            "document-close-parser-blocking", "http://127.0.0.1:9",
+            "<html><body></body></html>",
+        );
+        page.js.as_mut().unwrap().execute_script("replacement", &format!(r#"
+            document.open();
+            globalThis.__closeOrder = [];
+            document.addEventListener('DOMContentLoaded', () => __closeOrder.push('dom'), {{once:true}});
+            window.addEventListener('load', () => __closeOrder.push('load'), {{once:true}});
+            document.write('<script src="{base}/written.js"><\/script>');
+            document.write('<script>globalThis.__closeOrder.push("inline");<\/script>');
+            document.close();
+        "#)).unwrap();
+        page.settle(250).await;
+        assert_eq!(requests.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "/written.js");
+        assert_eq!(page.js.as_mut().unwrap().evaluate("__closeOrder").unwrap(),
+            serde_json::json!(["external", "inline", "dom", "load"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn document_write_external_script_blocks_later_parser_scripts() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(75),

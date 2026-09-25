@@ -885,6 +885,15 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
         for runtime_event in runtime_events {
             for session_id in sessions {
                 let (method, params) = match &runtime_event {
+                    obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } => (
+                        "Page.lifecycleEvent",
+                        json!({
+                            "frameId": ctx.pages.iter().find(|page| page.id == page_id).map(|page| &page.frame_id),
+                            "loaderId": ctx.current_loader_ids.get(&page_id),
+                            "name": name,
+                            "timestamp": timestamp,
+                        }),
+                    ),
                     obscura_js::ops::RuntimeEvent::Console(event) => (
                         "Runtime.consoleAPICalled",
                         json!({
