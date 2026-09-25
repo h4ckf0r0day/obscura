@@ -6136,6 +6136,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_check_visibility());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
@@ -7253,6 +7254,34 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
         object.insert(name, serde_json::Value::String(value));
     }
     serde_json::Value::Object(object).to_string()
+}
+
+/// `Element.checkVisibility()` in one native call. Walking ancestors through
+/// `getComputedStyle()` cost a JS proxy per ancestor, and Playwright calls
+/// this before every action.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_check_visibility(
+    state: &OpState,
+    nid: u32,
+    check_opacity: bool,
+    check_visibility_css: bool,
+) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_prepared_render(&mut gs).is_none() {
+        return false;
+    }
+    let (Some(prepared), Some(dom)) = (gs.prepared_render.as_ref(), gs.dom.as_ref()) else {
+        return false;
+    };
+    prepared.check_visibility(
+        dom,
+        obscura_dom::tree::NodeId::new(nid),
+        check_opacity,
+        check_visibility_css,
+    )
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

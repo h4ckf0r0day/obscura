@@ -1457,6 +1457,11 @@ pub struct LayoutStyle {
     /// ancestor's `opacity` is zero. Fractional values remain paintable and
     /// are isolated into composited groups by the paint pass.
     pub effectively_invisible: bool,
+    /// Resolved during the inheritance pass: the computed `visibility` is
+    /// `hidden`, from the element's own value or an ancestor's. Unlike
+    /// `effectively_invisible` it ignores opacity; `getComputedStyle()`
+    /// reports it.
+    pub visibility_hidden_computed: bool,
 
     /// A CSS image supplied by `content: url(...)` on a replaced element.
     /// This is distinct from generated pseudo text: on an `<img>` it becomes
