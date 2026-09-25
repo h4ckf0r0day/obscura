@@ -637,9 +637,14 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     if parts.len() < 5 { return Err(()); }
 
     let day: u64 = parts[1].parse().map_err(|_| ())?;
+    if !(1..=31).contains(&day) { return Err(()); }
     let month = months.iter().position(|m| parts[2].to_lowercase().starts_with(m))
         .ok_or(())? as u64 + 1;
     let year: u64 = parts[3].parse().map_err(|_| ())?;
+    // Reject pre-epoch and unreasonably large years: the former is meaningless
+    // for a cookie expiry, the latter would make the loop below iterate
+    // unbounded on attacker-controlled input.
+    if !(1970..=9999).contains(&year) { return Err(()); }
 
     let time_parts: Vec<&str> = parts[4].split(':').collect();
     let hour: u64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -785,6 +790,41 @@ fn domain_matches(host: &str, domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1046: a huge year must not make the day-counting loop run unbounded.
+    #[test]
+    fn parse_http_date_rejects_huge_year_instead_of_hanging() {
+        assert!(parse_http_date("Sun, 06 Nov 999999999 08:49:37 GMT").is_err());
+    }
+
+    // #1036: day=0 must not underflow into a garbage/near-permanent timestamp.
+    #[test]
+    fn parse_http_date_rejects_day_zero() {
+        assert!(parse_http_date("Sun, 00 Nov 2026 08:49:37 GMT").is_err());
+    }
+
+    #[test]
+    fn parse_http_date_rejects_day_above_31() {
+        assert!(parse_http_date("Sun, 32 Nov 2026 08:49:37 GMT").is_err());
+    }
+
+    #[test]
+    fn parse_http_date_rejects_pre_epoch_year() {
+        assert!(parse_http_date("Sun, 06 Nov 1969 08:49:37 GMT").is_err());
+    }
+
+    #[test]
+    fn parse_http_date_accepts_valid_recent_date() {
+        let ts = parse_http_date("Fri, 06 Nov 2026 08:49:37 GMT").expect("valid date should parse");
+        // Sanity: well after 1970 epoch, well before the loop's rejected range.
+        assert!(ts > 1_700_000_000 && ts < 4_000_000_000);
+    }
+
+    #[test]
+    fn parse_http_date_accepts_epoch_year() {
+        let ts = parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT").expect("epoch date should parse");
+        assert_eq!(ts, 0);
+    }
 
     #[test]
     fn test_set_and_get_cookie() {
