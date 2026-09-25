@@ -22,6 +22,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_dispatchTouch', '__obscura_dispatchDrag',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
@@ -49,7 +50,6 @@ const __obscuraCore = globalThis.Deno.core;
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
     '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
     '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
-    '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
     '_makeListenerBox',
     // WebIDL interfaces. A real browser exposes these on the global as
     // enumerable:false; here they were assigned with `globalThis.X = X`, which
@@ -68,6 +68,11 @@ const __obscuraCore = globalThis.Deno.core;
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
+    'Touch', 'TouchList', 'TouchEvent', 'DataTransfer', 'DataTransferItem',
+    'DataTransferItemList', 'DragEvent', 'WebSocket', 'CloseEvent',
+    'IDBFactory', 'IDBDatabase', 'IDBTransaction', 'IDBObjectStore', 'IDBIndex',
+    'IDBCursor', 'IDBCursorWithValue', 'IDBKeyRange', 'IDBRequest', 'IDBOpenDBRequest',
+    'IDBVersionChangeEvent', 'DOMStringList',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -5740,6 +5745,7 @@ class Document extends Node {
       'compositionevent': CompositionEvent,
       'wheelevent': WheelEvent,
       'pointerevent': PointerEvent,
+      'dragevent': DragEvent,
       'errorevent': ErrorEvent,
       'popstateevent': PopStateEvent,
       'animationevent': AnimationEvent,
@@ -10333,7 +10339,305 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
     this.total = i.total != null ? Number(i.total) : 0;
   }
 };
-globalThis.ClipboardEvent = class extends Event {};
+// Touch Events. Desktop Chrome exposes Touch, TouchList and TouchEvent (so
+// `new TouchEvent(...)` works) while reporting maxTouchPoints 0 and rejecting
+// document.createEvent('TouchEvent'); match that split.
+globalThis.Touch = class Touch {
+  constructor(init) {
+    if (!init || typeof init !== 'object' || init.identifier === undefined || !init.target) {
+      throw new TypeError("Failed to construct 'Touch': required member identifier/target is undefined.");
+    }
+    this.identifier = Number(init.identifier);
+    this.target = init.target;
+    this.clientX = +init.clientX || 0; this.clientY = +init.clientY || 0;
+    this.screenX = +init.screenX || 0; this.screenY = +init.screenY || 0;
+    this.pageX = init.pageX !== undefined ? +init.pageX : this.clientX + (globalThis.scrollX || 0);
+    this.pageY = init.pageY !== undefined ? +init.pageY : this.clientY + (globalThis.scrollY || 0);
+    this.radiusX = +init.radiusX || 0; this.radiusY = +init.radiusY || 0;
+    this.rotationAngle = +init.rotationAngle || 0;
+    this.force = +init.force || 0;
+    this.altitudeAngle = init.altitudeAngle !== undefined ? +init.altitudeAngle : Math.PI / 2;
+    this.azimuthAngle = +init.azimuthAngle || 0;
+    this.touchType = init.touchType === 'stylus' ? 'stylus' : 'direct';
+  }
+  get [Symbol.toStringTag]() { return 'Touch'; }
+};
+globalThis.TouchList = class TouchList {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'TouchList'; }
+};
+const _makeTouchList = (touches) => {
+  const list = Object.create(TouchList.prototype);
+  const arr = Array.from(touches || []);
+  arr.forEach((t, i) => { list[i] = t; });
+  Object.defineProperty(list, 'length', { value: arr.length, enumerable: false });
+  list.item = (i) => (i >>> 0) < arr.length ? arr[i >>> 0] : null;
+  list[Symbol.iterator] = function* () { yield* arr; };
+  return list;
+};
+globalThis.TouchEvent = class TouchEvent extends UIEvent {
+  constructor(t, o = {}) {
+    super(t, o);
+    this.touches = _makeTouchList(o.touches);
+    this.targetTouches = _makeTouchList(o.targetTouches);
+    this.changedTouches = _makeTouchList(o.changedTouches);
+    this.altKey = !!o.altKey; this.metaKey = !!o.metaKey;
+    this.ctrlKey = !!o.ctrlKey; this.shiftKey = !!o.shiftKey;
+  }
+  get [Symbol.toStringTag]() { return 'TouchEvent'; }
+};
+
+// HTML drag-and-drop data store.
+globalThis.DataTransferItem = class DataTransferItem {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'DataTransferItem'; }
+};
+globalThis.DataTransferItemList = class DataTransferItemList {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get [Symbol.toStringTag]() { return 'DataTransferItemList'; }
+};
+const _dtItem = (kind, type, value) => {
+  const item = Object.create(DataTransferItem.prototype);
+  Object.defineProperties(item, {
+    kind: { value: kind, enumerable: true },
+    type: { value: type, enumerable: true },
+  });
+  item.getAsString = (cb) => { if (kind === 'string' && typeof cb === 'function') setTimeout(() => cb(value), 0); };
+  item.getAsFile = () => (kind === 'file' ? value : null);
+  return item;
+};
+globalThis.DataTransfer = class DataTransfer {
+  constructor() {
+    const entries = [];
+    const dt = this;
+    let dropEffect = 'none';
+    let effectAllowed = 'uninitialized';
+    const norm = (f) => {
+      f = String(f).toLowerCase();
+      return f === 'text' ? 'text/plain' : f === 'url' ? 'text/uri-list' : f;
+    };
+    const list = Object.create(DataTransferItemList.prototype);
+    const syncIndexes = () => {
+      for (const k of Object.keys(list)) if (/^\d+$/.test(k)) delete list[k];
+      entries.forEach((e, i) => { list[i] = e.item; });
+    };
+    Object.defineProperty(list, 'length', { get: () => entries.length });
+    list.add = (data, type) => {
+      if (typeof File !== 'undefined' && data instanceof File) {
+        const e = { kind: 'file', type: data.type, value: data, item: _dtItem('file', data.type, data) };
+        entries.push(e); syncIndexes(); return e.item;
+      }
+      const t = norm(type);
+      if (entries.some((e) => e.kind === 'string' && e.type === t)) {
+        throw new DOMException("Failed to execute 'add' on 'DataTransferItemList': An item already exists for type '" + t + "'.", 'NotSupportedError');
+      }
+      const e = { kind: 'string', type: t, value: String(data), item: _dtItem('string', t, String(data)) };
+      entries.push(e); syncIndexes(); return e.item;
+    };
+    list.remove = (i) => { entries.splice(i >>> 0, 1); syncIndexes(); };
+    list.clear = () => { entries.length = 0; syncIndexes(); };
+    list[Symbol.iterator] = function* () { for (const e of entries) yield e.item; };
+    Object.defineProperties(this, {
+      items: { get: () => list, enumerable: true },
+      types: {
+        get: () => {
+          const t = entries.filter((e) => e.kind === 'string').map((e) => e.type);
+          if (entries.some((e) => e.kind === 'file')) t.push('Files');
+          return Object.freeze(t);
+        },
+        enumerable: true,
+      },
+      files: { get: () => _makeFileList(entries.filter((e) => e.kind === 'file').map((e) => e.value)), enumerable: true },
+      dropEffect: {
+        get: () => dropEffect,
+        set: (v) => { if (['none', 'copy', 'link', 'move'].includes(v)) dropEffect = v; },
+        enumerable: true,
+      },
+      effectAllowed: {
+        get: () => effectAllowed,
+        set: (v) => { if (['none', 'copy', 'copyLink', 'copyMove', 'link', 'linkMove', 'move', 'all', 'uninitialized'].includes(v)) effectAllowed = v; },
+        enumerable: true,
+      },
+    });
+    dt.setData = (format, data) => {
+      const t = norm(format);
+      const idx = entries.findIndex((e) => e.kind === 'string' && e.type === t);
+      if (idx >= 0) entries.splice(idx, 1);
+      const v = String(data);
+      entries.push({ kind: 'string', type: t, value: v, item: _dtItem('string', t, v) });
+      syncIndexes();
+    };
+    dt.getData = (format) => {
+      const t = norm(format);
+      const e = entries.find((x) => x.kind === 'string' && x.type === t);
+      if (!e) return '';
+      return String(format).toLowerCase() === 'url' ? (e.value.split(/\r?\n/).find((l) => l && l[0] !== '#') || '') : e.value;
+    };
+    dt.clearData = (format) => {
+      if (format === undefined) {
+        for (let i = entries.length - 1; i >= 0; i--) if (entries[i].kind === 'string') entries.splice(i, 1);
+      } else {
+        const t = norm(format);
+        const idx = entries.findIndex((e) => e.kind === 'string' && e.type === t);
+        if (idx >= 0) entries.splice(idx, 1);
+      }
+      syncIndexes();
+    };
+    dt.setDragImage = () => {};
+  }
+  get [Symbol.toStringTag]() { return 'DataTransfer'; }
+};
+globalThis.DragEvent = class DragEvent extends MouseEvent {
+  constructor(t, o = {}) {
+    super(t, o);
+    this.dataTransfer = o.dataTransfer instanceof DataTransfer ? o.dataTransfer : null;
+  }
+  get [Symbol.toStringTag]() { return 'DragEvent'; }
+};
+for (const _c of [Touch, TouchList, TouchEvent, DataTransferItem, DataTransferItemList, DataTransfer, DragEvent]) _markNative(_c);
+
+// CDP Input.dispatchTouchEvent. Each touch keeps the element it started on as
+// its target (Touch Events spec). Returns the taps no listener cancelled so
+// the CDP layer can deliver the compatibility mouse events and click, like
+// Chrome's gesture recognizer does under touch emulation.
+(function() {
+  const active = new Map();
+  const TAP_SLOP = 15;
+  const fire = (target, ev) => target.dispatchEvent(globalThis.__obscura_markTrusted(ev));
+  const mods = (m) => ({ altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8) });
+  const pointer = (type, rec, m, pressure) => new PointerEvent(type, Object.assign({
+    bubbles: type !== 'pointerenter' && type !== 'pointerleave', cancelable: type !== 'pointercancel', composed: true, view: globalThis,
+    clientX: rec.x, clientY: rec.y, pointerId: rec.pointerId, pointerType: 'touch', isPrimary: rec.primary,
+    button: type === 'pointerdown' || type === 'pointerup' ? 0 : -1, buttons: pressure > 0 ? 1 : 0,
+    width: rec.rx * 2 || 1, height: rec.ry * 2 || 1, pressure,
+  }, mods(m)));
+  const touchOf = (rec) => new Touch({
+    identifier: rec.id, target: rec.target, clientX: rec.x, clientY: rec.y, screenX: rec.x, screenY: rec.y,
+    radiusX: rec.rx, radiusY: rec.ry, rotationAngle: rec.angle, force: rec.force,
+  });
+  const touchEvent = (type, changed, m) => {
+    const all = [...active.values()].map(touchOf);
+    const changedTouches = changed.map(touchOf);
+    const byTarget = new Map();
+    for (const rec of changed) {
+      if (!byTarget.has(rec.target)) byTarget.set(rec.target, []);
+    }
+    let cancelled = false;
+    for (const target of byTarget.keys()) {
+      const ev = new TouchEvent(type, Object.assign({
+        bubbles: true, cancelable: type !== 'touchcancel', composed: true, view: globalThis,
+        touches: all, changedTouches,
+        targetTouches: all.filter((t) => t.target === target),
+      }, mods(m)));
+      if (!fire(target, ev)) cancelled = true;
+    }
+    return cancelled;
+  };
+  let nextPointerId = 2;
+  globalThis.__obscura_dispatchTouch = function(type, points, m) {
+    points = Array.isArray(points) ? points : [];
+    m = m | 0;
+    if (type === 'touchStart' || type === 'touchMove') {
+      const started = [], moved = [];
+      points.forEach((p, i) => {
+        const id = p.id !== undefined ? p.id : i;
+        const x = +p.x || 0, y = +p.y || 0;
+        const prev = active.get(id);
+        if (!prev) {
+          const target = (document.elementFromPoint && document.elementFromPoint(x, y)) || document.body || document.documentElement;
+          if (!target) return;
+          const rec = { id, target, x, y, sx: x, sy: y, rx: +p.radiusX || 1, ry: +p.radiusY || 1, angle: +p.rotationAngle || 0,
+            force: p.force !== undefined ? +p.force : 1, pointerId: nextPointerId++, primary: active.size === 0, prevented: false, moved: false };
+          active.set(id, rec);
+          started.push(rec);
+        } else if (prev.x !== x || prev.y !== y) {
+          prev.x = x; prev.y = y;
+          if (Math.hypot(x - prev.sx, y - prev.sy) > TAP_SLOP) prev.moved = true;
+          moved.push(prev);
+        }
+      });
+      for (const rec of started) {
+        fire(rec.target, pointer('pointerover', rec, m, rec.force));
+        fire(rec.target, pointer('pointerenter', rec, m, rec.force));
+        fire(rec.target, pointer('pointerdown', rec, m, rec.force));
+      }
+      if (started.length && touchEvent('touchstart', started, m)) started.forEach((r) => { r.prevented = true; });
+      for (const rec of moved) fire(rec.target, pointer('pointermove', rec, m, rec.force));
+      if (moved.length && touchEvent('touchmove', moved, m)) moved.forEach((r) => { r.prevented = true; });
+      return [];
+    }
+    if (type === 'touchEnd' || type === 'touchCancel') {
+      const keep = new Set(points.map((p, i) => (p.id !== undefined ? p.id : i)));
+      const ended = [...active.values()].filter((r) => !keep.has(r.id));
+      const cancel = type === 'touchCancel';
+      for (const rec of ended) {
+        fire(rec.target, pointer(cancel ? 'pointercancel' : 'pointerup', rec, m, 0));
+        fire(rec.target, pointer('pointerout', rec, m, 0));
+        fire(rec.target, pointer('pointerleave', rec, m, 0));
+      }
+      // The ended touches leave `touches` before the event fires.
+      ended.forEach((r) => active.delete(r.id));
+      const endCancelled = ended.length ? touchEvent(cancel ? 'touchcancel' : 'touchend', ended, m) : false;
+      if (cancel || endCancelled) return [];
+      // Taps the caller turns into mouse press/release (and so click and
+      // activation behavior) at the lift point.
+      return ended
+        .filter((rec) => rec.primary && !rec.moved && !rec.prevented)
+        .map((rec) => ({ x: rec.x, y: rec.y }));
+    }
+    return [];
+  };
+
+  // CDP Input.dispatchDragEvent: dragEnter / dragOver / drop / dragCancel at
+  // a point, carrying the drag data the client supplies.
+  let dragTarget = null;
+  const effectFor = (mask) => {
+    const copy = !!(mask & 1), link = !!(mask & 2), move = !!(mask & 16);
+    if (copy && link && move) return 'all';
+    if (copy && move) return 'copyMove';
+    if (copy && link) return 'copyLink';
+    if (link && move) return 'linkMove';
+    return copy ? 'copy' : link ? 'link' : move ? 'move' : 'none';
+  };
+  globalThis.__obscura_dispatchDrag = function(type, x, y, data, m) {
+    data = data || {};
+    const dt = new DataTransfer();
+    for (const item of data.items || []) {
+      try { dt.items.add(String(item.data), String(item.mimeType)); } catch (_e) {}
+    }
+    for (const path of data.files || []) {
+      try { dt.items.add(new File([], String(path).split(/[\\/]/).pop())); } catch (_e) {}
+    }
+    dt.effectAllowed = effectFor(data.dragOperationsMask === undefined ? 0xffff : data.dragOperationsMask);
+    const init = (t) => Object.assign({ bubbles: true, cancelable: t !== 'dragleave', composed: true, view: globalThis,
+      clientX: x, clientY: y, dataTransfer: dt }, mods(m | 0));
+    const target = (document.elementFromPoint && document.elementFromPoint(x, y)) || document.body || document.documentElement;
+    if (type === 'dragCancel') {
+      if (dragTarget) fire(dragTarget, new DragEvent('dragleave', init('dragleave')));
+      dragTarget = null;
+      return 'none';
+    }
+    if (!target) return 'none';
+    if (type === 'dragEnter' || (type === 'dragOver' && target !== dragTarget)) {
+      if (dragTarget && dragTarget !== target) fire(dragTarget, new DragEvent('dragleave', init('dragleave')));
+      dragTarget = target;
+      fire(target, new DragEvent('dragenter', init('dragenter')));
+    }
+    if (type === 'dragOver' || type === 'dragEnter') {
+      const accepted = !fire(target, new DragEvent('dragover', init('dragover')));
+      return accepted ? (dt.dropEffect === 'none' ? 'copy' : dt.dropEffect) : 'none';
+    }
+    if (type === 'drop') {
+      dragTarget = null;
+      fire(target, new DragEvent('drop', init('drop')));
+      return dt.dropEffect;
+    }
+    return 'none';
+  };
+})();
+globalThis.ClipboardEvent = class ClipboardEvent extends Event {
+  constructor(t, o = {}) { super(t, o); this.clipboardData = o.clipboardData instanceof DataTransfer ? o.clipboardData : null; }
+};
 globalThis.SubmitEvent = class extends Event {};
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
@@ -11187,32 +11491,67 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // backing map. Plain prototype methods alone could not intercept direct
 // property access, so `localStorage.foo = x` never updated length before.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
+// Areas are backed by the browser context (localStorage, shared by every page
+// of the origin and persisted with --storage-dir) and by the tab
+// (sessionStorage, kept across navigations). The origin is derived natively
+// from the calling document. A bare runtime with no page falls back to a
+// realm-local map.
+const _stBacked = () => { try { return __obscuraCore.ops.op_storage_available(); } catch (e) { return false; } };
+const _stHas = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+Storage.prototype._keys = function() {
+  if (_stBacked()) return JSON.parse(__obscuraCore.ops.op_storage_keys(this._kind));
+  return Object.keys(this._data);
+};
+Storage.prototype.getItem = function(k) {
+  k = String(k);
+  if (_stBacked()) return JSON.parse(__obscuraCore.ops.op_storage_get(this._kind, k));
+  return _stHas(this._data, k) ? this._data[k] : null;
+};
+Storage.prototype.setItem = function(k, v) {
+  k = String(k); v = String(v);
+  if (_stBacked()) {
+    if (!__obscuraCore.ops.op_storage_set(this._kind, k, v)) {
+      throw new DOMException("Failed to execute 'setItem' on 'Storage': Setting the value of '" + k + "' exceeded the quota.", 'QuotaExceededError');
+    }
+    return;
+  }
+  this._data[k] = v;
+};
+Storage.prototype.removeItem = function(k) {
+  k = String(k);
+  if (_stBacked()) { __obscuraCore.ops.op_storage_remove(this._kind, k); return; }
+  delete this._data[k];
+};
+Storage.prototype.clear = function() {
+  if (_stBacked()) { __obscuraCore.ops.op_storage_clear(this._kind); return; }
+  const d = this._data; for (const k in d) delete d[k];
+};
+Storage.prototype.key = function(i) { const ks = this._keys(); i = i >>> 0; return i < ks.length ? ks[i] : null; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._keys().length; }, configurable: true });
+Object.defineProperty(Storage.prototype, '_keys', { enumerable: false });
 
-const _mkStore = () => {
+const _mkStore = (kind) => {
   const target = Object.create(Storage.prototype);
   Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
+  Object.defineProperty(target, '_kind', { value: kind, writable: false, enumerable: false, configurable: true });
+  const isReal = (p) => p === '_data' || p === '_kind' || p === 'constructor' || (p in Storage.prototype);
   return new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return t.getItem(p) !== null; },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys(t) { return t._keys(); },
     getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      if (typeof p !== 'symbol' && !isReal(p)) {
+        const v = t.getItem(p);
+        if (v !== null) return { value: v, writable: true, enumerable: true, configurable: true };
+      }
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore(0);
+globalThis.sessionStorage = _mkStore(1);
 
 globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
@@ -13935,121 +14274,1106 @@ globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candida
 // the first `get` because their request's `onsuccess` is never called. Fire
 // `onsuccess` asynchronously with `null` so reads complete-but-empty, which
 // most libraries treat as a cache miss and fall back to the network.
-function _idbRequest(produceResult) {
-  const req = {
-    result: undefined,
-    error: null,
-    source: null,
-    transaction: null,
-    readyState: 'pending',
-    onsuccess: null,
-    onerror: null,
-    addEventListener(type, fn) { req['on' + type] = fn; },
-    removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
+// IndexedDB. An in-memory engine with real object stores, indexes, key
+// ranges, cursors and transactions. Each database is kept per origin in the
+// browser context's store (ops op_idb_*), so it survives navigation, is seen
+// by other pages of the origin, and is saved with --storage-dir. A bare
+// runtime with no page keeps databases for the life of the realm.
+//
+// Transactions follow the spec's lifecycle: a transaction is active in the
+// task that created it and while its request events (and the microtasks they
+// queue) run; requests are processed one per task; it commits once no
+// requests remain, and abort rolls every change back.
+{
+  const OPS = __obscuraCore.ops;
+  const backed = () => { try { return OPS.op_storage_available(); } catch (_e) { return false; } };
+  const later = (fn) => { if (_scheduleAfter(0, fn) === undefined) Promise.resolve().then(fn); };
+  const err = (name, message) => new DOMException(message, name);
+
+  // ---- keys ----
+  const RANK = { number: 1, date: 2, string: 3, binary: 4, array: 5 };
+  const keyKind = (k) => {
+    if (typeof k === 'number') return 'number';
+    if (typeof k === 'string') return 'string';
+    if (k instanceof Date) return 'date';
+    if (k instanceof ArrayBuffer) return 'binary';
+    if (Array.isArray(k)) return 'array';
+    return null;
   };
-  Promise.resolve().then(() => {
+  // Convert a script value to an internal key, or undefined when invalid.
+  const toKey = (input, seen) => {
+    if (typeof input === 'number') return Number.isNaN(input) ? undefined : input;
+    if (typeof input === 'string') return input;
+    if (input instanceof Date) { const t = input.getTime(); return Number.isNaN(t) ? undefined : new Date(t); }
+    if (input instanceof ArrayBuffer) return input.slice(0);
+    if (ArrayBuffer.isView(input)) return input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
+    if (Array.isArray(input)) {
+      seen = seen || new Set();
+      if (seen.has(input)) return undefined;
+      seen.add(input);
+      const out = [];
+      for (let i = 0; i < input.length; i++) {
+        if (!(i in input)) return undefined;
+        const k = toKey(input[i], seen);
+        if (k === undefined) return undefined;
+        out.push(k);
+      }
+      seen.delete(input);
+      return out;
+    }
+    return undefined;
+  };
+  const requireKey = (input, what) => {
+    const k = toKey(input);
+    if (k === undefined) throw err('DataError', 'Failed to execute \'' + what + '\': The parameter is not a valid key.');
+    return k;
+  };
+  const cmp = (a, b) => {
+    const ka = keyKind(a), kb = keyKind(b);
+    if (ka !== kb) return RANK[ka] < RANK[kb] ? -1 : 1;
+    switch (ka) {
+      case 'number': return a < b ? -1 : a > b ? 1 : 0;
+      case 'date': { const x = a.getTime(), y = b.getTime(); return x < y ? -1 : x > y ? 1 : 0; }
+      case 'string': return a < b ? -1 : a > b ? 1 : 0;
+      case 'binary': {
+        const x = new Uint8Array(a), y = new Uint8Array(b);
+        const n = Math.min(x.length, y.length);
+        for (let i = 0; i < n; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+        return x.length === y.length ? 0 : x.length < y.length ? -1 : 1;
+      }
+      default: {
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++) { const c = cmp(a[i], b[i]); if (c) return c; }
+        return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+      }
+    }
+  };
+  const copyKey = (k) => {
+    if (k instanceof Date) return new Date(k.getTime());
+    if (k instanceof ArrayBuffer) return k.slice(0);
+    if (Array.isArray(k)) return k.map(copyKey);
+    return k;
+  };
+
+  // ---- key paths ----
+  const validPath = (p) => p === '' || p.split('.').every((s) => /^[$A-Z_a-zª-￿][$\wª-￿]*$/.test(s));
+  const checkKeyPath = (kp, what) => {
+    if (kp === null || kp === undefined) return null;
+    if (Array.isArray(kp)) {
+      const arr = kp.map(String);
+      if (!arr.length || !arr.every(validPath)) throw err('SyntaxError', 'Failed to execute \'' + what + '\': The keyPath option is not a valid key path.');
+      return arr;
+    }
+    const s = String(kp);
+    if (!validPath(s)) throw err('SyntaxError', 'Failed to execute \'' + what + '\': The keyPath option is not a valid key path.');
+    return s;
+  };
+  const evalPath = (value, path) => {
+    if (path === '') return { ok: true, v: value };
+    let v = value;
+    for (const part of path.split('.')) {
+      if (v === null || v === undefined) return { ok: false };
+      if (typeof v === 'string' && part === 'length') { v = v.length; continue; }
+      if (typeof v !== 'object' && typeof v !== 'function') return { ok: false };
+      if (!(part in Object(v))) return { ok: false };
+      v = v[part];
+    }
+    return { ok: true, v };
+  };
+  // Key at `kp` in `value`: a key, undefined (absent), or null (present but invalid).
+  const extractKey = (value, kp) => {
+    if (Array.isArray(kp)) {
+      const out = [];
+      for (const p of kp) {
+        const r = evalPath(value, p);
+        if (!r.ok) return null;
+        const k = toKey(r.v);
+        if (k === undefined) return null;
+        out.push(k);
+      }
+      return out;
+    }
+    const r = evalPath(value, kp);
+    if (!r.ok) return undefined;
+    const k = toKey(r.v);
+    return k === undefined ? null : k;
+  };
+  const injectKey = (value, kp, key) => {
+    const parts = kp.split('.');
+    let o = value;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!(parts[i] in o)) o[parts[i]] = {};
+      o = o[parts[i]];
+    }
+    o[parts[parts.length - 1]] = copyKey(key);
+  };
+  const canInject = (value, kp) => {
+    const parts = kp.split('.');
+    let o = value;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (o === null || typeof o !== 'object') return false;
+      if (!(parts[i] in o)) return true;
+      o = o[parts[i]];
+    }
+    return o !== null && typeof o === 'object';
+  };
+
+  // ---- sorted arrays ----
+  // First index whose entry is >= key (by `get`), and whether it is equal.
+  const search = (arr, key, get) => {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (cmp(get(arr[mid]), key) < 0) lo = mid + 1; else hi = mid;
+    }
+    return { i: lo, found: lo < arr.length && cmp(get(arr[lo]), key) === 0 };
+  };
+  const entryCmp = (a, b) => cmp(a.k, b.k) || cmp(a.p, b.p);
+  const searchEntry = (arr, e) => {
+    let lo = 0, hi = arr.length;
+    while (lo < hi) { const mid = (lo + hi) >>> 1; if (entryCmp(arr[mid], e) < 0) lo = mid + 1; else hi = mid; }
+    return lo;
+  };
+
+  // ---- key ranges ----
+  globalThis.IDBKeyRange = class IDBKeyRange {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get lower() { return this._l === undefined ? undefined : copyKey(this._l); }
+    get upper() { return this._u === undefined ? undefined : copyKey(this._u); }
+    includes(key) {
+      const k = requireKey(key, 'includes');
+      return rangeHas(this, k);
+    }
+    static only(v) { const k = requireKey(v, 'only'); return makeRange(k, k, false, false); }
+    static lowerBound(v, open) { return makeRange(requireKey(v, 'lowerBound'), undefined, open, true); }
+    static upperBound(v, open) { return makeRange(undefined, requireKey(v, 'upperBound'), true, open); }
+    static bound(l, u, lo, uo) {
+      const a = requireKey(l, 'bound'), b = requireKey(u, 'bound');
+      const c = cmp(a, b);
+      if (c > 0 || (c === 0 && (lo || uo))) throw err('DataError', "Failed to execute 'bound' on 'IDBKeyRange': The lower key is greater than the upper key.");
+      return makeRange(a, b, lo, uo);
+    }
+    get [Symbol.toStringTag]() { return 'IDBKeyRange'; }
+  };
+  function makeRange(lower, upper, lowerOpen, upperOpen) {
+    const r = Object.create(IDBKeyRange.prototype);
+    Object.defineProperties(r, {
+      _l: { value: lower }, _u: { value: upper },
+      lowerOpen: { value: !!lowerOpen, enumerable: true },
+      upperOpen: { value: !!upperOpen, enumerable: true },
+    });
+    return r;
+  }
+  const rangeHas = (r, k) => {
+    if (r._l !== undefined) { const c = cmp(k, r._l); if (c < 0 || (c === 0 && r.lowerOpen)) return false; }
+    if (r._u !== undefined) { const c = cmp(k, r._u); if (c > 0 || (c === 0 && r.upperOpen)) return false; }
+    return true;
+  };
+  const ALL = makeRange(undefined, undefined, true, true);
+  // A query (key or range) as a range; `nullOk` maps null/undefined to ALL.
+  const toRange = (q, nullOk, what) => {
+    if (q instanceof IDBKeyRange) return q;
+    if (q === null || q === undefined) {
+      if (nullOk) return ALL;
+      throw err('DataError', 'Failed to execute \'' + what + '\': No key or key range specified.');
+    }
+    const k = requireKey(q, what);
+    return makeRange(k, k, false, false);
+  };
+  // Index of the first / last element of `arr` inside range `r`.
+  const lowerIndex = (arr, r, get) => {
+    if (r._l === undefined) return 0;
+    const s = search(arr, r._l, get);
+    let i = s.i;
+    if (r.lowerOpen) while (i < arr.length && cmp(get(arr[i]), r._l) === 0) i++;
+    return i;
+  };
+  const upperIndex = (arr, r, get) => {
+    if (r._u === undefined) return arr.length;
+    const s = search(arr, r._u, get);
+    let i = s.i;
+    if (!r.upperOpen) while (i < arr.length && cmp(get(arr[i]), r._u) === 0) i++;
+    return i;
+  };
+  const K = (rec) => rec.k;
+
+  // ---- serialization for persistence ----
+  const enc = (v, seen) => {
+    if (v === undefined) return { u: 1 };
+    if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
+    if (typeof v === 'number') return Number.isFinite(v) && !Object.is(v, -0) ? v : { n: Object.is(v, -0) ? '-0' : String(v) };
+    if (typeof v === 'bigint') return { bi: v.toString() };
+    if (typeof v !== 'object') return { u: 1 };
+    if (seen.has(v)) return { ref: seen.get(v) };
+    const id = seen.size; seen.set(v, id);
+    if (v instanceof Date) return { d: v.getTime(), id };
+    if (v instanceof RegExp) return { re: v.source, f: v.flags, id };
+    if (v instanceof ArrayBuffer) return { ab: _bytesToBinaryString(new Uint8Array(v)), id };
+    if (ArrayBuffer.isView(v)) return { ta: v.constructor.name, ab: _bytesToBinaryString(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)), id };
+    if (typeof Blob !== 'undefined' && v instanceof Blob) return { blob: _bytesToBinaryString(v._bytes || new Uint8Array()), type: v.type, name: v.name, lm: v.lastModified, id };
+    if (v instanceof Map) return { map: [...v].map(([a, b]) => [enc(a, seen), enc(b, seen)]), id };
+    if (v instanceof Set) return { set: [...v].map((a) => enc(a, seen)), id };
+    if (Array.isArray(v)) return { a: v.map((x) => enc(x, seen)), id };
+    const o = {};
+    for (const key of Object.keys(v)) o[key] = enc(v[key], seen);
+    return { o, id };
+  };
+  const binStr = (s) => { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i); return b; };
+  const dec = (v, refs) => {
+    if (v === null || typeof v !== 'object') return v;
+    if ('u' in v) return undefined;
+    if ('n' in v) return v.n === '-0' ? -0 : Number(v.n);
+    if ('bi' in v) return BigInt(v.bi);
+    if ('ref' in v) return refs[v.ref];
+    let out;
+    if ('d' in v) out = new Date(v.d);
+    else if ('re' in v) out = new RegExp(v.re, v.f);
+    else if ('ta' in v) { const b = binStr(v.ab); const C = globalThis[v.ta] || Uint8Array; out = v.ta === 'DataView' ? new DataView(b.buffer) : new C(b.buffer); }
+    else if ('ab' in v) out = binStr(v.ab).buffer;
+    else if ('blob' in v) {
+      out = v.name !== undefined && typeof File !== 'undefined' ? new File([binStr(v.blob)], v.name, { type: v.type, lastModified: v.lm }) : new Blob([binStr(v.blob)], { type: v.type });
+    } else if ('map' in v) { out = new Map(); refs[v.id] = out; for (const [a, b] of v.map) out.set(dec(a, refs), dec(b, refs)); return out; }
+    else if ('set' in v) { out = new Set(); refs[v.id] = out; for (const a of v.set) out.add(dec(a, refs)); return out; }
+    else if ('a' in v) { out = []; refs[v.id] = out; for (const x of v.a) out.push(dec(x, refs)); return out; }
+    else if ('o' in v) { out = {}; refs[v.id] = out; for (const key of Object.keys(v.o)) out[key] = dec(v.o[key], refs); return out; }
+    else return undefined;
+    refs[v.id] = out;
+    return out;
+  };
+  const encodeDb = (db) => JSON.stringify({
+    version: db.version,
+    stores: [...db.stores.values()].map((s) => ({
+      name: s.name, keyPath: s.keyPath, autoIncrement: s.autoIncrement, current: s.current,
+      records: s.records.map((r) => [enc(r.k, new Map()), enc(r.v, new Map())]),
+      indexes: [...s.indexes.values()].map((ix) => ({ name: ix.name, keyPath: ix.keyPath, unique: ix.unique, multiEntry: ix.multiEntry })),
+    })),
+  });
+  const decodeDb = (name, raw) => {
+    const data = JSON.parse(raw);
+    const db = { name, version: data.version, stores: new Map(), connections: new Set(), txs: [] };
+    for (const s of data.stores) {
+      const store = { name: s.name, keyPath: s.keyPath, autoIncrement: s.autoIncrement, current: s.current, records: [], indexes: new Map() };
+      store.records = s.records.map(([k, v]) => ({ k: dec(k, []), v: dec(v, []) }));
+      for (const ix of s.indexes) {
+        const index = { name: ix.name, keyPath: ix.keyPath, unique: ix.unique, multiEntry: ix.multiEntry, entries: [] };
+        for (const r of store.records) for (const k of multiKeys(index, r.v)) index.entries.push({ k, p: r.k });
+        index.entries.sort(entryCmp);
+        store.indexes.set(ix.name, index);
+      }
+      db.stores.set(s.name, store);
+    }
+    return db;
+  };
+
+  // ---- database registry ----
+  const dbs = new Map();
+  const loadDb = (name) => {
+    if (dbs.has(name)) return dbs.get(name);
+    if (!backed()) return null;
+    const raw = OPS.op_idb_get(name);
+    if (!raw) return null;
+    try { const db = decodeDb(name, raw); dbs.set(name, db); return db; } catch (_e) { return null; }
+  };
+  const persist = (db) => { if (backed() && dbs.get(db.name) === db) OPS.op_idb_put(db.name, encodeDb(db)); };
+
+  // Index keys a value contributes: one key, or with multiEntry each distinct
+  // valid member of an array.
+  const multiKeys = (index, value) => {
+    if (index.multiEntry && !Array.isArray(index.keyPath)) {
+      const r = evalPath(value, index.keyPath);
+      if (!r.ok) return [];
+      if (Array.isArray(r.v)) {
+        const out = [];
+        for (const x of r.v) { const k = toKey(x); if (k !== undefined && !out.some((y) => cmp(k, y) === 0)) out.push(k); }
+        return out;
+      }
+    }
+    const k = extractKey(value, index.keyPath);
+    return k === undefined || k === null ? [] : [k];
+  };
+
+  // ---- store primitives (run while a request executes) ----
+  const recordAt = (store, key) => { const s = search(store.records, key, K); return s.found ? store.records[s.i] : null; };
+  const removeRecord = (store, key) => {
+    const s = search(store.records, key, K);
+    if (!s.found) return false;
+    const rec = store.records[s.i];
+    store.records.splice(s.i, 1);
+    for (const index of store.indexes.values()) {
+      for (const k of multiKeys(index, rec.v)) {
+        const i = searchEntry(index.entries, { k, p: key });
+        if (i < index.entries.length && entryCmp(index.entries[i], { k, p: key }) === 0) index.entries.splice(i, 1);
+      }
+    }
+    return true;
+  };
+  const storeRecord = (store, key, value, noOverwrite) => {
+    const existing = recordAt(store, key);
+    if (existing && noOverwrite) throw err('ConstraintError', 'Key already exists in the object store.');
+    for (const index of store.indexes.values()) {
+      if (!index.unique) continue;
+      for (const k of multiKeys(index, value)) {
+        const s = search(index.entries, k, K);
+        if (s.found && cmp(index.entries[s.i].p, key) !== 0) throw err('ConstraintError', "Unable to add key to index '" + index.name + "': at least one key does not satisfy the uniqueness requirements.");
+      }
+    }
+    if (existing) removeRecord(store, key);
+    const s = search(store.records, key, K);
+    store.records.splice(s.i, 0, { k: key, v: value });
+    for (const index of store.indexes.values()) {
+      for (const k of multiKeys(index, value)) {
+        const e = { k, p: key };
+        index.entries.splice(searchEntry(index.entries, e), 0, e);
+      }
+    }
+    return key;
+  };
+
+  // ---- events ----
+  globalThis.IDBVersionChangeEvent = class IDBVersionChangeEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      const oldVersion = init.oldVersion === undefined ? 0 : Number(init.oldVersion);
+      const newVersion = init.newVersion === undefined ? null : init.newVersion;
+      Object.defineProperties(this, {
+        oldVersion: { get: () => oldVersion, enumerable: true },
+        newVersion: { get: () => newVersion, enumerable: true },
+      });
+    }
+    get [Symbol.toStringTag]() { return 'IDBVersionChangeEvent'; }
+  };
+  // Dispatch along [target, ...ancestors] with capture and bubble phases;
+  // event.target stays the request. Returns whether a listener threw.
+  const dispatch = (path, event) => {
+    let threw = false;
+    event.target = path[0];
+    globalThis.__obscura_markTrusted(event);
+    const invoke = (node, phase, capture) => {
+      event.currentTarget = node;
+      event.eventPhase = phase;
+      const listeners = (_eventTargetListeners.get(node)?.get(event.type) || []).slice();
+      for (const entry of listeners) {
+        if (phase !== 2 && entry.capture !== capture) continue;
+        if (entry.once) _eventTargetRemove(node, event.type, entry.callback, entry.capture);
+        try {
+          if (typeof entry.callback === 'function') entry.callback.call(node, event);
+          else entry.callback.handleEvent.call(entry.callback, event);
+        } catch (e) { threw = true; console.error(e); }
+        if (event._immediatePropagationStopped) return;
+      }
+    };
+    event._dispatching = true;
     try {
-      req.result = produceResult();
-      req.readyState = 'done';
-      if (typeof req.onsuccess === 'function') {
-        try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
-      }
-    } catch (e) {
-      req.error = e; req.readyState = 'done';
-      if (typeof req.onerror === 'function') {
-        try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
-      }
+      for (let i = path.length - 1; i > 0 && !event._propagationStopped; i--) invoke(path[i], 1, true);
+      if (!event._propagationStopped) invoke(path[0], 2, false);
+      if (event.bubbles) for (let i = 1; i < path.length && !event._propagationStopped; i++) invoke(path[i], 3, false);
+    } finally {
+      event._dispatching = false;
+      event.currentTarget = null;
+      event.eventPhase = 0;
     }
-  });
-  return req;
-}
-
-function _idbObjectStore(name) {
-  const data = new Map();
-  return {
-    name,
-    keyPath: null,
-    autoIncrement: false,
-    indexNames: { contains() { return false; }, length: 0, item() { return null; } },
-    transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
-    openCursor() { return _idbRequest(() => null); },
-    openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
-    deleteIndex() {},
+    return threw;
   };
-}
+  const handlerProps = (proto, types) => {
+    for (const type of types) {
+      const slot = Symbol('on' + type);
+      Object.defineProperty(proto, 'on' + type, {
+        get() { return this[slot]?.fn ?? null; },
+        set(fn) {
+          if (this[slot]) _eventTargetRemove(this, type, this[slot].wrapper);
+          this[slot] = null;
+          if (typeof fn === 'function') {
+            const wrapper = function (ev) { return fn.call(this, ev); };
+            this[slot] = { fn, wrapper };
+            _eventTargetAdd(this, type, wrapper);
+          }
+        },
+        enumerable: true, configurable: true,
+      });
+    }
+  };
+  const eventTargetMethods = (proto) => {
+    proto.addEventListener = function (type, cb, opts) { _eventTargetAdd(this, type, cb, opts); };
+    proto.removeEventListener = function (type, cb, opts) { _eventTargetRemove(this, type, cb, opts); };
+    proto.dispatchEvent = function (ev) { return _eventTargetDispatch(this, ev); };
+    Object.setPrototypeOf(proto, globalThis.EventTarget.prototype);
+  };
+  const stringList = (items) => {
+    const arr = [...items].sort();
+    const list = Object.create(DOMStringList.prototype);
+    arr.forEach((v, i) => { list[i] = v; });
+    Object.defineProperty(list, 'length', { value: arr.length });
+    return list;
+  };
+  if (typeof globalThis.DOMStringList === 'undefined') {
+    globalThis.DOMStringList = class DOMStringList {
+      constructor() { throw new TypeError('Illegal constructor'); }
+      item(i) { i >>>= 0; return i < this.length ? this[i] : null; }
+      contains(s) { for (let i = 0; i < this.length; i++) if (this[i] === String(s)) return true; return false; }
+      *[Symbol.iterator]() { for (let i = 0; i < this.length; i++) yield this[i]; }
+      get [Symbol.toStringTag]() { return 'DOMStringList'; }
+    };
+  }
 
-function _idbTransaction(storeNames) {
-  const stores = new Map();
-  const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
-  const tx = {
-    db: null,
-    mode: 'readonly',
-    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
-    onabort: null, oncomplete: null, onerror: null,
-    error: null,
+  // ---- requests ----
+  globalThis.IDBRequest = class IDBRequest {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get result() {
+      if (this._state !== 'done') throw err('InvalidStateError', "Failed to read the 'result' property from 'IDBRequest': The request has not finished.");
+      return this._result;
+    }
+    get error() {
+      if (this._state !== 'done') throw err('InvalidStateError', "Failed to read the 'error' property from 'IDBRequest': The request has not finished.");
+      return this._error;
+    }
+    get source() { return this._source; }
+    get transaction() { return this._tx; }
+    get readyState() { return this._state; }
+    get [Symbol.toStringTag]() { return 'IDBRequest'; }
+  };
+  eventTargetMethods(IDBRequest.prototype);
+  handlerProps(IDBRequest.prototype, ['success', 'error']);
+  globalThis.IDBOpenDBRequest = class IDBOpenDBRequest extends IDBRequest {
+    get [Symbol.toStringTag]() { return 'IDBOpenDBRequest'; }
+  };
+  handlerProps(IDBOpenDBRequest.prototype, ['blocked', 'upgradeneeded']);
+  const newRequest = (Cls, source, tx) => {
+    const r = Object.create(Cls.prototype);
+    r._state = 'pending'; r._result = undefined; r._error = null; r._source = source; r._tx = tx;
+    return r;
+  };
+
+  // ---- transactions ----
+  globalThis.IDBTransaction = class IDBTransaction {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get db() { return this._db; }
+    get mode() { return this._mode; }
+    get durability() { return this._durability; }
+    get error() { return this._error; }
+    get objectStoreNames() { return stringList(this._scope); }
     objectStore(name) {
-      let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
-      s.transaction = tx;
-      return s;
-    },
-    abort() {},
-    commit() {},
-    addEventListener(type, fn) { tx['on' + type] = fn; },
-    removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
-  };
-  Promise.resolve().then(() => {
-    if (typeof tx.oncomplete === 'function') {
-      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
+      if (this._state === 'finished') throw err('InvalidStateError', "Failed to execute 'objectStore' on 'IDBTransaction': The transaction has finished.");
+      name = String(name);
+      if (!this._scope.includes(name) || !this._db._db.stores.has(name)) throw err('NotFoundError', "Failed to execute 'objectStore' on 'IDBTransaction': The specified object store was not found.");
+      let handle = this._stores.get(name);
+      if (!handle) { handle = makeStoreHandle(this, this._db._db.stores.get(name)); this._stores.set(name, handle); }
+      return handle;
     }
-  });
-  return tx;
-}
-
-function _idbDatabase(name, version) {
-  return {
-    name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
-    transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
-      tx.mode = mode || 'readonly';
-      return tx;
-    },
-    close() {},
-    onversionchange: null, onabort: null, onerror: null, onclose: null,
-    addEventListener() {}, removeEventListener() {},
+    abort() {
+      if (this._state === 'finished' || this._state === 'committing') throw err('InvalidStateError', "Failed to execute 'abort' on 'IDBTransaction': The transaction has finished.");
+      abortTx(this, null);
+    }
+    commit() {
+      if (this._state !== 'active') throw err('InvalidStateError', "Failed to execute 'commit' on 'IDBTransaction': The transaction is not active.");
+      this._commitRequested = true;
+    }
+    get [Symbol.toStringTag]() { return 'IDBTransaction'; }
   };
-}
+  eventTargetMethods(IDBTransaction.prototype);
+  handlerProps(IDBTransaction.prototype, ['abort', 'complete', 'error']);
 
-globalThis.indexedDB = {
-  open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
-  },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
-  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
-};
-globalThis.IDBKeyRange = {
-  only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
-  lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
-  upperBound(v, open) { return { lower: null, upper: v, lowerOpen: false, upperOpen: !!open, includes(x) { return open ? x < v : x <= v; } }; },
-  bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
-};
+  const newTx = (dbHandle, scope, mode, durability) => {
+    const tx = Object.create(IDBTransaction.prototype);
+    Object.assign(tx, {
+      _db: dbHandle, _scope: scope, _mode: mode, _durability: durability || 'default', _error: null,
+      _state: 'active', _queue: [], _stores: new Map(), _snapshot: null, _commitRequested: false, _openRequest: null,
+    });
+    dbHandle._txs.add(tx);
+    dbHandle._db.txs.push(tx);
+    later(() => step(tx));
+    return tx;
+  };
+  // Copy-on-write rollback point for a writing transaction.
+  const snapshotFor = (tx) => {
+    if (tx._snapshot || tx._mode === 'readonly') return;
+    const db = tx._db._db;
+    const copyStore = (s) => ({
+      ...s, records: s.records.slice(),
+      indexes: new Map([...s.indexes].map(([n, ix]) => [n, { ...ix, entries: ix.entries.slice() }])),
+    });
+    tx._snapshot = {
+      version: db.version,
+      stores: new Map([...db.stores].map(([n, s]) => [n, s])),
+      copies: new Map([...db.stores].map(([n, s]) => [n, copyStore(s)])),
+    };
+  };
+  const queue = (tx, request, op) => {
+    if (tx._state !== 'active') throw err('TransactionInactiveError', 'The transaction is not active.');
+    request._state = 'pending';
+    tx._queue.push({ request, op });
+    return request;
+  };
+  // A transaction waits for every earlier unfinished one whose scope overlaps
+  // it unless both only read, so writers see a consistent, isolated store.
+  const blocked = (tx) => {
+    for (const t of tx._db._db.txs) {
+      if (t === tx) return false;
+      if (t._state === 'finished') continue;
+      if ((t._mode !== 'readonly' || tx._mode !== 'readonly') && t._scope.some((n) => tx._scope.includes(n))) return true;
+    }
+    return false;
+  };
+  const retire = (tx) => {
+    const db = tx._db._db;
+    db.txs = db.txs.filter((t) => t !== tx);
+    for (const t of db.txs) if (t._waiting) { t._waiting = false; later(() => step(t)); }
+  };
+  const step = (tx) => {
+    if (tx._state === 'finished') return;
+    if (tx._state === 'active') tx._state = 'inactive';
+    if (!tx._started) {
+      if (blocked(tx)) { tx._waiting = true; return; }
+      tx._started = true;
+    }
+    const next = tx._queue.shift();
+    if (next) {
+      const { request, op } = next;
+      let failed = null;
+      try { request._result = op(); } catch (e) { failed = e; }
+      request._state = 'done';
+      tx._state = 'active';
+      if (failed) {
+        request._result = undefined;
+        request._error = failed;
+        const ev = new Event('error', { bubbles: true, cancelable: true });
+        const threw = dispatch([request, tx, tx._db], ev);
+        if (!ev.defaultPrevented || threw) { abortTx(tx, failed); return; }
+      } else if (dispatch([request, tx, tx._db], new Event('success'))) {
+        abortTx(tx, err('AbortError', 'An exception was thrown in an event handler.'));
+        return;
+      }
+      later(() => step(tx));
+      return;
+    }
+    // Nothing queued and the transaction is inactive: commit.
+    tx._state = 'committing';
+    const db = tx._db._db;
+    if (tx._mode !== 'readonly') persist(db);
+    tx._state = 'finished';
+    tx._db._txs.delete(tx);
+    retire(tx);
+    dispatch([tx, tx._db], new Event('complete'));
+    if (tx._onDone) tx._onDone(true);
+  };
+  const abortTx = (tx, error) => {
+    if (tx._state === 'finished') return;
+    const db = tx._db._db;
+    if (tx._snapshot) {
+      db.version = tx._snapshot.version;
+      db.stores = tx._snapshot.stores;
+      for (const [n, copy] of tx._snapshot.copies) {
+        const live = db.stores.get(n);
+        if (live) { live.records = copy.records; live.indexes = copy.indexes; live.current = copy.current; live.name = n; }
+      }
+      for (const [n, s] of db.stores) s.name = n;
+    }
+    tx._error = error || err('AbortError', 'The transaction was aborted, so the request cannot be fulfilled.');
+    tx._state = 'finished';
+    tx._db._txs.delete(tx);
+    retire(tx);
+    const pending = tx._queue.splice(0);
+    later(() => {
+      for (const { request } of pending) {
+        request._state = 'done';
+        request._result = undefined;
+        request._error = err('AbortError', 'The transaction was aborted, so the request cannot be fulfilled.');
+        dispatch([request, tx, tx._db], new Event('error', { bubbles: true, cancelable: true }));
+      }
+      dispatch([tx, tx._db], new Event('abort', { bubbles: true }));
+      if (tx._onDone) tx._onDone(false);
+    });
+  };
+
+  // ---- object stores ----
+  globalThis.IDBObjectStore = class IDBObjectStore {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get name() { return this._s.name; }
+    set name(v) {
+      v = String(v);
+      if (this._tx._mode !== 'versionchange') throw err('InvalidStateError', 'Object stores can only be renamed in a version change transaction.');
+      if (v === this._s.name) return;
+      const db = this._tx._db._db;
+      if (db.stores.has(v)) throw err('ConstraintError', 'An object store with the specified name already exists.');
+      snapshotFor(this._tx);
+      db.stores.delete(this._s.name);
+      this._s.name = v;
+      db.stores.set(v, this._s);
+    }
+    get keyPath() { return Array.isArray(this._s.keyPath) ? this._s.keyPath.slice() : this._s.keyPath; }
+    get autoIncrement() { return this._s.autoIncrement; }
+    get indexNames() { return stringList(this._s.indexes.keys()); }
+    get transaction() { return this._tx; }
+    put(value, key) { return this._write(value, key, false, 'put'); }
+    add(value, key) { return this._write(value, key, true, 'add'); }
+    _write(value, key, noOverwrite, what) {
+      const tx = this._tx, s = this._s;
+      if (tx._mode === 'readonly') throw err('ReadOnlyError', "Failed to execute '" + what + "' on 'IDBObjectStore': The transaction is read-only.");
+      if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute '" + what + "' on 'IDBObjectStore': The transaction is not active.");
+      if (s.keyPath !== null && key !== undefined) throw err('DataError', "Failed to execute '" + what + "' on 'IDBObjectStore': The object store uses in-line keys and the key parameter was provided.");
+      if (s.keyPath === null && key === undefined && !s.autoIncrement) throw err('DataError', "Failed to execute '" + what + "' on 'IDBObjectStore': The object store uses out-of-line keys and has no key generator and the key parameter was not provided.");
+      let explicit = key === undefined ? undefined : requireKey(key, what);
+      let clone;
+      try { clone = structuredClone(value); } catch (e) { throw err('DataCloneError', "Failed to execute '" + what + "' on 'IDBObjectStore': " + (e && e.message || 'value could not be cloned.')); }
+      if (s.keyPath !== null) {
+        const k = extractKey(clone, s.keyPath);
+        if (k === null) throw err('DataError', "Failed to execute '" + what + "' on 'IDBObjectStore': Evaluating the object store's key path yielded a value that is not a valid key.");
+        if (k === undefined) {
+          if (!s.autoIncrement) throw err('DataError', "Failed to execute '" + what + "' on 'IDBObjectStore': Evaluating the object store's key path did not yield a value.");
+          if (!canInject(clone, s.keyPath)) throw err('DataError', "Failed to execute '" + what + "' on 'IDBObjectStore': A generated key could not be inserted into the value.");
+        } else explicit = k;
+      }
+      return queue(tx, newRequest(IDBRequest, this, tx), () => {
+        snapshotFor(tx);
+        let k = explicit;
+        if (k === undefined) {
+          if (s.current > 9007199254740992) throw err('ConstraintError', 'The key generator has reached its maximum value.');
+          k = s.current++;
+          if (s.keyPath !== null) injectKey(clone, s.keyPath, k);
+        } else if (s.autoIncrement && typeof k === 'number' && k >= s.current) {
+          s.current = Math.min(Math.floor(k) + 1, 9007199254740993);
+        }
+        storeRecord(s, k, clone, noOverwrite);
+        return copyKey(k);
+      });
+    }
+    _read(query, what, fn, nullOk) {
+      const tx = this._tx;
+      if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute '" + what + "' on 'IDBObjectStore': The transaction is not active.");
+      const range = toRange(query, nullOk, what);
+      return queue(tx, newRequest(IDBRequest, this, tx), () => fn(range));
+    }
+    get(query) {
+      return this._read(query, 'get', (r) => { const i = lowerIndex(this._s.records, r, K); const rec = this._s.records[i]; return rec && rangeHas(r, rec.k) ? structuredClone(rec.v) : undefined; });
+    }
+    getKey(query) {
+      return this._read(query, 'getKey', (r) => { const i = lowerIndex(this._s.records, r, K); const rec = this._s.records[i]; return rec && rangeHas(r, rec.k) ? copyKey(rec.k) : undefined; });
+    }
+    getAll(query, count) {
+      count = count === undefined ? 0 : count >>> 0;
+      return this._read(query, 'getAll', (r) => {
+        const a = this._s.records, lo = lowerIndex(a, r, K), hi = upperIndex(a, r, K);
+        const out = [];
+        for (let i = lo; i < hi && (!count || out.length < count); i++) out.push(structuredClone(a[i].v));
+        return out;
+      }, true);
+    }
+    getAllKeys(query, count) {
+      count = count === undefined ? 0 : count >>> 0;
+      return this._read(query, 'getAllKeys', (r) => {
+        const a = this._s.records, lo = lowerIndex(a, r, K), hi = upperIndex(a, r, K);
+        const out = [];
+        for (let i = lo; i < hi && (!count || out.length < count); i++) out.push(copyKey(a[i].k));
+        return out;
+      }, true);
+    }
+    count(query) {
+      return this._read(query, 'count', (r) => Math.max(0, upperIndex(this._s.records, r, K) - lowerIndex(this._s.records, r, K)), true);
+    }
+    delete(query) {
+      if (this._tx._mode === 'readonly') throw err('ReadOnlyError', "Failed to execute 'delete' on 'IDBObjectStore': The transaction is read-only.");
+      return this._read(query, 'delete', (r) => {
+        snapshotFor(this._tx);
+        const a = this._s.records;
+        const keys = a.slice(lowerIndex(a, r, K), upperIndex(a, r, K)).map(K);
+        for (const k of keys) removeRecord(this._s, k);
+        return undefined;
+      });
+    }
+    clear() {
+      if (this._tx._mode === 'readonly') throw err('ReadOnlyError', "Failed to execute 'clear' on 'IDBObjectStore': The transaction is read-only.");
+      return this._read(null, 'clear', () => {
+        snapshotFor(this._tx);
+        this._s.records = [];
+        for (const ix of this._s.indexes.values()) ix.entries = [];
+        return undefined;
+      }, true);
+    }
+    openCursor(query, direction) { return openCursor(this, this._tx, query, direction, true, 'openCursor'); }
+    openKeyCursor(query, direction) { return openCursor(this, this._tx, query, direction, false, 'openKeyCursor'); }
+    createIndex(name, keyPath, options = {}) {
+      const tx = this._tx, s = this._s;
+      if (tx._mode !== 'versionchange') throw err('InvalidStateError', "Failed to execute 'createIndex' on 'IDBObjectStore': The database is not running a version change transaction.");
+      if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute 'createIndex' on 'IDBObjectStore': The transaction is not active.");
+      name = String(name);
+      if (s.indexes.has(name)) throw err('ConstraintError', "Failed to execute 'createIndex' on 'IDBObjectStore': An index with the specified name already exists.");
+      const kp = checkKeyPath(keyPath, 'createIndex');
+      if (kp === null) throw err('SyntaxError', "Failed to execute 'createIndex' on 'IDBObjectStore': The keyPath argument contains an invalid key path.");
+      const multiEntry = !!options.multiEntry;
+      if (multiEntry && Array.isArray(kp)) throw err('InvalidAccessError', "Failed to execute 'createIndex' on 'IDBObjectStore': The keyPath argument was an array and the multiEntry option is true.");
+      snapshotFor(tx);
+      const index = { name, keyPath: kp, unique: !!options.unique, multiEntry, entries: [] };
+      for (const rec of s.records) for (const k of multiKeys(index, rec.v)) index.entries.push({ k, p: rec.k });
+      index.entries.sort(entryCmp);
+      if (index.unique) {
+        for (let i = 1; i < index.entries.length; i++) {
+          if (cmp(index.entries[i - 1].k, index.entries[i].k) === 0) {
+            // Existing data violates the constraint: the upgrade aborts.
+            later(() => abortTx(tx, err('ConstraintError', 'Unable to create index: existing data violates the unique constraint.')));
+            break;
+          }
+        }
+      }
+      s.indexes.set(name, index);
+      return this.index(name);
+    }
+    index(name) {
+      name = String(name);
+      const ix = this._s.indexes.get(name);
+      if (!ix) throw err('NotFoundError', "Failed to execute 'index' on 'IDBObjectStore': The specified index was not found.");
+      if (!this._indexes) this._indexes = new Map();
+      let h = this._indexes.get(name);
+      if (!h) { h = Object.create(IDBIndex.prototype); h._ix = ix; h._store = this; this._indexes.set(name, h); }
+      return h;
+    }
+    deleteIndex(name) {
+      const tx = this._tx;
+      if (tx._mode !== 'versionchange') throw err('InvalidStateError', "Failed to execute 'deleteIndex' on 'IDBObjectStore': The database is not running a version change transaction.");
+      name = String(name);
+      if (!this._s.indexes.has(name)) throw err('NotFoundError', "Failed to execute 'deleteIndex' on 'IDBObjectStore': The specified index was not found.");
+      snapshotFor(tx);
+      this._s.indexes.delete(name);
+      if (this._indexes) this._indexes.delete(name);
+    }
+    get [Symbol.toStringTag]() { return 'IDBObjectStore'; }
+  };
+  const makeStoreHandle = (tx, s) => { const h = Object.create(IDBObjectStore.prototype); h._tx = tx; h._s = s; return h; };
+
+  // ---- indexes ----
+  globalThis.IDBIndex = class IDBIndex {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get name() { return this._ix.name; }
+    get objectStore() { return this._store; }
+    get keyPath() { return Array.isArray(this._ix.keyPath) ? this._ix.keyPath.slice() : this._ix.keyPath; }
+    get unique() { return this._ix.unique; }
+    get multiEntry() { return this._ix.multiEntry; }
+    _read(query, what, fn, nullOk) {
+      const tx = this._store._tx;
+      if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute '" + what + "' on 'IDBIndex': The transaction is not active.");
+      const range = toRange(query, nullOk, what);
+      return queue(tx, newRequest(IDBRequest, this, tx), () => fn(range));
+    }
+    _slice(r) { const e = this._ix.entries; return [lowerIndex(e, r, K), upperIndex(e, r, K)]; }
+    get(query) {
+      return this._read(query, 'get', (r) => { const [lo, hi] = this._slice(r); if (lo >= hi) return undefined; const rec = recordAt(this._store._s, this._ix.entries[lo].p); return rec ? structuredClone(rec.v) : undefined; });
+    }
+    getKey(query) {
+      return this._read(query, 'getKey', (r) => { const [lo, hi] = this._slice(r); return lo < hi ? copyKey(this._ix.entries[lo].p) : undefined; });
+    }
+    getAll(query, count) {
+      count = count === undefined ? 0 : count >>> 0;
+      return this._read(query, 'getAll', (r) => {
+        const [lo, hi] = this._slice(r); const out = [];
+        for (let i = lo; i < hi && (!count || out.length < count); i++) { const rec = recordAt(this._store._s, this._ix.entries[i].p); if (rec) out.push(structuredClone(rec.v)); }
+        return out;
+      }, true);
+    }
+    getAllKeys(query, count) {
+      count = count === undefined ? 0 : count >>> 0;
+      return this._read(query, 'getAllKeys', (r) => {
+        const [lo, hi] = this._slice(r); const out = [];
+        for (let i = lo; i < hi && (!count || out.length < count); i++) out.push(copyKey(this._ix.entries[i].p));
+        return out;
+      }, true);
+    }
+    count(query) { return this._read(query, 'count', (r) => { const [lo, hi] = this._slice(r); return Math.max(0, hi - lo); }, true); }
+    openCursor(query, direction) { return openCursor(this, this._store._tx, query, direction, true, 'openCursor'); }
+    openKeyCursor(query, direction) { return openCursor(this, this._store._tx, query, direction, false, 'openKeyCursor'); }
+    get [Symbol.toStringTag]() { return 'IDBIndex'; }
+  };
+
+  // ---- cursors ----
+  globalThis.IDBCursor = class IDBCursor {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get source() { return this._source; }
+    get direction() { return this._dir; }
+    get key() { return this._key === undefined ? undefined : copyKey(this._key); }
+    get primaryKey() { return this._pk === undefined ? undefined : copyKey(this._pk); }
+    get request() { return this._req; }
+    advance(count) {
+      count = Number(count);
+      if (!(count >= 1) || count > 4294967295) throw new TypeError("Failed to execute 'advance' on 'IDBCursor': A count argument with value 0 (zero) was supplied, must be greater than 0.");
+      this._iterate({ count: Math.floor(count) }, 'advance');
+    }
+    continue(key) {
+      let target;
+      if (key !== undefined) {
+        target = requireKey(key, 'continue');
+        const c = this._key === undefined ? 1 : cmp(target, this._key);
+        if (this._dir.startsWith('next') ? c <= 0 : c >= 0) throw err('DataError', "Failed to execute 'continue' on 'IDBCursor': The parameter is less than or equal to this cursor's position.");
+      }
+      this._iterate({ key: target }, 'continue');
+    }
+    continuePrimaryKey(key, primaryKey) {
+      if (!this._isIndex) throw err('InvalidAccessError', "Failed to execute 'continuePrimaryKey' on 'IDBCursor': The cursor's source is not an index.");
+      if (this._dir.endsWith('unique')) throw err('InvalidAccessError', "Failed to execute 'continuePrimaryKey' on 'IDBCursor': The cursor's direction is not 'next' or 'prev'.");
+      this._iterate({ key: requireKey(key, 'continuePrimaryKey'), pk: requireKey(primaryKey, 'continuePrimaryKey') }, 'continuePrimaryKey');
+    }
+    _iterate(target, what) {
+      const tx = this._tx;
+      if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute '" + what + "' on 'IDBCursor': The transaction is not active.");
+      if (!this._gotValue) throw err('InvalidStateError', "Failed to execute '" + what + "' on 'IDBCursor': The cursor is being iterated or has iterated past its end.");
+      this._gotValue = false;
+      queue(tx, this._req, () => advanceCursor(this, target));
+    }
+    update(value) {
+      const tx = this._tx;
+      if (tx._mode === 'readonly') throw err('ReadOnlyError', "Failed to execute 'update' on 'IDBCursor': The record may not be updated inside a read-only transaction.");
+      if (!this._gotValue || !this._withValue) throw err('InvalidStateError', "Failed to execute 'update' on 'IDBCursor': The cursor is being iterated or has iterated past its end.");
+      const store = this._isIndex ? this._source._store : this._source;
+      if (store._s.keyPath !== null) {
+        let clone;
+        try { clone = structuredClone(value); } catch (e) { throw err('DataCloneError', "Failed to execute 'update' on 'IDBCursor': value could not be cloned."); }
+        const k = extractKey(clone, store._s.keyPath);
+        if (k === undefined || k === null || cmp(k, this._pk) !== 0) throw err('DataError', "Failed to execute 'update' on 'IDBCursor': The effective object store of this cursor uses in-line keys and evaluating the key path of the value parameter results in a different value than the cursor's effective key.");
+        return store.put(value);
+      }
+      return store.put(value, this._pk);
+    }
+    delete() {
+      const tx = this._tx;
+      if (tx._mode === 'readonly') throw err('ReadOnlyError', "Failed to execute 'delete' on 'IDBCursor': The record may not be deleted inside a read-only transaction.");
+      if (!this._gotValue || !this._withValue) throw err('InvalidStateError', "Failed to execute 'delete' on 'IDBCursor': The cursor is being iterated or has iterated past its end.");
+      const store = this._isIndex ? this._source._store : this._source;
+      return store.delete(this._pk);
+    }
+    get [Symbol.toStringTag]() { return 'IDBCursor'; }
+  };
+  globalThis.IDBCursorWithValue = class IDBCursorWithValue extends IDBCursor {
+    get value() { return this._value; }
+    get [Symbol.toStringTag]() { return 'IDBCursorWithValue'; }
+  };
+  const DIRS = ['next', 'nextunique', 'prev', 'prevunique'];
+  const openCursor = (source, tx, query, direction, withValue, what) => {
+    direction = direction === undefined ? 'next' : String(direction);
+    if (!DIRS.includes(direction)) throw new TypeError("Failed to execute '" + what + "': The provided value '" + direction + "' is not a valid enum value of type IDBCursorDirection.");
+    if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute '" + what + "': The transaction is not active.");
+    const range = toRange(query, true, what);
+    const c = Object.create((withValue ? IDBCursorWithValue : IDBCursor).prototype);
+    Object.assign(c, {
+      _source: source, _tx: tx, _dir: direction, _range: range, _withValue: withValue,
+      _isIndex: source instanceof IDBIndex, _key: undefined, _pk: undefined, _value: undefined, _gotValue: false,
+    });
+    c._req = newRequest(IDBRequest, source, tx);
+    return queue(tx, c._req, () => advanceCursor(c, { count: 1, first: true }));
+  };
+  // Move the cursor per spec "iterate a cursor"; returns the cursor or null.
+  const advanceCursor = (c, target) => {
+    const forward = c._dir.startsWith('next'), unique = c._dir.endsWith('unique');
+    const r = c._range;
+    let count = target.count || 1;
+    const store = c._isIndex ? c._source._store._s : c._source._s;
+    const list = c._isIndex ? c._source._ix.entries : store.records;
+    const pkOf = c._isIndex ? (e) => e.p : (e) => e.k;
+    let pos = target.first ? undefined : c._key, objPos = target.first ? undefined : c._pk;
+    let found = null;
+    while (count-- > 0) {
+      found = null;
+      if (forward) {
+        let i = pos === undefined ? lowerIndex(list, r, K) : search(list, pos, K).i;
+        for (; i < list.length; i++) {
+          const e = list[i];
+          if (!rangeHas(r, e.k)) { if (r._u !== undefined && cmp(e.k, r._u) > 0) break; continue; }
+          if (target.key !== undefined && cmp(e.k, target.key) < 0) continue;
+          if (target.key !== undefined && target.pk !== undefined && cmp(e.k, target.key) === 0 && cmp(pkOf(e), target.pk) < 0) continue;
+          if (pos !== undefined) {
+            const kc = cmp(e.k, pos);
+            if (kc < 0) continue;
+            if (kc === 0 && (unique || !c._isIndex || cmp(pkOf(e), objPos) <= 0)) continue;
+          }
+          found = e; break;
+        }
+      } else {
+        let i = pos === undefined ? upperIndex(list, r, K) - 1 : search(list, pos, K).i + 1;
+        if (pos !== undefined) while (i < list.length && cmp(list[i].k, pos) === 0) i++;
+        for (i = Math.min(i, list.length - 1); i >= 0; i--) {
+          const e = list[i];
+          if (!rangeHas(r, e.k)) { if (r._l !== undefined && cmp(e.k, r._l) < 0) break; continue; }
+          if (target.key !== undefined && cmp(e.k, target.key) > 0) continue;
+          if (target.key !== undefined && target.pk !== undefined && cmp(e.k, target.key) === 0 && cmp(pkOf(e), target.pk) > 0) continue;
+          if (pos !== undefined) {
+            const kc = cmp(e.k, pos);
+            if (kc > 0) continue;
+            if (kc === 0 && (unique || !c._isIndex || cmp(pkOf(e), objPos) >= 0)) continue;
+          }
+          if (unique) {
+            // prevunique lands on the first entry of the key.
+            let j = i;
+            while (j > 0 && cmp(list[j - 1].k, e.k) === 0) j--;
+            found = list[j];
+          } else found = e;
+          break;
+        }
+      }
+      if (!found) break;
+      pos = found.k; objPos = pkOf(found);
+      target = { count: 0 };
+    }
+    if (!found) {
+      c._key = undefined; c._pk = undefined; c._value = undefined; c._gotValue = false;
+      return null;
+    }
+    c._key = found.k; c._pk = pkOf(found);
+    if (c._withValue) { const rec = recordAt(store, c._pk); c._value = rec ? structuredClone(rec.v) : undefined; }
+    c._gotValue = true;
+    return c;
+  };
+
+  // ---- connections ----
+  globalThis.IDBDatabase = class IDBDatabase {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get name() { return this._db.name; }
+    get version() { return this._version; }
+    get objectStoreNames() { return stringList(this._closed && !this._upgrade ? this._names : this._db.stores.keys()); }
+    createObjectStore(name, options = {}) {
+      const tx = this._upgrade;
+      if (!tx || tx._state === 'finished') throw err('InvalidStateError', "Failed to execute 'createObjectStore' on 'IDBDatabase': The database is not running a version change transaction.");
+      if (tx._state !== 'active') throw err('TransactionInactiveError', "Failed to execute 'createObjectStore' on 'IDBDatabase': The transaction is not active.");
+      name = String(name);
+      if (this._db.stores.has(name)) throw err('ConstraintError', "Failed to execute 'createObjectStore' on 'IDBDatabase': An object store with the specified name already exists.");
+      const kp = checkKeyPath(options === null ? undefined : options.keyPath, 'createObjectStore');
+      const autoIncrement = !!(options && options.autoIncrement);
+      if (autoIncrement && (kp === '' || Array.isArray(kp))) throw err('InvalidAccessError', "Failed to execute 'createObjectStore' on 'IDBDatabase': The autoIncrement option was set but the keyPath option was empty or an array.");
+      snapshotFor(tx);
+      const s = { name, keyPath: kp, autoIncrement, current: 1, records: [], indexes: new Map() };
+      this._db.stores.set(name, s);
+      tx._scope.push(name);
+      return tx.objectStore(name);
+    }
+    deleteObjectStore(name) {
+      const tx = this._upgrade;
+      if (!tx || tx._state === 'finished') throw err('InvalidStateError', "Failed to execute 'deleteObjectStore' on 'IDBDatabase': The database is not running a version change transaction.");
+      name = String(name);
+      if (!this._db.stores.has(name)) throw err('NotFoundError', "Failed to execute 'deleteObjectStore' on 'IDBDatabase': The specified object store was not found.");
+      snapshotFor(tx);
+      this._db.stores.delete(name);
+      tx._stores.delete(name);
+    }
+    transaction(storeNames, mode, options) {
+      if (this._closed) throw err('InvalidStateError', "Failed to execute 'transaction' on 'IDBDatabase': The database connection is closing.");
+      if (this._upgrade && this._upgrade._state !== 'finished') throw err('InvalidStateError', "Failed to execute 'transaction' on 'IDBDatabase': A version change transaction is running.");
+      const names = typeof storeNames === 'string' ? [storeNames] : Array.from(storeNames || [], String);
+      const scope = [...new Set(names)];
+      if (!scope.length) throw err('InvalidAccessError', "Failed to execute 'transaction' on 'IDBDatabase': The storeNames parameter was empty.");
+      for (const n of scope) if (!this._db.stores.has(n)) throw err('NotFoundError', "Failed to execute 'transaction' on 'IDBDatabase': One of the specified object stores was not found.");
+      mode = mode === undefined ? 'readonly' : String(mode);
+      if (mode !== 'readonly' && mode !== 'readwrite') throw new TypeError("Failed to execute 'transaction' on 'IDBDatabase': The provided value '" + mode + "' is not a valid enum value of type IDBTransactionMode.");
+      return newTx(this, scope, mode, options && options.durability);
+    }
+    close() {
+      if (this._closed) return;
+      this._closed = true;
+      this._names = [...this._db.stores.keys()];
+      this._db.connections.delete(this);
+    }
+    get [Symbol.toStringTag]() { return 'IDBDatabase'; }
+  };
+  eventTargetMethods(IDBDatabase.prototype);
+  handlerProps(IDBDatabase.prototype, ['abort', 'close', 'error', 'versionchange']);
+
+  const openDb = (name, version, request) => {
+    let db = loadDb(name);
+    const existed = !!db;
+    if (!db) db = { name, version: 0, stores: new Map(), connections: new Set(), txs: [] };
+    if (version === undefined) version = db.version || 1;
+    if (version < db.version) {
+      request._state = 'done';
+      request._error = err('VersionError', 'The requested version (' + version + ') is less than the existing version (' + db.version + ').');
+      dispatch([request], new Event('error', { bubbles: true, cancelable: true }));
+      return;
+    }
+    if (!existed) dbs.set(name, db);
+    const conn = Object.create(IDBDatabase.prototype);
+    Object.assign(conn, { _db: db, _version: db.version, _closed: false, _upgrade: null, _txs: new Set(), _names: [] });
+    const succeed = () => {
+      request._state = 'done';
+      request._result = conn;
+      request._tx = null;
+      db.connections.add(conn);
+      dispatch([request], new Event('success'));
+    };
+    if (version === db.version) { succeed(); return; }
+    // Other connections get versionchange and should close.
+    for (const other of [...db.connections]) {
+      if (!other._closed) dispatch([other], new IDBVersionChangeEvent('versionchange', { oldVersion: db.version, newVersion: version }));
+    }
+    const open = [...db.connections].filter((c) => !c._closed);
+    if (open.length) dispatch([request], new IDBVersionChangeEvent('blocked', { oldVersion: db.version, newVersion: version }));
+    const oldVersion = db.version;
+    const tx = newTx(conn, [...db.stores.keys()], 'versionchange');
+    snapshotFor(tx);
+    db.version = version;
+    conn._version = version;
+    conn._upgrade = tx;
+    request._tx = tx;
+    request._state = 'done';
+    request._result = conn;
+    tx._state = 'active';
+    // upgradeneeded runs with the version change transaction active.
+    const threw = dispatch([request], new IDBVersionChangeEvent('upgradeneeded', { oldVersion, newVersion: version }));
+    if (threw) abortTx(tx, err('AbortError', 'An exception was thrown in the upgradeneeded handler.'));
+    tx._onDone = (committed) => {
+      conn._upgrade = null;
+      if (committed && !conn._closed) { succeed(); return; }
+      conn._version = oldVersion;
+      if (!existed && oldVersion === 0) dbs.delete(name);
+      conn._closed = true;
+      request._state = 'done';
+      request._result = undefined;
+      request._tx = null;
+      request._error = err('AbortError', 'The version change transaction was aborted.');
+      dispatch([request], new Event('error', { bubbles: true, cancelable: true }));
+    };
+  };
+
+  globalThis.IDBFactory = class IDBFactory {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    open(name, version) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'open' on 'IDBFactory': 1 argument required, but only 0 present.");
+      name = String(name);
+      if (version !== undefined) {
+        version = Number(version);
+        if (!Number.isFinite(version) || version < 1 || version > 9007199254740991) throw new TypeError("Failed to execute 'open' on 'IDBFactory': Value is outside the 'unsigned long long' value range.");
+        version = Math.floor(version);
+      }
+      const request = newRequest(IDBOpenDBRequest, null, null);
+      later(() => openDb(name, version, request));
+      return request;
+    }
+    deleteDatabase(name) {
+      name = String(name);
+      const request = newRequest(IDBOpenDBRequest, null, null);
+      later(() => {
+        const db = loadDb(name);
+        const oldVersion = db ? db.version : 0;
+        if (db) {
+          for (const c of [...db.connections]) if (!c._closed) dispatch([c], new IDBVersionChangeEvent('versionchange', { oldVersion, newVersion: null }));
+          dbs.delete(name);
+        }
+        if (backed()) OPS.op_idb_delete(name);
+        request._state = 'done';
+        request._result = undefined;
+        dispatch([request], new IDBVersionChangeEvent('success', { oldVersion, newVersion: null }));
+      });
+      return request;
+    }
+    databases() {
+      const names = new Set(dbs.keys());
+      if (backed()) for (const n of JSON.parse(OPS.op_idb_names())) names.add(n);
+      const out = [];
+      for (const n of names) { const db = loadDb(n); if (db && db.version > 0) out.push({ name: n, version: db.version }); }
+      return Promise.resolve(out);
+    }
+    cmp(a, b) {
+      if (arguments.length < 2) throw new TypeError("Failed to execute 'cmp' on 'IDBFactory': 2 arguments required.");
+      return cmp(requireKey(a, 'cmp'), requireKey(b, 'cmp'));
+    }
+    get [Symbol.toStringTag]() { return 'IDBFactory'; }
+  };
+  const factory = Object.create(IDBFactory.prototype);
+  Object.defineProperty(globalThis, 'indexedDB', { get: () => factory, enumerable: true, configurable: true });
+  for (const C of [IDBFactory, IDBDatabase, IDBTransaction, IDBObjectStore, IDBIndex, IDBCursor, IDBCursorWithValue,
+    IDBKeyRange, IDBRequest, IDBOpenDBRequest, IDBVersionChangeEvent, DOMStringList]) _markNative(C);
+}
 
 globalThis.caches = {
   open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
@@ -15079,43 +16403,196 @@ if (typeof EventSource === 'undefined') {
   };
 }
 
-if (typeof WebSocket === 'undefined') {
+// WebSocket over a real connection (ws_ops.rs): the page's cookies, user
+// agent, proxy and private-network policy apply, and in stealth builds the
+// handshake carries the Chrome TLS fingerprint. Messages arrive as trusted
+// events while the page's event loop runs.
+globalThis.CloseEvent = class CloseEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    const wasClean = !!init.wasClean, code = (init.code || 0) & 0xffff, reason = init.reason === undefined ? '' : String(init.reason);
+    Object.defineProperties(this, {
+      wasClean: { get: () => wasClean, enumerable: true },
+      code: { get: () => code, enumerable: true },
+      reason: { get: () => reason, enumerable: true },
+    });
+  }
+  get [Symbol.toStringTag]() { return 'CloseEvent'; }
+};
+_markNative(globalThis.CloseEvent);
+{
+  const wsState = new WeakMap();
+  const stateFor = (ws) => {
+    const st = wsState.get(ws);
+    if (!st) throw new TypeError('Illegal invocation');
+    return st;
+  };
+  const fire = (ws, ev) => { _eventTargetDispatch(ws, globalThis.__obscura_markTrusted(ev)); };
+  const TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  const utf8Length = (s) => new TextEncoder().encode(s).length;
+  const toBytes = (data) => {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    return null;
+  };
+  const closeWith = (ws, st, code, reason, clean) => {
+    if (st.readyState === 3) return;
+    st.readyState = 3;
+    if (!clean) fire(ws, new Event('error'));
+    fire(ws, new CloseEvent('close', { wasClean: clean, code, reason }));
+  };
+  const pump = async (ws, st) => {
+    for (;;) {
+      let ev;
+      try { ev = JSON.parse(await __obscuraCore.ops.op_ws_recv(st.id)); } catch (_e) { ev = { t: 'close', code: 1006, reason: '', clean: false }; }
+      if (ev.t === 'close') { closeWith(ws, st, ev.code, ev.reason, !!ev.clean); return; }
+      if (st.readyState !== 1) continue;
+      let data = ev.d;
+      if (ev.t === 'binary') {
+        const bytes = _base64ToUint8Array(ev.d);
+        data = st.binaryType === 'arraybuffer' ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : new Blob([bytes]);
+      }
+      fire(ws, new MessageEvent('message', { data, origin: st.origin }));
+    }
+  };
+
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
-      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
-      if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
-        throw new DOMException(
-          "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
-          'SyntaxError'
-        );
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+      let parsed;
+      try { parsed = new URL(String(url), globalThis.document?.baseURI || globalThis.location?.href); }
+      catch (_e) { throw new DOMException("Failed to construct 'WebSocket': The URL '" + url + "' is invalid.", 'SyntaxError'); }
+      if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+      else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+      if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        throw new DOMException("Failed to construct 'WebSocket': The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '" + parsed.protocol.slice(0, -1) + "' is not allowed.", 'SyntaxError');
       }
-      this.url = url;
-      this.readyState = 0; // CONNECTING
-      this.bufferedAmount = 0;
-      this.binaryType = 'blob';
-      this.extensions = '';
-      this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
-      this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
-      _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
+      if (parsed.hash) {
+        throw new DOMException("Failed to construct 'WebSocket': The URL contains a fragment identifier ('" + parsed.hash.slice(1) + "'). Fragment identifiers are not allowed in WebSocket URLs.", 'SyntaxError');
+      }
+      const list = protocols === undefined ? [] : (typeof protocols === 'string' || !protocols?.[Symbol.iterator]) ? [String(protocols)] : Array.from(protocols, String);
+      const seen = new Set();
+      for (const p of list) {
+        if (!TOKEN.test(p) || seen.has(p)) {
+          throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + p + "' is invalid.", 'SyntaxError');
+        }
+        seen.add(p);
+      }
+      const st = {
+        url: parsed.href, readyState: 0, protocol: '', extensions: '', binaryType: 'blob',
+        bufferedAmount: 0, id: 0, handlers: {}, wrappers: {}, closeRequested: null,
+        origin: parsed.origin.replace(/^http/, 'ws'), sendChain: null,
+      };
+      wsState.set(this, st);
+      const origin = globalThis.location?.origin || 'null';
+      __obscuraCore.ops.op_ws_open(st.url, JSON.stringify(list), origin).then((raw) => {
+        const info = JSON.parse(raw);
+        st.id = info.id;
+        if (st.closeRequested) {
+          // close() during CONNECTING fails the connection (error + 1006).
+          __obscuraCore.ops.op_ws_close(st.id, 1000, '');
+          closeWith(this, st, 1006, '', false);
+          return;
+        }
+        st.protocol = info.protocol || '';
+        st.extensions = info.extensions || '';
+        st.readyState = 1;
+        fire(this, new Event('open'));
+        pump(this, st);
+      }, (err) => {
+        try { console.error("WebSocket connection to '" + st.url + "' failed: " + String(err && err.message || err)); } catch (_e) {}
+        closeWith(this, st, 1006, '', false);
       });
     }
-    send(data) { /* drop; no real socket */ }
-    close(code, reason) {
-      if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+    get url() { return stateFor(this).url; }
+    get readyState() { return stateFor(this).readyState; }
+    get bufferedAmount() { return stateFor(this).bufferedAmount; }
+    get extensions() { return stateFor(this).extensions; }
+    get protocol() { return stateFor(this).protocol; }
+    get binaryType() { return stateFor(this).binaryType; }
+    set binaryType(v) { if (v === 'blob' || v === 'arraybuffer') stateFor(this).binaryType = v; }
+    send(data) {
+      const st = stateFor(this);
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'send' on 'WebSocket': 1 argument required, but only 0 present.");
+      if (st.readyState === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+      const deliver = (payload) => {
+        if (st.readyState !== 1) return;
+        if (typeof payload === 'string') __obscuraCore.ops.op_ws_send_text(st.id, payload);
+        else __obscuraCore.ops.op_ws_send_binary(st.id, payload);
+      };
+      let payload;
+      if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        payload = data.arrayBuffer().then((buf) => new Uint8Array(buf));
+      } else {
+        payload = toBytes(data);
+        if (payload === null) payload = String(data);
+      }
+      if (st.readyState !== 1) {
+        st.bufferedAmount += typeof payload === 'string' ? utf8Length(payload) : (payload.byteLength || 0);
+        return;
+      }
+      // A Blob is read asynchronously; keep later sends behind it in order.
+      if (payload instanceof Promise || st.sendChain) {
+        const prev = st.sendChain || Promise.resolve();
+        const chain = prev.then(() => payload).then(deliver, () => {});
+        st.sendChain = chain;
+        chain.then(() => { if (st.sendChain === chain) st.sendChain = null; });
+        return;
+      }
+      deliver(payload);
     }
-    static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+    close(code, reason) {
+      const st = stateFor(this);
+      if (code !== undefined) {
+        code = Number(code) & 0xffff;
+        if (code !== 1000 && (code < 3000 || code > 4999)) {
+          throw new DOMException("Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. " + code + " is neither.", 'InvalidAccessError');
+        }
+      }
+      reason = reason === undefined ? '' : String(reason);
+      if (utf8Length(reason) > 123) {
+        throw new DOMException("Failed to execute 'close' on 'WebSocket': The close reason must not be greater than 123 UTF-8 bytes.", 'SyntaxError');
+      }
+      if (st.readyState >= 2) return;
+      if (st.readyState === 0) { st.readyState = 2; st.closeRequested = true; return; }
+      st.readyState = 2;
+      __obscuraCore.ops.op_ws_close(st.id, code === undefined ? 1000 : code, reason);
+    }
+    addEventListener(type, callback, options) { stateFor(this); _eventTargetAdd(this, type, callback, options); }
+    removeEventListener(type, callback, options) { stateFor(this); _eventTargetRemove(this, type, callback, options); }
+    dispatchEvent(event) { stateFor(this); return _eventTargetDispatch(this, event); }
+    get [Symbol.toStringTag]() { return 'WebSocket'; }
   };
+  for (const type of ['open', 'message', 'error', 'close']) {
+    Object.defineProperty(WebSocket.prototype, 'on' + type, {
+      get() { return stateFor(this).handlers[type] ?? null; },
+      set(fn) {
+        const st = stateFor(this);
+        fn = typeof fn === 'function' || (fn && typeof fn === 'object') ? fn : null;
+        const had = st.handlers[type];
+        st.handlers[type] = fn;
+        if (fn && !had) {
+          st.wrappers[type] = (ev) => {
+            const h = st.handlers[type];
+            if (typeof h === 'function') return h.call(this, ev);
+          };
+          _eventTargetAdd(this, type, st.wrappers[type]);
+        } else if (!fn && had) {
+          _eventTargetRemove(this, type, st.wrappers[type]);
+          st.wrappers[type] = null;
+        }
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  const consts = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+  for (const [k, v] of Object.entries(consts)) {
+    Object.defineProperty(WebSocket, k, { value: v, enumerable: true });
+    Object.defineProperty(WebSocket.prototype, k, { value: v, enumerable: true });
+  }
+  Object.setPrototypeOf(WebSocket.prototype, globalThis.EventTarget.prototype);
+  _markNative(WebSocket);
 }
 
 if (typeof BroadcastChannel === 'undefined') {

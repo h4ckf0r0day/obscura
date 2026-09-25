@@ -7,7 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util"]
 
 [dependencies]
 reqwest = { workspace = true }
@@ -21,7 +21,15 @@ async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
 psl = "2"
-futures-util = { version = "0.3", optional = true }
+futures-util = { version = "0.3", features = ["sink"] }
+# Page WebSocket transport (websocket.rs). TLS is rustls pinned to the ring
+# provider, the same provider reqwest uses, so only one CryptoProvider exists.
+base64 = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-socks = "0.5"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
 # wreq and wreq-util are pre-release crates whose API changes between rc builds
 # (CertStore moved out of `tls`, `cert_store` renamed to `tls_cert_store`, the
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
@@ -44,7 +52,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # Enabling it on other platforms produces unresolved `build_script_main_*`
 # symbols at link time (see issue #39).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wreq = { version = "=6.0.0-rc.29", optional = true, features = ["prefix-symbols", "socks", "stream", "gzip", "brotli", "deflate", "zstd"] }
+wreq = { version = "=6.0.0-rc.29", optional = true, features = ["prefix-symbols", "socks", "stream", "gzip", "brotli", "deflate", "zstd", "ws"] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
-wreq = { version = "=6.0.0-rc.29", optional = true, features = ["socks", "stream", "gzip", "brotli", "deflate", "zstd"] }
+wreq = { version = "=6.0.0-rc.29", optional = true, features = ["socks", "stream", "gzip", "brotli", "deflate", "zstd", "ws"] }

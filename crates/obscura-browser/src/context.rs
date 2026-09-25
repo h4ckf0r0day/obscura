@@ -1,11 +1,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
+use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache, WebStorage};
+
+/// File under `storage_dir` holding localStorage and IndexedDB.
+pub const WEB_STORAGE_FILE: &str = "web_storage.json";
 
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
+    /// Backs `localStorage` and IndexedDB for every page in this context,
+    /// keyed by origin. Persisted next to cookies when `storage_dir` is set.
+    pub web_storage: Arc<WebStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -98,6 +104,16 @@ impl BrowserContext {
             }
         }
 
+        let web_storage = Arc::new(WebStorage::new());
+        if let Some(ref dir) = storage_dir {
+            let path = dir.join(WEB_STORAGE_FILE);
+            if path.exists() {
+                if let Err(e) = web_storage.load_from_file(&path) {
+                    tracing::warn!("Failed to load web storage from {}: {}", path.display(), e);
+                }
+            }
+        }
+
         // Per-context proxy rotation: an explicit proxy (CLI --proxy / config)
         // always wins; otherwise rotate the next IP from the pool
         // (OBSCURA_PROXIES). Empty pool ⇒ None ⇒ direct connection.
@@ -131,6 +147,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            web_storage,
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -185,9 +202,18 @@ impl BrowserContext {
             *guard = self.user_agent.clone();
         }
 
+        // A persistent copy writes to the same storage directory, so it shares
+        // the template's store rather than racing it with a divergent copy.
+        let web_storage = if persistent {
+            self.web_storage.clone()
+        } else {
+            Arc::new(WebStorage::new())
+        };
+
         BrowserContext {
             id,
             cookie_jar,
+            web_storage,
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),
@@ -203,7 +229,8 @@ impl BrowserContext {
         }
     }
 
-    /// Persist cookies to disk if storage_dir is configured.
+    /// Persist cookies, localStorage and IndexedDB to disk if storage_dir is
+    /// configured.
     /// Called during graceful shutdown.
     pub fn save_cookies(&self) {
         if let Some(ref dir) = self.storage_dir {
@@ -213,6 +240,10 @@ impl BrowserContext {
                 tracing::warn!("Failed to save cookies to {}: {}", cookie_path.display(), e);
             } else {
                 tracing::info!("Saved cookies to {}", cookie_path.display());
+            }
+            let storage_path = dir.join(WEB_STORAGE_FILE);
+            if let Err(e) = self.web_storage.save_to_file(&storage_path) {
+                tracing::warn!("Failed to save web storage to {}: {}", storage_path.display(), e);
             }
         }
     }

@@ -7,6 +7,7 @@ pub mod ops;
 pub mod runtime;
 pub mod v8_flags;
 mod write_stream;
+mod ws_ops;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
 pub use v8_flags::set_v8_flags;

@@ -1382,7 +1382,7 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
         else {
             continue;
         };
-        let (frame_id, page_url, network_events) = {
+        let (frame_id, page_url, network_events, ws_events) = {
             let Some(page) = ctx.get_page_mut(&page_id) else {
                 continue;
             };
@@ -1391,8 +1391,16 @@ fn sync_live_page_network_events(ctx: &mut CdpContext) {
                 page.frame_id.clone(),
                 page.url_string(),
                 page.network_events.drain(..).collect::<Vec<_>>(),
+                page.take_websocket_events(),
             )
         };
+        for (method, params) in ws_events {
+            ctx.pending_events.push(crate::types::CdpEvent {
+                method,
+                params,
+                session_id: session_id.clone(),
+            });
+        }
         if network_events.is_empty() {
             continue;
         }

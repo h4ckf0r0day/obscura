@@ -936,6 +936,8 @@ impl ObscuraJsRuntime {
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let parent = self.state.borrow();
         frame.cookie_jar = parent.cookie_jar.clone();
+        frame.local_storage = parent.local_storage.clone();
+        frame.session_storage = parent.session_storage.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
         frame.encoding = parent.encoding.clone();
@@ -1149,6 +1151,16 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    pub fn set_web_storage(
+        &self,
+        local: std::sync::Arc<obscura_net::WebStorage>,
+        session: std::sync::Arc<obscura_net::WebStorage>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.local_storage = Some(local);
+        state.session_storage = Some(session);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
@@ -3944,6 +3956,10 @@ impl ObscuraJsRuntime {
     /// Drain the network events recorded for script-initiated requests
     /// (fetch/XHR/dynamic resource). The Page moves these into its own
     /// network_events so the CDP layer emits Network events for them (#406).
+    pub fn take_ws_cdp_events(&self) -> Vec<(String, serde_json::Value)> {
+        std::mem::take(&mut self.state.borrow_mut().ws_cdp_events)
+    }
+
     pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
         std::mem::take(&mut self.state.borrow_mut().js_network_events)
     }

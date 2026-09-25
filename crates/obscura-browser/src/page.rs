@@ -229,6 +229,8 @@ pub struct Page {
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
+    /// Backing store for this tab's `sessionStorage`, kept across navigations.
+    pub session_storage: Arc<obscura_net::WebStorage>,
     pub context: Arc<BrowserContext>,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
@@ -1076,6 +1078,7 @@ impl Page {
         };
 
         Page {
+            session_storage: Arc::new(obscura_net::WebStorage::new()),
             id,
             frame_id,
             url: None,
@@ -1793,6 +1796,7 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_web_storage(self.context.web_storage.clone(), self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -4104,6 +4108,12 @@ impl Page {
     /// responseReceived for them (issue #406). Idempotent: the runtime's queue
     /// is drained, so calling this repeatedly does not duplicate events. The
     /// fetch-{N} request id is preserved so Network.getResponseBody resolves.
+    /// CDP `Network.webSocket*` events queued by page WebSockets since the
+    /// last call, as (method, params).
+    pub fn take_websocket_events(&mut self) -> Vec<(String, serde_json::Value)> {
+        self.js.as_ref().map(|js| js.take_ws_cdp_events()).unwrap_or_default()
+    }
+
     pub fn sync_js_network_events(&mut self) {
         let events = match self.js.as_ref() {
             Some(js) => js.take_js_network_events(),

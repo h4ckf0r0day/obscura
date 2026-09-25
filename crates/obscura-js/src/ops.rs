@@ -119,6 +119,10 @@ pub struct ObscuraState {
     pub referrer: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    /// Context-wide, origin-keyed store behind `localStorage` and IndexedDB.
+    pub local_storage: Option<Arc<obscura_net::WebStorage>>,
+    /// Page (tab) store behind `sessionStorage`; survives same-tab navigation.
+    pub session_storage: Option<Arc<obscura_net::WebStorage>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -155,6 +159,9 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    /// CDP Network.webSocket* events (method, params) from page WebSockets,
+    /// drained by the CDP layer. Capped like `js_network_events`.
+    pub ws_cdp_events: Vec<(String, serde_json::Value)>,
     // Frame documents that have been fetched and are waiting for a realm.
     // Building one needs the whole runtime, which an op cannot reach, so
     // `op_frame_document_ready` queues here and the Page drains it between
@@ -351,6 +358,8 @@ impl ObscuraState {
             referrer: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            local_storage: None,
+            session_storage: None,
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -370,6 +379,7 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            ws_cdp_events: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
             frame_id_counter: 0,
@@ -5034,6 +5044,122 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+/// Web Storage area for the calling realm: `kind` 0 is localStorage
+/// (context-wide), 1 is sessionStorage (this tab). The origin comes from the
+/// realm's own document URL, never from script, so a page cannot read another
+/// origin's area.
+fn storage_area(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    kind: u32,
+) -> Option<(Arc<obscura_net::WebStorage>, String)> {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let store = if kind == 0 {
+        gs.local_storage.clone()
+    } else {
+        gs.session_storage.clone()
+    }?;
+    let origin = url::Url::parse(&gs.url)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| "null".to_string());
+    Some((store, origin))
+}
+
+/// JSON-encoded value, or `null` when the key is absent.
+#[op2]
+#[string]
+fn op_storage_get(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    kind: u32,
+    #[string] key: String,
+) -> String {
+    storage_area(scope, state, kind)
+        .and_then(|(store, origin)| store.get(&origin, &key))
+        .map(|v| serde_json::Value::String(v).to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// False when the write would exceed the origin's quota.
+#[op2(fast)]
+fn op_storage_set(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    kind: u32,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> bool {
+    match storage_area(scope, state, kind) {
+        Some((store, origin)) => store.set(&origin, key, value),
+        None => true,
+    }
+}
+
+#[op2(fast)]
+fn op_storage_remove(scope: &mut v8::PinScope, state: &OpState, kind: u32, #[string] key: &str) {
+    if let Some((store, origin)) = storage_area(scope, state, kind) {
+        store.remove(&origin, key);
+    }
+}
+
+#[op2(fast)]
+fn op_storage_clear(scope: &mut v8::PinScope, state: &OpState, kind: u32) {
+    if let Some((store, origin)) = storage_area(scope, state, kind) {
+        store.clear(&origin);
+    }
+}
+
+/// JSON array of the area's keys in storage order.
+#[op2]
+#[string]
+fn op_storage_keys(scope: &mut v8::PinScope, state: &OpState, kind: u32) -> String {
+    let keys = storage_area(scope, state, kind)
+        .map(|(store, origin)| store.keys(&origin))
+        .unwrap_or_default();
+    serde_json::to_string(&keys).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// IndexedDB snapshot for `name` in the calling realm's origin, or "".
+#[op2]
+#[string]
+fn op_idb_get(scope: &mut v8::PinScope, state: &OpState, #[string] name: String) -> String {
+    storage_area(scope, state, 0)
+        .and_then(|(store, origin)| store.idb_get(&origin, &name))
+        .unwrap_or_default()
+}
+
+#[op2(fast)]
+fn op_idb_put(scope: &mut v8::PinScope, state: &OpState, #[string] name: &str, #[string] snapshot: &str) {
+    if let Some((store, origin)) = storage_area(scope, state, 0) {
+        store.idb_put(&origin, name, snapshot);
+    }
+}
+
+#[op2(fast)]
+fn op_idb_delete(scope: &mut v8::PinScope, state: &OpState, #[string] name: &str) {
+    if let Some((store, origin)) = storage_area(scope, state, 0) {
+        store.idb_delete(&origin, name);
+    }
+}
+
+/// JSON array of the origin's database names.
+#[op2]
+#[string]
+fn op_idb_names(scope: &mut v8::PinScope, state: &OpState) -> String {
+    let names = storage_area(scope, state, 0)
+        .map(|(store, origin)| store.idb_names(&origin))
+        .unwrap_or_default();
+    serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Whether the realm has a backing store. Without one (a bare runtime with no
+/// page), the JS shim keeps a realm-local map instead.
+#[op2(fast)]
+fn op_storage_available(scope: &mut v8::PinScope, state: &OpState) -> bool {
+    storage_area(scope, state, 0).is_some()
+}
+
 #[op2]
 #[string]
 fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
@@ -6095,6 +6221,21 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_fetch_url(),
         op_get_cookies(),
+        op_storage_get(),
+        op_storage_set(),
+        op_storage_remove(),
+        op_storage_clear(),
+        op_storage_keys(),
+        op_storage_available(),
+        op_idb_get(),
+        op_idb_put(),
+        op_idb_delete(),
+        op_idb_names(),
+        crate::ws_ops::op_ws_open(),
+        crate::ws_ops::op_ws_send_text(),
+        crate::ws_ops::op_ws_send_binary(),
+        crate::ws_ops::op_ws_close(),
+        crate::ws_ops::op_ws_recv(),
         op_set_cookie(),
         op_navigate(),
         op_frame_document_ready(),
