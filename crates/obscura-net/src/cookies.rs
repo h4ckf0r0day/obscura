@@ -640,6 +640,14 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     let month = months.iter().position(|m| parts[2].to_lowercase().starts_with(m))
         .ok_or(())? as u64 + 1;
     let year: u64 = parts[3].parse().map_err(|_| ())?;
+    // Bound the year before it drives `for y in 1970..year`. An unbounded year
+    // from a hostile Set-Cookie header would run this loop for billions of
+    // iterations (CPU DoS, #1046). Cookie expiries never legitimately exceed
+    // year 9999; a larger value is rejected and the cookie becomes a session
+    // cookie rather than stalling the request.
+    if year > 9999 {
+        return Err(());
+    }
 
     let time_parts: Vec<&str> = parts[4].split(':').collect();
     let hour: u64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -794,6 +802,20 @@ mod tests {
 
         let header = jar.get_cookie_header_same_site(&url);
         assert!(header.contains("session=abc123"));
+    }
+
+    // #1046: the Expires year is parsed into a u64 and drives `for y in
+    // 1970..year`. An unbounded year from a malicious Set-Cookie header turns
+    // date parsing into a multi-billion-iteration CPU DoS, so the parser must
+    // reject out-of-range years rather than loop over them.
+    #[test]
+    fn parse_http_date_rejects_out_of_range_year() {
+        // Just past the accepted maximum: small enough that the pre-fix loop
+        // still finishes and returns Ok (proving the missing bound), while the
+        // fix rejects it outright.
+        assert_eq!(parse_http_date("Thu, 01 Jan 100000 00:00:00 GMT"), Err(()));
+        // A realistic future expiry still parses.
+        assert!(parse_http_date("Thu, 01 Jan 2035 00:00:00 GMT").is_ok());
     }
 
     // RFC 6265 §5.3: document.cookie (a non-HTTP API) must not overwrite or
