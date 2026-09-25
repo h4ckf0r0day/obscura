@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>forced line break geometry</title>
+  <style>
+    html, body { margin: 0; }
+    .column {
+      position: absolute;
+      top: 0;
+      width: 120px;
+      color: transparent;
+      font: 16px/20px "Liberation Sans", sans-serif;
+    }
+    .marker { width: 100px; height: 20px; }
+    .pure { left: 0; }
+    .trailing { left: 150px; }
+    .break-only { left: 300px; }
+    .mixed { left: 450px; }
+    .flex { left: 600px; display: flex; flex-direction: column; }
+    .tight {
+      left: 750px;
+      font-size: 20px;
+      line-height: 10px;
+    }
+    .pure .marker { background: #087f5b; }
+    .trailing .marker { background: #1971c2; }
+    .break-only .marker { background: #e8590c; }
+    .mixed .marker { background: #7048e8; }
+    .flex .marker { background: #c2255c; }
+    .tight .marker { background: #2b8a3e; }
+  </style>
+</head>
+<body>
+  <div class="column pure"><br><div class="marker"></div></div>
+  <div class="column trailing">Ag<br><br><div class="marker"></div></div>
+  <div class="column break-only"><br><br><br><div class="marker"></div></div>
+  <div class="column mixed"><span>Ag</span><br><br><div style="height: 20px"></div><div class="marker"></div></div>
+  <div class="column flex"><div style="height: 10px"></div><br><div class="marker" style="height: 10px"></div></div>
+  <div class="column tight"><br><br><div class="marker"></div></div>
+</body>
+</html>

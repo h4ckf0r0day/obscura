@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { margin: 0 }
+  table { table-layout: fixed; width: 300px }
+  td { height: 30px; padding: 0; border: 0 }
+  .collapsed { border-collapse: collapse }
+  .separate { margin-top: 40px; border: 4px solid #212529; border-spacing: 10px 0 }
+  .content-box { box-sizing: content-box }
+  .first { width: 50px }
+  .long { color: transparent; white-space: nowrap }
+</style>
+<table class="collapsed">
+  <tr><td class="first" style="background:#e03131"></td><td style="background:#1971c2"></td></tr>
+  <tr><td class="long" style="background:#2f9e44">XXXXXXXXXXXXXXXXXXXXXXXX</td><td style="background:#f08c00"></td></tr>
+</table>
+<table class="separate">
+  <tr><td class="first" style="background:#862e9c"></td><td style="background:#15aabf"></td></tr>
+  <tr><td class="long" style="background:#c2255c">XXXXXXXXXXXXXXXXXXXXXXXX</td><td style="background:#fab005"></td></tr>
+</table>
+<table class="separate content-box">
+  <tr><td class="first" style="background:#5f3dc4"></td><td style="background:#66a80f"></td></tr>
+</table>

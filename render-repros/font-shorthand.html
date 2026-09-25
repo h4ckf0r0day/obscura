@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>font shorthand geometry</title>
+  <style>
+    html, body { margin: 0; }
+    :root { --hero-font: italic 700 40px/50px "Arial", sans-serif; }
+    #hero {
+      font: var(--hero-font);
+      width: 5em;
+      height: 2em;
+      background: #1971c2;
+    }
+    #reset {
+      font-style: italic;
+      font-weight: bold;
+      line-height: 3;
+      font: 20px/30px sans-serif;
+      width: 10em;
+      height: 2em;
+      background: #e8590c;
+    }
+  </style>
+</head>
+<body>
+  <div id="hero"></div>
+  <div id="reset"></div>
+</body>
+</html>

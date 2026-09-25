@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Block whitespace margin collapse</title>
+  <style>
+    html, body { margin: 0; }
+    .first {
+      height: 20px;
+      margin-bottom: 30px;
+      background: #087f5b;
+    }
+    .second {
+      display: grid;
+      height: 20px;
+      margin-top: 40px;
+      background: #1971c2;
+    }
+  </style>
+</head>
+<body>
+  <div class="first"></div>
+  <div class="second"></div>
+</body>
+</html>

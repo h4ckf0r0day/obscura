@@ -51,7 +51,15 @@ async fn main() {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let context = Arc::new(BrowserContext::with_options("worker".to_string(), proxy, false));
+    let stealth = std::env::var("OBSCURA_STEALTH")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
+    context.obey_robots = obey_robots;
+    let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
 
     let stdin = tokio::io::stdin();
@@ -98,7 +106,22 @@ async fn main() {
                 }
             }
             WorkerCommand::Evaluate { expression } => {
-                let result = page.evaluate(&expression);
+                // Await promise-returning expressions so async IIFEs resolve
+                // before serialization. Previously the sync path serialized an
+                // unresolved Promise as `{}`, making single-invocation flows
+                // that call async app APIs impossible (issue #693). A 30s cap
+                // matches the CDP await timeout so a never-settling promise
+                // cannot hang the worker.
+                let result = match page
+                    .evaluate_for_cdp_with_timeout(&expression, true, true, 30_000)
+                    .await
+                {
+                    Ok(info) => match info.value {
+                        Some(v) => v,
+                        None => serde_json::Value::String(info.description),
+                    },
+                    Err(_) => serde_json::Value::Null,
+                };
                 WorkerResponse::success(result)
             }
             WorkerCommand::Title => {

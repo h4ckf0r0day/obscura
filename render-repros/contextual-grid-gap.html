@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Contextual grid gap</title>
+  <style>
+    html { font-size: 62.5%; }
+    body { margin: 0; }
+    .grid {
+      display: grid;
+      grid-template-columns: 10px 10px;
+      grid-template-rows: 20px 20px;
+      gap: 4rem calc(1rem + 2vw);
+    }
+    .a { background: #e03131; }
+    .b { background: #2f9e44; }
+    .c { background: #1971c2; }
+    .d { background: #f08c00; }
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <div class="a"></div>
+    <div class="b"></div>
+    <div class="c"></div>
+    <div class="d"></div>
+  </div>
+</body>
+</html>

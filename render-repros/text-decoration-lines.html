@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Text decoration lines</title>
+<style>
+  body { margin: 24px; font: 28px/1.8 sans-serif; color: #19324b; }
+  .sample { margin: 12px 0; }
+  .underline { text-decoration: underline; }
+  .overline { text-decoration: overline; }
+  .strike { text-decoration: line-through; }
+  .combined { text-decoration: underline overline line-through; }
+  .wrapped { width: 260px; text-decoration: overline line-through; }
+</style>
+<div class="sample">Plain text control</div>
+<div class="sample underline">Underline unchanged</div>
+<div class="sample overline">Overline visible</div>
+<div class="sample strike">Line-through visible</div>
+<div class="sample combined">Three lines together</div>
+<div class="sample strike">Nested <span style="text-decoration:none">inline text</span></div>
+<div class="sample wrapped">Decorations remain visible on wrapped text</div>

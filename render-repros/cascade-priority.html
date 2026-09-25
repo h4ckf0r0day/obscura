@@ -1,0 +1,16 @@
+<!DOCTYPE html><html><head><title>cascade priority</title><style>
+body{margin:0;font-family:sans-serif}.case{height:36px;margin:8px;color:white}
+#sheet-important{width:320px!important;background:green!important}.case#sheet-important{width:80px;background:red}
+.inline-normal{width:320px!important;background:green!important}
+#inline-important{width:80px!important;background:red!important}
+.custom-important{--case-width:320px!important;--case-width:80px;width:var(--case-width);background:green}
+.hint{width:320px;background:green}
+</style></head><body>
+<p>Every bar must be green and about 320px wide.</p>
+<div id="sheet-important" class="case">stylesheet important beats later normal</div>
+<div class="case inline-normal" style="width:80px;background:red">stylesheet important beats inline normal</div>
+<div id="inline-important" class="case" style="width:320px!important;background:green!important">inline important beats stylesheet important</div>
+<div class="case" style="width:320px!important;width:80px;background:green!important;background:red">inline important beats later inline normal</div>
+<div class="case custom-important">important custom property wins</div>
+<div class="case hint" bgcolor="red">author CSS beats a presentational hint</div>
+</body></html>

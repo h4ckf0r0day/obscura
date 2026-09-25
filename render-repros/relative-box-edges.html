@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>relative box edges</title>
+  <style>
+    html { font-size: 18px; }
+    html, body { margin: 0; }
+    .row { width: 100%; height: 80px; overflow: hidden; }
+    .vh-row { height: 200px; }
+    .box { width: 100px; height: 40px; }
+    .vh-margin { margin-top: 15vh; background: #087f5b; }
+    .vw-margin { margin-left: 10vw; background: #1971c2; }
+    .em-padding { box-sizing: border-box; width: 200px; height: 40px; padding-left: 2em; font-size: 20px; background: #e8590c; }
+    .rem-padding { box-sizing: border-box; width: 200px; height: 40px; padding-left: 2rem; background: #7048e8; }
+    .em-inner { width: 20px; height: 40px; background: #c2255c; }
+    .rem-inner { width: 20px; height: 40px; background: #2b8a3e; }
+    .vmin-margin { margin-left: 10vmin; background: #f08c00; }
+    .vmax-margin { margin-left: 10vmax; background: #1098ad; }
+  </style>
+</head>
+<body>
+  <div class="row vh-row"><div class="box vh-margin"></div></div>
+  <div class="row"><div class="box vw-margin"></div></div>
+  <div class="row"><div class="em-padding"><div class="em-inner"></div></div></div>
+  <div class="row"><div class="rem-padding"><div class="rem-inner"></div></div></div>
+  <div class="row"><div class="box vmin-margin"></div></div>
+  <div class="row"><div class="box vmax-margin"></div></div>
+</body>
+</html>

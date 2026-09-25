@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ratio-only inline image sizing</title>
+  <style>
+    html, body { margin: 0; }
+    .case {
+      position: absolute;
+      width: 280px;
+      height: 280px;
+      line-height: 0;
+    }
+    #direct-case { left: 0; top: 0; }
+    #anchor-case { left: 300px; top: 0; }
+    #inline-case { left: 600px; top: 0; }
+    #block-case { left: 0; top: 300px; }
+    #inline-block-case { left: 300px; top: 300px; }
+    #authored-inline { display: inline; }
+    #authored-block { display: block; }
+    #authored-inline-block { display: inline-block; }
+  </style>
+</head>
+<body>
+  <div class="case" id="direct-case"><img id="direct" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'%3E%3Crect width='576' height='576' fill='%23087f5b'/%3E%3C/svg%3E"></div>
+  <div class="case" id="anchor-case"><a><img id="anchored" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'%3E%3Crect width='576' height='576' fill='%231971c2'/%3E%3C/svg%3E"></a></div>
+  <div class="case" id="inline-case"><img id="authored-inline" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'%3E%3Crect width='576' height='576' fill='%23862e9c'/%3E%3C/svg%3E"></div>
+  <div class="case" id="block-case"><img id="authored-block" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'%3E%3Crect width='576' height='576' fill='%23e8590c'/%3E%3C/svg%3E"></div>
+  <div class="case" id="inline-block-case"><img id="authored-inline-block" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 576'%3E%3Crect width='576' height='576' fill='%23c2255c'/%3E%3C/svg%3E"></div>
+</body>
+</html>

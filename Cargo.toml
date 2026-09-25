@@ -7,7 +7,9 @@ members = [
     "crates/obscura-cdp",
     "crates/obscura-js",
     "crates/obscura-mcp",
+    "crates/obscura-render",
     "crates/obscura-cli",
+    "crates/obscura",
 ]
 
 [workspace.package]
@@ -23,15 +25,26 @@ obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
+obscura-render = { path = "crates/obscura-render" }
 
-html5ever = "0.29"
-markup5ever = "0.14"
+html5ever = "0.39"
+markup5ever = "0.39"
 selectors = "0.26"
 servo_arc = "0.4"
 cssparser = "0.34"
+# Layout engine for the optional render layer (obscura-render). Pure Rust.
+taffy = "0.12"
+# CPU-only pure-Rust 2D rasterizer for the render layer's paint step.
+tiny-skia = "0.12"
+# Pure-Rust glyph rasterizer for the render layer's text step.
+ab_glyph = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
-reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "native-tls-vendored", "socks"], default-features = false }
+# No "cookies" feature: obscura manages cookies through its own CookieJar
+# (obscura-net/src/cookies.rs) and never uses reqwest's cookie store. Pulling
+# it in only added the cookie/cookie_store crates, and cookie 0.18.1's blanket
+# From impl fails to compile under coherence on some toolchains (issue #295).
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
@@ -42,3 +55,24 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
+
+[patch.crates-io]
+# Keep the grid shrink-to-fit correction local until it lands upstream.
+taffy = { path = "vendor/taffy" }
+# Carry the same canonical variable-font coordinates through shaping and
+# rasterization until the upstream API exposes them.
+cosmic-text = { path = "vendor/cosmic-text" }
+
+# Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
+# their bodies in std::panic::catch_unwind so a panic degrades to an error return
+# instead of unwinding into V8's FFI frame and aborting the process. panic="abort"
+# would turn every catchable op panic into a hard crash.
+[profile.release]
+panic = "unwind"
+
+[profile.release-dist]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

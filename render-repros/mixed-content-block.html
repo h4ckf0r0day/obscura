@@ -1,0 +1,13 @@
+<!DOCTYPE html><html><head><title>mixed inline+block</title><style>body{margin:0;font-family:sans-serif}
+.box{width:400px;border:2px solid red;margin:8px}</style></head><body>
+<p>Block children of a mixed-content block must stay FULL WIDTH (not shrink to content),
+and inline runs must wrap as text, not one word per line.</p>
+<div class="box">
+  leading inline text that should wrap across the full width of this container as a normal paragraph would
+  <div style="background:#cdf">block child: must span the full 400px</div>
+  trailing inline text after the block child
+  <div style="position:relative;height:60px;background:#efe">
+    <div style="position:absolute;inset:0;background:rgba(0,128,0,.5)">contentless wrapper w/ abs fill</div>
+  </div>
+</div>
+</body></html>

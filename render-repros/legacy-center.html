@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>legacy center uses block text alignment</title>
+  <style>
+    html, body { margin: 0; }
+    .host {
+      width: 400px;
+      height: 120px;
+      background: #fff3bf;
+    }
+    .inline-box {
+      display: inline-block;
+      width: 100px;
+      height: 20px;
+      background: #087f5b;
+    }
+    .block-box {
+      width: 100px;
+      height: 20px;
+      background: #1971c2;
+    }
+    .nesting-box {
+      width: 100px;
+      height: 20px;
+    }
+    .nested-inline {
+      display: inline-block;
+      width: 60px;
+      height: 20px;
+      background: #862e9c;
+    }
+    .auto-block {
+      height: 20px;
+      background: #c92a2a;
+    }
+    .center-table {
+      width: 200px;
+      height: 40px;
+      border-spacing: 0;
+      background: #74c0fc;
+    }
+    .center-table td {
+      padding: 0;
+      width: 200px;
+    }
+    .table-inline {
+      display: inline-block;
+      width: 80px;
+      height: 20px;
+      background: #5f3dc4;
+    }
+    .cell-center {
+      height: 20px;
+      background: #fab005;
+    }
+    #legacy {
+      font-size: 0;
+      line-height: 0;
+    }
+    #override {
+      text-align: left;
+    }
+    .override-box {
+      display: inline-block;
+      width: 80px;
+      height: 20px;
+      background: #e8590c;
+    }
+    #pure-center {
+      height: 20px;
+      background: #2f9e44;
+    }
+  </style>
+</head>
+<body>
+  <div class="host">
+    <center id="legacy">
+      <span class="inline-box"></span>
+      <div class="block-box"></div>
+      <div class="nesting-box"><span class="nested-inline"></span></div>
+      <div class="auto-block"></div>
+      <table class="center-table">
+        <tr><td><span class="table-inline"></span></td></tr>
+        <tr><td><center class="cell-center">cell text</center></td></tr>
+      </table>
+    </center>
+  </div>
+  <div class="host">
+    <center id="override"><span class="override-box"></span></center>
+  </div>
+  <div class="host"><center id="pure-center">centered text</center></div>
+</body>
+</html>

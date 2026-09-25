@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Modern hydration DOM contracts</title>
+  <style>
+    html, body { margin: 0; padding: 0; }
+    body { padding: 24px; font: 16px sans-serif; }
+    #result {
+      box-sizing: border-box;
+      width: 360px;
+      height: 90px;
+      padding: 20px;
+      background: #aa3333;
+      color: white;
+    }
+    #result.passed { background: #16803c; }
+  </style>
+</head>
+<body>
+  <main id="server-shell">
+    <div id="result">hydration contracts failed</div>
+  </main>
+  <script>
+    globalThis.__parserScriptRuns = (globalThis.__parserScriptRuns || 0) + 1;
+
+    // React 19 removes singleton attributes through one retained
+    // NamedNodeMap. Its length and numeric entries must remain live.
+    const probe = document.createElement("div");
+    probe.setAttribute("id", "probe");
+    probe.setAttribute("class", "card");
+    probe.setAttribute("data-state", "server");
+    const attributes = probe.attributes;
+    let removed = 0;
+    while (attributes.length && removed < 10) {
+      probe.removeAttributeNode(attributes[0]);
+      removed++;
+    }
+
+    // Modern ref callbacks call element.scrollTo({left, top, behavior}).
+    const scroller = document.createElement("div");
+    scroller.setAttribute("style", "position:absolute;left:-1000px;width:10px;height:10px;overflow:scroll");
+    const scrollContent = document.createElement("div");
+    scrollContent.setAttribute("style", "width:100px;height:100px");
+    scroller.appendChild(scrollContent);
+    document.body.appendChild(scroller);
+    scroller.scrollTo({left: 12, top: 20, behavior: "auto"});
+    scroller.scrollBy(3, -5);
+
+    // Framework hydration may hoist or reorder an existing parser script.
+    // Moving it must not execute it again.
+    const parserScript = document.currentScript;
+    if (globalThis.__parserScriptRuns === 1) document.head.appendChild(parserScript);
+
+    const passed =
+      globalThis.__parserScriptRuns === 1 &&
+      attributes instanceof NamedNodeMap &&
+      attributes === probe.attributes &&
+      removed === 3 &&
+      attributes.length === 0 &&
+      !probe.hasAttributes() &&
+      scroller.scrollLeft === 15 &&
+      scroller.scrollTop === 15 &&
+      document.getElementById("server-shell") !== null;
+
+    const result = document.getElementById("result");
+    result.textContent = passed ? "hydration contracts passed" : "hydration contracts failed";
+    result.className = passed ? "passed" : "";
+    globalThis.__modernHydrationContracts = passed;
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<!DOCTYPE html><html><head><title>abs fill</title><style>body{margin:0}
+.box{width:400px;border:2px solid red;margin:6px}</style></head><body>
+<p>Every colored area below must FILL its box. Before P0 all were 0x0 (blank).</p>
+<div class="box"><span>A rel(auto-width)+BLOCK, abs inset:0:</span>
+  <div style="position:relative;height:100px"><div style="position:absolute;inset:0;background:blue"></div></div></div>
+<div class="box"><span>B rel+FLEX, abs inset:0:</span>
+  <div style="position:relative;height:100px;display:flex"><div style="position:absolute;inset:0;background:green"></div></div></div>
+<div class="box"><span>C rel+GRID, abs inset:0:</span>
+  <div style="position:relative;height:100px;display:grid"><div style="position:absolute;inset:0;background:purple"></div></div></div>
+<div class="box"><span>D abs width:100%/height:100%:</span>
+  <div style="position:relative;height:100px"><div style="position:absolute;top:0;left:0;width:100%;height:100%;background:teal"></div></div></div>
+<div class="box"><span>E padding-hack ratio + abs fill IMG:</span>
+  <div style="position:relative;height:0;padding-bottom:40%"><img src="https://web.dev/static/images/ai-feature.png" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover"></div></div>
+</body></html>

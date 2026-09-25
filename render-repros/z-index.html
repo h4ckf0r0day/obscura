@@ -1,0 +1,12 @@
+<!DOCTYPE html><html><head><title>z-index</title><style>body{margin:0;font-family:sans-serif}</style></head><body>
+<p>A: z:10 overlay declared BEFORE a later sibling must paint ON TOP (green wins):</p>
+<div style="position:relative;height:120px">
+  <div style="position:absolute;top:0;left:0;width:200px;height:100px;background:green;z-index:10"></div>
+  <div style="position:absolute;top:20px;left:40px;width:200px;height:100px;background:red"></div>
+</div>
+<p>B: z:-1 backdrop declared AFTER content must paint UNDER it (blue stays visible, orange edges show):</p>
+<div style="position:relative;height:120px">
+  <div style="width:220px;height:90px;background:blue"></div>
+  <div style="position:absolute;top:0;left:0;width:260px;height:110px;background:orange;z-index:-1"></div>
+</div>
+</body></html>

@@ -13,7 +13,60 @@
 //!
 //! For non-HTML resources (JS, CSS, JSON), only steps 1 and 3 apply.
 
-use encoding_rs::{Encoding, UTF_8};
+use encoding_rs::{CoderResult, DecoderResult, EncoderResult, Encoding, UTF_8};
+
+/// WHATWG canonical (lowercased) name for an encoding label, or None if the
+/// label is not a known encoding. Backs `TextDecoder`'s label validation and
+/// its `.encoding` property.
+pub fn label_name(label: &str) -> Option<String> {
+    Encoding::for_label(label.as_bytes()).map(|e| e.name().to_ascii_lowercase())
+}
+
+/// Decode `bytes` with an explicit encoding label, with TextDecoder semantics.
+/// Returns None when the label is unknown, or (when `fatal`) when the input is
+/// not valid in that encoding. Non-fatal decoding replaces errors with U+FFFD.
+pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: bool) -> Option<String> {
+    let enc = Encoding::for_label(label.as_bytes())?;
+    let mut dec = if ignore_bom {
+        enc.new_decoder_without_bom_handling()
+    } else {
+        enc.new_decoder()
+    };
+    // Both decode calls write only into the string's spare capacity and stop
+    // with OutputFull when it runs out. Legacy encodings can expand one byte into
+    // three UTF-8 bytes, so grow the buffer and continue until the input is
+    // consumed instead of truncating (or, in fatal mode, rejecting valid input).
+    let mut out = String::with_capacity(bytes.len() + 1);
+    let mut src = bytes;
+    if fatal {
+        loop {
+            let (res, read) = dec.decode_to_string_without_replacement(src, &mut out, true);
+            src = &src[read..];
+            match res {
+                DecoderResult::InputEmpty => return Some(out),
+                DecoderResult::OutputFull => out.reserve(
+                    dec.max_utf8_buffer_length_without_replacement(src.len())
+                        .unwrap_or(src.len().saturating_mul(3))
+                        .max(4),
+                ),
+                DecoderResult::Malformed(..) => return None,
+            }
+        }
+    } else {
+        loop {
+            let (res, read, _) = dec.decode_to_string(src, &mut out, true);
+            src = &src[read..];
+            match res {
+                CoderResult::InputEmpty => return Some(out),
+                CoderResult::OutputFull => out.reserve(
+                    dec.max_utf8_buffer_length(src.len())
+                        .unwrap_or(src.len().saturating_mul(3))
+                        .max(4),
+                ),
+            }
+        }
+    }
+}
 
 /// Decode an HTTP response body. `content_type_header` is the raw header
 /// value if present (e.g. `text/html; charset=gbk`). For HTML resources,
@@ -22,6 +75,98 @@ pub fn decode_response(bytes: &[u8], content_type_header: Option<&str>) -> Strin
     let (encoding, _) = detect_encoding(bytes, content_type_header);
     let (cow, _, _) = encoding.decode(bytes);
     cow.into_owned()
+}
+
+/// Like `decode_response`, but also returns the WHATWG canonical name of the
+/// encoding that was used (e.g. "EUC-JP", "Shift_JIS", "UTF-8"). Callers use
+/// the name to expose `document.characterSet` and to do document-encoding-aware
+/// URL query serialization (the WHATWG "encoding override").
+pub fn decode_response_with_name(
+    bytes: &[u8],
+    content_type_header: Option<&str>,
+) -> (String, &'static str) {
+    let (encoding, _) = detect_encoding(bytes, content_type_header);
+    let (cow, _, _) = encoding.decode(bytes);
+    (cow.into_owned(), encoding.name())
+}
+
+const PCT_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+fn push_pct(out: &mut String, b: u8) {
+    out.push('%');
+    out.push(PCT_HEX[(b >> 4) as usize] as char);
+    out.push(PCT_HEX[(b & 0x0F) as usize] as char);
+}
+
+/// Append an ASCII `byte` to a URL query string, percent-encoding it when it is
+/// in the WHATWG query percent-encode set (C0 controls, space, `"`, `#`, `<`,
+/// `>`, 0x7F), plus `'` for special schemes (the special-query set). ASCII
+/// delimiters like `=` and `&` are left literal, so structured queries survive.
+fn push_query_ascii(out: &mut String, b: u8, special: bool) {
+    let must_encode = b <= 0x20
+        || b == 0x7F
+        || matches!(b, 0x22 | 0x23 | 0x3C | 0x3E)
+        || (special && b == 0x27);
+    if must_encode {
+        push_pct(out, b);
+    } else {
+        out.push(b as char);
+    }
+}
+
+/// Encode a run of non-ASCII code points to the target charset and percent-
+/// encode EVERY resulting byte. The bytes serialize a non-ASCII character, so
+/// all of them are escaped (this is what the WPT legacy-mb encode-href tests
+/// expect, e.g. Big5 `一` -> `%A4%40` even though the 0x40 trail byte is ASCII).
+/// Unmappable code points become the literal `%26%23<decimal>%3B` sequence (a
+/// percent-encoded `&#NNN;` numeric character reference), per the URL spec.
+fn encode_run_pct(out: &mut String, run: &str, enc: &'static Encoding) {
+    let mut encoder = enc.new_encoder();
+    let mut input = run;
+    let mut buf = [0u8; 256];
+    loop {
+        let (result, read, written) =
+            encoder.encode_from_utf8_without_replacement(input, &mut buf, true);
+        for &b in &buf[..written] {
+            push_pct(out, b);
+        }
+        input = &input[read..];
+        match result {
+            EncoderResult::InputEmpty => break,
+            EncoderResult::OutputFull => continue,
+            EncoderResult::Unmappable(c) => {
+                out.push_str("%26%23");
+                out.push_str(&(c as u32).to_string());
+                out.push_str("%3B");
+            }
+        }
+    }
+}
+
+/// WHATWG URL "percent-encode after encoding" for the query component, using a
+/// non-UTF-8 document encoding override (`label`). `query` is the already
+/// UTF-8-percent-decoded query string. ASCII code points use the (special-)
+/// query percent-encode set so real query delimiters (`=`, `&`) stay literal;
+/// runs of non-ASCII code points are encoded to the target charset with every
+/// byte percent-encoded. Returns None when the label is unknown.
+pub fn url_encode_query(query: &str, label: &str, special: bool) -> Option<String> {
+    let enc = Encoding::for_label(label.as_bytes())?;
+    let mut out = String::with_capacity(query.len() * 3);
+    let mut run_start: Option<usize> = None;
+    for (idx, c) in query.char_indices() {
+        if c.is_ascii() {
+            if let Some(s) = run_start.take() {
+                encode_run_pct(&mut out, &query[s..idx], enc);
+            }
+            push_query_ascii(&mut out, c as u8, special);
+        } else if run_start.is_none() {
+            run_start = Some(idx);
+        }
+    }
+    if let Some(s) = run_start {
+        encode_run_pct(&mut out, &query[s..], enc);
+    }
+    Some(out)
 }
 
 /// Same as `decode_response` but skips the `<meta charset>` sniff. Use for
@@ -80,6 +225,71 @@ fn charset_from_content_type(header: &str) -> Option<String> {
     None
 }
 
+/// Return an exact attribute value from a lowercased `<meta ...>` tag.
+///
+/// This deliberately tokenizes attribute names instead of searching for a
+/// substring: `data-charset` and a description containing `charset=...` are
+/// not character encoding declarations.
+fn meta_attribute<'a>(tag: &'a str, target: &str) -> Option<&'a str> {
+    let mut rest = tag.strip_prefix("<meta")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii_whitespace() && !matches!(c, '>' | '/'))
+    {
+        return None;
+    }
+
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+        if rest.is_empty() || rest.starts_with('>') {
+            break;
+        }
+
+        let name_end = rest
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '>' | '/'))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            rest = &rest[rest.chars().next()?.len_utf8()..];
+            continue;
+        }
+
+        let name = &rest[..name_end];
+        rest = rest[name_end..].trim_start();
+
+        let mut value = "";
+        if let Some(after_equals) = rest.strip_prefix('=') {
+            let after_equals = after_equals.trim_start();
+            if let Some(quote) = after_equals
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '"' | '\''))
+            {
+                let quoted = &after_equals[quote.len_utf8()..];
+                if let Some(end) = quoted.find(quote) {
+                    value = &quoted[..end];
+                    rest = &quoted[end + quote.len_utf8()..];
+                } else {
+                    value = quoted;
+                    rest = "";
+                }
+            } else {
+                let end = after_equals
+                    .find(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '/'))
+                    .unwrap_or(after_equals.len());
+                value = &after_equals[..end];
+                rest = &after_equals[end..];
+            }
+        }
+
+        if name.eq_ignore_ascii_case(target) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
 /// Scan the first 1024 bytes for a `<meta charset="...">` or
 /// `<meta http-equiv="Content-Type" content="...; charset=...">` declaration.
 /// We only look at ASCII bytes; valid meta-charset declarations are always
@@ -100,21 +310,21 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
         let end = s[abs..].find('>').map(|e| abs + e).unwrap_or(s.len());
         let tag = &s[abs..end];
 
-        if let Some(charset_pos) = tag.find("charset") {
-            let after = &tag[charset_pos + "charset".len()..];
-            let after = after.trim_start();
-            if let Some(eq_rest) = after.strip_prefix('=') {
-                let value = eq_rest
-                    .trim_start()
-                    .trim_start_matches(|c: char| c == '"' || c == '\'')
-                    .split(|c: char| c == '"' || c == '\'' || c == ';' || c.is_whitespace() || c == '/')
-                    .next()
-                    .unwrap_or("");
-                if !value.is_empty() {
-                    if let Some(enc) = Encoding::for_label(value.as_bytes()) {
-                        return Some(enc);
-                    }
-                }
+        if let Some(enc) = meta_attribute(tag, "charset")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| Encoding::for_label(value.as_bytes()))
+        {
+            return Some(enc);
+        }
+
+        let is_legacy_declaration = meta_attribute(tag, "http-equiv")
+            .is_some_and(|value| value.eq_ignore_ascii_case("content-type"));
+        if is_legacy_declaration {
+            if let Some(enc) = meta_attribute(tag, "content")
+                .and_then(charset_from_content_type)
+                .and_then(|value| Encoding::for_label(value.as_bytes()))
+            {
+                return Some(enc);
             }
         }
 
@@ -130,6 +340,34 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Legacy single-byte encodings can expand one input byte into three UTF-8
+    // bytes (windows-1252 0x80 is U+20AC). The decoder only writes into spare
+    // capacity, so an undersized buffer used to truncate the text or, in fatal
+    // mode, reject valid input.
+    #[test]
+    fn decode_with_label_does_not_truncate_expanding_input() {
+        let euros = [0x80u8; 12];
+        let expected = "€".repeat(12);
+        assert_eq!(
+            decode_with_label("windows-1252", &euros, false, false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decode_with_label("windows-1252", &euros, true, false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decode_with_label("windows-1252", &[0xE9; 4], true, false).as_deref(),
+            Some("éééé")
+        );
+        // Malformed input is still rejected in fatal mode and replaced otherwise.
+        assert_eq!(decode_with_label("utf-8", &[0x61, 0xFF], true, false), None);
+        assert_eq!(
+            decode_with_label("utf-8", &[0x61, 0xFF], false, false).as_deref(),
+            Some("a\u{FFFD}")
+        );
+    }
 
     #[test]
     fn content_type_charset_wins() {
@@ -161,6 +399,19 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_meta_attributes_do_not_declare_a_charset() {
+        for bytes in [
+            &b"<meta name=\"description\" content=\"charset=gbk\">"[..],
+            &b"<meta data-charset=\"gbk\">"[..],
+            &b"<metadata charset=\"gbk\">"[..],
+        ] {
+            let (enc, source) = detect_encoding(bytes, None);
+            assert_eq!(enc.name(), "UTF-8");
+            assert_eq!(source, "default-utf8");
+        }
+    }
+
+    #[test]
     fn no_charset_anywhere_falls_back_to_utf8() {
         let bytes = b"<html><body>hello</body></html>";
         let (enc, source) = detect_encoding(bytes, None);
@@ -184,6 +435,37 @@ mod tests {
         let bytes = br#"var x = '<meta charset="gbk">'; // not the real charset"#;
         let s = decode_non_html(bytes, Some("application/javascript"));
         assert!(s.contains("<meta charset="));
+    }
+
+    #[test]
+    fn url_encode_query_eucjp_high_bytes() {
+        // U+8108 (脈) is EUC-JP CC AE; both bytes are above 0x7E so both encode.
+        assert_eq!(url_encode_query("\u{8108}", "euc-jp", true).unwrap(), "%CC%AE");
+    }
+
+    #[test]
+    fn url_encode_query_unmappable_becomes_ncr() {
+        // A code point not in shift_jis becomes the percent-encoded &#NNN;.
+        // U+3402 is a CJK ext-A han char not in shift_jis.
+        let got = url_encode_query("\u{3402}", "shift_jis", true).unwrap();
+        assert_eq!(got, "%26%2313314%3B");
+    }
+
+    #[test]
+    fn url_encode_query_big5_low_trail_byte_is_escaped() {
+        // U+4E00 (一) is Big5 A4 40; the 0x40 trail byte is ASCII '@' but must
+        // still be percent-encoded because it serializes a non-ASCII char.
+        assert_eq!(url_encode_query("\u{4e00}", "big5", true).unwrap(), "%A4%40");
+    }
+
+    #[test]
+    fn url_encode_query_keeps_ascii_structure() {
+        // ASCII delimiters in a real query stay literal (standard query set):
+        // only the non-ASCII value is re-encoded to the target charset.
+        assert_eq!(
+            url_encode_query("a=\u{8108}&b=c", "euc-jp", true).unwrap(),
+            "a=%CC%AE&b=c"
+        );
     }
 
     #[test]

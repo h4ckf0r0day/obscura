@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Display contents cascade</title>
+  <style>
+    html, body { margin: 0; }
+    nav {
+      width: 400px;
+      height: 80px;
+      display: flex;
+    }
+    .desktop { display: none; }
+    .item {
+      width: 200px;
+      height: 80px;
+    }
+    .first { background: #087f5b; }
+    .second { background: #1971c2; }
+    @media (width >= 832px) {
+      .desktop { display: contents; }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="desktop">
+      <div class="item first"></div>
+      <div class="item second"></div>
+    </div>
+  </nav>
+</body>
+</html>

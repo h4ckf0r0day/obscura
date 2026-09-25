@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>grid auto repeat</title>
+  <style>
+    html, body { margin: 0; }
+    .grid { display: grid; width: 900px; gap: 20px; }
+    .fill { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+    .fit { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-top: 20px; }
+    .fill > div { height: 60px; background: #087f5b; }
+    .fit > div { height: 60px; background: #1971c2; }
+  </style>
+</head>
+<body>
+  <div class="grid fill"><div></div><div></div><div></div><div></div></div>
+  <div class="grid fit"><div></div><div></div><div></div></div>
+</body>
+</html>

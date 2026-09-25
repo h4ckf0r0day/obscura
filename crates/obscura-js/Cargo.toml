@@ -2,22 +2,53 @@
 name = "obscura-js"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Builds obscura-net with its stealth (wreq) HTTP client and lets scripted
+# fetch()/XHR be routed through it so JS-level requests carry the same Chrome
+# TLS fingerprint and client hints as stealth navigation.
+stealth = ["obscura-net/stealth"]
+# Builds the obscura-render layout layer and exposes real box geometry to JS
+# (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
+# rasterizes screenshots. Off by default so the scraping build stays lean.
+render = ["dep:obscura-render", "obscura-render/paint"]
 
 [build-dependencies]
-deno_core = "0.350"
+deno_core = "0.412"
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
-deno_core = "0.350"
+deno_core = "0.412"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
+# document.domain must reject public suffixes (including private suffixes such
+# as github.io), not just compare dotted strings.  `psl` embeds the Mozilla
+# Public Suffix List and adds no runtime I/O.
+psl = "2"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 html5ever = { workspace = true }
-deno_error = "0.6"
+deno_error = "0.7"
 base64 = { workspace = true }
+sha1 = "0.10"
+sha2 = "0.10"
+# WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,
+# and they unify on the digest 0.10 / cipher 0.4 stack already in the tree.
+hmac = "0.12"
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hkdf = "0.12"
+# CSPRNG for getRandomValues / randomUUID (replaces Math.random).
+getrandom = "0.2"
+obscura-render = { workspace = true, optional = true }

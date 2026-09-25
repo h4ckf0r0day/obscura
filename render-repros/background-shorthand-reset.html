@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>background shorthand reset</title>
+  <style>
+    html, body { margin: 0; }
+    #underlay {
+      width: 300px;
+      height: 200px;
+      background: #f08c00;
+    }
+    #reset {
+      width: 300px;
+      height: 200px;
+      padding: 50px;
+      box-sizing: border-box;
+      background: #1971c2;
+      background-size: 20px 20px;
+      background-position: center;
+      background: 0;
+    }
+    #content {
+      width: 200px;
+      height: 100px;
+      background: #087f5b;
+    }
+  </style>
+</head>
+<body>
+  <div id="underlay">
+    <div id="reset">
+      <div id="content"></div>
+    </div>
+  </div>
+</body>
+</html>

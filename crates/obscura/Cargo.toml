@@ -1,0 +1,31 @@
+[package]
+name = "obscura"
+version = "0.1.0"
+edition = "2021"
+description = "Rust API for the Obscura headless browser"
+readme = "README.md"
+repository = "https://github.com/h4ckf0r0day/obscura"
+license = "Apache-2.0"
+
+[features]
+default = ["api"]
+api = ["obscura-browser", "obscura-net", "tokio"]
+stealth = ["api", "obscura-browser/stealth"]
+render = ["api", "obscura-browser/render"]
+
+[dependencies]
+obscura-browser = { path = "../obscura-browser", optional = true }
+obscura-net = { path = "../obscura-net", optional = true }
+anyhow = "1"
+tokio = { version = "1", features = ["rt"], optional = true }
+thiserror = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[[example]]
+name = "basic"
+required-features = ["stealth"]

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Live form values and checked state</title>
+  <style>
+    body { font: 18px Arial, sans-serif; padding: 24px; }
+    label { display: block; margin: 20px 0; }
+    input[type="text"], input[type="password"] { width: 240px; height: 30px; }
+  </style>
+</head>
+<body>
+  <h1>Live control state</h1>
+  <label>Typed value <input id="live" type="text" value="Default value"></label>
+  <label>Cleared value <input id="empty" type="text" value="Default value" placeholder="Empty now"></label>
+  <label>Masked value <input id="secret" type="password"></label>
+  <label>Checked <input id="checked" type="checkbox" value="Do not paint this value"></label>
+  <label>Unchecked <input id="unchecked" type="checkbox" checked></label>
+  <label>Mixed <input id="mixed" type="checkbox"></label>
+  <label>Selected <input id="radio" type="radio" name="choice" value="Do not paint this value"></label>
+  <script>
+    document.getElementById('live').value = 'Current value';
+    document.getElementById('empty').value = '';
+    document.getElementById('secret').value = 'secret';
+    document.getElementById('checked').checked = true;
+    document.getElementById('unchecked').checked = false;
+    document.getElementById('mixed').indeterminate = true;
+    document.getElementById('radio').checked = true;
+  </script>
+</body>
+</html>

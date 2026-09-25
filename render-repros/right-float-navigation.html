@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>right float navigation</title>
+  <style>
+    html, body { margin: 0; }
+    #bar {
+      width: 400px;
+      height: 30px;
+      overflow: hidden;
+      background: #343a40;
+    }
+    #bar span {
+      display: inline-block;
+      height: 30px;
+    }
+    #left-one {
+      width: 60px;
+      background: #087f5b;
+    }
+    #left-two {
+      width: 80px;
+      background: #1971c2;
+    }
+    #right-one {
+      float: right;
+      width: 40px;
+      height: 30px;
+      background: #e8590c;
+    }
+    #right-two {
+      float: right;
+      width: 50px;
+      height: 30px;
+      background: #862e9c;
+    }
+    #right-three {
+      float: right;
+      width: 30px;
+      height: 30px;
+      background: #2f9e44;
+    }
+  </style>
+</head>
+<body>
+  <nav id="bar">
+    <span id="left-one"></span>
+    <div id="right-one"></div>
+    <span id="left-two"></span>
+    <div id="right-two"></div>
+    <div id="right-three"></div>
+  </nav>
+</body>
+</html>

@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>replaced element in an auto block wrapper</title>
+  <style>
+    html { box-sizing: border-box; }
+    *, ::before, ::after { box-sizing: inherit; }
+    html, body { margin: 0; }
+    #grid {
+      display: grid;
+      width: 900px;
+      grid-template-columns: repeat(2, 450px);
+    }
+    #description {
+      width: auto;
+      height: 300px;
+      background: #e8590c;
+    }
+    #media {
+      width: auto;
+      min-width: 0;
+    }
+    #frame {
+      width: auto;
+      margin: 0;
+      padding: 48px;
+      background: #1971c2;
+      text-align: center;
+    }
+    #wrapper {
+      display: block;
+      width: auto;
+    }
+    #image {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="grid">
+    <section id="description"></section>
+    <div id="media">
+      <figure id="frame">
+        <picture id="wrapper">
+          <img id="image" alt="" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='720' height='424'%3E%3Crect width='720' height='424' fill='%23c2255c'/%3E%3C/svg%3E">
+        </picture>
+      </figure>
+    </div>
+  </div>
+</body>
+</html>

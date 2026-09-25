@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>text alignment does not align flex items</title>
+  <style>
+    html, body { margin: 0; }
+    #stack {
+      display: flex;
+      flex-direction: column;
+      box-sizing: border-box;
+      width: 400px;
+      padding: 20px;
+      text-align: center;
+      background: #f08c00;
+    }
+    #media {
+      width: auto;
+      height: 80px;
+      background: #087f5b;
+    }
+    #label {
+      width: auto;
+      height: 60px;
+      background: #1971c2;
+    }
+    #chip {
+      display: inline-block;
+      width: 100px;
+      height: 20px;
+      background: #c2255c;
+    }
+  </style>
+</head>
+<body>
+  <div id="stack">
+    <div id="media"></div>
+    <div id="label"><span id="chip"></span></div>
+  </div>
+</body>
+</html>

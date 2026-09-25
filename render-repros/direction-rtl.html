@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; direction: rtl }
+  .case { width: 300px; height: 40px; margin-bottom: 20px; background: #dee2e6 }
+  .flex { display: flex }
+  .grid { display: grid; grid-template-columns: 50px 50px }
+  .item { width: 50px; height: 40px }
+  .red { background: #e03131 }
+  .blue { background: #1971c2 }
+  .green { background: #2f9e44 }
+  .block > div { width: 50px; height: 40px; background: #862e9c }
+</style>
+<div class="case flex"><div class="item red"></div><div class="item blue"></div></div>
+<div class="case grid"><div class="item green"></div><div class="item blue"></div></div>
+<div class="case block"><div></div></div>

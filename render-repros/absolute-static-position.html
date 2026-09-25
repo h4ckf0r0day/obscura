@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>absolute auto axes preserve static position</title>
+  <style>
+    html, body { margin: 0; }
+    #cb {
+      position: relative;
+      width: 400px;
+      height: 300px;
+      box-sizing: border-box;
+      border: 10px solid #f08c00;
+      background: #ffd43b;
+    }
+    #spacer {
+      width: 1px;
+      height: 80px;
+    }
+    #flow {
+      width: 200px;
+      height: 120px;
+      margin-left: 80px;
+      padding-left: 30px;
+      background: #d0ebff;
+    }
+    #top-static-inline {
+      position: absolute;
+      top: 50px;
+      margin-left: 5px;
+      width: 40px;
+      height: 30px;
+      background: #087f5b;
+    }
+    #left-static-block {
+      position: absolute;
+      left: 200px;
+      margin-top: 7px;
+      width: 50px;
+      height: 20px;
+      background: #1971c2;
+    }
+    #nested-cb {
+      position: relative;
+      width: 400px;
+      height: 300px;
+      margin-top: 40px;
+      box-sizing: border-box;
+      border: 10px solid #e8590c;
+      background: #ffe8cc;
+    }
+    #nested-spacer {
+      width: 1px;
+      height: 60px;
+    }
+    #outer-flow {
+      width: 220px;
+      height: 140px;
+      margin-left: 50px;
+      padding-left: 20px;
+      background: #e5dbff;
+    }
+    #outer-static {
+      position: absolute;
+      top: 40px;
+      margin-left: 4px;
+      width: 160px;
+      height: 100px;
+      background: #862e9c;
+    }
+    #inner-spacer {
+      width: 1px;
+      height: 20px;
+    }
+    #inner-flow {
+      width: 100px;
+      height: 50px;
+      margin-left: 30px;
+      padding-left: 10px;
+      background: #f3d9fa;
+    }
+    #nested-static {
+      position: absolute;
+      left: 70px;
+      margin-top: 3px;
+      width: 20px;
+      height: 20px;
+      background: #0b7285;
+    }
+  </style>
+</head>
+<body>
+  <div id="cb">
+    <div id="spacer"></div>
+    <div id="flow">
+      <div id="top-static-inline"></div>
+      <div id="left-static-block"></div>
+    </div>
+  </div>
+  <div id="nested-cb">
+    <div id="nested-spacer"></div>
+    <div id="outer-flow">
+      <div id="outer-static">
+        <div id="inner-spacer"></div>
+        <div id="inner-flow">
+          <div id="nested-static"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

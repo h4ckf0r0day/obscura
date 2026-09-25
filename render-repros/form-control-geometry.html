@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>form control geometry</title>
+  <style>
+    html, body { margin: 0; }
+    .form-case {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 300px;
+    }
+    .row {
+      position: absolute;
+      display: flex;
+      align-items: flex-start;
+    }
+    .text-row { left: 350px; top: 0; }
+    .override-row { left: 700px; top: 0; }
+    .checkbox-row { left: 0; top: 100px; }
+    .range-row { left: 200px; top: 100px; }
+    .hidden-row { left: 500px; top: 100px; }
+    .textarea-row { left: 0; top: 200px; }
+    .textarea-rows8-row { left: 350px; top: 200px; }
+    .marker { width: 20px; }
+    .form-marker { width: 100px; height: 20px; background: #087f5b; }
+    .text-marker { height: 21px; background: #1971c2; }
+    .override-marker { height: 30px; background: #e8590c; }
+    .checkbox-marker { height: 13px; background: #7048e8; }
+    .range-marker { height: 16px; background: #c2255c; }
+    .hidden-marker { height: 20px; background: #2b8a3e; }
+    .textarea-marker { height: 36px; background: #f08c00; }
+    .textarea-rows8-marker { height: 126px; background: #e64980; }
+  </style>
+</head>
+<body>
+  <div class="form-case">
+    <form><input size="17"></form>
+    <div class="form-marker"></div>
+  </div>
+  <div class="row text-row"><input size="17"><div class="marker text-marker"></div></div>
+  <div class="row override-row">
+    <input size="40" style="width: 100px; height: 30px">
+    <div class="marker override-marker"></div>
+  </div>
+  <div class="row checkbox-row"><input type="checkbox"><div class="marker checkbox-marker"></div></div>
+  <div class="row range-row"><input type="range"><div class="marker range-marker"></div></div>
+  <div class="row hidden-row"><input type="hidden"><div class="marker hidden-marker"></div></div>
+  <div class="row textarea-row"><textarea></textarea><div class="marker textarea-marker"></div></div>
+  <div class="row textarea-rows8-row"><textarea rows="8"></textarea><div class="marker textarea-rows8-marker"></div></div>
+</body>
+</html>

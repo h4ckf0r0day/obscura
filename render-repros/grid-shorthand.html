@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>grid shorthand</title>
+  <style>
+    html, body { margin: 0; }
+    .grid { display: grid; width: 900px; gap: 20px; }
+    .direct { grid: auto-flow / repeat(3, 1fr); }
+    .custom { --responsive-grid: auto-flow/repeat(3, 1fr); grid: var(--responsive-grid); margin-top: 20px; }
+    .direct > div { height: 60px; background: #087f5b; }
+    .custom > div { height: 60px; background: #1971c2; }
+  </style>
+</head>
+<body>
+  <div class="grid direct"><div></div><div></div><div></div></div>
+  <div class="grid custom"><div></div><div></div><div></div></div>
+</body>
+</html>

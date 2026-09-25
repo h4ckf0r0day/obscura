@@ -3,7 +3,12 @@ use serde_json::Value;
 
 const DEFAULT_COOKIE_PATH: &str = "/";
 
-pub fn parse_cdp_cookie(value: &Value) -> Option<CookieInfo> {
+pub struct ParsedCookie {
+    pub cookie: CookieInfo,
+    pub host_only: bool,
+}
+
+pub fn parse_cdp_cookie(value: &Value) -> Option<ParsedCookie> {
     let name = value.get("name").and_then(|v| v.as_str())?.to_string();
     let cookie_value = value
         .get("value")
@@ -16,11 +21,10 @@ pub fn parse_cdp_cookie(value: &Value) -> Option<CookieInfo> {
         .and_then(|v| v.as_str())
         .and_then(|u| url::Url::parse(u).ok());
 
-    let domain = value
-        .get("domain")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| url_parsed.as_ref().and_then(|u| u.host_str().map(|h| h.to_string())))
+    let explicit_domain = value.get("domain").and_then(|v| v.as_str());
+    let domain = explicit_domain
+        .map(str::to_string)
+        .or_else(|| url_parsed.as_ref().and_then(|u| u.host_str().map(str::to_string)))
         .unwrap_or_default();
 
     if domain.is_empty() {
@@ -31,7 +35,11 @@ pub fn parse_cdp_cookie(value: &Value) -> Option<CookieInfo> {
         .get("path")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| url_parsed.as_ref().map(|u| u.path().to_string()))
+        .or_else(|| {
+            url_parsed
+                .as_ref()
+                .map(|u| obscura_net::default_cookie_path(u.path()))
+        })
         .unwrap_or_else(|| DEFAULT_COOKIE_PATH.to_string());
 
     let secure = value.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -43,15 +51,18 @@ pub fn parse_cdp_cookie(value: &Value) -> Option<CookieInfo> {
         .to_string();
     let expires = value.get("expires").and_then(|v| v.as_f64()).map(|f| f as i64);
 
-    Some(CookieInfo {
-        name,
-        value: cookie_value,
-        domain,
-        path,
-        secure,
-        http_only,
-        same_site,
-        expires,
+    Some(ParsedCookie {
+        cookie: CookieInfo {
+            name,
+            value: cookie_value,
+            domain,
+            path,
+            secure,
+            http_only,
+            same_site,
+            expires,
+        },
+        host_only: explicit_domain.is_none(),
     })
 }
 
@@ -105,7 +116,9 @@ mod tests {
             "sameSite": "Strict",
             "expires": 1_900_000_000.0,
         });
-        let c = parse_cdp_cookie(&v).unwrap();
+        let parsed = parse_cdp_cookie(&v).unwrap();
+        let c = parsed.cookie;
+        assert!(!parsed.host_only);
         assert_eq!(c.name, "session");
         assert_eq!(c.value, "abc");
         assert_eq!(c.domain, ".example.com");
@@ -118,13 +131,41 @@ mod tests {
 
     #[test]
     fn parse_with_url_fallback_for_domain_and_path() {
+        // RFC 6265 5.1.4 default-path: a cookie set under /v1/things with no
+        // explicit Path is scoped to the directory /v1, not the full request
+        // path. Puppeteer's page.setCookie / Playwright's addCookies reach this
+        // path when the caller omits `path`.
         let v = json!({
             "name": "tok",
             "value": "xyz",
             "url": "https://api.example.com/v1/things",
         });
-        let c = parse_cdp_cookie(&v).unwrap();
+        let parsed = parse_cdp_cookie(&v).unwrap();
+        let c = parsed.cookie;
+        assert!(parsed.host_only);
         assert_eq!(c.domain, "api.example.com");
+        assert_eq!(c.path, "/v1");
+
+        let jar = obscura_net::CookieJar::new();
+        jar.set_cookies_from_cdp_with_scope([(c, parsed.host_only)]);
+        assert!(jar
+            .get_cookie_header(&url::Url::parse("https://api.example.com/v1/item").unwrap())
+            .contains("tok=xyz"));
+        assert!(jar
+            .get_cookie_header(&url::Url::parse("https://sub.api.example.com/v1/item").unwrap())
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_explicit_path_overrides_default() {
+        // An explicit Path attribute wins over the RFC default-path.
+        let v = json!({
+            "name": "tok",
+            "value": "xyz",
+            "url": "https://api.example.com/v1/things",
+            "path": "/v1/things",
+        });
+        let c = parse_cdp_cookie(&v).unwrap().cookie;
         assert_eq!(c.path, "/v1/things");
     }
 
@@ -141,7 +182,7 @@ mod tests {
             "value": "v",
             "domain": "example.com",
         });
-        let c = parse_cdp_cookie(&v).unwrap();
+        let c = parse_cdp_cookie(&v).unwrap().cookie;
         assert_eq!(c.path, "/");
     }
 

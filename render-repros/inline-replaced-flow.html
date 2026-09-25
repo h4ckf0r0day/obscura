@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>inline replaced flow</title>
+  <style>
+    html, body { margin: 0; }
+    .case {
+      position: absolute;
+      left: 0;
+      width: 300px;
+      line-height: 0;
+    }
+    .atomic {
+      display: inline-block;
+      height: 20px;
+      vertical-align: top;
+    }
+    .lead {
+      width: 60px;
+      background: #087f5b;
+    }
+    img {
+      width: 40px;
+      height: 20px;
+      vertical-align: top;
+      background: #1971c2;
+    }
+    .tail {
+      width: 70px;
+      background: #e8590c;
+    }
+    #default-inline { top: 0; }
+    #authored-block { top: 60px; }
+    #authored-block img { display: block; }
+
+    #mixed-cell {
+      position: absolute;
+      left: 0;
+      top: 160px;
+      width: 300px;
+      border-spacing: 0;
+    }
+    #mixed-cell table {
+      width: 100%;
+      border-spacing: 0;
+    }
+    #mixed-cell td { padding: 0; }
+    #mixed-cell .zero {
+      width: 0;
+      height: 0;
+      background: transparent;
+    }
+    #mixed-cell .rule {
+      height: 4px;
+      background: #7048e8;
+    }
+    #mixed-cell center { height: 20px; }
+    #mixed-cell .centered {
+      width: 100px;
+      background: #2b8a3e;
+    }
+  </style>
+</head>
+<body>
+  <div id="default-inline" class="case"><span class="atomic lead"></span><img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSIyMCI+PHJlY3Qgd2lkdGg9IjQwIiBoZWlnaHQ9IjIwIiBmaWxsPSIjMTk3MWMyIi8+PC9zdmc+" alt=""><span class="atomic tail"></span></div>
+  <div id="authored-block" class="case"><span class="atomic lead"></span><img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSIyMCI+PHJlY3Qgd2lkdGg9IjQwIiBoZWlnaHQ9IjIwIiBmaWxsPSIjMTk3MWMyIi8+PC9zdmc+" alt=""><span class="atomic tail"></span></div>
+  <table id="mixed-cell">
+    <tr>
+      <td>
+        <img class="zero" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSIyMCI+PHJlY3Qgd2lkdGg9IjQwIiBoZWlnaHQ9IjIwIiBmaWxsPSIjMTk3MWMyIi8+PC9zdmc+" alt="">
+        <table><tr><td class="rule"></td></tr></table>
+        <center><span class="atomic centered"></span></center>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

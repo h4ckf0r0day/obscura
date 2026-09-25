@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>inline block flex items use block inner flow</title>
+  <style>
+    html, body { margin: 0; }
+    #header {
+      display: flex;
+      justify-content: space-between;
+      width: 650px;
+      height: 120px;
+      background: #f08c00;
+    }
+    #brand {
+      display: inline-block;
+      padding-left: 32px;
+    }
+    #title {
+      display: block;
+      width: 350px;
+      height: 20px;
+      background: #087f5b;
+    }
+    #links {
+      display: inline-block;
+      margin: 0 35px 0 0;
+      padding: 0;
+    }
+    #links li {
+      display: block;
+      height: 20px;
+      margin: 0;
+      background: #1971c2;
+    }
+    #one { width: 90px; }
+    #two { width: 70px; }
+    #three { width: 80px; }
+    #matrix {
+      border-spacing: 0;
+      margin-top: 20px;
+      width: 200px;
+    }
+    #cell { padding: 0; }
+    #chips {
+      display: inline-block;
+      margin: 0;
+      padding: 0;
+    }
+    #chips li {
+      display: inline-block;
+      width: 30px;
+      height: 20px;
+      margin: 0;
+      padding: 0;
+      background: #c2255c;
+    }
+  </style>
+</head>
+<body>
+  <header id="header">
+    <hgroup id="brand"><span id="title"></span></hgroup>
+    <ul id="links">
+      <li id="one"></li>
+      <li id="two"></li>
+      <li id="three"></li>
+    </ul>
+  </header>
+  <table id="matrix"><tbody><tr><td id="cell"><ul id="chips"><li id="alpha"></li><li id="beta"></li><li id="gamma"></li></ul></td></tr></tbody></table>
+</body>
+</html>

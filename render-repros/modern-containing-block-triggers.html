@@ -1,0 +1,28 @@
+<!DOCTYPE html><html><head><title>modern containing block triggers</title><style>
+html,body{margin:0}
+.root{position:relative;width:800px;height:200px;padding:20px;box-sizing:border-box;background:#eee}
+.row{display:grid;grid-template-columns:100px 100px 100px 100px 100px 100px;column-gap:20px}
+.cb{width:100px;height:80px;background:#ccc}
+.filter{filter:blur(0)}
+.perspective{perspective:1000px}
+.contain{contain:layout}
+.container{container-type:inline-size}
+.will-change{will-change:transform}
+.visibility{content-visibility:auto}
+.badge{position:absolute;right:5px;bottom:5px;width:20px;height:20px}
+.filter .badge{background:#087f5b}
+.perspective .badge{background:#1971c2}
+.contain .badge{background:#e8590c}
+.container .badge{background:#7048e8}
+.will-change .badge{background:#c2255c}
+.visibility .badge{background:#2b8a3e}
+.fixed-filter{position:fixed;left:5px;top:5px;width:10px;height:10px;background:#f08c00}
+.fixed-contain{position:fixed;left:5px;top:5px;width:10px;height:10px;background:#1098ad}
+</style></head><body><div class="root"><div class="row">
+  <div id="filter-cb" class="cb filter"><span id="filter-badge" class="badge"></span><span id="filter-fixed" class="fixed-filter"></span></div>
+  <div id="perspective-cb" class="cb perspective"><span id="perspective-badge" class="badge"></span></div>
+  <div id="contain-cb" class="cb contain"><span id="contain-badge" class="badge"></span><span id="contain-fixed" class="fixed-contain"></span></div>
+  <div id="container-cb" class="cb container"><span id="container-badge" class="badge"></span></div>
+  <div id="will-change-cb" class="cb will-change"><span id="will-change-badge" class="badge"></span></div>
+  <div id="visibility-cb" class="cb visibility"><span id="visibility-badge" class="badge"></span></div>
+</div></div></body></html>

@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>float flow bands</title>
+  <style>
+    html, body { margin: 0; }
+    #container { width: 900px; }
+    #float {
+      float: right;
+      width: 250px;
+      height: 400px;
+      background: #1971c2;
+    }
+    .avoids-float {
+      overflow: hidden;
+      margin: 0;
+      width: auto;
+    }
+    #intro { height: 100px; background: #087f5b; }
+    #release { height: 50px; background: #e8590c; }
+    .inline {
+      display: inline-block;
+      vertical-align: top;
+      height: 30px;
+    }
+    #download { width: 60px; background: #c2255c; }
+    #archive { width: 90px; background: #7048e8; }
+    #mobile-duplicate {
+      display: none;
+      height: 300px;
+    }
+    #sponsors { height: 50px; background: #f08c00; }
+    #logos { height: 70px; background: #1098ad; }
+    #cleared {
+      clear: both;
+      width: 900px;
+      height: 50px;
+      background: #a61e4d;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <aside id="float"></aside>
+    <div id="intro" class="avoids-float"></div>
+    <h2 id="release" class="avoids-float"></h2>
+    <span id="download" class="inline"></span><span id="archive" class="inline"></span>
+    <div id="mobile-duplicate"></div>
+    <h2 id="sponsors" class="avoids-float"></h2>
+    <div id="logos" class="avoids-float"></div>
+    <div id="cleared"></div>
+  </div>
+</body>
+</html>

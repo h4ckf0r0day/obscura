@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -20,75 +20,199 @@ jobs:
             # newer glibc shipped by ubuntu-latest.
             os: ubuntu-22.04
             name: obscura-x86_64-linux
-            cross: false
           - target: aarch64-unknown-linux-gnu
             # Native build on GitHub's ARM runner.
             os: ubuntu-22.04-arm
             name: obscura-aarch64-linux
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            # Cross-compile fallback from x86_64 Ubuntu 22.04. Same glibc
-            # 2.35 floor, useful when ARM runners are unavailable.
-            os: ubuntu-22.04
-            name: obscura-aarch64-linux-cross
-            cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             name: obscura-aarch64-macos
-            cross: false
           - target: x86_64-apple-darwin
-            os: macos-latest
+            # Must run on a native Intel runner. obscura-js bakes a V8 startup
+            # snapshot at build time, and that snapshot is architecture specific.
+            # macos-latest is Apple Silicon, so building x86_64 there embeds an
+            # arm64 snapshot into the Intel binary and V8 crashes deserializing
+            # it at isolate init (issue #290). macos-15-intel is the last x86_64
+            # image (available until Aug 2027); there is no cross-build that
+            # produces a correct snapshot.
+            os: macos-15-intel
             name: obscura-x86_64-macos
-            cross: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: obscura-x86_64-windows
-            cross: false
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation toolchain (aarch64-linux)
-        if: matrix.cross == true
+      - name: Install stealth build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'CARGO_EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          CARGO_EOF
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Configure libclang (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Use one coherent SDK. A hard-coded CommandLineTools include path can
+          # mix libc++ headers with the selected Xcode SDK and break BoringSSL.
+          XCODE_PATH="$(xcode-select -p)"
+          SDK_PATH="$(xcrun --show-sdk-path)"
+          echo "SDKROOT=$SDK_PATH" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-isystem $SDK_PATH/usr/include/c++/v1" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$XCODE_PATH/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
 
-      - name: Build stealth
-        run: cargo build --release --target ${{ matrix.target }} --features stealth
-        continue-on-error: true
+      - name: Configure libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build no-render release binary
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features
+
+      - name: Stage no-render release binary
+        shell: bash
+        run: |
+          BIN_DIR=target/${{ matrix.target }}/release-dist
+          mkdir -p dist/no-render
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/no-render/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/no-render/
+          fi
+
+      - name: Build no-render stealth release binary
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
+
+      - name: Stage no-render stealth release binary
+        shell: bash
+        run: |
+          BIN_DIR=target/${{ matrix.target }}/release-dist
+          mkdir -p dist/no-render-stealth
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/no-render-stealth/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/no-render-stealth/
+          fi
+
+      - name: Build render-enabled release binary
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render
+
+      - name: Stage default release binary
+        shell: bash
+        run: |
+          BIN_DIR=target/${{ matrix.target }}/release-dist
+          mkdir -p dist/default
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/default/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/default/
+          fi
+
+      - name: Build render-enabled stealth release binary
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
+
+      - name: Stage stealth release binary
+        shell: bash
+        run: |
+          BIN_DIR=target/${{ matrix.target }}/release-dist
+          mkdir -p dist/stealth
+          if [ -f "$BIN_DIR/obscura.exe" ]; then
+            cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/stealth/
+          else
+            cp "$BIN_DIR/obscura" "$BIN_DIR/obscura-worker" dist/stealth/
+          fi
+
+      - name: Smoke test release binaries (V8 snapshot)
+        # Run the V8 path once so a release never ships a binary that crashes at
+        # isolate init from a mismatched snapshot (issue #290). The data: URL
+        # keeps it offline. Every target here is native, so the runner can
+        # execute all variants it just built.
+        shell: bash
+        run: |
+          for VARIANT in default stealth no-render no-render-stealth; do
+            BIN=dist/$VARIANT/obscura
+            [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+            "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
+          done
+          for VARIANT in default stealth; do
+            BIN=dist/$VARIANT/obscura
+            [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+            "$BIN" fetch "data:text/html,<style>body{margin:0;background:%23123456}</style>" --screenshot smoke.png
+            test -s smoke.png
+            rm smoke.png
+          done
+          for VARIANT in no-render no-render-stealth; do
+            BIN=dist/$VARIANT/obscura
+            [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+            if "$BIN" fetch "data:text/html,<title>no-render</title>" --screenshot smoke.png; then
+              echo "$VARIANT unexpectedly supports screenshots" >&2
+              exit 1
+            fi
+            test ! -e smoke.png
+          done
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz obscura obscura-worker
-          cd ../../..
+          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
+          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
+          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
+          tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
-          cd ../../..
+          cd dist/default
+          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+          cd ../stealth
+          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
+          cd ../no-render
+          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
+          cd ../no-render-stealth
+          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
 
-      - name: Upload
-        uses: softprops/action-gh-release@v2
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          files: |
+          name: release-${{ matrix.name }}
+          path: |
             ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}-stealth.tar.gz
+            ${{ matrix.name }}-no-render.tar.gz
+            ${{ matrix.name }}-no-render-stealth.tar.gz
             ${{ matrix.name }}.zip
+            ${{ matrix.name }}-stealth.zip
+            ${{ matrix.name }}-no-render.zip
+            ${{ matrix.name }}-no-render-stealth.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      # This job never checks out or executes repository code. The write token is
+      # available only while collecting and publishing the completed artifacts.
+      - name: Download packaged binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*

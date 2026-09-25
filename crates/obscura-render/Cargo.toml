@@ -1,0 +1,51 @@
+[package]
+name = "obscura-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional scoped render layer for Obscura: layout (taffy) and, with the paint feature, text and raster output for screenshots."
+
+[features]
+default = []
+# Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
+# shaping + line breaking, ab_glyph fallback) and images.
+# Off by default; the layout core (getBoundingClientRect etc.) works without it.
+paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+
+[dependencies]
+taffy = { workspace = true }
+obscura-dom = { workspace = true }
+tiny-skia = { workspace = true, optional = true }
+ab_glyph = { workspace = true, optional = true }
+# Real inline text layout: HarfBuzz-class shaping (rustybuzz) + UAX#14 line
+# breaking, the same algorithms browsers use. Built with only our embedded
+# fonts (no system-font scan) so layout stays deterministic across hosts.
+cosmic-text = { version = "=0.14.2", default-features = false, features = ["std", "swash"], optional = true }
+# Keep this exactly aligned with cosmic-text 0.14's raster backend. Cosmic
+# and the renderer consume the same canonical variation coordinates for
+# shaping and rasterization.
+swash = { version = "=0.2.0", default-features = false, features = ["std", "scale", "render"], optional = true }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"], optional = true }
+ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
+base64 = { workspace = true, optional = true }
+# SVG rasterization for <img src="*.svg">, inline <svg>, and background-image
+# SVGs, all extremely common for logos/icons. Pure Rust, CPU, no system deps,
+# same deterministic-rendering guarantee as the rest of this crate.
+resvg = { version = "0.47", default-features = false, features = ["text", "raster-images"], optional = true }
+usvg = { version = "0.47", default-features = false, optional = true }
+url = { workspace = true, optional = true }
+cssparser = "0.34"
+wuff = { version = "0.2.7", optional = true }
+# Same `log` instance usvg emits glyph-fallback warnings through, so tests can
+# install a collector and assert on them.
+[dev-dependencies]
+log = "0.4"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "paint_file"
+path = "src/bin/paint_file.rs"
+required-features = ["paint"]

@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 1080px; background: #030712; }
+  #stack {
+    display: flex;
+    flex-flow: column;
+    gap: 150px;
+    width: 1080px;
+    overflow: hidden;
+  }
+  #row {
+    display: flex;
+    flex-flow: row;
+    align-items: flex-start;
+    gap: 40px;
+    width: 1080px;
+    height: min-content;
+    overflow: hidden;
+  }
+  #media {
+    flex: 1 0 0;
+    width: 1px;
+    height: auto;
+    aspect-ratio: 1.72;
+    position: relative;
+    overflow: hidden;
+    background: #7048e8;
+  }
+  #visual {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1.75571;
+    background: #2f9e44;
+  }
+  #copy {
+    flex: 1 0 0;
+    width: 1px;
+    height: 150px;
+    background: #1971c2;
+  }
+  #after { width: 1080px; height: 20px; background: #e8590c; }
+</style>
+<div id="stack">
+  <div id="row">
+    <div id="media"><div id="visual"></div></div>
+    <div id="copy"></div>
+  </div>
+  <div id="after"></div>
+</div>

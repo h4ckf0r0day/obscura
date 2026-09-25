@@ -32,6 +32,16 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => Ok(json!({})),
+        "disable" => {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.clear_response_bodies();
+            } else {
+                for page in &mut ctx.pages {
+                    page.clear_response_bodies();
+                }
+            }
+            Ok(json!({}))
+        }
         "setExtraHTTPHeaders" => {
             let headers = params.get("headers").and_then(|v| v.as_object());
             if let Some(page) = ctx.get_session_page(session_id) {
@@ -60,13 +70,18 @@ pub async fn handle(
         "setCookie" => {
             let cookie = parse_cdp_cookie(params)
                 .ok_or("setCookie: missing required name/domain (or url)")?;
-            cookie_jar_for(ctx, session_id).set_cookies_from_cdp(vec![cookie]);
+            cookie_jar_for(ctx, session_id)
+                .set_cookies_from_cdp_with_scope([(cookie.cookie, cookie.host_only)]);
             Ok(json!({ "success": true }))
         }
         "setCookies" => {
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
                 let parsed: Vec<_> = cookies.iter().filter_map(parse_cdp_cookie).collect();
-                cookie_jar_for(ctx, session_id).set_cookies_from_cdp(parsed);
+                cookie_jar_for(ctx, session_id).set_cookies_from_cdp_with_scope(
+                    parsed
+                        .into_iter()
+                        .map(|cookie| (cookie.cookie, cookie.host_only)),
+                );
             }
             Ok(json!({}))
         }
@@ -86,6 +101,47 @@ pub async fn handle(
         }
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
+        "setBlockedURLs" => {
+            let patterns = params
+                .get("urls")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_blocked_urls(patterns);
+            } else {
+                for page in &mut ctx.pages {
+                    page.set_blocked_urls(patterns.clone());
+                }
+            }
+            Ok(json!({}))
+        }
+        "getResponseBody" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(|v| v.as_str())
+                .ok_or("Network.getResponseBody requires requestId")?;
+
+            let body = if let Some(page) = ctx.get_session_page(session_id) {
+                page.get_response_body(request_id)
+            } else {
+                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
+            };
+
+            match body {
+                Some(body) => Ok(json!({
+                    "body": body.body,
+                    "base64Encoded": body.base64_encoded,
+                })),
+                None => Err(format!("No response body found for requestId {}", request_id)),
+            }
+        }
         _ => Err(format!("Unknown Network method: {}", method)),
     }
 }
@@ -192,6 +248,163 @@ mod tests {
             .await
             .expect("clearBrowserCookies must succeed");
         assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_blocked_urls_targets_session_page_without_enabling_interception() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        handle(
+            "setBlockedURLs",
+            &json!({
+                "urls": [
+                    "*://*.example.com/*.png",
+                    "*://cdn.example.com/*"
+                ]
+            }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("setBlockedURLs must succeed for a session page");
+
+        let page = ctx.get_page(&page_id).unwrap();
+        assert_eq!(
+            page.blocked_url_patterns,
+            vec![
+                "*://*.example.com/*.png".to_string(),
+                "*://cdn.example.com/*".to_string(),
+            ]
+        );
+        assert!(!page.intercept_enabled);
+        assert!(page.intercept_block_patterns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_blocked_urls_without_session_updates_existing_pages() {
+        let mut ctx = CdpContext::new();
+        let left = ctx.create_page();
+        let right = ctx.create_page();
+
+        handle(
+            "setBlockedURLs",
+            &json!({ "urls": ["*://tiles.example.test/*"] }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("setBlockedURLs must succeed without a session");
+
+        assert_eq!(
+            ctx.get_page(&left).unwrap().blocked_url_patterns,
+            vec!["*://tiles.example.test/*".to_string()]
+        );
+        assert_eq!(
+            ctx.get_page(&right).unwrap().blocked_url_patterns,
+            vec!["*://tiles.example.test/*".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_blocked_urls_replaces_existing_patterns() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        handle(
+            "setBlockedURLs",
+            &json!({ "urls": ["*://old.example.test/*"] }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+        handle(
+            "setBlockedURLs",
+            &json!({ "urls": ["*://new.example.test/*"] }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ctx.get_page(&page_id).unwrap().blocked_url_patterns,
+            vec!["*://new.example.test/*".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_response_body_returns_stored_document_body() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html><body>hello body</body></html>")
+            .await
+            .unwrap();
+        let request_id = page.network_events[0].request_id.clone();
+
+        let result = handle(
+            "getResponseBody",
+            &json!({ "requestId": request_id }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["body"], "<html><body>hello body</body></html>");
+        assert_eq!(result["base64Encoded"], false);
+    }
+
+    #[tokio::test]
+    async fn get_response_body_errors_for_unknown_request_id() {
+        let mut ctx = CdpContext::new();
+        let err = handle(
+            "getResponseBody",
+            &json!({ "requestId": "missing" }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn network_disable_clears_stored_response_bodies() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("session-1".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+
+        let page = ctx.get_page_mut(&page_id).unwrap();
+        page.navigate("data:text/html,<html><body>temporary body</body></html>")
+            .await
+            .unwrap();
+        let request_id = page.network_events[0].request_id.clone();
+
+        handle("disable", &json!({}), &mut ctx, &session_id)
+            .await
+            .unwrap();
+
+        let err = handle(
+            "getResponseBody",
+            &json!({ "requestId": request_id }),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("No response body found"));
     }
 }
 

@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>nested float clearance keeps the tallest shared-BFC endpoint</title>
+  <style>
+    html, body { margin: 0; }
+    .container { width: 600px; }
+    .header-float {
+      float: left;
+      width: 120px;
+      height: 100px;
+      background: #087f5b;
+    }
+    .collapse::after {
+      display: table;
+      clear: both;
+      content: "";
+    }
+    .nested-float {
+      float: left;
+      width: 200px;
+      height: 50px;
+      margin-top: 20px;
+      background: #1971c2;
+    }
+    .following {
+      width: 600px;
+      height: 20px;
+      background: #862e9c;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-float"></div>
+    <div class="collapse"><div class="nested-float"></div></div>
+    <div class="following"></div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>table track geometry</title>
+  <style>
+    html, body { margin: 0; }
+    body { font-family: sans-serif; font-size: 13px; }
+    table { position: absolute; }
+    #auto { left: 0; top: 0; border-spacing: 2px; }
+    #auto td { padding: 4px; }
+    #auto .fixed { width: 200px; background: #ffcc99; }
+    #auto .automatic { background: #74c0fc; }
+
+    #percent { left: 0; top: 50px; width: 400px; border-spacing: 2px; }
+    #percent td { height: 20px; padding: 0; }
+    #percent .half { width: 50%; background: #69db7c; }
+    #percent .rest { background: #f783ac; }
+
+    #zero-padding { left: 0; top: 100px; }
+    #zero-padding .first { background: #9775fa; }
+    #zero-padding .second { background: #ffa94d; }
+    .forty { width: 40px; height: 18px; }
+    .fifty { width: 50px; height: 18px; }
+
+    #author-padding { left: 0; top: 140px; }
+    #author-padding td { padding: 3px; background: #22b8cf; }
+
+    #collapsed {
+      left: 0;
+      top: 190px;
+      border-spacing: 8px;
+      border-collapse: collapse;
+    }
+    #collapsed td { padding: 0; }
+    #collapsed .first { background: #e64980; }
+    #collapsed .second { background: #15aabf; }
+    .twenty { height: 20px; }
+
+    .alignment { top: 240px; border-spacing: 0; }
+    .alignment td { width: 80px; height: 60px; padding: 0; }
+    .alignment .marker { width: 20px; height: 20px; }
+    #middle { left: 0; }
+    #middle .marker { background: #5f3dc4; }
+    #bottom { left: 100px; }
+    #bottom tr { vertical-align: bottom; }
+    #bottom .marker { background: #f08c00; }
+    #top { left: 200px; }
+    #top td { vertical-align: top; }
+    #top .marker { background: #2b8a3e; }
+
+    #ua-default { left: 0; top: 330px; }
+    #ua-default td { background: #1971c2; }
+    #ua-default div { width: 10px; height: 10px; }
+  </style>
+</head>
+<body>
+  <table id="auto">
+    <tr><td class="fixed">fixed 200</td><td class="automatic">auto col</td></tr>
+    <tr><td>second row same col</td><td>x</td></tr>
+  </table>
+
+  <table id="percent">
+    <tr><td class="half"></td><td class="rest"></td></tr>
+  </table>
+
+  <table id="zero-padding" cellpadding="0" cellspacing="0">
+    <tr>
+      <td class="first"><div class="forty"></div></td>
+      <td class="second"><div class="fifty"></div></td>
+    </tr>
+  </table>
+
+  <table id="author-padding" cellpadding="8" cellspacing="0">
+    <tr><td><div class="forty"></div></td></tr>
+  </table>
+
+  <table id="collapsed">
+    <tr>
+      <td class="first"><div class="forty twenty"></div></td>
+      <td class="second"><div class="fifty twenty"></div></td>
+    </tr>
+  </table>
+
+  <table id="middle" class="alignment" cellspacing="0" cellpadding="0">
+    <tr><td><div class="marker"></div></td></tr>
+  </table>
+  <table id="bottom" class="alignment" cellspacing="0" cellpadding="0">
+    <tr><td><div class="marker"></div></td></tr>
+  </table>
+  <table id="top" class="alignment" cellspacing="0" cellpadding="0">
+    <tr><td><div class="marker"></div></td></tr>
+  </table>
+
+  <table id="ua-default">
+    <tr><td><div></div></td></tr>
+  </table>
+</body>
+</html>

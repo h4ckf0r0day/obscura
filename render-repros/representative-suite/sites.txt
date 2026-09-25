@@ -1,0 +1,22 @@
+# Modern framework applications and documentation.
+https://react.dev/
+https://vuejs.org/
+https://angular.dev/
+https://emberjs.com/
+https://qwik.dev/
+https://www.solidjs.com/
+https://remix.run/
+
+# CSS systems and CSS-heavy documentation.
+https://tailwindcss.com/
+https://bulma.io/
+https://developer.mozilla.org/en-US/docs/Web/CSS
+
+# Commercial and marketing surfaces.
+https://brave.com/
+https://www.apple.com/
+https://porkbun.com/
+https://termius.com/
+
+# Native and framework-styled form controls.
+https://getbootstrap.com/docs/5.3/forms/overview/

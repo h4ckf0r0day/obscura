@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>EventTarget lifecycle</title>
+  <style>
+    body { margin: 0; font: 18px sans-serif; }
+    #result {
+      box-sizing: border-box;
+      width: 420px;
+      height: 120px;
+      padding: 32px;
+      background: #a22;
+      color: white;
+    }
+    #result.passed { background: #18723a; }
+  </style>
+</head>
+<body>
+  <div id="result">lifecycle pending</div>
+  <script type="module">
+    const result = document.getElementById("result");
+    class LifecycleTarget extends EventTarget {}
+    const lifecycle = new LifecycleTarget();
+    let insertedNode = null;
+    lifecycle.addEventListener("insert", (event) => {
+      insertedNode = event.node;
+    });
+    const event = new Event("insert");
+    event.node = result;
+    lifecycle.dispatchEvent(event);
+
+    if (insertedNode === result) {
+      result.textContent = "framework lifecycle completed";
+      result.className = "passed";
+    } else {
+      result.textContent = "framework lifecycle stalled";
+    }
+  </script>
+</body>
+</html>
