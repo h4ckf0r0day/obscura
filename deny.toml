@@ -8,6 +8,8 @@
 ignore = [
     "RUSTSEC-2025-0057", # fxhash unmaintained, transitive via selectors
     "RUSTSEC-2024-0436", # paste unmaintained, transitive via v8
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained, transitive via cosmic-text/fontdb/usvg
+    "RUSTSEC-2026-0206", # rustybuzz unmaintained, transitive via cosmic-text/usvg
 ]
 
 [bans]
