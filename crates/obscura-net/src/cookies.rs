@@ -680,6 +680,14 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
     if dom.is_empty() {
         return None;
     }
+    // RFC 6265 §5.1.3 / §5.3: an IP-address origin never domain-matches a Domain
+    // attribute unless the two strings are identical. A Domain attribute must not
+    // widen an IP origin's scope (e.g. 192.168.1.100 setting Domain=168.1.100,
+    // which would then reach 10.168.1.100), so keep the cookie host-only and
+    // require the attribute to equal the origin exactly (#1053).
+    if host_is_ip_literal(&origin) {
+        return (dom == origin).then_some((origin, true));
+    }
     if is_public_suffix(&dom) {
         return (dom == origin).then_some((origin, true));
     }
@@ -692,6 +700,13 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
 
 fn is_public_suffix(domain: &str) -> bool {
     psl::suffix_str(domain).is_some_and(|suffix| suffix.eq_ignore_ascii_case(domain))
+}
+
+/// RFC 6265 §5.1.3: only host names domain-match a cookie domain by suffix. An
+/// IP-address host matches only when the strings are identical, so callers must
+/// special-case IP literals before applying suffix logic.
+fn host_is_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
 }
 
 /// RFC 6265bis secure-overlay protection: an insecure response must not replace
@@ -772,6 +787,12 @@ fn domain_matches(host: &str, domain: &str) -> bool {
     if host.eq_ignore_ascii_case(domain) {
         return true;
     }
+    // RFC 6265 §5.1.3: an IP-address host matches only an identical domain
+    // string (handled above); it never suffix-matches, so a cookie scoped to a
+    // numeric suffix cannot leak across unrelated IPs (#1053).
+    if host_is_ip_literal(host) {
+        return false;
+    }
     // Suffix match with a '.' boundary: host = "sub.example.com",
     // domain = "example.com". The byte before the suffix in host
     // must be '.'.
@@ -794,6 +815,41 @@ mod tests {
 
         let header = jar.get_cookie_header_same_site(&url);
         assert!(header.contains("session=abc123"));
+    }
+
+    // #1053: RFC 6265 §5.1.3 forbids suffix domain-matching for IP-address
+    // hosts, so an IP origin cannot widen a cookie to unrelated IPs.
+    #[test]
+    fn ip_origin_cannot_widen_cookie_domain_to_other_ips() {
+        // A server at 192.168.1.100 must not scope a cookie to the numeric
+        // suffix "168.1.100" (which would also match 10.168.1.100).
+        assert_eq!(resolve_cookie_domain("192.168.1.100", Some("168.1.100")), None);
+        // A Domain equal to the origin IP is kept, host-only.
+        assert_eq!(
+            resolve_cookie_domain("192.168.1.100", Some("192.168.1.100")),
+            Some(("192.168.1.100".to_string(), true))
+        );
+        // No Domain attribute stays host-only, as before.
+        assert_eq!(
+            resolve_cookie_domain("192.168.1.100", None),
+            Some(("192.168.1.100".to_string(), true))
+        );
+        // Name hosts still honor a valid parent Domain.
+        assert_eq!(
+            resolve_cookie_domain("www.example.com", Some("example.com")),
+            Some(("example.com".to_string(), false))
+        );
+    }
+
+    // #1053: the send path must not suffix-match IP hosts either.
+    #[test]
+    fn domain_matches_never_suffix_matches_ip_hosts() {
+        // Cross-IP: a cookie stored for "168.1.100" must not reach 10.168.1.100.
+        assert!(!domain_matches("10.168.1.100", "168.1.100"));
+        // The exact IP still matches.
+        assert!(domain_matches("192.168.1.100", "192.168.1.100"));
+        // Name-host suffix matching is unaffected.
+        assert!(domain_matches("www.example.com", "example.com"));
     }
 
     // RFC 6265 §5.3: document.cookie (a non-HTTP API) must not overwrite or
