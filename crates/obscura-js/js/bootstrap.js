@@ -15016,16 +15016,11 @@ if (typeof FileReader === 'undefined') {
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
 
-// Real network sockets aren't implemented; we don't have a runtime WS / SSE
-// client in V8. But pages that wait for an `open` event (Vite HMR clients
-// embedded on docs sites, live-dashboards, anything calling
-// `await new Promise(r => ws.addEventListener('open', r))`) silently hang
-// forever otherwise. Fire `open` after a microtask so the consumer at least
-// proceeds; subsequent messages never arrive, which is no worse than the
-// current "no signal whatsoever" behaviour.
-// Minimal EventTarget shared by socket-like classes. Real `EventTarget` is
-// currently aliased to `Node`, which would drag DOM-tree assumptions into a
-// `WebSocket`. Defining a private shim avoids that.
+// There is no EventSource transport yet. Pages that wait for an `open` event
+// (dev-server reload clients, live dashboards) would hang forever otherwise, so
+// fire `open` after a microtask; no messages ever arrive.
+// Minimal listener box for EventSource. Real `EventTarget` is currently
+// aliased to `Node`, which would drag DOM-tree assumptions into it.
 function _makeListenerBox(self) {
   const map = new Map();
   self.addEventListener = function (type, fn) {
@@ -15072,42 +15067,259 @@ if (typeof EventSource === 'undefined') {
 }
 
 if (typeof WebSocket === 'undefined') {
+  // The socket itself lives in Rust (src/websocket.rs); this class is the
+  // WHATWG WebSocket state machine around it. Connection failures surface the
+  // way browsers report them: `error`, then `close` with code 1006 and
+  // wasClean false, so callers' reconnect paths run.
+  const CONNECTING = 0, OPEN = 1, CLOSING = 2, CLOSED = 3;
+  const socketState = new WeakMap();
+  const stateFor = (socket) => {
+    const state = socketState.get(socket);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  };
+  // RFC 7230 token: the grammar Sec-WebSocket-Protocol values must follow.
+  const PROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  const syntaxError = (message) =>
+    new DOMException("Failed to construct 'WebSocket': " + message, 'SyntaxError');
+
+  if (typeof CloseEvent === 'undefined') {
+    globalThis.CloseEvent = class CloseEvent extends Event {
+      constructor(type, init) {
+        const i = init || {};
+        super(type, i);
+        this.wasClean = !!i.wasClean;
+        this.code = i.code === undefined ? 0 : (Number(i.code) & 0xffff);
+        this.reason = i.reason === undefined ? '' : String(i.reason);
+      }
+    };
+  }
+
+  const fire = (socket, event) => {
+    try { _eventTargetDispatch(socket, event); } catch (e) { console.error(e); }
+  };
+
+  const finish = (socket, state, code, reason, wasClean) => {
+    if (state.readyState === CLOSED) return;
+    state.readyState = CLOSED;
+    if (!wasClean) fire(socket, new Event('error'));
+    fire(socket, new CloseEvent('close', { code, reason, wasClean }));
+  };
+
+  const pump = (socket, state) => {
+    const pending = __obscuraCore.ops.op_ws_next(state.id);
+    // An idle open socket is not pending page work: without this a page with
+    // a live socket would never be reported idle by the event loop.
+    try { __obscuraCore.unrefOpPromise(pending); } catch (e) {}
+    pending.then((raw) => {
+      const event = JSON.parse(raw);
+      if (event.type === 'close') {
+        finish(socket, state, event.code, event.reason, event.clean);
+        return;
+      }
+      // Messages that arrive once close() has started are discarded.
+      if (state.readyState === OPEN) {
+        let data = event.data;
+        if (event.type === 'binary') {
+          const bytes = _base64ToUint8Array(data);
+          data = state.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
+        }
+        fire(socket, new MessageEvent('message', { data, origin: state.origin }));
+      }
+      pump(socket, state);
+    });
+  };
+
+  // Snapshot outgoing data synchronously: the caller may mutate a buffer
+  // right after send() returns.
+  const encodeOutgoing = (data) => {
+    if (data instanceof ArrayBuffer) return { bytes: new Uint8Array(data.slice(0)), text: false };
+    if (ArrayBuffer.isView(data)) {
+      return { bytes: new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)), text: false };
+    }
+    if (typeof Blob === 'function' && data instanceof Blob) {
+      return { bytes: (data._bytes || new Uint8Array()).slice(), text: false };
+    }
+    return { bytes: new TextEncoder().encode(String(data)), text: true };
+  };
+
+  const handlerSlots = ['open', 'message', 'error', 'close'];
+
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
-      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
-      if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
-        throw new DOMException(
-          "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
-          'SyntaxError'
-        );
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
       }
-      this.url = url;
-      this.readyState = 0; // CONNECTING
-      this.bufferedAmount = 0;
-      this.binaryType = 'blob';
-      this.extensions = '';
-      this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
-      this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
-      _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
-      });
+      let parsed;
+      try {
+        parsed = new URL(String(url), document.baseURI);
+      } catch (e) {
+        throw syntaxError("The URL '" + url + "' is invalid.");
+      }
+      if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+      else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+      if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        throw syntaxError("The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '" + parsed.protocol.slice(0, -1) + "' is not allowed.");
+      }
+      if (parsed.hash || parsed.href.endsWith('#')) {
+        throw syntaxError("The URL contains a fragment identifier ('" + parsed.hash + "'). Fragment identifiers are not allowed in WebSocket URLs.");
+      }
+      let list = [];
+      if (protocols !== undefined) {
+        list = typeof protocols === 'string' || typeof protocols?.[Symbol.iterator] !== 'function'
+          ? [String(protocols)]
+          : Array.from(protocols, String);
+      }
+      const seen = new Set();
+      for (const protocol of list) {
+        if (!PROTOCOL_TOKEN.test(protocol)) {
+          throw syntaxError("The subprotocol '" + protocol + "' is invalid.");
+        }
+        if (seen.has(protocol)) {
+          throw syntaxError("The subprotocol '" + protocol + "' is duplicated.");
+        }
+        seen.add(protocol);
+      }
+
+      const state = {
+        url: parsed.href,
+        origin: parsed.origin,
+        readyState: CONNECTING,
+        bufferedAmount: 0,
+        binaryType: 'blob',
+        protocol: '',
+        extensions: '',
+        handlers: {},
+        wrappers: {},
+        sendChain: Promise.resolve(),
+        id: __obscuraCore.ops.op_ws_create(),
+      };
+      socketState.set(this, state);
+
+      const pageOrigin = globalThis.location?.origin || 'null';
+      __obscuraCore.ops.op_ws_connect(state.id, state.url, list.join(', '), pageOrigin)
+        .then((raw) => {
+          const result = JSON.parse(raw);
+          // close() during CONNECTING already reported the failure.
+          if (state.readyState !== CONNECTING) return;
+          if (!result.ok) {
+            finish(this, state, 1006, '', false);
+            return;
+          }
+          state.readyState = OPEN;
+          state.protocol = result.protocol || '';
+          state.extensions = result.extensions || '';
+          fire(this, new Event('open'));
+          pump(this, state);
+        });
     }
-    send(data) { /* drop; no real socket */ }
+
+    get url() { return stateFor(this).url; }
+    get readyState() { return stateFor(this).readyState; }
+    get bufferedAmount() { return stateFor(this).bufferedAmount; }
+    get protocol() { return stateFor(this).protocol; }
+    get extensions() { return stateFor(this).extensions; }
+    get binaryType() { return stateFor(this).binaryType; }
+    set binaryType(value) {
+      const state = stateFor(this);
+      // An unknown value is ignored, not an error (WebIDL enum attribute).
+      if (value === 'blob' || value === 'arraybuffer') state.binaryType = value;
+    }
+
+    send(data) {
+      const state = stateFor(this);
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'send' on 'WebSocket': 1 argument required, but only 0 present.");
+      }
+      if (state.readyState === CONNECTING) {
+        throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+      }
+      const { bytes, text } = encodeOutgoing(data);
+      // After close() the data is not sent, but bufferedAmount still grows,
+      // as the spec requires.
+      state.bufferedAmount += bytes.length;
+      if (state.readyState !== OPEN) return;
+      state.sendChain = state.sendChain
+        .then(() => __obscuraCore.ops.op_ws_send(state.id, bytes, text))
+        .then(() => { state.bufferedAmount -= bytes.length; }, () => {});
+    }
+
     close(code, reason) {
-      if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+      const state = stateFor(this);
+      if (code !== undefined) {
+        code = Math.min(Math.max(Math.round(Number(code)) || 0, 0), 0xffff);
+        if (code !== 1000 && (code < 3000 || code > 4999)) {
+          throw new DOMException("Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. " + code + " is neither.", 'InvalidAccessError');
+        }
+      }
+      reason = reason === undefined ? '' : String(reason);
+      if (new TextEncoder().encode(reason).length > 123) {
+        throw new DOMException("Failed to execute 'close' on 'WebSocket': The close reason must not be greater than 123 UTF-8 bytes.", 'SyntaxError');
+      }
+      if (state.readyState === CLOSING || state.readyState === CLOSED) return;
+      if (state.readyState === CONNECTING) {
+        state.readyState = CLOSING;
+        __obscuraCore.ops.op_ws_close(state.id, 0, '');
+        // Reported as a failed connection, from a later task.
+        _scheduleAfter(0, () => finish(this, state, 1006, '', false));
+        return;
+      }
+      state.readyState = CLOSING;
+      // Queued behind earlier send() calls so they reach the peer first.
+      const frameCode = code === undefined ? 0 : code;
+      const frameReason = code === undefined ? '' : reason;
+      state.sendChain = state.sendChain
+        .then(() => __obscuraCore.ops.op_ws_close(state.id, frameCode, frameReason));
     }
-    static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+
+    addEventListener(type, callback, options) {
+      stateFor(this);
+      _eventTargetAdd(this, type, callback, options);
+    }
+    removeEventListener(type, callback, options) {
+      stateFor(this);
+      _eventTargetRemove(this, type, callback, options);
+    }
+    dispatchEvent(event) {
+      stateFor(this);
+      return _eventTargetDispatch(this, event);
+    }
+    get [Symbol.toStringTag]() { return 'WebSocket'; }
   };
+
+  // on<event> handler attributes are listeners in registration order, like
+  // any other EventTarget: installed once, retargeted on reassignment.
+  for (const type of handlerSlots) {
+    Object.defineProperty(globalThis.WebSocket.prototype, 'on' + type, {
+      configurable: true,
+      enumerable: true,
+      get() { return stateFor(this).handlers[type] || null; },
+      set(callback) {
+        const state = stateFor(this);
+        callback = typeof callback === 'function'
+          || (callback && typeof callback.handleEvent === 'function') ? callback : null;
+        const hadHandler = !!state.handlers[type];
+        state.handlers[type] = callback;
+        if (callback && !hadHandler) {
+          state.wrappers[type] = (event) => {
+            const current = state.handlers[type];
+            if (!current) return;
+            if (typeof current === 'function') current.call(this, event);
+            else current.handleEvent.call(current, event);
+          };
+          _eventTargetAdd(this, type, state.wrappers[type]);
+        } else if (!callback && hadHandler) {
+          _eventTargetRemove(this, type, state.wrappers[type]);
+          state.wrappers[type] = null;
+        }
+      },
+    });
+  }
+  for (const [name, value] of Object.entries({ CONNECTING, OPEN, CLOSING, CLOSED })) {
+    Object.defineProperty(globalThis.WebSocket, name, { value, enumerable: true });
+    Object.defineProperty(globalThis.WebSocket.prototype, name, { value, enumerable: true });
+  }
+  Object.setPrototypeOf(globalThis.WebSocket.prototype, globalThis.EventTarget.prototype);
 }
 
 if (typeof BroadcastChannel === 'undefined') {
