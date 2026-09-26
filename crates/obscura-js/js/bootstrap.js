@@ -27,6 +27,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
+    '__obscura_inputChecked', '__obscura_setInputChecked',
+    '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts', '__obscura_hasPendingParserBlockingScripts',
     '__obscura_nextPendingTimeoutDelay',
@@ -758,6 +760,32 @@ function _loadFormState(nid) {
   }
   _formStateLoaded.add(nid);
 }
+
+// Native activation changes checkedness without invoking author-defined IDL
+// accessors. Frameworks may wrap those accessors to track script assignments.
+function _inputChecked(el) {
+  if (_formChecked[el._nid] === undefined) _loadFormState(el._nid);
+  if (_formChecked[el._nid] !== undefined) return _formChecked[el._nid];
+  return el.hasAttribute("checked");
+}
+function _setInputChecked(el, value) {
+  const checked = !!value;
+  _formChecked[el._nid] = checked;
+  _dom("set_form_checked", el._nid, String(checked));
+}
+function _inputIndeterminate(el) {
+  if (_formIndeterminate[el._nid] === undefined) _loadFormState(el._nid);
+  return _formIndeterminate[el._nid] === true;
+}
+function _setInputIndeterminate(el, value) {
+  const indeterminate = !!value;
+  _formIndeterminate[el._nid] = indeterminate;
+  _dom("set_form_indeterminate", el._nid, String(indeterminate));
+}
+globalThis.__obscura_inputChecked = _inputChecked;
+globalThis.__obscura_setInputChecked = _setInputChecked;
+globalThis.__obscura_inputIndeterminate = _inputIndeterminate;
+globalThis.__obscura_setInputIndeterminate = _setInputIndeterminate;
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -3912,8 +3940,8 @@ class Element extends Node {
     }
     let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
-      _oldChecked = !!this.checked;
-      _oldIndeterminate = !!this.indeterminate;
+      _oldChecked = _inputChecked(this);
+      _oldIndeterminate = _inputIndeterminate(this);
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -3923,29 +3951,29 @@ class Element extends Node {
             const r = _all[i];
             if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
             if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
-            _radioStates.push([r, !!r.checked]);
-            if (r !== this) r.checked = false;
+            _radioStates.push([r, _inputChecked(r)]);
+            if (r !== this) _setInputChecked(r, false);
           }
         }
-        this.checked = true;
+        _setInputChecked(this, true);
       } else {
         // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
         // checkedness *and* drops indeterminateness. Clearing it here, not on
         // `change`, is what lets the cancelled-activation path put the old
         // flag back instead of leaving it stuck off.
-        this.checked = !_oldChecked;
-        this.indeterminate = false;
+        _setInputChecked(this, !_oldChecked);
+        _setInputIndeterminate(this, false);
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
-      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
+      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _setInputChecked(_radioStates[i][0], _radioStates[i][1]); }
+      else if (_checkable) { _setInputChecked(this, _oldChecked); _setInputIndeterminate(this, _oldIndeterminate); }
       return;
     }
-    if (_checkable && this.checked !== _oldChecked) {
+    if (_checkable && _inputChecked(this) !== _oldChecked) {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
         if (_trusted) globalThis.__obscura_markTrusted(_e);
@@ -4304,27 +4332,20 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    if (_formChecked[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
-    return this.hasAttribute("checked");
+    return _inputChecked(this);
   }
   set checked(v) {
-    const checked = !!v;
-    _formChecked[this._nid] = checked;
-    _dom("set_form_checked", this._nid, String(checked));
+    _setInputChecked(this, v);
   }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so
   // the property itself must exist on the prototype for `'indeterminate' in
   // el` to be true on a freshly created element. Native node-keyed state
   // keeps IDL access and rendering consistent without changing attributes.
   get indeterminate() {
-    if (_formIndeterminate[this._nid] === undefined) _loadFormState(this._nid);
-    return _formIndeterminate[this._nid] === true;
+    return _inputIndeterminate(this);
   }
   set indeterminate(v) {
-    const indeterminate = !!v;
-    _formIndeterminate[this._nid] = indeterminate;
-    _dom("set_form_indeterminate", this._nid, String(indeterminate));
+    _setInputIndeterminate(this, v);
   }
   get selected() {
     if (this._selected !== undefined) return this._selected;
