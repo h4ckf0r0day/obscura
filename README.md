@@ -474,14 +474,14 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | Domain | Methods |
 |--------|---------|
 | **Target** | createTarget, closeTarget, attachToTarget, createBrowserContext, disposeBrowserContext |
-| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF |
+| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF (selectable text, headers/footers, outline, `@page` size) |
 | **Runtime** | evaluate, callFunctionOn, getProperties, addBinding |
 | **DOM** | getDocument, querySelector, querySelectorAll, getOuterHTML, resolveNode |
-| **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
+| **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride; webSocketCreated, webSocketWillSendHandshakeRequest, webSocketHandshakeResponseReceived, webSocketFrameSent/Received, webSocketFrameError, webSocketClosed events |
 | **Fetch** | enable, continueRequest, fulfillRequest, failRequest (live interception), takeResponseBodyAsStream |
 | **IO** | read, close (stream a large response body in chunks) |
 | **Storage** | getCookies, setCookies, deleteCookies |
-| **Input** | dispatchMouseEvent, dispatchKeyEvent |
+| **Input** | dispatchMouseEvent, dispatchKeyEvent, dispatchTouchEvent, dispatchDragEvent, setInterceptDrags |
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
 
 To download a large resource without one giant `Network.getResponseBody` blob, call `Fetch.takeResponseBodyAsStream` then read it in chunks with `IO.read` / `IO.close`. Response bodies over the cache limit (`OBSCURA_NETWORK_BODY_BUFFER_BYTES`, default 2 MiB) are not retained, so raise that limit when you intend to stream large downloads.
