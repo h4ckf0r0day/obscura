@@ -2080,6 +2080,7 @@ dependencies = [
  "async-trait",
  "encoding_rs",
  "futures-util",
+ "obscura-ssrf",
  "psl",
  "rcgen",
  "reqwest",
@@ -2107,6 +2108,7 @@ dependencies = [
  "image",
  "log",
  "obscura-dom",
+ "obscura-ssrf",
  "resvg",
  "swash",
  "taffy",
@@ -2116,6 +2118,10 @@ dependencies = [
  "usvg",
  "wuff",
 ]
+
+[[package]]
+name = "obscura-ssrf"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

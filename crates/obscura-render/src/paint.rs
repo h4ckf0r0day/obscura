@@ -7676,6 +7676,12 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
                 std::thread::sleep(backoff);
                 backoff *= 2;
             }
+            // A resolution failure is not transient at this timescale, and it
+            // is also how the SSRF guard below refuses a host: never sleep
+            // through the backoff for a request that will not be made.
+            Err(ureq::Error::Transport(err)) if err.kind() == ureq::ErrorKind::Dns => {
+                return None;
+            }
             Err(ureq::Error::Transport(_)) if attempt < 2 => {
                 std::thread::sleep(backoff);
                 backoff *= 2;
@@ -7703,8 +7709,42 @@ fn image_agent() -> &'static ureq::Agent {
             // cnbc, techcrunch, arstechnica), so the images Chrome loads came
             // back blank; a real browser UA loads the same bytes Chrome does.
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            .resolver(SsrfGuardResolver)
             .build()
     })
+}
+
+/// The renderer's copy of the SSRF gate every page transport applies. This
+/// loader only runs for standalone callers (the `paint_file` tool, library
+/// users rendering a bare DOM, a JS runtime with no page transport); a
+/// page-owned runtime is cache-only and fetches through `obscura-net`, which
+/// has its own resolver. Checking at resolution time covers literal
+/// addresses, names that resolve to a private address (DNS rebinding), and
+/// every redirect hop, since ureq resolves each connection through here.
+/// `OBSCURA_ALLOW_PRIVATE_NETWORK` lifts the restriction, as it does for the
+/// transports; the renderer has no per-context flag to consult.
+struct SsrfGuardResolver;
+
+impl ureq::Resolver for SsrfGuardResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+        if !obscura_ssrf::env_allows_private_network() {
+            if let Some(bad) = addrs
+                .iter()
+                .find(|addr| obscura_ssrf::is_forbidden_ip(addr.ip()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "SSRF blocked: '{netloc}' resolves to forbidden address {}",
+                        bad.ip()
+                    ),
+                ));
+            }
+        }
+        Ok(addrs)
+    }
 }
 
 /// Decode a percent-escaped data: URI payload (`%23` -> `#`, etc). Bytes that
@@ -11963,6 +12003,71 @@ mod tests {
             })),
             "the painted glyphs must be the value's color, not the grey placeholder"
         );
+    }
+
+    /// Loopback HTTP/1.0 server that counts connections and answers every
+    /// request with `body`. The count is the evidence: a refused fetch must
+    /// never even open the socket.
+    fn loopback_http_server(
+        body: &'static [u8],
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        (port, hits)
+    }
+
+    #[test]
+    fn default_loader_refuses_private_network_hosts() {
+        std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
+        let (port, hits) = loopback_http_server(b"png-bytes");
+        let mut cache = RenderResourceCache::default();
+        // A literal loopback address and a name that resolves to one: the
+        // second must be caught at DNS resolution, the same way the page
+        // transports close DNS rebinding.
+        for url in [
+            format!("http://127.0.0.1:{port}/a.png"),
+            format!("http://localhost:{port}/b.png"),
+        ] {
+            assert!(
+                fetch_bytes(&url, None, &mut cache).is_none(),
+                "{url} must be refused by the standalone loader"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a forbidden host must never be connected to"
+        );
+    }
+
+    #[test]
+    fn default_loader_honors_the_private_network_opt_in() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (port, hits) = loopback_http_server(b"png-bytes");
+        let mut cache = RenderResourceCache::default();
+        let url = format!("http://127.0.0.1:{port}/a.png");
+        assert_eq!(
+            fetch_bytes(&url, None, &mut cache).as_deref(),
+            Some(b"png-bytes".as_slice())
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
