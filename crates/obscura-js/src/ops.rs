@@ -2632,6 +2632,12 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Fetch "append a request `Origin` header": cross-origin requests and any
+/// request whose method is neither GET nor HEAD carry the requester's origin.
+fn sends_origin_header(method: &str, cross_origin: bool) -> bool {
+    cross_origin || !matches!(method, "GET" | "HEAD")
+}
+
 /// Strip headers that must not survive a redirect. On a redirect that changes
 /// origin, credential headers (`Authorization`, `Proxy-Authorization`, an
 /// explicit `Cookie`) are removed so they are not forwarded to a different
@@ -3331,7 +3337,7 @@ async fn op_fetch_url(
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
-        if current_is_cross_origin {
+        if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
             req = req.header("Origin", &page_origin);
         }
 
@@ -3701,7 +3707,7 @@ async fn stealth_fetch_all(
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
         crossed_origin |= current_is_cross_origin;
-        if current_is_cross_origin {
+        if sends_origin_header(&current_method, current_is_cross_origin) {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &current_headers {

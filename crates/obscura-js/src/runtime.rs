@@ -18168,6 +18168,104 @@ mod tests {
         assert_post_redirect_method(307, "POST").await;
     }
 
+    /// Serves `count` requests on a fresh loopback origin and forwards each raw
+    /// request. `POST /redirect` answers 302 to `/after`, everything else 200.
+    fn raw_request_runtime(
+        count: usize,
+    ) -> (ObscuraJsRuntime, String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let length = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..length]).to_string();
+                let response = if request.starts_with("POST /redirect ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /after\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                };
+                let _ = requests_tx.send(request);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (redirect_runtime_for_origin(&origin), origin, requests_rx)
+    }
+
+    // Fetch "append a request Origin header": a same-origin request carries
+    // Origin only when its method is neither GET nor HEAD, decided per hop.
+    async fn assert_origin_sent_for_non_get_methods(
+        mut rt: ObscuraJsRuntime,
+        origin: &str,
+        requests: std::sync::mpsc::Receiver<String>,
+    ) {
+        rt.call_function_on_for_cdp(
+            r#"async () => {
+                await fetch("/get");
+                await fetch("/head", { method: "HEAD" });
+                await fetch("/post", { method: "POST", body: "x" });
+                await fetch("/put", { method: "PUT", body: "x" });
+                await fetch("/redirect", { method: "POST", body: "x" });
+            }"#,
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let observed: Vec<(String, Option<String>)> = (0..6)
+            .map(|_| {
+                let request = requests
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let head = request.split("\r\n\r\n").next().unwrap_or_default();
+                let target = head.split(" HTTP/").next().unwrap_or_default().to_string();
+                let origin_header = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("origin")
+                        .then(|| value.trim().to_string())
+                });
+                (target, origin_header)
+            })
+            .collect();
+        let sent = Some(origin.to_string());
+        assert_eq!(
+            observed,
+            vec![
+                ("GET /get".to_string(), None),
+                ("HEAD /head".to_string(), None),
+                ("POST /post".to_string(), sent.clone()),
+                ("PUT /put".to_string(), sent.clone()),
+                ("POST /redirect".to_string(), sent),
+                ("GET /after".to_string(), None),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_origin_fetch_sends_origin_for_non_get_methods() {
+        let (rt, origin, requests) = raw_request_runtime(6);
+        assert_origin_sent_for_non_get_methods(rt, &origin, requests).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_same_origin_fetch_sends_origin_for_non_get_methods() {
+        let (mut rt, origin, requests) = raw_request_runtime(6);
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+            std::sync::Arc::new(obscura_net::CookieJar::new()),
+        )));
+        assert_origin_sent_for_non_get_methods(rt, &origin, requests).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn same_origin_no_cors_redirect_keeps_response_identity() {
         let mut rt = redirect_chain_runtime(2);
