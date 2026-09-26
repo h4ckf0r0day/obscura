@@ -14775,6 +14775,25 @@ mod tests {
     }
 
     #[test]
+    fn non_replaced_inline_ignores_transform_for_geometry() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <span id="inline" style="transform:translateX(50px)">abc</span>
+              <span id="atomic" style="display:inline-block;transform:translateX(50px)">abc</span>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (300.0, 100.0), None, &mut resources)
+            .expect("prepared inline transform geometry");
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let atomic = tree.get_element_by_id("atomic").unwrap();
+
+        assert!(prepared.layout().transforms.get(&inline).is_none());
+        assert!(prepared.layout().transforms.get(&atomic).is_some());
+        assert!(prepared.document_rect(atomic).unwrap().x >= 50.0);
+    }
+
+    #[test]
     fn transformed_subtree_is_clipped_by_outside_ancestor() {
         let tree = parse_html(
             r#"<html><body style="margin:0">
