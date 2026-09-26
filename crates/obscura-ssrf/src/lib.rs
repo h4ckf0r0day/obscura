@@ -109,6 +109,25 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                     s[2] as u8,
                 )));
             }
+            // Teredo (RFC 4380, 2001:0::/32) carries the server's IPv4 in
+            // bits 32..64 and the client's public IPv4, bit-inverted, in the
+            // last 32 bits. Either one embedding a forbidden address is
+            // refused, like the other IPv4-in-IPv6 forms above.
+            if s[0] == 0x2001 && s[1] == 0 {
+                let server = Ipv4Addr::new(
+                    (s[2] >> 8) as u8,
+                    s[2] as u8,
+                    (s[3] >> 8) as u8,
+                    s[3] as u8,
+                );
+                let client = Ipv4Addr::new(
+                    !(s[6] >> 8) as u8,
+                    !s[6] as u8,
+                    !(s[7] >> 8) as u8,
+                    !s[7] as u8,
+                );
+                return is_forbidden_ip(IpAddr::V4(server)) || is_forbidden_ip(IpAddr::V4(client));
+            }
 
             // Discard-only, local-use NAT64, and documentation prefixes.
             (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
