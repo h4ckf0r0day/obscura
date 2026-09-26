@@ -107,7 +107,7 @@ use obscura_net::StealthHttpClient;
 /// non-file scheme into a file: URL. We treat that move as an SOP
 /// violation because the existing realm survives the navigation and
 /// can read the new document's body.
-fn cross_scheme_to_file(from: &str, to: &str) -> bool {
+pub(crate) fn cross_scheme_to_file(from: &str, to: &str) -> bool {
     let to_is_file = Url::parse(to)
         .map(|u| u.scheme().eq_ignore_ascii_case("file"))
         .unwrap_or(false);
@@ -117,6 +117,14 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
     Url::parse(from)
         .map(|u| !u.scheme().eq_ignore_ascii_case("file"))
         .unwrap_or(true)
+}
+
+/// Whether a navigation target is a local file, including spellings the URL
+/// parser rejects (a bare `file:` prefix) so they cannot slip past the gate.
+fn url_is_file_scheme(raw: &str) -> bool {
+    Url::parse(raw)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or_else(|_| raw.trim_start().to_ascii_lowercase().starts_with("file:"))
 }
 
 /// Sub-resource fetch policy. http(s) is always fine; data: is allowed
@@ -3193,6 +3201,16 @@ impl Page {
         body: &str,
         initial_referrer: &str,
     ) -> Result<(), PageError> {
+        // file:// is a local file read. Every client route (CLI, CDP's
+        // Page.navigate/reload/history and Target.createTarget, the MCP
+        // tools) ends up here, so the context's opt-in is enforced once
+        // instead of being copied into each handler, where a route that
+        // missed its copy read local files (#1069).
+        if url_is_file_scheme(url_str) && !self.context.allow_file_access {
+            return Err(PageError::NetworkError(format!(
+                "file:// navigation is disabled for this browser context: {url_str}"
+            )));
+        }
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
@@ -4688,6 +4706,33 @@ impl Page {
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
+            // SOP gate for navigations the page queued itself (a timer or
+            // handler assigning location, a link click, a form submit). They
+            // arrive here as a fresh first URL, so the chain gate in
+            // navigate_with_wait_post_inner never sees them. A web document
+            // must not drive itself into file:// even in a context that lets
+            // clients open local files (#1069).
+            let current_url = self.url_string();
+            if cross_scheme_to_file(&current_url, &url) {
+                tracing::warn!(
+                    "blocking page-initiated cross-scheme navigation to file: {} -> {}",
+                    current_url,
+                    url,
+                );
+                // The location setter already published the target as the
+                // virtual URL; put location back on the document that is
+                // still loaded so nothing later adopts the blocked target.
+                if let Some(js) = self.js.as_mut() {
+                    let _ = js.execute_script(
+                        "<blocked-navigation>",
+                        &format!(
+                            "globalThis.__virtualUrl = {};",
+                            serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
+                        ),
+                    );
+                }
+                return Ok(false);
+            }
             let source_url = self
                 .url
                 .as_ref()
@@ -4872,6 +4917,89 @@ mod tests {
             .unwrap();
         assert_eq!(b_loaded.as_str(), Some("yes"), "load fired on the target link");
         assert_eq!(a_loaded.as_str(), None, "load did not fire on the other link");
+    }
+
+    fn local_html_fixture(tag: &str) -> (std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(format!(
+            "obscura-file-gate-{tag}-{}.html",
+            std::process::id()
+        ));
+        std::fs::write(&path, "<p id=secret>local-secret</p>").expect("write fixture");
+        let file_url = url::Url::from_file_path(&path).expect("file url").to_string();
+        (path, file_url)
+    }
+
+    fn file_gate_context(name: &str, allow_file_access: bool) -> std::sync::Arc<crate::BrowserContext> {
+        let mut context = crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        context.allow_file_access = allow_file_access;
+        std::sync::Arc::new(context)
+    }
+
+    // file:// is a local file read, so a browser context must opt in before any
+    // client-driven navigation reaches it. Every CLI, CDP and MCP route funnels
+    // through the one navigation entry point, so the opt-in is enforced there
+    // rather than copied into each handler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_navigation_requires_the_context_to_allow_file_access() {
+        let (path, file_url) = local_html_fixture("client");
+
+        let mut locked = super::Page::new("file-gate".to_string(), file_gate_context("file-gate", false));
+        let error = locked
+            .navigate(&file_url)
+            .await
+            .expect_err("file:// must be refused unless the context allows it")
+            .to_string();
+        assert!(error.contains("file://"), "{error}");
+        assert_ne!(locked.url_string(), file_url);
+
+        let mut open = super::Page::new("file-gate-open".to_string(), file_gate_context("file-gate-open", true));
+        open.navigate(&file_url).await.expect("an opted-in context reads local files");
+        assert_eq!(open.url_string(), file_url);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A page must never drive itself from a web origin into file://, even in a
+    // context that lets clients open local files. Timers, link clicks and form
+    // submits are consumed by process_pending_navigation as a fresh first URL,
+    // so the in-navigation chain's cross-scheme gate never sees them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_driven_navigation_cannot_cross_into_file_scheme() {
+        let (path, file_url) = local_html_fixture("page");
+        let mut page = super::Page::new("file-gate-page".to_string(), file_gate_context("file-gate-page", true));
+        page.navigate("data:text/html,<p id=web>web</p>")
+            .await
+            .expect("web page");
+        let web_url = page.url_string();
+
+        page.evaluate(&format!(
+            "location.href = {}",
+            serde_json::to_string(&file_url).expect("json string")
+        ));
+        assert!(page.has_pending_navigation(), "the page queued a navigation");
+
+        let navigated = page
+            .process_pending_navigation()
+            .await
+            .expect("a blocked page navigation is not an error");
+        assert!(!navigated);
+        assert_eq!(page.url_string(), web_url);
+        assert!(!page.has_pending_navigation(), "the blocked navigation is dropped");
+        // The location setter published the target before the block; the
+        // page must not keep reporting (or later adopt) a document it never
+        // loaded.
+        assert_eq!(page.evaluate("location.href"), serde_json::json!(web_url));
+        assert!(!page.sync_virtual_url());
+        assert_eq!(page.url_string(), web_url);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -19,9 +19,10 @@ pub struct BrowserContext {
     /// Default is false: a remote CDP client cannot point the browser
     /// at /etc/shadow even if Obscura is running as a privileged user.
     /// Flip on via `obscura serve --allow-file-access` for legitimate
-    /// local-HTML testing workflows. The CLI's own `obscura fetch
-    /// file://...` path is unaffected because it does not go through
-    /// the CDP server.
+    /// local-HTML testing workflows. Enforced by `Page` navigation itself,
+    /// so every CDP and MCP route is covered; the CLI's own `obscura fetch
+    /// file://...` opts its local context in. A page can never drive
+    /// itself from a web origin into file:// regardless of this flag.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     /// When true, the http client allows fetching localhost / RFC1918 /
