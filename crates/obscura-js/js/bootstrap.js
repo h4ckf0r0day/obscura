@@ -3450,6 +3450,99 @@ function _animationsForTarget(target) {
   });
 }
 
+// Native range value sanitization and user input defaults. Script assignments
+// share the sanitizer but never generate input/change events.
+function _rangeNumber(raw) {
+  if (raw === null || !/^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(String(raw))) return NaN;
+  const n = Number(raw); return Number.isFinite(n) ? n : NaN;
+}
+function _rangeLimits(el) {
+  let min = _rangeNumber(el.getAttribute('min')), max = _rangeNumber(el.getAttribute('max'));
+  if (!Number.isFinite(min)) min = 0;
+  if (!Number.isFinite(max)) max = 100;
+  max = Math.max(min, max);
+  let step = _rangeNumber(el.getAttribute('step'));
+  if (!(step > 0)) step = 1;
+  let base = _rangeNumber(el.getAttribute('min'));
+  if (!Number.isFinite(base)) base = _rangeNumber(el.getAttribute('value'));
+  if (!Number.isFinite(base)) base = 0;
+  return {min, max, step, base, any: el.getAttribute('step') === 'any'};
+}
+function _rangeSanitize(el, raw) {
+  const r = _rangeLimits(el); let n = _rangeNumber(raw);
+  if (!Number.isFinite(n)) n = r.min / 2 + r.max / 2;
+  n = Math.max(r.min, Math.min(r.max, n));
+  if (!r.any && r.max > r.min) {
+    const lo = Math.ceil((r.min-r.base)/r.step), hi = Math.floor((r.max-r.base)/r.step);
+    if (hi >= lo) {
+      const aligned = r.base + Math.max(lo, Math.min(hi, Math.floor((n-r.base)/r.step + 0.5))) * r.step;
+      if (Number.isFinite(aligned)) n = Number(aligned.toPrecision(15));
+    }
+  }
+  return String(n);
+}
+function _rangeAttributeChanged(el, name) {
+  if (el.localName !== 'input' || !['min','max','step','type'].includes(name) || (el.getAttribute('type') || '').toLowerCase() !== 'range') return;
+  if (_formValues[el._nid] === undefined) _loadFormState(el._nid);
+  if (_formValues[el._nid] !== undefined) {
+    const value = _rangeSanitize(el, _formValues[el._nid]);
+    _formValues[el._nid] = value; _dom('set_form_value', el._nid, value);
+  }
+}
+function _isNativeRange(el) {
+  return el && el.localName === 'input' && (el.getAttribute('type') || '').toLowerCase() === 'range' && !globalThis.__obscura_isDisabled(el);
+}
+function _rangeValue(el) {
+  return Object.getOwnPropertyDescriptor(Element.prototype, 'value').get.call(el);
+}
+function _rangeEvent(el, type) {
+  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event(type, {bubbles:true, composed:type === 'input'})));
+}
+function _rangeUpdate(el, value) {
+  const old = _rangeValue(el);
+  globalThis.__obscura_setFieldValue(el, 'value', value);
+  if (_rangeValue(el) === old) return false;
+  _rangeEvent(el, 'input'); return true;
+}
+function _rangePointerValue(el, x) {
+  const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+  const px = name => parseFloat(style[name]) || 0;
+  const left = px('paddingLeft') + px('borderLeftWidth'), right = px('paddingRight') + px('borderRightWidth');
+  const height = Math.max(0, rect.height - px('paddingTop') - px('paddingBottom') - px('borderTopWidth') - px('borderBottomWidth'));
+  const width = Math.max(0, rect.width-left-right), thumb = Math.min(16, height, width);
+  const r = _rangeLimits(el), length = width - thumb;
+  let fraction = length > 0 ? Math.max(0, Math.min(1, (x - rect.left - left - thumb/2)/length)) : 0;
+  if (style.direction === 'rtl') fraction = 1-fraction;
+  return String(r.min + fraction * (r.max-r.min));
+}
+globalThis.__obscura_rangePointerDown = function(el, x) {
+  globalThis.__obscura_rangeDrag = null;
+  if (!_isNativeRange(el)) return;
+  globalThis.__obscura_rangeDrag = {el, initial:_rangeValue(el)};
+  _rangeUpdate(el, _rangePointerValue(el, x));
+};
+globalThis.__obscura_rangePointerMove = function(x) {
+  const drag = globalThis.__obscura_rangeDrag;
+  if (drag && drag.el.isConnected && _isNativeRange(drag.el)) _rangeUpdate(drag.el, _rangePointerValue(drag.el, x));
+};
+globalThis.__obscura_rangePointerUp = function() {
+  const drag = globalThis.__obscura_rangeDrag; globalThis.__obscura_rangeDrag = null;
+  if (drag && drag.el.isConnected && _isNativeRange(drag.el) && _rangeValue(drag.el) !== drag.initial) _rangeEvent(drag.el, 'change');
+};
+globalThis.__obscura_rangeKey = function(el, key) {
+  if (!_isNativeRange(el)) return;
+  const r = _rangeLimits(el), old = Number(_rangeValue(el)), step = r.any ? (r.max-r.min)/100 : r.step;
+  const rtl = getComputedStyle(el).direction === 'rtl'; let next;
+  if (key === 'Home') next = r.min;
+  else if (key === 'End') next = r.max;
+  else if (key === 'ArrowUp' || key === (rtl ? 'ArrowLeft' : 'ArrowRight')) next = old + step;
+  else if (key === 'ArrowDown' || key === (rtl ? 'ArrowRight' : 'ArrowLeft')) next = old - step;
+  else if (key === 'PageUp') next = old + Math.max(step, (r.max-r.min)/10);
+  else if (key === 'PageDown') next = old - Math.max(step, (r.max-r.min)/10);
+  else return;
+  if (_rangeUpdate(el, String(next))) _rangeEvent(el, 'change');
+};
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -3668,6 +3761,7 @@ class Element extends Node {
       : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    _rangeAttributeChanged(this, n);
     if (n === "src" && this.localName === "iframe") {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
@@ -3721,6 +3815,7 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     _dom("remove_attribute", this._nid, n);
+    _rangeAttributeChanged(this, n);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
@@ -4173,6 +4268,9 @@ class Element extends Node {
       return '';
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
+    if (tag === 'input' && (this.getAttribute('type') || '').toLowerCase() === 'range') {
+      return _rangeSanitize(this, _formValues[this._nid] !== undefined ? _formValues[this._nid] : this.getAttribute('value'));
+    }
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
@@ -4224,7 +4322,7 @@ class Element extends Node {
       }
       return;
     }
-    const value = String(v);
+    const value = tag === 'input' && (this.getAttribute('type') || '').toLowerCase() === 'range' ? _rangeSanitize(this, String(v)) : String(v);
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
@@ -8768,6 +8866,11 @@ globalThis.getComputedStyle = (el) => {
         if (Number.isFinite(value)) return String(Math.min(1, Math.max(0, value)));
       }
       return inlineVal;
+    }
+    if (kebab === 'direction') {
+      const dir = (el.getAttribute?.('dir') || '').toLowerCase();
+      if (dir === 'ltr' || dir === 'rtl') return dir;
+      return el.parentElement ? globalThis.getComputedStyle(el.parentElement).direction : 'ltr';
     }
     const dim = dimensionFor(kebab);
     if (dim != null) return dim;

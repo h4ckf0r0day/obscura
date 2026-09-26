@@ -1485,6 +1485,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 0
             };
         }
+        "appearance" | "-webkit-appearance" => style.appearance_none = value.eq_ignore_ascii_case("none"),
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
         "pointer-events" => {
             style.pointer_events_none = Some(value.eq_ignore_ascii_case("none"));
@@ -2145,6 +2146,8 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "overflow-x"
             | "overflow-y"
             | "scrollbar-gutter"
+            | "appearance"
+            | "-webkit-appearance"
             | "visibility"
             | "pointer-events"
             | "opacity"
@@ -2329,6 +2332,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                         || px_value(token).is_some_and(f32::is_finite)
                 })
         }
+        "appearance" | "-webkit-appearance" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "none"),
         "visibility" => matches!(
             value.to_ascii_lowercase().as_str(),
             "visible" | "hidden" | "collapse"

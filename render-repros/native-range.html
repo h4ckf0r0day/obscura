@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native horizontal range controls</title>
+<style>
+body { margin: 20px; font: 16px sans-serif; background: white; }
+label { display: block; margin-bottom: 20px; }
+input { display: block; margin: 8px 0; width: 200px; height: 20px; }
+.unstyled { appearance: none; -webkit-appearance: none; background: #eee; }
+</style>
+<label>Minimum<input type="range" min="0" max="100" value="0"></label>
+<label>Live value 80<input id="live" type="range" min="0" max="100" step="10" value="50"></label>
+<label>Maximum<input type="range" min="0" max="100" value="100"></label>
+<label>Right-to-left<input type="range" dir="rtl" value="20"></label>
+<label>Disabled<input type="range" value="50" disabled></label>
+<label>Track appearance removed, default thumb retained<input class="unstyled" type="range" value="50"></label>
+<script>document.getElementById('live').value = '80';</script>

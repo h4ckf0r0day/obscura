@@ -14,6 +14,40 @@ use tiny_skia::{
     Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform,
 };
 
+// HTML floating-point syntax (not Rust/JavaScript's more permissive parser).
+// Keep this consistent with range value sanitization in the DOM bindings.
+fn range_number(raw: Option<&str>) -> Option<f64> {
+    let raw = raw?;
+    let unsigned = raw.strip_prefix('-').unwrap_or(raw);
+    let mut exponent = unsigned.split(['e', 'E']);
+    let mantissa = exponent.next()?;
+    if let Some(exp) = exponent.next() {
+        let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+        if digits.is_empty()
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+            || exponent.next().is_some()
+        {
+            return None;
+        }
+    }
+    let mut decimal = mantissa.split('.');
+    let whole = decimal.next()?;
+    if !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(fraction) = decimal.next() {
+        if fraction.is_empty()
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+            || decimal.next().is_some()
+        {
+            return None;
+        }
+    } else if whole.is_empty() {
+        return None;
+    }
+    raw.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
 static SYSTEM_FONT_BYTES: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SERIF_FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
@@ -1570,6 +1604,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
+        out.insert("direction", if style.direction == Some(taffy::Direction::Rtl) { "rtl" } else { "ltr" }.to_string());
         out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
         out.insert(
             "background-color",
@@ -4828,6 +4863,104 @@ fn paint_laid_dom_scrolled(
 
         let input_type =
             (name.local.as_ref() == "input").then(|| node.get_attribute("type").unwrap_or("text"));
+        let range = input_type.is_some_and(|kind| kind.eq_ignore_ascii_case("range"));
+        if range && rect.width > 0.0 && rect.height > 0.0 {
+            // Native horizontal range geometry also defines pointer mapping in
+            // the input default action: a 16px thumb travels inside the box.
+            let number = range_number;
+            let min = number(node.get_attribute("min")).unwrap_or(0.0);
+            let max = number(node.get_attribute("max")).unwrap_or(100.0).max(min);
+            let live = tree
+                .form_control_state(nid)
+                .and_then(|control| control.value);
+            let mut value = number(live.as_deref().or_else(|| node.get_attribute("value")))
+                .unwrap_or(min / 2.0 + max / 2.0)
+                .clamp(min, max);
+            if node.get_attribute("step") != Some("any") && max > min {
+                let step = number(node.get_attribute("step"))
+                    .filter(|n| *n > 0.0)
+                    .unwrap_or(1.0);
+                let base = number(node.get_attribute("min"))
+                    .or_else(|| number(node.get_attribute("value")))
+                    .unwrap_or(0.0);
+                let low = ((min - base) / step).ceil();
+                let high = ((max - base) / step).floor();
+                if high >= low {
+                    let aligned = base + ((value - base) / step + 0.5).floor().clamp(low, high) * step;
+                    if aligned.is_finite() {
+                        value = aligned;
+                    }
+                }
+            }
+            let mut fraction = if max > min {
+                ((value - min) / (max - min)) as f32
+            } else {
+                0.0
+            };
+            let rtl = style.direction == Some(taffy::Direction::Rtl);
+            if rtl {
+                fraction = 1.0 - fraction;
+            }
+            let inset_left = style.padding.left + style.border.left;
+            let inset_right = style.padding.right + style.border.right;
+            let inset_top = style.padding.top + style.border.top;
+            let inset_bottom = style.padding.bottom + style.border.bottom;
+            let width = (rect.width - inset_left - inset_right).max(0.0);
+            let height = (rect.height - inset_top - inset_bottom).max(0.0);
+            let size = 16.0_f32.min(height).min(width);
+            let left = rect.x + inset_left + size / 2.0;
+            let right = rect.x + rect.width - inset_right - size / 2.0;
+            let center = left + fraction * (right - left);
+            let y = rect.y + inset_top + height / 2.0;
+            let disabled = node.get_attribute("disabled").is_some();
+            let mut paint = Paint::default();
+            paint.anti_alias = true;
+            let stroke = tiny_skia::Stroke {
+                width: 6.0_f32.min(size),
+                line_cap: tiny_skia::LineCap::Round,
+                ..Default::default()
+            };
+            let mut track = PathBuilder::new();
+            track.move_to(left, y);
+            track.line_to(right, y);
+            paint.set_color(Color::from_rgba8(210, 210, 210, 255));
+            if let Some(path) = track.finish().filter(|_| !style.appearance_none) {
+                pixmap.stroke_path(
+                    &path,
+                    &paint,
+                    &stroke,
+                    raster_transform(raster_scale),
+                    element_clip_mask,
+                );
+            }
+            paint.set_color(if disabled {
+                Color::from_rgba8(160, 160, 160, 255)
+            } else {
+                Color::from_rgba8(0, 117, 255, 255)
+            });
+            let mut fill = PathBuilder::new();
+            fill.move_to(if rtl { right } else { left }, y);
+            fill.line_to(center, y);
+            if let Some(path) = fill.finish().filter(|_| !style.appearance_none) {
+                pixmap.stroke_path(
+                    &path,
+                    &paint,
+                    &stroke,
+                    raster_transform(raster_scale),
+                    element_clip_mask,
+                );
+            }
+            if let Some(thumb) = PathBuilder::from_circle(center, y, size / 2.0) {
+                pixmap.fill_path(
+                    &thumb,
+                    &paint,
+                    FillRule::Winding,
+                    raster_transform(raster_scale),
+                    element_clip_mask,
+                );
+            }
+        }
+
         let checkable = input_type.is_some_and(|kind| {
             kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
         });
@@ -4934,7 +5067,7 @@ fn paint_laid_dom_scrolled(
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
-        if !checkable && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
+        if !checkable && !range && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
             let live_value = tree
                 .form_control_state(nid)
                 .and_then(|control| control.value);
@@ -12681,6 +12814,37 @@ mod tests {
             "fill origin: {:?}",
             f
         );
+    }
+
+    #[test]
+    fn native_range_thumb_tracks_value_direction_and_appearance() {
+        for (attrs, thumb_x, blue) in [
+            ("value=0", 8, true),
+            ("value=100", 192, true),
+            ("value=0 dir=rtl", 192, true),
+            ("value=0 disabled", 8, false),
+            ("min=+50 value=50", 100, true),
+            ("min=50. value=50", 100, true),
+        ] {
+            let tree = parse_html(&format!(
+                r#"<body style="margin:0"><input type=range {attrs} style="position:absolute;left:0;top:0;margin:0;width:200px;height:20px"></body>"#
+            ));
+            let image = paint_dom(&tree, (220.0, 40.0), None).unwrap();
+            let pixel = image.pixel(thumb_x, 10).unwrap();
+            if blue {
+                assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 117, 255));
+            } else {
+                assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (160, 160, 160));
+            }
+        }
+        let tree = parse_html(
+            r#"<body style="margin:0;background:white"><input type=range value=0 style="position:absolute;left:0;top:0;margin:0;width:200px;height:20px;appearance:none"></body>"#,
+        );
+        let image = paint_dom(&tree, (220.0, 40.0), None).unwrap();
+        let pixel = image.pixel(8, 10).unwrap();
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 117, 255));
+        let track = image.pixel(100, 10).unwrap();
+        assert_eq!((track.red(), track.green(), track.blue()), (255, 255, 255));
     }
 
     #[test]
