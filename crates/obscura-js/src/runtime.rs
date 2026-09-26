@@ -1631,16 +1631,23 @@ impl ObscuraJsRuntime {
         let ObscuraState {
             dom,
             render_resources,
+            canvas_surfaces,
+            element_scroll_offsets,
             ..
         } = &mut *state;
-        obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
-            dom.as_ref()?,
-            viewport,
-            base_url,
-            scroll,
-            animation_sample_time,
-            surface_color,
+        let dom = dom.as_ref()?;
+        let mut prepared = obscura_render::prepare_dom_at_animation_time(
+            dom, viewport, base_url, render_resources, animation_sample_time,
+        )?;
+        let resolved_scroll = prepared.resolve_scroll_state(dom, scroll, element_scroll_offsets);
+        let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+        obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            dom,
+            &mut prepared,
             render_resources,
+            &resolved_scroll,
+            surface_color,
+            &canvas_surfaces,
         )
     }
 
@@ -13946,6 +13953,36 @@ mod tests {
             result,
             serde_json::json!([null, null, null, true, "static fallback"])
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn unprepared_capture_preserves_live_canvas_pixels() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><body style="margin:0">
+                <canvas id="canvas" width="10" height="10" style="display:block"></canvas>
+            </body></html>"#,
+        );
+        let url = "http://example.test/canvas";
+        rt.set_url(url);
+        rt.set_viewport(40.0, 40.0);
+        let empty = rt.screenshot_prepared((40.0, 40.0), Some(url)).unwrap();
+        for color in ["#ff0000", "#00ff00"] {
+            rt.evaluate(&format!(
+                "(() => {{ const ctx = document.getElementById('canvas').getContext('2d'); ctx.fillStyle = '{color}'; ctx.fillRect(0,0,10,10); }})()"
+            )).unwrap();
+            for viewport in [(40.0, 40.0), (80.0, 30.0)] {
+                rt.set_viewport(viewport.0 as f64, viewport.1 as f64);
+                let retained = rt.screenshot_prepared(viewport, Some(url)).unwrap();
+                assert_ne!(retained, empty, "prepared capture must contain drawn pixels");
+                rt.set_viewport(40.0, 40.0);
+                let fallback = rt.screenshot_unprepared_with_retained_resources(
+                    viewport, Some("http://example.test/new-route"), (0.0, 0.0),
+                    obscura_render::AnimationSampleTime::default(), [255, 255, 255, 255],
+                ).unwrap();
+                assert_eq!(fallback, retained, "an alternate capture base or viewport must retain live canvas pixels");
+            }
+        }
     }
 
     #[cfg(feature = "render")]
