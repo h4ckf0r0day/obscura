@@ -264,6 +264,19 @@ fn js_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// The values CDP allows in `RemoteObject.unserializableValue` /
+/// `CallArgument.unserializableValue`: the non-JSON numbers and a bigint
+/// literal. Used to keep that field from acting as an implicit eval.
+fn is_cdp_unserializable_value(value: &str) -> bool {
+    if matches!(value, "Infinity" | "-Infinity" | "NaN" | "-0") {
+        return true;
+    }
+    value
+        .strip_suffix('n')
+        .map(|digits| digits.strip_prefix('-').unwrap_or(digits))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
     let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
     if remaining.is_zero() {
@@ -1289,11 +1302,12 @@ impl ObscuraJsRuntime {
                     .and_then(|rest| rest.split_once('-'))
                     .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
                     .unwrap_or(0);
+                let object_id_lit = js_string_literal(object_id);
                 let retrieval = if frame_id == 0 {
-                    format!("globalThis.__obscura_objects['{object_id}']")
+                    format!("globalThis.__obscura_objects[{object_id_lit}]")
                 } else {
                     format!(
-                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}']"
+                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}]"
                     )
                 };
                 self.object_store.insert(object_id.to_string(), retrieval);
@@ -2429,18 +2443,18 @@ impl ObscuraJsRuntime {
                 "(async function() {{\n\
                     try {{\n\
                         var __result = await (0, eval)({src});\n\
-                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        globalThis.__obscura_objects[{oid}] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
                         globalThis.__obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
-                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_objects[{oid}] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
                         globalThis.__obscura_await_rejected = true;\n\
                     }}\n\
                     globalThis.__obscura_done_{done_counter} = true;\n\
                 }})()",
                 src = source_literal,
-                oid = oid,
+                oid = js_string_literal(&oid),
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = Self::meta_extract_js("e"),
                 done_counter = done_counter,
@@ -2458,17 +2472,17 @@ impl ObscuraJsRuntime {
                     try {{\n\
                         __result = (0, eval)({src});\n\
                     }} catch(e) {{\n\
-                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_objects[{oid}] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
                         globalThis.__obscura_await_rejected = true;\n\
                         return globalThis.__obscura_await_meta;\n\
                     }}\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    globalThis.__obscura_objects[{oid}] = __result;\n\
                     globalThis.__obscura_await_rejected = false;\n\
                     return {meta_fn};\n\
                 }})()",
                 src = source_literal,
-                oid = oid,
+                oid = js_string_literal(&oid),
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = Self::meta_extract_js("e"),
             )
@@ -2541,7 +2555,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
         );
         if !return_by_value {
             // The eval-based wrapper above parses the raw expression as
@@ -2554,7 +2568,7 @@ impl ObscuraJsRuntime {
             let read = self
                 .execute_runtime_script(
                     "<readResult>",
-                    format!("globalThis.__obscura_objects['{}']", oid),
+                    format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
                 )
                 .map_err(|e| format!("JS error: {}", e))?;
             return self.v8_to_cdp_value(read);
@@ -2609,12 +2623,12 @@ impl ObscuraJsRuntime {
                     var __result;\n\
                     try {{\n\
                         __result = await __fn.call(__this, {args});\n\
-                        globalThis.__obscura_objects['{oid}'] = __result;\n\
+                        globalThis.__obscura_objects[{oid}] = __result;\n\
                         globalThis.__obscura_await_meta = {meta_fn};\n\
                         globalThis.__obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
                         __result = e;\n\
-                        globalThis.__obscura_objects['{oid}'] = e;\n\
+                        globalThis.__obscura_objects[{oid}] = e;\n\
                         globalThis.__obscura_await_meta = {err_meta_fn};\n\
                         globalThis.__obscura_await_rejected = true;\n\
                     }} finally {{\n\
@@ -2625,7 +2639,7 @@ impl ObscuraJsRuntime {
                 fn_decl = function_declaration,
                 this_expr = this_expr,
                 args = args_list,
-                oid = oid,
+                oid = js_string_literal(&oid),
                 meta_fn = Self::meta_extract_js("__result"),
                 err_meta_fn = err_meta_fn,
                 done_counter = done_counter,
@@ -2687,7 +2701,7 @@ impl ObscuraJsRuntime {
                 let read = self
                     .execute_runtime_script(
                         "<readResult>",
-                        format!("globalThis.__obscura_objects['{}']", oid),
+                        format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
                     )
                     .map_err(|e| format!("JS error: {}", e))?;
                 return self.v8_to_cdp_value(read);
@@ -2704,7 +2718,7 @@ impl ObscuraJsRuntime {
             };
             self.object_store.insert(
                 oid.clone(),
-                format!("globalThis.__obscura_objects['{}']", oid),
+                format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
             );
             return Ok(Self::info_from_meta(&meta_json, Some(oid)));
         }
@@ -2734,14 +2748,14 @@ impl ObscuraJsRuntime {
                 var __fn = ({fn_decl});\n\
                 var __this = ({this_expr});\n\
                 var __result = __fn.call(__this, {args});\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                globalThis.__obscura_objects[{oid}] = __result;\n\
                 return {meta_fn};\n\
             }})()",
             setup = setup,
             fn_decl = function_declaration,
             this_expr = this_expr,
             args = args_list,
-            oid = oid,
+            oid = js_string_literal(&oid),
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
@@ -2755,7 +2769,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
         );
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -2780,14 +2794,14 @@ impl ObscuraJsRuntime {
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
-            "globalThis.__obscura_objects['{}'] = ({});",
-            oid, js_expression,
+            "globalThis.__obscura_objects[{}] = ({});",
+            js_string_literal(&oid), js_expression,
         );
         self.execute_runtime_script("<store>", code)
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
         );
         Ok(oid)
     }
@@ -2802,11 +2816,11 @@ impl ObscuraJsRuntime {
         let code = format!(
             "(function() {{\n\
                 var __result = (\n{expr}\n);\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                globalThis.__obscura_objects[{oid}] = __result;\n\
                 return {meta_fn};\n\
             }})()",
             expr = js_expression,
-            oid = oid,
+            oid = js_string_literal(&oid),
             meta_fn = Self::meta_extract_js("__result"),
         );
         let result = self
@@ -2820,7 +2834,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
         );
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -2833,11 +2847,12 @@ impl ObscuraJsRuntime {
                 .and_then(|rest| rest.split_once('-'))
                 .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
                 .unwrap_or(0);
+            let object_id_lit = js_string_literal(object_id);
             let code = if frame_id == 0 {
-                format!("delete globalThis.__obscura_objects['{object_id}'];")
+                format!("delete globalThis.__obscura_objects[{object_id_lit}];")
             } else {
                 format!(
-                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}'];"
+                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}];"
                 )
             };
             let _ = self.execute_runtime_script("<release>", code);
@@ -4092,7 +4107,14 @@ impl ObscuraJsRuntime {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
                 }
             } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
-                setup_lines.push(format!("var {} = {};", arg_name, unser));
+                // CDP defines UnserializableValue as a closed set. Anything
+                // else is arbitrary source text arriving in a data field;
+                // treat it as undefined rather than evaluating it.
+                if is_cdp_unserializable_value(unser) {
+                    setup_lines.push(format!("var {} = {};", arg_name, unser));
+                } else {
+                    setup_lines.push(format!("var {} = undefined;", arg_name));
+                }
             } else {
                 setup_lines.push(format!("var {} = undefined;", arg_name));
             }
@@ -4256,7 +4278,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.to_string(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
         );
         let mut info = Self::info_from_meta(&meta_json, Some(oid.to_string()));
         info.thrown = true;
@@ -16011,6 +16033,104 @@ mod tests {
         assert_eq!(plugin_interfaces["enumerable"], false);
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unserializable_value_arguments_are_limited_to_the_cdp_set() {
+        // CDP's UnserializableValue is a closed set. Anything else is source
+        // text that must not be evaluated just because it arrived in that field.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let args = vec![serde_json::json!({
+            "unserializableValue": "(globalThis.__pwned = 1)"
+        })];
+        let result = rt
+            .call_function_on("(a) => typeof a", None, &args, true)
+            .await
+            .unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("undefined"));
+        assert_eq!(
+            rt.evaluate("globalThis.__pwned").unwrap(),
+            serde_json::Value::Null
+        );
+
+        for (unser, expected) in [
+            ("Infinity", "Infinity"),
+            ("-Infinity", "-Infinity"),
+            ("NaN", "NaN"),
+            ("-0", "-0"),
+            ("12n", "12n"),
+            ("-7n", "-7n"),
+        ] {
+            let args = vec![serde_json::json!({ "unserializableValue": unser })];
+            let result = rt
+                .call_function_on(
+                    "(a) => Object.is(a, -0) ? '-0' : (typeof a === 'bigint' ? a + 'n' : String(a))",
+                    None,
+                    &args,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.value.unwrap(), serde_json::json!(expected), "{unser}");
+        }
+    }
+
+    #[test]
+    fn release_object_never_interpolates_the_object_id_as_source() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // A key the CDP client controls only reaches release_object when the
+        // store holds it; simulate a store entry whose id carries source text.
+        let hostile = "x'];globalThis.__pwned=1;//";
+        rt.object_store
+            .insert(hostile.to_string(), "undefined".to_string());
+        rt.release_object(hostile);
+        assert_eq!(
+            rt.evaluate("globalThis.__pwned").unwrap(),
+            serde_json::Value::Null,
+            "the object id must be embedded as a string literal, never as source"
+        );
+    }
+
+    #[test]
+    fn replacing_a_subtree_releases_its_linked_stylesheets() {
+        // innerHTML and subtree removal bypass Node.removeChild, which was the
+        // only path that released native external stylesheet bytes. On an SPA
+        // that swaps sections holding <link rel=stylesheet>, the native map
+        // grew without bound and a recycled node id could inherit stale CSS.
+        let mut rt = setup_runtime(
+            "<html><body><div id=\"outer\"><div id=\"inner\">\
+             <link rel=\"stylesheet\" href=\"a.css\"></div></div>\
+             <div id=\"other\"><link rel=\"stylesheet\" href=\"b.css\"></div></body></html>",
+        );
+        rt.with_dom(|dom| {
+            for link in dom.query_selector_all("link").unwrap() {
+                dom.append_external_stylesheet(link, "p{color:red}".to_string(), true);
+            }
+        });
+        rt.execute_script(
+            "<register>",
+            "for (const l of document.querySelectorAll('link')) \
+                 globalThis.__obscura_registerLinkedStylesheet(l, 'http://x/' + l.getAttribute('href'));",
+        )
+        .unwrap();
+        assert_eq!(rt.with_dom(|dom| dom.external_stylesheets().len()).unwrap(), 2);
+
+        // innerHTML replacement of an ancestor.
+        rt.evaluate("document.getElementById('outer').innerHTML = '<p>gone</p>'")
+            .unwrap();
+        assert_eq!(
+            rt.with_dom(|dom| dom.external_stylesheets().len()).unwrap(),
+            1,
+            "innerHTML must release the linked stylesheet of a removed descendant"
+        );
+        // removeChild of an ancestor (the link is a grandchild, not the child).
+        rt.evaluate("document.body.removeChild(document.getElementById('other'))")
+            .unwrap();
+        assert_eq!(
+            rt.with_dom(|dom| dom.external_stylesheets().len()).unwrap(),
+            0,
+            "removing an ancestor must release the linked stylesheets below it"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

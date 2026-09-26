@@ -75,25 +75,27 @@ fn is_valid_shadow_host(tree: &DomTree, id: NodeId) -> bool {
     )
 }
 
+/// The element name html5ever asks for while parsing. A `Ref` into the tree's
+/// `RefCell` keeps the borrow alive for exactly as long as the name is used,
+/// so the borrow checker enforces what a raw pointer plus a phantom guard
+/// used to promise by convention.
 pub struct ObscuraElemName<'a> {
-    _ref: Ref<'a, ()>,
-    name: *const QualName,
+    name: Ref<'a, QualName>,
 }
 
 impl<'a> fmt::Debug for ObscuraElemName<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = unsafe { &*self.name };
-        write!(f, "{:?}", name)
+        write!(f, "{:?}", &*self.name)
     }
 }
 
 impl<'a> ElemName for ObscuraElemName<'a> {
     fn ns(&self) -> &Namespace {
-        unsafe { &(*self.name).ns }
+        &self.name.ns
     }
 
     fn local_name(&self) -> &LocalName {
-        unsafe { &(*self.name).local }
+        &self.name.local
     }
 }
 
@@ -113,19 +115,18 @@ impl TreeSink for DomTree {
     }
 
     fn elem_name<'a>(&'a self, target: &'a NodeId) -> ObscuraElemName<'a> {
-        let borrow = self.borrow_inner();
-        let node = borrow.nodes.get(target.index())
-            .and_then(|n| n.as_ref())
-            .expect("elem_name called on invalid node");
-        let name_ptr: *const QualName = match &node.data {
-            NodeData::Element { name, .. } => name as *const QualName,
-            _ => panic!("elem_name called on non-element"),
-        };
-        let ref_guard = Ref::map(borrow, |_| &());
-        ObscuraElemName {
-            _ref: ref_guard,
-            name: name_ptr,
-        }
+        let name = Ref::map(self.borrow_inner(), |inner| {
+            let node = inner
+                .nodes
+                .get(target.index())
+                .and_then(|n| n.as_ref())
+                .expect("elem_name called on invalid node");
+            match &node.data {
+                NodeData::Element { name, .. } => name,
+                _ => panic!("elem_name called on non-element"),
+            }
+        });
+        ObscuraElemName { name }
     }
 
     fn create_element(

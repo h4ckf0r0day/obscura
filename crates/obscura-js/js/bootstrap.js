@@ -2351,12 +2351,7 @@ class Node {
       );
     }
     const removedWindowNames = _windowNamedNamesInTree(c);
-    if (c instanceof Element && _linkedStylesheetNodes.has(c)) {
-      __obscuraCore.ops.op_external_stylesheet_remove(
-        c._nid, globalThis.__obscura_frameId || 0
-      );
-      _linkedStylesheetNodes.delete(c);
-    }
+    if (c instanceof Element) _releaseLinkedStylesheetsIn(c);
     const parentConnected = this.isConnected;
     const removed = _dom("remove_child", c._nid) === "true";
     if (!removed) {
@@ -3541,6 +3536,7 @@ class Element extends Node {
     // descendant style sheets before the backing nodes leave the document so
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
     for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
+    _releaseLinkedStylesheetsIn(this);
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
@@ -9202,10 +9198,29 @@ function _detachLinkedStyleSheet(link) {
   sheet._sourceNode = null;
   _linkElementSheets.delete(link);
 }
+// Drop the native bytes a host-fetched linked sheet installed for `link`.
+// Node.removeChild used to be the only path that did this; innerHTML and the
+// removal of an ancestor bypassed it, so the native map kept every sheet an
+// SPA ever swapped out (and a recycled node id could inherit stale CSS).
+function _releaseLinkedStylesheet(link) {
+  if (!_linkedStylesheetNodes.has(link)) return;
+  _linkedStylesheetNodes.delete(link);
+  try {
+    __obscuraCore.ops.op_external_stylesheet_remove(link._nid, globalThis.__obscura_frameId || 0);
+  } catch (e) {}
+  _detachLinkedStyleSheet(link);
+}
+function _releaseLinkedStylesheetsIn(root) {
+  if (!root || root.nodeType !== 1 && root.nodeType !== 11) return;
+  if (root.nodeType === 1 && root.localName === "link") _releaseLinkedStylesheet(root);
+  if (!root.querySelectorAll) return;
+  for (const link of root.querySelectorAll("link")) _releaseLinkedStylesheet(link);
+}
 function _detachStyleSheetsInSubtree(root) {
   if (!root) return;
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
   if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
+  _releaseLinkedStylesheetsIn(root);
   if (!root.querySelectorAll) return;
   for (const style of root.querySelectorAll("style")) _detachStyleSheet(style);
   for (const link of root.querySelectorAll('link[rel~="stylesheet"]')) {
