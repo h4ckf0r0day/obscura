@@ -144,18 +144,9 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
     if !params.is_object() {
         return Err("Invalid parameters: expected an object".to_string());
     }
-    let unsupported_true = [
-        ("displayHeaderFooter", "headers and footers"),
-        ("preferCSSPageSize", "CSS @page sizing"),
-        ("generateDocumentOutline", "document outlines"),
-    ];
-    for (name, capability) in unsupported_true {
-        if boolean(params, name, false)? {
-            return Err(format!(
-                "Page.printToPDF does not yet support {capability} ({name}=true)"
-            ));
-        }
-    }
+    let display_header_footer = boolean(params, "displayHeaderFooter", false)?;
+    let prefer_css_page_size = boolean(params, "preferCSSPageSize", false)?;
+    let generate_document_outline = boolean(params, "generateDocumentOutline", false)?;
     let requested_print_background = boolean(params, "printBackground", false)?;
     // Puppeteer currently sends true by default. Raster PDFs have no semantic
     // structure to tag, but rejecting the request makes the standard client
@@ -174,16 +165,17 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         }
         None => Vec::new(),
     };
-    for name in ["headerTemplate", "footerTemplate"] {
-        if let Some(value) = params.get(name) {
-            let template = value
+    let template = |name: &str| -> Result<String, String> {
+        match params.get(name) {
+            None => Ok(String::new()),
+            Some(value) => value
                 .as_str()
-                .ok_or_else(|| format!("Invalid parameters: {name} must be a string"))?;
-            if !template.is_empty() {
-                return Err(format!("Page.printToPDF {name} is not yet supported"));
-            }
+                .map(str::to_string)
+                .ok_or_else(|| format!("Invalid parameters: {name} must be a string")),
         }
-    }
+    };
+    let header_template = template("headerTemplate")?;
+    let footer_template = template("footerTemplate")?;
     let transfer_mode = match params.get("transferMode") {
         None => PdfTransferMode::ReturnAsBase64,
         Some(Value::String(value)) => match value.as_str() {
@@ -207,6 +199,11 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
             margin_bottom_in: number(params, "marginBottom", defaults.margin_bottom_in)?,
             margin_left_in: number(params, "marginLeft", defaults.margin_left_in)?,
             margin_right_in: number(params, "marginRight", defaults.margin_right_in)?,
+            display_header_footer,
+            header_template,
+            footer_template,
+            prefer_css_page_size,
+            generate_document_outline,
         },
         transfer_mode,
         requested_print_background,
@@ -238,6 +235,11 @@ pub async fn print_to_pdf(
             "obscuraRequestedTaggedPDF": options.requested_tagged_pdf,
             "obscuraCapabilities": {
                 "cssPagedMedia": false,
+                "pageSizeFromCss": true,
+                "reflowsToPaperWidth": true,
+                "selectableText": true,
+                "headerFooter": true,
+                "documentOutline": true,
                 "honorsPrintMedia": true,
                 "honorsPrintBackground": true,
                 "honorsScale": true,
@@ -288,7 +290,7 @@ mod tests {
     use crate::domains::page;
 
     #[test]
-    fn parser_accepts_standard_client_defaults_and_rejects_unrepresented_features() {
+    fn parser_accepts_standard_client_defaults_and_print_features() {
         let standard = parse_options(&json!({
             "transferMode": "ReturnAsStream",
             "displayHeaderFooter": false,
@@ -309,14 +311,20 @@ mod tests {
         assert_eq!(standard.raster.scale, 1.0);
         assert!(standard.raster.page_ranges.is_empty());
 
-        for params in [
-            json!({"displayHeaderFooter": true}),
-            json!({"preferCSSPageSize": true}),
-            json!({"headerTemplate": "<span>title</span>"}),
-            json!({"generateDocumentOutline": true}),
-        ] {
-            assert!(parse_options(&params).is_err(), "must reject {params}");
-        }
+        let full = parse_options(&json!({
+            "displayHeaderFooter": true,
+            "headerTemplate": "<span class=\"title\"></span>",
+            "footerTemplate": "<span class=\"pageNumber\"></span>",
+            "preferCSSPageSize": true,
+            "generateDocumentOutline": true,
+        }))
+        .expect("headers, footers, @page size and outlines are supported");
+        assert!(full.raster.display_header_footer);
+        assert_eq!(full.raster.header_template, "<span class=\"title\"></span>");
+        assert_eq!(full.raster.footer_template, "<span class=\"pageNumber\"></span>");
+        assert!(full.raster.prefer_css_page_size);
+        assert!(full.raster.generate_document_outline);
+        assert!(parse_options(&json!({"headerTemplate": 3})).is_err());
 
         let ranged = parse_options(&json!({
             "scale": 0.5,
@@ -406,7 +414,7 @@ mod tests {
         page::handle(
             "navigate",
             &json!({
-                "url": "data:text/html,<html style='margin:0'><body style='margin:0;height:400px;background:linear-gradient(red,blue)'></body></html>",
+                "url": "data:text/html,<html style='margin:0'><body style='margin:0;height:1200px;background:linear-gradient(red,blue)'></body></html>",
                 "waitUntil": "load",
             }),
             &mut ctx,
@@ -436,7 +444,7 @@ mod tests {
         assert!(text.contains("/MediaBox [0 0 288.000 432.000]"));
         assert!(
             text.matches("/Subtype /Image").count() >= 2,
-            "400px tall fixture should paginate at this printable aspect ratio"
+            "a 1200px document on 480px-tall printable pages spans several pages"
         );
 
         let streamed = page::handle(

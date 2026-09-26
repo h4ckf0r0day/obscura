@@ -26,6 +26,13 @@ struct Args {
     #[arg(long, global = true)]
     proxy: Option<String>,
 
+    /// Comma-separated proxy URLs to rotate across, per browser context (IP
+    /// rotation for scraping at volume). Each may carry auth, e.g.
+    /// `http://user:pass@host:port,socks5://host2:port`. Sets `OBSCURA_PROXIES`.
+    /// A single `--proxy` always overrides the pool.
+    #[arg(long, global = true)]
+    proxy_pool: Option<String>,
+
     /// Enable stealth mode (consistent browser fingerprint, and with the
     /// `stealth` build feature, TLS impersonation plus tracker blocking).
     /// Global: applies to fetch, serve, scrape, and mcp.
@@ -94,6 +101,7 @@ enum Command {
         #[arg(long)]
         allow_file_access: bool,
 
+
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
 
@@ -151,6 +159,13 @@ enum Command {
         #[arg(long)]
         user_agent: Option<String>,
 
+        /// Seed a request cookie before navigating, "name=value" (repeatable).
+        /// Scoped to the fetched URL's domain. Useful to set site preferences
+        /// that change server-rendered output — e.g. Amazon's `i18n-prefs=USD`
+        /// forces the marketplace's currency regardless of the egress IP geo.
+        #[arg(long = "cookie")]
+        cookies: Vec<String>,
+
         #[arg(long, short)]
         eval: Option<String>,
 
@@ -166,6 +181,12 @@ enum Command {
         /// Capture the settled page as a PNG. Requires the `render` feature.
         #[arg(long, short = 's', value_name = "FILE", conflicts_with = "file")]
         screenshot: Option<std::path::PathBuf>,
+
+        /// Recursively load TTF, TTC, OTF, and OTC files from this directory,
+        /// as on `serve`, so screenshots can use system fonts. Repeat for
+        /// multiple directories. Requires a render-enabled build.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
     },
 
     Scrape {
@@ -401,6 +422,16 @@ async fn run_cli() -> anyhow::Result<()> {
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
 
+    // --proxy-pool seeds OBSCURA_PROXIES before any BrowserContext is built, so
+    // ProxyPool::global() (read lazily during context construction) picks it up.
+    if let Some(pool) = args.proxy_pool.as_deref() {
+        if !pool.trim().is_empty() {
+            std::env::set_var("OBSCURA_PROXIES", pool);
+            let count = pool.split(',').filter(|s| !s.trim().is_empty()).count();
+            tracing::info!(proxies = count, "proxy pool configured (per-context rotation)");
+        }
+    }
+
     match args.command {
         Some(Command::Serve {
             port,
@@ -480,6 +511,7 @@ async fn run_cli() -> anyhow::Result<()> {
             timeout,
             wait_until,
             user_agent,
+            cookies,
             eval,
             output,
             quiet,
@@ -487,7 +519,9 @@ async fn run_cli() -> anyhow::Result<()> {
             file,
             concurrency,
             screenshot,
+            font_dirs,
         }) => {
+            configure_font_directories(&font_dirs)?;
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -531,6 +565,7 @@ async fn run_cli() -> anyhow::Result<()> {
                     timeout,
                     &wait_until,
                     user_agent,
+                    cookies,
                     stealth,
                     eval,
                     output,
@@ -814,6 +849,7 @@ async fn run_fetch(
     timeout_secs: u64,
     wait_until: &str,
     user_agent: Option<String>,
+    cookies: Vec<String>,
     stealth: bool,
     eval: Option<String>,
     output: Option<std::path::PathBuf>,
@@ -883,6 +919,30 @@ async fn run_fetch(
 
     if let Some(ref ua) = user_agent {
         page.http_client.set_user_agent(ua).await;
+    }
+
+    // Seed request cookies (--cookie "name=value") into the jar before
+    // navigating, scoped to the target URL's domain, so they're sent on the
+    // very first request. Lets callers set server-side preferences such as
+    // Amazon's `i18n-prefs=<CUR>` (force marketplace currency over egress geo).
+    if !cookies.is_empty() {
+        if let Ok(nav_url) = url::Url::parse(url_str) {
+            for c in &cookies {
+                let c = c.trim();
+                if c.is_empty() {
+                    continue;
+                }
+                // Accept "name=value" or a full Set-Cookie string; ensure a path.
+                let set_cookie = if c.contains("; ") || c.to_ascii_lowercase().contains("path=") {
+                    c.to_string()
+                } else {
+                    format!("{c}; Path=/")
+                };
+                context.cookie_jar.set_cookie(&set_cookie, &nav_url);
+            }
+        } else if !quiet {
+            eprintln!("Warning: cannot seed --cookie, invalid URL: {url_str}");
+        }
     }
 
     let wait_condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
@@ -1034,6 +1094,51 @@ async fn run_fetch(
         let found = wait_for_selector(&mut page, sel, wait_secs).await;
         if !found {
             eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
+        }
+    }
+
+    // Token-captcha auto-solve (opt-in: OBSCURA_CAPTCHA_API_KEY). Detects
+    // reCAPTCHA/hCaptcha/Turnstile, solves via CapSolver/2Captcha, injects the
+    // token + submits. No-op when unconfigured or no token captcha is present.
+    // Behavioral systems (PerimeterX/DataDome) are NOT handled here.
+    if let Some(cfg) = obscura_browser::captcha::CaptchaConfig::from_env() {
+        // Token-widget captchas: solve → inject token → submit.
+        match obscura_browser::captcha::try_solve(&mut page, url_str, &cfg).await {
+            Ok(true) => {
+                if !quiet {
+                    eprintln!("Solved token captcha; waiting for page to proceed");
+                }
+                page.settle(wait_secs.max(5) * 1000).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                if !quiet {
+                    eprintln!("Captcha solve failed: {e}");
+                }
+            }
+        }
+        // Type-B anti-bot challenges (AWS WAF / Cloudflare / DataDome): solve →
+        // set the clearance cookie (via obscura's egress proxy) → RE-FETCH so the
+        // real content loads with the cookie attached.
+        match obscura_browser::captcha::try_solve_challenge(&mut page, &cfg).await {
+            Ok(true) => {
+                if !quiet {
+                    eprintln!("Solved anti-bot challenge; re-fetching with clearance cookie");
+                }
+                let wc = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
+                let _ = timeout(
+                    Duration::from_secs(timeout_secs),
+                    page.navigate_with_wait(url_str, wc),
+                )
+                .await;
+                page.settle(wait_secs.max(3) * 1000).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                if !quiet {
+                    eprintln!("Challenge solve failed: {e}");
+                }
+            }
         }
     }
 
@@ -2575,11 +2680,13 @@ mod tests {
             timeout: 30,
             wait_until: "load".to_string(),
             user_agent: None,
+            cookies: vec![],
             eval: None,
             quiet: true,
             output: None,
             storage_dir: None,
             screenshot: None,
+            font_dirs: vec![],
         });
         assert!(is_quiet_command(&cmd));
     }

@@ -167,4 +167,5 @@ await browser.disconnect();  // leaves obscura serve running
 - Some device emulation, service-worker, native media, long-tail CSS, and
   compositor behavior remains incomplete relative to Chromium.
 - Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
-- PDF text is not selectable/searchable and tagged PDF is not yet available.
+- PDF pages are rasters with a selectable, searchable text layer; tagged PDF
+  and full CSS paged media are not yet available.

@@ -887,6 +887,18 @@ impl ResolvedScrollState {
 
 /// A final image/font-aware document layout retained across viewport paints.
 /// The DOM must not be mutated while this value is reused.
+/// One painted line of text in document coordinates (CSS px).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextFragment {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub baseline: f32,
+    pub font_size: f32,
+    pub text: String,
+}
+
 pub struct PreparedRender {
     viewport: (f32, f32),
     animation_sample: crate::AnimationSample,
@@ -1043,6 +1055,64 @@ impl PreparedRender {
 
     pub fn content_size(&self) -> (f32, f32) {
         self.content_size
+    }
+
+    /// Every painted text line in document coordinates, sorted top to bottom
+    /// then left to right. This backs the PDF text layer: it carries each
+    /// line's box, baseline, font size and characters, and nothing about how
+    /// the glyphs look.
+    pub fn text_fragments(&self) -> Vec<TextFragment> {
+        let laid = &self.layout;
+        let visible = |nid: &obscura_dom::tree::NodeId| {
+            !laid.styles.get(nid).is_some_and(|style| style.effectively_invisible)
+        };
+        let mut items: Vec<usize> = Vec::new();
+        for (nid, &idx) in &laid.ifc_items {
+            if visible(nid) {
+                items.push(idx);
+            }
+        }
+        for (nid, list) in laid.run_ifc_items.iter().chain(laid.word_ifc_items.iter()) {
+            if visible(nid) {
+                items.extend(list.iter().copied());
+            }
+        }
+        items.sort_unstable();
+        items.dedup();
+        let mut fragments = Vec::new();
+        for idx in items {
+            for (x, y, width, height, baseline, font_size, text) in
+                laid.text_engine.item_text_lines(idx, (0.0, 0.0))
+            {
+                fragments.push(TextFragment { x, y, width, height, baseline, font_size, text });
+            }
+        }
+        // Text laid out as per-word boxes (no shaped item) carries its own
+        // rects and words.
+        for (nid, runs) in &laid.text_runs {
+            let font_size = laid.styles.get(nid).and_then(|style| style.font_size);
+            for (rect, word) in runs {
+                let font_size = font_size.unwrap_or(rect.height / 1.15);
+                if word.trim().is_empty() {
+                    continue;
+                }
+                fragments.push(TextFragment {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    baseline: rect.y + rect.height * 0.8,
+                    font_size,
+                    text: word.clone(),
+                });
+            }
+        }
+        fragments.sort_by(|a, b| {
+            a.y.partial_cmp(&b.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        fragments
     }
 
     pub fn viewport_fixed_nodes(&self) -> &std::collections::HashSet<obscura_dom::tree::NodeId> {
@@ -1472,6 +1542,28 @@ impl PreparedRender {
         best.map(|(_, _, _, id)| id)
     }
 
+    /// `display`, whether the element is visible, and `white-space`: the
+    /// three properties `innerText` needs, without building a full snapshot.
+    pub fn text_style(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<(&'static str, bool, &'static str)> {
+        let style = self.layout.styles.get(&id)?;
+        let white_space = match style.white_space.unwrap_or_default() {
+            crate::WhiteSpace::Normal => "normal",
+            crate::WhiteSpace::NoWrap => "nowrap",
+            crate::WhiteSpace::Pre => "pre",
+            crate::WhiteSpace::PreWrap => "pre-wrap",
+            crate::WhiteSpace::PreLine => "pre-line",
+            crate::WhiteSpace::BreakSpaces => "break-spaces",
+        };
+        Some((
+            css_display_name(style),
+            !style.visibility_hidden.unwrap_or(false),
+            white_space,
+        ))
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,
@@ -1484,33 +1576,7 @@ impl PreparedRender {
         let rect = self.layout.rects.get(&id);
         let mut out = HashMap::new();
 
-        let active_webkit_clamp = style.webkit_box_display.is_some()
-            && style.webkit_box_orient_vertical
-            && style.webkit_line_clamp.is_some();
-        let display = if style.display_contents {
-            "contents"
-        } else if style.display == crate::Display::None {
-            "none"
-        } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
-            "flow-root"
-        } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
-            "-webkit-box"
-        } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
-            "-webkit-inline-box"
-        } else if style.internal_flex_container {
-            "block"
-        } else {
-            match (style.display, style.is_inline_block) {
-                (crate::Display::Flex, true) => "inline-flex",
-                (crate::Display::Grid, true) => "inline-grid",
-                (crate::Display::Block, true) => "inline-block",
-                (crate::Display::Flex, false) => "flex",
-                (crate::Display::Grid, false) => "grid",
-                (crate::Display::Inline, true) => "inline-block",
-                (crate::Display::Inline, false) => "inline",
-                _ => "block",
-            }
-        };
+        let display = css_display_name(style);
         out.insert("display", display.to_string());
         out.insert(
             "float",
@@ -4171,6 +4237,7 @@ fn paint_laid_dom_scrolled(
             width: rect.width,
             height: rect.height,
         };
+        let rect = table_box_without_captions(tree, laid, nid, rect, (ox, oy));
 
         // Ancestor `overflow: hidden` clip, if any. Skip painting entirely
         // once the box has no visible overlap with it (this is what makes the
@@ -4719,16 +4786,23 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
+                // ab_glyph's PxScale is the ascent-to-descent height, not the
+                // em size, so convert to match the item text. The marker then
+                // sits on the first line's baseline: the glyph box is centred
+                // in the line box, as for the text it labels.
+                let line_height = crate::inline::used_line_height(style);
+                let (marker_scale, baseline, ascent) =
+                    marker_metrics(fsize, line_height, style.font_family.as_deref());
+                let mw = measure_text(&marker, marker_scale, false, style.font_family.as_deref());
                 let mx = rect.x + style.padding.left - mw - 6.0;
-                let my = rect.y + style.border.top + style.padding.top;
+                let my = rect.y + style.border.top + style.padding.top + baseline - ascent;
                 draw_text(
                     &mut pixmap,
                     &marker,
                     mx,
                     my,
                     color,
-                    fsize,
+                    marker_scale,
                     false,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
@@ -5792,6 +5866,46 @@ fn effective_border_styles(style: &crate::LayoutStyle) -> crate::Sides<crate::Bo
         styles.left = crate::BorderStyle::Solid;
     }
     styles
+}
+
+/// A `<table>`'s layout rect spans its captions (as the CSS table wrapper
+/// box does), but its own background and border belong to the table box
+/// between them.
+fn table_box_without_captions(
+    tree: &DomTree,
+    laid: &crate::dom::DomLayout,
+    nid: obscura_dom::NodeId,
+    rect: crate::Rect,
+    offset: (f32, f32),
+) -> crate::Rect {
+    let is_table = tree
+        .get_node(nid)
+        .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "table"))
+        .unwrap_or(false);
+    if !is_table {
+        return rect;
+    }
+    let (mut top, mut bottom) = (rect.y, rect.y + rect.height);
+    for child in tree.children(nid) {
+        let is_caption = tree
+            .get_node(child)
+            .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "caption"))
+            .unwrap_or(false);
+        let (Some(cap), Some(cap_style)) = (laid.rects.get(&child), laid.styles.get(&child)) else {
+            continue;
+        };
+        if !is_caption || cap_style.display == crate::Display::None {
+            continue;
+        }
+        let cap_top = cap.y + offset.1;
+        let cap_bottom = cap_top + cap.height;
+        if cap_style.caption_bottom.unwrap_or(false) {
+            bottom = bottom.min(cap_top);
+        } else {
+            top = top.max(cap_bottom);
+        }
+    }
+    crate::Rect { x: rect.x, y: top, width: rect.width, height: (bottom - top).max(0.0) }
 }
 
 fn paint_css_border(
@@ -7020,6 +7134,30 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
     FONT_BYTES
 }
 
+/// For a list marker at CSS `font_size` in a line box `line_height` tall:
+/// the `draw_text` size (ab_glyph's PxScale is the ascent-to-descent height,
+/// not the em size), the first line's baseline offset from the line top, and
+/// the unrounded ascent `draw_text` adds to its y. The baseline mirrors the
+/// text engine: grid-fitted ascent and descent, centred in the line box with
+/// the half-leading rounded down to a whole pixel.
+fn marker_metrics(font_size: f32, line_height: f32, family: Option<&str>) -> (f32, f32, f32) {
+    let fallback = (font_size, line_height * 0.8, font_size * 0.8);
+    let Ok(font) = FontRef::try_from_slice(fallback_font_bytes(family)) else {
+        return fallback;
+    };
+    let units_per_em = font.units_per_em().unwrap_or(1000.0);
+    let height = font.height_unscaled();
+    if units_per_em <= 0.0 || height <= 0.0 {
+        return fallback;
+    }
+    let em = font_size / units_per_em;
+    let ascent = font.ascent_unscaled() * em;
+    let descent = -font.descent_unscaled() * em;
+    let (ascent_fit, descent_fit) = (ascent.round(), descent.round());
+    let baseline = ((line_height - ascent_fit - descent_fit) / 2.0).floor() + ascent_fit;
+    (height * em, baseline, ascent)
+}
+
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
     let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
     let scale = PxScale::from(size);
@@ -7269,19 +7407,31 @@ fn collect_web_fonts(
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
 
+    // Author sheets in document order: a `<style>` element's own text plus
+    // any stylesheets it imported, and fetched `<link rel=stylesheet>` sheets
+    // (Google Fonts and other CSS-delivered web fonts). Fetched sheets were
+    // rebased to their own URL, so their relative font URLs are absolute.
+    let external = tree.external_stylesheets();
+    let mut sheets: Vec<String> = Vec::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
-        if node
-            .as_element()
-            .map(|element| element.local.as_ref() != "style")
-            .unwrap_or(true)
-        {
+        let Some(local) = node.as_element().map(|element| element.local.to_string()) else {
+            continue;
+        };
+        if local != "style" && local != "link" {
             continue;
         }
-        let css = tree.text_content(nid);
-        for face in font_face_blocks(&css) {
+        if local == "style" {
+            sheets.push(tree.text_content(nid));
+        }
+        if let Some(sheet) = external.get(&nid) {
+            sheets.extend(sheet.sources.iter().map(|source| source.to_string()));
+        }
+    }
+    for css in &sheets {
+        for face in font_face_blocks(css) {
             if !font_face_covers_ascii(face) {
                 continue;
             }
@@ -10423,6 +10573,7 @@ fn render_svg_with_font_database(
     opts.default_size = usvg::Size::from_wh(width as f32, height as f32)?;
     opts.font_family = "Liberation Serif".to_string();
     opts.fontdb = std::sync::Arc::clone(fonts);
+    opts.font_resolver = svg_font_resolver();
     let tree = usvg::Tree::from_data(&viewport_svg, &opts).ok()?;
     let size = tree.size();
     if size.width() <= 0.0 || size.height() <= 0.0 {
@@ -10440,6 +10591,58 @@ fn render_svg_with_font_database(
 /// with SVG-heavy navigation and would be prohibitive for future repeated
 /// frame capture. The embedded faces are the same stable browser-generic
 /// families used by the HTML text engine.
+/// usvg's font selection, with named families that are not in the database
+/// (`font-family="Arial"`) mapped to the bundled face HTML text uses for the
+/// same name, so SVG text matches the page instead of falling back to serif.
+/// The author's name is still tried first, so a loaded web font wins.
+fn svg_font_resolver<'a>() -> usvg::FontResolver<'a> {
+    use usvg::fontdb::Family;
+    usvg::FontResolver {
+        select_font: Box::new(|font, fontdb| {
+            let mut names = Vec::new();
+            for family in font.families() {
+                match family {
+                    usvg::FontFamily::Serif => names.push(Family::Serif),
+                    usvg::FontFamily::SansSerif => names.push(Family::SansSerif),
+                    usvg::FontFamily::Cursive => names.push(Family::Cursive),
+                    usvg::FontFamily::Fantasy => names.push(Family::Fantasy),
+                    usvg::FontFamily::Monospace => names.push(Family::Monospace),
+                    usvg::FontFamily::Named(name) => {
+                        names.push(Family::Name(name));
+                        if let Some(bundled) = crate::inline::bundled_family_for_css_token(name) {
+                            names.push(Family::Name(bundled));
+                        }
+                    }
+                }
+            }
+            names.push(Family::Serif);
+            let stretch = match font.stretch() {
+                usvg::FontStretch::UltraCondensed => usvg::fontdb::Stretch::UltraCondensed,
+                usvg::FontStretch::ExtraCondensed => usvg::fontdb::Stretch::ExtraCondensed,
+                usvg::FontStretch::Condensed => usvg::fontdb::Stretch::Condensed,
+                usvg::FontStretch::SemiCondensed => usvg::fontdb::Stretch::SemiCondensed,
+                usvg::FontStretch::Normal => usvg::fontdb::Stretch::Normal,
+                usvg::FontStretch::SemiExpanded => usvg::fontdb::Stretch::SemiExpanded,
+                usvg::FontStretch::Expanded => usvg::fontdb::Stretch::Expanded,
+                usvg::FontStretch::ExtraExpanded => usvg::fontdb::Stretch::ExtraExpanded,
+                usvg::FontStretch::UltraExpanded => usvg::fontdb::Stretch::UltraExpanded,
+            };
+            let style = match font.style() {
+                usvg::FontStyle::Normal => usvg::fontdb::Style::Normal,
+                usvg::FontStyle::Italic => usvg::fontdb::Style::Italic,
+                usvg::FontStyle::Oblique => usvg::fontdb::Style::Oblique,
+            };
+            fontdb.query(&usvg::fontdb::Query {
+                families: &names,
+                weight: usvg::fontdb::Weight(font.weight()),
+                stretch,
+                style,
+            })
+        }),
+        select_fallback: usvg::FontResolver::default_fallback_selector(),
+    }
+}
+
 fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
     static DATABASE: std::sync::OnceLock<std::sync::Arc<usvg::fontdb::Database>> =
         std::sync::OnceLock::new();
@@ -12700,6 +12903,41 @@ mod tests {
         assert_eq!(outside.red(), 255);
         assert_eq!(outside.green(), 255);
         assert_eq!(outside.blue(), 255);
+    }
+
+    /// Inked rows (min, max) of dark pixels within columns `x0..x1`.
+    fn inked_rows(pixmap: &Pixmap, x0: u32, x1: u32) -> Option<(u32, u32)> {
+        let rows: Vec<u32> = (0..pixmap.height())
+            .filter(|&y| {
+                (x0..x1).any(|x| pixmap.pixel(x, y).is_some_and(|p| p.red() < 140))
+            })
+            .collect();
+        Some((*rows.first()?, *rows.last()?))
+    }
+
+    #[test]
+    fn list_markers_match_the_item_text_size_and_baseline() {
+        for size in [13, 16, 18, 24, 32] {
+            // The item's own text repeats the marker, so both runs have the
+            // same glyphs and must ink the same rows.
+            let tree = parse_html(&format!(
+                "<html style=\"background:white\"><body style=\"margin:0\">\
+                 <ol style=\"font:{size}px serif;margin:0;padding-left:60px\"><li>1.</li></ol>\
+                 </body></html>"
+            ));
+            let pixmap = paint_dom(&tree, (200.0, 80.0), None).expect("pixmap");
+            let marker = inked_rows(&pixmap, 0, 58).expect("marker ink");
+            let text = inked_rows(&pixmap, 60, 200).expect("text ink");
+            assert_eq!(
+                marker.1, text.1,
+                "{size}px: marker baseline row {marker:?} vs text {text:?}"
+            );
+            let (mh, th) = (marker.1 - marker.0, text.1 - text.0);
+            assert!(
+                mh + 1 >= th && mh <= th + 1,
+                "{size}px: marker height {mh} vs text height {th}"
+            );
+        }
     }
 
     #[test]
@@ -17596,5 +17834,36 @@ mod tests {
         assert_eq!(at_end.layout.styles[&overlay].visibility_hidden, Some(true));
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
+    }
+}
+
+/// CSS `display` keyword for a computed style, as `getComputedStyle` reports it.
+fn css_display_name(style: &crate::LayoutStyle) -> &'static str {
+    let active_webkit_clamp = style.webkit_box_display.is_some()
+        && style.webkit_box_orient_vertical
+        && style.webkit_line_clamp.is_some();
+    if style.display_contents {
+        "contents"
+    } else if style.display == crate::Display::None {
+        "none"
+    } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
+        "flow-root"
+    } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
+        "-webkit-box"
+    } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
+        "-webkit-inline-box"
+    } else if style.internal_flex_container {
+        "block"
+    } else {
+        match (style.display, style.is_inline_block) {
+            (crate::Display::Flex, true) => "inline-flex",
+            (crate::Display::Grid, true) => "inline-grid",
+            (crate::Display::Block, true) => "inline-block",
+            (crate::Display::Flex, false) => "flex",
+            (crate::Display::Grid, false) => "grid",
+            (crate::Display::Inline, true) => "inline-block",
+            (crate::Display::Inline, false) => "inline",
+            _ => "block",
+        }
     }
 }

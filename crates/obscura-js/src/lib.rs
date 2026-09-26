@@ -7,6 +7,7 @@ pub mod ops;
 pub mod runtime;
 pub mod v8_flags;
 mod write_stream;
+mod ws_ops;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
 pub use v8_flags::set_v8_flags;
@@ -15,6 +16,7 @@ pub use v8_flags::set_v8_flags;
 // render feature (which enables obscura-render/paint) is compiled in.
 #[cfg(feature = "render")]
 pub use obscura_render::{
+    TextFragment,
     configure_font_directories, screenshot_png, screenshot_png_scrolled,
     screenshot_png_scrolled_at_animation_time,
     screenshot_png_scrolled_at_animation_time_with_surface_color,

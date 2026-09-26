@@ -936,6 +936,8 @@ impl ObscuraJsRuntime {
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
         let parent = self.state.borrow();
         frame.cookie_jar = parent.cookie_jar.clone();
+        frame.local_storage = parent.local_storage.clone();
+        frame.session_storage = parent.session_storage.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
         frame.encoding = parent.encoding.clone();
@@ -1149,6 +1151,16 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    pub fn set_web_storage(
+        &self,
+        local: std::sync::Arc<obscura_net::WebStorage>,
+        session: std::sync::Arc<obscura_net::WebStorage>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.local_storage = Some(local);
+        state.session_storage = Some(session);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
@@ -1542,6 +1554,25 @@ impl ObscuraJsRuntime {
         true
     }
 
+    /// Swap the layout viewport used by rendering only, returning the previous
+    /// one. Page script does not observe it (no resize, `innerWidth` is
+    /// unchanged): printing lays the document out at the paper width and then
+    /// restores the screen viewport, as browsers do.
+    #[cfg(feature = "render")]
+    pub fn swap_render_viewport(&self, viewport: (f32, f32)) -> (f32, f32) {
+        let mut state = self.state.borrow_mut();
+        let previous = state.viewport;
+        if viewport.0.is_finite() && viewport.1.is_finite() && viewport.0 > 0.0 && viewport.1 > 0.0
+            && previous != viewport
+        {
+            state.viewport = viewport;
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+        previous
+    }
+
     /// Select the CSS media type for the next synchronous render flush.
     /// Changing media invalidates geometry and the compiled stylesheet key but
     /// leaves the live DOM, scroll offsets, and resource bytes untouched.
@@ -1810,6 +1841,52 @@ impl ObscuraJsRuntime {
                 paint_backgrounds,
                 &canvas_surfaces,
             )
+        })
+    }
+
+    /// Painted text lines of the prepared document, in document coordinates.
+    #[cfg(feature = "render")]
+    pub fn prepared_text_fragments(&self) -> Option<Vec<obscura_render::TextFragment>> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state)?;
+            state
+                .prepared_render
+                .as_ref()
+                .map(|render| render.text_fragments())
+        })
+    }
+
+    /// `h1`-`h6` headings of the prepared document in tree order, as
+    /// (level, text, document y). Headings with no box are skipped.
+    #[cfg(feature = "render")]
+    pub fn prepared_heading_outline(&self) -> Option<Vec<(u8, String, f32)>> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state)?;
+            let render = state.prepared_render.as_ref()?;
+            let dom = state.dom.as_ref()?;
+            let mut headings = Vec::new();
+            for id in dom.descendants(dom.document()) {
+                let level = dom.with_node(id, |node| {
+                    node.as_element().and_then(|element| match element.local.as_ref() {
+                        "h1" => Some(1u8),
+                        "h2" => Some(2),
+                        "h3" => Some(3),
+                        "h4" => Some(4),
+                        "h5" => Some(5),
+                        "h6" => Some(6),
+                        _ => None,
+                    })
+                });
+                let Some(Some(level)) = level else { continue };
+                let Some(rect) = render.document_rect(id) else { continue };
+                let text = dom.text_content(id).split_whitespace().collect::<Vec<_>>().join(" ");
+                if !text.is_empty() {
+                    headings.push((level, text, rect.y));
+                }
+            }
+            Some(headings)
         })
     }
 
@@ -3944,6 +4021,10 @@ impl ObscuraJsRuntime {
     /// Drain the network events recorded for script-initiated requests
     /// (fetch/XHR/dynamic resource). The Page moves these into its own
     /// network_events so the CDP layer emits Network events for them (#406).
+    pub fn take_ws_cdp_events(&self) -> Vec<(String, serde_json::Value)> {
+        std::mem::take(&mut self.state.borrow_mut().ws_cdp_events)
+    }
+
     pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
         std::mem::take(&mut self.state.borrow_mut().js_network_events)
     }

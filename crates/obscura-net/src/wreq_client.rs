@@ -273,6 +273,119 @@ impl StealthHttpClient {
         }
     }
 
+    /// Open a page WebSocket through the wreq client, so the TLS handshake
+    /// carries the same Chrome fingerprint, proxy and SSRF resolver as stealth
+    /// navigation. Mirrors [`crate::websocket::connect`].
+    pub async fn connect_websocket(
+        &self,
+        opts: crate::websocket::WsConnectOptions,
+    ) -> Result<crate::websocket::WsHandle, String> {
+        use crate::websocket::{WsCommand, WsEvent, WsHandle};
+        use wreq::ws::message::{CloseCode, CloseFrame, Message};
+
+        let http = crate::websocket::http_equivalent(&opts.url).ok_or("not a ws(s) URL")?;
+        crate::client::validate_url(&http, self.allow_private_network).map_err(|e| e.to_string())?;
+
+        let mut request = self
+            .client
+            .websocket(opts.url.as_str())
+            .max_message_size(64 << 20)
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache");
+        if !opts.protocols.is_empty() {
+            request = request.protocols(opts.protocols.clone());
+        }
+        if !opts.origin.is_empty() && opts.origin != "null" {
+            request = request.header("Origin", opts.origin.as_str());
+        }
+        if !opts.cookie_header.is_empty() {
+            request = request.header("Cookie", opts.cookie_header.as_str());
+        }
+        let response = tokio::time::timeout(Duration::from_secs(30), request.send())
+            .await
+            .map_err(|_| "WebSocket connection timed out".to_string())?
+            .map_err(|e| format!("WebSocket handshake failed: {e}"))?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let extensions = header("sec-websocket-extensions");
+        let set_cookies = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+        let mut ws = response
+            .into_websocket()
+            .await
+            .map_err(|e| format!("WebSocket handshake failed: {e}"))?;
+        let protocol = ws
+            .protocol()
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WsCommand>();
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<WsEvent>();
+        tokio::spawn(async move {
+            let mut closing = false;
+            loop {
+                tokio::select! {
+                    cmd = cmd_rx.recv(), if !closing => {
+                        let sent = match cmd {
+                            Some(WsCommand::Text(t)) => ws.send(Message::text(t)).await,
+                            Some(WsCommand::Binary(b)) => ws.send(Message::binary(b)).await,
+                            Some(WsCommand::Close { code, reason }) => {
+                                closing = true;
+                                ws.send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::from(code),
+                                    reason: reason.into(),
+                                })))
+                                .await
+                            }
+                            None => {
+                                let _ = ws.close(1001u16, "").await;
+                                return;
+                            }
+                        };
+                        if let Err(e) = sent {
+                            tracing::debug!("WebSocket send failed: {e}");
+                        }
+                    }
+                    msg = ws.recv() => {
+                        let event = match msg {
+                            Some(Ok(Message::Text(t))) => WsEvent::Text(t.as_str().to_string()),
+                            Some(Ok(Message::Binary(b))) => WsEvent::Binary(b.to_vec()),
+                            Some(Ok(Message::Close(frame))) => {
+                                let (code, reason) = frame
+                                    .map(|f| (u16::from(f.code), f.reason.as_str().to_string()))
+                                    .unwrap_or((1005, String::new()));
+                                while let Some(Ok(_)) = ws.recv().await {}
+                                let _ = ev_tx.send(WsEvent::Close { code, reason, clean: true });
+                                return;
+                            }
+                            Some(Ok(_)) => continue,
+                            Some(Err(_)) | None => {
+                                let _ = ev_tx.send(WsEvent::Close { code: 1006, reason: String::new(), clean: false });
+                                return;
+                            }
+                        };
+                        if ev_tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(WsHandle { protocol, extensions, set_cookies, commands: cmd_tx, events: ev_rx })
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_callbacks(url, None).await
     }

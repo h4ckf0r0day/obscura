@@ -1,3 +1,4 @@
+pub mod captcha;
 pub mod context;
 mod fork_virtual_url;
 pub mod lifecycle;

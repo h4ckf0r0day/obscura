@@ -132,6 +132,12 @@ pub async fn handle(
             let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
+            // Set when a touch tap drives this press/release: the touch path
+            // already fired the touch-type pointer events.
+            let from_touch = params
+                .get("__obscuraFromTouch")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
@@ -144,7 +150,7 @@ pub async fn handle(
                             var previousTarget = globalThis.__obscura_mouse_over_target || null;\
                             if (previousTarget !== target) {{\
                                 function ancestry(node) {{ var path=[]; while (node) {{ path.push(node); node=node.parentNode || null; }} return path; }}\
-                                function pointerEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
+                                function pointerEvent(node,type,bubbles,related) {{ if ({from_touch}) return; node.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
                                 function mouseEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
                                 var oldPath = previousTarget && previousTarget.isConnected ? ancestry(previousTarget) : [];\
                                 var newPath = ancestry(target);\
@@ -163,7 +169,7 @@ pub async fn handle(
                             }}\
                             var focusTarget = target.closest && target.closest('input,select,textarea,button,a[href],[tabindex],[contenteditable]');\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(pointer);\
+                            if (!{from_touch}) target.dispatchEvent(pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
@@ -178,6 +184,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                         pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
+                        from_touch = from_touch,
                     );
                     page.evaluate(&code);
                 }
@@ -190,7 +197,7 @@ pub async fn handle(
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(pointer);\
+                            if (!{from_touch}) target.dispatchEvent(pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
@@ -267,6 +274,7 @@ pub async fn handle(
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,
                         shift_key = shift_key,
+                        from_touch = from_touch,
                     );
                     page.evaluate(&code);
                     if !page.has_pending_navigation() && page.sync_virtual_url() {
@@ -443,7 +451,58 @@ pub async fn handle(
 
             Ok(json!({}))
         }
-        "dispatchTouchEvent" => Ok(json!({})),
+        "dispatchTouchEvent" => {
+            let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let points = params.get("touchPoints").cloned().unwrap_or_else(|| json!([]));
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let taps = match ctx.get_session_page_mut(session_id) {
+                Some(page) => page.evaluate(&format!(
+                    "JSON.stringify(globalThis.__obscura_dispatchTouch({}, {}, {}))",
+                    json!(event_type),
+                    points,
+                    modifiers
+                )),
+                None => return Ok(json!({})),
+            };
+            let taps: Vec<Value> = taps
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            // An uncancelled tap yields the compatibility mouse sequence, so
+            // click and activation behavior (links, submit, checkboxes) run
+            // through the same path as a real mouse click.
+            for tap in taps {
+                let (x, y) = (tap.get("x").cloned(), tap.get("y").cloned());
+                for (phase, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+                    let mouse = json!({
+                        "type": phase, "x": x, "y": y, "button": "left",
+                        "buttons": buttons, "clickCount": 1, "modifiers": modifiers,
+                        "__obscuraFromTouch": true,
+                    });
+                    Box::pin(handle("dispatchMouseEvent", &mouse, ctx, session_id)).await?;
+                }
+            }
+            Ok(json!({}))
+        }
+        "dispatchDragEvent" => {
+            let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let data = params.get("data").cloned().unwrap_or_else(|| json!({}));
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.evaluate(&format!(
+                    "globalThis.__obscura_dispatchDrag({}, {}, {}, {}, {})",
+                    json!(event_type),
+                    x,
+                    y,
+                    data,
+                    modifiers
+                ));
+            }
+            Ok(json!({}))
+        }
+        "setInterceptDrags" => Ok(json!({})),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {}", method)),
     }

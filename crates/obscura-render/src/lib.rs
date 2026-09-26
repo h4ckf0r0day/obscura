@@ -117,7 +117,7 @@ pub use paint::{
     prepare_dom_with_retained_attribute_styles, prepare_dom_with_retained_styles,
     prepare_dom_with_retained_styles_at_animation_time,
     prepare_dom_with_retained_styles_with_animation_state,
-    screenshot_prepared,
+    screenshot_prepared, TextFragment,
     screenshot_prepared_region_with_scroll,
     screenshot_prepared_region_with_scroll_and_surface_color,
     screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,
@@ -1357,6 +1357,10 @@ pub struct LayoutStyle {
     /// is still approximate, but collapsed tables must at minimum contribute
     /// no border-spacing to their geometry.
     pub border_collapse: Option<bool>,
+    /// Computed `caption-side`: true for `bottom`. Inherited; `None` means
+    /// not specified on this node and is resolved top-down like
+    /// `border_collapse`.
+    pub caption_bottom: Option<bool>,
 
     // Positioning. `position: absolute|fixed` takes the box out of normal flow.
     pub position: Option<taffy::Position>,

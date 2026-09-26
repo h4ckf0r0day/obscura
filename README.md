@@ -1,5 +1,6 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
+<img width="1200" height="630" alt="memory" src="https://github.com/user-attachments/assets/94eba4cb-0ba0-4a07-b891-b12ac2d42790" />
+
 </p>
 <h2 align="center">Obscura</h2>
 <p align="center">
@@ -60,6 +61,48 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
     </td>
   </tr>
 </table>
+
+## What this repository adds
+
+This repository ([incordai/incord-browser](https://github.com/incordai/incord-browser)) builds on upstream [Obscura](https://github.com/h4ckf0r0day/obscura) and adds the following. Upstream does not have these yet.
+
+### Web platform
+
+| Feature | What changed |
+|---|---|
+| **WebSocket** | A real connection instead of a stub that reported OPEN and dropped every message. Sends the page's cookies, `Origin` and user agent; uses the configured HTTP/SOCKS5 proxy; refuses private addresses unless `--allow-private-network`; stealth builds use the Chrome TLS fingerprint. Text, binary, Blob, subprotocols and close codes work. |
+| **WebSocket in CDP** | `Network.webSocketCreated`, `webSocketWillSendHandshakeRequest`, `webSocketHandshakeResponseReceived`, `webSocketFrameSent` / `Received`, `webSocketFrameError` and `webSocketClosed`, so Puppeteer and Playwright see socket traffic. |
+| **IndexedDB** | A working database instead of a shim that stored nothing: object stores, key generators, indexes (unique, multiEntry, compound), key ranges, cursors, transactions with rollback, version changes, `databases()`, `cmp()`. Dexie, idb-keyval and localForage run on it. Data persists per origin. |
+| **localStorage / sessionStorage** | Shared by every page and frame of an origin, kept across navigations, saved to `web_storage.json` with `--storage-dir`, with the 10 MiB per-origin quota. sessionStorage is per tab. |
+| **Touch and drag** | `Touch`, `TouchList`, `TouchEvent`, `DataTransfer` and `DragEvent`; CDP `Input.dispatchTouchEvent`, `Input.dispatchDragEvent` and `Input.setInterceptDrags`. |
+| **`innerText`** | Follows the HTML rendered-text rules: hidden content and `<script>`/`<style>` are skipped, whitespace collapses per `white-space`, and blocks, paragraphs and table cells get line breaks and tabs. Previously it returned `textContent`. |
+
+### Rendering
+
+| Feature | What changed |
+|---|---|
+| **Tables** | `border-collapse: collapse` draws each shared border once, resolved as CSS specifies. `<caption>` renders above or below the rows per `caption-side`, wrapping to the table width. |
+| **List markers** | Bullets and numbers are drawn at the item text's size and on its baseline instead of small and raised. |
+| **Inline SVG** | `<svg>` is inline like `<img>`, so `text-align` places it. SVG `font-family` names such as Arial map to the same bundled faces as HTML text. |
+| **Web fonts** | `@font-face` rules from linked stylesheets are applied, including cross-origin sheets with CORS such as Google Fonts. Previously only fonts from inline `<style>` worked. |
+
+### PDF export (`Page.printToPDF`, `page.pdf()`)
+
+| Feature | What changed |
+|---|---|
+| **Selectable text** | Each page has an invisible text layer over the painted text, so PDF text can be selected, searched and extracted (any Unicode text). Previously the pages were images with no text. |
+| **Reflow to paper width** | The page is laid out at the paper's printable width with print media, as Chrome does, instead of shrinking the screen layout onto the page. |
+| **No split lines** | Page breaks move above a line of text instead of cutting it in half. |
+| **Resolution** | Pages render at the device scale factor, so `Emulation.setDeviceMetricsOverride` with `deviceScaleFactor: 2` gives 192 dpi pages. |
+| **Headers and footers** | `displayHeaderFooter` with `headerTemplate` / `footerTemplate`, including the `date`, `title`, `url`, `pageNumber` and `totalPages` classes and Chrome's default templates. |
+| **Outline and page size** | `generateDocumentOutline` adds bookmarks from the headings; `preferCSSPageSize` uses `@page { size }`. |
+
+### CLI and extraction
+
+| Feature | What changed |
+|---|---|
+| **`fetch --font-dir`** | One-shot screenshots can load system fonts, as `serve --font-dir` already could. |
+| **`--dump markdown` tables** | Tables are valid GFM: a header row, a `\|---\|` separator, one line per row, and the caption as a paragraph. |
 
 ## Obscura Cloud
 
@@ -290,7 +333,7 @@ full allow/deny rules (DNS-resolution-time checks included).
 Official release archives and the Docker image include the rendering engine.
 It provides CSS layout and paint, viewport and full-page screenshots,
 scroll-aware fixed and sticky geometry, activity-driven CDP screencasting, and
-raster PDF export without starting Chromium.
+PDF export with selectable text, without starting Chromium.
 
 ```javascript
 await page.setViewport({ width: 1440, height: 1000 });
@@ -431,14 +474,14 @@ Obscura implements the Chrome DevTools Protocol for Puppeteer/Playwright compati
 | Domain | Methods |
 |--------|---------|
 | **Target** | createTarget, closeTarget, attachToTarget, createBrowserContext, disposeBrowserContext |
-| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF |
+| **Page** | navigate, getFrameTree, lifecycleEvents, captureScreenshot, start/stopScreencast, printToPDF (selectable text, headers/footers, outline, `@page` size) |
 | **Runtime** | evaluate, callFunctionOn, getProperties, addBinding |
 | **DOM** | getDocument, querySelector, querySelectorAll, getOuterHTML, resolveNode |
-| **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride |
+| **Network** | enable, setCookies, getCookies, setExtraHTTPHeaders, setUserAgentOverride; webSocketCreated, webSocketWillSendHandshakeRequest, webSocketHandshakeResponseReceived, webSocketFrameSent/Received, webSocketFrameError, webSocketClosed events |
 | **Fetch** | enable, continueRequest, fulfillRequest, failRequest (live interception), takeResponseBodyAsStream |
 | **IO** | read, close (stream a large response body in chunks) |
 | **Storage** | getCookies, setCookies, deleteCookies |
-| **Input** | dispatchMouseEvent, dispatchKeyEvent |
+| **Input** | dispatchMouseEvent, dispatchKeyEvent, dispatchTouchEvent, dispatchDragEvent, setInterceptDrags |
 | **LP** | getMarkdown (DOM-to-Markdown conversion) |
 
 To download a large resource without one giant `Network.getResponseBody` blob, call `Fetch.takeResponseBodyAsStream` then read it in chunks with `IO.read` / `IO.close`. Response bodies over the cache limit (`OBSCURA_NETWORK_BODY_BUFFER_BYTES`, default 2 MiB) are not retained, so raise that limit when you intend to stream large downloads.
@@ -494,6 +537,7 @@ Fetch and render a single page.
 | `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
 | `--selector` | — | Wait for CSS selector |
 | `-s`, `--screenshot` | — | Write a PNG screenshot (single URL; render-enabled build) |
+| `--font-dir` | — | Recursively load fonts for rendering, e.g. system fonts (repeatable; render build) |
 | `--stealth` | off | Anti-detection mode |
 | `--output` | — | Write dump or eval output to a file |
 | `--quiet` | off | Suppress banner |

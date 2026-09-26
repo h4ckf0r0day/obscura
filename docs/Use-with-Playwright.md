@@ -156,4 +156,5 @@ await browser.close();  // closes the CDP connection, leaves obscura serve runni
   [Persist cookies and storage](Persist-cookies-and-storage.md).
 - Service workers, native media, some Web APIs, long-tail CSS, and compositor
   behavior remain incomplete relative to Chromium.
-- PDF text is not selectable/searchable and tagged PDF is not yet available.
+- PDF pages are rasters with a selectable, searchable text layer; tagged PDF
+  and full CSS paged media are not yet available.
