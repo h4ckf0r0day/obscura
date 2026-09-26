@@ -5060,25 +5060,38 @@ fn storage_area(
     } else {
         gs.session_storage.clone()
     }?;
-    let origin = url::Url::parse(&gs.url)
-        .map(|u| u.origin().ascii_serialization())
-        .unwrap_or_else(|_| "null".to_string());
-    Some((store, origin))
+    Some((store, cached_origin(&gs.url)))
 }
 
-/// JSON-encoded value, or `null` when the key is absent.
+/// The serialized origin of `url`. Storage ops run once per `getItem` /
+/// `setItem`, so the last URL's origin is kept instead of re-parsing the same
+/// document URL on every call.
+fn cached_origin(url: &str) -> String {
+    thread_local! {
+        static LAST: std::cell::RefCell<(String, String)> = const { std::cell::RefCell::new((String::new(), String::new())) };
+    }
+    LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.0 != url || last.1.is_empty() {
+            let origin = url::Url::parse(url)
+                .map(|u| u.origin().ascii_serialization())
+                .unwrap_or_else(|_| "null".to_string());
+            *last = (url.to_string(), origin);
+        }
+        last.1.clone()
+    })
+}
+
+/// The stored value, or `null` when the key is absent.
 #[op2]
 #[string]
 fn op_storage_get(
     scope: &mut v8::PinScope,
     state: &OpState,
     kind: u32,
-    #[string] key: String,
-) -> String {
-    storage_area(scope, state, kind)
-        .and_then(|(store, origin)| store.get(&origin, &key))
-        .map(|v| serde_json::Value::String(v).to_string())
-        .unwrap_or_else(|| "null".to_string())
+    #[string] key: &str,
+) -> Option<String> {
+    storage_area(scope, state, kind).and_then(|(store, origin)| store.get(&origin, key))
 }
 
 /// False when the write would exceed the origin's quota.

@@ -11626,7 +11626,14 @@ globalThis.Storage = function Storage() {};
 // (sessionStorage, kept across navigations). The origin is derived natively
 // from the calling document. A bare runtime with no page falls back to a
 // realm-local map.
-const _stBacked = () => { try { return __obscuraCore.ops.op_storage_available(); } catch (e) { return false; } };
+// Once a realm has a backing store it keeps it, so a positive answer is
+// cached; that saves a native call on every storage access.
+let _stBackedKnown = false;
+const _stBacked = () => {
+  if (_stBackedKnown) return true;
+  try { _stBackedKnown = !!__obscuraCore.ops.op_storage_available(); } catch (e) {}
+  return _stBackedKnown;
+};
 const _stHas = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 Storage.prototype._keys = function() {
   if (_stBacked()) return JSON.parse(__obscuraCore.ops.op_storage_keys(this._kind));
@@ -11634,7 +11641,7 @@ Storage.prototype._keys = function() {
 };
 Storage.prototype.getItem = function(k) {
   k = String(k);
-  if (_stBacked()) return JSON.parse(__obscuraCore.ops.op_storage_get(this._kind, k));
+  if (_stBacked()) return __obscuraCore.ops.op_storage_get(this._kind, k) ?? null;
   return _stHas(this._data, k) ? this._data[k] : null;
 };
 Storage.prototype.setItem = function(k, v) {

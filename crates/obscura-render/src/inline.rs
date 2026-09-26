@@ -116,7 +116,7 @@ fn resolve_font_family(fam: Option<&str>) -> &'static str {
     FAMILY
 }
 
-fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
+pub(crate) fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
     let token = token
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')

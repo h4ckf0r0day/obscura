@@ -20,9 +20,27 @@ pub const WEB_STORAGE_QUOTA_BYTES: usize = 10 * 1024 * 1024;
 pub struct WebStorage {
     // BTreeMap: Chromium's storage area is an ordered map, so key(i) follows
     // key order rather than insertion order.
-    areas: RwLock<HashMap<String, BTreeMap<String, String>>>,
+    areas: RwLock<HashMap<String, Area>>,
     // origin -> database name -> opaque snapshot owned by the JS IndexedDB shim.
     idb: RwLock<HashMap<String, BTreeMap<String, String>>>,
+}
+
+/// One origin's entries plus their running UTF-16 byte size, so the quota
+/// check on a write is O(1) instead of summing the whole area.
+#[derive(Debug, Default)]
+struct Area {
+    entries: BTreeMap<String, String>,
+    used: usize,
+}
+
+impl Area {
+    fn insert(&mut self, key: String, value: String) {
+        let added = utf16_len(&key) + utf16_len(&value);
+        if let Some(old) = self.entries.insert(key.clone(), value) {
+            self.used -= utf16_len(&key) + utf16_len(&old);
+        }
+        self.used += added;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -50,7 +68,7 @@ impl WebStorage {
 
     pub fn get(&self, origin: &str, key: &str) -> Option<String> {
         let areas = self.areas.read().ok()?;
-        areas.get(origin)?.get(key).cloned()
+        areas.get(origin)?.entries.get(key).cloned()
     }
 
     /// Store `value` under `key`. Returns false, leaving the area unchanged,
@@ -60,9 +78,8 @@ impl WebStorage {
             return false;
         };
         let area = areas.entry(origin.to_string()).or_default();
-        let used: usize = area.iter().map(|(k, v)| utf16_len(k) + utf16_len(v)).sum();
-        let old = area.get(key).map(|v| utf16_len(key) + utf16_len(v)).unwrap_or(0);
-        if used - old + utf16_len(key) + utf16_len(value) > WEB_STORAGE_QUOTA_BYTES {
+        let old = area.entries.get(key).map(|v| utf16_len(key) + utf16_len(v)).unwrap_or(0);
+        if area.used - old + utf16_len(key) + utf16_len(value) > WEB_STORAGE_QUOTA_BYTES {
             return false;
         }
         area.insert(key.to_string(), value.to_string());
@@ -72,7 +89,9 @@ impl WebStorage {
     pub fn remove(&self, origin: &str, key: &str) {
         if let Ok(mut areas) = self.areas.write() {
             if let Some(area) = areas.get_mut(origin) {
-                area.remove(key);
+                if let Some(old) = area.entries.remove(key) {
+                    area.used -= utf16_len(key) + utf16_len(&old);
+                }
             }
         }
     }
@@ -87,7 +106,7 @@ impl WebStorage {
         self.areas
             .read()
             .ok()
-            .and_then(|areas| areas.get(origin).map(|a| a.keys().cloned().collect()))
+            .and_then(|areas| areas.get(origin).map(|a| a.entries.keys().cloned().collect()))
             .unwrap_or_default()
     }
 
@@ -95,7 +114,7 @@ impl WebStorage {
         self.areas
             .read()
             .ok()
-            .and_then(|areas| areas.get(origin).map(|a| a.len()))
+            .and_then(|areas| areas.get(origin).map(|a| a.entries.len()))
             .unwrap_or(0)
     }
 
@@ -107,7 +126,7 @@ impl WebStorage {
             .and_then(|areas| {
                 areas
                     .get(origin)
-                    .map(|a| a.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .map(|a| a.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             })
             .unwrap_or_default()
     }
@@ -148,8 +167,19 @@ impl WebStorage {
                 .map(|(o, a)| (o.clone(), a.clone()))
                 .collect::<HashMap<_, _>>()
         };
+        let local_storage = self
+            .areas
+            .read()
+            .map(|areas| {
+                areas
+                    .iter()
+                    .filter(|(o, a)| persistable(o) && !a.entries.is_empty())
+                    .map(|(o, a)| (o.clone(), a.entries.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let on_disk = OnDisk {
-            local_storage: self.areas.read().map(|a| keep(&a)).unwrap_or_default(),
+            local_storage,
             indexed_db: self.idb.read().map(|a| keep(&a)).unwrap_or_default(),
         };
         let json = serde_json::to_string(&on_disk)
@@ -170,7 +200,10 @@ impl WebStorage {
         if let Ok(mut areas) = self.areas.write() {
             for (origin, area) in on_disk.local_storage {
                 if persistable(&origin) {
-                    areas.entry(origin).or_default().extend(area);
+                    let target = areas.entry(origin).or_default();
+                    for (key, value) in area {
+                        target.insert(key, value);
+                    }
                 }
             }
         }
@@ -221,6 +254,22 @@ mod tests {
         // Replacing a value counts only the new size, not old + new.
         let fits = "x".repeat(WEB_STORAGE_QUOTA_BYTES / 2 - 8);
         assert!(s.set("o", "k", &fits));
+    }
+
+    #[test]
+    fn quota_tracks_removals_and_many_small_writes() {
+        let s = WebStorage::new();
+        let half = "x".repeat(WEB_STORAGE_QUOTA_BYTES / 4 - 8);
+        assert!(s.set("o", "a", &half));
+        assert!(s.set("o", "b", &half));
+        assert!(!s.set("o", "c", &half), "a third half-quota value must not fit");
+        s.remove("o", "a");
+        assert!(s.set("o", "c", &half), "removing a value frees its bytes");
+        s.clear("o");
+        for i in 0..20_000 {
+            assert!(s.set("o", &format!("k{i}"), "value"));
+        }
+        assert_eq!(s.len("o"), 20_000);
     }
 
     #[test]

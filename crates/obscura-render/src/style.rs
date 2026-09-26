@@ -301,6 +301,10 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             // middle alignment; rows and cells inherit it below.
             style.vertical_align = Some(crate::VerticalAlign::Middle);
         }
+    } else if tag == "caption" {
+        // Chromium's UA sheet: `caption { display: table-caption;
+        // text-align: -webkit-center }`. The table builder places it.
+        style.text_align = Some(taffy::AlignItems::CENTER);
     } else if tag == "tr" {
         style.internal_flex_container = true;
         // Rows fill the table width and can shrink below content min-content;
@@ -333,6 +337,11 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // must opt into that. A synthetic `max-width:100%` here distorts
         // deliberately oversized art whose height and intrinsic ratio
         // establish its width.
+        style.display = Display::Inline;
+    } else if tag == "svg" {
+        // An outer `<svg>` in HTML is an inline-level replaced element like
+        // `<img>`, so `text-align` places it and it sits on the text baseline.
+        // Its descendants are painted by the SVG renderer, not laid out.
         style.display = Display::Inline;
     }
     style
@@ -1800,6 +1809,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.border_spacing = Some((h, *dims.get(1).unwrap_or(&h)));
             }
         }
+        "caption-side" => {
+            style.caption_bottom = match value.trim().to_ascii_lowercase().as_str() {
+                "bottom" | "block-end" => Some(true),
+                "top" | "block-start" | "initial" | "revert" | "revert-layer" => Some(false),
+                "inherit" | "unset" => None,
+                _ => style.caption_bottom,
+            };
+        }
         "border-collapse" => {
             style.border_collapse = match value.trim().to_ascii_lowercase().as_str() {
                 "collapse" => Some(true),
@@ -2176,6 +2193,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "-webkit-column-break-inside"
             | "border-spacing"
             | "border-collapse"
+            | "caption-side"
             | "table-layout"
             | "grid-template-columns"
             | "grid-template-rows"
@@ -2992,6 +3010,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
             "top" | "baseline" | "text-top" | "middle" | "bottom" | "text-bottom"
         ),
         "border-collapse" => matches!(lower.as_str(), "collapse" | "separate"),
+        "caption-side" => matches!(lower.as_str(), "top" | "bottom" | "block-start" | "block-end"),
         "border-spacing" => dimensions(value, false, 2),
         "column-count" | "-webkit-column-count" => {
             lower == "auto" || parse_column_count(value).is_some()

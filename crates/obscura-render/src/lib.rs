@@ -1357,6 +1357,10 @@ pub struct LayoutStyle {
     /// is still approximate, but collapsed tables must at minimum contribute
     /// no border-spacing to their geometry.
     pub border_collapse: Option<bool>,
+    /// Computed `caption-side`: true for `bottom`. Inherited; `None` means
+    /// not specified on this node and is resolved top-down like
+    /// `border_collapse`.
+    pub caption_bottom: Option<bool>,
 
     // Positioning. `position: absolute|fixed` takes the box out of normal flow.
     pub position: Option<taffy::Position>,

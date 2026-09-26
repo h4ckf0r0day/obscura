@@ -4924,6 +4924,7 @@ fn layout_dom_once(
             italic: bool,
             box_sizing: crate::BoxSizing,
             border_collapse: bool,
+            caption_bottom: bool,
             table_vertical_align: Option<crate::VerticalAlign>,
             overflow_x: u8,
             overflow_y: u8,
@@ -4983,6 +4984,7 @@ fn layout_dom_once(
                     italic: false,
                     box_sizing: crate::BoxSizing::ContentBox,
                     border_collapse: false,
+                    caption_bottom: false,
                     table_vertical_align: None,
                     overflow_x: 0,
                     overflow_y: 0,
@@ -5120,6 +5122,9 @@ fn layout_dom_once(
                     inh.box_sizing = style.box_sizing;
                     if let Some(value) = style.border_collapse {
                         inh.border_collapse = value;
+                    }
+                    if let Some(value) = style.caption_bottom {
+                        inh.caption_bottom = value;
                     }
                     let is_table_part = tree.get_node(id).is_some_and(|node| {
                         node.as_element().is_some_and(|element| {
@@ -5585,6 +5590,10 @@ fn layout_dom_once(
                     Some(value) => inh.border_collapse = value,
                     None => style.border_collapse = Some(inh.border_collapse),
                 }
+                match style.caption_bottom {
+                    Some(value) => inh.caption_bottom = value,
+                    None => style.caption_bottom = Some(inh.caption_bottom),
+                }
                 let is_table_part = tree.get_node(id).map_or(false, |node| {
                     node.as_element().map_or(false, |name| {
                         matches!(
@@ -5982,6 +5991,7 @@ fn layout_dom_once(
         // effective spacing to the legacy flex fallback after the computed
         // top-down values are known.
         propagate_border_spacing(tree, &mut styles);
+        collapse_table_borders(tree, &mut styles);
 
         // Resolve native form-control intrinsic border-box geometry after
         // inheritance and author cascading. Text-like inputs use the HTML
@@ -6668,6 +6678,27 @@ fn layout_dom_once(
                         let min_c = min_c.max(
                             max_definite_table_content_width(tree, dom, &styles).unwrap_or(0.0),
                         );
+                        // Captions wrap to the table's width, so they are left
+                        // out of its max-content (their min-content is already in
+                        // `min_c`).
+                        let hidden_captions: Vec<(taffy::NodeId, taffy::Style)> = taffy_tree
+                            .children(tnode)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|child| {
+                                id_map.get(child).is_some_and(|&d| {
+                                    tree.get_node(d).is_some_and(|n| {
+                                        n.as_element().is_some_and(|e| e.local.as_ref() == "caption")
+                                    })
+                                })
+                            })
+                            .filter_map(|child| Some((child, taffy_tree.style(child).ok()?.clone())))
+                            .collect();
+                        for (child, style) in &hidden_captions {
+                            let mut none = style.clone();
+                            none.display = Display::None;
+                            let _ = taffy_tree.set_style(*child, none);
+                        }
                         let max_c = {
                             let _ = taffy_tree.compute_layout_with_measure(
                                 tnode,
@@ -6682,6 +6713,10 @@ fn layout_dom_once(
                                 .map(|l| l.size.width)
                                 .unwrap_or(0.0)
                         };
+                        for (child, style) in hidden_captions {
+                            let _ = taffy_tree.set_style(child, style);
+                        }
+                        let max_c = max_c.max(min_c);
                         let inline_outer_edges = table_inline_outer_edges(table_style);
                         let preferred_outer = match width_style {
                             crate::Dimension::Px(w)
@@ -6772,7 +6807,15 @@ fn layout_dom_once(
                                     .layout(*cell)
                                     .map(|l| l.size.width)
                                     .unwrap_or(0.0);
-                                measured.push((*col, *span, cmin, cmax.max(cmin)));
+                                // A caption wraps to the table's width: only its
+                                // min-content can widen the table.
+                                let is_caption = id_map.get(cell).is_some_and(|&dom| {
+                                    tree.get_node(dom).is_some_and(|n| {
+                                        n.as_element().is_some_and(|e| e.local.as_ref() == "caption")
+                                    })
+                                });
+                                let cmax = if is_caption { cmin } else { cmax.max(cmin) };
+                                measured.push((*col, *span, cmin, cmax));
                             }
                             let mut col_min = vec![0.0f32; ncols];
                             let mut col_max = vec![0.0f32; ncols];
@@ -7768,6 +7811,240 @@ fn propagate_border_spacing(tree: &DomTree, styles: &mut HashMap<NodeId, crate::
             s.row_gap_expression = None;
         }
         apply_to_rows(tree, id, h, v, styles);
+    }
+}
+
+/// One side of a border for `border-collapse` conflict resolution.
+#[derive(Clone, Copy)]
+struct CollapsedSide {
+    width: f32,
+    style: crate::BorderStyle,
+    color: Option<[u8; 4]>,
+}
+
+impl CollapsedSide {
+    fn of(style: &crate::LayoutStyle, side: usize) -> Self {
+        let (width, border_style, color) = match side {
+            0 => (style.border.top, style.border_model.styles.top, style.border_model.colors.top),
+            1 => (style.border.right, style.border_model.styles.right, style.border_model.colors.right),
+            2 => (style.border.bottom, style.border_model.styles.bottom, style.border_model.colors.bottom),
+            _ => (style.border.left, style.border_model.styles.left, style.border_model.colors.left),
+        };
+        Self { width, style: border_style, color: color.or(style.border_color).or(style.color) }
+    }
+
+    /// CSS 2.1 17.6.2.1: `hidden` wins, then the wider border, then the
+    /// style order double > solid > dashed > dotted > ridge > outset >
+    /// groove > inset. Ties keep `self` (the earlier cell).
+    fn wins_over(self, other: Self) -> bool {
+        use crate::BorderStyle as S;
+        if self.style == S::Hidden || other.style == S::Hidden {
+            return other.style != S::Hidden;
+        }
+        let visible = |s: Self| s.width > 0.0 && s.style.is_visible();
+        match (visible(self), visible(other)) {
+            (false, true) => return false,
+            (true, false) | (false, false) => return true,
+            _ => {}
+        }
+        if self.width != other.width {
+            return self.width > other.width;
+        }
+        let rank = |s: S| match s {
+            S::Double => 8,
+            S::Solid => 7,
+            S::Dashed => 6,
+            S::Dotted => 5,
+            S::Ridge => 4,
+            S::Outset => 3,
+            S::Groove => 2,
+            S::Inset => 1,
+            _ => 0,
+        };
+        rank(self.style) >= rank(other.style)
+    }
+
+    fn apply(self, style: &mut crate::LayoutStyle, side: usize) {
+        let width = if self.style.is_visible() { self.width } else { 0.0 };
+        match side {
+            0 => {
+                style.border.top = width;
+                style.border_model.styles.top = self.style;
+                style.border_model.colors.top = self.color;
+            }
+            1 => {
+                style.border.right = width;
+                style.border_model.styles.right = self.style;
+                style.border_model.colors.right = self.color;
+            }
+            2 => {
+                style.border.bottom = width;
+                style.border_model.styles.bottom = self.style;
+                style.border_model.colors.bottom = self.color;
+            }
+            _ => {
+                style.border.left = width;
+                style.border_model.styles.left = self.style;
+                style.border_model.colors.left = self.color;
+            }
+        }
+    }
+
+    fn clear(style: &mut crate::LayoutStyle, side: usize) {
+        Self { width: 0.0, style: crate::BorderStyle::None, color: None }.apply(style, side);
+    }
+}
+
+/// `border-collapse: collapse` for native HTML tables: each border shared by
+/// two adjacent cells is resolved once (CSS 2.1 17.6.2.1) and kept on the
+/// earlier cell, the later cell's side is removed, and the table's own border
+/// collapses with the outermost cell borders the same way. Without this every
+/// inner border painted twice, doubling its width.
+fn collapse_table_borders(tree: &DomTree, styles: &mut HashMap<NodeId, crate::LayoutStyle>) {
+    const MAX_SPAN: usize = 1000;
+    const MAX_COLS: usize = 1024;
+    const MAX_ROWS: usize = 10000;
+    let tables: Vec<NodeId> = rendered_descendants(tree, tree.document())
+        .into_iter()
+        .filter(|&id| {
+            tree.get_node(id)
+                .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "table"))
+                .unwrap_or(false)
+                && styles.get(&id).is_some_and(|s| {
+                    s.border_collapse.unwrap_or(false) && s.display != crate::Display::None
+                })
+        })
+        .collect();
+    for table in tables {
+        let mut rows = Vec::new();
+        collect_table_rows(tree, table, &mut rows);
+        rows.truncate(MAX_ROWS);
+        let nrows = rows.len();
+        // Same cell placement as `build_table`: (row, column) -> cell.
+        let mut grid: HashMap<(usize, usize), NodeId> = HashMap::new();
+        let mut placed: Vec<(NodeId, usize, usize, usize, usize)> = Vec::new();
+        let mut ncols = 0usize;
+        for (r, &(tr, group_end)) in rows.iter().enumerate() {
+            let mut c = 0usize;
+            for cid in tree.children(tr) {
+                let is_cell = tree
+                    .get_node(cid)
+                    .and_then(|n| n.as_element().map(|e| matches!(e.local.as_ref(), "td" | "th")))
+                    .unwrap_or(false);
+                if !is_cell
+                    || styles.get(&cid).is_none_or(|s| s.display == crate::Display::None)
+                {
+                    continue;
+                }
+                while grid.contains_key(&(r, c)) {
+                    c += 1;
+                }
+                if c >= MAX_COLS {
+                    break;
+                }
+                let span = |name: &str| {
+                    tree.get_node(cid)
+                        .and_then(|n| n.get_attribute(name).and_then(|v| v.trim().parse::<usize>().ok()))
+                        .unwrap_or(1)
+                };
+                let cs = span("colspan").clamp(1, MAX_SPAN).min(MAX_COLS - c);
+                let left = group_end.min(nrows).saturating_sub(r).max(1);
+                let rs = match span("rowspan") {
+                    0 => left,
+                    n => n,
+                }
+                .clamp(1, left);
+                for dr in 0..rs {
+                    for dc in 0..cs {
+                        grid.insert((r + dr, c + dc), cid);
+                    }
+                }
+                placed.push((cid, r, c, rs, cs));
+                c += cs;
+                ncols = ncols.max(c);
+            }
+        }
+        if placed.is_empty() {
+            continue;
+        }
+        // Inner edges: right neighbours (side 1 vs 3), then lower (2 vs 0).
+        let mut done: HashSet<(NodeId, NodeId, bool)> = HashSet::new();
+        for &(cid, r, c, rs, cs) in &placed {
+            for dr in 0..rs {
+                if let Some(&next) = grid.get(&(r + dr, c + cs)) {
+                    if next != cid && done.insert((cid, next, true)) {
+                        let (Some(a), Some(b)) = (styles.get(&cid), styles.get(&next)) else { continue };
+                        let (a_side, b_side) = (CollapsedSide::of(a, 1), CollapsedSide::of(b, 3));
+                        let winner = if a_side.wins_over(b_side) { a_side } else { b_side };
+                        if let Some(a) = styles.get_mut(&cid) {
+                            winner.apply(a, 1);
+                        }
+                        if let Some(b) = styles.get_mut(&next) {
+                            CollapsedSide::clear(b, 3);
+                        }
+                    }
+                }
+            }
+            for dc in 0..cs {
+                if let Some(&next) = grid.get(&(r + rs, c + dc)) {
+                    if next != cid && done.insert((cid, next, false)) {
+                        let (Some(a), Some(b)) = (styles.get(&cid), styles.get(&next)) else { continue };
+                        let (a_side, b_side) = (CollapsedSide::of(a, 2), CollapsedSide::of(b, 0));
+                        let winner = if a_side.wins_over(b_side) { a_side } else { b_side };
+                        if let Some(a) = styles.get_mut(&cid) {
+                            winner.apply(a, 2);
+                        }
+                        if let Some(b) = styles.get_mut(&next) {
+                            CollapsedSide::clear(b, 0);
+                        }
+                    }
+                }
+            }
+        }
+        // Outer edges: the table's border collapses with the cells on each
+        // side. When the table's side wins every cell there, the cells drop
+        // theirs. Otherwise each cell's segment is resolved on its own: the
+        // winner moves onto the cell and the table drops that side.
+        let Some(table_style) = styles.get(&table).cloned() else { continue };
+        for side in 0..4 {
+            let edge: Vec<NodeId> = placed
+                .iter()
+                .filter(|&&(_, r, c, rs, cs)| match side {
+                    0 => r == 0,
+                    1 => c + cs == ncols,
+                    2 => r + rs == nrows,
+                    _ => c == 0,
+                })
+                .map(|&(cid, ..)| cid)
+                .collect();
+            let table_side = CollapsedSide::of(&table_style, side);
+            let table_visible = table_side.width > 0.0 && table_side.style.is_visible();
+            if !table_visible && table_side.style != crate::BorderStyle::Hidden {
+                continue;
+            }
+            let table_wins = edge.iter().all(|cid| {
+                styles.get(cid).is_none_or(|cell| table_side.wins_over(CollapsedSide::of(cell, side)))
+            });
+            if table_wins {
+                for cid in &edge {
+                    if let Some(cell) = styles.get_mut(cid) {
+                        CollapsedSide::clear(cell, side);
+                    }
+                }
+            } else {
+                for cid in &edge {
+                    if let Some(cell) = styles.get_mut(cid) {
+                        let own = CollapsedSide::of(cell, side);
+                        if table_side.wins_over(own) {
+                            table_side.apply(cell, side);
+                        }
+                    }
+                }
+                if let Some(t) = styles.get_mut(&table) {
+                    CollapsedSide::clear(t, side);
+                }
+            }
+        }
     }
 }
 
@@ -11277,6 +11554,33 @@ fn build_table(
         return None;
     }
 
+    // `<caption>` children become grid rows spanning every column, before the
+    // cell rows for `caption-side: top` and after them for `bottom`. They are
+    // offset out past the table's border and padding, and paint draws the
+    // table's background and border around the cell rows only, which matches
+    // the CSS table wrapper box without a separate layout node.
+    let (top_captions, bottom_captions): (Vec<NodeId>, Vec<NodeId>) = if native_html_table {
+        tree.children(id)
+            .into_iter()
+            .filter(|&cid| {
+                tree.get_node(cid)
+                    .and_then(|n| n.as_element().map(|e| e.local.as_ref() == "caption"))
+                    .unwrap_or(false)
+                    && styles
+                        .get(&cid)
+                        .is_some_and(|cap| cap.display != crate::Display::None)
+            })
+            .partition(|cid| {
+                !styles
+                    .get(cid)
+                    .and_then(|cap| cap.caption_bottom)
+                    .unwrap_or(false)
+            })
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let row_offset = top_captions.len();
+
     // Build each cell and pin it to its grid area.
     let mut children: Vec<taffy::NodeId> = Vec::new();
     for (cid, r, c, rs, cs) in &placed {
@@ -11288,7 +11592,7 @@ fn build_table(
         if let Ok(cur) = taffy_tree.style(cell_node) {
             let mut cstyle = cur.clone();
             cstyle.grid_row = taffy::Line {
-                start: line((*r as i16) + 1),
+                start: line((*r + row_offset) as i16 + 1),
                 end: span(*rs as u16),
             };
             cstyle.grid_column = taffy::Line {
@@ -11484,12 +11788,13 @@ fn build_table(
 
     // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
     // (content can always grow a row), matching how tables treat heights.
-    let mut row_min: Vec<Option<f32>> = vec![None; nrows];
+    let total_rows = row_offset + nrows + bottom_captions.len();
+    let mut row_min: Vec<Option<f32>> = vec![None; total_rows];
     if native_html_table {
         for (r, &(tr, _)) in rows.iter().enumerate() {
             if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
                 if h > 0.0 {
-                    row_min[r] = Some(h);
+                    row_min[r + row_offset] = Some(h);
                 }
             }
         }
@@ -11500,7 +11805,8 @@ fn build_table(
         }
         if let Some(crate::Dimension::Px(h)) = styles.get(cid).map(|s| s.height) {
             if h > 0.0 {
-                row_min[*r] = Some(row_min[*r].map_or(h, |cur| cur.max(h)));
+                let r = *r + row_offset;
+                row_min[r] = Some(row_min[r].map_or(h, |cur| cur.max(h)));
             }
         }
     }
@@ -11553,11 +11859,63 @@ fn build_table(
         tstyle.size.width = Dimension::auto();
     }
     tstyle.grid_template_columns = (0..ncols).map(col).collect();
-    tstyle.grid_template_rows = (0..nrows).map(row_track).collect();
+    tstyle.grid_template_rows = (0..total_rows).map(row_track).collect();
     tstyle.gap = taffy::Size {
         width: length(horizontal_spacing),
         height: length(vertical_spacing),
     };
+    // Captions: full-width spanning rows outside the table's border box. The
+    // negative margins cancel the row gap next to each caption and widen it
+    // to the border box; the relative offset moves it past the border and
+    // padding (which already include the outer border-spacing band).
+    let edge_top = style.border.top + grid_style.padding.top;
+    let edge_bottom = style.border.bottom + grid_style.padding.bottom;
+    let edge_left = style.border.left + grid_style.padding.left;
+    let edge_right = style.border.right + grid_style.padding.right;
+    let caption_rows = top_captions
+        .iter()
+        .enumerate()
+        .map(|(i, &cid)| (cid, i, true))
+        .chain(
+            bottom_captions
+                .iter()
+                .enumerate()
+                .map(|(i, &cid)| (cid, row_offset + nrows + i, false)),
+        )
+        .collect::<Vec<_>>();
+    for (cid, track, top) in caption_rows {
+        let Some(caption_node) = build(
+            tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
+        ) else {
+            continue;
+        };
+        if let Ok(cur) = taffy_tree.style(caption_node) {
+            let mut cap = cur.clone();
+            cap.grid_row = taffy::Line {
+                start: line(track as i16 + 1),
+                end: span(1),
+            };
+            cap.grid_column = taffy::Line {
+                start: line(1),
+                end: span(ncols as u16),
+            };
+            cap.size.width = Dimension::auto();
+            cap.margin.left = LengthPercentageAuto::length(-edge_left);
+            cap.margin.right = LengthPercentageAuto::length(-edge_right);
+            cap.position = taffy::Position::Relative;
+            if top {
+                cap.margin.bottom = LengthPercentageAuto::length(-vertical_spacing);
+                cap.inset.top = LengthPercentageAuto::length(-edge_top);
+                cap.inset.bottom = LengthPercentageAuto::auto();
+            } else {
+                cap.margin.top = LengthPercentageAuto::length(-vertical_spacing);
+                cap.inset.top = LengthPercentageAuto::length(edge_bottom);
+                cap.inset.bottom = LengthPercentageAuto::auto();
+            }
+            let _ = taffy_tree.set_style(caption_node, cap);
+        }
+        children.push(caption_node);
+    }
     let table_node = taffy_tree.new_with_children(tstyle, &children).ok()?;
     id_map.insert(table_node, id);
     ifc_items.table_rows.insert(table_node, row_min);
@@ -13541,6 +13899,9 @@ fn inline_wraps_only_in_flow_blocks(
     };
     if style.display != crate::Display::Inline
         || style.is_inline_block
+        // A replaced box (an inline `<svg>` whose `<rect>` children compute
+        // to block) is atomic; flattening it would drop its own box.
+        || style.is_replaced_box
         || style.before_pseudo.is_some()
         || style.after_pseudo.is_some()
         || style.float.is_some()
@@ -19129,6 +19490,81 @@ mod tests {
     }
 
     #[test]
+    fn inline_svg_is_placed_by_text_align() {
+        let tree = parse_html(
+            r#"<body style="margin:0">
+                <div style="text-align:center;width:400px"><svg id="alone" width="50" height="20"><rect width="50" height="20"/></svg></div>
+                <div style="text-align:center;width:400px">a <svg id="in-text" width="50" height="20"></svg> b</div>
+                </body>"#,
+        );
+        let laid = layout_dom(&tree, (500.0, 300.0));
+        let rect = |id: &str| laid.rects.get(&tree.query_selector(&format!("#{id}")).unwrap().unwrap()).copied();
+        let alone = rect("alone").expect("an SVG with child shapes keeps its own box");
+        assert_eq!((alone.x, alone.width, alone.height), (175.0, 50.0, 20.0));
+        let in_text = rect("in-text").unwrap();
+        assert!(in_text.x > 150.0 && in_text.x < 200.0, "centred with its text: {in_text:?}");
+    }
+
+    #[test]
+    fn collapsed_table_borders_are_shared_between_cells() {
+        let tree = parse_html(
+            r#"<body style="margin:0"><table id="t" style="border-collapse:collapse">
+                <tr><td id="a" style="border:1px solid #000;width:20px"></td><td id="b" style="border:1px solid #000;width:20px"></td></tr>
+                <tr><td id="c" style="border:1px solid #000"></td><td id="d" style="border:3px solid red"></td></tr>
+                </table></body>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 300.0));
+        let style = |id: &str| {
+            let nid = tree.query_selector(&format!("#{id}")).unwrap().unwrap();
+            laid.styles.get(&nid).unwrap().clone()
+        };
+        // Each inner edge is painted once, by the earlier cell.
+        assert_eq!(style("a").border.right, 1.0);
+        assert_eq!(style("b").border.left, 0.0);
+        assert_eq!(style("a").border.bottom, 1.0);
+        assert_eq!(style("c").border.top, 0.0);
+        // The wider border wins its shared edges.
+        assert_eq!(style("b").border.bottom, 3.0);
+        assert_eq!(style("c").border.right, 3.0);
+        assert_eq!(style("d").border.top, 0.0);
+        assert_eq!(style("d").border.left, 0.0);
+
+        // The separate model keeps every cell's own border.
+        let tree = parse_html(
+            r#"<table><tr><td id="a" style="border:1px solid #000"></td><td id="b" style="border:1px solid #000"></td></tr></table>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 300.0));
+        let b = tree.query_selector("#b").unwrap().unwrap();
+        assert_eq!(laid.styles.get(&b).unwrap().border.left, 1.0);
+    }
+
+    #[test]
+    fn table_captions_sit_above_or_below_the_rows() {
+        let tree = parse_html(
+            r#"<body style="margin:0;font:16px sans-serif">
+                <table id="top" style="border:2px solid #000"><caption id="tc">Above</caption>
+                  <tr><td id="tcell">cell</td></tr></table>
+                <table id="bottom"><caption id="bc" style="caption-side:bottom">Below the table rows</caption>
+                  <tr><td id="bcell">x</td></tr></table>
+                </body>"#,
+        );
+        let laid = layout_dom(&tree, (400.0, 300.0));
+        let rect = |id: &str| *laid.rects.get(&tree.query_selector(&format!("#{id}")).unwrap().unwrap()).unwrap();
+        let (table, caption, cell) = (rect("top"), rect("tc"), rect("tcell"));
+        assert!(caption.height > 0.0, "the caption is laid out");
+        assert_eq!(caption.y, table.y, "a top caption starts the table wrapper");
+        assert_eq!(caption.width, table.width, "the caption spans the table box");
+        assert!(cell.y >= caption.y + caption.height + 2.0, "rows follow the caption and the table border");
+        // Below the last row: 2px border-spacing, then the 2px table border.
+        assert_eq!(table.y + table.height, cell.y + cell.height + 4.0);
+
+        let (table, caption, cell) = (rect("bottom"), rect("bc"), rect("bcell"));
+        assert!(caption.y >= cell.y + cell.height, "a bottom caption follows the rows");
+        assert_eq!(caption.y + caption.height, table.y + table.height);
+        assert!(caption.height > 20.0, "a caption wider than the table wraps instead of widening it");
+    }
+
+    #[test]
     fn root_percentage_font_size_controls_rem_lengths() {
         let tree = parse_html(
             r#"<style>
@@ -21076,3 +21512,4 @@ mod tests {
         assert!(style.is_inline_block);
     }
 }
+
