@@ -35,6 +35,11 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+# Client transport for the page `WebSocket` API. rustls with webpki roots
+# reuses the ring-backed rustls reqwest already links, so wss:// adds no new
+# TLS stack.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 html5ever = { workspace = true }
 deno_error = "0.7"
 base64 = { workspace = true }

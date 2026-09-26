@@ -6103,6 +6103,11 @@ pub fn build_extension() -> Extension {
         op_encoding_for_label(),
         op_text_decode(),
         op_url_encode_query(),
+        crate::websocket::op_ws_create(),
+        crate::websocket::op_ws_connect(),
+        crate::websocket::op_ws_send(),
+        crate::websocket::op_ws_close(),
+        crate::websocket::op_ws_next(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
