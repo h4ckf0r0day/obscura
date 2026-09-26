@@ -887,6 +887,18 @@ impl ResolvedScrollState {
 
 /// A final image/font-aware document layout retained across viewport paints.
 /// The DOM must not be mutated while this value is reused.
+/// One painted line of text in document coordinates (CSS px).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextFragment {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub baseline: f32,
+    pub font_size: f32,
+    pub text: String,
+}
+
 pub struct PreparedRender {
     viewport: (f32, f32),
     animation_sample: crate::AnimationSample,
@@ -1043,6 +1055,64 @@ impl PreparedRender {
 
     pub fn content_size(&self) -> (f32, f32) {
         self.content_size
+    }
+
+    /// Every painted text line in document coordinates, sorted top to bottom
+    /// then left to right. This backs the PDF text layer: it carries each
+    /// line's box, baseline, font size and characters, and nothing about how
+    /// the glyphs look.
+    pub fn text_fragments(&self) -> Vec<TextFragment> {
+        let laid = &self.layout;
+        let visible = |nid: &obscura_dom::tree::NodeId| {
+            !laid.styles.get(nid).is_some_and(|style| style.effectively_invisible)
+        };
+        let mut items: Vec<usize> = Vec::new();
+        for (nid, &idx) in &laid.ifc_items {
+            if visible(nid) {
+                items.push(idx);
+            }
+        }
+        for (nid, list) in laid.run_ifc_items.iter().chain(laid.word_ifc_items.iter()) {
+            if visible(nid) {
+                items.extend(list.iter().copied());
+            }
+        }
+        items.sort_unstable();
+        items.dedup();
+        let mut fragments = Vec::new();
+        for idx in items {
+            for (x, y, width, height, baseline, font_size, text) in
+                laid.text_engine.item_text_lines(idx, (0.0, 0.0))
+            {
+                fragments.push(TextFragment { x, y, width, height, baseline, font_size, text });
+            }
+        }
+        // Text laid out as per-word boxes (no shaped item) carries its own
+        // rects and words.
+        for (nid, runs) in &laid.text_runs {
+            let font_size = laid.styles.get(nid).and_then(|style| style.font_size);
+            for (rect, word) in runs {
+                let font_size = font_size.unwrap_or(rect.height / 1.15);
+                if word.trim().is_empty() {
+                    continue;
+                }
+                fragments.push(TextFragment {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    baseline: rect.y + rect.height * 0.8,
+                    font_size,
+                    text: word.clone(),
+                });
+            }
+        }
+        fragments.sort_by(|a, b| {
+            a.y.partial_cmp(&b.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        fragments
     }
 
     pub fn viewport_fixed_nodes(&self) -> &std::collections::HashSet<obscura_dom::tree::NodeId> {

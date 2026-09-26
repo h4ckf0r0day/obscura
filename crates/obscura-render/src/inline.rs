@@ -3410,6 +3410,55 @@ impl TextEngine {
     /// Rasterize inline context `idx` into `pixmap`, honoring its finalized
     /// clip. Tests and generated items whose coordinates do not change between
     /// layout and paint use this path.
+    /// Each laid-out line of item `idx` as (left, top, width, height,
+    /// baseline, font size, text) in document coordinates. Whitespace-only
+    /// lines are skipped. Used for the PDF text layer, which only needs the
+    /// run's box and characters, not individual glyphs.
+    pub(crate) fn item_text_lines(
+        &self,
+        idx: usize,
+        offset: (f32, f32),
+    ) -> Vec<(f32, f32, f32, f32, f32, f32, String)> {
+        let Some(item) = self.items.get(idx) else {
+            return Vec::new();
+        };
+        let (ox, oy) = (item.origin.0 + offset.0, item.origin.1 + offset.1);
+        let mut lines = Vec::new();
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            let mut x0 = f32::INFINITY;
+            let mut x1 = f32::NEG_INFINITY;
+            let (mut start, mut end) = (usize::MAX, 0usize);
+            let mut font_size = 0.0f32;
+            for glyph in run.glyphs {
+                x0 = x0.min(glyph.x);
+                x1 = x1.max(glyph.x + glyph.w);
+                start = start.min(glyph.start);
+                end = end.max(glyph.end);
+                font_size = font_size.max(glyph.font_size);
+            }
+            if start >= end || !x0.is_finite() || !x1.is_finite() {
+                continue;
+            }
+            let Some(text) = run.text.get(start..end) else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            lines.push((
+                ox + line_offset + x0,
+                oy + run.line_top,
+                (x1 - x0).max(0.0),
+                run.line_height,
+                oy + run.line_y,
+                font_size,
+                text.to_string(),
+            ));
+        }
+        lines
+    }
+
     pub fn paint_item(&mut self, idx: usize, pixmap: &mut tiny_skia::Pixmap, offset: (f32, f32)) {
         self.paint_item_with_clip(idx, pixmap, offset, None);
     }

@@ -117,7 +117,7 @@ pub use paint::{
     prepare_dom_with_retained_attribute_styles, prepare_dom_with_retained_styles,
     prepare_dom_with_retained_styles_at_animation_time,
     prepare_dom_with_retained_styles_with_animation_state,
-    screenshot_prepared,
+    screenshot_prepared, TextFragment,
     screenshot_prepared_region_with_scroll,
     screenshot_prepared_region_with_scroll_and_surface_color,
     screenshot_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces,

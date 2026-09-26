@@ -92,9 +92,12 @@ Use raw CDP for `Page.captureScreenshot`, `Page.startScreencast`, and
 `Page.screencastFrame` using `Page.screencastFrameAck`. Frames are driven by
 page activity; this is not fixed-frame-rate desktop capture.
 
-PDF output supports paper dimensions, margins, landscape, scale, backgrounds,
-and page ranges. It does not currently provide selectable text, tagged PDF,
-outlines, headers/footers, or complete CSS paged-media behavior.
+PDF output lays the page out at the paper width with print media and supports
+paper dimensions, margins, landscape, scale, backgrounds, page ranges,
+`displayHeaderFooter` templates, `generateDocumentOutline`, and
+`preferCSSPageSize` (`@page { size }`). Pages are rasters at the device scale
+factor with an invisible text layer, so text is selectable and extractable.
+Tagged PDF and complete CSS paged-media behavior are not provided.
 
 ## Drive MCP
 

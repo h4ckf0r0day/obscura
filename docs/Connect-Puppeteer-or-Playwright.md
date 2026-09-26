@@ -102,7 +102,8 @@ screencasting, and current output limits.
 ## Current limits
 
 - Pages share one V8 isolate. CPU-bound JavaScript on one page can delay others.
-- PDF output is raster-backed; text is not selectable and tagged PDF,
-  headers/footers, outlines, and full CSS paged media are not implemented.
+- PDF pages are rasters with an invisible text layer: text is selectable,
+  searchable and extractable, but not vector. Tagged PDF and full CSS paged
+  media (page boxes, `break-*` rules) are not implemented.
 - Service workers, native media playback, some Web APIs, and long-tail CSS or
   compositor effects are still incomplete relative to Chromium.
