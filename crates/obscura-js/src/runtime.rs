@@ -13948,6 +13948,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canvas_hsl_colors_paint_expected_pixels() {
+        let mut rt = setup_runtime("<canvas id=canvas width=1 height=1></canvas>");
+        let pixels = rt.evaluate(r#"(() => {
+            const ctx = document.getElementById('canvas').getContext('2d');
+            return ['hsl(0,100%,50%)', 'hsl(120deg 100% 50%)',
+                'hsl(.5turn 100% 50%)', 'hsl(-120,100%,50%)',
+                'hsl(200grad 100% 50%)', 'hsla(240,100%,50%,1)',
+                'hsl(0 0% 25%)', 'hsl(0 100% 50% / 100%)'].map(color => {
+                    ctx.clearRect(0,0,1,1); ctx.fillStyle = color; ctx.fillRect(0,0,1,1);
+                    return Array.from(ctx.getImageData(0,0,1,1).data);
+                });
+        })()"#).unwrap();
+        assert_eq!(pixels, serde_json::json!([
+            [255,0,0,255], [0,255,0,255], [0,255,255,255], [0,0,255,255],
+            [0,255,255,255], [0,0,255,255], [64,64,64,255], [255,0,0,255]
+        ]));
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {

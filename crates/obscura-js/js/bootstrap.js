@@ -13353,6 +13353,36 @@ class _Canvas2D {
       if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
       if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
     }
+    const hsl = css.trim().toLowerCase().match(/^hsla?\((.*)\)$/);
+    if (hsl) {
+      const body = hsl[1].trim();
+      const sections = body.split('/');
+      const parts = body.includes(',') ? body.split(',').map(v => v.trim())
+        : sections[0].trim().split(/\s+/);
+      if (!body.includes(',') && sections.length === 2) parts.push(sections[1].trim());
+      const validSyntax = body.includes(',') ? !body.includes('/')
+        : sections.length <= 2 && sections[0].trim().split(/\s+/).length === 3;
+      const hue = parts[0] && parts[0].match(/^([-+]?(?:\d+(?:\.\d*)?|\.\d+))(deg|grad|rad|turn)?$/);
+      const percent = (value) => /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)%$/.test(value);
+      const alpha = parts[3] === undefined ? 1 : percent(parts[3])
+        ? Number.parseFloat(parts[3]) / 100 : Number(parts[3]);
+      if (validSyntax && (parts.length === 3 || parts.length === 4) && hue
+          && percent(parts[1]) && percent(parts[2]) && (parts[3] === undefined || parts[3] !== '')
+          && Number.isFinite(Number(hue[1])) && Number.isFinite(alpha)) {
+        const units = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
+        const degrees = Number(hue[1]) * (units[hue[2] || 'deg']);
+        const h = ((degrees % 360 + 360) % 360) / 60;
+        const saturation = Math.max(0, Math.min(1, Number.parseFloat(parts[1]) / 100));
+        const lightness = Math.max(0, Math.min(1, Number.parseFloat(parts[2]) / 100));
+        const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+        const x = chroma * (1 - Math.abs(h % 2 - 1));
+        const rgb = h < 1 ? [chroma, x, 0] : h < 2 ? [x, chroma, 0]
+          : h < 3 ? [0, chroma, x] : h < 4 ? [0, x, chroma]
+          : h < 5 ? [x, 0, chroma] : [chroma, 0, x];
+        const m = lightness - chroma / 2;
+        return [...rgb.map(v => Math.round((v + m) * 255)), Math.round(Math.max(0, Math.min(1, alpha)) * 255)];
+      }
+    }
     const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
     if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
     const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
