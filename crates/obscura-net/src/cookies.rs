@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use url::Url;
 
 const DEFAULT_SAME_SITE: &str = "Lax";
@@ -58,6 +58,18 @@ struct CookieEntry {
 }
 
 impl CookieJar {
+    /// Lock accessors that survive poisoning. A panic while holding the lock
+    /// (in any thread, for any reason) must not turn every later cookie
+    /// operation in the process into a panic: the jar's state is a plain map
+    /// that is valid at every point a guard can be dropped.
+    fn read_jar(&self) -> RwLockReadGuard<'_, HashMap<String, HashMap<(String, String), CookieEntry>>> {
+        self.cookies.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_jar(&self) -> RwLockWriteGuard<'_, HashMap<String, HashMap<(String, String), CookieEntry>>> {
+        self.cookies.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn new() -> Self {
         CookieJar {
             cookies: RwLock::new(HashMap::new()),
@@ -127,6 +139,9 @@ impl CookieJar {
         // Validate Domain against the response origin (RFC 6265): an unrelated
         // or public-suffix Domain rejects the cookie so a response from attacker.test
         // cannot scope a cookie to victim.test (GHSA-f22c-8v6q-v6h6).
+        if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), &path) {
+            return;
+        }
         let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
             Some(d) => d,
             None => return,
@@ -137,7 +152,7 @@ impl CookieJar {
             return;
         }
 
-        let mut cookies = self.cookies.write().unwrap();
+        let mut cookies = self.write_jar();
         if !source_is_secure && secure_cookie_conflicts(&cookies, &name, &domain, &path) {
             return;
         }
@@ -187,7 +202,7 @@ impl CookieJar {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
         let is_secure = url.scheme() == "https";
-        let cookies = self.cookies.read().unwrap();
+        let cookies = self.read_jar();
         if cookies.is_empty() {
             return String::new();
         }
@@ -238,7 +253,7 @@ impl CookieJar {
     }
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
-        let cookies = self.cookies.read().unwrap();
+        let cookies = self.read_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -284,12 +299,12 @@ impl CookieJar {
         if std::ptr::eq(self, source) {
             return;
         }
-        let snapshot = source.cookies.read().unwrap().clone();
-        *self.cookies.write().unwrap() = snapshot;
+        let snapshot = source.read_jar().clone();
+        *self.write_jar() = snapshot;
     }
 
     fn set_cookies_from_import(&self, cookies: impl IntoIterator<Item = (CookieInfo, bool)>) {
-        let mut jar = self.cookies.write().unwrap();
+        let mut jar = self.write_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -306,6 +321,9 @@ impl CookieJar {
                 continue;
             }
             if cookie.same_site == "None" && !cookie.secure {
+                continue;
+            }
+            if !cookie_prefix_allows(&cookie.name, cookie.secure, !host_only, &cookie.path) {
                 continue;
             }
             if cookie.expires.is_some_and(|expires| {
@@ -343,7 +361,7 @@ impl CookieJar {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
         let is_secure = url.scheme() == "https";
-        let cookies = self.cookies.read().unwrap();
+        let cookies = self.read_jar();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -439,6 +457,9 @@ impl CookieJar {
             }
         }
 
+        if !cookie_prefix_allows(&name, secure, domain_attr.is_some(), &path) {
+            return;
+        }
         let (domain, host_only) = match resolve_cookie_domain(&request_host, domain_attr.as_deref()) {
             Some(d) => d,
             None => return,
@@ -449,7 +470,7 @@ impl CookieJar {
             return;
         }
 
-        let mut cookies = self.cookies.write().unwrap();
+        let mut cookies = self.write_jar();
         if !source_is_secure && secure_cookie_conflicts(&cookies, &name, &domain, &path) {
             return;
         }
@@ -498,7 +519,7 @@ impl CookieJar {
     }
 
     pub fn delete_cookie(&self, name: &str, domain: &str) {
-        let mut cookies = self.cookies.write().unwrap();
+        let mut cookies = self.write_jar();
         if domain.is_empty() {
             for domain_cookies in cookies.values_mut() {
                 domain_cookies.retain(|_k, e| e.name != name);
@@ -509,7 +530,7 @@ impl CookieJar {
     }
 
     pub fn delete_cookies_filtered(&self, name: &str, domain: &str, path: Option<&str>) {
-        let mut cookies = self.cookies.write().unwrap();
+        let mut cookies = self.write_jar();
         let matches_path = |entry_path: &str| match path {
             Some(p) => entry_path == p,
             None => true,
@@ -524,7 +545,7 @@ impl CookieJar {
     }
 
     pub fn clear(&self) {
-        self.cookies.write().unwrap().clear();
+        self.write_jar().clear();
     }
 
     /// Serialize all non-expired cookies to a JSON file.
@@ -532,7 +553,7 @@ impl CookieJar {
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         use std::io::Write;
 
-        let cookies = self.cookies.read().unwrap();
+        let cookies = self.read_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -706,6 +727,24 @@ fn resolve_cookie_domain(origin_host: &str, domain_attr: Option<&str>) -> Option
             .strip_suffix(&dom)
             .is_some_and(|prefix| prefix.ends_with('.')))
     .then_some((dom, false))
+}
+
+/// RFC 6265bis 4.1.3 cookie name prefixes. `__Secure-` requires the Secure
+/// attribute; `__Host-` additionally requires no Domain attribute and
+/// `Path=/`, which is what makes it a host-only cookie a sibling or parent
+/// host cannot plant. Chrome matches the prefixes case-insensitively.
+fn cookie_prefix_allows(name: &str, secure: bool, has_domain_attr: bool, path: &str) -> bool {
+    let has_prefix = |prefix: &str| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    if has_prefix("__host-") {
+        secure && !has_domain_attr && path == "/"
+    } else if has_prefix("__secure-") {
+        secure
+    } else {
+        true
+    }
 }
 
 fn is_public_suffix(domain: &str) -> bool {
@@ -1580,6 +1619,92 @@ mod tests {
             jar.get_cookie_header_in_context(&target, SameSiteContext::CrossSite),
             "secure=1"
         );
+    }
+
+    #[test]
+    fn host_prefix_cookies_must_be_secure_host_only_and_root_path() {
+        // RFC 6265bis 4.1.3 / Chrome: __Host- promises host-only isolation,
+        // so a subdomain must not be able to plant one with a Domain scope.
+        let jar = CookieJar::new();
+        let sub = Url::parse("https://sub.example.test/").unwrap();
+        let parent = Url::parse("https://example.test/").unwrap();
+        jar.set_cookie("__Host-session=evil; Domain=example.test; Secure; Path=/", &sub);
+        jar.set_cookie("__Host-a=1; Secure; Path=/admin", &sub);
+        jar.set_cookie("__Host-b=1; Path=/", &sub);
+        jar.set_cookie_from_js("__Host-c=1; Secure; Domain=example.test", &sub);
+        jar.set_cookies_from_cdp_with_scope([(
+            CookieInfo {
+                name: "__Host-d".into(),
+                value: "1".into(),
+                domain: "example.test".into(),
+                path: "/".into(),
+                secure: true,
+                http_only: false,
+                same_site: String::new(),
+                expires: None,
+            },
+            false,
+        )]);
+        for url in [&sub, &parent] {
+            let header = jar.get_cookie_header_same_site(url);
+            assert!(!header.contains("__Host-"), "{}: {header}", url);
+        }
+
+        // The compliant form is stored, host-only, and the prefix match is
+        // case-insensitive like Chrome's.
+        jar.set_cookie("__Host-ok=1; Secure; Path=/", &sub);
+        jar.set_cookie("__host-ci=1; Secure; Path=/", &sub);
+        jar.set_cookie_from_js("__Host-js=1; Secure; Path=/", &sub);
+        let header = jar.get_cookie_header_same_site(&sub);
+        assert!(header.contains("__Host-ok=1"), "{header}");
+        assert!(header.contains("__host-ci=1"), "{header}");
+        assert!(header.contains("__Host-js=1"), "{header}");
+        let other = Url::parse("https://other.sub.example.test/").unwrap();
+        assert!(!jar.get_cookie_header_same_site(&other).contains("__Host-"));
+    }
+
+    #[test]
+    fn secure_prefix_cookies_require_the_secure_attribute() {
+        let jar = CookieJar::new();
+        let origin = Url::parse("https://example.test/").unwrap();
+        jar.set_cookie("__Secure-token=plain", &origin);
+        jar.set_cookie_from_js("__Secure-js=plain", &origin);
+        jar.set_cookies_from_cdp_with_scope([(
+            CookieInfo {
+                name: "__Secure-cdp".into(),
+                value: "plain".into(),
+                domain: "example.test".into(),
+                path: "/".into(),
+                secure: false,
+                http_only: false,
+                same_site: String::new(),
+                expires: None,
+            },
+            true,
+        )]);
+        assert!(!jar.get_cookie_header_same_site(&origin).contains("__Secure-"));
+
+        jar.set_cookie("__Secure-token=ok; Secure", &origin);
+        assert!(jar.get_cookie_header_same_site(&origin).contains("__Secure-token=ok"));
+    }
+
+    #[test]
+    fn a_poisoned_jar_lock_does_not_take_down_later_cookie_operations() {
+        // One panic while holding the lock (any thread, any cause) used to
+        // turn every later cookie call in the process into a panic.
+        let jar = std::sync::Arc::new(CookieJar::new());
+        let url = Url::parse("http://example.test/").unwrap();
+        jar.set_cookie("before=1", &url);
+        let poisoner = jar.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.cookies.write().unwrap();
+            panic!("poison the jar lock while holding it");
+        })
+        .join();
+        assert!(jar.cookies.is_poisoned());
+        jar.set_cookie("after=2", &url);
+        let header = jar.get_cookie_header_same_site(&url);
+        assert!(header.contains("before=1") && header.contains("after=2"), "{header}");
     }
 
     #[test]

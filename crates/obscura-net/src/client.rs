@@ -780,6 +780,11 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                     )));
                 }
             }
+            // Octal, hex, decimal and overlong IPv4 spellings ("0x7f000001",
+            // "0177.0.0.1", "2130706433") never reach this arm: for the http
+            // and https schemes the url crate normalizes them to Host::Ipv4,
+            // which is checked above. This arm is a belt-and-braces check on
+            // names, and the resolver re-checks whatever the name resolves to.
             url::Host::Domain(domain) => {
                 let lower_domain = domain.to_lowercase();
                 if lower_domain == "localhost"

@@ -57,7 +57,16 @@ impl Default for RobotsCache {
 }
 
 fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
-    let our_agent_lower = our_agent.to_lowercase();
+    // RFC 9309 2.2.1: a group applies when its product token equals one of
+    // ours, case-insensitively. Our identification string is a full
+    // User-Agent, so split it into its product tokens. Substring matching in
+    // either direction let "User-agent: Moz" govern a Mozilla/5.0 UA and
+    // "User-agent: ObscuraBot" govern a UA of "Obscura".
+    let our_tokens: Vec<String> = our_agent
+        .split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ';' | ','))
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect();
     let mut disallowed = Vec::new();
     let mut allowed = Vec::new();
     let mut in_matching_section = false;
@@ -76,9 +85,8 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
             match key.as_str() {
                 "user-agent" => {
                     let agent = value.to_lowercase();
-                    in_matching_section = agent == "*"
-                        || our_agent_lower.contains(&agent)
-                        || agent.contains(&our_agent_lower);
+                    in_matching_section =
+                        agent == "*" || our_tokens.iter().any(|token| *token == agent);
                     if agent != "*" && in_matching_section {
                         found_specific = true;
                     }
@@ -148,6 +156,23 @@ mod tests {
         assert!(!cache.is_allowed("example.com", "/private/secret"));
         assert!(!cache.is_allowed("example.com", "/admin"));
         assert!(cache.is_allowed("example.com", "/admin/public"));
+    }
+
+    #[test]
+    fn agent_groups_match_product_tokens_not_substrings() {
+        // RFC 9309 2.2.1: a group applies when its product token equals one of
+        // ours. Substring matching in either direction let "User-agent: Moz"
+        // govern a Mozilla/5.0 UA and "User-agent: ObscuraBot" govern "Obscura".
+        let chrome = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+        let cache = RobotsCache::new();
+        cache.parse_and_store("a.test", "User-agent: Moz\nDisallow: /\n", chrome);
+        assert!(cache.is_allowed("a.test", "/page"), "a token prefix is not a match");
+        cache.parse_and_store("b.test", "User-agent: chrome\nDisallow: /\n", chrome);
+        assert!(!cache.is_allowed("b.test", "/page"), "an exact token still matches, case-insensitively");
+        cache.parse_and_store("c.test", "User-agent: ObscuraBot\nDisallow: /\n", "Obscura");
+        assert!(cache.is_allowed("c.test", "/page"), "our token being a substring of theirs is not a match");
+        cache.parse_and_store("d.test", "User-agent: Obscura\nDisallow: /\n", "Obscura/1.0 (+https://example.test)");
+        assert!(!cache.is_allowed("d.test", "/page"), "a product token followed by a version matches");
     }
 
     #[test]
