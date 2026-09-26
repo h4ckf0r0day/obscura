@@ -231,6 +231,12 @@ pub mod inline {
             }
         }
 
+        pub(crate) fn measure_generated_text(
+            &mut self, _text: &str, _style: &crate::LayoutStyle,
+        ) -> Option<(f32, f32)> {
+            None
+        }
+
         pub(crate) fn push_generated_text(
             &mut self,
             _text: &str,

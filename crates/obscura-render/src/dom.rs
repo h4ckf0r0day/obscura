@@ -6051,13 +6051,18 @@ fn layout_dom_once(
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                let mut content_width = text_width(
-                    &label,
-                    font_size,
-                    bold,
-                    style.font_family.as_deref(),
-                    style.letter_spacing.unwrap_or(0.0),
-                );
+                // Match the selected font and shaping used by the button's
+                // actual text. Static glyph advances use different scaling
+                // and can make an unconstrained label wrap inside its own box.
+                let mut content_width = engine.measure_generated_text(&label, style)
+                    .map(|(width, _)| width)
+                    .unwrap_or_else(|| text_width(
+                        &label,
+                        font_size,
+                        bold,
+                        style.font_family.as_deref(),
+                        style.letter_spacing.unwrap_or(0.0),
+                    ));
                 content_width += intrinsic_content
                     .map(|content| content.atomic_width)
                     .unwrap_or(0.0);
@@ -15498,6 +15503,29 @@ mod tests {
             "children heights should be 40 and 60, got {:?}",
             sorted
         );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn auto_button_intrinsic_width_matches_its_shaped_label() {
+        for family in ["system-ui", "Arial", "monospace"] {
+            for text_style in ["font-weight:400", "font-weight:700;letter-spacing:2px", "text-transform:uppercase"] {
+                let tree = parse_html(&format!(r#"<style>
+                    body{{margin:0;font:16px {family}}}
+                    button,span{{font:inherit;{text_style}}}
+                    button{{padding:8px;border:0}}
+                    span{{display:inline-block;white-space:pre}}
+                  </style><button id="button">Save and sign in</button>
+                  <div><span id="reference">Save and sign in</span></div>"#));
+                let laid = layout_dom(&tree, (390.0, 844.0));
+                let button = laid.rects[&tree.get_element_by_id("button").unwrap()];
+                let reference = laid.rects[&tree.get_element_by_id("reference").unwrap()];
+                assert!((button.width - 16.0 - reference.width).abs() <= 1.0,
+                    "button must reserve its actual shaped label width: family={family}, style={text_style}, button={button:?}, reference={reference:?}");
+                assert!((button.height - 16.0 - reference.height).abs() <= 1.0,
+                    "an unconstrained button must not wrap its label: family={family}, style={text_style}, button={button:?}, reference={reference:?}");
+            }
+        }
     }
 
     #[test]
