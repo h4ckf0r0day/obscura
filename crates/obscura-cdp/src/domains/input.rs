@@ -27,6 +27,7 @@ fn insert_text_js(text: &str) -> String {
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.localName === 'input' && (t.getAttribute('type') || '').toLowerCase() === 'range') return;\
             var ins = {text};\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
@@ -53,6 +54,7 @@ fn insert_text_js(text: &str) -> String {
 const BACKSPACE_JS: &str = "(function() {\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.localName === 'input' && (t.getAttribute('type') || '').toLowerCase() === 'range') return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
     function backCount(str, p) {\
@@ -163,9 +165,10 @@ pub async fn handle(
                             }}\
                             var focusTarget = target.closest && target.closest('input,select,textarea,button,a[href],[tabindex],[contenteditable]');\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(pointer);\
+                            var pointerAllowed = target.dispatchEvent(pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            var mouseAllowed = target.dispatchEvent(evt);\
+                            if ({button_code} == 0 && pointerAllowed && mouseAllowed) globalThis.__obscura_rangePointerDown(target, {x});\
                             if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
                         }})()",
                         x = x,
@@ -181,6 +184,10 @@ pub async fn handle(
                     );
                     page.evaluate(&code);
                 }
+            } else if event_type == "mouseMoved" {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    page.evaluate(&format!("(function() {{ var drag = globalThis.__obscura_rangeDrag; if (!drag) return; var target=drag.el; target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', {{bubbles:true,cancelable:true,composed:true,clientX:{x},clientY:{y},buttons:{buttons},pointerId:1,pointerType:'mouse',isPrimary:true}}))); target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', {{bubbles:true,cancelable:true,composed:true,clientX:{x},clientY:{y},buttons:{buttons}}}))); globalThis.__obscura_rangePointerMove({x}); }})()"));
+                }
             } else if event_type == "mouseReleased" {
                 let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
@@ -193,6 +200,7 @@ pub async fn handle(
                             target.dispatchEvent(pointer);\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
+                            if ({button_code} == 0) globalThis.__obscura_rangePointerUp();\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
                             while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
@@ -373,7 +381,7 @@ pub async fn handle(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
-                                target.dispatchEvent(evt);\
+                                if (target.dispatchEvent(evt)) globalThis.__obscura_rangeKey(target, {key});\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
