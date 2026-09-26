@@ -203,8 +203,8 @@ pub async fn handle(
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
                             if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
-                            var oldChecked = checkable ? !!clickTarget.checked : false;\
-                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
+                            var oldChecked = checkable ? globalThis.__obscura_inputChecked(clickTarget) : false;\
+                            var oldIndeterminate = checkable ? globalThis.__obscura_inputIndeterminate(clickTarget) : false;\
                             var radioStates = null;\
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
@@ -214,24 +214,24 @@ pub async fn handle(
                                     for (var ri = 0; ri < candidates.length; ri++) {{\
                                         var radio = candidates[ri];\
                                         if ((radio.getAttribute('type') || '').toLowerCase() !== 'radio' || (radio.getAttribute('name') || '') !== radioName || radio.form !== clickTarget.form) continue;\
-                                        radioStates.push([radio, !!radio.checked]);\
-                                        if (radio !== clickTarget) radio.checked = false;\
+                                        radioStates.push([radio, globalThis.__obscura_inputChecked(radio)]);\
+                                        if (radio !== clickTarget) globalThis.__obscura_setInputChecked(radio, false);\
                                     }}\
                                 }}\
-                                clickTarget.checked = true;\
+                                globalThis.__obscura_setInputChecked(clickTarget, true);\
                             }} else if (checkable) {{\
-                                clickTarget.checked = !oldChecked;\
-                                clickTarget.indeterminate = false;\
+                                globalThis.__obscura_setInputChecked(clickTarget, !oldChecked);\
+                                globalThis.__obscura_setInputIndeterminate(clickTarget, false);\
                             }}\
                             var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
-                                    for (var rr = 0; rr < radioStates.length; rr++) radioStates[rr][0].checked = radioStates[rr][1];\
-                                }} else if (checkable) {{ clickTarget.checked = oldChecked; clickTarget.indeterminate = oldIndeterminate; }}\
+                                    for (var rr = 0; rr < radioStates.length; rr++) globalThis.__obscura_setInputChecked(radioStates[rr][0], radioStates[rr][1]);\
+                                }} else if (checkable) {{ globalThis.__obscura_setInputChecked(clickTarget, oldChecked); globalThis.__obscura_setInputIndeterminate(clickTarget, oldIndeterminate); }}\
                                 return;\
                             }}\
-                            if (checkable && clickTarget.checked !== oldChecked) {{\
+                            if (checkable && globalThis.__obscura_inputChecked(clickTarget) !== oldChecked) {{\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
