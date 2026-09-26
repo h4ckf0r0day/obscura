@@ -13364,11 +13364,15 @@ class _Canvas2D {
         : sections.length <= 2 && sections[0].trim().split(/\s+/).length === 3;
       const hue = parts[0] && parts[0].match(/^([-+]?(?:\d+(?:\.\d*)?|\.\d+))(deg|grad|rad|turn)?$/);
       const percent = (value) => /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)%$/.test(value);
-      const alpha = parts[3] === undefined ? 1 : percent(parts[3])
+      // Number() accepts JavaScript-only forms such as 0x1 and 0b1; CSS
+      // <alpha-value> accepts decimal numbers (including exponents) or percentages.
+      const validAlpha = parts[3] === undefined
+        || /^[-+]?(?:\d*\.\d+|\d+)(?:e[-+]?\d+)?%?$/.test(parts[3]);
+      const alpha = parts[3] === undefined ? 1 : parts[3].endsWith('%')
         ? Number.parseFloat(parts[3]) / 100 : Number(parts[3]);
       if (validSyntax && (parts.length === 3 || parts.length === 4) && hue
           && percent(parts[1]) && percent(parts[2]) && (parts[3] === undefined || parts[3] !== '')
-          && Number.isFinite(Number(hue[1])) && Number.isFinite(alpha)) {
+          && validAlpha && Number.isFinite(Number(hue[1])) && Number.isFinite(alpha)) {
         const units = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
         const degrees = Number(hue[1]) * (units[hue[2] || 'deg']);
         const h = ((degrees % 360 + 360) % 360) / 60;

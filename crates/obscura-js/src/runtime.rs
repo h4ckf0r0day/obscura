@@ -13949,6 +13949,25 @@ mod tests {
     }
 
     #[test]
+    fn canvas_hsl_alpha_uses_css_numbers_not_javascript_numeric_literals() {
+        let mut rt = setup_runtime("<canvas id=canvas width=1 height=1></canvas>");
+        let colors = rt.evaluate(r#"(() => {
+            const ctx = document.getElementById('canvas').getContext('2d');
+            return ['0x1', '0b1', '0o1', '0x1%', '0b1%', '0o1%', '', '1.',
+                '1e0', '1e2%', '+.5', '5e1%', '-.5', '2'].map(alpha =>
+                    ctx._parseColor('hsl(0 100% 50% / ' + alpha + ')'));
+        })()"#).unwrap();
+        // The existing parser's invalid-color fallback is black. This change
+        // rejects invalid alpha spellings without redefining fillStyle handling.
+        assert_eq!(colors, serde_json::json!([
+            [0,0,0,255], [0,0,0,255], [0,0,0,255], [0,0,0,255],
+            [0,0,0,255], [0,0,0,255], [0,0,0,255], [0,0,0,255],
+            [255,0,0,255], [255,0,0,255], [255,0,0,128], [255,0,0,128],
+            [255,0,0,0], [255,0,0,255]
+        ]));
+    }
+
+    #[test]
     fn canvas_hsl_colors_paint_expected_pixels() {
         let mut rt = setup_runtime("<canvas id=canvas width=1 height=1></canvas>");
         let pixels = rt.evaluate(r#"(() => {
