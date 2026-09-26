@@ -11240,12 +11240,32 @@ globalThis.atob = globalThis.atob || ((s) => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
   const historyToken = Symbol("History");
-  const resolveOrFallback = (url) => {
+  const resolveOrFallback = (url, method) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
     // current document URL per the HTML spec — capture it so the entry does not
     // reset location back to the original document URL.
     if (url === null || url === undefined) return __currentUrl();
-    try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
+    const current = __currentUrl();
+    let resolved = null;
+    try { resolved = new URL(String(url), current).href; } catch (e) {}
+    // HTML "shared history push/replace state steps": the new URL must be
+    // same origin with the document, else SecurityError. A document with an
+    // opaque origin (about:blank, file:) has nothing to protect and keeps the
+    // lenient fallback; a real origin must never be relabelled, since
+    // location.href, page.url and every CDP Page/Target payload follow it.
+    let currentOrigin = null;
+    try { currentOrigin = new URL(current).origin; } catch (e) {}
+    if (currentOrigin && currentOrigin !== "null") {
+      let nextOrigin = null;
+      try { if (resolved !== null) nextOrigin = new URL(resolved).origin; } catch (e) {}
+      if (nextOrigin !== currentOrigin) {
+        throw new DOMException(
+          "Failed to execute '" + method + "' on 'History': A history state object with URL '" +
+            String(url) + "' cannot be created in a document with origin '" + currentOrigin + "'.",
+          "SecurityError");
+      }
+    }
+    return resolved === null ? String(url) : resolved;
   };
   const applyVirtual = () => {
     const entry = stack[idx];
@@ -11278,7 +11298,7 @@ globalThis.atob = globalThis.atob || ((s) => {
     }
     pushState(state, _title, url) {
       const prevUrl = __currentUrl();
-      const resolved = resolveOrFallback(url);
+      const resolved = resolveOrFallback(url, "pushState");
       // Truncate forward entries (real Chrome drops the forward stack on a
       // new push) then append + advance.
       stack.length = idx + 1;
@@ -11289,7 +11309,7 @@ globalThis.atob = globalThis.atob || ((s) => {
     }
     replaceState(state, _title, url) {
       const prevUrl = __currentUrl();
-      const resolved = resolveOrFallback(url);
+      const resolved = resolveOrFallback(url, "replaceState");
       stack[idx] = {state: state ?? null, url: resolved};
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
