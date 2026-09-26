@@ -443,7 +443,12 @@ pub async fn handle(
 
             Ok(json!({}))
         }
-        "dispatchTouchEvent" => Ok(json!({})),
+        // Touch sequences require contact tracking, touch/pointer event ordering,
+        // cancellation and gesture defaults. A successful no-op makes callers
+        // believe a tap was delivered. Reject until those semantics are supported.
+        "dispatchTouchEvent" => Err(
+            "Input.dispatchTouchEvent is not supported: touch input is not implemented".to_string(),
+        ),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {}", method)),
     }
