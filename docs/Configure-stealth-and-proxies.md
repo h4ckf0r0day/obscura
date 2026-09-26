@@ -100,3 +100,5 @@ obscura serve \
   --proxy http://user:pass@proxy.example.com:8080 \
   --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ..."
 ```
+
+For remote clients, see [native CDP downloads and transport diagnostics](Remote-files-and-transport.md).
