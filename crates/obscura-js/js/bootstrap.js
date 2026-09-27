@@ -5109,10 +5109,34 @@ class Element extends Node {
     }
     return new DOMRectList([this.getBoundingClientRect()]);
   }
-  // No layout engine: a stub that always returns true unblocks Playwright's
-  // actionability polling. With a real layout we'd check display, visibility,
-  // opacity and rect dimensions per spec.
-  checkVisibility(opts) { return true; }
+  // CSSOM View checkVisibility(). Box existence is judged from display along
+  // the flattened ancestor chain rather than from geometry, since some
+  // visible inline elements report 0x0 rects (#722). Playwright calls this
+  // before every action, so render builds answer from the retained cascade
+  // in one native call.
+  checkVisibility(opts) {
+    if (!this.isConnected) return false;
+    const options = opts && typeof opts === 'object' ? opts : {};
+    const checkOpacity = !!(options.opacityProperty || options.checkOpacity);
+    const checkVisibilityCSS = !!(options.visibilityProperty || options.checkVisibilityCSS);
+    if (typeof __obscuraCore.ops.op_check_visibility === 'function') {
+      return __obscuraCore.ops.op_check_visibility(this._nid | 0, checkOpacity, checkVisibilityCSS);
+    }
+    // Without the renderer, computed style only reflects inline declarations,
+    // so read them directly and resolve inheritance of `visibility` here.
+    let visibility = '';
+    for (let el = this; el; el = el.parentElement || (el.parentNode && el.parentNode.host) || null) {
+      const style = el.style;
+      if (!style) continue;
+      const display = style.display;
+      if (display === 'none' || (el === this && display === 'contents')) return false;
+      if (checkOpacity && style.opacity !== '' && parseFloat(style.opacity) <= 0) return false;
+      if (!visibility && style.visibility && style.visibility !== 'inherit') {
+        visibility = style.visibility;
+      }
+    }
+    return !(checkVisibilityCSS && visibility && visibility !== 'visible');
+  }
   // ARIA reflection properties. Without an accessibility tree we expose the
   // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
   // at least find elements that author them explicitly.
