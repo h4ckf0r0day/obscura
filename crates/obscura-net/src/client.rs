@@ -1778,8 +1778,6 @@ mod ssrf_tests {
             "100.64.0.1",             // CGNAT / RFC 6598 start
             "100.100.100.200",        // Alibaba Cloud metadata (CGNAT)
             "100.127.255.255",        // CGNAT end
-            "198.18.0.1",             // benchmarking / RFC 2544 start
-            "198.19.255.255",         // benchmarking end
             "192.88.99.1",            // 6to4 relay anycast / RFC 7526
             "::ffff:100.100.100.200", // v4-mapped CGNAT
         ] {
@@ -1793,10 +1791,23 @@ mod ssrf_tests {
         for s in [
             "100.63.255.255", // just below 100.64.0.0/10
             "100.128.0.0",    // just above 100.127.255.255
-            "198.17.255.255", // just below 198.18.0.0/15
-            "198.20.0.0",     // just above 198.19.255.255
             "192.88.98.255",  // just below 192.88.99.0/24
             "192.88.100.0",   // just above 192.88.99.0/24
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    // #852: 198.18.0.0/15 (RFC 2544 benchmarking) is not in the deny-set.
+    // Clash fake-ip and WSL2 NAT hand it out as the address of ordinary public
+    // hosts, so blocking it fails every fetch on those setups.
+    #[test]
+    fn ipv4_benchmarking_range_is_allowed() {
+        for s in [
+            "198.18.0.1",
+            "198.18.1.206", // the fake-ip address reported in #852
+            "198.19.255.255",
+            "::ffff:198.18.1.206", // v4-mapped form follows the v4 rule
         ] {
             assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
         }
