@@ -3397,6 +3397,7 @@ async fn op_fetch_url(
             client
         };
         if let Some(stealth) = stealth {
+            let shared = state.borrow().borrow::<SharedState>().clone();
             return stealth_fetch_all(
                 stealth,
                 url.clone(),
@@ -3409,6 +3410,9 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                shared,
+                request_id,
+                was_intercepted,
             )
             .await;
         }
@@ -3666,36 +3670,9 @@ async fn op_fetch_url(
             cbs.fire_response(&info, &resp).await;
         }
     }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
+    {
+        let shared = state.borrow().borrow::<SharedState>().clone();
+        record_script_response(&shared, JsNetworkEvent {
             request_id: request_id.clone(),
             intercepted: was_intercepted,
             url: current_url.clone(),
@@ -3703,15 +3680,9 @@ async fn op_fetch_url(
             status,
             response_headers: resp_headers.clone(),
             body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+            timestamp: network_event_timestamp(),
+        }, &resp_body);
+    }
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -3731,13 +3702,46 @@ async fn op_fetch_url(
         "status": if opaque { 0 } else { status },
         "body": if opaque { String::new() } else { resp_body },
         "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
-        "requestId": response_request_id,
+        "requestId": request_id,
         "url": current_url,
         "redirected": redirected,
         "opaque": opaque,
         "headers": script_headers,
     })
     .to_string())
+}
+
+fn record_script_response(
+    shared: &SharedState,
+    event: JsNetworkEvent,
+    body: &str,
+) {
+    let mut gs = shared.borrow_mut();
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
+        gs.network_response_bodies.insert(
+            event.request_id.clone(),
+            StoredNetworkResponseBody { body: body.to_string(), base64_encoded: false },
+        );
+        gs.network_response_body_order.push_back(event.request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    gs.js_network_events.push(event);
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+}
+
+fn network_event_timestamp() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64()
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -3763,8 +3767,8 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar. Completed requests use the same event identity and bounded
+/// response-body retention as the normal transport.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     stealth: Arc<StealthHttpClient>,
@@ -3778,6 +3782,9 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
+    shared: SharedState,
+    request_id: String,
+    was_intercepted: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -3956,6 +3963,17 @@ async fn stealth_fetch_all(
         }
     }
 
+    record_script_response(&shared, JsNetworkEvent {
+        request_id: request_id.clone(),
+        intercepted: was_intercepted,
+        url: current_url.clone(),
+        method: current_method.clone(),
+        status,
+        response_headers: resp_headers.clone(),
+        body_size: resp_bytes.len(),
+        timestamp: network_event_timestamp(),
+    }, &resp_body);
+
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
@@ -3969,6 +3987,7 @@ async fn stealth_fetch_all(
         "bodyBase64": if opaque { String::new() } else { resp_body_base64 },
         "url": current_url,
         "redirected": redirects_followed > 0,
+        "requestId": request_id,
         "opaque": opaque,
         "headers": script_headers,
     })
