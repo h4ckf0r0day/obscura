@@ -1567,18 +1567,33 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
     }
 }
 
+/// The session that receives a page-initiated navigation (a form submission
+/// or script navigation). Several sessions can attach to one page, and the
+/// session map has no order, so an additional observer session could receive
+/// the navigation events instead of the page client. Prefer the session that
+/// enabled lifecycle events, then Runtime, then the lowest session id.
+fn navigation_session_for_page(ctx: &CdpContext, page_id: &str) -> Option<String> {
+    ctx.sessions
+        .iter()
+        .filter(|(_, owner)| owner.as_str() == page_id)
+        .map(|(session_id, _)| session_id)
+        .min_by_key(|session_id| {
+            (
+                !ctx.lifecycle_enabled_sessions.contains(*session_id),
+                !ctx.runtime_enabled_sessions.contains(*session_id),
+                (*session_id).clone(),
+            )
+        })
+        .cloned()
+}
+
 fn take_live_pending_navigation(
     ctx: &CdpContext,
 ) -> Option<(String, String, String, String)> {
     // With several live pages, a pending navigation may belong to any of them,
     // not just the first live page — scan until one yields a navigation (#872).
     for page in ctx.pages.iter().filter(|page| page.has_js()) {
-        let Some(session_id) = ctx
-            .sessions
-            .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| session_id.clone())
-        else {
+        let Some(session_id) = navigation_session_for_page(ctx, &page.id) else {
             continue;
         };
         if let Some((url, method, body)) = page.take_pending_navigation() {
@@ -2168,6 +2183,26 @@ mod tests {
         merge_cookie_delta, parse_cdp_headers, pump_live_page_event_loop,
         websocket_authority, ControlRefusal,
     };
+
+    #[test]
+    fn page_navigations_go_to_the_page_client_not_an_observer() {
+        // Session ids chosen so the observer sorts first: without a preference
+        // it would win whenever the unordered map yields it first.
+        for _ in 0..16 {
+            let mut ctx = crate::dispatch::CdpContext::new();
+            let page_id = ctx.create_page();
+            ctx.sessions.insert("a-observer".into(), page_id.clone());
+            ctx.sessions.insert("z-page-client".into(), page_id.clone());
+            ctx.sessions.insert("other-page".into(), "unrelated".into());
+            assert_eq!(super::navigation_session_for_page(&ctx, &page_id).as_deref(), Some("a-observer"));
+            ctx.runtime_enabled_sessions.insert("z-page-client".into());
+            assert_eq!(super::navigation_session_for_page(&ctx, &page_id).as_deref(), Some("z-page-client"));
+            ctx.runtime_enabled_sessions.insert("a-observer".into());
+            ctx.lifecycle_enabled_sessions.insert("z-page-client".into());
+            assert_eq!(super::navigation_session_for_page(&ctx, &page_id).as_deref(), Some("z-page-client"));
+            assert_eq!(super::navigation_session_for_page(&ctx, "missing"), None);
+        }
+    }
     #[cfg(feature = "render")]
     use super::pump_and_forward_screencast_frames;
     use obscura_net::{CookieInfo, CookieJar};
