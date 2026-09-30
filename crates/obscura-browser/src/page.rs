@@ -3458,9 +3458,20 @@ impl Page {
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
         // corrupts them (issue #340). Text-like types stay as text.
         let main_is_binary = !is_text_like_content_type(response.content_type());
+        // Report the document the page actually loaded: the final URL after
+        // redirects, and the method of that final request. CDP matches the
+        // navigation response by this URL, so recording the original URL of a
+        // redirected POST left clients without a navigation response. A POST
+        // is followed with GET after 301/302/303, which the response does not
+        // distinguish from 307/308, so a redirected navigation reports GET.
+        let document_method = if response.redirected_from.is_empty() {
+            method.to_ascii_uppercase()
+        } else {
+            "GET".to_string()
+        };
         self.record_network_event_with_body(
-            url.as_str(),
-            "GET",
+            response.url.as_str(),
+            &document_method,
             "Document",
             response.status,
             &response.headers,
@@ -6269,6 +6280,57 @@ mod tests {
             serde_json::json!(32.0),
             "Fetch.enable patterns pause matching requests; they are not blocked URLs",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_navigation_records_the_loaded_document() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    // The redirected request must be a GET; anything unexpected is 405.
+                    let response = if request.starts_with("POST /submit ") {
+                        "HTTP/1.1 303 See Other\r\nLocation: /result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if request.starts_with("GET /result ") || request.starts_with("POST /direct ") {
+                        let body = "<html><body><h1>done</h1></body></html>";
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    } else {
+                        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "post-navigation-document".to_string(), None, false, None, None, true,
+        ));
+        for (path, final_path, method) in [("submit", "result", "GET"), ("direct", "direct", "POST")] {
+            let mut page = super::Page::new(format!("post-navigation-{path}"), context.clone());
+            page.navigate_with_wait_post(
+                &format!("http://{address}/{path}"),
+                crate::lifecycle::WaitUntil::Load,
+                "POST",
+                "q=value",
+            )
+            .await
+            .unwrap();
+            let final_url = format!("http://{address}/{final_path}");
+            assert_eq!(page.url_string(), final_url);
+            let document = page
+                .network_events
+                .iter()
+                .find(|event| event.resource_type == "Document")
+                .unwrap();
+            // CDP matches the navigation response by the page URL.
+            assert_eq!(document.url, final_url);
+            assert_eq!(document.method, method);
+            assert_eq!(document.status, 200);
+        }
     }
 
     #[test]
