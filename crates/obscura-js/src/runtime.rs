@@ -6788,6 +6788,510 @@ mod tests {
     }
 
     #[test]
+    fn pre_insertion_validity_checks_arguments_and_order() {
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body><p id='log'></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const name = (fn) => {
+                    try { fn(); return "none"; }
+                    catch (error) { return error instanceof TypeError ? "TypeError" : error.name; }
+                };
+                const body = document.body;
+                const text = document.createTextNode("t");
+                const a = document.createElement("a");
+                const b = document.createElement("b");
+                const c = document.createElement("i");
+                a.appendChild(b);
+                const doc = document.implementation.createHTMLDocument("title");
+                const doctype = document.implementation.createDocumentType("html", "", "");
+                return [
+                    name(() => body.insertBefore(null, null)),
+                    name(() => body.insertBefore(text)),
+                    name(() => body.insertBefore(text, {})),
+                    name(() => body.appendChild({})),
+                    name(() => body.removeChild(null)),
+                    name(() => body.replaceChild(text, null)),
+                    name(() => text.insertBefore(document.createTextNode("x"), null)),
+                    name(() => text.appendChild(text)),
+                    name(() => b.insertBefore(a, c)),
+                    name(() => b.insertBefore(text, c)),
+                    name(() => a.insertBefore(doc, null)),
+                    name(() => a.insertBefore(doctype, null)),
+                    name(() => doc.insertBefore(doc.createTextNode("x"), doc.documentElement)),
+                    name(() => doc.appendChild(doc.createElement("x"))),
+                    name(() => doc.insertBefore(doctype, null)),
+                    Array.from(doc.childNodes, n => n.nodeType),
+                    doc.doctype === doc.firstChild,
+                    body.insertBefore(text, undefined) === text,
+                    body.lastChild === text,
+                    document.doctype === document.firstChild,
+                    Node.prototype.insertBefore.length,
+                    Node.prototype.appendChild.length
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "TypeError", "TypeError", "TypeError", "TypeError", "TypeError", "TypeError",
+                "HierarchyRequestError", "HierarchyRequestError", "HierarchyRequestError",
+                "NotFoundError", "HierarchyRequestError", "HierarchyRequestError",
+                "HierarchyRequestError", "HierarchyRequestError", "HierarchyRequestError",
+                [10, 1], true, true, true, true, 2, 1
+            ])
+        );
+    }
+
+    #[test]
+    fn document_child_constraints_follow_dom_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const name = (fn) => { try { fn(); return "none"; } catch (error) { return error.name; } };
+                const doc = document.implementation.createHTMLDocument("t");
+                const comment = doc.insertBefore(doc.createComment("c"), doc.firstChild);
+                const root = doc.documentElement;
+                doc.removeChild(root);
+                const afterRemove = Array.from(doc.childNodes, n => n.nodeType);
+                const fragment = doc.createDocumentFragment();
+                fragment.appendChild(doc.createElement("a"));
+                const beforeDoctype = name(() => doc.insertBefore(fragment, doc.doctype));
+                const beforeComment = name(() => doc.insertBefore(fragment, comment));
+                const appended = name(() => doc.appendChild(fragment));
+                const two = doc.createDocumentFragment();
+                two.append(doc.createElement("x"), doc.createElement("y"));
+                const replacedDoctype = name(() => doc.replaceChild(doc.createElement("z"), doc.doctype));
+                return [
+                    afterRemove, beforeDoctype, beforeComment, appended,
+                    doc.documentElement.localName, name(() => doc.appendChild(two)),
+                    replacedDoctype
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [8, 10], "HierarchyRequestError", "HierarchyRequestError", "none", "a",
+                "HierarchyRequestError", "HierarchyRequestError"
+            ])
+        );
+    }
+
+    #[test]
+    fn child_list_records_match_the_dom_mutation_algorithms() {
+        let mut rt = setup_runtime("<html><body><div id='p'><a></a><b></b><i></i></div><div id='q'><u></u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const p = document.getElementById("p");
+                const q = document.getElementById("q");
+                const [a, b, i] = Array.from(p.childNodes);
+                const u = q.firstChild;
+                const observer = new MutationObserver(() => {});
+                observer.observe(p, { childList: true, attributes: true, characterData: true, subtree: true });
+                const describe = (records) => records.map(r => [
+                    r.type,
+                    r.target.id || r.target.nodeName,
+                    Array.from(r.addedNodes, n => n.nodeName),
+                    Array.from(r.removedNodes, n => n.nodeName),
+                    r.previousSibling && r.previousSibling.nodeName,
+                    r.nextSibling && r.nextSibling.nodeName,
+                    r.attributeName,
+                    r.attributeNamespace,
+                    r.oldValue
+                ]);
+                const out = {};
+                p.insertBefore(b, a);
+                out.moveWithin = describe(observer.takeRecords());
+                const fragment = document.createDocumentFragment();
+                fragment.append(document.createElement("x"), document.createElement("y"));
+                p.appendChild(fragment);
+                out.fragment = describe(observer.takeRecords());
+                p.replaceChild(u, i);
+                out.replaceFromOtherParent = describe(observer.takeRecords());
+                p.replaceChild(a, a);
+                out.replaceSelf = describe(observer.takeRecords());
+                const e = document.createElement("em");
+                e.textContent = "";
+                p.appendChild(e);
+                observer.takeRecords();
+                e.textContent = "";
+                out.emptyTextContent = describe(observer.takeRecords());
+                e.append("one", "two");
+                out.appendTwo = describe(observer.takeRecords());
+                e.normalize();
+                out.normalize = describe(observer.takeRecords());
+                e.setAttribute("title", "x");
+                e.setAttribute("title", "y");
+                e.removeAttribute("title");
+                out.attributes = describe(observer.takeRecords());
+                out.recordType = [
+                    typeof MutationRecord,
+                    (() => { p.appendChild(document.createElement("s")); return observer.takeRecords()[0] instanceof MutationRecord; })(),
+                    Object.keys((() => { p.appendChild(document.createElement("s")); return observer.takeRecords()[0]; })()).length
+                ];
+                out.options = [
+                    (() => { try { observer.observe(p, {}); return "none"; } catch (error) { return error.constructor.name; } })(),
+                    (() => { try { observer.observe(p, { attributeOldValue: true, attributes: false }); return "none"; } catch (error) { return error.constructor.name; } })()
+                ];
+                return out;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "moveWithin": [
+                    ["childList", "p", [], ["B"], "A", "I", null, null, null],
+                    ["childList", "p", ["B"], [], null, "A", null, null, null]
+                ],
+                "fragment": [["childList", "p", ["X", "Y"], [], "I", null, null, null, null]],
+                "replaceFromOtherParent": [["childList", "p", ["U"], ["I"], "A", "X", null, null, null]],
+                "replaceSelf": [
+                    ["childList", "p", [], ["A"], "B", "U", null, null, null],
+                    ["childList", "p", ["A"], [], "B", "U", null, null, null]
+                ],
+                "emptyTextContent": [],
+                "appendTwo": [["childList", "EM", ["#text", "#text"], [], null, null, null, null, null]],
+                "normalize": [
+                    ["characterData", "#text", [], [], null, null, null, null, null],
+                    ["childList", "EM", [], ["#text"], "#text", null, null, null, null]
+                ],
+                "attributes": [
+                    ["attributes", "EM", [], [], null, null, "title", null, null],
+                    ["attributes", "EM", [], [], null, null, "title", null, null],
+                    ["attributes", "EM", [], [], null, null, "title", null, null]
+                ],
+                "recordType": ["function", true, 0],
+                "options": ["TypeError", "TypeError"]
+            })
+        );
+    }
+
+    #[test]
+    fn parent_node_insertion_of_several_nodes_is_one_mutation() {
+        let mut rt = setup_runtime("<html><body><div id='p'><i id='first'></i></div><div id='q'><u></u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const p = document.getElementById("p");
+                    const q = document.getElementById("q");
+                    const first = document.getElementById("first");
+                    const observer = new MutationObserver(() => {});
+                    observer.observe(document.body, { childList: true, subtree: true });
+                    const describe = (records) => records.map(r => [
+                        r.target.id, Array.from(r.addedNodes, n => n.nodeName), Array.from(r.removedNodes, n => n.nodeName),
+                        r.previousSibling && r.previousSibling.nodeName, r.nextSibling && r.nextSibling.nodeName
+                    ]);
+                    const a = document.createElement("a");
+                    p.append(a, "t", q.firstChild);
+                    const appended = describe(observer.takeRecords());
+                    const b = document.createElement("b");
+                    p.prepend(b, "s");
+                    const prepended = describe(observer.takeRecords());
+                    first.after(first, "x");
+                    const withSelf = describe(observer.takeRecords());
+                    const errors = [];
+                    try { p.append(document.createElement("em"), document.body); } catch (e) { errors.push(e.name); }
+                    return [appended, prepended, withSelf, errors, Array.from(p.childNodes, n => n.nodeName)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [["q", [], ["U"], null, null], ["p", ["A", "#text", "U"], [], "I", null]],
+                [["p", ["B", "#text"], [], null, "I"]],
+                [["p", [], ["I"], "#text", "A"], ["p", ["I", "#text"], [], "#text", "A"]],
+                ["HierarchyRequestError"],
+                ["B", "#text", "I", "#text", "A", "#text", "U"]
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_observer_old_values_and_callback_this() {
+        let mut rt = setup_runtime("<html><body><p id='p' title='a'>text</p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const p = document.getElementById("p");
+                const observer = new MutationObserver(() => {});
+                observer.observe(p, { attributeOldValue: true, characterDataOldValue: true, subtree: true, attributeFilter: ["title"] });
+                p.setAttribute("title", "b");
+                p.setAttribute("lang", "en");
+                p.firstChild.data = "changed";
+                const records = observer.takeRecords().map(r => [r.type, r.attributeName, r.oldValue]);
+                let seenThis = null;
+                const callbackObserver = new MutationObserver(function (list, obs) {
+                    seenThis = [this === callbackObserver, obs === callbackObserver, arguments.length, Array.isArray(list)];
+                });
+                callbackObserver.observe(p, { childList: true });
+                p.appendChild(document.createElement("span"));
+                globalThis.__callbackThis = () => seenThis;
+                return records;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([["attributes", "title", "a"], ["characterData", null, "text"]])
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__callbackThis()").unwrap(),
+            serde_json::json!([true, true, 2, true])
+        );
+    }
+
+    #[test]
+    fn range_mutations_move_nodes_and_queue_records() {
+        let mut rt = setup_runtime("<html><body><div id='d'><b>bold</b><i>ital</i><u>under</u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const d = document.getElementById("d");
+                const [b, i, u] = Array.from(d.children);
+                const observer = new MutationObserver(() => {});
+                observer.observe(d, { childList: true, characterData: true, subtree: true });
+                const range = document.createRange();
+                range.setStart(b.firstChild, 2);
+                range.setEnd(u.firstChild, 3);
+                const cloned = range.cloneContents();
+                const clonedText = Array.from(cloned.childNodes, n => n.textContent);
+                const unchanged = d.textContent;
+                observer.takeRecords();
+                const extracted = range.extractContents();
+                const extractedText = Array.from(extracted.childNodes, n => [n.nodeName, n.textContent]);
+                const afterExtract = [d.innerHTML, range.startContainer === d, range.startOffset, range.collapsed];
+                const extractRecords = observer.takeRecords().map(r => [r.type, Array.from(r.removedNodes, n => n.nodeName)]);
+                const insertRange = document.createRange();
+                insertRange.setStart(d, 1);
+                insertRange.collapse(true);
+                const marker = document.createElement("mark");
+                insertRange.insertNode(marker);
+                const afterInsert = [d.innerHTML, insertRange.endContainer === d, insertRange.endOffset];
+                const surround = document.createRange();
+                surround.selectNode(marker);
+                const wrapper = document.createElement("span");
+                surround.surroundContents(wrapper);
+                const deleteRange = document.createRange();
+                deleteRange.selectNodeContents(d);
+                deleteRange.deleteContents();
+                return [clonedText, unchanged, extractedText, afterExtract, extractRecords, afterInsert, marker.parentNode === wrapper, d.childNodes.length];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["ld", "ital", "und"],
+                "bolditalunder",
+                [["B", "ld"], ["I", "ital"], ["U", "und"]],
+                ["<b>bo</b><u>er</u>", true, 1, true],
+                [["characterData", []], ["childList", ["I"]], ["characterData", []]],
+                ["<b>bo</b><mark></mark><u>er</u>", true, 2],
+                true,
+                0
+            ])
+        );
+    }
+
+    #[test]
+    fn node_document_follows_the_creating_document_and_adoption() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const doc = document.implementation.createHTMLDocument();
+                const el = doc.createElement("p");
+                const text = doc.createTextNode("t");
+                const created = [el.ownerDocument === doc, text.ownerDocument === doc, doc.ownerDocument, doc.title, !!doc.body, doc.defaultView];
+                doc.body.appendChild(el);
+                el.innerHTML = "<span>parsed</span>";
+                const parsed = el.firstChild;
+                const inTree = [el.ownerDocument === doc, parsed.ownerDocument === doc, doc.querySelector("span") === parsed, document.querySelector("span")];
+                doc.body.removeChild(el);
+                const removed = [el.ownerDocument === doc, parsed.ownerDocument === doc];
+                document.body.appendChild(el);
+                const adopted = [el.ownerDocument === document, parsed.ownerDocument === document, el.isConnected];
+                document.body.removeChild(el);
+                const leftMain = el.ownerDocument === document;
+                const imported = doc.importNode(document.createElement("q"), true);
+                const adoptedNode = doc.adoptNode(el);
+                const xml = document.implementation.createDocument(null, "root", null);
+                const parser = new DOMParser().parseFromString("<p>x</p>", "text/html");
+                return [
+                    created, inTree, removed, adopted, leftMain,
+                    imported.ownerDocument === doc, adoptedNode.ownerDocument === doc,
+                    xml instanceof XMLDocument, xml.documentElement.localName, xml.contentType,
+                    xml.documentElement.ownerDocument === xml,
+                    parser.querySelector("p").ownerDocument === parser,
+                    document.createElement("div").ownerDocument === document,
+                    document.documentElement.ownerDocument === document
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true, null, "", true, null],
+                [true, true, true, null],
+                [true, true],
+                [true, true, true],
+                true,
+                true, true,
+                true, "root", "application/xml",
+                true, true, true, true
+            ])
+        );
+    }
+
+    #[test]
+    fn mutation_errors_use_the_dom_exception_of_the_node_frame() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const iframe = document.createElement("iframe");
+                    document.body.appendChild(iframe);
+                    const child = iframe.contentWindow;
+                    const doc = child.document;
+                    const caught = (fn) => { try { fn(); return null; } catch (error) { return error; } };
+                    const out = [];
+                    for (const make of [
+                        () => doc.createElement("a"),
+                        () => doc.createTextNode("t"),
+                        () => doc.createComment("c"),
+                    ]) {
+                        const node = make();
+                        doc.body.appendChild(node);
+                        const error = caught(() => node.removeChild(doc));
+                        out.push([
+                            node.ownerDocument === doc,
+                            error && error.name,
+                            error && error.constructor === child.DOMException,
+                            error && error.constructor === DOMException,
+                        ]);
+                    }
+                    const local = caught(() => document.body.removeChild(document.createElement("p")));
+                    out.push([local.name, local.constructor === DOMException, local.constructor === child.DOMException]);
+                    return [child.DOMException !== DOMException, out];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                [
+                    [true, "NotFoundError", true, false],
+                    [true, "NotFoundError", true, false],
+                    [true, "NotFoundError", true, false],
+                    ["NotFoundError", true, false]
+                ]
+            ])
+        );
+    }
+
+    #[test]
+    fn media_rules_expose_nested_rules_and_accept_insert_rule() {
+        let mut rt = setup_runtime("<html><head><style id='s'>#t { color: black; } @media all { #t { color: blue; } }</style></head><body><div id='t'></div></body></html>");
+        let result = rt
+            .evaluate(
+                r##"
+                const sheet = document.getElementById("s").sheet;
+                const media = sheet.cssRules[1];
+                const before = [media instanceof CSSMediaRule, media instanceof CSSGroupingRule, media.type, media.conditionText, media.cssRules.length];
+                const index = media.insertRule("#t { color: red; }", 1);
+                const inserted = [index, media.cssRules.length, media.cssRules[1].parentRule === media, media.cssRules[1].parentStyleSheet === sheet];
+                media.deleteRule(1);
+                return [before, inserted, media.cssRules.length, typeof CSSSupportsRule];
+                "##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[true, true, 4, "all", 1], [1, 2, true, true], 1, "function"])
+        );
+    }
+
+    #[test]
+    fn new_dom_interfaces_have_browser_shapes() {
+        let mut rt = setup_runtime("<html><head><style id='s'>@media all { p { color: red } }</style></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r##"(() => {
+                    const caught = (fn) => { try { fn(); return "none"; } catch (e) { return e.message; } };
+                    const observer = new MutationObserver(() => {});
+                    const div = document.createElement("div");
+                    observer.observe(div, { childList: true });
+                    div.appendChild(document.createElement("i"));
+                    const record = observer.takeRecords()[0];
+                    const media = document.getElementById("s").sheet.cssRules[0];
+                    return [
+                        Object.prototype.toString.call(record),
+                        Object.prototype.toString.call(media),
+                        caught(() => new MutationRecord()),
+                        caught(() => new IntersectionObserverEntry({})),
+                        [MutationRecord.length, IntersectionObserverEntry.length, CSSConditionRule.length, CSSMediaRule.length],
+                        ["MutationRecord", "IntersectionObserverEntry", "CSSMediaRule", "XMLDocument"]
+                            .map(name => Object.getOwnPropertyDescriptor(globalThis, name).enumerable),
+                        Object.getOwnPropertyNames(CSSConditionRule.prototype).sort(),
+                        media.cssText,
+                        Document.prototype.importNode.length
+                    ];
+                })()"##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object MutationRecord]",
+                "[object CSSMediaRule]",
+                "Failed to construct 'MutationRecord': Illegal constructor",
+                "Failed to construct 'IntersectionObserverEntry': Illegal constructor",
+                [0, 0, 0, 0],
+                [false, false, false, false],
+                ["conditionText", "constructor"],
+                "@media all {\n  p { color: red; }\n}",
+                1
+            ])
+        );
+    }
+
+    #[test]
+    fn computed_style_is_empty_outside_a_document() {
+        let mut rt = setup_runtime("<html><body><div id='c' style='color: red'></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const detached = document.createElement("div");
+                detached.style.color = "red";
+                const style = getComputedStyle(detached);
+                const empty = [style.length, style.color, style.getPropertyValue("color"), style.display];
+                document.body.appendChild(detached);
+                const live = style.color !== "";
+                const host = document.createElement("div");
+                const shadow = host.attachShadow({ mode: "open" });
+                shadow.innerHTML = "<p id='in'></p>";
+                const inDetachedShadow = getComputedStyle(shadow.getElementById("in")).display;
+                return [empty, live, inDetachedShadow, typeof getComputedStyle(document.getElementById("c")).color];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[0, "", "", ""], true, "", "string"])
+        );
+    }
+
+    #[test]
     fn shadow_root_identity_and_children_are_native_tree_backed() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
