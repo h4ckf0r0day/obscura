@@ -2470,6 +2470,35 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .contains(&NodeId::new(other))
                 .to_string()
         }
+        // arg1 is an inclusive ancestor of arg2 through ordinary parents.
+        "is_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
+                .to_string()
+        }
+        // "previous,next" sibling ids of arg1, -1 for none: one crossing for
+        // the pair a mutation record captures.
+        "sibling_nids" => {
+            let Ok(nid) = arg1.parse::<u32>() else {
+                return "-1,-1".into();
+            };
+            let (prev, next) = dom
+                .with_node(NodeId::new(nid), |node| (node.prev_sibling, node.next_sibling))
+                .unwrap_or((None, None));
+            let id = |value: Option<NodeId>| value.map_or(-1, |id| id.index() as i64);
+            format!("{},{}", id(prev), id(next))
+        }
+        // arg1 is a host-including inclusive ancestor of arg2. Walks up from
+        // arg2 instead of enumerating arg1's descendants.
+        "is_host_including_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_host_including_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
+                .to_string()
+        }
         // Connectivity is maintained incrementally by DomTree. Exposing the
         // cached bit avoids an ancestor op crossing for every level when JS
         // builds a deep detached subtree.
