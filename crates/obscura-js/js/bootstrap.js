@@ -2195,6 +2195,25 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Insertion runs two subtree scans, script preparation and window named
+// access, over the same nodes. One native query serves both, cached until the
+// next DOM mutation command; most inserted subtrees match nothing, so both
+// hooks then return without wrapping a node.
+const _INSERTED_SUBTREE_SELECTOR =
+  "script,[id],embed[name],form[name],iframe[name],img[name],object[name]";
+let _insertedSubtreeHitsFor = -1;
+let _insertedSubtreeHitsEpoch = -1;
+let _insertedSubtreeHitsIds = null;
+function _insertedSubtreeHits(root) {
+  if (_insertedSubtreeHitsFor !== root._nid || _insertedSubtreeHitsEpoch !== _domMutationEpoch) {
+    _insertedSubtreeHitsIds =
+      _domParse("query_selector_all_scoped", root._nid, _INSERTED_SUBTREE_SELECTOR) || [];
+    _insertedSubtreeHitsFor = root._nid;
+    _insertedSubtreeHitsEpoch = _domMutationEpoch;
+  }
+  return _insertedSubtreeHitsIds;
+}
+
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
@@ -2206,10 +2225,12 @@ function __prepareInsertedSubtree(root) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  const ids = root instanceof Element
+    ? _insertedSubtreeHits(root)
+    : _domParse("query_selector_all_scoped", root._nid, "script") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
-    if (script && !seen.has(script._nid)) {
+    if (script && script.localName === "script" && !seen.has(script._nid)) {
       scripts.push(script);
       seen.add(script._nid);
     }
@@ -3536,8 +3557,12 @@ class Element extends Node {
       Object.setPrototypeOf(upgrading, new.target.prototype);
       return upgrading;
     }
-    this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
+  // Built on first use. Most elements never touch .style, and the declaration
+  // plus its Proxy cost more than the rest of element construction. It reads
+  // the style attribute lazily, so writes before then need no sync.
+  get _style() { return this.__style ??= _styleProxy(new CSSStyleDeclaration(this)); }
+  set _style(v) { this.__style = v; }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
@@ -3762,7 +3787,7 @@ class Element extends Node {
         _reconcileWindowNamedProperty(previousWindowName);
       }
     }
-    if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "style") this.__style?._replaceFromAttribute(value);
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -3791,7 +3816,7 @@ class Element extends Node {
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
-    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (ns === "" && n === "style") this.__style?._replaceFromAttribute(value);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -3807,7 +3832,7 @@ class Element extends Node {
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
     }
-    if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "style") this.__style?._replaceFromAttribute("");
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -3830,7 +3855,7 @@ class Element extends Node {
     n = String(n);
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     this._nullNamespaceAttrs = null;
-    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (ns === "" && n === "style") this.__style?._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -10217,6 +10242,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     this._documentGeneration = _browserPostedTaskGeneration();
     this._connected = true;
     globalThis.__intersectionObservers.push(this);
+    _syncIntersectionMutationObserver();
   }
   _rootBounds(measurements) {
     let x = 0, y = 0;
@@ -10350,6 +10376,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
       if (!globalThis.__intersectionObservers.includes(this)) {
         globalThis.__intersectionObservers.push(this);
       }
+      _syncIntersectionMutationObserver();
     }
     this._targets.add(el);
     this._previous.delete(el);
@@ -10367,6 +10394,7 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     _intersectionDeliveryObservers.delete(this);
     const index = globalThis.__intersectionObservers.indexOf(this);
     if (index >= 0) globalThis.__intersectionObservers.splice(index, 1);
+    _syncIntersectionMutationObserver();
   }
   takeRecords() { return this._records.splice(0); }
   get root() { return this._root; }
@@ -10384,25 +10412,37 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   // rendering update and schedules both observer families.
   globalThis.__obscura_recompute_intersections = _scheduleIntersectionRenderCheckpoint;
   globalThis.addEventListener("resize", renderingUpdate);
-  const wireUp = () => {
-    if (!globalThis.document) return;
-    // DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
-    // MutationObserver is only needed for intersection geometry. Scheduling RO
-    // again here would escape its depth-bounded delivery cycle and allow a
-    // self-resizing callback to create an infinite chain of zero-delay tasks.
-    const observer = new MutationObserver(_scheduleIntersectionRenderCheckpoint);
+})();
+// DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
+// MutationObserver is only needed for intersection geometry. Scheduling RO
+// again here would escape its depth-bounded delivery cycle and allow a
+// self-resizing callback to create an infinite chain of zero-delay tasks.
+//
+// Attached only while an IntersectionObserver exists. A document-wide subtree
+// observer makes every DOM write build a mutation record and walk the target's
+// ancestors, which was most of appendChild's cost on pages that never use IO.
+let _intersectionMutationObserver = null;
+function _syncIntersectionMutationObserver() {
+  const wanted = globalThis.__intersectionObservers.length > 0;
+  if (wanted && !_intersectionMutationObserver) {
+    if (!globalThis.document) {
+      Promise.resolve().then(_syncIntersectionMutationObserver);
+      return;
+    }
+    _intersectionMutationObserver = new MutationObserver(_scheduleIntersectionRenderCheckpoint);
     try {
-      observer.observe(globalThis.document, {
+      _intersectionMutationObserver.observe(globalThis.document, {
         childList: true,
         subtree: true,
         attributes: true,
         characterData: true,
       });
     } catch {}
-  };
-  if (globalThis.document) wireUp();
-  else Promise.resolve().then(wireUp);
-})();
+  } else if (!wanted && _intersectionMutationObserver) {
+    _intersectionMutationObserver.disconnect();
+    _intersectionMutationObserver = null;
+  }
+}
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 // Feature detection reads this static before deciding to observe anything;
@@ -12768,7 +12808,14 @@ function _windowNamedNamesInTree(root) {
   if (root.nodeType === 1) {
     for (const name of _windowNamedSupportedNames(root)) names.add(name);
   }
-  if (typeof root.querySelectorAll === "function") {
+  if (root instanceof Element) {
+    // Superset query shared with script preparation; the supported-names
+    // check below drops the script-only hits.
+    for (const nid of _insertedSubtreeHits(root)) {
+      const element = _wrapEl(+nid);
+      if (element) for (const name of _windowNamedSupportedNames(element)) names.add(name);
+    }
+  } else if (typeof root.querySelectorAll === "function") {
     const elements = root.querySelectorAll(
       "[id],embed[name],form[name],iframe[name],img[name],object[name]"
     );
