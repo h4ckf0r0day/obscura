@@ -1641,12 +1641,54 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
     serde_json::json!({ "originClean": true, "css": css }).to_string()
 }
 
+/// Which JS wrapper class an element gets, as a small code. This is the
+/// native twin of `_classForKind` in bootstrap.js and replaces three string
+/// round trips (tag name, namespace, local name) per wrapped element.
+/// 0 Element, 1 SVGElement, 2 SVGPathElement, 3 SVGSVGElement, 4 form,
+/// 5 input, 6 textarea, 7 meta, 8 slot, 9 img, 10 canvas, 11 audio, 12 video,
+/// 13 track.
+fn element_class_kind(name: &html5ever::QualName) -> i32 {
+    let html = name.ns == html5ever::ns!(html);
+    let local = name.local.as_ref();
+    // The same tagName JS would see: uppercase in the HTML namespace,
+    // qualified and case-preserved elsewhere.
+    let tag = if html {
+        local.to_uppercase()
+    } else {
+        match &name.prefix {
+            Some(prefix) => format!("{}:{}", prefix, local),
+            None => local.to_string(),
+        }
+    };
+    if tag != tag.to_uppercase() && name.ns.as_ref() == "http://www.w3.org/2000/svg" {
+        return match tag.as_str() {
+            "path" => 2,
+            "svg" => 3,
+            _ => 1,
+        };
+    }
+    match tag.as_str() {
+        "FORM" => 4,
+        "INPUT" if html && local == "input" => 5,
+        "TEXTAREA" => 6,
+        "META" if html && local == "meta" => 7,
+        "SLOT" if html => 8,
+        "IMG" => 9,
+        "CANVAS" => 10,
+        "AUDIO" => 11,
+        "VIDEO" => 12,
+        "TRACK" => 13,
+        _ => 0,
+    }
+}
+
 /// Numeric tree reads for the hottest getters. No command string, no number
 /// formatting or JSON: `parentNode`, `firstChild`, `nodeType` and friends run
 /// on the V8 fast-call path. Codes: 0 parent, 1 first child, 2 last child,
 /// 3 next sibling, 4 previous sibling (each -1 when absent), 5 node type
 /// (0 for an unknown node), 6 connected (0/1), 7 stylesheet owner in subtree
-/// (0/1), 8 subtree_flags bits.
+/// (0/1), 8 subtree_flags bits, 9 node type in the low 4 bits and for
+/// elements `element_class_kind` above them.
 #[op2(fast)]
 fn op_dom_nav(state: &OpState, code: u32, nid: u32, frame_id: u32) -> i32 {
     let shared = frame_state(state, frame_id);
@@ -1673,6 +1715,16 @@ fn op_dom_nav(state: &OpState, code: u32, nid: u32, frame_id: u32) -> i32 {
                     NodeData::ProcessingInstruction { .. } => 7,
                 })
                 .unwrap_or(0),
+            9 => dom
+                .with_node(id, |n| match &n.data {
+                    NodeData::Document => 9,
+                    NodeData::Element { name, .. } => 1 | (element_class_kind(name) << 4),
+                    NodeData::Text { .. } => 3,
+                    NodeData::Comment { .. } => 8,
+                    NodeData::Doctype { .. } => 10,
+                    NodeData::ProcessingInstruction { .. } => 7,
+                })
+                .unwrap_or(0),
             6 => i32::from(dom.is_connected(id)),
             7 => i32::from(dom.subtree_flags(id) & 1 != 0),
             8 => i32::from(dom.subtree_flags(id)),
@@ -1680,6 +1732,83 @@ fn op_dom_nav(state: &OpState, code: u32, nid: u32, frame_id: u32) -> i32 {
         }
     }))
     .unwrap_or(-1)
+}
+
+/// String-valued node reads: 0 tagName, 1 localName, 2 namespaceURI,
+/// 3 textContent, 4 nodeName, 5 innerHTML, 6 outerHTML. The same values the
+/// JSON-returning commands carry, without the JSON on either side.
+fn node_text(dom: &DomTree, code: u32, nid: u32) -> String {
+    let id = NodeId::new(nid);
+    match code {
+        0 => dom
+            .with_node(id, |n| {
+                n.as_element().map(|name| {
+                    if name.ns == html5ever::ns!(html) {
+                        name.local.as_ref().to_ascii_uppercase()
+                    } else {
+                        match &name.prefix {
+                            Some(prefix) => format!("{}:{}", prefix, name.local),
+                            None => name.local.to_string(),
+                        }
+                    }
+                })
+            })
+            .flatten()
+            .unwrap_or_default(),
+        1 => dom
+            .with_node(id, |n| n.as_element().map(|name| name.local.to_string()))
+            .flatten()
+            .unwrap_or_default(),
+        2 => dom
+            .with_node(id, |n| n.as_element().map(|name| name.ns.as_ref().to_string()))
+            .flatten()
+            .unwrap_or_default(),
+        3 => dom.text_content(id),
+        4 => dom
+            .with_node(id, |n| match &n.data {
+                NodeData::Document => "#document".to_string(),
+                NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
+                NodeData::Text { .. } => "#text".to_string(),
+                NodeData::Comment { .. } => "#comment".to_string(),
+                NodeData::Doctype { name, .. } => name.clone(),
+                NodeData::ProcessingInstruction { target, .. } => target.clone(),
+            })
+            .unwrap_or_default(),
+        5 => dom.inner_html(id),
+        6 => dom.outer_html(id),
+        _ => String::new(),
+    }
+}
+
+#[op2]
+#[string]
+fn op_dom_text(state: &OpState, code: u32, nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let gs = shared.borrow();
+        gs.dom.as_ref().map(|dom| node_text(dom, code, nid)).unwrap_or_default()
+    }))
+    .unwrap_or_default()
+}
+
+/// getAttribute without a command string or a JSON round trip: the value, or
+/// null when the node or attribute is absent.
+#[op2]
+#[string]
+fn op_dom_attr(
+    state: &OpState,
+    nid: u32,
+    #[string] name: String,
+    frame_id: u32,
+) -> Option<String> {
+    let shared = frame_state(state, frame_id);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let gs = shared.borrow();
+        let dom = gs.dom.as_ref()?;
+        dom.with_node(NodeId::new(nid), |n| n.get_attribute(&name).map(str::to_owned))
+            .flatten()
+    }))
+    .unwrap_or(None)
 }
 
 #[op2]
@@ -2229,21 +2358,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "node_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name: String = dom
-                .with_node(NodeId::new(nid), |n| match &n.data {
-                    NodeData::Document => "#document".to_string(),
-                    NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
-                    NodeData::Text { .. } => "#text".to_string(),
-                    NodeData::Comment { .. } => "#comment".to_string(),
-                    NodeData::Doctype { name, .. } => name.clone(),
-                    NodeData::ProcessingInstruction { target, .. } => target.clone(),
-                })
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 4, nid)).unwrap_or("\"\"".into())
         }
         "text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&dom.text_content(NodeId::new(nid))).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 3, nid)).unwrap_or("\"\"".into())
         }
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2309,45 +2428,18 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom
-                .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| {
-                        if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
-                        } else {
-                            match &name.prefix {
-                                Some(prefix) => format!("{}:{}", prefix, name.local),
-                                None => name.local.to_string(),
-                            }
-                        }
-                    })
-                })
-                .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 0, nid)).unwrap_or("\"\"".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom
-                .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| name.local.to_string())
-                })
-                .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 1, nid)).unwrap_or("\"\"".into())
         }
         // The tree builder already assigns foreign content (an <svg>/<math>
         // subtree) its own namespace; expose it so JS does not have to guess
         // the namespace from the tag name.
         "namespace_uri" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ns = dom
-                .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| name.ns.as_ref().to_string())
-                })
-                .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&ns).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 2, nid)).unwrap_or("\"\"".into())
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2387,11 +2479,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "inner_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&dom.inner_html(NodeId::new(nid))).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 5, nid)).unwrap_or("\"\"".into())
         }
         "outer_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&dom.outer_html(NodeId::new(nid))).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 6, nid)).unwrap_or("\"\"".into())
         }
         "append_child" => {
             // Reject if either nid failed to parse (was "undefined"/empty) — those
@@ -6635,6 +6727,8 @@ pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
         op_dom_nav(),
+        op_dom_attr(),
+        op_dom_text(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),
