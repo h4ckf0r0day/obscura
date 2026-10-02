@@ -319,6 +319,8 @@ pub struct Page {
     runtime_events_enabled: std::cell::Cell<bool>,
     console_messages_enabled: std::cell::Cell<bool>,
     pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
+    /// Script downloads started during navigation, consumed by `execute_scripts`.
+    script_prefetch: Option<ScriptPrefetch>,
     /// Document-owned HTML script preparation flags saved while the V8 realm
     /// is suspended for CDP/MCP tab switching.  These are restored only when
     /// the same surviving DomTree is resumed; navigation clears them.
@@ -342,6 +344,37 @@ pub struct Page {
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
+#[derive(Debug, Clone, Copy)]
+enum ScriptKind {
+    Classic,
+    Module,
+    ImportMap,
+}
+
+#[derive(Debug)]
+struct ScriptInfo {
+    src: Option<String>,
+    inline: String,
+    is_defer: bool,
+    is_async: bool,
+    kind: ScriptKind,
+    nid: u32,
+    /// Document base URL at this element's parser encounter point.
+    base_url: String,
+}
+
+/// Parser-discovered scripts with their external classic fetches already running.
+struct ScriptPrefetch {
+    scripts: Vec<ScriptInfo>,
+    /// Script indexes with a fetch in `fetches`.
+    planned: std::collections::HashSet<usize>,
+    fetches: tokio::task::JoinSet<(usize, Option<(String, obscura_net::Response)>)>,
+    /// Finished fetches, keyed by script index, not yet taken by execution.
+    ready: std::collections::HashMap<usize, (String, String, obscura_net::Response)>,
+    /// Indexes whose fetch finished, whether or not it produced a body.
+    finished: std::collections::HashSet<usize>,
+}
+
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 
 /// The first navigation counts. The low default stops a page that resets
@@ -1128,6 +1161,7 @@ impl Page {
             runtime_events_enabled: std::cell::Cell::new(false),
             console_messages_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
+            script_prefetch: None,
             suspended_started_script_ids: Vec::new(),
             suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
             suspended_console_messages: Vec::new(),
@@ -2181,62 +2215,69 @@ impl Page {
         .await
     }
 
-    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
-        let scripts_started = std::time::Instant::now();
-        tracing::info!(
-            "execute_scripts called, js runtime exists: {}",
-            self.js.is_some()
-        );
-        // Soft deadline on the entire script-execution phase. Heavy SPAs
-        // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
-        // fetch + execute loop can blow past a Puppeteer/Playwright goto
-        // timeout. The old 10s default was too tight: a heavy React/Vue/Angular
-        // SPA had its remaining scripts skipped before the app booted, so it
-        // never fired its XHR/fetch calls and page.on('response') saw nothing
-        // (issue #361). Only pages that actually run past the deadline are
-        // affected; fast pages finish and return well before it, so a larger
-        // budget costs them nothing. 30s gives an app room to initialize while
-        // the per-phase watchdog (armed at this + 1s) still bounds a real
-        // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
-        // for very heavy SPAs on slow networks (pair it with a matching client
-        // navigation timeout).
-        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
-        let script_deadline =
-            tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
-
-        // Hard backstop over the WHOLE script-execution phase. Inline scripts
-        // run back-to-back with no await between them, so neither the soft
-        // deadline above (only checked between scripts) nor the per-script guard
-        // can interrupt a page that burns the budget across many synchronous
-        // scripts (the real-world SPA / anti-bot busy-loop hang). This watchdog
-        // terminates the isolate if cumulative synchronous script work overruns.
-        let exec_wd = self
-            .js
-            .as_mut()
-            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
-
-        #[derive(Debug, Clone, Copy)]
-        enum ScriptKind {
-            Classic,
-            Module,
-            ImportMap,
+    /// The fetched body of script `index`, waiting only for that script's own
+    /// download. Other downloads keep running while this one is awaited, and
+    /// their results are parked in `pending.ready` for later scripts.
+    async fn script_body(
+        &mut self,
+        pending: &mut ScriptPrefetch,
+        index: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<(String, String, obscura_net::Response)> {
+        if !pending.planned.contains(&index) {
+            return None;
         }
-
-        #[derive(Debug)]
-        struct ScriptInfo {
-            src: Option<String>,
-            inline: String,
-            is_defer: bool,
-            is_async: bool,
-            kind: ScriptKind,
-            nid: u32,
-            /// Document base URL at this element's parser encounter point.
-            base_url: String,
+        while !pending.finished.contains(&index) {
+            let joined = match tokio::time::timeout_at(deadline, pending.fetches.join_next()).await
+            {
+                Ok(Some(joined)) => joined,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "execute_scripts: fetch deadline reached, some scripts may not have loaded"
+                    );
+                    return None;
+                }
+            };
+            if let Ok(done) = joined {
+                self.absorb_script_fetch(pending, done);
+            }
         }
+        pending.ready.remove(&index)
+    }
 
+    /// Records a finished script download without waiting for the others.
+    fn absorb_script_fetch(
+        &mut self,
+        pending: &mut ScriptPrefetch,
+        (idx, result): (usize, Option<(String, obscura_net::Response)>),
+    ) {
+        pending.finished.insert(idx);
+        let Some((url, resp)) = result else { return };
+        if !script_response_is_executable(resp.status) {
+            self.record_network_event_with_body(
+                &url,
+                "GET",
+                "Script",
+                resp.status,
+                &resp.headers,
+                &resp.body,
+                false,
+            );
+            tracing::warn!("Refusing to execute script {} after HTTP {}", url, resp.status);
+            return;
+        }
+        // Script bodies: only the HTTP Content-Type charset matters
+        // (no in-band meta-charset for JS).
+        let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+        pending.ready.insert(idx, (url, code, resp));
+    }
+
+    /// Plans the parser-discovered scripts and starts fetching the external
+    /// classic ones as background tasks. Navigation calls this before the
+    /// stylesheet wave so script and stylesheet downloads overlap, as they do
+    /// in a browser; `execute_scripts` consumes the result.
+    fn start_script_fetches(&mut self) -> Option<ScriptPrefetch> {
         let all_scripts = match &self.js {
             Some(js) => {
                 let document_url = self.url_string();
@@ -2321,24 +2362,8 @@ impl Page {
                 })
                 .unwrap_or_default()
             }
-            None => return,
+            None => return None,
         };
-
-        // HTML scripts have an "already started" flag. Mark every
-        // parser-discovered script before running page code so React/Next
-        // hydration can move or hoist those nodes without appendChild
-        // executing them a second time.
-        if let Some(js) = &mut self.js {
-            let ids = all_scripts
-                .iter()
-                .map(|script| script.nid.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = js.execute_script(
-                "<parser-scripts>",
-                &format!("globalThis.__markParserScripts([{}]);", ids),
-            );
-        }
 
         tracing::info!("Found {} parser-discovered scripts", all_scripts.len());
         let mut fetch_tasks: Vec<(usize, String)> = Vec::new();
@@ -2439,52 +2464,89 @@ impl Page {
         // Bound concurrency: a page with 100 external scripts would
         // otherwise open 100 sockets at once, exhausting the connection
         // pool / ephemeral ports and triggering OS-level backpressure.
-        // 16 is well above the per-host pool ceiling most browsers use
-        // and matches what real Chrome does for a given origin.
-        use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
-        let fetch_results = match tokio::time::timeout_at(
-            script_deadline,
-            fetch_stream.collect::<Vec<_>>(),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!(
-                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
-                );
-                Vec::new()
-            }
-        };
-
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
-        for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
-                if !script_response_is_executable(resp.status) {
-                    self.record_network_event_with_body(
-                        &url,
-                        "GET",
-                        "Script",
-                        resp.status,
-                        &resp.headers,
-                        &resp.body,
-                        false,
-                    );
-                    tracing::warn!(
-                        "Refusing to execute script {} after HTTP {}",
-                        url,
-                        resp.status
-                    );
-                    continue;
-                }
-                // Script bodies: only the HTTP Content-Type charset matters
-                // (no in-band meta-charset for JS).
-                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
-            }
+        // 16 matches what real Chrome does for a given origin.
+        let permits = Arc::new(tokio::sync::Semaphore::new(16));
+        let mut fetches = tokio::task::JoinSet::new();
+        for ((idx, _), fetch) in fetch_tasks.iter().zip(fetch_futures) {
+            let permits = permits.clone();
+            let idx = *idx;
+            fetches.spawn(async move {
+                let _permit = permits.acquire_owned().await.ok();
+                (idx, fetch.await.map(|(_, url, resp)| (url, resp)))
+            });
         }
+        Some(ScriptPrefetch {
+            scripts: all_scripts,
+            planned: fetch_tasks.iter().map(|(idx, _)| *idx).collect(),
+            fetches,
+            ready: std::collections::HashMap::new(),
+            finished: std::collections::HashSet::new(),
+        })
+    }
+
+    async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
+        let scripts_started = std::time::Instant::now();
+        tracing::info!(
+            "execute_scripts called, js runtime exists: {}",
+            self.js.is_some()
+        );
+        // Soft deadline on the entire script-execution phase. Heavy SPAs
+        // (GitHub, Linear, CodeSandbox) ship 50+ scripts and our serial
+        // fetch + execute loop can blow past a Puppeteer/Playwright goto
+        // timeout. The old 10s default was too tight: a heavy React/Vue/Angular
+        // SPA had its remaining scripts skipped before the app booted, so it
+        // never fired its XHR/fetch calls and page.on('response') saw nothing
+        // (issue #361). Only pages that actually run past the deadline are
+        // affected; fast pages finish and return well before it, so a larger
+        // budget costs them nothing. 30s gives an app room to initialize while
+        // the per-phase watchdog (armed at this + 1s) still bounds a real
+        // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
+        // for very heavy SPAs on slow networks (pair it with a matching client
+        // navigation timeout).
+        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000);
+        let script_deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
+
+        // Hard backstop over the WHOLE script-execution phase. Inline scripts
+        // run back-to-back with no await between them, so neither the soft
+        // deadline above (only checked between scripts) nor the per-script guard
+        // can interrupt a page that burns the budget across many synchronous
+        // scripts (the real-world SPA / anti-bot busy-loop hang). This watchdog
+        // terminates the isolate if cumulative synchronous script work overruns.
+        let exec_wd = self
+            .js
+            .as_mut()
+            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
+
+
+        let prefetch = match self.script_prefetch.take() {
+            Some(prefetch) => Some(prefetch),
+            None => self.start_script_fetches(),
+        };
+        let Some(mut pending) = prefetch else {
+            return;
+        };
+        let all_scripts = std::mem::take(&mut pending.scripts);
+
+        // HTML scripts have an "already started" flag. Mark every
+        // parser-discovered script before running page code so React/Next
+        // hydration can move or hoist those nodes without appendChild
+        // executing them a second time.
+        if let Some(js) = &mut self.js {
+            let ids = all_scripts
+                .iter()
+                .map(|script| script.nid.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = js.execute_script(
+                "<parser-scripts>",
+                &format!("globalThis.__markParserScripts([{}]);", ids),
+            );
+        }
+
 
         // Spec: readyState is "loading" while parser-discovered scripts execute.
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
@@ -2642,6 +2704,16 @@ impl Page {
             };
 
         let mut post_parse = Vec::new();
+        let mut late_async = Vec::new();
+        let pending_script_arrived = |page: &mut Self, pending: &mut ScriptPrefetch, index: usize| {
+            if !pending.planned.contains(&index) {
+                return true;
+            }
+            while let Some(Ok(done)) = pending.fetches.try_join_next() {
+                page.absorb_script_fetch(pending, done);
+            }
+            pending.finished.contains(&index)
+        };
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
@@ -2670,8 +2742,13 @@ impl Page {
                 ScriptKind::Classic => {
                     if script.is_defer && !script.is_async && script.src.is_some() {
                         post_parse.push(ScheduledScript::Classic(index));
+                    } else if script.is_async && !pending_script_arrived(self, &mut pending, index) {
+                        // An async script runs when its download finishes, not
+                        // in document order, so a slow one must not hold up the
+                        // parser-blocking scripts behind it.
+                        late_async.push(ScheduledScript::Classic(index));
                     } else {
-                        let fetched_script = fetched.remove(&index);
+                        let fetched_script = self.script_body(&mut pending, index, script_deadline).await;
                         execute_classic(self, script, fetched_script);
                         if let Some(js) = &mut self.js {
                             if js.take_document_write_inserted_script()
@@ -2834,6 +2911,8 @@ impl Page {
             }
         }
 
+        post_parse.extend(late_async);
+
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
@@ -2852,7 +2931,7 @@ impl Page {
             match scheduled {
                 ScheduledScript::Classic(index) => {
                     let script = &all_scripts[index];
-                    let fetched_script = fetched.remove(&index);
+                    let fetched_script = self.script_body(&mut pending, index, script_deadline).await;
                     execute_classic(self, script, fetched_script);
                     if let Some(js) = &mut self.js {
                         if js.take_document_write_inserted_script()
@@ -3354,8 +3433,10 @@ impl Page {
         referrer: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        let nav_started = std::time::Instant::now();
 
         // The previous document's background loads end with the document.
+        self.script_prefetch = None;
         self.retire_render_resources();
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
@@ -3446,6 +3527,7 @@ impl Page {
             PageError::NetworkError(e.to_string())
         })?;
 
+        tracing::debug!(phase = "nav-document-fetched", elapsed_ms = nav_started.elapsed().as_millis());
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
         // corrupts them (issue #340). Text-like types stay as text.
@@ -3482,7 +3564,11 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        tracing::debug!(phase = "nav-js-init", elapsed_ms = nav_started.elapsed().as_millis());
+        // Start the script downloads now so they overlap the stylesheet wave.
+        self.script_prefetch = self.start_script_fetches();
         let author_stylesheets = self.fetch_stylesheets().await;
+        tracing::debug!(phase = "nav-stylesheets", elapsed_ms = nav_started.elapsed().as_millis());
 
         // Install fetched CSS in native DOM state. Cross-origin bytes must not
         // become observable through a synthetic style element or page global.
@@ -3561,6 +3647,7 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+        tracing::debug!(phase = "nav-scripts", elapsed_ms = nav_started.elapsed().as_millis());
 
         #[cfg(feature = "render")]
         {
@@ -3577,6 +3664,7 @@ impl Page {
             let _ = self.prepare_screenshot_resources(warmup_ms).await;
         }
 
+        tracing::debug!(phase = "nav-dcl", elapsed_ms = nav_started.elapsed().as_millis());
         self.lifecycle = LifecycleState::DomContentLoaded;
 
         // Before any `wait_until` can return, because the frames belong to the
@@ -7253,6 +7341,11 @@ mod tests {
             <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
         </head><body></body></html>"#,
         );
+        // An async script runs in place only if its download has finished when
+        // the parser reaches it; give the download the head start navigation
+        // gives it while stylesheets load.
+        page.script_prefetch = page.start_script_fetches();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         page.execute_scripts().await;
         page.settle_for_duration(500).await;
         assert_eq!(
