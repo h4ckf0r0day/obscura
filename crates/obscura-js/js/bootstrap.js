@@ -2299,11 +2299,12 @@ function __prepareInsertedSubtree(root) {
   for (const script of scripts) __prepareInsertedScript(script);
 }
 
-// Shared marker for "provably no null-namespace attributes yet". A Map per
-// created element cost about as much as the rest of createElement, so it is
-// only built on the first write (setAttribute replaces this marker). It is
-// never mutated.
-const _EMPTY_ATTRS = new Map();
+// Script-created elements track their null-namespace attributes as a flat
+// [name, value, ...] array: a Map per element cost about as much as the rest
+// of createElement. This shared empty marker stands for "provably none yet";
+// setAttribute swaps in a real array on the first write, so it is never
+// mutated.
+const _EMPTY_ATTRS = Object.freeze([]);
 
 function _seedDetachedTreeState(node) {
   // Epoch -1 never expires: a node removed or created through the JS API has
@@ -3877,10 +3878,12 @@ class Element extends Node {
     // Script-created elements start with a provably empty attribute set. Keep
     // that small null-namespace map coherent through the ordinary mutation
     // APIs so React's write-then-read reflection does not cross the bridge.
-    if (this._nullNamespaceAttrs instanceof Map) {
-      return this._nullNamespaceAttrs.has(n)
-        ? this._nullNamespaceAttrs.get(n)
-        : null;
+    const tracked = this._nullNamespaceAttrs;
+    if (tracked) {
+      for (let i = 0; i < tracked.length; i += 2) {
+        if (tracked[i] === n) return tracked[i + 1];
+      }
+      return null;
     }
     return __obscuraCore.ops.op_dom_attr(this._nid >>> 0, n, _realmFrameId);
   }
@@ -3897,8 +3900,14 @@ class Element extends Node {
       else this._resetIframeFrame();
     }
     const tracked = this._nullNamespaceAttrs;
-    if (tracked === _EMPTY_ATTRS) this._nullNamespaceAttrs = new Map([[n, value]]);
-    else if (tracked instanceof Map) tracked.set(n, value);
+    if (tracked === _EMPTY_ATTRS) {
+      this._nullNamespaceAttrs = [n, value];
+    } else if (tracked) {
+      let i = 0;
+      while (i < tracked.length && tracked[i] !== n) i += 2;
+      if (i < tracked.length) tracked[i + 1] = value;
+      else tracked.push(n, value);
+    }
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       // Detached elements (the common construction order) cannot be in the
       // document tree, so skip the native root lookup for them.
@@ -3947,8 +3956,11 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     _dom("remove_attribute", this._nid, n);
-    if (this._nullNamespaceAttrs instanceof Map && this._nullNamespaceAttrs !== _EMPTY_ATTRS) {
-      this._nullNamespaceAttrs.delete(n);
+    const tracked = this._nullNamespaceAttrs;
+    if (tracked && tracked !== _EMPTY_ATTRS) {
+      for (let i = 0; i < tracked.length; i += 2) {
+        if (tracked[i] === n) { tracked.splice(i, 2); break; }
+      }
     }
     if (previousWindowName
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
