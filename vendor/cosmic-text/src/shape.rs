@@ -1326,6 +1326,20 @@ impl VisualLine {
 }
 
 impl ShapeLine {
+    /// Release spare capacity left over from incremental shaping.
+    pub fn shrink_to_fit(&mut self) {
+        self.spans.shrink_to_fit();
+        for span in &mut self.spans {
+            span.words.shrink_to_fit();
+            for word in &mut span.words {
+                word.glyphs.shrink_to_fit();
+                word.soft_breaks.shrink_to_fit();
+                word.emergency_breaks.shrink_to_fit();
+                word.min_content_breaks.shrink_to_fit();
+            }
+        }
+    }
+
     /// Creates an empty line.
     ///
     /// The returned line is in an invalid state until [`Self::build_in_buffer`] is called.

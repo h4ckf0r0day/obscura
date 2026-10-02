@@ -1755,6 +1755,7 @@ impl TextEngine {
             }
         }
 
+        buffer.shrink_to_fit();
         let marker_buffer = marker_attrs.map(|attrs| {
             let variation_index = attrs
                 .variations
