@@ -1414,6 +1414,7 @@ impl TextEngine {
         );
         self.push_shaped_item(
             base,
+            base.white_space.unwrap_or_default(),
             line_height,
             spans,
             collector.clip_fills,
@@ -1470,6 +1471,7 @@ impl TextEngine {
         }
         self.push_shaped_item(
             base,
+            base.white_space.unwrap_or_default(),
             line_height,
             spans,
             collector.clip_fills,
@@ -1487,6 +1489,17 @@ impl TextEngine {
     /// inline formatting context. The caller measures/finalizes/paints the
     /// returned item immediately against the pseudo's resolved content box.
     pub(crate) fn push_generated_text(&mut self, text: &str, style: &LayoutStyle) -> Option<usize> {
+        self.push_generated_text_with_white_space(text, style, None)
+    }
+
+    /// [`push_generated_text`] with `style.white_space` replaced, so a caller
+    /// needing one different value does not have to clone the whole style.
+    pub(crate) fn push_generated_text_with_white_space(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+        white_space: Option<crate::WhiteSpace>,
+    ) -> Option<usize> {
         let mut collector = Collector::new();
         let font = resolve_loaded_font(
             style.font_family.as_deref(),
@@ -1494,7 +1507,10 @@ impl TextEngine {
             style.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        let context = base_span_ctx(style, font, &mut collector);
+        let mut context = base_span_ctx(style, font, &mut collector);
+        if let Some(white_space) = white_space {
+            context.white_space = white_space;
+        }
         let line_height = context.line_height;
         let attrs = SpanAttrs {
             font_size: context.font_size,
@@ -1528,6 +1544,7 @@ impl TextEngine {
         );
         self.push_shaped_item(
             style,
+            context.white_space,
             line_height,
             spans,
             collector.clip_fills,
@@ -1543,6 +1560,7 @@ impl TextEngine {
     fn push_shaped_item(
         &mut self,
         base: &LayoutStyle,
+        white_space: crate::WhiteSpace,
         line_h: f32,
         mut spans: Vec<(String, SpanAttrs)>,
         clip_fills: Vec<ClipTextFill>,
@@ -1550,7 +1568,6 @@ impl TextEngine {
         mut owner_boxes: Vec<InlineOwnerBox>,
         mut boundary_events: Vec<InlineBoundaryEvent>,
     ) -> Option<usize> {
-        let white_space = base.white_space.unwrap_or_default();
         let layout_wrap = if spans
             .iter()
             .any(|(_, attrs)| attrs.has_layout_emergency_breaks())

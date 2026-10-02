@@ -10212,9 +10212,11 @@ fn build_shaped_word_leaves(
         // A token normally retains one trailing collapsed space. Shape it as
         // preformatted content so the item keeps that advance instead of the
         // paragraph path trimming collapsible trailing whitespace.
-        let mut token_style = style.clone();
-        token_style.white_space = Some(crate::WhiteSpace::Pre);
-        let Some(item) = engine.push_generated_text(&token, &token_style) else {
+        let Some(item) = engine.push_generated_text_with_white_space(
+            &token,
+            style,
+            Some(crate::WhiteSpace::Pre),
+        ) else {
             // Returning no leaves makes the caller use the deterministic
             // layout-only/static-font fallback for the whole text node.
             return Vec::new();
