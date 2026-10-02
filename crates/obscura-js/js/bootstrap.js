@@ -2294,16 +2294,22 @@ function __prepareInsertedSubtree(root) {
   for (const script of scripts) __prepareInsertedScript(script);
 }
 
+// Shared marker for "provably no null-namespace attributes yet". A Map per
+// created element cost about as much as the rest of createElement, so it is
+// only built on the first write (setAttribute replaces this marker). It is
+// never mutated.
+const _EMPTY_ATTRS = new Map();
+
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
+  // Epoch -1 never expires: a node removed or created through the JS API has
+  // no parent until the JS API inserts it.
   node._treeParent = null;
-  node._treeParentEpoch = _parentCacheEpoch;
+  node._treeParentEpoch = -1;
   node._treeConnected = false;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  node._treeConnectedEpoch = -1;
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
   node._treeParent = parent;
   node._treeParentEpoch = _parentCacheEpoch;
   node._treeConnected = !!connected;
@@ -2408,8 +2414,8 @@ class Node {
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
-    if (this._treeDetachedExact) return null;
-    if (this._treeParentEpoch === _parentCacheEpoch) return this._treeParent;
+    const cached = this._treeParentEpoch;
+    if (cached === _parentCacheEpoch || cached === -1) return this._treeParent;
     const parent = _wrap(_nav(0, this._nid));
     this._treeParent = parent;
     this._treeParentEpoch = _parentCacheEpoch;
@@ -2651,8 +2657,9 @@ class Node {
     return root;
   }
   get isConnected() {
-    if (this._treeDetachedExact) return false;
-    if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
+    const cached = this._treeConnectedEpoch;
+    if (cached === _treeMutationEpoch) return this._treeConnected;
+    if (cached === -1) return false;
     const connected = _nav(6, this._nid) === 1;
     this._treeConnected = connected;
     this._treeConnectedEpoch = _treeMutationEpoch;
@@ -3727,6 +3734,15 @@ class Element extends Node {
       this.content.innerHTML = v;
       return;
     }
+    // Without observers, one native call replaces the content when neither
+    // the old nor the new content needs stylesheet or window-name bookkeeping.
+    if (!globalThis.__mutationObservers?.length) {
+      const r = _domTreeBulk("set_inner_html_x", this._nid, String(v ?? ""));
+      if (r !== "s") {
+        if (r === "2") _registerWindowNamedTree(this);
+        return;
+      }
+    }
     // Capture the children that are about to be replaced so we can deliver
     // them as `removedNodes` in the MutationObserver record. Without this,
     // libraries that mutate via `innerHTML =` (jQuery's `.html(s)`, React
@@ -3875,11 +3891,13 @@ class Element extends Node {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
     }
-    if (this._nullNamespaceAttrs instanceof Map) {
-      this._nullNamespaceAttrs.set(n, value);
-    }
+    const tracked = this._nullNamespaceAttrs;
+    if (tracked === _EMPTY_ATTRS) this._nullNamespaceAttrs = new Map([[n, value]]);
+    else if (tracked instanceof Map) tracked.set(n, value);
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
-      if (this.getRootNode() === globalThis.document) {
+      // Detached elements (the common construction order) cannot be in the
+      // document tree, so skip the native root lookup for them.
+      if (this.isConnected && this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
       }
       if (previousWindowName && previousWindowName !== value) {
@@ -3924,7 +3942,7 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     _dom("remove_attribute", this._nid, n);
-    if (this._nullNamespaceAttrs instanceof Map) {
+    if (this._nullNamespaceAttrs instanceof Map && this._nullNamespaceAttrs !== _EMPTY_ATTRS) {
       this._nullNamespaceAttrs.delete(n);
     }
     if (previousWindowName
@@ -5922,7 +5940,7 @@ class Document extends Node {
     el._tagName = localName.toUpperCase();
     el._lname = localName;
     el._ns = "http://www.w3.org/1999/xhtml";
-    el._nullNamespaceAttrs = new Map();
+    el._nullNamespaceAttrs = _EMPTY_ATTRS;
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
     if (el && localName === 'template') {
@@ -5955,7 +5973,7 @@ class Document extends Node {
     el._tagName = qualified;
     el._lname = localName;
     el._ns = effectiveNamespace;
-    el._nullNamespaceAttrs = new Map();
+    el._nullNamespaceAttrs = _EMPTY_ATTRS;
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
     return el;
@@ -6511,7 +6529,26 @@ class DocumentType extends Node {
   get ownerDocument() { return this._ownerDocument || globalThis.document; }
 }
 
-const _cache = new Map();
+// Node wrappers by node id. Ids are small dense integers, and a holey array
+// is several times cheaper than a Map for both insertion and lookup; ids past
+// the array limit fall back to a Map.
+const _CACHE_ARRAY_MAX = 1 << 23;
+const _cache = {
+  _a: [],
+  _m: null,
+  get(nid) { return nid < _CACHE_ARRAY_MAX ? this._a[nid] : this._m?.get(nid); },
+  set(nid, n) {
+    if (nid < _CACHE_ARRAY_MAX) {
+      const a = this._a;
+      if (nid >= a.length) a.length = Math.max(nid + 1, a.length * 2, 1024);
+      a[nid] = n;
+    } else {
+      (this._m ??= new Map()).set(nid, n);
+    }
+    return this;
+  },
+  has(nid) { return this.get(nid) !== undefined; },
+};
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -14380,7 +14417,6 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   const shadow = new ShadowRoot(rootNid, this, opts);
   _treeMutationEpoch++;
   _parentCacheEpoch++;
-  shadow._treeDetachedExact = false;
   shadow._treeParent = null;
   shadow._treeParentEpoch = _parentCacheEpoch;
   shadow._treeConnected = this.isConnected;

@@ -922,12 +922,12 @@ fn render_mutation_impact(
             let Some((name, value)) = arg2.split_once('\0') else {
                 return RenderMutationImpact::default();
             };
-            let old = dom
-                .with_node(target, |node| node.get_attribute(name).map(str::to_owned))
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute(name) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "set_attribute_ns" => {
@@ -1817,6 +1817,28 @@ fn op_dom_composite(shared: SharedState, cmd: &str, arg1: String, arg2: String) 
             }
             format!("{};{}", text_node, removed)
         }
+        // Element.innerHTML = html when the old and new content need no
+        // stylesheet or window-named bookkeeping. "s": the old children own a
+        // stylesheet or a named element, nothing changed. "1": done. "2": done,
+        // and the new content has elements that may need a named property.
+        "set_inner_html_x" => {
+            let Some(target) = arg1.parse::<u32>().ok().map(NodeId::new) else {
+                return "s".into();
+            };
+            let children_flags = |shared: &SharedState| {
+                let gs = shared.borrow();
+                gs.dom.as_ref().map_or(3, |dom| {
+                    dom.children(target)
+                        .into_iter()
+                        .fold(0, |flags, child| flags | dom.subtree_flags(child))
+                })
+            };
+            if children_flags(&shared) != 0 {
+                return "s".into();
+            }
+            op_dom_inner(shared.clone(), "set_inner_html".into(), arg1, arg2);
+            if children_flags(&shared) & 2 != 0 { "2" } else { "1" }.into()
+        }
         _ => "null".into(),
     }
 }
@@ -1824,7 +1846,7 @@ fn op_dom_composite(shared: SharedState, cmd: &str, arg1: String, arg2: String) 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     if matches!(
         cmd.as_str(),
-        "append_child_x" | "insert_before_x" | "remove_child_x" | "set_text_el"
+        "append_child_x" | "insert_before_x" | "remove_child_x" | "set_text_el" | "set_inner_html_x"
     ) {
         return op_dom_composite(shared, &cmd, arg1, arg2);
     }
