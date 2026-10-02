@@ -2069,6 +2069,9 @@ impl TextEngine {
         }
         item.origin = (content_origin.0 + alignment_inset, content_origin.1);
         item.clip = clip;
+        // The final layout is what paint reads; the shaped glyphs behind it
+        // are rebuilt on demand if this item is ever laid out again.
+        item.buffer.release_shapes();
     }
 
     /// Replace only the finalized clip without reshaping. Used when canonical

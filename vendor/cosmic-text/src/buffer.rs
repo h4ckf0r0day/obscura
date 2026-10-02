@@ -279,6 +279,14 @@ impl Buffer {
         }
     }
 
+    /// Drop each laid out line's shaped glyph cache to save memory once the
+    /// layout is final. A later relayout reshapes the line.
+    pub fn release_shapes(&mut self) {
+        for line in &mut self.lines {
+            line.release_shape();
+        }
+    }
+
     /// Mutably borrows the buffer together with an [`FontSystem`] for more convenient methods
     pub fn borrow_with<'a>(
         &'a mut self,
