@@ -187,6 +187,9 @@ pub struct ObscuraState {
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
+    /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
+    /// sent to the interception channel; empty means every request.
+    pub intercept_url_patterns: Vec<String>,
     pub intercept_page_id: String,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
@@ -435,6 +438,7 @@ impl ObscuraState {
             pending_history_traversal: None,
             intercept_tx: None,
             intercept_enabled: false,
+            intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
@@ -3200,6 +3204,42 @@ fn visible_response_headers(
         .collect()
 }
 
+/// Match a CDP `Fetch.enable` / `Network.setBlockedURLs` URL pattern, where
+/// `*` matches any run of characters. Shared with the CDP layer so reported
+/// pauses use the same patterns as live interception.
+pub fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let mut remainder = url;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+
+        let Some(index) = remainder.find(part) else {
+            return false;
+        };
+
+        if first && !pattern.starts_with('*') && index != 0 {
+            return false;
+        }
+
+        remainder = &remainder[index + part.len()..];
+        first = false;
+    }
+
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+/// Whether a scripted request is paused for the interception consumer. Like
+/// Chrome, only requests matching a `Fetch.enable` URL pattern pause.
+pub(crate) fn should_intercept_url(enabled: bool, patterns: &[String], url: &str) -> bool {
+    enabled && (patterns.is_empty() || patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url)))
+}
+
 /// Build the JS-facing result for an intercepted request a CDP client chose to
 /// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
 /// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
@@ -3293,7 +3333,7 @@ async fn op_fetch_url(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let itx = if gs.intercept_enabled {
+        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
             gs.intercept_tx.clone()
         } else {
             None
@@ -4170,6 +4210,21 @@ mod tests {
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn scripted_requests_pause_only_for_matching_fetch_patterns() {
+        let url = "https://example.test/value/1";
+        assert!(!super::should_intercept_url(false, &[], url));
+        assert!(super::should_intercept_url(true, &[], url));
+        assert!(super::should_intercept_url(true, &["*".to_string()], url));
+        assert!(super::should_intercept_url(true, &["*/value/*".to_string()], url));
+        assert!(!super::should_intercept_url(true, &["*never-matches*".to_string()], url));
+        assert!(super::should_intercept_url(
+            true,
+            &["*never-matches*".to_string(), "https://example.test/*".to_string()],
+            url
+        ));
+    }
 
     // #967 — a redirect must not forward the caller's credentials to a
     // different origin, and a 301/302/303 GET downgrade drops the body headers.

@@ -1834,6 +1834,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_intercept_url_patterns(self.intercept_block_patterns.clone());
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
@@ -4934,6 +4935,7 @@ impl Page {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
+            js.set_intercept_url_patterns(self.intercept_block_patterns.clone());
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
@@ -4946,32 +4948,7 @@ fn script_response_is_executable(status: u16) -> bool {
     (200..=299).contains(&status)
 }
 
-fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let mut remainder = url;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() {
-            continue;
-        }
-
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-
-        if first && !pattern.starts_with('*') && index != 0 {
-            return false;
-        }
-
-        remainder = &remainder[index + part.len()..];
-        first = false;
-    }
-
-    pattern.ends_with('*') || remainder.is_empty()
-}
+pub use obscura_js::ops::url_matches_cdp_pattern;
 
 impl Drop for Page {
     fn drop(&mut self) {

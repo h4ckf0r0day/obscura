@@ -861,6 +861,19 @@ pub(crate) fn schedule_screencast_frame(
     }
 }
 
+/// Whether a request reported after navigation may be paused for the client.
+/// Chrome only pauses requests that match the `Fetch.enable` URL patterns;
+/// omitted patterns mean every request.
+fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
+    ctx.fetch_intercept.enabled
+        && (ctx.fetch_intercept.patterns.is_empty()
+            || ctx
+                .fetch_intercept
+                .patterns
+                .iter()
+                .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -933,7 +946,7 @@ pub fn emit_navigation_events(
             params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
-        if ctx.fetch_intercept.enabled {
+        if fetch_pause_matches(ctx, &net_event.url) {
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
@@ -984,7 +997,10 @@ pub fn emit_navigation_events(
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
-            if Some(i) == nav_idx || net_event.intercepted {
+            if Some(i) == nav_idx
+                || net_event.intercepted
+                || !fetch_pause_matches(ctx, &net_event.url)
+            {
                 continue;
             }
             let rid = &nav_request_ids[i];
@@ -2118,6 +2134,65 @@ mod tests {
         assert_eq!(network.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
             ["Network.responseReceived", "Network.loadingFinished"]);
         assert!(network.iter().all(|e| e.params["requestId"] == "fetch-7"));
+    }
+
+    #[test]
+    fn post_navigation_fetch_pauses_follow_enable_patterns() {
+        let page_url = "https://example.test/";
+        let events = [
+            (page_url, "Document"),
+            ("https://example.test/image.png", "Image"),
+            ("https://example.test/value/1", "Fetch"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (url, kind))| obscura_browser::NetworkEvent {
+            request_id: format!("finished-{index}"),
+            intercepted: false,
+            url: url.into(),
+            method: "GET".into(),
+            resource_type: kind.into(),
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            body_size: 10,
+            timestamp: 1.0,
+        })
+        .collect::<Vec<_>>();
+        for (patterns, expected) in [
+            (vec!["*never-matches*"], vec![]),
+            (vec!["*/value/*"], vec!["https://example.test/value/1"]),
+            (
+                vec!["*"],
+                vec![page_url, "https://example.test/image.png", "https://example.test/value/1"],
+            ),
+        ] {
+            let mut ctx = CdpContext::new();
+            let page_id = ctx.create_page();
+            let session_id = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+            ctx.fetch_intercept.enabled = true;
+            ctx.fetch_intercept.patterns = patterns.iter().map(|p| p.to_string()).collect();
+            emit_navigation_events(
+                &mut ctx, &session_id, "frame-1", "loader-1", page_url, &page_id,
+                &events, WaitUntil::Load, true,
+            );
+            let paused = ctx
+                .pending_events
+                .iter()
+                .filter(|event| event.method == "Fetch.requestPaused")
+                .map(|event| event.params["request"]["url"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(paused, expected, "patterns {patterns:?}");
+            // Network reporting is independent of interception patterns.
+            for method in ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"] {
+                assert_eq!(
+                    ctx.pending_events.iter().filter(|event| event.method == method).count(),
+                    3,
+                    "{method} with patterns {patterns:?}"
+                );
+            }
+        }
     }
 
     #[test]
