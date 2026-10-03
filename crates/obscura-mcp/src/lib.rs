@@ -70,6 +70,7 @@ pub struct BrowserState {
     tab_counter: u32,
     context: Arc<BrowserContext>,
     user_agent: Option<String>,
+    operator_network_hints: bool,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
@@ -87,6 +88,7 @@ impl BrowserState {
             tab_counter: 0,
             context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
             user_agent,
+            operator_network_hints: false,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
         }
@@ -243,6 +245,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     let mut writer = stdout;
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
+    state.operator_network_hints = true;
     let mut runtime_pump_armed = false;
 
     loop {
@@ -947,13 +950,22 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
     let ua = state.user_agent.clone();
+    let operator_hints = state.operator_network_hints;
     let page = state.page_mut();
     if let Some(ref ua) = ua {
         page.http_client.set_user_agent(ua).await;
     }
 
     page.navigate_with_wait(url, condition).await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let message = e.to_string();
+            if operator_hints {
+                if let Some(hint) = obscura_net::private_network_error_hint(&message) {
+                    return format!("{}\n{}", message, hint);
+                }
+            }
+            message
+        })?;
 
     let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
     // DOM changed — invalidate the ref table. Next snapshot will rebuild.
@@ -2189,6 +2201,24 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    #[tokio::test]
+    async fn local_network_hint_is_limited_to_operator_stdio_state() {
+        std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
+        let mut state = BrowserState::new(None, None, false);
+        let args = json!({"url": "http://localhost:9/"});
+        let remote_error = tool_navigate(&args, &mut state).await.unwrap_err();
+        assert!(remote_error.contains("is not allowed"));
+        assert!(!remote_error.contains("--allow-private-network"));
+        state.operator_network_hints = true;
+        let local_error = tool_navigate(&args, &mut state).await.unwrap_err();
+        assert!(local_error.contains("is not allowed"));
+        assert!(local_error.contains("--allow-private-network"));
+        assert!(local_error.contains("OBSCURA_ALLOW_PRIVATE_NETWORK=1"));
+        let metadata_error = tool_navigate(&json!({"url":"http://169.254.169.254/latest/meta-data/"}), &mut state).await.unwrap_err();
+        assert!(metadata_error.contains("is not allowed"));
+        assert!(!metadata_error.contains("--allow-private-network"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -128,3 +128,9 @@ claude mcp add obscura /path/to/obscura mcp
   }
 }
 ```
+
+Local and private network addresses are blocked by default. CLI and stdio MCP
+navigation errors explain the existing `--allow-private-network` /
+`OBSCURA_ALLOW_PRIVATE_NETWORK=1` opt-in for your own local services. The hint
+does not grant access, is omitted for known metadata endpoints and special
+address ranges, and is not shown by the HTTP MCP transport.

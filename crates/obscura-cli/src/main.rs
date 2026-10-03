@@ -349,6 +349,14 @@ fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
 }
 
+fn operator_network_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    match obscura_net::private_network_error_hint(&message) {
+        Some(hint) => format!("{}\n{}", message, hint),
+        None => message,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -969,7 +977,7 @@ async fn run_fetch(
     .await
     {
         Ok(result) => {
-            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, operator_network_error(e)))?
         }
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
@@ -1265,7 +1273,7 @@ async fn fetch_original_response(
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
                 Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
             };
         }
@@ -1281,7 +1289,7 @@ async fn fetch_original_response(
 
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
         Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
     }
 }
