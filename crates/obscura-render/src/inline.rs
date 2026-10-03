@@ -1479,6 +1479,18 @@ impl TextEngine {
         )
     }
 
+    /// Measure intrinsic text through the same selected face and shaper used
+    /// for painting, without retaining an extra paint item for the measurement.
+    pub(crate) fn measure_generated_text(
+        &mut self, text: &str, style: &LayoutStyle,
+    ) -> Option<(f32, f32)> {
+        let item = self.push_generated_text(text, style)?;
+        let size = self.measure(item, None);
+        debug_assert_eq!(item + 1, self.items.len());
+        self.items.pop();
+        Some(size)
+    }
+
     /// Shape generated text that owns a positioned pseudo box.
     ///
     /// Positioned `::before`/`::after` boxes do not participate in the taffy
