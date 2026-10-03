@@ -34,6 +34,8 @@ markup5ever = "0.39"
 selectors = "0.26"
 servo_arc = "0.4"
 cssparser = "0.34"
+# Pure Rust embedded database for IndexedDB storage
+redb = "2.1"
 # Layout engine for the optional render layer (obscura-render). Pure Rust.
 taffy = "0.12"
 # CPU-only pure-Rust 2D rasterizer for the render layer's paint step.

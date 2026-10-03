@@ -1,5 +1,6 @@
 pub mod cdp_watchdog;
 pub mod frame;
+pub mod idb;
 mod import_map;
 pub mod markdown;
 pub mod module_loader;

@@ -1247,6 +1247,10 @@ impl ObscuraJsRuntime {
         }
     }
 
+    pub fn set_storage_dir(&self, storage_dir: Option<std::path::PathBuf>) {
+        self.state.borrow_mut().storage_dir = storage_dir;
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
@@ -23310,5 +23314,123 @@ mod tests {
             serde_json::json!("true,true,1,true,1,true,0,0,true"),
             "label association must follow the HTML labelable-element rules"
         );
+    }
+
+    #[test]
+    fn test_localstorage_disk_persistence() {
+        let temp_dir = std::env::temp_dir().join(format!("obscura_test_ls_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Instance 1: write items to localStorage
+        {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_url("https://example.com/login");
+            rt.set_storage_dir(Some(temp_dir.clone()));
+            rt.execute_script("<test>", "localStorage.setItem('auth_token', 'secret123'); localStorage.setItem('user', 'alice');").unwrap();
+            let token = rt.evaluate("localStorage.getItem('auth_token')").unwrap();
+            assert_eq!(token, serde_json::json!("secret123"));
+        }
+
+        // Verify disk file exists
+        let ls_file = temp_dir.join("localStorage").join("https___example.com.json");
+        assert!(ls_file.exists(), "localStorage json file must exist on disk");
+
+        // Instance 2: new runtime with same storage_dir should load the saved items
+        {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_url("https://example.com/dashboard");
+            rt.set_storage_dir(Some(temp_dir.clone()));
+            let token = rt.evaluate("localStorage.getItem('auth_token')").unwrap();
+            assert_eq!(token, serde_json::json!("secret123"));
+            let user = rt.evaluate("localStorage.getItem('user')").unwrap();
+            assert_eq!(user, serde_json::json!("alice"));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_indexeddb_redb_disk_persistence() {
+        let temp_dir = std::env::temp_dir().join(format!("obscura_test_idb_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Instance 1: write items into indexedDB
+        {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_url("https://app.example.com/");
+            rt.set_storage_dir(Some(temp_dir.clone()));
+            rt.execute_script("<test>", r#"
+                const req = indexedDB.open('my_auth_db', 1);
+                const db = req.result;
+                const store = db.createObjectStore('sessions');
+                store.put({ token: 'jwt-xyz-987', userId: 42 }, 'current_session');
+            "#).unwrap();
+        }
+
+        // Verify the .redb file was created on disk
+        let db_file = temp_dir.join("indexeddb").join("https___app.example.com").join("my_auth_db.redb");
+        assert!(db_file.exists(), "IndexedDB redb file must exist on disk at {:?}", db_file);
+
+        // Instance 2: new runtime with same storage_dir reads back the object
+        {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_url("https://app.example.com/");
+            rt.set_storage_dir(Some(temp_dir.clone()));
+            let result = rt.evaluate(r#"
+                (() => {
+                    const req = indexedDB.open('my_auth_db', 1);
+                    const db = req.result;
+                    const tx = db.transaction(['sessions'], 'readonly');
+                    const store = tx.objectStore('sessions');
+                    const getReq = store.get('current_session');
+                    return getReq.result;
+                })()
+            "#).unwrap();
+            assert_eq!(result, serde_json::json!({ "token": "jwt-xyz-987", "userId": 42 }));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cache_storage_disk_persistence() {
+        let temp_dir = std::env::temp_dir().join(format!("obscura_test_cache_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Instance 1: write to caches
+        {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_url("https://api.example.com/app");
+            rt.set_storage_dir(Some(temp_dir.clone()));
+            let _ = rt.evaluate_for_cdp_with_timeout(r#"
+                (async () => {
+                    const cache = await caches.open('v1');
+                    await cache.put('https://api.example.com/user', new Response('{"id":123,"role":"admin"}', {
+                        headers: { 'content-type': 'application/json' }
+                    }));
+                })()
+            "#, true, true, 1000).await.unwrap();
+        }
+
+        // Verify .redb file exists on disk
+        let cache_file = temp_dir.join("cache_storage").join("https___api.example.com").join("caches.redb");
+        assert!(cache_file.exists(), "CacheStorage redb file must exist on disk at {:?}", cache_file);
+
+        // Instance 2: read back from fresh runtime
+        {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.set_url("https://api.example.com/app");
+            rt.set_storage_dir(Some(temp_dir.clone()));
+            let result = rt.evaluate_for_cdp_with_timeout(r#"
+                (async () => {
+                    const cache = await caches.open('v1');
+                    const res = await cache.match('https://api.example.com/user');
+                    return res ? await res.text() : null;
+                })()
+            "#, true, true, 1000).await.unwrap();
+            assert_eq!(result.value, Some(serde_json::json!("{\"id\":123,\"role\":\"admin\"}")));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
