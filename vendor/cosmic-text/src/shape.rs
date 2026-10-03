@@ -1378,6 +1378,8 @@ pub struct ShapeLine {
     pub rtl: bool,
     pub spans: Vec<ShapeSpan>,
     pub metrics_opt: Option<Metrics>,
+    /// The shaped spans were dropped to save memory; see [`Self::release`].
+    released: bool,
 }
 
 // Visual Line Ranges: (span_index, (first_word_index, first_glyph_index), (last_word_index, last_glyph_index))
@@ -1399,6 +1401,32 @@ impl VisualLine {
 }
 
 impl ShapeLine {
+    /// Drop the shaped glyphs of a line whose layout is final. Only `rtl` stays
+    /// valid; the owner must reshape before laying the line out again.
+    pub fn release(&mut self) {
+        self.spans = Vec::new();
+        self.released = true;
+    }
+
+    /// Whether [`Self::release`] dropped the shaped spans.
+    pub fn is_released(&self) -> bool {
+        self.released
+    }
+
+    /// Release spare capacity left over from incremental shaping.
+    pub fn shrink_to_fit(&mut self) {
+        self.spans.shrink_to_fit();
+        for span in &mut self.spans {
+            span.words.shrink_to_fit();
+            for word in &mut span.words {
+                word.glyphs.shrink_to_fit();
+                word.soft_breaks.shrink_to_fit();
+                word.emergency_breaks.shrink_to_fit();
+                word.min_content_breaks.shrink_to_fit();
+            }
+        }
+    }
+
     /// Creates an empty line.
     ///
     /// The returned line is in an invalid state until [`Self::build_in_buffer`] is called.
@@ -1407,6 +1435,7 @@ impl ShapeLine {
             rtl: false,
             spans: Vec::default(),
             metrics_opt: None,
+            released: false,
         }
     }
 
@@ -1443,6 +1472,7 @@ impl ShapeLine {
         shaping: Shaping,
         tab_width: u16,
     ) {
+        self.released = false;
         let mut spans = mem::take(&mut self.spans);
 
         // Cache the shape spans in reverse order so they can be popped for reuse in the same order.
