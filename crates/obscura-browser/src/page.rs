@@ -8333,9 +8333,16 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 2048];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let first = String::from_utf8_lossy(&request[..read])
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                            let mut chunk = [0u8; 2048];
+                            let read = stream.read(&mut chunk).unwrap();
+                            assert!(read > 0, "request closed before its headers");
+                            request.extend_from_slice(&chunk[..read]);
+                        }
+                        let first = String::from_utf8_lossy(&request)
                             .lines()
                             .next()
                             .unwrap_or_default()
@@ -8377,11 +8384,13 @@ mod tests {
         runtime.set_dom(dom);
         runtime.set_url(&page_url);
         runtime.set_viewport(100.0, 80.0);
-        runtime.run_page_init();
         page.js = Some(runtime);
         page.url = Some(url::Url::parse(&page_url).unwrap());
 
         assert_eq!(page.prepare_screenshot_resources(1_000).await, 1);
+        // Keep the initial parser image load behind page-transport preparation.
+        // A hostless runtime can already load it synchronously during init.
+        page.js.as_mut().unwrap().run_page_init();
         assert_eq!(
             page.js
                 .as_mut()
@@ -8392,10 +8401,8 @@ mod tests {
             "cache/network fragment normalization must not alter currentSrc"
         );
         page.screenshot(page.viewport).expect("prefetched capture");
-        assert!(seen_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-            .starts_with("GET /asset.svg "));
+        let first = seen_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(first.starts_with("GET /asset.svg "), "unexpected request: {first:?}");
         assert!(
             seen_rx
                 .recv_timeout(std::time::Duration::from_millis(200))
