@@ -30,6 +30,15 @@ pub use dom::{
     layout_dom, layout_dom_with_images, layout_dom_with_resources, AttributeStyleMutation,
     DomLayout, RetainedStyleMutation, StickyLayout, TreeStyleMutation,
 };
+// The warmup-resource API needs the optional `url` crate (only present with
+// the `paint` feature), so its re-exports follow that gate. Consumers that
+// pull in the paint feature (the browser page transport and screenshot paths)
+// see them transparently.
+#[cfg(feature = "paint")]
+pub use dom::{
+    collect_render_warmup_resource_urls, compute_render_warmup_resource_urls,
+    compute_render_warmup_styles,
+};
 
 /// Whether an image MIME type names a format supported by the renderer build.
 ///
