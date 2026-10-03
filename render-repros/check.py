@@ -25,6 +25,24 @@ from scipy.ndimage import (
 )
 
 
+def word_spacing_checks(array):
+    """Compare ink positions within one engine, allowing rasterization differences."""
+    rows = []
+    for top in (20, 100, 180, 260, 340):
+        ink = np.any(np.all(array[top : top + 70, :400] < 128, axis=2), axis=0)
+        starts = np.flatnonzero(ink & ~np.r_[False, ink[:-1]]).tolist()
+        rows.append(starts)
+    results = []
+    for index, spacing in enumerate((0, 30, 30, 0, -10)):
+        passed = len(rows[0]) == len(rows[index]) == 3
+        if passed:
+            passed = all(abs(rows[index][glyph] - rows[0][glyph] - glyph * spacing) <= 1
+                         for glyph in range(3))
+        results.append({"name": f"word spacing row {index}", "passed": passed,
+                        "glyph_starts": rows[index], "spacing": spacing})
+    return results
+
+
 def rgb(value):
     value = value.removeprefix("#")
     return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
@@ -205,6 +223,11 @@ def main():
             "behavior": {"obscura": [], "chromium": []},
         }
         for engine, array in (("obscura", ours), ("chromium", chromium)):
+            if name == "word-spacing":
+                for check in word_spacing_checks(array):
+                    fixture["behavior"][engine].append(check)
+                    if not check["passed"]:
+                        failures.append(f"{name} {engine}: {check}")
             for check in checks.get(name, []):
                 expected_count = check.get("count", 1)
                 matches = []
