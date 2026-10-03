@@ -655,7 +655,9 @@ mod context_ownership_tests {
 fn is_v8_free_method(method: &str) -> bool {
     matches!(
         method,
-        "Target.getTargets"
+        "Obscura.getTransportInfo"
+            | "Obscura.download"
+            | "Target.getTargets"
             | "Target.setDiscoverTargets"
             | "Target.attachToTarget"
             | "Target.attachToBrowserTarget"
@@ -790,6 +792,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     let result = match domain {
+        "Obscura" => domains::obscura::handle(method, &req.params, ctx, &req.session_id).await,
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
         "Browser" => domains::browser::handle(method, &req.params).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,

@@ -15,7 +15,7 @@ path = "src/worker.rs"
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
+stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth", "obscura-cdp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 
 [dependencies]
