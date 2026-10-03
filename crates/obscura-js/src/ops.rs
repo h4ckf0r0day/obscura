@@ -75,6 +75,106 @@ pub struct StoredNetworkResponseBody {
     pub base64_encoded: bool,
 }
 
+fn stored_network_response_body(
+    body: &[u8],
+    content_type: Option<&str>,
+    body_base64: &str,
+) -> StoredNetworkResponseBody {
+    if let Some(body) = decode_devtools_response_body(body, content_type) {
+        StoredNetworkResponseBody {
+            body,
+            base64_encoded: false,
+        }
+    } else {
+        StoredNetworkResponseBody {
+            body: body_base64.to_string(),
+            base64_encoded: true,
+        }
+    }
+}
+
+/// Apply Chromium's CDP response-body text policy without exposing it through
+/// obscura-net's public API. A body is text only when its MIME type has a text
+/// decoder and decoding is lossless; otherwise CDP returns the original bytes
+/// as base64. Chromium treats a missing Content-Type as Windows-1252 text.
+fn decode_devtools_response_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+    if body.is_empty() {
+        return Some(String::new());
+    }
+
+    let Some(content_type) = content_type else {
+        return obscura_net::decode_with_label("windows-1252", body, true, false);
+    };
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    let decoder = devtools_text_decoder(&mime)?;
+
+    let explicit_charset = content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        (!value.is_empty()).then_some(value)
+    });
+    let encoding = if let Some(charset) = explicit_charset {
+        charset
+    } else if matches!(decoder, DevtoolsTextDecoder::Html) {
+        obscura_net::encoding::detect_encoding(body, Some(content_type)).0.name()
+    } else if matches!(decoder, DevtoolsTextDecoder::Utf8) {
+        "utf-8"
+    } else {
+        // Chromium classifies the remaining text/* family as plain text and
+        // defaults it to ISO-8859-1, whose WHATWG decoder is Windows-1252.
+        "windows-1252"
+    };
+    obscura_net::decode_with_label(encoding, body, true, false)
+}
+
+#[derive(Clone, Copy)]
+enum DevtoolsTextDecoder {
+    Html,
+    Utf8,
+    Plain,
+}
+
+fn devtools_text_decoder(mime: &str) -> Option<DevtoolsTextDecoder> {
+    if mime == "text/html" {
+        return Some(DevtoolsTextDecoder::Html);
+    }
+    if matches!(
+        mime,
+        "application/javascript"
+            | "application/ecmascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    ) || matches!(mime, "application/json" | "text/json")
+        || mime.ends_with("+json")
+        || matches!(mime, "application/xml" | "text/xml")
+        || (mime.starts_with("application/") && mime.ends_with("+xml"))
+    {
+        return Some(DevtoolsTextDecoder::Utf8);
+    }
+    (mime.starts_with("text/") && mime != "text/xsl")
+        .then_some(DevtoolsTextDecoder::Plain)
+}
+
 /// A network request made from page JS (fetch()/XHR/dynamic resource) recorded
 /// so the CDP layer can emit Network.requestWillBeSent / responseReceived for
 /// it. Static navigation subresources go through Page::record_network_event;
@@ -3945,13 +4045,17 @@ async fn op_fetch_url(
             }
         }
         if let Some(state) = body_state.upgrade() {
+            let stored = stored_network_response_body(
+                &resp_bytes, resp_headers.get("content-type").map(String::as_str),
+                &BASE64.encode(&resp_bytes),
+            );
             record_js_network_completion(&state, JsNetworkEvent {
                 request_id, intercepted: was_intercepted,
                 url: current_url, method: current_method.as_str().to_string(), status,
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            }, &stored.body, stored.base64_encoded);
         }
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
         Ok(resp_bytes)
@@ -4229,6 +4333,7 @@ mod tests {
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
         sanitize_redirect_headers, validate_fetch_url,
+        decode_devtools_response_body,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
@@ -4544,6 +4649,61 @@ mod tests {
             vec!["u6", "u7", "u8", "u9"],
             "the newest entries must be kept, oldest evicted",
         );
+    }
+
+    #[test]
+    fn devtools_body_matches_chromium_text_decoding_boundaries() {
+        assert_eq!(decode_devtools_response_body(b"", None), Some(String::new()));
+        assert_eq!(
+            decode_devtools_response_body(&[0x81, 0x8d], None),
+            Some("\u{81}\u{8d}".to_string()),
+        );
+        assert_eq!(
+            decode_devtools_response_body(b"ABC", Some("application/octet-stream")),
+            None,
+        );
+        assert_eq!(
+            decode_devtools_response_body(&[0xff], Some("text/plain")),
+            Some("ÿ".to_string()),
+        );
+        assert_eq!(
+            decode_devtools_response_body(&[0xff], Some("application/json")),
+            None,
+        );
+        assert_eq!(
+            decode_devtools_response_body(&[0x80], Some("text/plain; charset=windows-1252")),
+            Some("€".to_string()),
+        );
+        assert_eq!(
+            decode_devtools_response_body(&[0xff], Some("text/css")),
+            Some("ÿ".to_string()),
+        );
+        assert_eq!(
+            decode_devtools_response_body(&[0xff], Some("text/javascript")),
+            None,
+        );
+        for content_type in [
+            "application/x-ecmascript",
+            "text/javascript1.5",
+            "text/json",
+        ] {
+            assert_eq!(
+                decode_devtools_response_body(&[0xff], Some(content_type)),
+                None,
+                "{content_type} must use Chromium's UTF-8 decoder",
+            );
+        }
+        assert_eq!(
+            decode_devtools_response_body(b"<html/>", Some("application/xhtml+xml")),
+            Some("<html/>".to_string()),
+        );
+        for content_type in ["image/svg+xml", "text/xsl", "foo/bar+xml"] {
+            assert_eq!(
+                decode_devtools_response_body(b"<xml/>", Some(content_type)),
+                None,
+                "{content_type} has no Chromium raw-resource text decoder",
+            );
+        }
     }
 
     // SEC-006 / #580 — PBKDF2 parameters arrive straight from page JS. Without
