@@ -8333,9 +8333,20 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 2048];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let first = String::from_utf8_lossy(&request[..read])
+                        // Accepted sockets can inherit the listener's nonblocking
+                        // mode. Consume the complete request before responding,
+                        // including fragmented headers.
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let size = stream.read(&mut chunk).unwrap();
+                            assert_ne!(size, 0, "request closed before its headers completed");
+                            request.extend_from_slice(&chunk[..size]);
+                            assert!(request.len() <= 16_384, "fixture request headers too large");
+                        }
+                        let first = String::from_utf8_lossy(&request)
                             .lines()
                             .next()
                             .unwrap_or_default()
