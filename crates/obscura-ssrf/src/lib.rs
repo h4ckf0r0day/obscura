@@ -49,10 +49,11 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 // are common SSRF targets:
                 //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
                 //                  Alibaba 100.100.100.200) lives here.
-                //   198.18.0.0/15  benchmarking / RFC2544.
                 //   192.88.99.0/24 6to4 relay anycast / RFC7526.
+                // 198.18.0.0/15 (benchmarking / RFC2544) is deliberately not
+                // here: Clash fake-ip and WSL2 NAT hand it out as the address
+                // of ordinary public hosts (#852).
                 || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99)
                 // Most of 192.0.0.0/24 is special-purpose and not globally
                 // reachable. Keep the two globally reachable PCP anycast
