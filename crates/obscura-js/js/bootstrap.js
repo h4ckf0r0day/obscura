@@ -7646,19 +7646,26 @@ function _arrayBufferFromBytes(bytes) {
 function _installWasmStreamingFallback() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
-  const nativeInstantiateStreaming = WebAssembly.instantiateStreaming;
-  const fallback = async function instantiateStreaming(source, imports) {
+  // The native streaming entry points call deno_core's isolate-wide wasm
+  // streaming callback, which panics (and, inside a V8 callback, aborts the
+  // process) because no JS handler is registered. Never reach them: read the
+  // Response body and compile it, and reject a non-Response source with a
+  // TypeError as browsers do.
+  const responseBytes = async (source, name) => {
     const response = await source;
-    if (response && typeof response.arrayBuffer === 'function') {
-      return WebAssembly.instantiate(await response.arrayBuffer(), imports);
-    }
-    if (typeof nativeInstantiateStreaming === 'function') {
-      return nativeInstantiateStreaming.call(WebAssembly, response, imports);
-    }
-    return WebAssembly.instantiate(response, imports);
+    if (response && typeof response.arrayBuffer === 'function') return response.arrayBuffer();
+    throw new TypeError(`Failed to execute '${name}' on 'WebAssembly': An argument must be provided, which must be a Response or Promise<Response> object.`);
   };
-  fallback.__obscuraFallback = true;
-  WebAssembly.instantiateStreaming = fallback;
+  const instantiateStreaming = async function instantiateStreaming(source, imports) {
+    return WebAssembly.instantiate(await responseBytes(source, 'instantiateStreaming'), imports);
+  };
+  const compileStreaming = async function compileStreaming(source) {
+    return WebAssembly.compile(await responseBytes(source, 'compileStreaming'));
+  };
+  instantiateStreaming.__obscuraFallback = true;
+  compileStreaming.__obscuraFallback = true;
+  WebAssembly.instantiateStreaming = instantiateStreaming;
+  WebAssembly.compileStreaming = compileStreaming;
 }
 _installWasmStreamingFallback();
 

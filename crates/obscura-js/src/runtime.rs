@@ -20850,6 +20850,67 @@ mod tests {
         assert_eq!(result.value.unwrap(), serde_json::json!(true));
     }
 
+    // Native compileStreaming reached deno_core's wasm streaming callback with
+    // no JS handler registered: a panic inside a V8 callback, which aborted
+    // the whole process.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wasm_compile_streaming_uses_response_array_buffer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+                const module = await WebAssembly.compileStreaming(
+                    Promise.resolve(new Response(bytes)),
+                );
+                return module instanceof WebAssembly.Module;
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wasm_streaming_rejects_a_non_response_source() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+                const names = [];
+                for (const call of [
+                    () => WebAssembly.compileStreaming(Promise.resolve(bytes)),
+                    () => WebAssembly.instantiateStreaming(Promise.resolve(bytes), {}),
+                ]) {
+                    try {
+                        await call();
+                        names.push("resolved");
+                    } catch (error) {
+                        names.push(error.name);
+                    }
+                }
+                return names;
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["TypeError", "TypeError"])
+        );
+    }
+
     #[test]
     fn test_text_decoder_respects_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
