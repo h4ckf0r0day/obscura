@@ -1467,6 +1467,13 @@ fn emit_routed_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_will_be_sent.to_string());
+    for observer in crate::domains::page::network_observer_sessions(
+        ctx, &intercepted.page_id, &session_id,
+    ) {
+        let mut event = request_will_be_sent.clone();
+        event["sessionId"] = json!(observer);
+        let _ = reply_tx.send(event.to_string());
+    }
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -2257,6 +2264,36 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn intercepted_request_is_observable_without_sharing_fetch_control() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page = ctx.create_page();
+        let other = ctx.create_page();
+        ctx.sessions.insert("driver".into(), page.clone());
+        ctx.sessions.insert("observer".into(), page.clone());
+        ctx.sessions.insert("unrelated".into(), other);
+        let (resolver, _resolution) = tokio::sync::oneshot::channel();
+        let intercepted = obscura_js::ops::InterceptedRequest {
+            request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
+            method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        super::emit_intercepted_request(intercepted, &ctx, Some((&page, "frame-1", Some("driver".into()))), &tx, &mut paused);
+        let driver: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let observer: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let pause: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(driver["method"], "Network.requestWillBeSent");
+        assert_eq!(observer["method"], driver["method"]);
+        assert_eq!(observer["params"], driver["params"]);
+        assert_eq!(observer["sessionId"], "observer");
+        assert_eq!(pause["method"], "Fetch.requestPaused");
+        assert_eq!(pause["sessionId"], "driver");
+        assert_eq!(paused.len(), 1);
+        assert!(paused.contains_key("fetch-1"));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn lifecycle_subscription_commands_reach_the_stateful_dispatcher() {
