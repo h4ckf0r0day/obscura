@@ -503,7 +503,7 @@ pub fn retained_attribute_mutation_kind(
             | "viewbox"
             | "width"
     ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
-        || (local == "select" && name == "size")
+        || (matches!(local.as_str(), "select" | "font") && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
     {
@@ -2394,9 +2394,38 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
     }
 }
 
+/// https://html.spec.whatwg.org/multipage/rendering.html#rules-for-parsing-a-legacy-font-size
+fn legacy_font_size_hint(value: &str) -> Option<&'static str> {
+    let value = value.trim_start_matches(['\t', '\n', '\u{c}', '\r', ' ']);
+    let (base, sign, digits) = if let Some(digits) = value.strip_prefix('+') {
+        (3, 1, digits)
+    } else if let Some(digits) = value.strip_prefix('-') {
+        (3, -1, digits)
+    } else {
+        (0, 1, value)
+    };
+    let mut digits = digits.bytes().take_while(u8::is_ascii_digit);
+    let first = digits.next()?;
+    // Only the clamped 1..7 result matters, so arbitrarily long inputs cannot overflow.
+    let value = digits.fold((first - b'0').min(7) as i8, |value, digit| {
+        (value * 10 + (digit - b'0') as i8).min(7)
+    });
+    Some([
+        "font-size:x-small", "font-size:small", "font-size:medium",
+        "font-size:large", "font-size:x-large", "font-size:xx-large", "font-size:xxx-large",
+    ][((base + sign * value).clamp(1, 7) - 1) as usize])
+}
+
 /// Apply HTML presentational attributes at their cascade origin: above the UA
 /// defaults, but below every author stylesheet and style attribute.
 fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+    if node.as_element().is_some_and(|name| {
+        name.local.as_ref() == "font" && name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+    }) {
+        if let Some(hint) = node.get_attribute("size").and_then(legacy_font_size_hint) {
+            crate::style::apply_inline(style, hint);
+        }
+    }
     if let Some(direction) = node.get_attribute("dir") {
         style.direction = match direction.trim().to_ascii_lowercase().as_str() {
             "ltr" => Some(taffy::Direction::Ltr),
@@ -19870,6 +19899,87 @@ mod tests {
         let tree = parse_html("");
         let laid = layout_dom(&tree, (1280.0, 720.0));
         assert!(laid.rects.len() <= 4, "got {}", laid.rects.len());
+    }
+
+    #[test]
+    fn legacy_font_size_hints_follow_numeric_rules_and_author_cascade() {
+        let cases = [
+            ("1", 10.0), ("2", 13.0), ("3", 16.0), ("4", 18.0),
+            ("5", 24.0), ("6", 32.0), ("7", 48.0), ("0", 10.0), ("8", 48.0),
+            ("+1", 18.0), ("-1", 13.0), ("-2", 10.0), ("+0", 16.0), ("-0", 16.0),
+            (" \t+2tail", 24.0), ("\n2", 13.0),
+            ("999999999999999999999999", 48.0), ("-999999999999999999999999", 10.0),
+            ("", 20.0), ("word", 20.0), ("+ 1", 20.0), ("- 1", 20.0), ("\u{a0}2", 20.0),
+        ];
+        let mut html = String::from("<!doctype html><style>html{font-size:16px}body{font-size:20px}#sheet{font-size:21px}</style>");
+        for (index, (size, _)) in cases.iter().enumerate() {
+            html.push_str(&format!("<font id=f{index} size='{size}'><span id=c{index}>x</span></font>"));
+        }
+        html.push_str("<font id=sheet size=1>x</font><font id=inline size=1 style='font-size:23px'>x</font><span id=ordinary size=1>x</span>");
+        let tree = parse_html(&html);
+        let laid = layout_dom(&tree, (640.0, 480.0));
+        for (index, (size, expected)) in cases.iter().enumerate() {
+            for id in [format!("f{index}"), format!("c{index}")] {
+                let node = tree.get_element_by_id(&id).unwrap();
+                assert_eq!(laid.styles[&node].font_size, Some(*expected), "{id}: size={size:?}");
+            }
+        }
+        for (id, expected) in [("sheet", 21.0), ("inline", 23.0), ("ordinary", 20.0)] {
+            let node = tree.get_element_by_id(id).unwrap();
+            assert_eq!(laid.styles[&node].font_size, Some(expected), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_font_size_mutations_restyle_inherited_descendants() {
+        let tree = parse_html("<!doctype html><style>body{font-size:20px}</style><font id=font size=1><span id=child>x</span></font><aside>clean</aside>");
+        let font = tree.get_element_by_id("font").unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        let viewport = (640.0, 480.0);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree, viewport, &HashMap::new(), &[], &mut cache,
+        );
+        assert_eq!(initial.styles[&font].font_size, Some(10.0));
+        for (old, new, expected) in [(Some("1"), Some("6"), 32.0), (Some("6"), None, 20.0)] {
+            tree.with_node_mut(font, |node| {
+                if let Some(value) = new { node.set_attribute("size", value.into()); }
+                else { node.remove_attribute_ns("", "size"); }
+            });
+            let retained = RetainedStyleMaps {
+                styles: std::mem::take(&mut initial.styles),
+                custom_properties: std::mem::take(&mut initial.custom_properties),
+            };
+            let (incremental, _) = layout_dom_with_web_fonts_pass_limit(
+                &tree, viewport, &HashMap::new(), &[], None, Some(&mut cache), Some(retained),
+                &[AttributeStyleMutation { node: font, name: "size".into(),
+                    old_value: old.map(str::to_owned), new_value: new.map(str::to_owned) }.into()],
+            );
+            for node in [font, child] {
+                assert_eq!(incremental.styles[&node].font_size, Some(expected), "size={new:?}");
+            }
+            let full = layout_dom(&tree, viewport);
+            assert_computed_styles_match("font size mutation", &incremental, &full);
+            assert_eq!(incremental.rects, full.rects);
+            initial = incremental;
+        }
+    }
+
+    #[test]
+    fn absolute_font_size_keywords_use_the_default_medium_scale() {
+        let cases = [("xx-small", 9.0), ("x-small", 10.0), ("small", 13.0),
+            ("medium", 16.0), ("large", 18.0), ("x-large", 24.0),
+            ("xx-large", 32.0), ("xxx-large", 48.0)];
+        let mut html = String::from("<!doctype html><style>html{font-size:16px}body{font-size:20px}</style>");
+        for (index, (keyword, _)) in cases.iter().enumerate() {
+            html.push_str(&format!("<span id=k{index} style='font-size:{keyword}'>x</span>"));
+        }
+        let tree = parse_html(&html);
+        let laid = layout_dom(&tree, (640.0, 480.0));
+        for (index, (keyword, expected)) in cases.iter().enumerate() {
+            let node = tree.get_element_by_id(&format!("k{index}")).unwrap();
+            assert_eq!(laid.styles[&node].font_size, Some(*expected), "{keyword}");
+        }
     }
 
     #[test]

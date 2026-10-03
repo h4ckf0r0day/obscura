@@ -7034,17 +7034,17 @@ fn valid_counter_name(name: &str) -> bool {
             .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '"' | '\''))
 }
 
-/// Absolute keyword font-sizes (the `medium`-anchored scale), for the handful
-/// of pages that still use them.
+/// Absolute keyword font-sizes using the default 16px medium scale.
 fn font_size_keyword(v: &str) -> Option<f32> {
     Some(match v.to_ascii_lowercase().as_str() {
-        "xx-small" => 9.6,
-        "x-small" => 12.0,
-        "small" => 13.3,
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
         "medium" => 16.0,
         "large" => 18.0,
         "x-large" => 24.0,
         "xx-large" => 32.0,
+        "xxx-large" => 48.0,
         _ => return None,
     })
 }
