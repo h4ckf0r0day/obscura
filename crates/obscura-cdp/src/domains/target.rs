@@ -243,9 +243,7 @@ pub async fn handle(
         "setAutoAttach" => Ok(json!({})),
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                let page_id = ctx.sessions.remove(session_id);
-                ctx.runtime_enabled_sessions.remove(session_id);
-                ctx.lifecycle_enabled_sessions.remove(session_id);
+                let page_id = ctx.detach_session(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
                     let params = json!({"sessionId": session_id, "targetId": page_id});
@@ -488,6 +486,14 @@ mod tests {
         .await
         .unwrap();
         let session_id = attached["sessionId"].as_str().unwrap().to_string();
+        ctx.page_enabled_sessions.insert(session_id.clone());
+        ctx.lifecycle_enabled_sessions.insert(session_id.clone());
+        ctx.network_enabled_sessions.insert(session_id.clone());
+        ctx.runtime_enabled_sessions.insert(session_id.clone());
+        ctx.page_announced_frames_by_session
+            .insert(session_id.clone(), vec!["frame-1".into()]);
+        ctx.announced_frames
+            .insert(page_id.clone(), vec!["frame-1".into()]);
         ctx.pending_events.clear();
 
         handle(
@@ -506,6 +512,45 @@ mod tests {
         assert_eq!(event.session_id, parent_session);
         assert_eq!(event.params["sessionId"], session_id);
         assert_eq!(event.params["targetId"], page_id);
+        assert!(!ctx.page_enabled_sessions.contains(&session_id));
+        assert!(!ctx.lifecycle_enabled_sessions.contains(&session_id));
+        assert!(!ctx.network_enabled_sessions.contains(&session_id));
+        assert!(!ctx.runtime_enabled_sessions.contains(&session_id));
+        assert!(!ctx.page_announced_frames_by_session.contains_key(&session_id));
+        assert!(ctx.announced_frames.contains_key(&page_id));
+    }
+
+    #[tokio::test]
+    async fn closing_target_removes_every_session_subscription() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "explicit-session".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+        ctx.page_enabled_sessions.insert(session_id.clone());
+        ctx.lifecycle_enabled_sessions.insert(session_id.clone());
+        ctx.network_enabled_sessions.insert(session_id.clone());
+        ctx.runtime_enabled_sessions.insert(session_id.clone());
+        ctx.page_announced_frames_by_session
+            .insert(session_id.clone(), vec!["frame-1".into()]);
+        ctx.announced_frames
+            .insert(page_id.clone(), vec!["frame-1".into()]);
+
+        handle(
+            "closeTarget",
+            &json!({"targetId": page_id}),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("target close should succeed");
+
+        assert!(!ctx.sessions.contains_key(&session_id));
+        assert!(!ctx.page_enabled_sessions.contains(&session_id));
+        assert!(!ctx.lifecycle_enabled_sessions.contains(&session_id));
+        assert!(!ctx.network_enabled_sessions.contains(&session_id));
+        assert!(!ctx.runtime_enabled_sessions.contains(&session_id));
+        assert!(!ctx.page_announced_frames_by_session.contains_key(&session_id));
+        assert!(!ctx.announced_frames.contains_key(&page_id));
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ integration_tests!(
     concurrent_page_isolation,
     control_plane_unblocked,
     document_write_lifecycle,
+    domain_event_subscriptions,
     dynamic_script_onload_fires,
     dynamic_stylesheet_onload_fires,
     execution_context_ownership,
