@@ -265,6 +265,7 @@ pub struct Page {
     /// keeps this baseline across subsequent override calls and restores it
     /// only when the override is cleared.
     device_metrics_baseline: Option<DeviceMetricsBaseline>,
+    reduced_motion: bool,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -1107,6 +1108,7 @@ impl Page {
             screen_metrics_emulated: false,
             locale_override: None,
             device_metrics_baseline: None,
+            reduced_motion: false,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
@@ -1692,6 +1694,13 @@ impl Page {
         self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        self.reduced_motion = reduce;
+        if let Some(js) = &mut self.js {
+            js.set_reduced_motion(reduce);
+        }
+    }
+
     /// Set the screenshot surface density without changing CSS layout. CDP
     /// uses zero to disable its override, which restores the native 1x surface
     /// in Obscura's headless-only model.
@@ -1845,6 +1854,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
+        rt.set_reduced_motion(self.reduced_motion);
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),

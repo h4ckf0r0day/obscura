@@ -310,7 +310,9 @@ impl Page {
         if !js.set_animation_sample(animation_sample) {
             return Err(RasterPdfError::NoRenderableDocument);
         }
-        let previous_media = js.set_render_media(obscura_js::CssMediaType::Print);
+        let previous_media = js.set_render_media(
+            obscura_js::CssMediaType::Print.with_reduced_motion(js.prefers_reduced_motion()),
+        );
         let result = (|| {
             let (content_width, content_height) = js
                 .prepared_content_size()
