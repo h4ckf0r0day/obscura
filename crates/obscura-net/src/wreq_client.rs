@@ -219,6 +219,14 @@ impl StealthHttpClient {
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
+            // Read a folded header line (obs-fold) as Chrome does instead of
+            // failing the response. Set after `emulation()`, which overwrites
+            // `http1_options`; the Chrome profile leaves them unset.
+            .http1_options(
+                wreq::http1::Http1Options::builder()
+                    .allow_obsolete_multiline_headers_in_responses(true)
+                    .build(),
+            )
             .timeout(Duration::from_secs(30))
             // SSRF guard: reject hostnames that resolve to a private/loopback
             // IP. Use the same opt-in as the `validate_url` calls below so
@@ -836,6 +844,31 @@ mod tests {
 
         assert!(matches!(error, ObscuraNetError::Network(_)));
         assert_eq!(server.join().unwrap(), 1);
+    }
+
+    // See `navigation_accepts_a_folded_response_header` in client.rs: the
+    // stealth transport must read a folded header as Chrome does.
+    #[tokio::test]
+    async fn stealth_client_accepts_a_folded_response_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\ncontent-length: 6\r\nconnection: close\r\n\r\nfolded";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "folded");
     }
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.

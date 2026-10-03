@@ -1070,6 +1070,9 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
+                // Read a folded header line (obs-fold) as browsers do instead of
+                // failing the response.
+                .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
@@ -2035,6 +2038,23 @@ mod ssrf_tests {
     fn redirect_to_self() -> String {
         "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string()
+    }
+
+    // Browsers read a folded header line (obs-fold, RFC 9112 5.2) as part of
+    // the line above. Some origins still fold long values: promodirect.com
+    // sends its Content-Security-Policy over several lines, each continuation
+    // after a bare LF and two spaces. httparse rejects the whole response
+    // unless obs-fold is allowed.
+    #[tokio::test]
+    async fn navigation_accepts_a_folded_response_header() {
+        let folded = "Content-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\n";
+        let (target, _rx) = http_fixture(vec![ok_response(folded, "folded")]).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(response.body, b"folded");
     }
 
     // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
