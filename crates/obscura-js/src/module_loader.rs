@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadOptions;
 use deno_core::ModuleLoadReferrer;
@@ -15,7 +17,7 @@ use deno_core::ModuleSpecifier;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::ObscuraState;
+use crate::ops::{ObscuraState, JsNetworkEvent, StoredNetworkResponseBody, record_network_completion};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -215,6 +217,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // decrement the count through Drop as well as success and failure.
         let is_dyn_import = options.is_dynamic_import;
         let activity_guard = is_dyn_import.then(|| activity.begin());
+        let page_state = self.page_state.clone();
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
                 let state = weak
@@ -301,6 +304,38 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .await
                             .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
                     };
+                    // A module response belongs to the owning page regardless
+                    // of whether graph preparation or evaluation later fails.
+                    // Status 0 is the transport's blocked-tracker sentinel.
+                    if resp.status != 0 {
+                        if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
+                            let mut state = state.try_borrow_mut().map_err(|_| {
+                                io_err("Module loader page state is already borrowed".to_string())
+                            })?;
+                            static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(1);
+                            let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
+                                1, std::sync::atomic::Ordering::Relaxed,
+                            ));
+                            record_network_completion(&mut state, JsNetworkEvent {
+                                request_id, intercepted: false,
+                                url: resp.url.to_string(), method: "GET".to_string(),
+                                resource_type: "Script".to_string(), status: resp.status,
+                                response_headers: resp.headers.clone(), body_size: resp.body.len(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_secs_f64(),
+                                error_text: None,
+                            }, || match std::str::from_utf8(&resp.body) {
+                                Ok(body) => StoredNetworkResponseBody {
+                                    body: body.to_string(), base64_encoded: false,
+                                },
+                                Err(_) => StoredNetworkResponseBody {
+                                    body: BASE64.encode(&resp.body), base64_encoded: true,
+                                },
+                            });
+                        }
+                    }
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",

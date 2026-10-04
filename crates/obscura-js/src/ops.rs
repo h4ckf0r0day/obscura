@@ -80,9 +80,10 @@ pub struct StoredNetworkResponseBody {
 /// it. Static navigation subresources go through Page::record_network_event;
 /// this is the parallel channel for script-initiated requests, which run in the
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
+/// ES-module graph responses share this queue through the module loader.
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
-    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Matches the request id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
     /// The interception consumer already received the request start.
@@ -667,12 +668,20 @@ fn record_js_network_completion(
     let state_borrow = state.borrow();
     let gs = state_borrow.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
+        body: body.to_string(), base64_encoded,
+    });
+}
+
+pub(crate) fn record_network_completion(
+    gs: &mut ObscuraState,
+    event: JsNetworkEvent,
+    body: impl FnOnce() -> StoredNetworkResponseBody,
+) {
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
-            body: body.to_string(), base64_encoded,
-        });
+        gs.network_response_bodies.insert(event.request_id.clone(), body());
         gs.network_response_body_order.push_back(event.request_id.clone());
         while gs.network_response_body_order.len() > max_entries {
             if let Some(oldest) = gs.network_response_body_order.pop_front() {
@@ -680,7 +689,7 @@ fn record_js_network_completion(
             }
         }
     }
-    push_js_network_event(&mut gs, event);
+    push_js_network_event(gs, event);
 }
 
 fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
