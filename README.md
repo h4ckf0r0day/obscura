@@ -328,6 +328,8 @@ obscura --proxy http://127.0.0.1:8080 scrape https://example.com https://news.yc
 
 ## Puppeteer / Playwright
 
+[Media preference emulation](docs/CDP-media.md) covers color-scheme and reduced-motion overrides.
+
 ### Puppeteer
 
 ```bash

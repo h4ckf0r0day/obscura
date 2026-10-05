@@ -267,6 +267,7 @@ pub struct Page {
     /// only when the override is cleared.
     device_metrics_baseline: Option<DeviceMetricsBaseline>,
     reduced_motion: bool,
+    dark_color_scheme: bool,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -1110,6 +1111,7 @@ impl Page {
             locale_override: None,
             device_metrics_baseline: None,
             reduced_motion: false,
+            dark_color_scheme: false,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
@@ -1695,6 +1697,16 @@ impl Page {
         self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
+    /// Override reduced-motion and dark color-scheme preferences together.
+    /// The pair persists across navigation and is shared with child documents.
+    pub fn set_media_preferences(&mut self, reduce: bool, dark: bool) {
+        self.reduced_motion = reduce;
+        self.dark_color_scheme = dark;
+        if let Some(js) = &mut self.js {
+            js.set_media_preferences(reduce, dark);
+        }
+    }
+
     pub fn set_reduced_motion(&mut self, reduce: bool) {
         self.reduced_motion = reduce;
         if let Some(js) = &mut self.js {
@@ -1855,7 +1867,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
-        rt.set_reduced_motion(self.reduced_motion);
+        rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
