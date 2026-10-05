@@ -6924,6 +6924,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
+        ops.push(op_layout_hit_test_stack());
         ops.push(op_layout_caret());
         ops.push(op_layout_caret_rect());
         ops.push(op_resize_observer_measurements());
@@ -7982,6 +7983,38 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
     prepared
         .hit_test(dom, scroll, x as f32, y as f32)
         .map_or(-1, |id| id.index() as i32)
+}
+
+/// Every element under a viewport point, front to back, for
+/// `elementsFromPoint`. The first id is `op_layout_hit_test`'s answer, since
+/// both rank the same candidates the same way. Comma-separated native node
+/// ids; empty when the point is outside the viewport or no rendered element
+/// contains it.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_hit_test_stack(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
+        return String::new();
+    }
+    let Some((_, scroll)) = gs.resolved_scroll.as_ref() else {
+        return String::new();
+    };
+    let Some(prepared) = gs.prepared_render.as_ref() else {
+        return String::new();
+    };
+    let Some(dom) = gs.dom.as_ref() else {
+        return String::new();
+    };
+    prepared
+        .hit_test_stack(dom, scroll, x as f32, y as f32)
+        .iter()
+        .map(|id| id.index().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(feature = "render")]
