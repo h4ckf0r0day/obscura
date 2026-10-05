@@ -502,6 +502,10 @@ Fetch and render a single page.
 
 Scrape multiple URLs in parallel with worker processes.
 
+`scrape` and `fetch --file ... --dump original` keep at most `--concurrency`
+jobs active, starting the next URL as soon as a slot becomes available. Results
+remain in input order. URL input and completed results are still held in memory.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--concurrency` | `10` | Parallel workers |
