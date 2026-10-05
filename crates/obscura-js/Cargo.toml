@@ -40,6 +40,9 @@ deno_error = "0.7"
 base64 = { workspace = true }
 sha1 = "0.10"
 sha2 = "0.10"
+# SVG parsing and curve lengths; shared with the existing SVG renderer.
+svgtypes = "0.16"
+kurbo = "0.13"
 # WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,
 # and they unify on the digest 0.10 / cipher 0.4 stack already in the tree.
 hmac = "0.12"
