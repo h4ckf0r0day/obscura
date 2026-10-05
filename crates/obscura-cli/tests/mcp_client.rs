@@ -46,6 +46,8 @@ impl TestPageServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit nonblocking mode on macOS.
+                        stream.set_nonblocking(false).expect("blocking fixture client");
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = [0u8; 2048];
                         let _ = stream.read(&mut request);

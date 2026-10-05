@@ -2,6 +2,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::cmp::{max, min};
@@ -82,6 +83,8 @@ pub struct ShapeBuffer {
     /// Buffer for holding unicode text.
     rustybuzz_buffer: Option<rustybuzz::UnicodeBuffer>,
 
+    shape_plans: Vec<CachedShapePlan>,
+
     /// Temporary buffers for scripts.
     scripts: Vec<Script>,
 
@@ -97,6 +100,53 @@ pub struct ShapeBuffer {
 
     /// Buffer for sets of layout glyphs.
     glyph_sets: Vec<Vec<LayoutGlyph>>,
+}
+
+const SHAPE_PLAN_CACHE_LIMIT: usize = 32;
+const SHAPE_PLAN_FEATURE_LIMIT: usize = 16;
+
+struct CachedShapePlan {
+    font: Arc<Font>,
+    direction: rustybuzz::Direction,
+    script: rustybuzz::Script,
+    language: Option<rustybuzz::Language>,
+    features: Vec<rustybuzz::Feature>,
+    plan: rustybuzz::ShapePlan,
+}
+
+impl ShapeBuffer {
+    fn cached_shape_plan(
+        &mut self,
+        font: &Arc<Font>,
+        direction: rustybuzz::Direction,
+        script: rustybuzz::Script,
+        language: Option<rustybuzz::Language>,
+        features: &[rustybuzz::Feature],
+    ) -> &rustybuzz::ShapePlan {
+        if let Some(index) = self.shape_plans.iter().position(|cached| {
+            Arc::ptr_eq(&cached.font, font)
+                && cached.direction == direction
+                && cached.script == script
+                && cached.language == language
+                && cached.features == features
+        }) {
+            return &self.shape_plans[index].plan;
+        }
+        let plan = rustybuzz::ShapePlan::new(
+            font.rustybuzz(), direction, Some(script), language.as_ref(), features,
+        );
+        // Font IDs can be reused after a database change. Retaining the exact
+        // immutable Font prevents a cached plan from matching a different face.
+        // Bound both retained plans and their feature lists for arbitrary text.
+        if self.shape_plans.len() == SHAPE_PLAN_CACHE_LIMIT {
+            self.shape_plans.remove(0);
+        }
+        self.shape_plans.push(CachedShapePlan {
+            font: Arc::clone(font), direction, script, language,
+            features: features.to_vec(), plan,
+        });
+        &self.shape_plans.last().expect("inserted shape plan").plan
+    }
 }
 
 impl fmt::Debug for ShapeBuffer {
@@ -130,7 +180,7 @@ fn cluster_allows_letter_spacing(line: &str, cluster_start: usize) -> bool {
 fn shape_fallback(
     scratch: &mut ShapeBuffer,
     glyphs: &mut Vec<ShapeGlyph>,
-    font: &Font,
+    font: &Arc<Font>,
     line: &str,
     attrs_list: &AttrsList,
     start_run: usize,
@@ -229,14 +279,22 @@ fn shape_fallback(
         ));
     }
 
-    let shape_plan = rustybuzz::ShapePlan::new(
-        face,
-        buffer.direction(),
-        Some(buffer.script()),
-        buffer.language().as_ref(),
-        &rb_font_features,
-    );
-    let glyph_buffer = rustybuzz::shape_with_plan(face, &shape_plan, buffer);
+    // Plans depend on face coordinates as well as segment properties. Cache
+    // only the Font's immutable default face; per-span variable coordinates
+    // keep their existing plan construction and shaping behavior.
+    let uncached_plan;
+    let shape_plan = if varied_face.is_none() && rb_font_features.len() <= SHAPE_PLAN_FEATURE_LIMIT {
+        scratch.cached_shape_plan(
+            font, buffer.direction(), buffer.script(), buffer.language(), &rb_font_features,
+        )
+    } else {
+        uncached_plan = rustybuzz::ShapePlan::new(
+            face, buffer.direction(), Some(buffer.script()),
+            buffer.language().as_ref(), &rb_font_features,
+        );
+        &uncached_plan
+    };
+    let glyph_buffer = rustybuzz::shape_with_plan(face, shape_plan, buffer);
     let glyph_infos = glyph_buffer.glyph_infos();
     let glyph_positions = glyph_buffer.glyph_positions();
 
@@ -497,6 +555,13 @@ fn shape_run_cached(
 ) {
     use crate::{AttrsOwned, ShapeRunKey};
 
+    // ShapeRunKey is public and has no direction field. Only memoize LTR
+    // shaping so existing key construction stays source-compatible and RTL
+    // runs cannot collide with a previously cached LTR run.
+    if span_rtl || end_run - start_run > crate::shape_run_cache::MAX_RUN_BYTES {
+        shape_run(glyphs, font_system, line, attrs_list, start_run, end_run, span_rtl);
+        return;
+    }
     let run_range = start_run..end_run;
     let mut key = ShapeRunKey {
         text: line[run_range.clone()].to_string(),
@@ -511,9 +576,17 @@ fn shape_run_cached(
         let start = max(attrs_range.start, start_run).saturating_sub(start_run);
         let end = min(attrs_range.end, end_run).saturating_sub(start_run);
         if end > start {
+            if key.attrs_spans.len() == crate::shape_run_cache::MAX_RUN_SPANS {
+                shape_run(glyphs, font_system, line, attrs_list, start_run, end_run, span_rtl);
+                return;
+            }
             let range = start..end;
             key.attrs_spans.push((range, attrs.clone()));
         }
+    }
+    if !key.is_cacheable() {
+        shape_run(glyphs, font_system, line, attrs_list, start_run, end_run, span_rtl);
+        return;
     }
     if let Some(cache_glyphs) = font_system.shape_run_cache.get(&key) {
         for mut glyph in cache_glyphs.iter().cloned() {
@@ -2176,6 +2249,213 @@ impl ShapeLine {
         scratch.visual_lines.append(&mut cached_visual_lines);
         scratch.cached_visual_lines = cached_visual_lines;
         scratch.glyph_sets = cached_glyph_sets;
+    }
+}
+
+#[cfg(all(test, feature = "std", feature = "shape-run-cache"))]
+mod shape_run_cache_tests {
+    use super::*;
+    use crate::{fontdb, Attrs, Family, FeatureTag, FontFeatures, FontVariations, VariationTag};
+
+    fn system() -> FontSystem {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(include_bytes!("../fonts/NotoSans-Regular.ttf").to_vec());
+        db.load_font_data(include_bytes!("../fonts/NotoSansHebrew.ttf").to_vec());
+        db.set_sans_serif_family("Noto Sans");
+        FontSystem::new_with_locale_and_db("en-US".into(), db)
+    }
+
+    fn run(system: &mut FontSystem, line: &str, attrs: &AttrsList, start: usize, rtl: bool, cached: bool) -> String {
+        let mut glyphs = Vec::new();
+        if cached {
+            shape_run_cached(&mut glyphs, system, line, attrs, start, line.len(), rtl);
+        } else {
+            shape_run(&mut glyphs, system, line, attrs, start, line.len(), rtl);
+        }
+        format!("{glyphs:?}")
+    }
+
+    #[test]
+    fn shape_run_cache_matches_fresh_attributes_directions_and_rebased_offsets() {
+        let mut system = system();
+        system.db_mut().load_font_data(include_bytes!("../fonts/NotoSansArabic.ttf").to_vec());
+        for text in ["office AV e\u{301}", "שָׁלוֹם עולם", "خالصة كلمة", "a\tb"] {
+            for index in 0..10 {
+                let mut attrs = Attrs::new().family(Family::Name("Noto Sans"));
+                match index {
+                    1 => attrs = attrs.letter_spacing(0.125),
+                    2 => attrs = attrs.metadata(23),
+                    3 => attrs = attrs.color(Color::rgb(23, 45, 67)),
+                    4 => attrs = attrs.metrics(Metrics::new(19.0, 25.0)),
+                    5 => {
+                        let mut features = FontFeatures::new();
+                        features.disable(FeatureTag::STANDARD_LIGATURES);
+                        attrs = attrs.font_features(features);
+                    }
+                    6 => {
+                        let mut variations = FontVariations::new();
+                        variations.set(VariationTag::new(b"wght"), 635.0);
+                        attrs.font_variations = variations;
+                    }
+                    7 => attrs = attrs.family(Family::Name("Noto Sans Hebrew")),
+                    8 => attrs.font_id_opt = system.db().faces().next().map(|face| face.id),
+                    9 => attrs.font_optical_size_opt = Some(crate::VariationValue(22.0)),
+                    _ => {}
+                }
+                for prefix in ["", "prefix "] {
+                    let line = format!("{prefix}{text}");
+                    let mut list = AttrsList::new(&attrs);
+                    let start = prefix.len();
+                    let first_end = start + text.chars().next().unwrap().len_utf8();
+                    list.add_span(start..first_end, &attrs.clone().metadata(97).color(Color::rgb(3, 5, 7)));
+                    for rtl in [false, true, false] {
+                        let expected = run(&mut system, &line, &list, start, rtl, false);
+                        for _ in 0..2 {
+                            assert_eq!(run(&mut system, &line, &list, start, rtl, true), expected,
+                                "text={text:?} case={index} prefix={prefix:?} rtl={rtl}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shape_run_cache_invalidates_when_the_font_database_changes() {
+        let mut system = system();
+        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Noto Sans Arabic")));
+        let text = "خالصة كلمة";
+        // Deliberately exercise an LTR span so this checks invalidation rather
+        // than the RTL bypass. Newly loaded glyphs must replace old fallbacks.
+        let first = run(&mut system, text, &attrs, 0, false, true);
+        system.db_mut().load_font_data(include_bytes!("../fonts/NotoSansArabic.ttf").to_vec());
+        let fresh = run(&mut system, text, &attrs, 0, false, false);
+        assert_ne!(first, fresh);
+        assert_eq!(run(&mut system, text, &attrs, 0, false, true), fresh);
+
+        let attrs = AttrsList::new(&Attrs::new().family(Family::SansSerif));
+        let text = " ";
+        let before = run(&mut system, text, &attrs, 0, false, true);
+        system.db_mut().set_sans_serif_family("Noto Sans Hebrew");
+        let after = run(&mut system, text, &attrs, 0, false, false);
+        assert_ne!(before, after);
+        assert_eq!(run(&mut system, text, &attrs, 0, false, true), after);
+    }
+
+    #[test]
+    fn shape_run_cache_preserves_oversized_run_and_span_output() {
+        let mut system = system();
+        let text = "office AV ".repeat(140);
+        let list = AttrsList::new(&Attrs::new());
+        assert_eq!(run(&mut system, &text, &list, 0, false, true), run(&mut system, &text, &list, 0, false, false));
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let mut list = AttrsList::new(&Attrs::new());
+        for index in 0..text.len() {
+            list.add_span(index..index + 1, &Attrs::new().metadata(index + 1));
+        }
+        assert_eq!(run(&mut system, text, &list, 0, false, true), run(&mut system, text, &list, 0, false, false));
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod shape_plan_cache_tests {
+    use super::*;
+    use crate::{fontdb, Attrs, FeatureTag, FontFeatures};
+
+    fn font(bytes: &[u8]) -> Arc<Font> {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(bytes.to_vec());
+        let id = db.faces().next().unwrap().id;
+        Arc::new(Font::new(&db, id).unwrap())
+    }
+
+    fn buffer(text: &str, direction: rustybuzz::Direction, language: &str) -> rustybuzz::UnicodeBuffer {
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        buffer.set_direction(direction);
+        buffer.set_language(language.parse().unwrap());
+        buffer.guess_segment_properties();
+        buffer
+    }
+
+    #[test]
+    fn shape_plan_cache_matches_fresh_glyphs_for_all_key_properties() {
+        let mut scratch = ShapeBuffer::default();
+        let cases: [(&[u8], &str); 3] = [
+            (include_bytes!("../fonts/NotoSans-Regular.ttf"), "office ffi e\u{301} AV"),
+            (include_bytes!("../fonts/NotoSansArabic.ttf"), "خالصة كلمة"),
+            (include_bytes!("../fonts/NotoSansHebrew.ttf"), "שָׁלוֹם עולם"),
+        ];
+        for (bytes, text) in cases {
+            let font = font(bytes);
+            for direction in [rustybuzz::Direction::LeftToRight, rustybuzz::Direction::RightToLeft] {
+                for language in ["en", "ar", "he"] {
+                    for features in [
+                        Vec::new(),
+                        vec!["liga=0".parse().unwrap()],
+                        vec!["kern=0".parse().unwrap(), "liga=1".parse().unwrap()],
+                    ] {
+                        let properties = buffer(text, direction, language);
+                        let fresh = rustybuzz::ShapePlan::new(
+                            font.rustybuzz(), direction, Some(properties.script()),
+                            properties.language().as_ref(), &features,
+                        );
+                        let expected = rustybuzz::shape_with_plan(font.rustybuzz(), &fresh, properties);
+                        let expected = format!("{:?}|{:?}", expected.glyph_infos(), expected.glyph_positions());
+                        let mut first_plan = None;
+                        for _ in 0..2 {
+                            let properties = buffer(text, direction, language);
+                            let cached = scratch.cached_shape_plan(
+                                &font, direction, properties.script(), properties.language(), &features,
+                            );
+                            let identity = cached as *const rustybuzz::ShapePlan;
+                            if let Some(first) = first_plan { assert_eq!(first, identity); }
+                            first_plan = Some(identity);
+                            let actual = rustybuzz::shape_with_plan(font.rustybuzz(), cached, properties);
+                            assert_eq!(expected, format!("{:?}|{:?}", actual.glyph_infos(), actual.glyph_positions()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shape_plan_cache_bounds_entries_and_distinguishes_reused_font_ids() {
+        let first = font(include_bytes!("../fonts/NotoSans-Regular.ttf"));
+        let second = font(include_bytes!("../fonts/NotoSansArabic.ttf"));
+        assert_eq!(first.id(), second.id(), "separate databases reuse the first font ID");
+        let mut scratch = ShapeBuffer::default();
+        let direction = rustybuzz::Direction::LeftToRight;
+        let script = rustybuzz::script::LATIN;
+        scratch.cached_shape_plan(&first, direction, script, None, &[]);
+        scratch.cached_shape_plan(&second, direction, script, None, &[]);
+        assert_eq!(scratch.shape_plans.len(), 2);
+        scratch.cached_shape_plan(&first, direction, rustybuzz::script::ARABIC, None, &[]);
+        assert_eq!(scratch.shape_plans.len(), 3, "script is part of the key for the same font");
+        for index in 0..SHAPE_PLAN_CACHE_LIMIT + 5 {
+            scratch.cached_shape_plan(&first, direction, script,
+                Some(format!("en-x-{index}").parse().unwrap()), &[]);
+            assert!(scratch.shape_plans.len() <= SHAPE_PLAN_CACHE_LIMIT);
+        }
+        assert_eq!(scratch.shape_plans.len(), SHAPE_PLAN_CACHE_LIMIT);
+        assert!(!scratch.shape_plans.iter().any(|entry| entry.language.is_none()));
+        assert_eq!(Arc::strong_count(&second), 1, "eviction releases old font ownership");
+    }
+
+    #[test]
+    fn shape_plan_cache_skips_oversized_feature_lists() {
+        let font = font(include_bytes!("../fonts/NotoSans-Regular.ttf"));
+        let mut features = FontFeatures::new();
+        for index in 0..SHAPE_PLAN_FEATURE_LIMIT + 1 {
+            features.set(FeatureTag::KERNING, (index % 2) as u32);
+        }
+        let attrs = Attrs::new().font_features(features);
+        let mut scratch = ShapeBuffer::default();
+        let mut glyphs = Vec::new();
+        shape_fallback(&mut scratch, &mut glyphs, &font, "AV", &AttrsList::new(&attrs), 0, 2, false);
+        assert!(!glyphs.is_empty());
+        assert!(scratch.shape_plans.is_empty());
     }
 }
 

@@ -883,6 +883,8 @@ pub struct DetailedGridInfo {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg(feature = "detailed_layout_info")]
 pub struct DetailedGridTracksInfo {
+    /// Farthest track edge from the container's border-box start, after alignment.
+    pub end_offset: f32,
     /// Number of leading implicit grid tracks
     pub negative_implicit_tracks: u16,
     /// Number of explicit grid tracks
@@ -923,6 +925,9 @@ impl DetailedGridTracksInfo {
     /// Construct DetailedGridTracksInfo from TrackCounts and GridTracks
     fn from_grid_tracks_and_track_count(track_count: TrackCounts, grid_tracks: Vec<GridTrack>) -> Self {
         DetailedGridTracksInfo {
+            end_offset: grid_tracks.iter()
+                .filter(|track| track.kind == GridTrackKind::Track && !track.is_collapsed)
+                .fold(0.0_f32, |end, track| end.max(track.offset + track.base_size)),
             negative_implicit_tracks: track_count.negative_implicit,
             explicit_tracks: track_count.explicit,
             positive_implicit_tracks: track_count.positive_implicit,

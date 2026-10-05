@@ -34,6 +34,40 @@ const HN_HTML: &str = r##"
     </table>
 "##;
 
+#[cfg(feature = "paint")]
+#[test]
+fn mixed_content_shaped_runs_retain_inline_owner_geometry() {
+    for content in ["ABCD", "AB<b id='nested'>CD</b>"] {
+        let tree = parse_html(&format!(
+            "<style>body{{margin:0;font:20px/24px monospace}}</style>\
+             <div id='parent'>AAAA<div style='height:30px'></div>\
+             <span id='owner'>{content}</span></div>"));
+        let layout = layout_dom(&tree, (200.0, 200.0));
+        let owner = tree.get_element_by_id("owner").unwrap();
+        let rect = layout.rects.get(&owner).expect("shaped inline owner has geometry");
+        assert!(rect.x.abs() < 0.01 && (52.0..=57.0).contains(&rect.y)
+            && (40.0..=55.0).contains(&rect.width) && (18.0..=26.0).contains(&rect.height),
+            "inline following a 24px line and 30px block: {rect:?}");
+        let pieces = layout.inline_fragments.get(&owner).expect("canonical inline fragments");
+        assert!(!pieces.is_empty());
+        for piece in pieces {
+            assert!(piece.width > 0.0 && piece.height > 0.0
+                && piece.x >= rect.x && piece.y >= rect.y
+                && piece.x + piece.width <= rect.x + rect.width + 0.01
+                && piece.y + piece.height <= rect.y + rect.height + 0.01,
+                "inline fragments remain within their owner bounds: {piece:?}, {rect:?}");
+        }
+        let parent = tree.get_element_by_id("parent").unwrap();
+        assert!((layout.rects[&parent].height - 78.0).abs() < 0.01,
+            "preserving inline ownership must not add a line or change block flow");
+        if let Some(nested) = tree.get_element_by_id("nested") {
+            let nested = layout.rects.get(&nested).expect("nested inline owner has geometry");
+            assert!((20.0..=28.0).contains(&nested.x) && (20.0..=28.0).contains(&nested.width)
+                && (nested.y - rect.y).abs() < 1.0, "nested text bounds: {nested:?}");
+        }
+    }
+}
+
 /// Top-left of the tightest laid-out element box whose text contains
 /// `needle`. Text geometry is no longer a per-word list: a pure-text
 /// container collapses to a single cosmic-text inline formatting context
@@ -528,6 +562,26 @@ fn inset_absolute_uses_nearest_positioned_ancestor() {
     assert!((abs_percent.y - 160.0).abs() < 1.0, "wrong percent-inset y: {abs_percent:?}");
     assert!((fixed.x - 520.0).abs() < 1.0, "fixed box did not use viewport x: {fixed:?}");
     assert!((fixed.y - 40.0).abs() < 1.0, "fixed box did not use viewport y: {fixed:?}");
+}
+
+#[test]
+fn inset_absolute_fills_positioned_inline_flex_ancestor() {
+    let tree = parse_html(
+        r#"<body style="margin:0">
+          <div style="display:flex">
+            <div id="button" style="position:relative;display:inline-flex;width:115px;height:40px;padding:0 12px;box-sizing:border-box">
+              <a id="overlay" style="position:absolute;inset:unset;top:50%;left:50%;width:max(48px,100%);height:max(48px,100%);transform:translate(-50%,-50%)"></a>
+            </div>
+          </div>
+        </body>"#,
+    );
+    let layout = layout_dom(&tree, (1120.0, 780.0));
+    let button = layout.rects[&tree.get_element_by_id("button").unwrap()];
+    let overlay = layout.rects[&tree.get_element_by_id("overlay").unwrap()];
+
+    assert_eq!((button.width, button.height), (115.0, 40.0));
+    assert_eq!(overlay.width, 91.0);
+    assert_eq!(overlay.height, 48.0, "functional percentage height must use the 40px containing block");
 }
 
 #[test]
@@ -3487,6 +3541,36 @@ fn cyclic_descendant_percentages_do_not_inflate_a_flex_items_intrinsic_minimum()
     }
 }
 
+#[test]
+fn cyclic_percentage_flex_row_keeps_its_intrinsic_content_width() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0 }
+          #scroller { display:flex; width:768px }
+          #month { flex:0 0 auto; width:auto; max-width:336px; padding:0 24px }
+          #week { display:flex; width:100% }
+          .day { flex:1 0 48px; width:48px; height:48px }
+        </style>
+        <div id="scroller"><div id="month"><div><div id="week">
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div><div class="day"></div><div class="day"></div>
+          <div class="day"></div>
+        </div></div></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1000.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+
+    assert_eq!(rect("week").width, 336.0, "percentage row: {:?}", rect("week"));
+    assert_eq!(
+        rect("month").width,
+        384.0,
+        "content width plus inline padding: {:?}",
+        rect("month")
+    );
+}
+
 /// Chromium resolves both spellings to the same 163px content width: the
 /// percentage is cyclic while the link's flex-item width is being measured,
 /// then resolves against that link's final width. Carbon Ads uses the bare
@@ -4374,6 +4458,36 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
 }
 
 #[test]
+fn nested_grid_input_contributes_intrinsic_height_without_preventing_stretch() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:14px Arial; line-height:22px }
+          .outer { display:grid; width:214px; align-items:center }
+          .editor { display:inline-grid; grid-area:1 / 1 / 2 / 3;
+                    grid-template-columns:0 min-content }
+          input { display:block; width:100%; grid-area:1 / 2;
+                  font:inherit; min-width:2px; padding:0; border:0 }
+          .short { grid-template-rows:12px }
+        </style>
+        <div class="outer"><div class="editor" id="auto-editor"><input id="auto-input"></div></div>
+        <div class="outer"><div class="editor short" id="short-editor"><input id="short-input"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (input, editor, height) in [
+        ("auto-input", "auto-editor", 22.0),
+        ("short-input", "short-editor", 12.0),
+    ] {
+        let input_rect = layout.rects[&tree.get_element_by_id(input).unwrap()];
+        let editor_rect = layout.rects[&tree.get_element_by_id(editor).unwrap()];
+        assert_eq!(input_rect.height, height, "{input}");
+        assert_eq!(editor_rect.height, height, "{editor}");
+        assert!(input_rect.width >= 2.0, "{input}");
+    }
+}
+
+#[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(
         r#"
@@ -4436,6 +4550,56 @@ fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
 }
 
 #[test]
+fn inline_block_percentage_height_uses_definite_block_content_height() {
+    let tree = parse_html(r#"<!doctype html>
+        <style>
+          html, body { margin:0 }
+          .switch { position:relative; width:32px; height:16px; line-height:1 }
+          input { position:absolute; width:100%; height:100%; margin:0; opacity:0; z-index:-1000 }
+          label { display:inline-block; box-sizing:border-box; width:100%; height:100%; border:1px solid }
+          .padded { height:30px; box-sizing:border-box; padding:4px; border:1px solid }
+          .indefinite { height:auto; min-height:40px }
+        </style>
+        <div class="switch"><input type="checkbox"><label id="percentage"></label></div>
+        <div class="switch"><input type="checkbox"><label id="pixels" style="height:16px"></label></div>
+        <div class="switch padded"><label id="content-box"></label></div>
+        <div class="switch padded"><label id="half" style="height:50%"></label></div>
+        <div class="switch indefinite"><label id="indefinite"></label></div>
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (name, width, height) in [
+        ("percentage", 32.0, 16.0), ("pixels", 32.0, 16.0),
+        ("content-box", 22.0, 20.0), ("half", 22.0, 10.0), ("indefinite", 32.0, 2.0),
+    ] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!(rect.width, width, "{name}");
+        assert_eq!(rect.height, height, "{name}");
+    }
+}
+
+#[test]
+fn inherited_font_shorthand_overrides_native_control_typography() {
+    let tree = parse_html(r#"
+        <style>
+          body { font:700 20px/30px Arial }
+          input { display:block; border:0; padding:0 }
+        </style>
+        <input id="inherit" style="font:inherit">
+        <input id="unset" style="font:unset">
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for name in ["inherit", "unset"] {
+        let node = tree.get_element_by_id(name).unwrap();
+        let style = &layout.styles[&node];
+        assert_eq!(style.font_size, Some(20.0), "{name}");
+        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
+        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
+        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
+        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
+    }
+}
+
+#[test]
 fn grid_ordinary_aspect_ratio_preserves_normal_alignment_provenance() {
     let tree = parse_html(
         r#"
@@ -4495,4 +4659,30 @@ fn deeply_nested_wrappers_cascade_without_stack_overflow() {
         (rect.width - 50.0).abs() < 0.01,
         "the descendant rule must match at depth 400, got {rect:?}"
     );
+}
+
+#[test]
+fn float_ending_at_rounded_segment_boundary_does_not_panic() {
+    use taffy::{compute::FloatContext, Clear, FloatDirection, Size};
+
+    fn place(
+        context: &mut FloatContext,
+        height: f32,
+        direction: FloatDirection,
+    ) -> taffy::Point<f32> {
+        context.place_floated_box(
+            Size { width: 100.0, height },
+            1859.0,
+            [0.0, 0.0],
+            direction,
+            Clear::None,
+        )
+    }
+
+    let mut context = FloatContext::new();
+    context.set_width(1000.0);
+    place(&mut context, 421.3333, FloatDirection::Left);
+    place(&mut context, 400.3333, FloatDirection::Right);
+
+    assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }

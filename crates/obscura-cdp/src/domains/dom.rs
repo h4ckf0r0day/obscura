@@ -145,7 +145,13 @@ pub async fn handle(
                     crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
-                result.as_f64().map(|n| n as u64).unwrap_or(0)
+                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
+                // saturate to 0 (the document root), so check before casting.
+                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+                if nid < 0 {
+                    return Err(format!("objectId {oid} could not be resolved to a node"));
+                }
+                nid as u64
             } else {
                 return Err("nodeId or objectId required".to_string());
             };
@@ -167,28 +173,18 @@ pub async fn handle(
                     crate::util::object_id_literal(oid)
                 );
                 let result = page.evaluate(&code);
-                result.as_f64().map(|n| n as u64).unwrap_or(0)
+                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
+                // saturate to 0 (the document root), so check before casting.
+                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+                if nid < 0 {
+                    return Err(format!("objectId {oid} could not be resolved to a node"));
+                }
+                nid as u64
             } else {
                 return Err("nodeId or objectId required".to_string());
             };
 
-            let js_code = format!(
-                "(function() {{\
-                    var nid = {};\
-                    var node = null;\
-                    if (globalThis._cache && globalThis._cache.has(nid)) {{\
-                        node = globalThis._cache.get(nid);\
-                    }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '', globalThis.__obscura_frameId >>> 0);\
-                        if (t === 1) node = new Element(nid);\
-                        else if (t === 9) node = globalThis.document;\
-                        else node = new Node(nid);\
-                        if (globalThis._cache) globalThis._cache.set(nid, node);\
-                    }}\
-                    return node;\
-                }})()",
-                node_id,
-            );
+            let js_code = format!("globalThis._wrap({node_id})");
 
             let info = if let Some(js) = &mut page.js {
                 match js.store_object_with_meta(&js_code) {
@@ -238,12 +234,12 @@ pub async fn handle(
         "scrollIntoViewIfNeeded" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = resolve_node_id(page, params)?;
-            // Obscura has no layout viewport to move, but the JS shim records
-            // this element for the hit testing used by subsequent input events.
+            // Share the DOM shim's nested-scrollport handling. Fully visible
+            // boxes stay put; clipped boxes are centered only where needed.
             let code = format!(
                 "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
-                 if (!el || typeof el.scrollIntoView !== 'function') return false; \
-                 el.scrollIntoView(); return true; }})()",
+                 if (!el || typeof el.scrollIntoViewIfNeeded !== 'function') return false; \
+                 el.scrollIntoViewIfNeeded(); return true; }})()",
                 node_id
             );
             let did_scroll = page.evaluate(&code).as_bool().unwrap_or(false);
@@ -534,6 +530,67 @@ mod tests {
     // the id as a JSON literal rather than splicing it into a single-quoted
     // string, so there is no per-domain escaping left to assert on.
 
+    // A stale/invalid objectId resolves to -1 in JS. describeNode/resolveNode
+    // must surface an error, not cast -1 to nodeId 0 (the document root) and
+    // return the wrong node. See #917.
+    #[tokio::test]
+    async fn describe_node_errors_on_unresolvable_object_id() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let res = handle(
+            "describeNode",
+            &json!({ "objectId": "no-such-object" }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "describeNode must error on an unresolvable objectId, got: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_node_errors_on_unresolvable_object_id() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<p>hi</p>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let res = handle(
+            "resolveNode",
+            &json!({ "objectId": "no-such-object" }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "resolveNode must error on an unresolvable objectId, got: {res:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dom_focus_sets_active_element() {
         // CDP clients (browser-use) focus an input via DOM.focus before typing;
@@ -571,6 +628,75 @@ mod tests {
             active,
             json!("INPUT"),
             "DOM.focus must set document.activeElement to the focused input"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_node_preserves_identity_and_specialized_wrappers() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        crate::domains::page::handle("navigate", &json!({
+            "url": "data:text/html,<html><body><textarea id=field></textarea><a id=link href=https://example.com>Next</a></body></html>"
+        }), &mut ctx, &session).await.unwrap();
+        for (id, constructor) in [
+            ("field", "HTMLTextAreaElement"),
+            ("link", "HTMLAnchorElement"),
+        ] {
+            let selector = format!("#{id}");
+            let query = handle(
+                "querySelector",
+                &json!({"selector": selector}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+            let resolved = handle(
+                "resolveNode",
+                &json!({"backendNodeId": query["nodeId"]}),
+                &mut ctx,
+                &session,
+            )
+            .await
+            .unwrap();
+            let object_id = resolved["object"]["objectId"].as_str().unwrap();
+            let expression = format!(
+                "(() => {{ const node = globalThis.__obscura_objects[{}]; return node === document.getElementById({}) && node instanceof {}; }})()",
+                serde_json::to_string(object_id).unwrap(),
+                serde_json::to_string(id).unwrap(),
+                constructor
+            );
+            assert_eq!(
+                ctx.get_session_page_mut(&session)
+                    .unwrap()
+                    .evaluate(&expression),
+                json!(true)
+            );
+        }
+
+        let document = handle("getDocument", &json!({}), &mut ctx, &session)
+            .await
+            .unwrap();
+        let resolved = handle(
+            "resolveNode",
+            &json!({"nodeId": document["root"]["nodeId"]}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .unwrap();
+        let object_id = resolved["object"]["objectId"].as_str().unwrap();
+        let expression = format!(
+            "globalThis.__obscura_objects[{}] === document",
+            serde_json::to_string(object_id).unwrap()
+        );
+        assert_eq!(
+            ctx.get_session_page_mut(&session)
+                .unwrap()
+                .evaluate(&expression),
+            json!(true)
         );
     }
 
@@ -635,6 +761,24 @@ mod tests {
                 .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
             assert_eq!(target_id, json!("target"));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "render")]
+    async fn scroll_into_view_if_needed_preserves_visible_positions() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        crate::domains::page::handle("navigate", &json!({
+            "url": "data:text/html,<body style='margin:0;height:1800px'><div style='height:200px'></div><button id=target style='height:40px'>Go</button></body>",
+            "waitUntil": "load"
+        }), &mut ctx, &session).await.unwrap();
+        let node = handle("querySelector", &json!({"selector":"#target"}), &mut ctx, &session).await.unwrap();
+        handle("scrollIntoViewIfNeeded", &json!({"nodeId":node["nodeId"]}), &mut ctx, &session).await.unwrap();
+        let position = ctx.get_session_page_mut(&session).unwrap()
+            .evaluate("[scrollY, document.getElementById('target').getBoundingClientRect().top]");
+        assert_eq!(position, json!([0, 200]));
     }
 
     #[tokio::test(flavor = "current_thread")]

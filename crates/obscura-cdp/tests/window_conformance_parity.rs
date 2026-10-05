@@ -134,3 +134,31 @@ async fn document_adopt_node_moves_node() {
     assert_eq!(val["sameNode"], true);
     assert_eq!(val["ownerDoc"], true);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn assignment_shadows_window_named_element_property() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(function () {
+            'use strict';
+            const named = window.a;
+            window.a = 42;
+            const descriptor = Object.getOwnPropertyDescriptor(window, 'a');
+            return JSON.stringify({
+                startedAsElement: named === document.getElementById('a'),
+                value: window.a,
+                writable: descriptor.writable,
+                hasGetter: typeof descriptor.get === 'function',
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["startedAsElement"], true);
+    assert_eq!(val["value"], 42);
+    assert_eq!(val["writable"], true);
+    assert_eq!(val["hasGetter"], false);
+}

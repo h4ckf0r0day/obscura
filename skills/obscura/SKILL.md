@@ -73,6 +73,10 @@ Use `--dump original` for a binary or raw HTTP response that should bypass DOM
 and JavaScript processing. Use `scrape` for many URLs when the requested output
 does not require one screenshot per URL.
 
+A local `http://127.0.0.1:N` needs the global `--allow-private-network`, which
+unblocks loopback, RFC1918 and link-local; without it the fetch fails with
+`Access to private/internal IP address 127.0.0.1 is not allowed`.
+
 ## Drive CDP
 
 Start the server:

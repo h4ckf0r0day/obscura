@@ -9,10 +9,18 @@
 //! whatever width taffy offers. Line wrapping, alignment, and intrinsic
 //! sizing then come from a real text engine instead of flexbox tricks.
 //!
-//! Fonts are loaded from embedded bytes only, never the OS, so layout is
-//! byte-for-byte deterministic across hosts (the whole engine's guarantee).
+//! Fonts are loaded from embedded bytes by default, never implicitly from the
+//! OS, so layout remains deterministic unless the operator supplies fonts.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cosmic_text::{
     Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
@@ -188,12 +196,269 @@ struct ResolvedFont {
     synthetic_italic: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct WebFont {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub family: Option<String>,
     pub weight: Option<(u16, u16)>,
     pub italic: Option<bool>,
+}
+
+type FontDatabase = (
+    cosmic_text::fontdb::Database,
+    HashMap<String, LoadedFamily>,
+);
+type FontDeclaration = (
+    cosmic_text::fontdb::ID,
+    Option<String>,
+    Option<(u16, u16)>,
+    Option<bool>,
+);
+
+const WEB_FONT_CACHE_ENTRIES: usize = 8;
+const WEB_FONT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+struct CachedWebFontSet {
+    signature: u64,
+    load_emoji: bool,
+    fonts: Vec<WebFont>,
+    bytes: usize,
+    database: FontDatabase,
+}
+
+static FONT_DIRECTORIES: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static BASE_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
+static EMOJI_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
+static WEB_FONT_DATABASES: OnceLock<Mutex<VecDeque<Arc<CachedWebFontSet>>>> = OnceLock::new();
+
+#[cfg(test)]
+static BASE_FONT_DATABASE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Configure additional process-wide fonts before the first render.
+///
+/// Returns false when fonts have already been configured or initialized.
+pub fn configure_font_directories(directories: Vec<PathBuf>) -> bool {
+    if BASE_FONT_DATABASE.get().is_some() {
+        return false;
+    }
+    FONT_DIRECTORIES.set(directories).is_ok()
+}
+
+fn load_font_directories(
+    database: &mut cosmic_text::fontdb::Database,
+    directories: &[PathBuf],
+) -> Vec<cosmic_text::fontdb::ID> {
+    let mut pending = directories.to_vec();
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "ttf" | "ttc" | "otf" | "otc"
+                        )
+                    })
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort_unstable();
+    files.dedup();
+    let mut ids = Vec::new();
+    for path in files {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        ids.extend(database.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data))));
+    }
+    ids
+}
+
+fn register_loaded_faces(
+    database: &cosmic_text::fontdb::Database,
+    declarations: Vec<FontDeclaration>,
+) -> HashMap<String, LoadedFamily> {
+    let mut loaded_families = HashMap::new();
+    for (id, declared_family, declared_weight, declared_italic) in declarations {
+        let Some(face) = database.face(id) else {
+            continue;
+        };
+        let names = face.families.clone();
+        let internal_name = names
+            .first()
+            .map(|(name, _)| Arc::<str>::from(name.as_str()))
+            .unwrap_or_else(|| Arc::from(FAMILY));
+        let shape_weight = face.weight.0;
+        let metrics = font_metrics(database, id)
+            .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
+        let italic = declared_italic
+            .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
+        let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
+        let declared_names: Vec<String> = declared_family
+            .map(|name| vec![name])
+            .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
+        for name in declared_names {
+            let family = loaded_families
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() });
+            family.faces.push(LoadedFace {
+                name: Arc::clone(&internal_name),
+                font_id: Some(id),
+                metrics,
+                min_weight: weight.0,
+                max_weight: weight.1,
+                italic,
+            });
+        }
+    }
+    loaded_families
+}
+
+fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
+    let base = BASE_FONT_DATABASE.get_or_init(|| {
+        #[cfg(test)]
+        BASE_FONT_DATABASE_BUILDS.fetch_add(1, Ordering::Relaxed);
+
+        let mut database = cosmic_text::fontdb::Database::new();
+        let mut declarations = Vec::new();
+        for bytes in [
+            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
+            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
+        ] {
+            for id in database
+                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)))
+            {
+                declarations.push((id, None, None, None));
+            }
+        }
+        declarations.extend(
+            load_font_directories(
+                &mut database,
+                FONT_DIRECTORIES.get_or_init(Vec::new),
+            )
+            .into_iter()
+            .map(|id| (id, None, None, None)),
+        );
+        let loaded_families = register_loaded_faces(&database, declarations);
+        database.set_sans_serif_family(FAMILY);
+        (database, loaded_families)
+    });
+
+    if !load_emoji {
+        return base;
+    }
+    EMOJI_FONT_DATABASE.get_or_init(|| {
+        let (mut database, _) = (*base).clone();
+        let declarations = database
+            .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R)))
+            .into_iter()
+            .map(|id| (id, None, None, None))
+            .collect();
+        let loaded_families = register_loaded_faces(&database, declarations);
+        let mut all_loaded_families = base.1.clone();
+        for (name, mut family) in loaded_families {
+            all_loaded_families
+                .entry(name)
+                .or_insert_with(|| LoadedFamily { faces: Vec::new() })
+                .faces
+                .append(&mut family.faces);
+        }
+        (database, all_loaded_families)
+    })
+}
+
+fn web_font_signature(fonts: &[WebFont], load_emoji: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    load_emoji.hash(&mut hasher);
+    fonts.len().hash(&mut hasher);
+    for font in fonts {
+        font.family.hash(&mut hasher);
+        font.weight.hash(&mut hasher);
+        font.italic.hash(&mut hasher);
+        let data = font.data.as_slice();
+        data.len().hash(&mut hasher);
+        data[..data.len().min(64)].hash(&mut hasher);
+        if data.len() > 64 {
+            data[data.len() - 64..].hash(&mut hasher);
+        }
+        if data.len() > 128 {
+            let middle = data.len() / 2;
+            data[middle - 32..middle + 32].hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn cached_web_font_database(
+    fonts: &[WebFont],
+    load_emoji: bool,
+) -> Option<Arc<CachedWebFontSet>> {
+    let signature = web_font_signature(fonts, load_emoji);
+    let candidates: Vec<_> = WEB_FONT_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|entry| entry.signature == signature && entry.load_emoji == load_emoji)
+        .cloned()
+        .collect();
+    candidates.into_iter().find(|entry| entry.fonts == fonts)
+}
+
+fn cache_web_font_database(
+    fonts: &[WebFont],
+    load_emoji: bool,
+    database: FontDatabase,
+) -> FontDatabase {
+    let bytes = fonts
+        .iter()
+        .fold(0usize, |total, font| total.saturating_add(font.data.len()));
+    if bytes > WEB_FONT_CACHE_BYTES {
+        return database;
+    }
+
+    let signature = web_font_signature(fonts, load_emoji);
+    let mut cache = WEB_FONT_DATABASES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.iter().find(|entry| {
+        entry.signature == signature && entry.load_emoji == load_emoji && entry.fonts == fonts
+    }) {
+        return existing.database.clone();
+    }
+    while cache.len() >= WEB_FONT_CACHE_ENTRIES
+        || cache.iter().map(|entry| entry.bytes).sum::<usize>()
+            > WEB_FONT_CACHE_BYTES.saturating_sub(bytes)
+    {
+        cache.pop_front();
+    }
+    cache.push_back(Arc::new(CachedWebFontSet {
+        signature,
+        load_emoji,
+        fonts: fonts.to_vec(),
+        bytes,
+        database: database.clone(),
+    }));
+    database
 }
 
 fn resolve_loaded_font(
@@ -423,11 +688,27 @@ type ClipTextFill = (f32, Vec<([u8; 4], Option<f32>)>);
 /// directly, while the upper half is a one-based index into an optional
 /// variation-set table.
 const META_UNDERLINE: usize = 1;
-const META_FILL_SHIFT: usize = 1;
+const META_OVERLINE: usize = 2;
+const META_LINE_THROUGH: usize = 4;
+const META_DECORATIONS: usize = META_UNDERLINE | META_OVERLINE | META_LINE_THROUGH;
+const META_FILL_SHIFT: usize = 3;
 const META_VARIATION_BITS: usize = usize::BITS as usize / 2;
 const META_VARIATION_SHIFT: usize = usize::BITS as usize - META_VARIATION_BITS;
 const META_VARIATION_MASK: usize = ((1usize << META_VARIATION_BITS) - 1) << META_VARIATION_SHIFT;
-const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_UNDERLINE;
+const META_FILL_MASK: usize = ((1usize << META_VARIATION_SHIFT) - 1) & !META_DECORATIONS;
+
+fn decoration_stroke(
+    (start, end, size, color, relative): (f32, f32, f32, [u8; 4], (f32, f32)),
+    baseline: f32,
+    flag: usize,
+) -> (f32, f32, f32, f32, [u8; 4]) {
+    let offset = match flag {
+        META_OVERLINE => -size * 0.8,
+        META_LINE_THROUGH => -size * 0.3,
+        _ => (size * 0.12).max(1.0),
+    };
+    (start, end, baseline + relative.1 + offset, (size / 14.0).max(1.0), color)
+}
 
 fn metadata_fill(metadata: usize) -> Option<usize> {
     ((metadata & META_FILL_MASK) >> META_FILL_SHIFT).checked_sub(1)
@@ -499,6 +780,11 @@ pub struct InlineItem {
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
     relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+    /// Mixed-content IFCs own only this sibling range. Caret queries replay
+    /// the collector on demand rather than retaining a map for every glyph.
+    caret_run: Option<(NodeId, NodeId)>,
+    /// Exact measurement results retained across repeated Taffy probes.
+    measured: Vec<(Option<u32>, Wrap, (f32, f32))>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -589,8 +875,27 @@ pub struct TextEngine {
     loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
     variable_swash: VariableSwashCache,
+    shape_templates: HashMap<String, Vec<ShapeTemplate>>,
+    shape_template_count: usize,
+    #[cfg(test)]
+    shape_template_hits: usize,
     items: Vec<InlineItem>,
     replaced: Vec<ReplacedItem>,
+}
+
+// Repeated labels, table cells, and list/card rows are common, and building
+// cosmic-text's attributed buffer for each identical run is measurable. Keep
+// only small templates and stop admitting entries once this per-layout cache
+// is full: memory stays bounded even for attacker-controlled page text.
+const SHAPE_TEMPLATE_LIMIT: usize = 64;
+const SHAPE_TEMPLATE_TEXT_LIMIT: usize = 256;
+
+struct ShapeTemplate {
+    font_size_bits: u32,
+    line_height_bits: u32,
+    wrap: Wrap,
+    attrs: SpanAttrs,
+    buffer: Buffer,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -772,6 +1077,7 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy)]
 struct ReplacedItem {
+    independent_axes: bool,
     intrinsic_width: Option<f32>,
     intrinsic_height: Option<f32>,
     preferred_width: Option<f32>,
@@ -829,6 +1135,7 @@ impl ReplacedItem {
             })
             .unwrap_or(2.0);
         ReplacedItem {
+            independent_axes: false,
             intrinsic_width: intrinsic
                 .width
                 .filter(|width| width.is_finite() && *width > 0.0),
@@ -908,6 +1215,12 @@ impl ReplacedItem {
     }
 
     fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
+        if self.independent_axes {
+            return taffy::Size {
+                width: known.width.or(self.intrinsic_width).unwrap_or(0.0),
+                height: known.height.or(self.intrinsic_height).unwrap_or(0.0),
+            };
+        }
         let (width, height) = match (known.width, known.height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (width, width / self.preferred_ratio),
@@ -975,7 +1288,7 @@ impl TextEngine {
         let fonts: Vec<_> = fonts
             .iter()
             .map(|data| WebFont {
-                data: data.clone(),
+                data: Arc::new(data.clone()),
                 family: None,
                 weight: None,
                 italic: None,
@@ -989,69 +1302,39 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
-        // Build a database from embedded and page-provided faces. Never call
-        // load_system_fonts: a host's font set would make layout differ
-        // machine to machine and add a multi-millisecond startup scan.
-        let mut db = cosmic_text::fontdb::Database::new();
-        let mut declarations = Vec::new();
-        for bytes in [
-            SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B,
-            MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B,
-        ] {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes))) {
-                declarations.push((id, None, None, None));
+        let (db, loaded_families) = if fonts.is_empty() {
+            (*base_font_database(load_emoji)).clone()
+        } else if let Some(cached) = cached_web_font_database(fonts, load_emoji) {
+            cached.database.clone()
+        } else {
+            let (mut db, mut loaded_families) = (*base_font_database(load_emoji)).clone();
+            let mut declarations = Vec::new();
+            for font in fonts {
+                for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(
+                    font.data.clone(),
+                )) {
+                    declarations.push((id, font.family.clone(), font.weight, font.italic));
+                }
             }
-        }
-        if load_emoji {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R))) {
-                declarations.push((id, None, None, None));
+            for (name, mut family) in register_loaded_faces(&db, declarations) {
+                loaded_families
+                    .entry(name)
+                    .or_insert_with(|| LoadedFamily { faces: Vec::new() })
+                    .faces
+                    .append(&mut family.faces);
             }
-        }
-        for font in fonts {
-            for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(
-                font.data.clone(),
-            ))) {
-                declarations.push((id, font.family.clone(), font.weight, font.italic));
-            }
-        }
-        let mut loaded_families = HashMap::new();
-        for (id, declared_family, declared_weight, declared_italic) in declarations {
-            let Some(face) = db.face(id) else { continue };
-            let names = face.families.clone();
-            let internal_name = names
-                .first()
-                .map(|(name, _)| Arc::<str>::from(name.as_str()))
-                .unwrap_or_else(|| Arc::from(FAMILY));
-            let shape_weight = face.weight.0;
-            let metrics = font_metrics(&db, id)
-                .unwrap_or_else(|| bundled_face_metrics(internal_name.as_ref()));
-            let italic = declared_italic
-                .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
-            let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
-            let declared_names: Vec<String> = declared_family
-                .map(|name| vec![name])
-                .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
-            for name in declared_names {
-                let family = loaded_families
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
-                family.faces.push(LoadedFace {
-                    name: Arc::clone(&internal_name),
-                    font_id: Some(id),
-                    metrics,
-                    min_weight: weight.0,
-                    max_weight: weight.1,
-                    italic,
-                });
-            }
-        }
-        db.set_sans_serif_family(FAMILY);
+            cache_web_font_database(fonts, load_emoji, (db, loaded_families))
+        };
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
             loaded_families,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
+            shape_templates: HashMap::new(),
+            shape_template_count: 0,
+            #[cfg(test)]
+            shape_template_hits: 0,
             items: Vec::new(),
             replaced: Vec::new(),
         }
@@ -1196,7 +1479,7 @@ impl TextEngine {
                 &self.loaded_families,
             );
         }
-        self.push_shaped_item(
+        let index = self.push_shaped_item(
             base,
             line_height,
             spans,
@@ -1204,7 +1487,9 @@ impl TextEngine {
             collector.owner_ranges,
             collector.owner_boxes,
             collector.boundary_events,
-        )
+        )?;
+        self.items[index].caret_run = Some((*run.first()?, *run.last()?));
+        Some(index)
     }
 
     /// Shape generated text that owns a positioned pseudo box.
@@ -1236,6 +1521,8 @@ impl TextEngine {
             italic: context.italic,
             synthetic_italic: context.synthetic_italic,
             underline: context.underline,
+            overline: context.overline,
+            line_through: context.line_through,
             color: context.color,
             family: context.family,
             clip_fill: context.clip_fill,
@@ -1251,6 +1538,7 @@ impl TextEngine {
             &attrs,
             &mut spans,
             &mut collector,
+            None,
         );
         self.push_shaped_item(
             style,
@@ -1369,7 +1657,31 @@ impl TextEngine {
         // ~invisible, matching the intent, and one page can never abort a worker.
         let cosmic_size = base_size.max(1.0);
         let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let cacheable_template = clip_fills.is_empty()
+            && owner_ranges.is_empty()
+            && owner_boxes.is_empty()
+            && boundary_events.is_empty()
+            && text_len <= SHAPE_TEMPLATE_TEXT_LIMIT
+            && spans.len() == 1;
+        let template_text = cacheable_template.then(|| spans[0].0.as_str());
+        let cached_buffer = template_text.and_then(|text| {
+            self.shape_templates.get(text).and_then(|templates| {
+                templates.iter().find_map(|template| {
+                    (template.font_size_bits == metrics.font_size.to_bits()
+                        && template.line_height_bits == metrics.line_height.to_bits()
+                        && template.wrap == layout_wrap
+                        && template.attrs == spans[0].1)
+                        .then(|| template.buffer.clone())
+                })
+            })
+        });
+        let template_hit = cached_buffer.is_some();
+        #[cfg(test)]
+        if template_hit {
+            self.shape_template_hits += 1;
+        }
+        let mut buffer =
+            cached_buffer.unwrap_or_else(|| Buffer::new(&mut self.font_system, metrics));
         // Install the used-layout mode now; intrinsic measurement temporarily
         // swaps to `min_content_wrap` below. Keeping those modes separate is
         // what prevents `overflow-wrap: break-word` from shrinking a
@@ -1415,13 +1727,30 @@ impl TextEngine {
             (text.as_str(), attrs.to_attrs(variation_index))
         });
         let defaults = Attrs::new().family(Family::Name(FAMILY));
-        buffer.set_rich_text(
-            &mut self.font_system,
-            rich,
-            &defaults,
-            Shaping::Advanced,
-            None,
-        );
+        if !template_hit {
+            buffer.set_rich_text(
+                &mut self.font_system,
+                rich,
+                &defaults,
+                Shaping::Advanced,
+                None,
+            );
+            if let Some(text) = template_text {
+                if self.shape_template_count < SHAPE_TEMPLATE_LIMIT {
+                    self.shape_templates
+                        .entry(text.to_owned())
+                        .or_default()
+                        .push(ShapeTemplate {
+                            font_size_bits: metrics.font_size.to_bits(),
+                            line_height_bits: metrics.line_height.to_bits(),
+                            wrap: layout_wrap,
+                            attrs: spans[0].1.clone(),
+                            buffer: buffer.clone(),
+                        });
+                    self.shape_template_count += 1;
+                }
+            }
+        }
 
         let marker_buffer = marker_attrs.map(|attrs| {
             let variation_index = attrs
@@ -1487,6 +1816,8 @@ impl TextEngine {
             owner_boxes,
             boundary_events,
             relative_owner_ranges: Vec::new(),
+            caret_run: None,
+            measured: Vec::new(),
         });
         Some(idx)
     }
@@ -1507,20 +1838,33 @@ impl TextEngine {
     }
 
     fn measure_text_with_wrap(&mut self, idx: usize, width: Option<f32>, wrap: Wrap) -> (f32, f32) {
+        let key = width.map(f32::to_bits);
+        if let Some((_, _, size)) = self.items[idx]
+            .measured
+            .iter()
+            .find(|(cached_width, cached_wrap, _)| *cached_width == key && *cached_wrap == wrap)
+        {
+            return *size;
+        }
         let TextEngine {
             font_system, items, ..
         } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
         let (width, height, clamped) = buffer_size(item);
-        (
+        let size = (
             width,
             if clamped {
                 height
             } else {
                 height.max(item.forced_min_height)
             },
-        )
+        );
+        if item.measured.len() == 16 {
+            item.measured.remove(0);
+        }
+        item.measured.push((key, wrap, size));
+        size
     }
 
     /// Exact max-content size for one fallback word item. Paragraph IFCs keep
@@ -1567,6 +1911,16 @@ impl TextEngine {
             crate::ReplacedIntrinsic::from_dimensions(width, height),
             style,
         )
+    }
+
+    pub(crate) fn register_native_control(
+        &mut self, width: f32, height: f32, style: &LayoutStyle,
+    ) -> usize {
+        let mut item = ReplacedItem::from_style(width, height, style);
+        item.independent_axes = true;
+        let index = self.replaced.len();
+        self.replaced.push(item);
+        REPLACED_CONTEXT_BIT | index
     }
 
     pub(crate) fn register_replaced_intrinsic(
@@ -1838,6 +2192,145 @@ impl TextEngine {
         }
         out
     }
+
+    fn caret_source(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+    ) -> Option<(String, Vec<CaretBoundary>)> {
+        let item = self.items.get(index)?;
+        let base = styles.get(&parent)?;
+        let mut collector = Collector::new();
+        collector.caret_boundaries = Some(Vec::new());
+        let font = resolve_loaded_font(base.font_family.as_deref(),
+            crate::style::used_font_weight(base), base.font_style_italic.unwrap_or(false),
+            &self.loaded_families);
+        let ctx = base_span_ctx(base, font, &mut collector);
+        let mut spans = Vec::new();
+        if let Some((first, last)) = item.caret_run {
+            let mut children = crate::dom::rendered_children(tree, parent);
+            if !children.contains(&first) || !children.contains(&last) {
+                let mut flattened = Vec::new();
+                crate::dom::flatten_boxless_inline_children(tree, &children, styles, &mut flattened);
+                children = flattened;
+            }
+            let start = children.iter().position(|id| *id == first)?;
+            let end = children.iter().position(|id| *id == last)?;
+            for &id in children.get(start..=end)? {
+                collect_node_spans(tree, id, styles, ctx.clone(), &mut spans,
+                    &mut collector, &self.loaded_families);
+            }
+        } else {
+            collect_spans(tree, parent, styles, ctx, &mut spans,
+                &mut collector, &self.loaded_families);
+        }
+        let mut source: String = spans.into_iter().map(|(text, _)| text).collect();
+        if matches!(base.white_space.unwrap_or_default(),
+            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
+            && source.ends_with(' ')
+        {
+            source.pop();
+        }
+        let mut boundaries = collector.caret_boundaries?;
+        boundaries.retain(|boundary| boundary.byte <= source.len());
+        Some((source, boundaries))
+    }
+
+    /// Use the retained glyph clusters for hit testing, then translate the
+    /// shaped byte cursor into the original DOM node's UTF-16 boundary.
+    pub(crate) fn caret_from_point(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+        x: f32,
+        y: f32,
+        hit: NodeId,
+    ) -> Option<(NodeId, usize, f32)> {
+        let item = self.items.get(index)?;
+        let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
+        if hit != parent && !boundaries.iter().any(|boundary|
+            boundary.node == hit || tree.ancestors(boundary.node).contains(&hit))
+        { return None; }
+        let starts = source_line_starts(&item.buffer, &source);
+        let mut best: Option<(f32, usize, cosmic_text::Affinity)> = None;
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = *starts.get(run.line_i)?;
+            let end = start + run.text.len();
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            for glyph in run.glyphs {
+                if glyph.w <= 0.0 || item.marker.is_some_and(|marker|
+                    marker.line_index == line_index && glyph.x + indent + glyph.w > marker.content_end)
+                { continue; }
+                let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                let dx = item.origin.0 + indent + relative.0
+                    + line_edge_alignment_shift(item, start, end)
+                    + line_advance_before_text(item, start + glyph.start, start, end);
+                let dy = item.origin.1 + relative.1;
+                let left = dx + glyph.x;
+                let top = dy + run.line_top;
+                let distance = (x - x.clamp(left, left + glyph.w)).powi(2)
+                    + (y - y.clamp(top, top + run.line_height)).powi(2);
+                if best.as_ref().is_some_and(|(old, _, _)| *old <= distance) { continue; }
+                // Buffer::hit already implements grapheme/ligature and bidi
+                // boundaries. Remove the extra offsets applied by paint.
+                let hit_x = (x - dx).clamp(glyph.x, glyph.x + glyph.w);
+                let cursor = item.buffer.hit(hit_x, run.line_top + run.line_height * 0.5)?;
+                best = Some((distance, start + cursor.index, cursor.affinity));
+            }
+        }
+        let (distance, byte, affinity) = best?;
+        let nearest = boundaries.iter().map(|boundary| boundary.byte.abs_diff(byte)).min()?;
+        let matches = |boundary: &&CaretBoundary| boundary.byte.abs_diff(byte) == nearest;
+        let boundary = if affinity == cosmic_text::Affinity::Before {
+            boundaries.iter().find(matches)
+        } else {
+            boundaries.iter().rev().find(matches)
+        }?;
+        Some((boundary.node, boundary.offset, distance))
+    }
+
+    pub(crate) fn caret_rect(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+        node: NodeId,
+        offset: usize,
+    ) -> Option<Rect> {
+        let item = self.items.get(index)?;
+        let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
+        let boundary = boundaries.iter().filter(|boundary| boundary.node == node)
+            .min_by_key(|boundary| boundary.offset.abs_diff(offset))?;
+        let starts = source_line_starts(&item.buffer, &source);
+        let style = tree.with_node(node, |node| node.parent)
+            .flatten().and_then(|id| styles.get(&id)).or_else(|| styles.get(&parent))?;
+        let (ascent, descent) = self.inline_font_box_metrics(style);
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = *starts.get(run.line_i)?;
+            let byte = boundary.byte.checked_sub(start)?;
+            let Some(glyph) = run.glyphs.iter().find(|glyph| glyph.start <= byte && byte <= glyph.end) else {
+                continue;
+            };
+            let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            return Some(Rect {
+                x: item.origin.0 + run_cursor_x(&run, byte) + indent + relative.0
+                    + line_edge_alignment_shift(item, start, start + run.text.len())
+                    + line_advance_before_text(item, start + glyph.start, start, start + run.text.len()),
+                y: item.origin.1 + run.line_y + relative.1 - ascent,
+                width: 0.0,
+                height: ascent + descent,
+            });
+        }
+        None
+    }
 }
 
 /// A run of same-styled inline text.
@@ -1854,6 +2347,8 @@ struct SpanAttrs {
     italic: bool,
     synthetic_italic: bool,
     underline: bool,
+    overline: bool,
+    line_through: bool,
     color: [u8; 4],
     family: Arc<str>,
     clip_fill: Option<usize>,
@@ -1955,7 +2450,12 @@ impl SpanAttrs {
             word_break,
             overflow_wrap,
         });
-        a = a.metadata(fill | variation | usize::from(self.underline));
+        a = a.metadata(
+            fill | variation
+                | usize::from(self.underline) * META_UNDERLINE
+                | usize::from(self.overline) * META_OVERLINE
+                | usize::from(self.line_through) * META_LINE_THROUGH,
+        );
         a
     }
 }
@@ -1976,6 +2476,8 @@ struct SpanCtx {
     italic: bool,
     synthetic_italic: bool,
     underline: bool,
+    overline: bool,
+    line_through: bool,
     transform: TextTransform,
     white_space: crate::WhiteSpace,
     overflow_wrap: crate::OverflowWrap,
@@ -1992,6 +2494,14 @@ struct Collector {
     owner_boxes: Vec<InlineOwnerBox>,
     boundary_events: Vec<InlineBoundaryEvent>,
     text_len: usize,
+    caret_boundaries: Option<Vec<CaretBoundary>>,
+}
+
+#[derive(Clone, Copy)]
+struct CaretBoundary {
+    byte: usize,
+    node: NodeId,
+    offset: usize,
 }
 
 impl Collector {
@@ -2004,6 +2514,7 @@ impl Collector {
             owner_boxes: Vec::new(),
             boundary_events: Vec::new(),
             text_len: 0,
+            caret_boundaries: None,
         }
     }
 
@@ -2119,6 +2630,8 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         italic: base.font_style_italic.unwrap_or(false),
         synthetic_italic: font.synthetic_italic,
         underline: base.underline.unwrap_or(false),
+        overline: base.overline.unwrap_or(false),
+        line_through: base.line_through.unwrap_or(false),
         transform: base.text_transform.unwrap_or(TextTransform::None),
         white_space: base.white_space.unwrap_or_default(),
         overflow_wrap: base.overflow_wrap.unwrap_or_default(),
@@ -2155,7 +2668,7 @@ fn collect_node_spans(
     c: &mut Collector,
     loaded_families: &HashMap<String, LoadedFamily>,
 ) {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return;
     };
     match &node.data {
@@ -2172,6 +2685,8 @@ fn collect_node_spans(
                 italic: ctx.italic,
                 synthetic_italic: ctx.synthetic_italic,
                 underline: ctx.underline,
+                overline: ctx.overline,
+                line_through: ctx.line_through,
                 color: ctx.color,
                 family: Arc::clone(&ctx.family),
                 clip_fill: ctx.clip_fill,
@@ -2179,7 +2694,7 @@ fn collect_node_spans(
                 overflow_wrap: ctx.overflow_wrap,
                 word_break: ctx.word_break,
             };
-            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c);
+            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c, Some(cid));
         }
         _ => {
             let Some(elem) = node.as_element() else {
@@ -2204,6 +2719,8 @@ fn collect_node_spans(
                         italic: ctx.italic,
                         synthetic_italic: ctx.synthetic_italic,
                         underline: ctx.underline,
+                        overline: ctx.overline,
+                        line_through: ctx.line_through,
                         color: ctx.color,
                         family: Arc::clone(&ctx.family),
                         clip_fill: ctx.clip_fill,
@@ -2282,6 +2799,8 @@ fn collect_node_spans(
                 // Underline propagates in: an ancestor's underline covers
                 // descendant text; an element only sets its own via CSS.
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
+                overline: ctx.overline || style.and_then(|style| style.overline).unwrap_or(false),
+                line_through: ctx.line_through || style.and_then(|style| style.line_through).unwrap_or(false),
                 transform: style
                     .and_then(|s| s.text_transform)
                     .unwrap_or(ctx.transform),
@@ -2308,9 +2827,44 @@ fn push_text(
     attrs: &SpanAttrs,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
+    node: Option<NodeId>,
 ) {
+    let start = c.text_len;
+    let buf = if let (Some(boundaries), Some(node)) = (&mut c.caret_boundaries, node) {
+        normalize_text(raw, transform, white_space, &mut c.last_was_space, |byte, offset| {
+            // Pre-line normalization can remove the space before a newline.
+            while boundaries.last().is_some_and(|boundary| boundary.byte > start + byte) {
+                boundaries.pop();
+            }
+            boundaries.push(CaretBoundary { byte: start + byte, node, offset });
+        })
+    } else {
+        normalize_text(raw, transform, white_space, &mut c.last_was_space, |_, _| {})
+    };
+    if buf.is_empty() {
+        return;
+    }
+    c.record_text(buf.len());
+    if let Some((last_text, last_attrs)) = out.last_mut() {
+        if last_attrs == attrs {
+            last_text.push_str(&buf);
+            return;
+        }
+    }
+    out.push((buf, attrs.clone()));
+}
+
+fn normalize_text(
+    raw: &str,
+    transform: TextTransform,
+    white_space: crate::WhiteSpace,
+    last_was_space: &mut bool,
+    mut boundary: impl FnMut(usize, usize),
+) -> String {
     let mut buf = String::new();
-    let mut at_word_start = c.last_was_space;
+    let mut at_word_start = *last_was_space;
+    let mut offset = 0;
+    boundary(0, 0);
     for ch in raw.chars() {
         if ch.is_whitespace() {
             match white_space {
@@ -2323,10 +2877,10 @@ fn push_text(
                     }
                     buf.push('\n');
                 }
-                _ if !c.last_was_space => buf.push(' '),
+                _ if !*last_was_space => buf.push(' '),
                 _ => {}
             }
-            c.last_was_space = true;
+            *last_was_space = true;
             at_word_start = true;
         } else {
             match transform {
@@ -2335,21 +2889,13 @@ fn push_text(
                 TextTransform::Capitalize if at_word_start => buf.extend(ch.to_uppercase()),
                 _ => buf.push(ch),
             }
-            c.last_was_space = false;
+            *last_was_space = false;
             at_word_start = false;
         }
+        offset += ch.len_utf16();
+        boundary(buf.len(), offset);
     }
-    if buf.is_empty() {
-        return;
-    }
-    c.record_text(buf.len());
-    if let Some((last_text, last_attrs)) = out.last_mut() {
-        if last_attrs == attrs {
-            last_text.push_str(&buf);
-            return;
-        }
-    }
-    out.push((buf, attrs.clone()));
+    buf
 }
 
 fn boundary_event_on_line(
@@ -2836,13 +3382,13 @@ pub(crate) fn default_replaced_intrinsic_size(
 /// genuinely cannot fold are rejected: replaced/atomic elements, block-level
 /// children, floats, out-of-flow positioned boxes, and elements with generated
 /// content (which would be lost).
-fn inline_child_ok(
+pub(crate) fn inline_child_ok(
     tree: &DomTree,
     cid: NodeId,
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,
     has_text: &mut bool,
 ) -> bool {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return true;
     };
     match &node.data {
@@ -3175,10 +3721,6 @@ impl TextEngine {
             .map(|source| source_line_starts(&item.buffer, source))
             .unwrap_or_default();
 
-        // Collect underline segments before drawing glyphs (both borrow the
-        // buffer). Underline is carried per glyph via metadata; group runs of
-        // consecutive underlined glyphs on a line into one stroke below the
-        // baseline. Done first so the draw() mutable borrow does not overlap.
         let mut underlines: Vec<(f32, f32, f32, f32, [u8; 4])> = Vec::new(); // x0, x1, y, thickness, color
         let mut fill_bounds: Vec<Option<(f32, f32, f32, f32)>> = vec![None; item.clip_fills.len()];
         for (line_index, run) in item.buffer.layout_runs().enumerate() {
@@ -3192,7 +3734,8 @@ impl TextEngine {
             let inline_alignment =
                 line_edge_alignment_shift(item, line_source_start, line_source_end);
             let base_y = run.line_y;
-            let mut seg: Option<(f32, f32, f32, [u8; 4], (f32, f32))> = None;
+            let mut segments: [Option<(f32, f32, f32, [u8; 4], (f32, f32))>; 3] = [None; 3];
+            let mut active_decorations = 0;
             for g in run.glyphs {
                 // Keep decoration and background-clip bounds in lockstep with
                 // glyph painting. A truncated glyph must not leave an
@@ -3216,7 +3759,7 @@ impl TextEngine {
                         line_source_start,
                         line_source_end,
                     );
-                let underlined = g.metadata & META_UNDERLINE != 0;
+                let decoration_flags = g.metadata & META_DECORATIONS;
                 if let Some(fill_index) = metadata_fill(g.metadata) {
                     if let Some(bounds) = fill_bounds.get_mut(fill_index) {
                         let glyph_bounds = (
@@ -3243,51 +3786,42 @@ impl TextEngine {
                 if print_economy {
                     col = crate::paint::print_economy_color(col);
                 }
-                if underlined {
-                    match &mut seg {
-                        Some((_, x1, fs, c, prior_relative))
-                            if *c == col && *prior_relative == relative =>
-                        {
-                            *x1 = g.x + line_offset + g.w + relative.0;
-                            *fs = fs.max(g.font_size);
-                        }
-                        _ => {
-                            if let Some((x0, x1, fs, c, prior_relative)) = seg.take() {
-                                underlines.push((
-                                    x0,
-                                    x1,
-                                    base_y + prior_relative.1 + (fs * 0.12).max(1.0),
-                                    (fs / 14.0).max(1.0),
-                                    c,
+                if decoration_flags | active_decorations == 0 {
+                    continue;
+                }
+                active_decorations = decoration_flags;
+                for (index, flag) in [META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH].into_iter().enumerate() {
+                    let segment = &mut segments[index];
+                    if decoration_flags & flag != 0 {
+                        match segment {
+                            Some((_, end, size, color, prior_relative))
+                                if *color == col && *prior_relative == relative =>
+                            {
+                                *end = g.x + line_offset + g.w + relative.0;
+                                *size = size.max(g.font_size);
+                            }
+                            _ => {
+                                if let Some(previous) = segment.take() {
+                                    underlines.push(decoration_stroke(previous, base_y, flag));
+                                }
+                                *segment = Some((
+                                    g.x + line_offset + relative.0,
+                                    g.x + line_offset + g.w + relative.0,
+                                    g.font_size,
+                                    col,
+                                    relative,
                                 ));
                             }
-                            seg = Some((
-                                g.x + line_offset + relative.0,
-                                g.x + line_offset + g.w + relative.0,
-                                g.font_size,
-                                col,
-                                relative,
-                            ));
                         }
+                    } else if let Some(previous) = segment.take() {
+                        underlines.push(decoration_stroke(previous, base_y, flag));
                     }
-                } else if let Some((x0, x1, fs, c, relative)) = seg.take() {
-                    underlines.push((
-                        x0,
-                        x1,
-                        base_y + relative.1 + (fs * 0.12).max(1.0),
-                        (fs / 14.0).max(1.0),
-                        c,
-                    ));
                 }
             }
-            if let Some((x0, x1, fs, c, relative)) = seg.take() {
-                underlines.push((
-                    x0,
-                    x1,
-                    base_y + relative.1 + (fs * 0.12).max(1.0),
-                    (fs / 14.0).max(1.0),
-                    c,
-                ));
+            for (segment, flag) in segments.into_iter().zip([META_UNDERLINE, META_OVERLINE, META_LINE_THROUGH]) {
+                if let Some(previous) = segment {
+                    underlines.push(decoration_stroke(previous, base_y, flag));
+                }
             }
         }
 
@@ -3559,6 +4093,142 @@ mod tests {
     }
 
     #[test]
+    fn embedded_font_database_is_initialized_once() {
+        let _first = TextEngine::new();
+        let _second = TextEngine::new();
+        assert_eq!(BASE_FONT_DATABASE_BUILDS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn repeated_web_font_set_reuses_the_parsed_database() {
+        let font = WebFont {
+            data: Arc::new(FALLBACK.to_vec()),
+            family: Some("Issue 879 cache fixture".to_string()),
+            weight: Some((400, 400)),
+            italic: Some(false),
+        };
+        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_none());
+        let first = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
+        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_some());
+        let second = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
+        assert_eq!(
+            first.loaded_families["issue 879 cache fixture"].faces[0].metrics,
+            second.loaded_families["issue 879 cache fixture"].faces[0].metrics,
+        );
+
+        let mut different_descriptor = font;
+        different_descriptor.weight = Some((700, 700));
+        assert!(
+            cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_plain_text_reuses_the_attributed_buffer_template() {
+        let tree = obscura_dom::parse_html(
+            "<p id='first'>repeated label</p><p id='second'>repeated label</p>",
+        );
+        let first = tree.get_element_by_id("first").unwrap();
+        let second = tree.get_element_by_id("second").unwrap();
+        let style = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            line_height: Some(crate::LineHeight::Px(20.0)),
+            ..Default::default()
+        };
+        let styles = HashMap::from([(first, style.clone()), (second, style)]);
+        let mut engine = TextEngine::new();
+        let first_item = engine.try_build(&tree, first, &styles).unwrap();
+        let second_item = engine.try_build(&tree, second, &styles).unwrap();
+
+        assert_eq!(engine.shape_template_count, 1);
+        assert_eq!(engine.shape_template_hits, 1);
+        assert_eq!(
+            engine.measure(first_item, Some(120.0)),
+            engine.measure(second_item, Some(120.0))
+        );
+    }
+
+    #[test]
+    fn repeated_measurements_reuse_exact_results_and_preserve_final_paint() {
+        let tree = obscura_dom::parse_html(
+            "<p id='copy'>alpha <span id='inline'>beta gamma delta epsilon</span> zeta</p>",
+        );
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let base = LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            text_indent: Some(Dimension::Px(7.25)),
+            ..Default::default()
+        };
+        let child = LayoutStyle {
+            display: Display::Inline,
+            padding: crate::Edges {
+                left: 3.5,
+                right: 2.25,
+                ..Default::default()
+            },
+            ..base.clone()
+        };
+        let styles = HashMap::from([(copy, base), (inline, child)]);
+        let mut engine = TextEngine::new();
+        let item = engine.try_build(&tree, copy, &styles).unwrap();
+
+        for (width, wrap) in [
+            (None, Wrap::WordOrGlyph),
+            (Some(0.0), Wrap::WordOrGlyph),
+            (Some(100.01), Wrap::None),
+            (Some(100.49), Wrap::WordOrGlyph),
+            (Some(100.51), Wrap::Glyph),
+        ] {
+            let actual = engine.measure_text_with_wrap(item, width, wrap);
+            let cached_entries = engine.items[item].measured.len();
+            assert_eq!(
+                engine.measure_text_with_wrap(item, width, wrap),
+                actual
+            );
+            assert_eq!(engine.items[item].measured.len(), cached_entries);
+
+            let mut fresh = TextEngine::new();
+            let fresh_item = fresh.try_build(&tree, copy, &styles).unwrap();
+            assert_eq!(
+                actual,
+                fresh.measure_text_with_wrap(fresh_item, width, wrap)
+            );
+            engine.finalize(item, (0.0, 0.0), 100.49, None);
+            fresh.finalize(fresh_item, (0.0, 0.0), 100.49, None);
+            let mut actual_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            let mut expected_image = tiny_skia::Pixmap::new(220, 120).unwrap();
+            engine.paint_item(item, &mut actual_image, (0.0, 0.0));
+            fresh.paint_item(fresh_item, &mut expected_image, (0.0, 0.0));
+            assert_eq!(actual_image.data(), expected_image.data());
+        }
+    }
+
+    #[test]
+    fn configured_font_directory_loads_nested_fonts_and_skips_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "obscura-font-directory-test-{}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+        let font = variable_font_fixture();
+        std::fs::write(nested.join("fixture.TTF"), &font).unwrap();
+        std::fs::write(nested.join("ignored.txt"), &font).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, nested.join("cycle")).unwrap();
+
+        assert!(configure_font_directories(vec![root.clone()]));
+        let engine = TextEngine::new();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(engine.loaded_families.contains_key("obscura vf test"));
+    }
+
+    #[test]
     fn text_surface_cull_is_conservative_for_offsets_and_ink_overhang() {
         let (mut engine, item) = surface_cull_fixture();
         assert!(inline_item_may_intersect_surface(
@@ -3762,7 +4432,7 @@ mod tests {
     #[test]
     fn declared_web_family_keeps_the_loaded_faces_line_metrics() {
         let engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: FALLBACK.to_vec(),
+            data: Arc::new(FALLBACK.to_vec()),
             family: Some("Page Face".to_string()),
             weight: Some((400, 400)),
             italic: Some(false),
@@ -4017,7 +4687,7 @@ mod tests {
 
     #[test]
     fn descriptor_selected_resource_pins_the_exact_font_face() {
-        let data = SANS_R.to_vec();
+        let data = Arc::new(SANS_R.to_vec());
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
                 data: data.clone(),
@@ -4126,6 +4796,8 @@ mod tests {
             italic: false,
             synthetic_italic: false,
             underline: true,
+            overline: true,
+            line_through: true,
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
             clip_fill: Some(37),
@@ -4134,7 +4806,7 @@ mod tests {
             word_break: crate::WordBreak::Normal,
         };
         let shaped = attrs.to_attrs(42);
-        assert_ne!(shaped.metadata & META_UNDERLINE, 0);
+        assert_eq!(shaped.metadata & META_DECORATIONS, META_DECORATIONS);
         assert_eq!(metadata_fill(shaped.metadata), Some(37));
         assert_eq!(metadata_variation(shaped.metadata), Some(41));
         assert_eq!(
@@ -4206,6 +4878,8 @@ mod tests {
             italic: false,
             synthetic_italic: false,
             underline: false,
+            overline: false,
+            line_through: false,
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
             clip_fill: None,
@@ -4271,7 +4945,7 @@ mod tests {
     #[test]
     fn variable_font_multi_axis_shaping_preserves_space_advance() {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".into()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4306,14 +4980,16 @@ mod tests {
     {
         let mut engine = TextEngine::new_with_web_fonts(&[
             WebFont {
-                data: include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
-                    .to_vec(),
+                data: Arc::new(
+                    include_bytes!("../../../vendor/cosmic-text/fonts/NotoSansArabic.ttf")
+                        .to_vec(),
+                ),
                 family: Some("Static Primary".to_string()),
                 weight: Some((400, 400)),
                 italic: Some(false),
             },
             WebFont {
-                data: variable_font_fixture(),
+                data: Arc::new(variable_font_fixture()),
                 family: Some("Variable Fallback".to_string()),
                 weight: Some((100, 900)),
                 italic: Some(false),
@@ -4458,7 +5134,7 @@ mod tests {
 
     fn render_variable_weight(weight: u16) -> ((f32, f32), u64, Vec<u16>) {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4552,7 +5228,7 @@ mod tests {
     #[test]
     fn variable_glyph_cache_keys_include_weight_axis() {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),
@@ -4599,7 +5275,7 @@ mod tests {
         width: f32,
     ) -> ((f32, f32), usize, std::collections::HashSet<u32>) {
         let mut engine = TextEngine::new_with_web_fonts(&[WebFont {
-            data: variable_font_fixture(),
+            data: Arc::new(variable_font_fixture()),
             family: Some("Obscura VF Test".to_string()),
             weight: Some((100, 900)),
             italic: Some(false),

@@ -4,7 +4,10 @@
 - C compiler (gcc or clang)
 - ~5 GB free disk space (V8 compiles from source on first build)
 
-First build takes about 5 minutes. Incremental builds are seconds.
+Build time depends on the machine and cache state. Cargo reuses unchanged
+dependencies, but a release source edit can still require substantial compilation
+and linking. For the scoped incremental runtime workflow, see
+[Fast edit/test loop](Testing-and-debugging.md#fast-edittest-loop).
 
 ## Build
 

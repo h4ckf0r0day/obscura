@@ -38,6 +38,15 @@ const items = await page.$$eval('.item', els => els.map(el => ({
 })));
 ```
 
+## SVG element interfaces
+
+SVG nodes created with `document.createElementNS` or parsed from SVG markup
+expose their corresponding interfaces, such as `SVGImageElement` and
+`SVGUseElement`, with prototype ancestry from the [SVG IDL](https://svgwg.org/svg2-draft/idl.html)
+and [Filter Effects IDL](https://www.w3.org/TR/filter-effects-1/#svg-interfaces). This supports interface
+checks in page scripts; it does not imply support for every SVG property,
+method or rendering feature.
+
 ## Interact
 
 ```js
@@ -81,6 +90,44 @@ await page.route('**/*', route => {
   }
 });
 ```
+
+## JavaScript heap measurements
+
+```js
+const client = await context.newCDPSession(page);
+await client.send('HeapProfiler.collectGarbage'); // Optional explicit collection.
+const heap = await client.send('Runtime.getHeapUsage');
+console.log(heap.usedSize, heap.totalSize, heap.backingStorageSize);
+await client.detach();
+```
+
+These are native V8 isolate byte counts, not process memory. Reading them does
+not run page tasks or force collection. `embedderHeapUsedSize` is zero because
+Obscura's Rust DOM is not a V8-managed cppgc heap; Rust allocations and renderer
+memory are not included.
+
+## Application timing
+
+Page scripts can record `performance.mark()` and `performance.measure()`
+entries, retrieve them through the timeline getters, and observe them through
+`PerformanceObserver`, including buffered delivery. Measurement options accept
+named marks or numeric timestamps; `detail` is structured-cloned.
+
+`PerformanceObserver.supportedEntryTypes` reports `mark` and `measure` only.
+Navigation, resource, paint, and long-task entries are not emitted. User Timing
+entries remain available until cleared or the realm is destroyed; applications
+that continuously record timings should call `clearMarks()` and `clearMeasures()`.
+Legacy `performance.timing` records main-document navigation start, fetch start,
+response completion and DOM/load milestones. Event-end values remain zero until
+their handlers finish. These read-only, integer epoch timestamps use a native
+monotonic clock and share the real origin with `performance.timeOrigin`; they
+survive runtime suspension and are not replaced by synthetic events or
+`document.open()`/`close()`. Named User Timing measures can use these milestones.
+Transport response completion is observed when the buffered fetch returns.
+DNS, connection, TLS, first-byte, redirect and previous-document unload timings
+remain unavailable rather than fabricated. Child realms record their own DOM
+and load milestones, but do not yet receive the fetch's start/completion metadata.
+This is partial legacy timing support, not Navigation Timing conformance.
 
 ## Multiple pages
 
@@ -147,8 +194,40 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 await browser.close();  // closes the CDP connection, leaves obscura serve running
 ```
 
+## Fetch cancellation
+
+Page `fetch()` honors an `AbortSignal` passed directly or inherited from a
+`Request`. Pre-aborted calls reject with the signal's reason without sending a
+request. Aborting an active fetch cancels native transport work, including a
+pending response body, and releases the page's network-readiness counters.
+Cancelled requests report `Network.loadingFailed` rather than a successful
+`Network.loadingFinished`; the Rust network event exposes `error_text` for
+failed requests. Explicit `signal: null` overrides an inherited signal.
+
+Aborting also errors a fully buffered but unread response body. A drained or
+cancelled body stays closed. `Request` and its clones expose distinct following
+signals; dependent signals are marked aborted before the parent's abort event,
+then receive their own events afterward. Cancellation uses internal abort
+algorithms, not overridable public event methods. Dependency links and internal
+body observers use weak references; signals with live abort listeners remain
+reachable.
+
+Cloned intercepted responses follow cancellation even when their bodies are
+already buffered and have no native transport resource. Browser-generated abort
+events are trusted; dispatching an author-created event does not abort a fetch.
+
+Response bodies remain capped, buffered one-chunk bodies. Cancellation does
+not introduce incremental network stream delivery or backpressure support.
+`Response.clone()` currently shares buffered bytes rather than a byte-stream
+tee. Close/error timing can differ when the last chunk is consumed inside an
+early parent abort listener, before dependent abort steps run.
+
 ## Current limits
 
+- `document.queryCommandSupported()` reports editing commands as unsupported.
+  `execCommand()` does not perform clipboard or rich-text editing operations.
+  Capability detection allows editor libraries to initialize; it is not full
+  editor interaction support.
 - Playwright `page.video()` and tracing artifacts that require desktop capture
   are not implemented. Use the raw CDP flow above for page frames.
 - `BrowserContext` storage-state save/restore remains limited; use

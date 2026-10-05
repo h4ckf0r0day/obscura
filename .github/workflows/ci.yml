@@ -2,6 +2,8 @@ name: PR checks
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 # Pull requests execute contributor-controlled build scripts, proc macros,
 # tests, and binaries. They must never receive a write token or repository
@@ -22,6 +24,7 @@ env:
 jobs:
   policy:
     name: PR / Policy
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     outputs:
@@ -79,6 +82,7 @@ jobs:
                 audit=true
                 ;;
               .github/workflows/ci.yml)
+                runtime=true
                 audit=true
                 ;;
               scripts/ci/*)
@@ -113,7 +117,11 @@ jobs:
   core:
     name: PR / Core
     needs: policy
-    if: needs.policy.outputs.runtime == 'true'
+    # A successful main build warms dependencies for read-only PR jobs.
+    if: >-
+      !cancelled() &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (needs.policy.result == 'success' && needs.policy.outputs.runtime == 'true'))
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -131,6 +139,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
+      - name: Test obstacle comparison gate
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
         with:
@@ -140,9 +151,10 @@ jobs:
       - name: Restore Rust dependency cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # PR caches are restored but never saved. A contributor therefore
-          # cannot poison a cache later consumed by a release.
-          save-if: false
+          shared-key: obscura-ci-dependencies
+          # Only successful main builds save. PRs remain restore-only and
+          # release workflows do not consume this cache.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build render release
         run: cargo build --release -p obscura-cli --bins --features render
@@ -152,6 +164,29 @@ jobs:
 
       - name: Stage candidate binary for comparison
         run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
+
+      - name: Checkout pinned obstacle course
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: h4ckf0r0day/obscura-benchmark
+          ref: 2d08d9a8e860e423b47209434a9fba9c75e6eee6
+          path: obscura-benchmark
+          persist-credentials: false
+
+      - name: Require all 33 obstacle stages
+        run: |
+          OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-pr" \
+            python3 obscura-benchmark/obstacle-course/run.py \
+              --json --runs 1 --warmup 0 > "$RUNNER_TEMP/obscura-ci/obstacle-candidate.json"
+
+      - name: Upload obstacle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: core-obstacle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/obscura-ci/obstacle-candidate.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build render and stealth release
         run: cargo build --release -p obscura-cli --bins --features render,stealth
@@ -202,17 +237,17 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 75
     steps:
-      - name: Checkout merge result
+      - name: Checkout trusted base revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          fetch-depth: 0
+          ref: ${{ needs.policy.outputs.base-sha }}
           persist-credentials: false
 
       - name: Checkout pinned obstacle course
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: h4ckf0r0day/obscura-benchmark
-          ref: 6ebac8293d7477f59e837768bfd4e74173f04f1c
+          ref: 2d08d9a8e860e423b47209434a9fba9c75e6eee6
           path: obscura-benchmark
           persist-credentials: false
 
@@ -234,6 +269,7 @@ jobs:
       - name: Restore Rust dependency cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: obscura-ci-dependencies
           save-if: false
 
       - name: Build base revision
@@ -242,21 +278,15 @@ jobs:
           BASE_SHA: ${{ needs.policy.outputs.base-sha }}
         run: |
           set -euo pipefail
-          base_root="$RUNNER_TEMP/obscura-base"
           script_root="$RUNNER_TEMP/obscura-ci-scripts"
-          git worktree add --detach "$base_root" "$BASE_SHA"
           mkdir -p "$script_root"
           git show "$BASE_SHA:scripts/ci/perf_smoke.py" > "$script_root/perf_smoke.py"
           git show "$BASE_SHA:scripts/ci/compare_obstacle.py" > "$script_root/compare_obstacle.py"
-          # Run from the trusted worktree so a PR-supplied .cargo/config.toml in
-          # the merge checkout cannot alter the compiler or wrapper for the base.
-          (
-            cd "$base_root"
-            CARGO_TARGET_DIR="$RUNNER_TEMP/obscura-base-target" \
-              cargo build --release -p obscura-cli --bins --features render
-          )
+          # Checkout and cache metadata both belong to the trusted base. Build
+          # in the restored target directory, not a separate empty worktree.
+          cargo build --release -p obscura-cli --bins --features render
           install -D -m 0755 \
-            "$RUNNER_TEMP/obscura-base-target/release/obscura" \
+            target/release/obscura \
             "$RUNNER_TEMP/obscura-ci/obscura-base"
           chmod 0755 "$RUNNER_TEMP/obscura-ci/obscura-pr"
 

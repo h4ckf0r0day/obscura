@@ -327,6 +327,12 @@ where
                 (Display::Flex, true) => compute_flexbox_layout(tree, node_id, inputs),
                 #[cfg(feature = "grid")]
                 (Display::Grid, true) => compute_grid_layout(tree, node_id, inputs),
+                #[cfg(feature = "grid")]
+                (Display::Grid, false) if {
+                    let node = &tree.taffy.nodes[node_id.into()];
+                    !node.has_context && (!node.style.grid_template_rows.is_empty()
+                        || !node.style.grid_template_columns.is_empty())
+                } => compute_grid_layout(tree, node_id, inputs),
                 (_, false) => {
                     let node_key = node_id.into();
                     let style = &tree.taffy.nodes[node_key].style;

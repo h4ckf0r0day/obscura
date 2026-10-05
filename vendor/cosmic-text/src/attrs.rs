@@ -334,6 +334,11 @@ impl FontVariations {
     pub fn iter(&self) -> impl Iterator<Item = &FontVariation> {
         self.variations.iter()
     }
+
+    #[cfg(feature = "shape-run-cache")]
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.variations.capacity() * core::mem::size_of::<FontVariation>()
+    }
 }
 
 /// A wrapper for letter spacing to get around that f32 doesn't implement Eq and Hash

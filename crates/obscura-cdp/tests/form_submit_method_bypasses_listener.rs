@@ -192,6 +192,52 @@ async fn cdp_click_submit_button_is_vetoed_by_prevent_default_listener() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cdp_click_on_submit_button_content_activates_the_button() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_form().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-nested-submit";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    navigate(&mut ctx, &url, session_id).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({"expression": "globalThis.__submits=0;var b=document.getElementById('b');b.innerHTML='<span id=inner>Go</span>';b.form.addEventListener('submit',()=>globalThis.__submits++);document.elementFromPoint=()=>document.getElementById('inner')"}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mousePressed", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        4,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mouseReleased", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        session_id,
+    )
+    .await;
+    let result = cdp(
+        &mut ctx,
+        5,
+        "Runtime.evaluate",
+        json!({"expression": "globalThis.__submits", "returnByValue": true}),
+        session_id,
+    )
+    .await;
+
+    assert_eq!(result["result"]["value"], json!(1.0), "button descendants share its activation behavior");
+}
+
 // requestSubmit(submitter) must validate its argument before doing anything
 // else (issue #424): a TypeError if the submitter is not a submit button, and a
 // NotFoundError DOMException if it is not owned by the form. obscura accepted

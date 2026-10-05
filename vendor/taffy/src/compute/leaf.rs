@@ -42,10 +42,16 @@ where
             (node_size, node_min_size, node_max_size, None)
         }
         SizingMode::InherentSize => {
-            let aspect_ratio = style.aspect_ratio();
-            let style_size = style
-                .size()
-                .maybe_resolve(parent_size, &resolve_calc_value)
+            let resolved_size = style.size().maybe_resolve(parent_size, &resolve_calc_value);
+            // A preferred ratio only supplies an automatic axis. Once both
+            // authored axes resolve, including percentages with definite
+            // bases, it must not raise the used height or transfer constraints.
+            let aspect_ratio = if resolved_size.width.is_some() && resolved_size.height.is_some() {
+                None
+            } else {
+                style.aspect_ratio()
+            };
+            let style_size = resolved_size
                 .maybe_apply_aspect_ratio(aspect_ratio)
                 .maybe_add(box_sizing_adjustment);
             let style_min_size = style

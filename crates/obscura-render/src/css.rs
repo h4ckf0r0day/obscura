@@ -25,6 +25,23 @@ pub enum CssMediaType {
     #[default]
     Screen,
     Print,
+    ScreenReducedMotion,
+    PrintReducedMotion,
+}
+
+impl CssMediaType {
+    pub fn with_reduced_motion(self, reduce: bool) -> Self {
+        match (self, reduce) {
+            (Self::Print | Self::PrintReducedMotion, false) => Self::Print,
+            (Self::Print | Self::PrintReducedMotion, true) => Self::PrintReducedMotion,
+            (_, false) => Self::Screen,
+            (_, true) => Self::ScreenReducedMotion,
+        }
+    }
+
+    pub fn reduced_motion(self) -> bool {
+        matches!(self, Self::ScreenReducedMotion | Self::PrintReducedMotion)
+    }
 }
 
 /// The part of the tree whose selector match may change when a dependency on
@@ -111,7 +128,7 @@ fn relational_key_may_match(
     tree: &DomTree,
     node: NodeId,
 ) -> bool {
-    let Some(dom_node) = tree.get_node(node) else {
+    let Some(dom_node) = tree.borrow_node(node) else {
         return false;
     };
     if dom_node.as_element().is_none() {
@@ -147,7 +164,7 @@ impl RelationalInvalidation {
     }
 
     pub(crate) fn relative_path_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
-        let Some(dom_node) = tree.get_node(node) else {
+        let Some(dom_node) = tree.borrow_node(node) else {
             return false;
         };
         let Some(element) = dom_node.as_element() else {
@@ -281,7 +298,7 @@ impl InvalidationMap {
         {
             return true;
         }
-        let Some(node) = tree.get_node(node) else {
+        let Some(node) = tree.borrow_node(node) else {
             return false;
         };
         let reaches_sibling = |dependencies: &[InvalidationDependency]| {
@@ -616,17 +633,11 @@ fn invalidation_compounds(selector: &str) -> (Vec<(String, InvalidationReaches)>
     } else if compounds.is_empty() {
         malformed = true;
     }
-    let mut descendants_to_right = false;
-    for (_, reaches) in compounds.iter_mut().rev() {
-        if reaches.contains(InvalidationReaches::DESCENDANTS) {
-            descendants_to_right = true;
-        } else if descendants_to_right && reaches.contains(InvalidationReaches::SIBLINGS) {
-            // `.foo ~ .bar .child`: a change to `.foo` can affect descendants
-            // of following siblings. A flat Siblings reach is insufficient
-            // unless phase 2 also carries the remaining descendant path.
-            *reaches = reaches.union(InvalidationReaches::CONSERVATIVE);
-        }
-    }
+    // The renderer expands SIBLINGS into entire following-sibling subtrees.
+    // An ordinary chain such as `.foo ~ .bar .child` therefore remains within
+    // that scope: later combinators move only down or to later siblings.
+    // Nested selector-list composition still uses its separate conservative
+    // fallback when a flat reach cannot describe the outer continuation.
     (compounds, malformed)
 }
 
@@ -1592,9 +1603,9 @@ fn append_declaration_stream(target: &mut String, declarations: &str) {
 const NO_CANDIDATE_SLOT: u32 = u32::MAX;
 
 fn is_root_element(tree: &DomTree, nid: NodeId) -> bool {
-    tree.get_node(nid)
+    tree.borrow_node(nid)
         .and_then(|node| node.parent)
-        .and_then(|parent| tree.get_node(parent))
+        .and_then(|parent| tree.borrow_node(parent))
         .is_some_and(|parent| parent.is_document())
 }
 
@@ -1722,7 +1733,7 @@ impl PseudoRuleMap {
         if self.candidate_slot_count != 0 {
             matcher.begin_candidate_collection(self.candidate_slot_count);
         }
-        let Some(node) = tree.get_node(nid) else {
+        let Some(node) = tree.borrow_node(nid) else {
             return false;
         };
         node.as_element().is_some_and(|element| {
@@ -2214,13 +2225,13 @@ impl<'a> ContainerQueryEvaluator<'a> {
             .unwrap_or_default();
         let mut candidate = match kind {
             ContainerQuerySubjectKind::Element => {
-                self.tree.get_node(subject).and_then(|node| node.parent)
+                self.tree.borrow_node(subject).and_then(|node| node.parent)
             }
             ContainerQuerySubjectKind::OriginatingPseudo => Some(subject),
         };
         while let Some(id) = candidate {
             self.stats.ancestor_steps += 1;
-            let parent = self.tree.get_node(id).and_then(|node| node.parent);
+            let parent = self.tree.borrow_node(id).and_then(|node| node.parent);
             if let Some(container) = self.snapshot.boxes.get(&id) {
                 let supports_axis = match container.container_type {
                     crate::ContainerType::Normal => !required_axes.inline && !required_axes.block,
@@ -2432,6 +2443,20 @@ struct CachedStylesheet {
 }
 
 impl StylesheetCache {
+    // A style-only read must not replace the key that validates retained layout
+    // styles. A miss goes through normal preparation before taking this path.
+    pub(crate) fn get(
+        &self,
+        sources: &[String],
+        viewport: (f32, f32),
+        media_type: CssMediaType,
+    ) -> Option<Arc<Stylesheet>> {
+        let entry = self.entry.as_ref()?;
+        (entry.viewport_bits == (viewport.0.to_bits(), viewport.1.to_bits())
+            && entry.media_type == media_type && entry.sources == sources)
+            .then(|| Arc::clone(&entry.sheet))
+    }
+
     pub(crate) fn get_or_parse(
         &mut self,
         tree: &DomTree,
@@ -2440,14 +2465,9 @@ impl StylesheetCache {
         media_type: CssMediaType,
     ) -> (Arc<Stylesheet>, bool) {
         let viewport_bits = (viewport.0.to_bits(), viewport.1.to_bits());
-        if let Some(entry) = self.entry.as_ref() {
-            if entry.viewport_bits == viewport_bits
-                && entry.media_type == media_type
-                && entry.sources == sources
-            {
-                self.hits = self.hits.saturating_add(1);
-                return (Arc::clone(&entry.sheet), true);
-            }
+        if let Some(sheet) = self.get(sources, viewport, media_type) {
+            self.hits = self.hits.saturating_add(1);
+            return (sheet, true);
         }
 
         self.misses = self.misses.saturating_add(1);
@@ -2564,7 +2584,7 @@ impl Stylesheet {
         if self.candidate_slot_count != 0 {
             matcher.begin_candidate_collection(self.candidate_slot_count);
         }
-        let Some(node) = tree.get_node(nid) else {
+        let Some(node) = tree.borrow_node(nid) else {
             return false;
         };
         let normal_match = node.as_element().is_some_and(|element| {
@@ -3062,7 +3082,7 @@ impl Stylesheet {
                     }
                 };
 
-            if let Some(node) = tree.get_node(nid) {
+            if let Some(node) = tree.borrow_node(nid) {
                 if let Some(element) = node.as_element() {
                     consider(
                         rules.by_local.get(element.local.as_ref()),
@@ -3225,7 +3245,7 @@ impl Stylesheet {
             }
         };
         let supports_placeholder = tree
-            .get_node(nid)
+            .borrow_node(nid)
             .is_some_and(|node| {
                 node.as_element().is_some_and(|element| {
                     matches!(element.local.as_ref(), "input" | "textarea")
@@ -3452,6 +3472,7 @@ impl Stylesheet {
             None,
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3519,6 +3540,7 @@ impl Stylesheet {
             Some(evaluator),
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3543,6 +3565,7 @@ impl Stylesheet {
         evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         self.apply_internal(
             tree,
@@ -3559,6 +3582,7 @@ impl Stylesheet {
             evaluator,
             animation_sample,
             animation_timeline,
+            ancestor_display_none,
         )
     }
 
@@ -3578,6 +3602,7 @@ impl Stylesheet {
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         let shadow_host_declarations = shadow_host_sheet
             .map(|sheet| {
@@ -3688,7 +3713,7 @@ impl Stylesheet {
             );
         }
         if !self.by_attribute.is_empty() {
-            if let Some(node) = tree.get_node(nid) {
+            if let Some(node) = tree.borrow_node(nid) {
                 if let Some(attributes) = node.attrs() {
                     for attribute in attributes {
                         consider(
@@ -4014,35 +4039,24 @@ impl Stylesheet {
         if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
+            // The winning display declaration participates in animation
+            // eligibility, including !important and shadow-scope declarations.
             for &(_, _, i) in &important_matched {
                 let rule = &self.rules[i];
-                if !rule.important_flags.has_animation {
-                    continue;
-                }
                 let expanded = substitute_declarations(
-                    &rule.important_decls,
-                    props,
-                    rule.important_flags.has_var,
+                    &rule.important_decls, props, rule.important_flags.has_var,
                 );
                 crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             }
-            if inline_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &inline_important,
-                    props,
-                    inline_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if shadow_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &shadow_scope_declarations.important,
-                    props,
-                    shadow_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if let Some(name) = animation_style.animation_name.as_deref() {
+            let expanded = substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            let expanded = substitute_declarations(
+                &shadow_scope_declarations.important, props, shadow_important_flags.has_var,
+            );
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            if ancestor_display_none || animation_style.display == crate::Display::None {
+                animation_timeline.suppress_css_animation(nid, animation_sample);
+            } else if let Some(name) = animation_style.animation_name.as_deref() {
                 if let Some(keyframes) = self.keyframes.get(name) {
                     style.animation_has_render_effect = !keyframes.tracks.is_empty();
                     style.animation_effect_impact = keyframes
@@ -5654,7 +5668,7 @@ fn parse_generated_content_items(
                     .next()
                     .filter(|name| !name.is_empty())?;
                 let value = tree
-                    .get_node(nid)
+                    .borrow_node(nid)
                     .and_then(|node| node.get_attribute(attribute).map(str::to_owned))
                     .unwrap_or_default();
                 items.push(crate::GeneratedContentItem::Text(value));
@@ -6850,8 +6864,8 @@ fn single_media_query_applies_for_viewport(
     let medium = compact.split_once("and").map_or(compact, |(medium, _)| medium);
     let medium_matches = match medium {
         "all" => true,
-        "screen" => media_type == CssMediaType::Screen,
-        "print" => media_type == CssMediaType::Print,
+        "screen" => matches!(media_type, CssMediaType::Screen | CssMediaType::ScreenReducedMotion),
+        "print" => matches!(media_type, CssMediaType::Print | CssMediaType::PrintReducedMotion),
         medium if medium.starts_with('(') => true,
         // Unknown named media such as `speech` do not match either visual
         // rendering mode.
@@ -6869,7 +6883,8 @@ fn single_media_query_applies_for_viewport(
         return false;
     }
     // Reduced-motion / high-contrast / inverted: default (no preference).
-    if compact.contains("prefers-reduced-motion:reduce")
+    if (compact.contains("prefers-reduced-motion:reduce") && !media_type.reduced_motion())
+        || (compact.contains("prefers-reduced-motion:no-preference") && media_type.reduced_motion())
         || compact.contains("prefers-contrast:more")
         || compact.contains("prefers-contrast:less")
         || compact.contains("inverted-colors:inverted")
@@ -7636,7 +7651,7 @@ mod tests {
             trigger,
             InvalidationReaches::SIBLINGS,
         ));
-        assert!(dependencies_reach(
+        assert!(!dependencies_reach(
             trigger,
             InvalidationReaches::CONSERVATIVE,
         ));
@@ -7702,7 +7717,10 @@ mod tests {
         assert!(!entries[2].text_side_effect);
         assert!(entries[3].structural_side_effect);
         assert!(entries[3].text_side_effect);
-        assert!(entries[4].unrepresentable_outer_path);
+        assert!(entries[4]
+            .anchor_reaches
+            .contains(InvalidationReaches::SIBLINGS));
+        assert!(!entries[4].unrepresentable_outer_path);
 
         let tree = obscura_dom::parse_html(
             "<section id=host class=host></section><section id=other class=other></section>",

@@ -65,6 +65,19 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "setEmulatedMedia" => {
+            let features = params.get("features").and_then(Value::as_array);
+            if let Some(features) = features {
+                let value = features.iter().find(|feature| feature["name"] == "prefers-reduced-motion")
+                    .and_then(|feature| feature["value"].as_str()).unwrap_or("");
+                if !matches!(value, "" | "reduce" | "no-preference") {
+                    return Err("Invalid prefers-reduced-motion value".into());
+                }
+                ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                    .set_reduced_motion(value == "reduce");
+            }
+            Ok(json!({}))
+        }
         "setDeviceMetricsOverride" => {
             let width = metric_dimension(params, "width")?;
             let height = metric_dimension(params, "height")?;
@@ -121,6 +134,42 @@ pub async fn handle(
             page.set_default_background_color_override(color);
             Ok(json!({}))
         }
+        "setUserAgentOverride" => {
+            let user_agent = params
+                .get("userAgent")
+                .and_then(Value::as_str)
+                .ok_or("Emulation.setUserAgentOverride requires userAgent")?;
+            let accept_language = params.get("acceptLanguage").and_then(Value::as_str);
+            let http_client = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?
+                .http_client
+                .clone();
+            if !user_agent.is_empty() {
+                http_client.set_user_agent(user_agent).await;
+                if let Some(js) = ctx
+                    .get_session_page_mut(session_id)
+                    .and_then(|page| page.js.as_mut())
+                {
+                    js.set_user_agent(user_agent);
+                }
+            }
+            if let Some(accept_language) = accept_language {
+                http_client.set_accept_language(accept_language).await;
+            }
+            Ok(json!({}))
+        }
+        "setLocaleOverride" => {
+            let locale = params
+                .get("locale")
+                .and_then(Value::as_str)
+                .ok_or("Emulation.setLocaleOverride requires locale")?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or("No page for session")?;
+            page.set_locale_override((!locale.is_empty()).then(|| locale.to_string()));
+            Ok(json!({}))
+        }
         // Touch emulation does not affect layout yet, but acknowledging it is
         // compatible with clients that pair it with a metrics override.
         "setTouchEmulationEnabled" => Ok(json!({})),
@@ -167,6 +216,59 @@ mod tests {
                          screen.availWidth, screen.availHeight, devicePixelRatio];"
             ),
             json!([1024, 768, 1024, 768, 1440, 900, 1440, 900, 2])
+        );
+    }
+
+    #[tokio::test]
+    async fn locale_emulation_reaches_requests_and_survives_navigation() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("locale-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        handle(
+            "setUserAgentOverride",
+            &json!({"userAgent": "", "acceptLanguage": "de-DE"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("accept-language override");
+        handle(
+            "setLocaleOverride",
+            &json!({"locale": "de-DE"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("locale override");
+
+        let http_client = ctx
+            .get_session_page(&session_id)
+            .unwrap()
+            .http_client
+            .clone();
+        assert_eq!(http_client.accept_language.read().await.as_str(), "de-DE");
+        assert_eq!(
+            ctx.get_session_page_mut(&session_id)
+                .unwrap()
+                .evaluate("[navigator.language, navigator.languages]"),
+            json!(["de-DE", ["de-DE", "de"]])
+        );
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({"url": "data:text/html,<p>locale</p>", "waitUntil": "load"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("navigate");
+        assert_eq!(
+            ctx.get_session_page_mut(&session_id)
+                .unwrap()
+                .evaluate("[navigator.language, navigator.languages]"),
+            json!(["de-DE", ["de-DE", "de"]])
         );
     }
 

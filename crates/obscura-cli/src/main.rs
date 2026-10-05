@@ -87,6 +87,10 @@ enum Command {
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
 
+        /// Atomically publish the bound address after V8 initialization.
+        #[arg(long, value_name = "PATH")]
+        ready_file: Option<std::path::PathBuf>,
+
         /// Allow CDP clients to navigate to file:// URLs. Off by
         /// default so a CDP connection cannot read arbitrary local
         /// files. Enable only when serving local HTML for testing
@@ -96,6 +100,11 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Recursively load TTF, TTC, OTF, and OTC files from this directory.
+        /// Repeat for multiple directories. Requires a render-enabled build.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
 
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
@@ -259,6 +268,30 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     )
 }
 
+fn configure_font_directories(font_dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    if font_dirs.is_empty() {
+        return Ok(());
+    }
+    for directory in font_dirs {
+        if !directory.is_dir() {
+            anyhow::bail!(
+                "Font directory does not exist or is not a directory: {}",
+                directory.display()
+            );
+        }
+    }
+
+    #[cfg(feature = "render")]
+    {
+        if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
+            anyhow::bail!("Font directories must be configured before the first render");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "render"))]
+    anyhow::bail!("--font-dir requires a render-enabled build")
+}
+
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
 }
@@ -301,8 +334,31 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("obscura-main".to_string())
+        // V8 derives its stack guard from the current native thread. Deep but
+        // valid hostile documents can otherwise exhaust the platform's small
+        // default stack while the page realm is initialized. This reserves
+        // address space; pages are committed only as the stack is used.
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
+}
+
+fn operator_network_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    match obscura_net::private_network_error_hint(&message) {
+        Some(hint) => format!("{}\n{}", message, hint),
+        None => message,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
@@ -365,8 +421,10 @@ async fn main() -> anyhow::Result<()> {
             user_agent,
             workers,
             max_connections,
+            ready_file,
             allow_file_access,
             storage_dir,
+            font_dirs,
             quiet: _,
         }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
@@ -377,7 +435,13 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
-            print_banner(port);
+            configure_font_directories(&font_dirs)?;
+            if ready_file.is_some() && workers != 1 {
+                anyhow::bail!("--ready-file requires --workers 1");
+            }
+            if port != 0 {
+                print_banner(port);
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -386,6 +450,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
+            }
+            for directory in &font_dirs {
+                tracing::info!("Font dir: {}", directory.display());
             }
             if stealth {
                 #[cfg(feature = "stealth")]
@@ -398,9 +465,18 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(
+                    port,
+                    host,
+                    workers,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    font_dirs,
+                )
+                .await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_serve_options_limit_and_ready_file(
                     port,
                     &host,
                     proxy,
@@ -410,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    ready_file.as_deref(),
                 )
                 .await?;
             }
@@ -533,6 +610,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn wait_for_serve_worker(
+    child: &mut tokio::process::Child,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("worker on port {} exited during startup: {}", port, status);
+        }
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => return Ok(()),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 async fn run_multi_worker_serve(
     port: u16,
     host: String,
@@ -540,17 +636,38 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    font_dirs: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let exe = std::env::current_exe()?;
+    // Claim the public port before starting children so another process cannot
+    // take it during worker startup.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    // Internal worker ports are implementation details. Asking the OS for
+    // free ports avoids assuming that every port adjacent to the public one is
+    // available (or that `port + workers` cannot overflow).
+    let mut reservations = Vec::with_capacity(workers as usize);
+    for _ in 0..workers {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let worker_port = reservation.local_addr()?.port();
+        reservations.push((worker_port, reservation));
+    }
     let mut children = Vec::new();
+    let mut worker_ports = Vec::with_capacity(workers as usize);
 
-    for i in 0..workers {
-        let worker_port = port + 1 + i;
-        let mut cmd = std::process::Command::new(&exe);
+    for (index, (worker_port, reservation)) in reservations.into_iter().enumerate() {
+        drop(reservation);
+        let mut cmd = TokioCommand::new(&exe);
+        cmd.kill_on_drop(true);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Workers receive the client-facing Host header through the TCP
+        // load balancer. Let their CDP security gate accept that public port
+        // while it continues to reject foreign hosts and browser origins.
+        cmd.env("OBSCURA_CDP_FORWARDED_HOST", &host);
+        cmd.env("OBSCURA_CDP_FORWARDED_PORT", port.to_string());
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -561,48 +678,124 @@ async fn run_multi_worker_serve(
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
         }
+        for directory in &font_dirs {
+            cmd.arg("--font-dir").arg(directory);
+        }
         if stealth {
             cmd.arg("--stealth");
         }
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
 
         let child = cmd.spawn()?;
-        tracing::info!("Worker {} on port {}", i + 1, worker_port);
-        children.push(child);
+        tracing::info!("Worker {} on port {}", index + 1, worker_port);
+        children.push((child, cmd));
+        worker_ports.push(worker_port);
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait only until every worker has bound its control port. The old fixed
+    // 500 ms sleep dominated multi-worker startup even when workers were ready
+    // in a few milliseconds.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    for ((child, _), &worker_port) in children.iter_mut().zip(&worker_ports) {
+        wait_for_serve_worker(child, worker_port, deadline).await?;
+    }
 
-    // Bind the load balancer to the requested host, not hardcoded loopback.
+    let mut availability = Vec::with_capacity(workers as usize);
+    let mut supervisors = tokio::task::JoinSet::new();
+    for ((mut child, mut cmd), &worker_port) in children.into_iter().zip(&worker_ports) {
+        let ready = Arc::new(AtomicBool::new(true));
+        availability.push(ready.clone());
+        supervisors.spawn(async move {
+            loop {
+                let status = child.wait().await;
+                ready.store(false, Ordering::Relaxed);
+                tracing::warn!("worker on port {} exited: {:?}", worker_port, status);
+                loop {
+                    // ponytail: fixed retry bounds crash loops; add backoff if
+                    // persistently failing worker configurations need it.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    match cmd.spawn() {
+                        Ok(mut replacement) => {
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                            match wait_for_serve_worker(&mut replacement, worker_port, deadline).await {
+                                Ok(()) => {
+                                    child = replacement;
+                                    ready.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(error) => tracing::warn!("worker {} restart failed: {}", worker_port, error),
+                            }
+                        }
+                        Err(error) => tracing::warn!("worker {} spawn failed: {}", worker_port, error),
+                    }
+                }
+            }
+        });
+    }
+
+    // The load balancer is bound to the requested host, not hardcoded loopback.
     // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
     // all interfaces; the multi-worker balancer must too, or the mapped port is
     // refused from outside the container (issue #336). Workers stay on loopback
     // and are only reached by the balancer.
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
 
-    let mut next_worker: u16 = 0;
+    let mut next_worker = 0usize;
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
-        next_worker = next_worker.wrapping_add(1);
+        if let Err(error) = client_stream.set_nodelay(true) {
+            tracing::warn!("client {} TCP_NODELAY failed: {}", peer_addr, error);
+        }
+        let worker_port = (0..worker_ports.len()).find_map(|_| {
+            let index = next_worker % worker_ports.len();
+            next_worker = next_worker.wrapping_add(1);
+            availability[index].load(Ordering::Relaxed).then_some(worker_ports[index])
+        });
+        let Some(worker_port) = worker_port else {
+            tokio::spawn(async move {
+                let mut client = client_stream;
+                let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n").await;
+                let _ = client.shutdown().await;
+            });
+            continue;
+        };
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
 
         let mut peek_buf = [0u8; 4];
-        client_stream.peek(&mut peek_buf).await?;
+        match client_stream.peek(&mut peek_buf).await {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                continue;
+            }
+        }
 
         if &peek_buf == b"GET " {
             let mut full_peek = [0u8; 256];
-            let n = client_stream.peek(&mut full_peek).await?;
+            let n = match client_stream.peek(&mut full_peek).await {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                    continue;
+                }
+            };
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
                 let worker_addr = format!("127.0.0.1:{}", worker_port);
                 match tokio::net::TcpStream::connect(&worker_addr).await {
                     Ok(mut worker_stream) => {
+                        if let Err(error) = worker_stream.set_nodelay(true) {
+                            tracing::warn!(
+                                "worker {} TCP_NODELAY failed: {}",
+                                worker_addr,
+                                error
+                            );
+                        }
                         tokio::spawn(async move {
                             let std_stream = match client_stream.into_std() {
                                 Ok(s) => s,
@@ -647,6 +840,10 @@ async fn run_multi_worker_serve(
         tokio::spawn(async move {
             match tokio::net::TcpStream::connect(&worker_addr).await {
                 Ok(mut worker_stream) => {
+                    if let Err(error) = worker_stream.set_nodelay(true) {
+                        tracing::warn!("worker {} TCP_NODELAY failed: {}", worker_addr, error);
+                        return;
+                    }
                     let mut client = client_stream;
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                 }
@@ -727,6 +924,10 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    // The browser layer refuses file:// unless the context opts in. A local
+    // user running `obscura fetch file://...` on their own files is the
+    // intended case; only network-facing servers (serve, mcp) keep it off.
+    context.allow_file_access = true;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -825,7 +1026,7 @@ async fn run_fetch(
     .await
     {
         Ok(result) => {
-            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, operator_network_error(e)))?
         }
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
@@ -1121,7 +1322,7 @@ async fn fetch_original_response(
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
                 Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
             };
         }
@@ -1137,7 +1338,7 @@ async fn fetch_original_response(
 
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
         Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
     }
 }
@@ -2197,6 +2398,29 @@ mod tests {
     fn parsed_serve_command_is_not_quiet() {
         let args = Args::try_parse_from(["obscura", "serve"]).expect("clap should accept serve");
         assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_serve_accepts_repeated_font_directories() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--font-dir",
+            "/fonts/cjk",
+            "--font-dir",
+            "/fonts/brand",
+        ])
+        .expect("clap should accept repeatable --font-dir");
+        match args.command {
+            Some(Command::Serve { font_dirs, .. }) => assert_eq!(
+                font_dirs,
+                [
+                    std::path::PathBuf::from("/fonts/cjk"),
+                    std::path::PathBuf::from("/fonts/brand"),
+                ]
+            ),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

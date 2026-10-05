@@ -168,3 +168,10 @@ await browser.disconnect();  // leaves obscura serve running
   compositor behavior remains incomplete relative to Chromium.
 - Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.
+
+Network events are shared by sessions attached to the same target. An additional
+CDP session can observe navigation and later fetch/XHR traffic without issuing a
+second navigation. Request IDs and loader IDs match the driving session, so
+`Network.getResponseBody` uses the same ID. Fetch interception control and the
+navigation lifecycle keep their existing owner; sessions on other targets do
+not receive this traffic.

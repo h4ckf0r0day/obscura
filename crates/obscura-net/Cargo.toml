@@ -10,6 +10,7 @@ default = []
 stealth = ["wreq", "wreq-util", "futures-util"]
 
 [dependencies]
+obscura-ssrf = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
@@ -20,6 +21,7 @@ thiserror = { workspace = true }
 async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
+psl = "2"
 futures-util = { version = "0.3", optional = true }
 # wreq and wreq-util are pre-release crates whose API changes between rc builds
 # (CertStore moved out of `tls`, `cert_store` renamed to `tls_cert_store`, the
