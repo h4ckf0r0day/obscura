@@ -6,6 +6,28 @@ use tokio::net::TcpListener;
 
 const SESSION: &str = "module-session";
 
+struct EnvOverride {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvOverride {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 async fn serve(routes: Vec<(&'static str, u16, &'static str, &'static [u8])>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -184,19 +206,19 @@ async fn body_not_retained() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn module_body_buffer_limit_keeps_response_metadata() {
-    std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "16");
+    let _env = EnvOverride::set("OBSCURA_NETWORK_BODY_BUFFER_BYTES", "16");
     body_not_retained().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn disabled_module_body_buffer_keeps_response_metadata() {
-    std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "0");
+    let _env = EnvOverride::set("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "0");
     body_not_retained().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn module_body_buffer_evicts_oldest_entry() {
-    std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "1");
+    let _env = EnvOverride::set("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "1");
     const ROOT: &str = "import '/child.js';";
     const CHILD: &str = "export const ready=true;";
     let base = serve(vec![
