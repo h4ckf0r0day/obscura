@@ -25,6 +25,7 @@ integration_tests!(
     accessibility_names,
     backspace_surrogate,
     binding_called_session,
+    call_function_on_object_id_arg,
     cdp_click_submit_parity,
     child_frame_tree,
     concurrent_connections_heavy_page,
