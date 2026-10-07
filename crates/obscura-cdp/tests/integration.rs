@@ -49,6 +49,7 @@ integration_tests!(
     js_fetch_emits_network_events,
     max_connections_cap,
     nodefilter_constants,
+    page_close_destroys_target,
     page_frame_contract,
     runtime_by_value_undefined,
     runtime_console_events,
