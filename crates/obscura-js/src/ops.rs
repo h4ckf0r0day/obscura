@@ -3831,7 +3831,13 @@ async fn fetch_url_inner(
                 unsafe_header_names.join(","),
             );
         }
-        let preflight = preflight_request.send().await.map_err(|e| {
+        let preflight = obscura_net::send_with_aia(
+            preflight_request,
+            allow_private_network,
+            proxy_url.as_deref(),
+        )
+        .await
+        .map_err(|e| {
                 deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
             })?;
 
@@ -4001,7 +4007,9 @@ async fn fetch_url_inner(
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 PageInFlightGuard(counter.clone())
             });
-            req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
+            obscura_net::send_with_aia(req, allow_private_network, proxy_url.as_deref())
+                .await
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
         };
 
         if credentials_allowed {

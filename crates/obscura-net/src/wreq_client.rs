@@ -183,9 +183,43 @@ async fn send_get_with_connection_reset_retry(
     }
 }
 
+/// wreq surfaces only BoringSSL's reason code, CERTIFICATE_VERIFY_FAILED, not
+/// the X509 verify result that distinguishes a missing issuer from an expired
+/// or mismatched certificate. So this only selects candidates; the chain read
+/// by `probe_chain` decides whether an intermediate is actually missing.
+#[cfg(feature = "stealth")]
+fn is_verify_failure(error: &wreq::Error) -> bool {
+    let mut source: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if format!("{e:?}").contains("CERTIFICATE_VERIFY_FAILED") {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// True when the topmost certificate of `chain` was issued by a root in the
+/// bundled webpki set, so nothing is missing and fetching would not help.
+/// Only meaningful when the default roots are in use.
+#[cfg(feature = "stealth")]
+fn chain_reaches_bundled_root(chain: &[Vec<u8>]) -> bool {
+    static SUBJECTS: std::sync::OnceLock<std::collections::HashSet<Vec<u8>>> =
+        std::sync::OnceLock::new();
+    let subjects = SUBJECTS.get_or_init(|| {
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|root| crate::aia::subject_name(root))
+            .collect()
+    });
+    crate::aia::tip_issuer_name(chain).is_some_and(|issuer| subjects.contains(&issuer))
+}
+
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
-    client: wreq::Client,
+    /// The client and the AIA cache generation it was built at.
+    client: std::sync::RwLock<(wreq::Client, u64)>,
+    proxy_url: Option<String>,
     allow_private_network: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
@@ -212,6 +246,36 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
+        let generation = crate::aia::generation();
+        let client = Self::build_client(
+            proxy_url,
+            allow_private_network,
+            &crate::aia::cached_certificates(),
+            false,
+        );
+
+        StealthHttpClient {
+            client: std::sync::RwLock::new((client, generation)),
+            proxy_url: proxy_url.map(str::to_string),
+            allow_private_network,
+            block_trackers: tracker_blocking_enabled(
+                std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
+            ),
+            cookie_jar,
+            extra_headers: RwLock::new(HashMap::new()),
+            in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    /// Build the Chrome-emulating client. `intermediates` are AIA-fetched
+    /// certificates (see aia.rs); `probe` builds the verification-off variant
+    /// that only reads a failing server's chain.
+    fn build_client(
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+        intermediates: &[Arc<[u8]>],
+        probe: bool,
+    ) -> wreq::Client {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -259,7 +323,11 @@ impl StealthHttpClient {
             std::env::var_os("SSL_CERT_FILE").as_deref(),
             std::env::var_os("SSL_CERT_DIR").as_deref(),
         ) {
-            match wreq::tls::trust::CertStore::builder().set_default_paths().build() {
+            let mut store = wreq::tls::trust::CertStore::builder().set_default_paths();
+            for der in intermediates {
+                store = store.add_der_cert(&der[..]);
+            }
+            match store.build() {
                 Ok(store) => builder = builder.tls_cert_store(store),
                 Err(error) => tracing::warn!(
                     %error,
@@ -267,6 +335,26 @@ impl StealthHttpClient {
                      continuing with the default roots"
                 ),
             }
+        } else if !intermediates.is_empty() {
+            // AIA-fetched intermediates (see aia.rs). A store REPLACES the
+            // bundled roots, so rebuild the same webpki set and add them. They
+            // are plain store entries, not trust anchors: BoringSSL still needs
+            // a chain to a self-signed root (no PARTIAL_CHAIN flag is set).
+            let mut store = wreq::tls::trust::CertStore::builder().add_der_certs(
+                webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().map(|c| c.as_ref()),
+            );
+            for der in intermediates {
+                store = store.add_der_cert(&der[..]);
+            }
+            match store.build() {
+                Ok(store) => builder = builder.tls_cert_store(store),
+                Err(error) => tracing::warn!(%error, "AIA intermediates not applied"),
+            }
+        }
+        if probe {
+            // Only to read the chain of a server that failed verification
+            // (see `probe_chain`).
+            builder = builder.tls_cert_verification(false).tls_info(true);
         }
 
         if let Some(proxy) = proxy_url {
@@ -275,17 +363,121 @@ impl StealthHttpClient {
             }
         }
 
-        let client = builder.build().expect("failed to build wreq stealth client");
+        builder.build().expect("failed to build wreq stealth client")
+    }
 
-        StealthHttpClient {
-            client,
-            allow_private_network,
-            block_trackers: tracker_blocking_enabled(
-                std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
-            ),
-            cookie_jar,
-            extra_headers: RwLock::new(HashMap::new()),
-            in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    fn current_client(&self) -> wreq::Client {
+        self.client.read().unwrap_or_else(|p| p.into_inner()).0.clone()
+    }
+
+    /// Rebuild the client with every cached AIA intermediate in its store.
+    fn rebuild_with_cached_intermediates(&self) {
+        let generation = crate::aia::generation();
+        let client = Self::build_client(
+            self.proxy_url.as_deref(),
+            self.allow_private_network,
+            &crate::aia::cached_certificates(),
+            false,
+        );
+        *self.client.write().unwrap_or_else(|p| p.into_inner()) = (client, generation);
+    }
+
+    /// Chain presented by `url`'s server, read without verification. This
+    /// completes a TLS handshake and sends `HEAD /` with no cookies or custom
+    /// headers; it runs only after the verified request already failed for a
+    /// missing issuer, uses the same Chrome emulation, proxy and SSRF resolver,
+    /// and nothing from the response is used except the certificates.
+    async fn probe_chain(&self, url: &Url) -> Option<Vec<Vec<u8>>> {
+        let client = Self::build_client(
+            self.proxy_url.as_deref(),
+            self.allow_private_network,
+            &[],
+            true,
+        );
+        let mut origin = url.clone();
+        origin.set_path("/");
+        origin.set_query(None);
+        origin.set_fragment(None);
+        let resp = client
+            .head(origin.as_str())
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?;
+        let info = resp.extensions().get::<wreq::tls::TlsInfo>()?;
+        let chain: Vec<Vec<u8>> = match info.peer_certificate_chain() {
+            Some(chain) => chain.map(<[u8]>::to_vec).collect(),
+            None => vec![info.peer_certificate()?.to_vec()],
+        };
+        Some(chain)
+    }
+
+    /// After a missing-issuer failure: make the next attempt's client able to
+    /// complete the chain. True when a retry is worthwhile.
+    async fn refresh_intermediates(&self, url: &Url) -> bool {
+        let built_at = self.client.read().unwrap_or_else(|p| p.into_inner()).1;
+        if crate::aia::generation() > built_at {
+            // Another request already fetched intermediates this client lacks.
+            self.rebuild_with_cached_intermediates();
+            return true;
+        }
+        let Some(mut chain) = self.probe_chain(url).await else { return false };
+        crate::aia::extend_from_cache(&mut chain);
+        let custom_roots = crate::client::custom_cert_store_requested(
+            std::env::var_os("SSL_CERT_FILE").as_deref(),
+            std::env::var_os("SSL_CERT_DIR").as_deref(),
+        );
+        if (!custom_roots && chain_reaches_bundled_root(&chain))
+            || !crate::aia::fetch_missing_issuer(
+            &chain,
+            self.allow_private_network,
+            self.proxy_url.as_deref(),
+        )
+        .await
+        {
+            return false;
+        }
+        self.rebuild_with_cached_intermediates();
+        true
+    }
+
+    /// Send `request`. If the handshake fails because the server did not send
+    /// its intermediate, fetch it via AIA and retry (at most `MAX_ROUNDS`
+    /// times). `reset_retry` adds the GET connection-reset retry.
+    async fn send_with_aia(
+        &self,
+        request: wreq::RequestBuilder,
+        url: &Url,
+        reset_retry: bool,
+    ) -> Result<wreq::Response, wreq::Error> {
+        let send_once = |client: wreq::Client, request: wreq::Request| async move {
+            let builder = wreq::RequestBuilder::from_parts(client, request);
+            if reset_retry {
+                send_get_with_connection_reset_retry(builder, url).await
+            } else {
+                builder.send().await
+            }
+        };
+        let (mut client, request) = request.build_split();
+        let request = request?;
+        let mut round = 0;
+        loop {
+            let Some(attempt) = request.try_clone() else {
+                return send_once(client, request).await;
+            };
+            let err = match send_once(client.clone(), attempt).await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => err,
+            };
+            round += 1;
+            if round > crate::aia::MAX_ROUNDS
+                || url.scheme() != "https"
+                || !is_verify_failure(&err)
+                || !self.refresh_intermediates(url).await
+            {
+                return Err(err);
+            }
+            client = self.current_client();
         }
     }
 
@@ -344,7 +536,7 @@ impl StealthHttpClient {
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
-            let mut req = self.client.get(current_url.as_str());
+            let mut req = self.current_client().get(current_url.as_str());
 
             req = req
                 .header("accept", request.accept())
@@ -401,7 +593,8 @@ impl StealthHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = send_get_with_connection_reset_retry(req, &current_url)
+            let resp = self
+                .send_with_aia(req, &current_url, true)
                 .await
                 .map_err(|e| {
                     ObscuraNetError::Network(format!(
@@ -541,7 +734,7 @@ impl StealthHttpClient {
         let req_method = method
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
-        let mut req = self.client.request(req_method, url.as_str());
+        let mut req = self.current_client().request(req_method, url.as_str());
 
         if let Some(context) = cookie_context {
             let cookie_header = self.cookie_jar.get_cookie_header_in_context(url, context);
@@ -560,7 +753,7 @@ impl StealthHttpClient {
         }
 
         let in_flight = InFlightGuard::new(&self.in_flight);
-        let resp = req.send().await.map_err(|e| {
+        let resp = self.send_with_aia(req, url, false).await.map_err(|e| {
             ObscuraNetError::Network(format!("{}: {}", url, e))
         })?;
 
@@ -822,7 +1015,8 @@ mod tests {
     async fn stealth_post_does_not_retry_connection_reset() {
         let (port, server) = reset_fixture(false);
         let client = StealthHttpClient {
-            client: wreq::Client::builder().no_proxy().build().unwrap(),
+            client: std::sync::RwLock::new((wreq::Client::builder().no_proxy().build().unwrap(), 0)),
+            proxy_url: None,
             allow_private_network: true,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),

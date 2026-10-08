@@ -34,8 +34,9 @@ fn configured_root_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
-fn configured_root_certificates() -> &'static [reqwest::Certificate] {
-    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+fn configured_root_certificates() -> &'static [rustls::pki_types::CertificateDer<'static>] {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
 
     ROOTS.get_or_init(|| {
         let mut certificates = Vec::new();
@@ -47,18 +48,47 @@ fn configured_root_certificates() -> &'static [reqwest::Certificate] {
                     continue;
                 }
             };
-            match reqwest::Certificate::from_pem_bundle(&bytes) {
-                Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
-                _ => match reqwest::Certificate::from_der(&bytes) {
-                    Ok(certificate) => certificates.push(certificate),
-                    Err(error) => {
-                        tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
-                    }
-                },
+            let mut bundle: Vec<_> = CertificateDer::pem_slice_iter(&bytes)
+                .filter_map(Result::ok)
+                .collect();
+            if bundle.is_empty() {
+                // Not PEM: a single DER certificate.
+                bundle.push(CertificateDer::from(bytes));
             }
+            certificates.append(&mut bundle);
         }
         certificates
     })
+}
+
+/// rustls config equal to reqwest's `rustls-tls` default (webpki roots plus
+/// any SSL_CERT_FILE / SSL_CERT_DIR roots), with the verifier wrapped so
+/// AIA-fetched intermediates can complete an incomplete chain. They are only
+/// offered as untrusted intermediates; see `aia.rs`.
+fn tls_config_with_aia() -> Option<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if std::env::var_os("SSL_CERT_FILE").is_some() || std::env::var_os("SSL_CERT_DIR").is_some() {
+        let (added, ignored) =
+            roots.add_parsable_certificates(configured_root_certificates().iter().cloned());
+        if ignored > 0 {
+            tracing::warn!(added, ignored, "some configured CA certificates could not be parsed");
+        }
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .ok()?;
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::aia::AiaVerifier::new(inner)))
+        .with_no_client_auth();
+    Some(config)
 }
 
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
@@ -1078,12 +1108,11 @@ impl ObscuraHttpClient {
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
 
-            if std::env::var_os("SSL_CERT_FILE").is_some()
-                || std::env::var_os("SSL_CERT_DIR").is_some()
-            {
-                for certificate in configured_root_certificates() {
-                    builder = builder.add_root_certificate(certificate.clone());
-                }
+            match tls_config_with_aia() {
+                Some(config) => builder = builder.use_preconfigured_tls(config),
+                None => tracing::warn!(
+                    "AIA-capable TLS config failed to build; continuing with reqwest's default"
+                ),
             }
 
             if let Some(ref proxy) = self.proxy_url {
@@ -1575,7 +1604,13 @@ impl ObscuraHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req_builder.send().await.map_err(|e| {
+            let resp = crate::aia::send_with_aia(
+                req_builder,
+                self.allow_private_network,
+                self.proxy_url.as_deref(),
+            )
+            .await
+            .map_err(|e| {
                 ObscuraNetError::Network(format!("{}: {}", current_url, e))
             })?;
 

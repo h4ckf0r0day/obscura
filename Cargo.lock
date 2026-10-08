@@ -2114,12 +2114,14 @@ name = "obscura-net"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "encoding_rs",
  "futures-util",
  "obscura-ssrf",
  "psl",
  "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "socket2",
@@ -2129,6 +2131,8 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "url",
+ "webpki-root-certs",
+ "webpki-roots 1.0.7",
  "wreq",
  "wreq-util",
 ]

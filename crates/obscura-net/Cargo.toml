@@ -7,7 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util", "futures-util", "webpki-root-certs"]
 
 [dependencies]
 obscura-ssrf = { workspace = true }
@@ -19,10 +19,19 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
+# Already in the tree through reqwest. Needed directly so the default client can
+# install a verifier that accepts AIA-fetched intermediates (see aia.rs).
+# default-features off: the default would add aws-lc-rs next to reqwest's ring.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+base64 = { workspace = true }
 encoding_rs = "0.8"
 tempfile = "3"
 psl = "2"
 futures-util = { version = "0.3", optional = true }
+# Already in the tree through wreq. The stealth client rebuilds its cert store
+# (which replaces wreq's bundled roots) when AIA intermediates are added.
+webpki-root-certs = { version = "1", optional = true }
 # wreq and wreq-util are pre-release crates whose API changes between rc builds
 # (CertStore moved out of `tls`, `cert_store` renamed to `tls_cert_store`, the
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
