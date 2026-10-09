@@ -111,6 +111,17 @@ fn xml_dom_parser_preserves_text_entities_and_non_element_nodes() {
 }
 
 #[test]
+fn xml_dom_parser_entity_events_keep_text_boundaries_and_character_references() {
+    let mut rt = runtime();
+    let result = rt.evaluate(r#"(() => {
+        const doc = new DOMParser().parseFromString(
+            '<Root>&amp;&#13;&#xA;&lt;A\r\nB<![CDATA[C]]>&gt;&apos;</Root>', 'text/xml');
+        return Array.from(doc.documentElement.childNodes, n => [n.nodeType, n.nodeValue]);
+    })()"#).unwrap();
+    assert_eq!(result, json!([[3, "&\r\n<A\nB"], [4, "C"], [3, ">'"]]));
+}
+
+#[test]
 fn xml_dom_parser_documents_are_detached_and_own_their_nodes() {
     let mut rt = runtime();
     let result = rt.evaluate(r#"(() => {

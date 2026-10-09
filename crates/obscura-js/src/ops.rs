@@ -1942,6 +1942,12 @@ fn parse_xml_document(dom: &DomTree, source: &str) -> Result<serde_json::Value, 
                 if parents.is_empty() { continue; }
                 (NodeData::Text { contents: value.clone() }, serde_json::json!({"type":3,"data":value}))
             }
+            Event::GeneralRef(reference) => {
+                let raw = format!("&{};", string(reference.as_ref())?);
+                let value = quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?.into_owned();
+                if parents.is_empty() { continue; }
+                (NodeData::Text { contents: value.clone() }, serde_json::json!({"type":3,"data":value}))
+            }
             Event::CData(text) => {
                 let value = normalize(&string(text.as_ref())?);
                 (NodeData::Text { contents: value.clone() }, serde_json::json!({"type":4,"data":value}))
@@ -1978,6 +1984,18 @@ fn parse_xml_document(dom: &DomTree, source: &str) -> Result<serde_json::Value, 
             Event::Decl(_) => continue,
             Event::Eof => break,
         };
+        // Entity references are separate reader events, but remain part of the
+        // same DOM text node. CDATA retains its distinct lexical boundary.
+        if info["type"] == 3 {
+            if let Some((NodeData::Text { contents }, previous, parent)) = plan.last_mut() {
+                if previous["type"] == 3 && *parent == parents.last().copied() {
+                    if let NodeData::Text { contents: value } = &data {
+                        contents.push_str(value);
+                        continue;
+                    }
+                }
+            }
+        }
         let element = matches!(&data, NodeData::Element { .. });
         let index = plan.len();
         plan.push((data, info, parents.last().copied()));
@@ -1987,6 +2005,11 @@ fn parse_xml_document(dom: &DomTree, source: &str) -> Result<serde_json::Value, 
     let mut ids = Vec::with_capacity(plan.len());
     let mut nodes = Vec::with_capacity(plan.len());
     for (data, mut info, parent) in plan {
+        if info["type"] == 3 {
+            if let NodeData::Text { contents } = &data {
+                info["data"] = serde_json::json!(contents);
+            }
+        }
         let id = dom.new_node(data);
         dom.append_child(parent.map(|p| ids[p]).unwrap_or(fragment), id);
         info["nodeId"] = serde_json::json!(id.index());
