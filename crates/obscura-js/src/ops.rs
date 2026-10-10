@@ -1121,12 +1121,12 @@ fn render_mutation_impact(
             let Some((name, value)) = arg2.split_once('\0') else {
                 return RenderMutationImpact::default();
             };
-            let old = dom
-                .with_node(target, |node| node.get_attribute(name).map(str::to_owned))
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute(name) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "set_attribute_ns" => {
@@ -1182,12 +1182,15 @@ fn render_mutation_impact(
             let (Some(parent), Some(child)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(parent).is_none() || dom.get_node(child).is_none() {
+            // Borrow instead of cloning nodes: this runs on every append, and
+            // the last child is a field, not a sibling-chain walk.
+            let (Some(_), Some(old_parent)) =
+                (dom.with_node(parent, |_| ()), dom.with_node(child, |node| node.parent))
+            else {
                 return RenderMutationImpact::default();
-            }
-            let old_parent = dom.get_node(child).and_then(|node| node.parent);
-            let already_last =
-                old_parent == Some(parent) && dom.children(parent).last().copied() == Some(child);
+            };
+            let already_last = old_parent == Some(parent)
+                && dom.with_node(parent, |node| node.last_child) == Some(Some(child));
             RenderMutationImpact {
                 // Moving a connected node into a detached subtree removes its
                 // old box, while attaching a detached node creates a new one.
@@ -1201,23 +1204,23 @@ fn render_mutation_impact(
             };
             RenderMutationImpact {
                 connected: node_is_connected(dom, child),
-                actual_change: dom.get_node(child).and_then(|node| node.parent).is_some(),
+                actual_change: dom.with_node(child, |node| node.parent.is_some()).unwrap_or(false),
             }
         }
         "insert_before" => {
             let (Some(new_node), Some(reference)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(new_node).is_none() {
+            if dom.with_node(new_node, |_| ()).is_none() {
                 return RenderMutationImpact::default();
             }
-            let Some(reference_parent) = dom.get_node(reference).and_then(|node| node.parent)
+            let Some((Some(reference_parent), reference_prev)) =
+                dom.with_node(reference, |node| (node.parent, node.prev_sibling))
             else {
                 return RenderMutationImpact::default();
             };
             let new_was_connected = node_is_connected(dom, new_node);
-            let already_immediately_before =
-                dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
+            let already_immediately_before = reference_prev == Some(new_node);
             RenderMutationImpact {
                 connected: node_is_connected(dom, reference_parent) || new_was_connected,
                 actual_change: new_node != reference && (!already_immediately_before
@@ -1232,7 +1235,7 @@ fn render_mutation_impact(
                 connected: node_is_connected(dom, target),
                 // Parsing normalizes source text, so a cheap string comparison
                 // cannot prove equality. Connected replacement remains dirty.
-                actual_change: dom.get_node(target).is_some(),
+                actual_change: dom.with_node(target, |_| ()).is_some(),
             }
         }
         "set_text_content" => {
@@ -1337,8 +1340,8 @@ fn retained_style_mutation(
         }
         "append_child" => {
             let child = NodeId::new(arg2.parse::<u32>().ok()?);
-            dom.get_node(node)?;
-            let old_parent = dom.get_node(child)?.parent;
+            dom.with_node(node, |_| ())?;
+            let old_parent = dom.with_node(child, |n| n.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node: child,
@@ -1349,16 +1352,16 @@ fn retained_style_mutation(
             )
         }
         "remove_child" => {
-            let old_parent = dom.get_node(node)?.parent?;
+            let old_parent = dom.with_node(node, |n| n.parent)??;
             Some(obscura_render::TreeStyleMutation::Remove { node, old_parent }.into())
         }
         "insert_before" => {
             let reference = NodeId::new(arg2.parse::<u32>().ok()?);
-            let new_parent = dom.get_node(reference)?.parent?;
+            let new_parent = dom.with_node(reference, |n| n.parent)??;
             if dom.containing_shadow_root(new_parent).is_some() {
                 return None;
             }
-            let old_parent = dom.get_node(node)?.parent;
+            let old_parent = dom.with_node(node, |n| n.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node,
@@ -1368,18 +1371,14 @@ fn retained_style_mutation(
                 .into(),
             )
         }
-        "set_text_content" => match &dom.get_node(node)?.data {
-            NodeData::Text { .. } => Some(
-                obscura_render::TreeStyleMutation::Text {
-                    node,
-                    parent: dom.get_node(node)?.parent,
-                }
-                .into(),
-            ),
+        "set_text_content" => match dom
+            .with_node(node, |n| matches!(n.data, NodeData::Text { .. }).then_some(n.parent))?
+        {
+            Some(parent) => Some(obscura_render::TreeStyleMutation::Text { node, parent }.into()),
             // Element/fragment textContent replaces a child list. That can
             // flip :empty and structural/relational selectors, so the local
             // text fast path cannot describe the mutation safely.
-            _ => None,
+            None => None,
         },
         _ => None,
     }
@@ -1841,6 +1840,176 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
     serde_json::json!({ "originClean": true, "css": css }).to_string()
 }
 
+/// Which JS wrapper class an element gets, as a small code. This is the
+/// native twin of `_classForKind` in bootstrap.js and replaces three string
+/// round trips (tag name, namespace, local name) per wrapped element.
+/// 0 Element, 1 SVGElement, 2 SVGPathElement, 3 SVGSVGElement, 4 form,
+/// 5 input, 6 textarea, 7 meta, 8 slot, 9 img, 10 canvas, 11 audio, 12 video,
+/// 13 track.
+fn element_class_kind(name: &html5ever::QualName) -> i32 {
+    let html = name.ns == html5ever::ns!(html);
+    let local = name.local.as_ref();
+    // The same tagName JS would see: uppercase in the HTML namespace,
+    // qualified and case-preserved elsewhere.
+    let tag = if html {
+        local.to_uppercase()
+    } else {
+        match &name.prefix {
+            Some(prefix) => format!("{}:{}", prefix, local),
+            None => local.to_string(),
+        }
+    };
+    if tag != tag.to_uppercase() && name.ns.as_ref() == "http://www.w3.org/2000/svg" {
+        return match tag.as_str() {
+            "path" => 2,
+            "svg" => 3,
+            _ => 1,
+        };
+    }
+    match tag.as_str() {
+        "FORM" => 4,
+        "INPUT" if html && local == "input" => 5,
+        "TEXTAREA" => 6,
+        "META" if html && local == "meta" => 7,
+        "SLOT" if html => 8,
+        "IMG" => 9,
+        "CANVAS" => 10,
+        "AUDIO" => 11,
+        "VIDEO" => 12,
+        "TRACK" => 13,
+        _ => 0,
+    }
+}
+
+/// Numeric tree reads for the hottest getters. No command string, no number
+/// formatting or JSON: `parentNode`, `firstChild`, `nodeType` and friends run
+/// on the V8 fast-call path. Codes: 0 parent, 1 first child, 2 last child,
+/// 3 next sibling, 4 previous sibling (each -1 when absent), 5 node type
+/// (0 for an unknown node), 6 connected (0/1), 7 stylesheet owner in subtree
+/// (0/1), 8 subtree_flags bits, 9 node type in the low 4 bits and for
+/// elements `element_class_kind` above them.
+#[op2(fast)]
+fn op_dom_nav(state: &OpState, code: u32, nid: u32, frame_id: u32) -> i32 {
+    let shared = frame_state(state, frame_id);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let gs = shared.borrow();
+        let Some(dom) = gs.dom.as_ref() else {
+            return if code == 5 { 0 } else { -1 };
+        };
+        let id = NodeId::new(nid);
+        let link = |link: Option<NodeId>| link.map_or(-1, |id| id.index() as i32);
+        match code {
+            0 => dom.with_node(id, |n| link(n.parent)).unwrap_or(-1),
+            1 => dom.with_node(id, |n| link(n.first_child)).unwrap_or(-1),
+            2 => dom.with_node(id, |n| link(n.last_child)).unwrap_or(-1),
+            3 => dom.with_node(id, |n| link(n.next_sibling)).unwrap_or(-1),
+            4 => dom.with_node(id, |n| link(n.prev_sibling)).unwrap_or(-1),
+            5 => dom
+                .with_node(id, |n| match &n.data {
+                    NodeData::Document => 9,
+                    NodeData::Element { .. } => 1,
+                    NodeData::Text { .. } => 3,
+                    NodeData::Comment { .. } => 8,
+                    NodeData::Doctype { .. } => 10,
+                    NodeData::ProcessingInstruction { .. } => 7,
+                })
+                .unwrap_or(0),
+            9 => dom
+                .with_node(id, |n| match &n.data {
+                    NodeData::Document => 9,
+                    NodeData::Element { name, .. } => 1 | (element_class_kind(name) << 4),
+                    NodeData::Text { .. } => 3,
+                    NodeData::Comment { .. } => 8,
+                    NodeData::Doctype { .. } => 10,
+                    NodeData::ProcessingInstruction { .. } => 7,
+                })
+                .unwrap_or(0),
+            6 => i32::from(dom.is_connected(id)),
+            7 => i32::from(dom.subtree_flags(id) & 1 != 0),
+            8 => i32::from(dom.subtree_flags(id)),
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// String-valued node reads: 0 tagName, 1 localName, 2 namespaceURI,
+/// 3 textContent, 4 nodeName, 5 innerHTML, 6 outerHTML. The same values the
+/// JSON-returning commands carry, without the JSON on either side.
+fn node_text(dom: &DomTree, code: u32, nid: u32) -> String {
+    let id = NodeId::new(nid);
+    match code {
+        0 => dom
+            .with_node(id, |n| {
+                n.as_element().map(|name| {
+                    if name.ns == html5ever::ns!(html) {
+                        name.local.as_ref().to_ascii_uppercase()
+                    } else {
+                        match &name.prefix {
+                            Some(prefix) => format!("{}:{}", prefix, name.local),
+                            None => name.local.to_string(),
+                        }
+                    }
+                })
+            })
+            .flatten()
+            .unwrap_or_default(),
+        1 => dom
+            .with_node(id, |n| n.as_element().map(|name| name.local.to_string()))
+            .flatten()
+            .unwrap_or_default(),
+        2 => dom
+            .with_node(id, |n| n.as_element().map(|name| name.ns.as_ref().to_string()))
+            .flatten()
+            .unwrap_or_default(),
+        3 => dom.text_content(id),
+        4 => dom
+            .with_node(id, |n| match &n.data {
+                NodeData::Document => "#document".to_string(),
+                NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
+                NodeData::Text { .. } => "#text".to_string(),
+                NodeData::Comment { .. } => "#comment".to_string(),
+                NodeData::Doctype { name, .. } => name.clone(),
+                NodeData::ProcessingInstruction { target, .. } => target.clone(),
+            })
+            .unwrap_or_default(),
+        5 => dom.inner_html(id),
+        6 => dom.outer_html(id),
+        _ => String::new(),
+    }
+}
+
+#[op2]
+#[string]
+fn op_dom_text(state: &OpState, code: u32, nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let gs = shared.borrow();
+        gs.dom.as_ref().map(|dom| node_text(dom, code, nid)).unwrap_or_default()
+    }))
+    .unwrap_or_default()
+}
+
+/// getAttribute without a command string or a JSON round trip: the value, or
+/// null when the node or attribute is absent.
+#[op2]
+#[string]
+fn op_dom_attr(
+    state: &OpState,
+    nid: u32,
+    #[string] name: String,
+    frame_id: u32,
+) -> Option<String> {
+    let shared = frame_state(state, frame_id);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let gs = shared.borrow();
+        let dom = gs.dom.as_ref()?;
+        dom.with_node(NodeId::new(nid), |n| n.get_attribute(&name).map(str::to_owned))
+            .flatten()
+    }))
+    .unwrap_or(None)
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -1863,9 +2032,24 @@ fn op_dom(
             if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
             return "true".into();
         }
-        let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
+        // Composite commands remove frames exactly like the command they wrap.
+        let (frame_cmd, composite) = match cmd.as_str() {
+            "append_child_x" => ("append_child", true),
+            "insert_before_x" => ("insert_before", true),
+            "remove_child_x" => ("remove_child", true),
+            "set_text_el" => ("set_text_content", true),
+            "set_inner_html_x" => ("set_inner_html", true),
+            other => (other, false),
+        };
+        let removed = registry.borrow().frames_removed_by(&shared, frame_cmd, &arg1, &arg2);
         let result = op_dom_inner(shared, cmd, arg1, arg2);
-        if result == "true" && !removed.is_empty() {
+        // A composite result starting "0" was rejected; "s"/"x" changed nothing.
+        let changed = if composite {
+            !matches!(result.as_bytes().first(), None | Some(b'0' | b's' | b'x'))
+        } else {
+            result == "true"
+        };
+        if changed && !removed.is_empty() {
             let registry = registry.borrow();
             for (id, _) in &removed {
                 if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
@@ -1882,6 +2066,142 @@ fn op_dom(
         tracing::error!("op_dom panicked; returning null");
         "null".to_string()
     })
+}
+
+/// Selector for descendants that script preparation or window named access
+/// must look at after an insertion. Keep in sync with `_INSERTED_SUBTREE_SELECTOR`
+/// in bootstrap.js.
+const INSERTED_SUBTREE_SELECTOR: &str =
+    "script,[id],embed[name],form[name],iframe[name],img[name],object[name]";
+
+/// What JS needs to know after a successful insertion, in one string: a digit
+/// (1 detached, 2 connected inside a shadow tree, 3 connected in the document
+/// tree) and, for a connected element with children, `:` plus the comma
+/// separated ids from `INSERTED_SUBTREE_SELECTOR`.
+fn inserted_subtree_state(shared: &SharedState, child: &str) -> String {
+    let gs = shared.borrow();
+    let (Some(dom), Ok(child)) = (gs.dom.as_ref(), child.parse::<u32>()) else {
+        return "1".into();
+    };
+    let child = NodeId::new(child);
+    if !dom.is_connected(child) {
+        return "1".into();
+    }
+    let mut out = String::from(if dom.tree_scope_root(child) == Some(dom.document()) {
+        "3"
+    } else {
+        "2"
+    });
+    let scan = dom
+        .with_node(child, |n| n.is_element() && n.first_child.is_some())
+        .unwrap_or(false);
+    if scan {
+        out.push(':');
+        if let Ok(ids) = dom.query_selector_all_from(child, INSERTED_SUBTREE_SELECTOR) {
+            for (i, id) in ids.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&id.index().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Several DOM commands behind one JS->Rust crossing. Each mutation still runs
+/// through `op_dom_inner`, so render invalidation and mutation bookkeeping are
+/// exactly those of the individual commands.
+fn op_dom_composite(shared: SharedState, cmd: &str, arg1: String, arg2: String) -> String {
+    match cmd {
+        // arg1 parent, arg2 child; insert_before: arg1 new node, arg2 reference.
+        "append_child_x" | "insert_before_x" => {
+            let append = cmd == "append_child_x";
+            let child = if append { arg2.clone() } else { arg1.clone() };
+            let base = if append { "append_child" } else { "insert_before" };
+            if op_dom_inner(shared.clone(), base.into(), arg1, arg2) != "true" {
+                return "0".into();
+            }
+            inserted_subtree_state(&shared, &child)
+        }
+        // "s": the subtree needs the full JS bookkeeping (stylesheet owners or
+        // window named properties); nothing was changed. "0": rejected.
+        // "1"/"2": removed, child was detached/connected beforehand.
+        "remove_child_x" => {
+            let child = arg1.parse::<u32>().ok().map(NodeId::new);
+            let (flags, connected) = {
+                let gs = shared.borrow();
+                match (gs.dom.as_ref(), child) {
+                    (Some(dom), Some(child)) => (dom.subtree_flags(child), dom.is_connected(child)),
+                    _ => return "0".into(),
+                }
+            };
+            if flags != 0 {
+                return "s".into();
+            }
+            if op_dom_inner(shared, "remove_child".into(), arg1, String::new()) != "true" {
+                return "0".into();
+            }
+            if connected { "2" } else { "1" }.into()
+        }
+        // Element.textContent = text. Returns "x" (nothing changed) when the
+        // target is not an element or an old child subtree owns a stylesheet,
+        // else "<new text node or -1>;<removed child ids>".
+        "set_text_el" => {
+            let target = arg1.parse::<u32>().ok().map(NodeId::new);
+            let old_children = {
+                let gs = shared.borrow();
+                let (Some(dom), Some(target)) = (gs.dom.as_ref(), target) else {
+                    return "x".into();
+                };
+                if !dom.with_node(target, |n| n.is_element()).unwrap_or(false) {
+                    return "x".into();
+                }
+                let children = dom.children(target);
+                if children.iter().any(|child| dom.subtree_flags(*child) & 1 != 0) {
+                    return "x".into();
+                }
+                children
+            };
+            let mut removed = String::new();
+            for (i, child) in old_children.iter().enumerate() {
+                op_dom_inner(shared.clone(), "remove_child".into(), child.index().to_string(), String::new());
+                if i > 0 {
+                    removed.push(',');
+                }
+                removed.push_str(&child.index().to_string());
+            }
+            let mut text_node = "-1".to_string();
+            if !arg2.is_empty() {
+                text_node = op_dom_inner(shared.clone(), "create_text_node".into(), arg2, String::new());
+                op_dom_inner(shared, "append_child".into(), arg1, text_node.clone());
+            }
+            format!("{};{}", text_node, removed)
+        }
+        // Element.innerHTML = html when the old and new content need no
+        // stylesheet or window-named bookkeeping. "s": the old children own a
+        // stylesheet or a named element, nothing changed. "1": done. "2": done,
+        // and the new content has elements that may need a named property.
+        "set_inner_html_x" => {
+            let Some(target) = arg1.parse::<u32>().ok().map(NodeId::new) else {
+                return "s".into();
+            };
+            let children_flags = |shared: &SharedState| {
+                let gs = shared.borrow();
+                gs.dom.as_ref().map_or(3, |dom| {
+                    dom.children(target)
+                        .into_iter()
+                        .fold(0, |flags, child| flags | dom.subtree_flags(child))
+                })
+            };
+            if children_flags(&shared) != 0 {
+                return "s".into();
+            }
+            op_dom_inner(shared.clone(), "set_inner_html".into(), arg1, arg2);
+            if children_flags(&shared) & 2 != 0 { "2" } else { "1" }.into()
+        }
+        _ => "null".into(),
+    }
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
@@ -1902,6 +2222,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     if cmd == "performance_lifecycle" {
         shared.borrow_mut().navigation_timing.record(&arg1);
         return "null".into();
+    }
+    if matches!(
+        cmd.as_str(),
+        "append_child_x" | "insert_before_x" | "remove_child_x" | "set_text_el" | "set_inner_html_x"
+    ) {
+        return op_dom_composite(shared, &cmd, arg1, arg2);
     }
     if cmd == "document_lifecycle" {
         let mut state = shared.borrow_mut();
@@ -1936,7 +2262,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     "append_child" => {
                         if let Ok(node) = arg2.parse::<u32>() {
                             let node = NodeId::new(node);
-                            if dom.get_node(node).and_then(|node| node.parent).is_some() {
+                            if dom.with_node(node, |node| node.parent.is_some()).unwrap_or(false) {
                                 roots.push(node);
                             }
                         }
@@ -1944,7 +2270,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     "insert_before" => {
                         if let Ok(node) = arg1.parse::<u32>() {
                             let node = NodeId::new(node);
-                            if dom.get_node(node).and_then(|node| node.parent).is_some() {
+                            if dom.with_node(node, |node| node.parent.is_some()).unwrap_or(false) {
                                 roots.push(node);
                             }
                         }
@@ -2055,12 +2381,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|reference| state.dom.as_ref()?.get_node(reference)?.parent),
+                    .and_then(|reference| state.dom.as_ref()?.with_node(reference, |n| n.parent)?),
                 "remove_child" => arg1
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|child| state.dom.as_ref()?.get_node(child)?.parent),
+                    .and_then(|child| state.dom.as_ref()?.with_node(child, |n| n.parent)?),
                 "set_inner_html" | "set_inner_html_context" | "set_text_content" => {
                     arg1.parse::<u32>().ok().map(NodeId::new)
                 }
@@ -2283,21 +2609,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "node_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name: String = dom
-                .with_node(NodeId::new(nid), |n| match &n.data {
-                    NodeData::Document => "#document".to_string(),
-                    NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
-                    NodeData::Text { .. } => "#text".to_string(),
-                    NodeData::Comment { .. } => "#comment".to_string(),
-                    NodeData::Doctype { name, .. } => name.clone(),
-                    NodeData::ProcessingInstruction { target, .. } => target.clone(),
-                })
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 4, nid)).unwrap_or("\"\"".into())
         }
         "text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&dom.text_content(NodeId::new(nid))).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 3, nid)).unwrap_or("\"\"".into())
         }
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2363,45 +2679,18 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom
-                .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| {
-                        if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
-                        } else {
-                            match &name.prefix {
-                                Some(prefix) => format!("{}:{}", prefix, name.local),
-                                None => name.local.to_string(),
-                            }
-                        }
-                    })
-                })
-                .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 0, nid)).unwrap_or("\"\"".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom
-                .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| name.local.to_string())
-                })
-                .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 1, nid)).unwrap_or("\"\"".into())
         }
         // The tree builder already assigns foreign content (an <svg>/<math>
         // subtree) its own namespace; expose it so JS does not have to guess
         // the namespace from the tag name.
         "namespace_uri" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let ns = dom
-                .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| name.ns.as_ref().to_string())
-                })
-                .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&ns).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 2, nid)).unwrap_or("\"\"".into())
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2441,11 +2730,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "inner_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&dom.inner_html(NodeId::new(nid))).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 5, nid)).unwrap_or("\"\"".into())
         }
         "outer_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&dom.outer_html(NodeId::new(nid))).unwrap_or("\"\"".into())
+            serde_json::to_string(&node_text(dom, 6, nid)).unwrap_or("\"\"".into())
         }
         "append_child" => {
             // Reject if either nid failed to parse (was "undefined"/empty) — those
@@ -2462,7 +2751,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let parent = NodeId::new(parent);
             let child = NodeId::new(child);
             dom.append_child(parent, child);
-            (dom.get_node(child).and_then(|node| node.parent) == Some(parent)).to_string()
+            (dom.with_node(child, |node| node.parent) == Some(Some(parent))).to_string()
         }
         "remove_child" => {
             let child = match arg1.parse::<u32>() {
@@ -2471,13 +2760,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             };
             let child = NodeId::new(child);
             let had_parent = dom
-                .get_node(child)
-                .is_some_and(|node| node.parent.is_some());
+                .with_node(child, |node| node.parent.is_some())
+                .unwrap_or(false);
             dom.remove_child(child);
             (had_parent
                 && dom
-                    .get_node(child)
-                    .is_some_and(|node| node.parent.is_none()))
+                    .with_node(child, |node| node.parent.is_none())
+                    .unwrap_or(false))
             .to_string()
         }
         "insert_before" => {
@@ -2491,10 +2780,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             };
             let ref_node = NodeId::new(ref_node);
             let new_node = NodeId::new(new_node);
-            let expected_parent = dom.get_node(ref_node).and_then(|node| node.parent);
+            let expected_parent = dom.with_node(ref_node, |node| node.parent).flatten();
             dom.insert_before(ref_node, new_node);
             (expected_parent.is_some()
-                && dom.get_node(new_node).and_then(|node| node.parent) == expected_parent)
+                && dom.with_node(new_node, |node| node.parent).flatten() == expected_parent)
                 .to_string()
         }
         "remove_attribute" => {
@@ -6861,6 +7150,9 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_dom_nav(),
+        op_dom_attr(),
+        op_dom_text(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),
