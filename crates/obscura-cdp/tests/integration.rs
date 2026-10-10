@@ -46,6 +46,7 @@ integration_tests!(
     input_mouse_label_activation,
     js_fetch_emits_network_events,
     max_connections_cap,
+    module_network_events,
     nodefilter_constants,
     page_frame_contract,
     runtime_by_value_undefined,
