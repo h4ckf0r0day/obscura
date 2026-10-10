@@ -12152,35 +12152,83 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // WHATWG Storage as a legacy platform object: a Proxy routes property access
 // (localStorage.foo, localStorage["foo"], delete, `in`, Object.keys) through
 // the named getter/setter so length/key()/iteration stay in sync with the
-// backing map. Plain prototype methods alone could not intercept direct
+// backing store. Plain prototype methods alone could not intercept direct
 // property access, so `localStorage.foo = x` never updated length before.
+// The store itself is Rust, keyed by origin, so it outlives the realm.
 globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
+// The backing store is Rust, keyed by origin, because the realm is rebuilt on
+// every navigation and a realm-local object loses every entry with it
+// (issue #678). The slot records which op owns the store so a same-origin frame
+// realm and the top document share the data while a cross-origin frame lands in
+// its own origin's bucket.
+const _storageSlots = new WeakMap();
+const _storageSlot = (value) => {
+  const slot = _storageSlots.get(value);
+  if (!slot) throw new TypeError('Illegal invocation');
+  return slot;
+};
+const _storageOp = (slot) => slot.local ? __obscuraCore.ops.op_local_storage : __obscuraCore.ops.op_session_storage;
+const _storageCall = (slot, command, key, value) => {
+  // The WebIDL string conversions stay outside the try: a Symbol argument has
+  // to raise TypeError, not fall through to the null that means "no backend".
+  const k = String(key);
+  const v = value === undefined ? '' : String(value);
+  try { return JSON.parse(_storageOp(slot)(command, k, v)); }
+  catch (_) { return null; }
+};
+// [key, value] pairs in insertion order, which is the order Storage.key() is
+// defined over.
+const _storageEntries = (slot) => {
+  const entries = _storageCall(slot, 'snapshot', '');
+  return Array.isArray(entries) ? entries : [];
+};
+Storage.prototype.getItem = function(k) {
+  const value = _storageCall(_storageSlot(this), 'get', k, '');
+  return typeof value === 'string' ? value : null;
+};
+Storage.prototype.setItem = function(k, v) {
+  const stored = _storageCall(_storageSlot(this), 'set', k, v);
+  if (stored !== true) throw new DOMException('Setting the value exceeded the quota.', 'QuotaExceededError');
+};
+Storage.prototype.removeItem = function(k) { _storageCall(_storageSlot(this), 'remove', k, ''); };
+Storage.prototype.clear = function() { _storageCall(_storageSlot(this), 'clear', '', ''); };
+Storage.prototype.key = function(i) {
+  const entries = _storageEntries(_storageSlot(this));
+  i = i >>> 0;
+  return i < entries.length ? entries[i][0] : null;
+};
+Object.defineProperty(Storage.prototype, 'length', {
+  get: function() { return _storageEntries(_storageSlot(this)).length; },
+  configurable: true,
+});
 
-const _mkStore = () => {
+const _mkStore = (local) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
-  return new Proxy(target, {
+  const slot = { local: !!local };
+  const isReal = (p) => p === 'constructor' || (p in Storage.prototype);
+  const proxy = new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return t.getItem(p) !== null; },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys() { return _storageEntries(slot).map((entry) => entry[0]); },
     getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
+      if (typeof p !== 'symbol') {
+        const value = t.getItem(p);
+        if (value !== null)
+          return { value, writable: true, enumerable: true, configurable: true };
+      }
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
+  // Both the target and the proxy resolve to the slot: property access can
+  // arrive on either depending on how the receiver is threaded.
+  _storageSlots.set(target, slot);
+  _storageSlots.set(proxy, slot);
+  return proxy;
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore(true);
+globalThis.sessionStorage = _mkStore(false);
 
 globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
@@ -15209,129 +15257,810 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-// Minimal but spec-shape-correct IndexedDB shim. We don't persist anything,
-// but authentication libraries (Firebase, Supabase, dexie) hang forever on
-// the first `get` because their request's `onsuccess` is never called. Fire
-// `onsuccess` asynchronously with `null` so reads complete-but-empty, which
-// most libraries treat as a cache miss and fall back to the network.
-function _idbRequest(produceResult) {
-  const req = {
-    result: undefined,
-    error: null,
-    source: null,
-    transaction: null,
-    readyState: 'pending',
-    onsuccess: null,
-    onerror: null,
-    addEventListener(type, fn) { req['on' + type] = fn; },
-    removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
-  };
-  Promise.resolve().then(() => {
+// IndexedDB. The object graph, the event ordering and the key handling live
+// here; the records and the schema live in Rust, keyed by origin, so they
+// survive the realm rebuild that every navigation performs and a profile
+// reload. The previous shim handed each object store its own Map and never
+// fired onupgradeneeded, so a schema-created database was unreachable and its
+// first read threw.
+(() => {
+  const _idbBackend = (payload) => {
     try {
-      req.result = produceResult();
-      req.readyState = 'done';
-      if (typeof req.onsuccess === 'function') {
-        try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
-      }
+      const reply = JSON.parse(__obscuraCore.ops.op_indexed_db(JSON.stringify(payload)));
+      if (reply && reply.ok) return reply;
+      return { ok: false, error: (reply && reply.error) || 'IndexedDB request failed' };
     } catch (e) {
-      req.error = e; req.readyState = 'done';
-      if (typeof req.onerror === 'function') {
-        try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
+      return { ok: false, error: 'IndexedDB backend is unavailable' };
+    }
+  };
+  const _idbFail = (name, message) => new DOMException(message, name);
+
+  // Key ordering follows the spec's type order, so a numeric key sorts before a
+  // string one and an array key after both.
+  const _keyRank = (value) => {
+    if (typeof value === 'number') return 0;
+    if (value instanceof Date) return 1;
+    if (typeof value === 'string') return 2;
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return 3;
+    if (Array.isArray(value)) return 4;
+    return 5;
+  };
+  const _idbCmp = (a, b) => {
+    const ra = _keyRank(a);
+    const rb = _keyRank(b);
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    if (ra === 0) return a === b ? 0 : (a < b ? -1 : 1);
+    if (ra === 1) {
+      const ta = a.getTime();
+      const tb = b.getTime();
+      return ta === tb ? 0 : (ta < tb ? -1 : 1);
+    }
+    if (ra === 2) return a === b ? 0 : (a < b ? -1 : 1);
+    if (ra === 4) {
+      const length = Math.max(a.length, b.length);
+      for (let i = 0; i < length; i++) {
+        if (i >= a.length) return -1;
+        if (i >= b.length) return 1;
+        const inner = _idbCmp(a[i], b[i]);
+        if (inner !== 0) return inner;
       }
+      return 0;
     }
-  });
-  return req;
-}
-
-function _idbObjectStore(name) {
-  const data = new Map();
-  return {
-    name,
-    keyPath: null,
-    autoIncrement: false,
-    indexNames: { contains() { return false; }, length: 0, item() { return null; } },
-    transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
-    openCursor() { return _idbRequest(() => null); },
-    openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
-    deleteIndex() {},
+    return 0;
   };
-}
+  const _idbValidKey = (value) => {
+    const rank = _keyRank(value);
+    if (rank === 0) return Number.isFinite(value);
+    if (rank === 2) return true;
+    if (rank === 4) return value.every(_idbValidKey);
+    return false;
+  };
+  const _idbInRange = (key, query) => {
+    if (query === undefined || query === null) return true;
+    if (typeof query === 'number' || typeof query === 'string' || query instanceof Date || Array.isArray(query)) {
+      return _idbCmp(key, query) === 0;
+    }
+    if (query.lower !== undefined && query.lower !== null) {
+      const lower = _idbCmp(key, query.lower);
+      if (query.lowerOpen ? lower <= 0 : lower < 0) return false;
+    }
+    if (query.upper !== undefined && query.upper !== null) {
+      const upper = _idbCmp(key, query.upper);
+      if (query.upperOpen ? upper >= 0 : upper > 0) return false;
+    }
+    return true;
+  };
+  // Key path: dotted, with numeric segments indexing into arrays, matching the
+  // spec's evaluation order for in-line keys.
+  const _idbExtractKey = (keyPath, value) => {
+    if (keyPath === undefined || keyPath === null || keyPath === '') return undefined;
+    let current = value;
+    for (const segment of String(keyPath).split('.')) {
+      if (current === undefined || current === null) return undefined;
+      current = current[segment];
+    }
+    return current;
+  };
+  const _idbSortedEntries = (records, query, direction, count) => {
+    const parsed = records.map((record) => ({
+      key: JSON.parse(record.key),
+      value: JSON.parse(record.value),
+    }));
+    parsed.sort((a, b) => _idbCmp(a.key, b.key));
+    if (direction === 'prev' || direction === 'previous') parsed.reverse();
+    if (query !== undefined && query !== null) {
+      return parsed.filter((entry) => _idbInRange(entry.key, query));
+    }
+    return parsed;
+  };
 
-function _idbTransaction(storeNames) {
-  const stores = new Map();
-  const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
-  const tx = {
-    db: null,
-    mode: 'readonly',
-    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
-    onabort: null, oncomplete: null, onerror: null,
-    error: null,
+  // ── IDBRequest ───────────────────────────────────────────────────────────
+  function IDBRequest() {}
+  IDBRequest.prototype = {
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return;
+      (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = this._listeners[type];
+      if (!list) return;
+      const at = list.indexOf(fn);
+      if (at >= 0) list.splice(at, 1);
+    },
+    _fire(type, event) {
+      const handler = this['on' + type];
+      if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) {} }
+      for (const fn of (this._listeners[type] || []).slice()) {
+        try { fn.call(this, event); } catch (e) {}
+      }
+    },
+  };
+  Object.defineProperty(IDBRequest.prototype, 'IDBRequest', { value: IDBRequest, configurable: true });
+
+  const _newRequest = (transaction, source) => {
+    const request = Object.create(IDBRequest.prototype);
+    request._listeners = {};
+    request.result = undefined;
+    request.error = null;
+    request.source = source || null;
+    request.transaction = transaction || null;
+    request.readyState = 'pending';
+    request.onsuccess = null;
+    request.onerror = null;
+    return request;
+  };
+  const _settle = (request, work) => {
+    Promise.resolve().then(() => {
+      if (request.readyState !== 'pending') return;
+      try {
+        request.result = work();
+        request.readyState = 'done';
+        request._fire('success', { type: 'success', target: request });
+      } catch (error) {
+        request.error = error;
+        request.readyState = 'done';
+        request._fire('error', { type: 'error', target: request });
+      }
+      if (request.transaction) request.transaction._requestSettled();
+    });
+  };
+  const _fail = (request, name, message) => {
+    request.error = _idbFail(name, message);
+    request.readyState = 'done';
+    request._fire('error', { type: 'error', target: request });
+    if (request.transaction) request.transaction._requestSettled();
+  };
+
+  // ── IDBTransaction ───────────────────────────────────────────────────────
+  function IDBTransaction() {}
+  IDBTransaction.prototype = {
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return;
+      (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = this._listeners[type];
+      if (!list) return;
+      const at = list.indexOf(fn);
+      if (at >= 0) list.splice(at, 1);
+    },
+    _fire(type, event) {
+      const handler = this['on' + type];
+      if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) {} }
+      for (const fn of (this._listeners[type] || []).slice()) {
+        try { fn.call(this, event); } catch (e) {}
+      }
+    },
     objectStore(name) {
-      let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
-      s.transaction = tx;
-      return s;
+      const key = String(name);
+      if (!this._storeNames.has(key)) {
+        throw _idbFail('NotFoundError', "no object store named '" + key + "' in this transaction");
+      }
+      return this._store(key);
     },
-    abort() {},
-    commit() {},
-    addEventListener(type, fn) { tx['on' + type] = fn; },
-    removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
+    abort() {
+      if (this._finished) throw _idbFail('InvalidStateError', 'the transaction is already finished');
+      this._finished = true;
+      this.error = this.error || _idbFail('AbortError', 'the transaction was aborted');
+      this._fire('abort', { type: 'abort', target: this });
+    },
+    commit() { this._committed = true; },
   };
-  Promise.resolve().then(() => {
-    if (typeof tx.oncomplete === 'function') {
-      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
+  Object.defineProperty(IDBTransaction.prototype, 'IDBTransaction', { value: IDBTransaction, configurable: true });
+
+  const _newTransaction = (db, storeNames, mode) => {
+    const transaction = Object.create(IDBTransaction.prototype);
+    transaction._listeners = {};
+    transaction.db = db;
+    transaction.mode = mode || 'readonly';
+    transaction.error = null;
+    transaction.onabort = null;
+    transaction.oncomplete = null;
+    transaction.onerror = null;
+    transaction._storeNames = new Set(storeNames);
+    transaction._stores = new Map();
+    transaction._pending = 0;
+    transaction._finished = false;
+    transaction._committed = false;
+    transaction.objectStoreNames = {
+      get length() { return transaction._storeNames.size; },
+      item: (index) => [...transaction._storeNames][index] ?? null,
+      contains: (name) => transaction._storeNames.has(String(name)),
+    };
+    return transaction;
+  };
+  IDBTransaction.prototype._store = function(name) {
+    let store = this._stores.get(name);
+    if (!store) {
+      store = _newObjectStore(this, name);
+      this._stores.set(name, store);
     }
-  });
-  return tx;
-}
-
-function _idbDatabase(name, version) {
-  return {
-    name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
-    transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
-      tx.mode = mode || 'readonly';
-      return tx;
-    },
-    close() {},
-    onversionchange: null, onabort: null, onerror: null, onclose: null,
-    addEventListener() {}, removeEventListener() {},
+    return store;
   };
-}
+  // The spec completes a transaction once its last request has settled, not on a
+  // fixed microtask, so a caller that chains requests in oncomplete still sees
+  // a live transaction.
+  IDBTransaction.prototype._requestStarted = function() {
+    if (this._finished) throw _idbFail('TransactionInactiveError', 'the transaction has already finished');
+    this._pending += 1;
+  };
+  IDBTransaction.prototype._requestSettled = function() {
+    if (this._finished) return;
+    this._pending -= 1;
+    if (this._pending > 0) return;
+    // Completion waits for a macrotask, not a microtask. The spec keeps a
+    // transaction alive while requests are still being queued in the same task,
+    // and the normal pattern is exactly that: chain a get after a getAll. With a
+    // microtask the transaction was already finished before the second request
+    // existed, so every chained call raised TransactionInactiveError.
+    setTimeout(() => {
+      if (this._finished || this._pending > 0) return;
+      this._finished = true;
+      this._fire('complete', { type: 'complete', target: this });
+    }, 0);
+  };
 
-globalThis.indexedDB = {
-  open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
-  },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
-  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
-};
-globalThis.IDBKeyRange = {
-  only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
-  lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
-  upperBound(v, open) { return { lower: null, upper: v, lowerOpen: false, upperOpen: !!open, includes(x) { return open ? x < v : x <= v; } }; },
-  bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
-};
+  // ── IDBCursor ────────────────────────────────────────────────────────────
+  function IDBCursor() {}
+  IDBCursor.prototype = {
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return;
+      (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = this._listeners[type];
+      if (!list) return;
+      const at = list.indexOf(fn);
+      if (at >= 0) list.splice(at, 1);
+    },
+    continue(key) {
+      if (key !== undefined) this._pendingKey = key;
+      this._advance(1);
+    },
+    continuePrimaryKey(key, primaryKey) { this.continue(key); },
+    advance(count) { this._advance(count); },
+    update(value) {
+      this._objectStore._write(this.primaryKey, value, false);
+    },
+    delete() {
+      this._objectStore._request('delete', () => ({ key: this.primaryKey }), undefined);
+    },
+    _advance(step) {
+      this._index += step;
+      this._emit();
+    },
+    _emit() {
+      const entry = this._entries[this._index];
+      // Running past the last record has to publish a null result and fire
+      // success again, otherwise a `while (cursor) cursor.continue()` loop never
+      // ends: the request kept its old cursor and nothing was dispatched.
+      if (!entry) {
+        this.request.result = null;
+        this._emitEvent();
+        return;
+      }
+      // `key` is the index key when the cursor came from an index, and the
+      // primary key otherwise; `primaryKey` is always the record's own key.
+      this.primaryKey = entry.primaryKey === undefined ? entry.key : entry.primaryKey;
+      this.key = this._keyOnly ? this.primaryKey : entry.key;
+      this.value = this._keyOnly ? undefined : entry.value;
+      this.request.result = this;
+      this._emitEvent();
+    },
+    _emitEvent() {
+      const handler = this.request.onsuccess;
+      const event = { type: 'success', target: this.request };
+      if (typeof handler === 'function') { try { handler.call(this.request, event); } catch (e) {} }
+      for (const fn of (this.request._listeners.success || []).slice()) {
+        try { fn.call(this.request, event); } catch (e) {}
+      }
+    },
+    _indexKey() { return this.key; },
+    // Unused now that _emit reads entry.key and entry.primaryKey directly, kept
+    // so nothing external depends on the old helper.
+    _indexKeyOf(entry) { return entry.key; },
+  };
+  Object.defineProperty(IDBCursor.prototype, 'IDBCursor', { value: IDBCursor, configurable: true });
+
+  const _newCursor = (request, objectStore, entries, keyOnly) => {
+    const cursor = Object.create(IDBCursor.prototype);
+    cursor._listeners = {};
+    cursor.request = request;
+    cursor._objectStore = objectStore;
+    cursor._entries = entries;
+    cursor._keyOnly = keyOnly;
+    cursor.direction = 'next';
+    cursor._index = -1;
+    cursor.primaryKey = undefined;
+    cursor.key = undefined;
+    cursor.value = undefined;
+    return cursor;
+  };
+
+  // ── IDBObjectStore and IDBIndex ───────────────────────────────────────────
+  function IDBObjectStore() {}
+  function IDBIndex() {}
+  IDBIndex.prototype = {
+    addEventListener() {}, removeEventListener() {},
+    get(key) { return this._objectStore._request('get', () => ({ key, index: this }), undefined); },
+    getKey(key) { return this._objectStore._request('get', () => ({ key, index: this }), undefined); },
+    getAll(query, count) {
+      return this._objectStore._request('entries', () => ({ query, count, index: this }), undefined);
+    },
+    getAllKeys(query, count) {
+      return this._objectStore._request('entries', () => ({ query, count, keysOnly: true, index: this }), undefined);
+    },
+    count(query) { return this._objectStore._request('entries', () => ({ query, index: this, countOnly: true }), undefined); },
+    openCursor(query, direction) {
+      return this._objectStore._request('entries', () => ({ query, direction, index: this, cursor: true }), undefined);
+    },
+    openKeyCursor(query, direction) {
+      return this._objectStore._request('entries', () => ({ query, direction, keysOnly: true, index: this, cursor: true }), undefined);
+    },
+  };
+  Object.defineProperty(IDBIndex.prototype, 'IDBIndex', { value: IDBIndex, configurable: true });
+
+  IDBObjectStore.prototype = {
+    addEventListener() {}, removeEventListener() {},
+    get name() { return this._name; },
+    get keyPath() { return this._keyPath ?? null; },
+    get autoIncrement() { return !!this._autoIncrement; },
+    get transaction() { return this._transaction; },
+    get indexNames() {
+      const names = Object.keys(this._indexes);
+      return {
+        get length() { return names.length; },
+        item: (index) => names[index] ?? null,
+        contains: (name) => Object.prototype.hasOwnProperty.call(this._indexes, String(name)),
+      };
+    },
+    put(value, key) { return this._write(key, value, false); },
+    add(value, key) { return this._write(key, value, true); },
+    get(key) { return this._request('get', () => ({ key }), undefined); },
+    getKey(key) { return this._request('get', () => ({ key }), undefined); },
+    getAll(query, count) { return this._request('entries', () => ({ query, count }), undefined); },
+    getAllKeys(query, count) { return this._request('entries', () => ({ query, count, keysOnly: true }), undefined); },
+    count(query) { return this._request('entries', () => ({ query, countOnly: true }), undefined); },
+    delete(key) { return this._request('delete', () => ({ key }), undefined); },
+    clear() { return this._request('clear', () => ({}), undefined); },
+    openCursor(query, direction) {
+      return this._cursor(query, direction, false);
+    },
+    openKeyCursor(query, direction) {
+      return this._cursor(query, direction, true);
+    },
+    createIndex(name, keyPath, options) {
+      if (this._transaction.mode !== 'versionchange') {
+        throw _idbFail('InvalidStateError', 'createIndex requires a versionchange transaction');
+      }
+      const index = Object.create(IDBIndex.prototype);
+      index._objectStore = this;
+      index.name = String(name);
+      index.keyPath = String(keyPath);
+      index.unique = !!(options && options.unique);
+      index.multiEntry = !!(options && options.multiEntry);
+      this._indexes[index.name] = index;
+      this._transaction._schemaChanged();
+      return index;
+    },
+    index(name) {
+      const index = this._indexes[String(name)];
+      if (!index) throw _idbFail('NotFoundError', "no index named '" + name + "'");
+      return index;
+    },
+    deleteIndex(name) {
+      delete this._indexes[String(name)];
+      this._transaction._schemaChanged();
+    },
+    // Resolve the key the spec would use: explicit key first, then the key path,
+    // then the generator when the store is auto-incrementing.
+    _resolveKey(value, explicitKey) {
+      if (explicitKey !== undefined && explicitKey !== null) {
+        if (!_idbValidKey(explicitKey)) throw _idbFail('DataError', 'the key is not a valid IndexedDB key');
+        return explicitKey;
+      }
+      const fromPath = this._keyPath ? _idbExtractKey(this._keyPath, value) : undefined;
+      if (fromPath !== undefined) {
+        if (!_idbValidKey(fromPath)) throw _idbFail('DataError', 'the key path did not yield a valid key');
+        return fromPath;
+      }
+      if (this._autoIncrement) {
+        this._nextKey += 1;
+        return this._nextKey;
+      }
+      throw _idbFail('DataError', 'the store needs an explicit key or a key path');
+    },
+    _write(key, value, mustBeNew) {
+      return this._request('put', () => ({ key: this._resolveKey(value, key), value, mustBeNew }), undefined);
+    },
+    _cursor(query, direction, keyOnly) {
+      return this._request('entries', () => ({ query, direction, keysOnly: keyOnly, cursor: true }));
+    },
+    // Every operation is one request: the spec allows the caller to read
+    // `transaction` and the store's metadata while a request is pending.
+    _request(command, args, initial) {
+      const request = _newRequest(this._transaction, this);
+      if (command === 'entries' && args().cursor) {
+        // A cursor request starts empty and is filled in by the body below, so
+        // `request.result` can be replaced by the first `continue`.
+        request.result = null;
+      }
+      if (initial !== null && initial !== undefined && command !== 'entries') {
+        request.result = initial;
+        return request;
+      }
+      this._transaction._requestStarted();
+      Promise.resolve().then(() => {
+        try {
+        const payload = args();
+        const base = { db: this._dbName, store: this._name, cmd: command };
+        let reply;
+        if (command === 'entries') {
+          reply = _idbBackend(Object.assign({}, base, { cmd: 'entries' }));
+          if (!reply.ok) return _fail(request, 'UnknownError', reply.error);
+          const entries = reply.records || [];
+          const parsed = entries.map((record) => ({ key: JSON.parse(record.key), value: JSON.parse(record.value) }));
+          const index = payload.index;
+          const scoped = index
+            ? parsed
+                .map((entry) => ({ key: _idbExtractKey(index.keyPath, entry.value), value: entry.value, primaryKey: entry.key }))
+                .filter((entry) => entry.key !== undefined && _idbInRange(entry.key, payload.query))
+                .sort((a, b) => _idbCmp(a.key, b.key))
+            : parsed.sort((a, b) => _idbCmp(a.key, b.key));
+          if (payload.direction === 'prev' || payload.direction === 'previous') scoped.reverse();
+          const limited = typeof payload.count === 'number' ? scoped.slice(0, payload.count) : scoped;
+          if (payload.cursor) {
+            const cursor = _newCursor(request, this, limited, !!payload.keysOnly);
+            cursor.direction = payload.direction || 'next';
+            request.result = cursor;
+            cursor._index = -1;
+            cursor._advance(1);
+            request.readyState = 'done';
+            this._transaction._requestSettled();
+            return;
+          }
+          if (payload.countOnly) { request.result = limited.length; request.readyState = 'done'; request._fire('success', { type: 'success', target: request }); this._transaction._requestSettled(); return; }
+          if (payload.keysOnly) { request.result = limited.map((entry) => (index ? entry.key : entry.key)); }
+          else if (index) { request.result = limited.map((entry) => entry.value); }
+          else { request.result = limited.map((entry) => entry.value); }
+          request.readyState = 'done';
+          request._fire('success', { type: 'success', target: request });
+          this._transaction._requestSettled();
+          return;
+        }
+        if (command === 'get') {
+          const keyJson = JSON.stringify(payload.key);
+          reply = _idbBackend(Object.assign({}, base, { cmd: 'get', key: payload.key }));
+          if (!reply.ok) return _fail(request, 'UnknownError', reply.error);
+          if (!reply.found) {
+            request.result = undefined;
+          } else {
+            const value = JSON.parse(reply.value);
+            if (payload.index) {
+              const indexKey = _idbExtractKey(payload.index.keyPath, value);
+              request.result = indexKey !== undefined && _idbCmp(indexKey, payload.key) === 0 ? value : undefined;
+            } else if (_idbCmp(JSON.parse(keyJson), payload.key) === 0) {
+              request.result = value;
+            } else {
+              request.result = undefined;
+            }
+          }
+          request.readyState = 'done';
+          request._fire('success', { type: 'success', target: request });
+          this._transaction._requestSettled();
+          return;
+        }
+        if (command === 'put') {
+          reply = _idbBackend(Object.assign({}, base, { cmd: 'put', key: payload.key, value: payload.value }));
+          if (!reply.ok) return _fail(request, 'QuotaExceededError', reply.error);
+          if (payload.mustBeNew && reply.replaced) {
+            return _fail(request, 'ConstraintError', 'the key already exists');
+          }
+          if (payload.index) {
+            this._keySeq += 1;
+            const keyJson = JSON.stringify(payload.key);
+          }
+          if (this._autoIncrement && typeof payload.key === 'number' && payload.key >= this._nextKey) {
+            this._nextKey = payload.key;
+          }
+          request.result = payload.key;
+          request.readyState = 'done';
+          request._fire('success', { type: 'success', target: request });
+          this._transaction._requestSettled();
+          return;
+        }
+        reply = _idbBackend(Object.assign({}, base, { cmd: command, key: payload.key }));
+        if (!reply.ok) return _fail(request, 'UnknownError', reply.error);
+        request.result = undefined;
+        request.readyState = 'done';
+        request._fire('success', { type: 'success', target: request });
+        this._transaction._requestSettled();
+        } catch (e) {
+          // A throw inside the body used to leave the request pending and the
+          // transaction never completing, which reads as a hung page.
+          _fail(request, 'UnknownError', String(e));
+        }
+      });
+      return request;
+    },
+  };
+  Object.defineProperty(IDBObjectStore.prototype, 'IDBObjectStore', { value: IDBObjectStore, configurable: true });
+
+  const _newObjectStore = (transaction, name) => {
+    const store = Object.create(IDBObjectStore.prototype);
+    const definition = transaction._schema[name] || {};
+    store._name = name;
+    store._dbName = transaction.db.name;
+    store._transaction = transaction;
+    store._keyPath = definition.keyPath ?? null;
+    store._autoIncrement = !!definition.autoIncrement;
+    store._indexes = {};
+    for (const stored of definition.indexes || []) {
+      const index = Object.create(IDBIndex.prototype);
+      index._objectStore = store;
+      index.name = stored.name;
+      index.keyPath = stored.keyPath;
+      index.unique = !!stored.unique;
+      index.multiEntry = !!stored.multiEntry;
+      store._indexes[index.name] = index;
+    }
+    store._nextKey = 0;
+    store._keySeq = 0;
+    return store;
+  };
+
+  // ── IDBDatabase ──────────────────────────────────────────────────────────
+  function IDBDatabase() {}
+  IDBDatabase.prototype = {
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return;
+      (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = this._listeners[type];
+      if (!list) return;
+      const at = list.indexOf(fn);
+      if (at >= 0) list.splice(at, 1);
+    },
+    _fire(type, event) {
+      const handler = this['on' + type];
+      if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) {} }
+      for (const fn of (this._listeners[type] || []).slice()) {
+        try { fn.call(this, event); } catch (e) {}
+      }
+    },
+    get name() { return this._name; },
+    get version() { return this._version; },
+    get objectStoreNames() {
+      const names = Object.keys(this._schema);
+      return {
+        get length() { return names.length; },
+        item: (index) => names[index] ?? null,
+        contains: (name) => Object.prototype.hasOwnProperty.call(this._schema, String(name)),
+      };
+    },
+    createObjectStore(name, options) {
+      if (this._closed) throw _idbFail('InvalidStateError', 'the database is closed');
+      const key = String(name);
+      if (this._schema[key]) throw _idbFail('ConstraintError', "an object store named '" + key + "' already exists");
+      this._schema[key] = {
+        keyPath: (options && options.keyPath) ?? null,
+        autoIncrement: !!(options && options.autoIncrement),
+        indexes: [],
+      };
+      this._upgradeTransaction._schemaChanged();
+      return this._upgradeTransaction._store(key);
+    },
+    deleteObjectStore(name) {
+      const key = String(name);
+      if (!this._schema[key]) throw _idbFail('NotFoundError', "no object store named '" + key + "'");
+      delete this._schema[key];
+      this._upgradeTransaction._schemaChanged();
+    },
+    transaction(storeNames, mode) {
+      if (this._closed) throw _idbFail('InvalidStateError', 'the database is closed');
+      const names = (Array.isArray(storeNames) ? storeNames : [storeNames]).map(String);
+      for (const name of names) {
+        if (!this._schema[name]) {
+          throw _idbFail('NotFoundError', "no object store named '" + name + "'");
+        }
+      }
+      const transaction = _newTransaction(this, names, mode);
+      transaction._schema = this._schema;
+      return transaction;
+    },
+    close() { this._closed = true; },
+  };
+  Object.defineProperty(IDBDatabase.prototype, 'IDBDatabase', { value: IDBDatabase, configurable: true });
+
+  const _newDatabase = (name, version, schema, upgradeTransaction) => {
+    const db = Object.create(IDBDatabase.prototype);
+    db._listeners = {};
+    db._name = name;
+    db._version = version;
+    db._schema = schema;
+    db._upgradeTransaction = upgradeTransaction || null;
+    db._closed = false;
+    db.onversionchange = null;
+    db.onabort = null;
+    db.onerror = null;
+    db.onclose = null;
+    return db;
+  };
+
+  const _serializeSchema = (db) => {
+    const stores = {};
+    for (const [name, definition] of Object.entries(db._schema)) {
+      stores[name] = {
+        keyPath: definition.keyPath ?? null,
+        autoIncrement: !!definition.autoIncrement,
+        indexes: Object.values(definition.indexes || {}).map((index) => ({
+          name: index.name, keyPath: index.keyPath, unique: !!index.unique, multiEntry: !!index.multiEntry,
+        })),
+      };
+    }
+    return stores;
+  };
+  const _deserializeSchema = (raw) => {
+    const schema = {};
+    for (const [name, definition] of Object.entries(raw || {})) {
+      const indexes = {};
+      for (const index of definition.indexes || []) indexes[index.name] = index;
+      schema[name] = {
+        keyPath: definition.keyPath ?? null,
+        autoIncrement: !!definition.autoIncrement,
+        indexes,
+      };
+    }
+    return schema;
+  };
+
+  // ── IDBKeyRange ──────────────────────────────────────────────────────────
+  function IDBKeyRange(lower, upper, lowerOpen, upperOpen) {
+    this.lower = lower === undefined ? null : lower;
+    this.upper = upper === undefined ? null : upper;
+    this.lowerOpen = !!lowerOpen;
+    this.upperOpen = !!upperOpen;
+  }
+  IDBKeyRange.prototype.includes = function(key) { return _idbInRange(key, this); };
+  Object.defineProperty(IDBKeyRange.prototype, 'IDBKeyRange', { value: IDBKeyRange, configurable: true });
+
+  const _keyRangeCheck = (value) => {
+    if (!_idbValidKey(value)) throw _idbFail('DataError', 'not a valid IndexedDB key');
+    return value;
+  };
+
+  // ── IDBFactory ───────────────────────────────────────────────────────────
+  function IDBFactory() {}
+  IDBFactory.prototype = {
+    open(name, version) {
+      const dbName = String(name);
+      const requested = Math.max(1, Math.trunc(version === undefined ? 1 : version) || 1);
+      const request = _newRequest(null, null);
+      request.onupgradeneeded = null;
+      request.onblocked = null;
+      request.onupgradeneeded_elsewhere = null;
+      Promise.resolve().then(() => {
+       try {
+        const reply = _idbBackend({ db: dbName, cmd: 'open', version: requested });
+        if (!reply.ok) {
+          request.error = _idbFail('UnknownError', reply.error);
+          request.readyState = 'done';
+          request._fire('error', { type: 'error', target: request });
+          return;
+        }
+        const schema = _deserializeSchema(reply.stores);
+        if (!reply.upgradeNeeded) {
+          request.result = _newDatabase(dbName, reply.version || requested, schema, null);
+          request.readyState = 'done';
+          request._fire('success', { type: 'success', target: request });
+          return;
+        }
+        // Upgrade path: hand the page a versionchange transaction whose
+        // createObjectStore calls land in the schema, then commit it.
+        const oldVersion = reply.version || 0;
+        const database = _newDatabase(dbName, requested, schema, null);
+        const transaction = _newTransaction(database, [], 'versionchange');
+        transaction._schema = schema;
+        transaction._upgrade = true;
+        transaction._schemaChanged = function() { this._schemaDirty = true; };
+        database._upgradeTransaction = transaction;
+        request.transaction = transaction;
+        request.result = database;
+        request.readyState = 'done';
+        request._fire('upgradeneeded', {
+          type: 'upgradeneeded',
+          target: request,
+          oldVersion,
+          newVersion: requested,
+          transaction,
+        });
+        Promise.resolve().then(() => {
+          if (!reply.exists && Object.keys(schema).length === 0 && !transaction._schemaDirty) {
+            // No schema was declared, which is a legitimate empty database.
+          }
+          const commit = _idbBackend({
+            db: dbName,
+            cmd: 'schema',
+            version: requested,
+            stores: _serializeSchema(database),
+          });
+          if (!commit.ok) {
+            request.error = _idbFail('UnknownError', commit.error);
+            request._fire('error', { type: 'error', target: request });
+            return;
+          }
+          transaction._fire('complete', { type: 'complete', target: transaction });
+          request._fire('success', { type: 'success', target: request });
+        });
+       } catch (e) {
+        request.error = _idbFail('UnknownError', String(e));
+        request.readyState = 'done';
+        request._fire('error', { type: 'error', target: request });
+       }
+      });
+      return request;
+    },
+    deleteDatabase(name) {
+      const dbName = String(name);
+      const request = _newRequest(null, null);
+      request.onblocked = null;
+      Promise.resolve().then(() => {
+        const reply = _idbBackend({ db: dbName, cmd: 'deleteDatabase' });
+        request.result = undefined;
+        request.readyState = 'done';
+        if (!reply.ok) {
+          request.error = _idbFail('UnknownError', reply.error);
+          request._fire('error', { type: 'error', target: request });
+          return;
+        }
+        request._fire('success', { type: 'success', target: request });
+      });
+      return request;
+    },
+    // The spec has IDBFactory.databases() return a Promise of
+    // IDBDatabaseInfo records, not a request. Returning the request left
+    // `await indexedDB.databases()` resolving to the request itself, so callers
+    // that read `.result` off the awaited value saw undefined and a boot that
+    // waits on that list never finished.
+    databases() {
+      const request = _newRequest(null, null);
+      const promise = Promise.resolve().then(() => {
+        const reply = _idbBackend({ cmd: 'list' });
+        const databases = reply.ok ? (reply.databases || []) : [];
+        request.result = databases;
+        request.readyState = 'done';
+        request._fire('success', { type: 'success', target: request });
+        return databases;
+      });
+      promise.request = request;
+      return promise;
+    },
+    cmp(a, b) { return _idbCmp(a, b); },
+  };
+  Object.defineProperty(IDBFactory.prototype, 'IDBFactory', { value: IDBFactory, configurable: true });
+
+  const _idbOpenRequests = new WeakMap();
+  const factory = new IDBFactory();
+  _idbOpenRequests.set(factory, factory);
+  globalThis.IDBFactory = IDBFactory;
+  globalThis.IDBRequest = IDBRequest;
+  globalThis.IDBTransaction = IDBTransaction;
+  globalThis.IDBDatabase = IDBDatabase;
+  globalThis.IDBObjectStore = IDBObjectStore;
+  globalThis.IDBIndex = IDBIndex;
+  globalThis.IDBCursor = IDBCursor;
+  globalThis.IDBKeyRange = IDBKeyRange;
+  globalThis.IDBKeyRange.only = (value) => new IDBKeyRange(_keyRangeCheck(value), _keyRangeCheck(value), false, false);
+  globalThis.IDBKeyRange.lowerBound = (value, open) => new IDBKeyRange(_keyRangeCheck(value), null, !!open, false);
+  globalThis.IDBKeyRange.upperBound = (value, open) => new IDBKeyRange(null, _keyRangeCheck(value), false, !!open);
+  globalThis.IDBKeyRange.bound = (lower, upper, lowerOpen, upperOpen) =>
+    new IDBKeyRange(_keyRangeCheck(lower), _keyRangeCheck(upper), !!lowerOpen, !!upperOpen);
+  globalThis.indexedDB = factory;
+})();
 
 // Do not advertise CacheStorage until it can retain responses. A successful
-// no-op cache selects broken persistence paths instead of normal fetch fallbacks.
+// no-op cache selects broken persistence paths instead of normal fetch fallbacks.ch fallbacks.
 
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);

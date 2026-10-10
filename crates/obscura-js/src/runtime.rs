@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, StoredNetworkResponseBody,
+    IndexedDbStorage, ObscuraState, OriginStorage, RuntimeEvent, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -1166,6 +1166,25 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    /// Install the context-scoped `localStorage` backing store. The Arc lives on
+    /// the BrowserContext, so entries outlive the V8 realm that wrote them.
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
+    }
+
+    /// Install the page-owned `sessionStorage` backing store, so an entry
+    /// survives realm teardown on a same-origin navigation and on CDP target
+    /// switching while staying inside the tab (issue #678).
+    pub fn set_session_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().session_storage = Some(storage);
+    }
+
+    /// Install the context-scoped IndexedDB backing store, so records and the
+    /// schema outlive the realm that wrote them.
+    pub fn set_indexed_db(&self, storage: std::sync::Arc<IndexedDbStorage>) {
+        self.state.borrow_mut().indexed_db = Some(storage);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {

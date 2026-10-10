@@ -653,7 +653,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
-    persistence_ctx.save_cookies();
+    persistence_ctx.save_storage();
     Ok(())
 }
 
@@ -887,7 +887,7 @@ fn run_connection(
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
-                persistence_context.save_cookies();
+                persistence_context.save_storage();
             }
 
             drop(persisted_context);

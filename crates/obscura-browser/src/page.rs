@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::{max_live_frames, NavigationTiming};
+use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -249,6 +249,11 @@ pub struct Page {
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
+    /// `sessionStorage` backing store, keyed by origin. Owned by the Page rather
+    /// than by the realm: `init_js` runs on every navigation and on CDP target
+    /// switching, but a session entry must survive both while never leaving the
+    /// tab (issue #678).
+    session_storage: Arc<OriginStorage>,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
     /// separate from `url`: direct automation navigations have no referrer,
@@ -1102,6 +1107,7 @@ impl Page {
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
+            session_storage: Arc::new(OriginStorage::default()),
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
@@ -1827,6 +1833,10 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        // Web Storage lives outside the realm so a navigation cannot drop it.
+        rt.set_local_storage(self.context.local_storage.clone());
+        rt.set_session_storage(self.session_storage.clone());
+        rt.set_indexed_db(self.context.indexed_db.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -3589,6 +3599,9 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+        // The document's own scripts are the common source of storage writes,
+        // so the profile is flushed once they have run, not before.
+        self.context.save_local_storage();
 
         #[cfg(feature = "render")]
         {
@@ -6495,6 +6508,160 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    /// Issue #678: `localStorage` belongs to the BrowserContext and
+    /// `sessionStorage` to the Page, so both survive the realm rebuild that
+    /// `init_js` performs on every navigation. The fixture serves one origin on
+    /// two paths plus a second origin, so a cross-origin hop is testable too.
+    async fn spawn_storage_server() -> (String, String) {
+        let first = "<html><body><script>window.__ran='YES';</script></body></html>";
+        async fn serve(listener: tokio::net::TcpListener, body: &'static str) {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.to_string();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        }
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        tokio::spawn(serve(listener_a, first));
+        tokio::spawn(serve(listener_b, first));
+        (format!("http://{addr_a}"), format!("http://{addr_b}"))
+    }
+
+    fn storage_page(name: &str, context: std::sync::Arc<crate::BrowserContext>) -> super::Page {
+        super::Page::new(name.to_string(), context)
+    }
+
+    #[tokio::test]
+    async fn web_storage_survives_navigation_and_is_scoped_per_origin() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin_a, origin_b) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "storage-regression".into(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = storage_page("storage-regression", context.clone());
+
+        page.navigate(&origin_a).await.unwrap();
+        page.evaluate(
+            r#"(() => {
+                localStorage.setItem('l1', 'local-value');
+                sessionStorage.setItem('s1', 'session-value');
+                return 'seeded';
+            })()"#,
+        );
+
+        // Same origin, different path: a new document, and therefore a new realm.
+        page.navigate(&format!("{origin_a}/second")).await.unwrap();
+        let after = page
+            .evaluate(
+                r#"({
+                    local: localStorage.getItem('l1'),
+                    session: sessionStorage.getItem('s1'),
+                    length: localStorage.length,
+                    viaProperty: localStorage.l1,
+                    has: 'l1' in localStorage,
+                    keys: Object.keys(localStorage),
+                })"#,
+            );
+        assert_eq!(
+            after.get("local").and_then(|v| v.as_str()),
+            Some("local-value"),
+            "localStorage must survive a same-origin navigation: {after:?}"
+        );
+        assert_eq!(
+            after.get("session").and_then(|v| v.as_str()),
+            Some("session-value"),
+            "sessionStorage must survive a same-origin navigation in the same tab: {after:?}"
+        );
+        // The Proxy surface has to agree with the methods now that the data
+        // lives in Rust: property access, `in`, key enumeration and length.
+        assert_eq!(after.get("viaProperty").and_then(|v| v.as_str()), Some("local-value"));
+        assert_eq!(after.get("has").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(after.get("length").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            after.get("keys").and_then(|v| v.as_array()).map(|k| k.len()),
+            Some(1)
+        );
+
+        // Another origin gets an empty store of its own: no cross-origin leak.
+        page.navigate(&origin_b).await.unwrap();
+        let other = page
+            .evaluate(
+                r#"({
+                    local: localStorage.getItem('l1'),
+                    session: sessionStorage.getItem('s1'),
+                })"#,
+            );
+        assert!(
+            other["local"].is_null() && other["session"].is_null(),
+            "a different origin must not see this origin's storage: {other:?}"
+        );
+
+        // Coming back, the original origin's data is still there.
+        page.navigate(&origin_a).await.unwrap();
+        let back = page.evaluate("localStorage.getItem('l1')");
+        assert_eq!(back.as_str(), Some("local-value"));
+    }
+
+    #[tokio::test]
+    async fn session_storage_stays_inside_the_tab_and_local_storage_is_shared() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin, _) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "storage-scope".into(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut first = storage_page("storage-scope-1", context.clone());
+        first.navigate(&origin).await.unwrap();
+        first.evaluate(
+            r#"(() => {
+                localStorage.setItem('shared', 'from-tab-one');
+                sessionStorage.setItem('tab', 'from-tab-one');
+                return 'ok';
+            })()"#,
+        );
+
+        // A second page of the same context shares localStorage but not
+        // sessionStorage, which is the split the storage bug got wrong.
+        let mut second = storage_page("storage-scope-2", context.clone());
+        second.navigate(&origin).await.unwrap();
+        let view = second
+            .evaluate(
+                r#"({
+                    local: localStorage.getItem('shared'),
+                    session: sessionStorage.getItem('tab'),
+                })"#,
+            );
+        assert_eq!(
+            view.get("local").and_then(|v| v.as_str()),
+            Some("from-tab-one"),
+            "localStorage is scoped to the BrowserContext: {view:?}"
+        );
+        assert!(
+            view.get("session") == Some(&serde_json::Value::Null),
+            "sessionStorage must not cross tabs: {view:?}"
+        );
     }
 
     /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the

@@ -149,6 +149,519 @@ impl NavigationTiming {
     }
 }
 
+/// Per-origin key/value store behind `localStorage` and `sessionStorage`.
+///
+/// Web Storage used to be a plain JS object inside the V8 realm, and
+/// `Page::init_js` builds a new realm on every navigation, so every entry was
+/// lost on the next document load (issue #678). Keeping the data here, keyed by
+/// origin, makes an entry survive realm teardown: `localStorage` on the
+/// BrowserContext so every page in a context shares it, `sessionStorage` on the
+/// Page so it crosses same-origin navigation without ever leaving the tab.
+///
+/// Insertion order is preserved because `Storage.key(i)` is defined in insertion
+/// order, not sorted order.
+const LOCAL_STORAGE_ORIGIN_LIMIT: usize = 5 * 1024 * 1024;
+const LOCAL_STORAGE_TOTAL_LIMIT: usize = 32 * 1024 * 1024;
+const LOCAL_STORAGE_ORIGIN_COUNT_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct OriginStorageInner {
+    origins: HashMap<String, Vec<(String, String)>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+pub struct OriginStorage {
+    inner: std::sync::Mutex<OriginStorageInner>,
+    /// Set by every mutation, cleared by the disk writer. Without it a
+    /// navigation would rewrite every origin file even when nothing changed,
+    /// and `--storage-dir` would turn each page load into a few dozen writes.
+    dirty: std::sync::atomic::AtomicBool,
+    /// Origins touched since the last successful write. The writer only has to
+    /// look at these, and an origin that lost its last entry is in here too, so
+    /// its file can be removed instead of resurrected on the next load.
+    changed: std::sync::Mutex<HashSet<String>>,
+}
+
+impl OriginStorage {
+    pub fn snapshot(&self, origin: &str) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .origins
+            .get(origin)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn get(&self, origin: &str, key: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .origins
+            .get(origin)
+            .and_then(|items| items.iter().find(|(name, _)| name == key))
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Returns false when the write would exceed a quota, which the caller
+    /// surfaces as a `QuotaExceededError` the way a real browser does.
+    pub fn set(&self, origin: &str, key: String, value: String) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !inner.origins.contains_key(origin)
+            && inner.origins.len() >= LOCAL_STORAGE_ORIGIN_COUNT_LIMIT
+        {
+            return false;
+        }
+
+        let items = inner.origins.get(origin);
+        let previous = items
+            .and_then(|items| items.iter().find(|(name, _)| name == &key))
+            .map(|(name, value)| name.len() + value.len())
+            .unwrap_or(0);
+        let origin_bytes = items
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let new_bytes = key.len() + value.len();
+        let next_origin_bytes = origin_bytes.saturating_sub(previous) + new_bytes;
+        let next_total_bytes = inner.bytes.saturating_sub(previous) + new_bytes;
+        if next_origin_bytes > LOCAL_STORAGE_ORIGIN_LIMIT
+            || next_total_bytes > LOCAL_STORAGE_TOTAL_LIMIT
+        {
+            return false;
+        }
+
+        let items = inner.origins.entry(origin.to_string()).or_default();
+        if let Some((_, old_value)) = items.iter_mut().find(|(name, _)| name == &key) {
+            *old_value = value;
+        } else {
+            items.push((key, value));
+        }
+        inner.bytes = next_total_bytes;
+        drop(inner);
+        self.mark_changed(origin);
+        true
+    }
+
+    pub fn remove(&self, origin: &str, key: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = inner.origins.get_mut(origin).and_then(|items| {
+            items
+                .iter()
+                .position(|(name, _)| name == key)
+                .map(|index| items.remove(index))
+        });
+        if let Some((name, value)) = removed {
+            inner.bytes -= name.len() + value.len();
+        }
+        if inner.origins.get(origin).is_some_and(Vec::is_empty) {
+            inner.origins.remove(origin);
+        }
+        drop(inner);
+        self.mark_changed(origin);
+    }
+
+    /// Every origin with entries, in a stable order so a disk write produces a
+    /// reproducible file set.
+    pub fn entries(&self) -> Vec<(String, Vec<(String, String)>)> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<(String, Vec<(String, String)>)> = inner
+            .origins
+            .iter()
+            .filter(|(_, items)| !items.is_empty())
+            .map(|(origin, items)| (origin.clone(), items.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Replace an origin's store wholesale. Used when reloading a profile from
+    /// `--storage-dir`, and by tests that assert a round trip.
+    pub fn load(&self, origin: &str, items: Vec<(String, String)>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes: usize = items
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        inner.bytes = inner.bytes.saturating_sub(
+            inner
+                .origins
+                .get(origin)
+                .map(|old| old.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>())
+                .unwrap_or(0),
+        ) + bytes;
+        if items.is_empty() {
+            inner.origins.remove(origin);
+        } else {
+            inner.origins.insert(origin.to_string(), items);
+        }
+        drop(inner);
+        self.mark_changed(origin);
+    }
+
+    fn mark_changed(&self, origin: &str) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(origin.to_string());
+    }
+
+    /// Origins written to since the last successful flush, in a stable order.
+    pub fn changed_origins(&self) -> Vec<String> {
+        let changed = self
+            .changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<String> = changed.iter().cloned().collect();
+        out.sort();
+        out
+    }
+
+    /// Called by the disk writer once every touched origin reached the disk, so
+    /// a failed write leaves the store dirty and is retried.
+    pub fn take_changed(&self) {
+        self.changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.dirty.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn clear(&self, origin: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = inner.origins.remove(origin);
+        if let Some(items) = removed {
+            inner.bytes -= items
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>();
+        }
+        drop(inner);
+        // Marked as changed, not just dirty: the writer only inspects origins in
+        // this set, so a clear that only set the flag left the file on disk and
+        // the next load resurrected the entries the user had cleared.
+        self.mark_changed(origin);
+    }
+}
+
+/// One object store's durable state. Keys and values are JSON so they cross the
+/// op boundary without a native value type; a `Date`, `Map` or `Blob` therefore
+/// does not survive a reload, which is a documented limitation rather than a
+/// silent one.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct StoredIdbStore {
+    #[serde(default)]
+    key_path: Option<String>,
+    #[serde(default)]
+    auto_increment: bool,
+    #[serde(default)]
+    indexes: Vec<StoredIdbIndex>,
+    /// (JSON key, JSON value) in insertion order.
+    #[serde(default)]
+    records: Vec<(String, String)>,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct StoredIdbIndex {
+    name: String,
+    key_path: String,
+    #[serde(default)]
+    unique: bool,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct StoredIdbDatabase {
+    version: u64,
+    #[serde(default)]
+    stores: std::collections::BTreeMap<String, StoredIdbStore>,
+}
+
+#[derive(Default)]
+struct IndexedDbInner {
+    /// origin -> database name -> database.
+    origins: HashMap<String, HashMap<String, StoredIdbDatabase>>,
+}
+
+/// IndexedDB backing store, keyed by origin the same way `localStorage` is.
+///
+/// The shim in `bootstrap.js` used to hand every object store its own `Map`, so
+/// `createObjectStore` results were unreachable and a database's data died with
+/// the realm. Records live here instead, so they survive navigation and a
+/// profile reload.
+#[derive(Default)]
+pub struct IndexedDbStorage {
+    inner: std::sync::Mutex<IndexedDbInner>,
+}
+
+impl IndexedDbStorage {
+    fn lock(&self) -> std::sync::MutexGuard<'_, IndexedDbInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn databases(&self, origin: &str) -> HashMap<String, StoredIdbDatabase> {
+        self.lock().origins.get(origin).cloned().unwrap_or_default()
+    }
+}
+
+/// Total records one origin may hold, so a runaway page cannot grow without
+/// bound inside one session.
+const IDB_ORIGIN_RECORD_LIMIT: usize = 100_000;
+
+fn idb_fail(message: &str) -> String {
+    let mut out = String::from("{\"ok\":false,\"error\":");
+    out.push_str(&serde_json::to_string(message).unwrap_or_else(|_| "\"error\"".to_string()));
+    out.push('}');
+    out
+}
+
+/// Handle one IndexedDB command. `payload` is a JSON object with at least a
+/// `cmd`; the reply is always a JSON object with `ok`, so the shim can tell a
+/// real failure from a malformed request.
+fn indexed_db_command(
+    storage: &Option<Arc<IndexedDbStorage>>,
+    origin: &str,
+    payload: &str,
+) -> String {
+    let Some(storage) = storage else {
+        return idb_fail("no IndexedDB storage is attached");
+    };
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return idb_fail("malformed IndexedDB request");
+    };
+    let command = request.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+    let db_name = request.get("db").and_then(|v| v.as_str()).unwrap_or("");
+    let store_name = request.get("store").and_then(|v| v.as_str()).unwrap_or("");
+
+    match command {
+        // Read the schema, and report whether an upgrade transaction is needed.
+        "open" => {
+            let requested = request
+                .get("version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .max(1);
+            let databases = storage.databases(origin);
+            let existing = databases.get(db_name);
+            let version = existing.map(|db| db.version).unwrap_or(0);
+            let stores = existing
+                .map(|db| {
+                    serde_json::to_value(&db.stores).unwrap_or_else(|_| serde_json::Value::Null)
+                })
+                .unwrap_or_else(|| serde_json::json!({}));
+            return serde_json::json!({
+                "ok": true,
+                "exists": existing.is_some(),
+                "version": version,
+                "upgradeNeeded": existing.is_none() || requested > version,
+                "stores": stores,
+            })
+            .to_string();
+        }
+        // Write the schema and the version once an upgrade transaction finished.
+        "schema" => {
+            let version = request.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+            let stores: std::collections::BTreeMap<String, StoredIdbStore> = request
+                .get("stores")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let mut inner = storage.lock();
+            let entry = inner
+                .origins
+                .entry(origin.to_string())
+                .or_default()
+                .entry(db_name.to_string())
+                .or_default();
+            entry.version = version;
+            // Stores removed by the upgrade are dropped, and the rest keep their
+            // records unless the key path or key generator changed.
+            let dropped: Vec<String> = entry
+                .stores
+                .keys()
+                .filter(|name| !stores.contains_key(*name))
+                .cloned()
+                .collect();
+            for name in dropped {
+                entry.stores.remove(&name);
+            }
+            for (name, store) in stores {
+                match entry.stores.get_mut(&name) {
+                    Some(existing) => {
+                        if existing.key_path != store.key_path
+                            || existing.auto_increment != store.auto_increment
+                        {
+                            *existing = StoredIdbStore {
+                                key_path: store.key_path,
+                                auto_increment: store.auto_increment,
+                                indexes: store.indexes,
+                                records: existing.records.clone(),
+                            };
+                        } else {
+                            existing.indexes = store.indexes;
+                        }
+                    }
+                    None => {
+                        entry.stores.insert(name, store);
+                    }
+                }
+            }
+            return serde_json::json!({ "ok": true }).to_string();
+        }
+        "put" => {
+            let key = request.get("key").cloned().unwrap_or(serde_json::Value::Null);
+            let value = request.get("value").cloned().unwrap_or(serde_json::Value::Null);
+            let key_json = key.to_string();
+            let value_json = value.to_string();
+            let mut inner = storage.lock();
+            let total: usize = inner
+                .origins
+                .get(origin)
+                .map(|databases| {
+                    databases
+                        .values()
+                        .flat_map(|db| db.stores.values())
+                        .map(|store| store.records.len())
+                        .sum()
+                })
+                .unwrap_or(0);
+            let Some(store) = inner
+                .origins
+                .get_mut(origin)
+                .and_then(|databases| databases.get_mut(db_name))
+                .and_then(|db| db.stores.get_mut(store_name))
+            else {
+                return idb_fail("object store not found");
+            };
+            if let Some(slot) = store
+                .records
+                .iter_mut()
+                .find(|(existing, _)| *existing == key_json)
+            {
+                slot.1 = value_json;
+                return serde_json::json!({ "ok": true, "replaced": true }).to_string();
+            }
+            if total >= IDB_ORIGIN_RECORD_LIMIT {
+                return idb_fail("quota exceeded");
+            }
+            store.records.push((key_json, value_json));
+            serde_json::json!({ "ok": true, "replaced": false }).to_string()
+        }
+        "get" => {
+            let key_json = request
+                .get("key")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let inner = storage.lock();
+            let store = inner
+                .origins
+                .get(origin)
+                .and_then(|databases| databases.get(db_name))
+                .and_then(|db| db.stores.get(store_name));
+            let found = store.and_then(|store| {
+                store
+                    .records
+                    .iter()
+                    .find(|(key, _)| *key == key_json)
+                    .map(|(_, value)| value.clone())
+            });
+            match found {
+                Some(value) => serde_json::json!({ "ok": true, "found": true, "value": value }).to_string(),
+                None => serde_json::json!({ "ok": true, "found": false }).to_string(),
+            }
+        }
+        "delete" => {
+            let key_json = request
+                .get("key")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            let mut inner = storage.lock();
+            let Some(store) = inner
+                .origins
+                .get_mut(origin)
+                .and_then(|databases| databases.get_mut(db_name))
+                .and_then(|db| db.stores.get_mut(store_name))
+            else {
+                return idb_fail("object store not found");
+            };
+            store.records.retain(|(key, _)| *key != key_json);
+            serde_json::json!({ "ok": true }).to_string()
+        }
+        "clear" => {
+            let mut inner = storage.lock();
+            if let Some(store) = inner
+                .origins
+                .get_mut(origin)
+                .and_then(|databases| databases.get_mut(db_name))
+                .and_then(|db| db.stores.get_mut(store_name))
+            {
+                store.records.clear();
+            }
+            serde_json::json!({ "ok": true }).to_string()
+        }
+        // Every read returns the whole store in one op call: getAll, getAllKeys,
+        // count and get are all projections of the same list, and a page that
+        // asks twice should not pay two round trips through V8.
+        "entries" => {
+            let inner = storage.lock();
+            let store = inner
+                .origins
+                .get(origin)
+                .and_then(|databases| databases.get(db_name))
+                .and_then(|db| db.stores.get(store_name));
+            let records = store.map(|store| store.records.clone()).unwrap_or_default();
+            serde_json::json!({
+                "ok": true,
+                "records": records
+                    .into_iter()
+                    .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+                    .collect::<Vec<_>>(),
+                "keyPath": store.and_then(|store| store.key_path.clone()),
+            })
+            .to_string()
+        }
+        "deleteDatabase" => {
+            let mut inner = storage.lock();
+            if let Some(databases) = inner.origins.get_mut(origin) {
+                databases.remove(db_name);
+            }
+            serde_json::json!({ "ok": true }).to_string()
+        }
+        "list" => {
+            let databases = storage.lock().origins.get(origin).cloned().unwrap_or_default();
+            let names: Vec<serde_json::Value> = databases
+                .into_iter()
+                .map(|(name, db)| serde_json::json!({ "name": name, "version": db.version }))
+                .collect();
+            serde_json::json!({ "ok": true, "databases": names }).to_string()
+        }
+        _ => idb_fail("unknown IndexedDB command"),
+    }
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -167,6 +680,16 @@ pub struct ObscuraState {
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    /// BrowserContext-scoped `localStorage`. Shared by every page of one
+    /// context and keyed by origin, so a realm rebuild cannot lose it.
+    pub local_storage: Option<Arc<OriginStorage>>,
+    /// Browsing-context-scoped `sessionStorage`. Owned by the Page and keyed by
+    /// origin: an entry survives realm teardown on a same-origin navigation but
+    /// never leaves the tab (issue #678).
+    pub session_storage: Option<Arc<OriginStorage>>,
+    /// BrowserContext-scoped IndexedDB records and schema. Shared by every page
+    /// of one context and keyed by origin, so a realm rebuild cannot lose them.
+    pub indexed_db: Option<Arc<IndexedDbStorage>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -398,6 +921,12 @@ pub struct PendingFrameMessage {
 impl ObscuraState {
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
         self.cookie_jar = parent.cookie_jar.clone();
+        // A frame shares its page's Web Storage Arcs. The ops key by the frame
+        // realm's own document URL, so a cross-origin frame still lands in its
+        // own bucket instead of the top document's.
+        self.local_storage = parent.local_storage.clone();
+        self.session_storage = parent.session_storage.clone();
+        self.indexed_db = parent.indexed_db.clone();
         self.http_client = parent.http_client.clone();
         self.callbacks = parent.callbacks.clone();
         self.encoding = parent.encoding.clone();
@@ -428,6 +957,9 @@ impl ObscuraState {
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            local_storage: Some(Arc::new(OriginStorage::default())),
+            session_storage: Some(Arc::new(OriginStorage::default())),
+            indexed_db: Some(Arc::new(IndexedDbStorage::default())),
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -4486,13 +5018,120 @@ pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchCredentials, ObscuraState, cors_response_allows, cors_unsafe_request_header_names,
+        FetchCredentials, LOCAL_STORAGE_ORIGIN_COUNT_LIMIT, LOCAL_STORAGE_ORIGIN_LIMIT,
+        LOCAL_STORAGE_TOTAL_LIMIT, ObscuraState, OriginStorage, cors_response_allows,
+        cors_unsafe_request_header_names,
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
         sanitize_redirect_headers, validate_fetch_url,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    // #678: Web Storage lives in Rust, keyed by origin, so these pin the
+    // behaviour the realm-local object could not provide.
+    #[test]
+    fn origin_storage_keeps_origins_apart_and_preserves_insertion_order() {
+        let store = OriginStorage::default();
+        assert!(store.set("https://a.example", "k1".into(), "one".into()));
+        assert!(store.set("https://a.example", "k2".into(), "two".into()));
+        assert!(store.set("https://b.example", "k1".into(), "other".into()));
+
+        // Storage.key() is defined in insertion order, not sorted order.
+        let order: Vec<String> = store
+            .snapshot("https://a.example")
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(order, vec!["k1".to_string(), "k2".to_string()]);
+
+        assert_eq!(store.get("https://a.example", "k1"), Some("one".to_string()));
+        assert_eq!(store.get("https://b.example", "k1"), Some("other".to_string()));
+        assert_eq!(store.get("https://c.example", "k1"), None);
+    }
+
+    #[test]
+    fn origin_storage_set_replaces_in_place_without_growing_the_quota() {
+        let store = OriginStorage::default();
+        let origin = "https://a.example";
+        assert!(store.set(origin, "k".into(), "x".repeat(1024).into()));
+        // Overwriting an existing key must not count the old bytes twice: a
+        // replacement stays within quota where a second key of the same size
+        // would still fit, and the entry count must not change.
+        assert!(store.set(origin, "k".into(), "y".repeat(1024).into()));
+        assert_eq!(store.snapshot(origin).len(), 1);
+        assert_eq!(store.get(origin, "k").map(|v| v.len()), Some(1024));
+
+        // A single value over the per-origin limit is rejected, and the
+        // rejected write leaves the store untouched.
+        let too_big = "z".repeat(LOCAL_STORAGE_ORIGIN_LIMIT + 1);
+        assert!(!store.set(origin, "big1".into(), too_big));
+        assert_eq!(store.snapshot(origin).len(), 1);
+        assert_eq!(store.get(origin, "k").map(|v| v.len()), Some(1024));
+    }
+
+    #[test]
+    fn origin_storage_remove_and_clear_return_the_quota() {
+        let store = OriginStorage::default();
+        let origin = "https://a.example";
+        assert!(store.set(origin, "k1".into(), "x".repeat(2048).into()));
+        assert!(store.set(origin, "k2".into(), "x".repeat(2048).into()));
+
+        store.remove(origin, "k1");
+        assert_eq!(store.get(origin, "k1"), None);
+        // The freed bytes are usable again, which is the part a naive counter
+        // gets wrong.
+        assert!(store.set(origin, "k3".into(), "x".repeat(2048).into()));
+
+        store.clear(origin);
+        assert!(store.snapshot(origin).is_empty());
+        assert!(store.set(origin, "after-clear".into(), "small".into()));
+    }
+
+    #[test]
+    fn origin_storage_total_and_origin_count_limits_are_enforced() {
+        let store = OriginStorage::default();
+
+        // Distinct origins share one total budget.
+        let per_origin = LOCAL_STORAGE_TOTAL_LIMIT / LOCAL_STORAGE_ORIGIN_COUNT_LIMIT + 1024;
+        let mut rejected = 0;
+        for index in 0..LOCAL_STORAGE_ORIGIN_COUNT_LIMIT {
+            let origin = format!("https://o{index}.example");
+            if !store.set(&origin, "k".into(), "q".repeat(per_origin).into()) {
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected > 0,
+            "the total budget must stop writes once {LOCAL_STORAGE_TOTAL_LIMIT} bytes are used"
+        );
+
+        // And the origin count is capped even when each origin is tiny.
+        let store = OriginStorage::default();
+        for index in 0..LOCAL_STORAGE_ORIGIN_COUNT_LIMIT {
+            assert!(store.set(&format!("https://o{index}.example"), "k".into(), "v".into()));
+        }
+        assert!(
+            !store.set("https://one-too-many.example", "k".into(), "v".into()),
+            "an origin past the count limit must be rejected"
+        );
+    }
+
+    #[test]
+    fn clearing_an_origin_marks_it_changed() {
+        let store = OriginStorage::default();
+        let origin = "https://a.example";
+        assert!(store.set(origin, "k".into(), "v".into()));
+        store.take_changed();
+        assert!(!store.is_dirty());
+        store.clear(origin);
+        assert!(store.is_dirty(), "a clear must mark the store dirty");
+        assert_eq!(
+            store.changed_origins(),
+            vec![origin.to_string()],
+            "a clear must name the origin so its file is removed, not left behind"
+        );
+    }
 
     // #967 — a redirect must not forward the caller's credentials to a
     // different origin, and a 301/302/303 GET downgrade drops the body headers.
@@ -5635,6 +6274,104 @@ fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
         Err(_) => return String::new(),
     };
     jar.get_js_visible_cookies(&url)
+}
+
+/// Origin of the calling realm's document. A cross-origin frame must land in
+/// its own origin's bucket rather than the top document's, so this resolves the
+/// realm that made the call instead of reading page state directly.
+fn storage_origin(state: &ObscuraState) -> String {
+    state.inherited_origin.clone().unwrap_or_else(|| {
+        url::Url::parse(&state.url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "null".to_string())
+    })
+}
+
+fn origin_storage_command(
+    storage: &Option<Arc<OriginStorage>>,
+    origin: &str,
+    command: &str,
+    key: &str,
+    value: &str,
+) -> String {
+    let Some(storage) = storage else {
+        return "null".to_string();
+    };
+
+    match command {
+        "snapshot" => serde_json::to_string(&storage.snapshot(origin))
+            .unwrap_or_else(|_| "[]".to_string()),
+        "get" => serde_json::to_string(&storage.get(origin, key))
+            .unwrap_or_else(|_| "null".to_string()),
+        "set" => storage.set(origin, key.to_string(), value.to_string()).to_string(),
+        "remove" => {
+            storage.remove(origin, key);
+            "true".to_string()
+        }
+        "clear" => {
+            storage.clear(origin);
+            "true".to_string()
+        }
+        _ => "null".to_string(),
+    }
+}
+
+/// `localStorage` backend. Returns JSON: an array of `[key, value]` pairs for
+/// "snapshot", a string or null for "get", and a boolean for the mutations so
+/// the shim can raise `QuotaExceededError` exactly where a browser would.
+#[op2]
+#[string]
+fn op_local_storage(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] command: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    origin_storage_command(
+        &gs.local_storage,
+        &storage_origin(&gs),
+        command,
+        key,
+        value,
+    )
+}
+
+/// IndexedDB backend. One command per call, JSON in and JSON out, so the shim
+/// keeps the spec's object graph and only the data lives in Rust.
+#[op2]
+#[string]
+fn op_indexed_db(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] payload: &str,
+) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    indexed_db_command(&gs.indexed_db, &storage_origin(&gs), payload)
+}
+
+/// `sessionStorage` backend, page-scoped in exactly the same way.
+#[op2]
+#[string]
+fn op_session_storage(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] command: &str,
+    #[string] key: &str,
+    #[string] value: &str,
+) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    origin_storage_command(
+        &gs.session_storage,
+        &storage_origin(&gs),
+        command,
+        key,
+        value,
+    )
 }
 
 #[op2(fast)]
@@ -6881,6 +7618,9 @@ pub fn build_extension() -> Extension {
         op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
+        op_local_storage(),
+        op_session_storage(),
+        op_indexed_db(),
         op_navigate(),
         op_session_history(),
         op_history_traverse(),

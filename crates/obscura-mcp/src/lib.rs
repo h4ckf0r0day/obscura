@@ -82,11 +82,23 @@ pub struct BrowserState {
 
 impl BrowserState {
     pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+        // `--storage-dir` is a global flag, so the profile arrives through the
+        // environment rather than through every constructor call. Without this
+        // the MCP path silently ignored the flag and persisted nothing, cookies
+        // included.
+        let storage_dir = std::env::var_os("OBSCURA_STORAGE_DIR").map(std::path::PathBuf::from);
+        let context = BrowserContext::with_storage_full(
+            "mcp".to_string(),
+            proxy,
+            stealth,
+            None,
+            storage_dir,
+        );
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
+            context: Arc::new(context),
             user_agent,
             operator_network_hints: false,
             console_messages: Vec::new(),
@@ -246,6 +258,8 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
     state.operator_network_hints = true;
+    // Cookies and Web Storage are written on every navigation; this covers the
+    // writes an agent makes after a page has settled, on the way out.
     let mut runtime_pump_armed = false;
 
     loop {
@@ -273,6 +287,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             continue;
         };
         if n == 0 {
+            state.context.save_storage();
             return Ok(());
         }
 
@@ -415,9 +430,23 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "expression": { "type": "string", "description": "JavaScript expression to evaluate" }
+                        "expression": { "type": "string", "description": "JavaScript expression to evaluate; a promise it returns is awaited" },
+                        "timeoutMs": { "type": "number", "description": "How long to wait for a returned promise, in milliseconds (default: 5000)" }
                     },
                     "required": ["expression"]
+                }
+            },
+            {
+                "name": "browser_wait_for_function",
+                "description": "Wait until a JavaScript expression returns true, polling the page",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "function": { "type": "string", "description": "JavaScript expression that must become truthy" },
+                        "timeout": { "type": "number", "description": "Timeout in milliseconds (default: 30000)" },
+                        "pollIntervalMs": { "type": "number", "description": "Poll interval in milliseconds (default: 100)" }
+                    },
+                    "required": ["function"]
                 }
             },
             {
@@ -771,6 +800,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_select_option" => tool_select_option(args, state),
         "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
+        "browser_wait_for_function" => tool_wait_for_function(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
         "browser_console_messages" => tool_console_messages(state),
         "browser_close" => tool_close(state),
@@ -1136,17 +1166,145 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
     }
 }
 
+/// Wrap an expression so a thenable it returns can be polled to settlement.
+/// Separate from the polling loop so its shape can be asserted directly: a
+/// wrapper that dereferences its slot before creating it turns every
+/// synchronous expression into "did not settle".
+fn expression_wrapper(expression: &str) -> String {
+    const SLOT: &str = "__obscura_mcp_expression";
+    format!(
+        r#"(function() {{
+            var slot = globalThis.{SLOT} || (globalThis.{SLOT} = {{}});
+            slot.state = 'pending';
+            try {{
+                var value = ({expression});
+                if (value && typeof value.then === 'function') {{
+                    value.then(
+                        function (resolved) {{ slot.state = 'done'; slot.value = resolved; }},
+                        function (rejected) {{ slot.state = 'failed'; slot.error = String(rejected); }}
+                    );
+                    return null;
+                }}
+                slot.state = 'sync';
+                slot.value = value;
+                return null;
+            }} catch (e) {{ slot.state = 'sync'; slot.value = null; slot.error = String(e); return null; }}
+        }})()"#,
+        SLOT = SLOT,
+        expression = expression,
+    )
+}
+/// Resolve a promise that a page expression produced.
+///
+/// `Page::evaluate` is synchronous, so an agent that wrote `await fetch(...)`
+/// or an async IIFE used to get `{}` back and no way to tell that from an empty
+/// object. The expression is evaluated once, and if the result is a thenable its
+/// settlement is polled until it resolves, fails, or the timeout runs out.
+async fn settle_expression_promise(
+    state: &mut BrowserState,
+    expression: &str,
+    timeout: std::time::Duration,
+) -> Option<Value> {
+    let wrapped = expression_wrapper(expression);
+    const SLOT: &str = "__obscura_mcp_expression";
+    let seed = state.page_mut().evaluate(&wrapped);
+    if seed.is_null() && !state.page_mut().has_js() {
+        // No realm: nothing can produce a thenable here.
+        return None;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last: Option<Value> = None;
+    loop {
+        let snapshot = state.page_mut().evaluate(&format!(
+            "JSON.stringify((function() {{ var s = globalThis.{SLOT}; return s ? {{state: s.state, value: s.value, error: s.error}} : null; }})())"
+        ));
+        let parsed = snapshot
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        if let Some(slot) = parsed {
+            match slot.get("state").and_then(Value::as_str) {
+                Some("pending") => last = slot.get("value").cloned(),
+                Some("sync") => return slot.get("value").cloned(),
+                Some("done") => return slot.get("value").cloned(),
+                Some("failed") => return Some(Value::String(
+                    slot.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string(),
+                )),
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(Value::String(format!(
+                "{{\"error\":\"the expression did not settle within {} ms\"}}",
+                timeout.as_millis()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // A promise that settles in a network callback needs the page's own
+        // task queue to turn. Polling evaluate alone leaves it pending forever,
+        // which is how `await fetch(...)` looked like a hang.
+        let _ = state.advance_active_page_tasks().await;
+        let _ = last;
+    }
+}
+
 async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let expression = args.get("expression").and_then(Value::as_str)
         .ok_or("Missing expression parameter")?;
+    let timeout_ms = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(5_000);
 
-    let result = state.page_mut().evaluate(expression);
+    let result = match settle_expression_promise(
+        state,
+        expression,
+        std::time::Duration::from_millis(timeout_ms),
+    )
+    .await
+    {
+        Some(value) => value,
+        // Fall back to the synchronous reading if the promise machinery was
+        // unavailable, so this can only ever return more than before.
+        None => state.page_mut().evaluate(expression),
+    };
     state.settle_synthetic_navigation().await?;
     Ok(match &result {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         other => serde_json::to_string_pretty(other).unwrap_or_default(),
     })
+}
+
+/// Poll a JavaScript predicate until it returns something truthy.
+///
+/// Agents otherwise express "wait until the app finished loading" as a loop of
+/// `browser_evaluate` plus a sleep, which costs a round trip per iteration and
+/// is where flaky automation comes from.
+async fn tool_wait_for_function(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let expression = args.get("function").or_else(|| args.get("expression"))
+        .and_then(Value::as_str)
+        .ok_or("Missing function parameter")?;
+    let timeout_ms = args.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    let poll_ms = args.get("pollIntervalMs").and_then(Value::as_u64).unwrap_or(100).max(10);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    let mut attempts: u64 = 0;
+    loop {
+        attempts += 1;
+        let value = state
+            .page_mut()
+            .evaluate(&format!("JSON.stringify((function(){{ try {{ return (function(){{ return !!({expression}); }})(); }} catch (e) {{ return false; }} }})())"));
+        let truthy = value
+            .as_str()
+            .map(|raw| raw == "true")
+            .unwrap_or(value.as_bool().unwrap_or(false));
+        if truthy {
+            return Ok(format!("condition met after {attempts} poll(s)"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "condition not met within {timeout_ms} ms after {attempts} poll(s): {expression}"
+            ));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+    }
 }
 
 async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String, String> {
@@ -2063,19 +2221,39 @@ fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
         "same_site": c.same_site,
         "expires": c.expires,
     })).collect();
-    // Pull localStorage + sessionStorage for the current page's origin.
+    // Web Storage now lives in the context, so every origin the browser has
+    // seen is reported, not only the page's current one. That is the whole point
+    // of an exported session state: an agent stashes it and restores it later.
     let storage_js = r#"(function(){
         var ls = [], ss = [];
         try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls.push([k, localStorage.getItem(k)]); } } catch(e) {}
         try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); ss.push([k2, sessionStorage.getItem(k2)]); } } catch(e) {}
         return { origin: location.origin || '', localStorage: ls, sessionStorage: ss };
     })()"#;
-    let storage = if state.active_tab.is_some() {
-        state.page_mut().evaluate(storage_js)
-    } else {
-        Value::Null
-    };
-    let origins = if storage.is_object() { vec![storage] } else { vec![] };
+    let mut origins: Vec<Value> = Vec::new();
+    if state.active_tab.is_some() {
+        let storage = state.page_mut().evaluate(storage_js);
+        if storage.is_object() {
+            origins.push(storage);
+        }
+    }
+    // Any origin written by a page that has since navigated away still counts.
+    for (origin, entries) in state.context.local_storage.entries() {
+        if entries.is_empty() {
+            continue;
+        }
+        if origins
+            .iter()
+            .any(|entry| entry.get("origin").and_then(Value::as_str) == Some(origin.as_str()))
+        {
+            continue;
+        }
+        origins.push(json!({
+            "origin": origin,
+            "localStorage": entries,
+            "sessionStorage": [],
+        }));
+    }
     let out = json!({ "cookies": cookies, "origins": origins });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -2149,6 +2327,24 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The promise wrapper has to work on a page that has never been evaluated
+    // on: the slot is created lazily, so the first synchronous expression must
+    // not throw on an undefined global. This caught a regression where every
+    // browser_evaluate answered "the expression did not settle".
+    #[test]
+    fn expression_promise_wrapper_creates_its_slot_before_writing_to_it() {
+        let wrapped = expression_wrapper("1 + 1");
+        // A wrapper that dereferences the slot before creating it throws on the
+        // first synchronous expression, which surfaced as every
+        // browser_evaluate answering "the expression did not settle".
+        assert!(
+            wrapped.contains("globalThis.__obscura_mcp_expression || (globalThis.__obscura_mcp_expression = {})"),
+            "the slot must be created on demand: {wrapped}"
+        );
+        assert!(wrapped.contains("slot.state = 'sync'"), "sync results must be recorded: {wrapped}");
+        assert!(wrapped.contains("typeof value.then === 'function'"), "thenables must be awaited: {wrapped}");
+    }
 
     // #1015: case-folding can change byte length (Turkish "İ" -> "i̇"), so a
     // match offset found in the lowercased haystack must be translated back to
