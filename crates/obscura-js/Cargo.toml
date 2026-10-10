@@ -36,6 +36,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 html5ever = { workspace = true }
+quick-xml = "0.41"
+roxmltree = "0.21"
 deno_error = "0.7"
 base64 = { workspace = true }
 sha1 = "0.10"

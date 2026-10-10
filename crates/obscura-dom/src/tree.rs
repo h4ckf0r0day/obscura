@@ -290,6 +290,7 @@ pub(crate) struct DomTreeInner {
     // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
     // class and id selectors match ASCII-case-insensitively.
     pub(crate) quirks: bool,
+    xml_documents: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -318,8 +319,41 @@ impl DomTree {
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
                 quirks: false,
+                xml_documents: HashSet::new(),
             }),
         }
+    }
+
+    /// XML documents share the arena without changing HTML's selector fast path.
+    pub fn new_xml_document(&self) -> NodeId {
+        let id = self.new_node(NodeData::Document);
+        self.inner.borrow_mut().xml_documents.insert(id);
+        id
+    }
+
+    pub fn is_html_element_in_html_document(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let Some(node) = inner.nodes.get(id.index()).and_then(Option::as_ref) else { return false; };
+        node.as_element().is_some_and(|name| name.ns == html5ever::ns!(html))
+            && !Self::node_is_in_xml_document(&inner, id)
+    }
+
+    pub fn is_in_xml_document(&self, id: NodeId) -> bool {
+        Self::node_is_in_xml_document(&self.inner.borrow(), id)
+    }
+
+    fn node_is_in_xml_document(inner: &DomTreeInner, id: NodeId) -> bool {
+        if inner.xml_documents.is_empty() { return false; }
+        if inner.nodes.get(id.index()).and_then(Option::as_ref).is_some_and(|n| n.connected) {
+            return inner.xml_documents.contains(&inner.document);
+        }
+        let mut current = Some(id);
+        for _ in 0..inner.nodes.len() {
+            let Some(id) = current else { return false; };
+            if inner.xml_documents.contains(&id) { return true; }
+            current = inner.nodes.get(id.index()).and_then(Option::as_ref).and_then(|n| n.parent);
+        }
+        false
     }
 
     pub fn document(&self) -> NodeId {
@@ -1154,6 +1188,7 @@ impl DomTree {
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
+                inner.xml_documents.remove(&id);
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -1916,6 +1951,35 @@ impl Default for DomTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_document_keeps_xhtml_type_selectors_case_sensitive() {
+        let tree = DomTree::new();
+        let doc = tree.new_xml_document();
+        let node = element(&tree, "Item");
+        tree.append_child(doc, node);
+        assert!(!tree.is_html_element_in_html_document(node));
+        assert!(tree.matches_selector(node, "Item").unwrap());
+        assert!(!tree.matches_selector(node, "item").unwrap());
+        tree.set_quirks(true);
+        tree.with_node_mut(node, |n| {
+            n.set_attribute("id", "Case".into());
+            n.set_attribute("class", "Case".into());
+        });
+        assert_eq!(tree.query_selector_from(doc, "#Case").unwrap(), Some(node));
+        assert_eq!(tree.query_selector_from(doc, "#case").unwrap(), None);
+        assert_eq!(tree.query_selector_from(doc, ".Case").unwrap(), Some(node));
+        assert_eq!(tree.query_selector_from(doc, ".case").unwrap(), None);
+        tree.append_child(tree.document(), node);
+        assert!(tree.is_html_element_in_html_document(node));
+        tree.remove(doc);
+        let replacement = tree.new_node(NodeData::Document);
+        assert_eq!(doc, replacement);
+        tree.append_child(replacement, node);
+        assert!(tree.is_html_element_in_html_document(node));
+    }
+
+
 
     #[test]
     fn cssom_stylesheet_storage_is_released_when_owner_is_detached() {

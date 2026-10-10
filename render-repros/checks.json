@@ -1,4 +1,7 @@
 {
+  "xml-data-consumer": [
+    {"name": "XML metadata and Atom content load", "color": "#087f5b", "x": 0, "y": 0, "width": 320, "height": 40}
+  ],
   "retained-cssom-raster": [
     {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
     {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},

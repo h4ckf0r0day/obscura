@@ -1884,7 +1884,149 @@ fn op_dom(
     })
 }
 
+// Validate XML namespaces and normalized attributes first, then retain lexical
+// node boundaries (notably CDATA) while constructing the detached native tree.
+fn parse_xml_document(dom: &DomTree, source: &str) -> Result<serde_json::Value, String> {
+    use quick_xml::events::Event;
+    use html5ever::{QualName, Namespace, LocalName, Prefix};
+    use obscura_dom::tree::Attribute;
+    let parsed = roxmltree::Document::parse_with_options(source, roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    }).map_err(|e| match e {
+        roxmltree::Error::UnexpectedCloseTag(_, _, _) => format!("opening and ending tag mismatch: {e}"),
+        _ => e.to_string(),
+    })?;
+    let mut elements = parsed.descendants().filter(|n| n.is_element());
+    let mut reader = quick_xml::Reader::from_str(source);
+    let mut plan: Vec<(NodeData, serde_json::Value, Option<usize>)> = Vec::new();
+    let mut parents = Vec::new();
+    let normalize = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n");
+    let string = |s: &[u8]| std::str::from_utf8(s).map(str::to_owned).map_err(|e| e.to_string());
+    loop {
+        let event = reader.read_event().map_err(|e| e.to_string())?;
+        let empty = matches!(event, Event::Empty(_));
+        let (data, info) = match event {
+            Event::Start(start) | Event::Empty(start) => {
+                let element = elements.next().ok_or("XML element mismatch")?;
+                let qualified = string(start.name().as_ref())?;
+                let (prefix, local) = qualified.split_once(':').map(|(p, l)| (Some(p), l)).unwrap_or((None, qualified.as_str()));
+                let namespace = element.tag_name().namespace().unwrap_or("");
+                let mut attrs = Vec::new();
+                for attribute in start.attributes() {
+                    let attribute = attribute.map_err(|e| e.to_string())?;
+                    let name = string(attribute.key.as_ref())?;
+                    let (prefix, local) = name.split_once(':').map(|(p, l)| (Some(p), l)).unwrap_or((None, name.as_str()));
+                    let ns = if name == "xmlns" || prefix == Some("xmlns") {
+                        "http://www.w3.org/2000/xmlns/"
+                    } else if let Some(prefix) = prefix {
+                        element.lookup_namespace_uri(Some(prefix)).ok_or("Unbound attribute prefix")?
+                    } else { "" };
+                    let value = if ns == "http://www.w3.org/2000/xmlns/" {
+                        element.lookup_namespace_uri(if name == "xmlns" { None } else { Some(local) }).unwrap_or("").to_owned()
+                    } else {
+                        element.attributes().find(|a| a.name() == local && a.namespace().unwrap_or("") == ns).map(|a| a.value()).ok_or("XML attribute mismatch")?.to_owned()
+                    };
+                    attrs.push(Attribute { name: QualName::new(prefix.map(Prefix::from), Namespace::from(ns), LocalName::from(local)), value });
+                }
+                (NodeData::Element {
+                    name: QualName::new(prefix.map(Prefix::from), Namespace::from(namespace), LocalName::from(local)),
+                    attrs, template_contents: None, mathml_annotation_xml_integration_point: false,
+                }, serde_json::json!({"type":1,"name":qualified,"namespace":namespace,"prefix":prefix}))
+            }
+            Event::End(_) => { parents.pop(); continue; }
+            Event::Text(text) => {
+                let raw = normalize(&string(text.as_ref())?);
+                let value = quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?.into_owned();
+                // XML documents do not retain whitespace outside the root.
+                if parents.is_empty() { continue; }
+                (NodeData::Text { contents: value.clone() }, serde_json::json!({"type":3,"data":value}))
+            }
+            Event::GeneralRef(reference) => {
+                let raw = format!("&{};", string(reference.as_ref())?);
+                let value = quick_xml::escape::unescape(&raw).map_err(|e| e.to_string())?.into_owned();
+                if parents.is_empty() { continue; }
+                (NodeData::Text { contents: value.clone() }, serde_json::json!({"type":3,"data":value}))
+            }
+            Event::CData(text) => {
+                let value = normalize(&string(text.as_ref())?);
+                (NodeData::Text { contents: value.clone() }, serde_json::json!({"type":4,"data":value}))
+            }
+            Event::Comment(text) => {
+                let value = normalize(&string(text.as_ref())?);
+                (NodeData::Comment { contents: value.clone() }, serde_json::json!({"type":8,"data":value}))
+            }
+            Event::PI(pi) => {
+                let target = string(pi.target())?;
+                let value = normalize(&string(pi.content())?).trim_start().to_owned();
+                (NodeData::ProcessingInstruction { target: target.clone(), data: value.clone() }, serde_json::json!({"type":7,"name":target,"data":value}))
+            }
+            Event::DocType(text) => {
+                let declaration = string(text.as_ref())?;
+                let name = declaration.split_whitespace().next().unwrap_or("").to_owned();
+                let mut quoted = Vec::new();
+                let mut remainder = declaration[name.len()..].trim_start();
+                let public = remainder.starts_with("PUBLIC");
+                let system = remainder.starts_with("SYSTEM");
+                if public || system {
+                    remainder = remainder[6..].trim_start();
+                    while let Some(quote) = remainder.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                        remainder = &remainder[1..];
+                        let end = remainder.find(quote).ok_or("Unterminated doctype identifier")?;
+                        quoted.push(remainder[..end].to_owned());
+                        remainder = remainder[end + 1..].trim_start();
+                    }
+                }
+                let public_id = if public { quoted.first().cloned().unwrap_or_default() } else { String::new() };
+                let system_id = quoted.get(usize::from(public)).cloned().unwrap_or_default();
+                (NodeData::Doctype { name: name.clone(), public_id: public_id.clone(), system_id: system_id.clone() }, serde_json::json!({"type":10,"name":name,"publicId":public_id,"systemId":system_id}))
+            }
+            Event::Decl(_) => continue,
+            Event::Eof => break,
+        };
+        // Entity references are separate reader events, but remain part of the
+        // same DOM text node. CDATA retains its distinct lexical boundary.
+        if info["type"] == 3 {
+            if let Some((NodeData::Text { contents }, previous, parent)) = plan.last_mut() {
+                if previous["type"] == 3 && *parent == parents.last().copied() {
+                    if let NodeData::Text { contents: value } = &data {
+                        contents.push_str(value);
+                        continue;
+                    }
+                }
+            }
+        }
+        let element = matches!(&data, NodeData::Element { .. });
+        let index = plan.len();
+        plan.push((data, info, parents.last().copied()));
+        if element && !empty { parents.push(index); }
+    }
+    let fragment = dom.new_xml_document();
+    let mut ids = Vec::with_capacity(plan.len());
+    let mut nodes = Vec::with_capacity(plan.len());
+    for (data, mut info, parent) in plan {
+        if info["type"] == 3 {
+            if let NodeData::Text { contents } = &data {
+                info["data"] = serde_json::json!(contents);
+            }
+        }
+        let id = dom.new_node(data);
+        dom.append_child(parent.map(|p| ids[p]).unwrap_or(fragment), id);
+        info["nodeId"] = serde_json::json!(id.index());
+        ids.push(id);
+        nodes.push(info);
+    }
+    Ok(serde_json::json!({"nodeId":fragment.index(),"nodes":nodes}))
+}
+
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "parse_xml" {
+        let state = shared.borrow();
+        return match state.dom.as_ref() {
+            Some(dom) => parse_xml_document(dom, &arg1).unwrap_or_else(|error| serde_json::json!({"error":error})).to_string(),
+            None => "null".into(),
+        };
+    }
     if cmd == "performance_time_origin" {
         return shared.borrow().navigation_timing.time_origin.to_string();
     }
@@ -2366,7 +2508,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let name = dom
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
-                        if name.ns == html5ever::ns!(html) {
+                        if dom.is_html_element_in_html_document(NodeId::new(nid)) {
                             name.local.as_ref().to_ascii_uppercase()
                         } else {
                             match &name.prefix {
@@ -2716,6 +2858,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        "create_xml_document" => dom.new_xml_document().index().to_string(),
         "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
         "clone_node" => {
             let nid = match arg1.parse::<u32>() {

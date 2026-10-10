@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>XML-backed content loading</title>
+<style>
+body { margin: 0; font: 16px sans-serif; }
+#status { width: 320px; height: 40px; background: #b91c1c; }
+#status.ready { background: #087f5b; }
+main { padding: 16px; }
+</style>
+<div id="status"></div><main><h1>XML-backed catalogue</h1><ul id="items"></ul></main>
+<script>
+(() => {
+  const parser = new DOMParser();
+  const metadata = parser.parseFromString('<edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx"><edmx:DataServices><Schema xmlns="http://docs.oasis-open.org/odata/ns/edm"><EntityType Name="Article"/></Schema></edmx:DataServices></edmx:Edmx>', 'application/xml');
+  if (metadata.documentElement.localName !== 'Edmx' || metadata.documentElement.namespaceURI !== 'http://docs.oasis-open.org/odata/ns/edmx') return;
+  const entity = metadata.getElementsByTagNameNS('http://docs.oasis-open.org/odata/ns/edm', 'EntityType')[0];
+  if (!entity || entity.getAttribute('Name') !== 'Article') return;
+  const feed = parser.parseFromString('<feed xmlns="http://www.w3.org/2005/Atom"><entry><title><![CDATA[Research & development]]></title></entry><entry><title>Markets &amp; trade</title></entry></feed>', 'text/xml');
+  if (feed.documentElement.localName !== 'feed' || feed.documentElement.namespaceURI !== 'http://www.w3.org/2005/Atom') return;
+  for (const title of feed.getElementsByTagNameNS('http://www.w3.org/2005/Atom', 'title')) {
+    const item = document.createElement('li');
+    item.textContent = title.textContent;
+    document.getElementById('items').appendChild(item);
+  }
+  if (document.getElementById('items').children.length === 2) document.getElementById('status').className = 'ready';
+})();
+</script>

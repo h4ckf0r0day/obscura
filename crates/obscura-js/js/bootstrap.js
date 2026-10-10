@@ -3037,7 +3037,7 @@ function _htmlAttrName(el, n) {
   for (let i = 0; i < n.length; i++) {
     const c = n.charCodeAt(i);
     if (c >= 65 && c <= 90) {
-      return el.namespaceURI === "http://www.w3.org/1999/xhtml" ? n.toLowerCase() : n;
+      return el.namespaceURI === "http://www.w3.org/1999/xhtml" && !el._xmlOwnerDocument ? n.toLowerCase() : n;
     }
   }
   return n;
@@ -6267,16 +6267,13 @@ class Document extends Node {
         root.appendChild(body);
         return doc;
       },
-      // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
-      // an XML document with a root element of the given name. We don't
-      // have a separate XML stack, so return a minimal detached document
-      // with an element of the requested local name as documentElement.
-      createDocument(_ns, qualifiedName, _doctype) {
-        const name = (qualifiedName && String(qualifiedName)) || "root";
-        const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = new DOMParser().parseFromString(html, "application/xml");
-        if (_doctype) doc._docType = _doctype;
+      createDocument(namespace, qualifiedName, doctype) {
+        const doc = _xmlDocument(+_dom("create_xml_document"), "application/xml");
+        if (doctype) {
+          _xmlOwnNode(doctype, doc);
+          doc.appendChild(doctype);
+        }
+        if (qualifiedName) doc.appendChild(doc.createElementNS(namespace, String(qualifiedName)));
         return doc;
       },
       // createDocumentType(qualifiedName, publicId, systemId): build a detached
@@ -11355,159 +11352,127 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   [Symbol.iterator](){ return this.entries(); }
 };
 
-// Conservative XML well-formedness check for DOMParser. Only detects clear
-// errors (tag balance / single root); defaults to well-formed when unsure so
-// valid XML is never falsely flagged.
-const _checkXmlWellFormed = (html) => {
-  // Strip comments, CDATA sections, processing instructions, and DOCTYPE
-  // declarations — they may contain angle brackets.
-  const s = html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
-    .replace(/<\?[\s\S]*?\?>/g, '')
-    .replace(/<!DOCTYPE\s[^>]*?>/gi, '');
-
-  const stack = [];
-  // Match open / close / self-closing tags.
-  // Group 1: tag name.  Group 2: optional '/' before '>'.
-  const tagRe = /<\/?([a-zA-Z_][\w.\-:]*)(?:\s[^>]*?)?(\/)?>/g;
-  let rootFound = false;
-  let match;
-
-  while ((match = tagRe.exec(s)) !== null) {
-    const fullTag = match[0];
-    const tagName = match[1];
-    const isClosing = fullTag.startsWith('</');
-    const isSelfClosing = match[2] === '/';
-
-    if (isClosing) {
-      if (stack.length === 0) {
-        return { wellFormed: false, error: 'error on line 1: extra closing tag </' + tagName + '>' };
-      }
-      const open = stack.pop();
-      if (open !== tagName) {
-        return { wellFormed: false, error: 'error on line 1: opening and ending tag mismatch: ' + open + ' and ' + tagName };
-      }
-      if (stack.length === 0) rootFound = true;
-    } else {
-      // Opening or self-closing tag. Check for extra content after root.
-      if (stack.length === 0 && rootFound) {
-        return { wellFormed: false, error: 'error on line 1: extra content after root element' };
-      }
-      if (isSelfClosing) {
-        // Self-closing: complete element, mark rootFound if at root level.
-        if (stack.length === 0) rootFound = true;
-      } else {
-        stack.push(tagName);
-      }
-    }
-  }
-
-  if (stack.length > 0) {
-    return { wellFormed: false, error: 'error on line 1: unclosed tag <' + stack[stack.length - 1] + '>' };
-  }
-
-  return { wellFormed: true };
-};
-
-// Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
-// so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
-// then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
-// feature-detect writes `<form></form>` and wiped real bodies). We parse the
-// input into a detached `<html>` element and wrap it so the common Document
-// API surface (body / head / documentElement / querySelector* / getElementById /
-// getElementsByTagName / getElementsByClassName / title / cloneNode) works.
-// Conservative XML well-formedness check. obscura has no XML parser, so this
-// only decides whether to surface a <parsererror> (it does not build an XML
-// tree). It flags clear structural errors — mismatched or unclosed tags,
-// multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
-// "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
-// flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
-// skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
-function _xmlWellFormed(src) {
-  const s = String(src);
-  const stack = [];
-  let rootsClosed = 0; // top-level elements fully closed (or self-closed)
-  let i = 0;
-  const n = s.length;
-  while (i < n) {
-    const lt = s.indexOf('<', i);
-    if (lt === -1) break;
-    i = lt;
-    if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i + 4); if (e === -1) return false; i = e + 3; continue; }
-    if (s.startsWith('<![CDATA[', i)) { const e = s.indexOf(']]>', i + 9); if (e === -1) return false; i = e + 3; continue; }
-    if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i + 2); if (e === -1) return false; i = e + 2; continue; }
-    if (s.startsWith('<!', i)) { const e = s.indexOf('>', i + 2); if (e === -1) return false; i = e + 1; continue; }
-    // A start/end/self-closing tag: find its '>' while skipping quoted regions.
-    let j = i + 1, quote = null;
-    while (j < n) {
-      const c = s[j];
-      if (quote) { if (c === quote) quote = null; }
-      else if (c === '"' || c === "'") quote = c;
-      else if (c === '>') break;
-      j++;
-    }
-    if (j >= n) return false; // unterminated tag
-    const inner = s.slice(i + 1, j).trim();
-    i = j + 1;
-    if (!inner) return false;
-    if (inner[0] === '/') {
-      const name = inner.slice(1).trim().split(/\s/)[0];
-      if (stack.length === 0 || stack[stack.length - 1] !== name) return false;
-      stack.pop();
-      if (stack.length === 0) rootsClosed++;
-    } else if (inner[inner.length - 1] === '/') {
-      if (stack.length === 0) rootsClosed++;
-    } else {
-      const name = inner.split(/\s/)[0];
-      if (!name) return false;
-      stack.push(name);
-    }
-  }
-  return stack.length === 0 && rootsClosed === 1;
+// XML uses a native parser and a detached document backing node. Keeping its
+// wrappers in the ordinary cache lets parent/child traversal and DOM mutation
+// use the same tree as HTML without HTML fragment repair or case folding.
+function _xmlElementsByTagName(name) {
+  name = String(name);
+  return HTMLCollection._from(Array.from(this.querySelectorAll("*"))
+    .filter(el => name === "*" || el.tagName === name));
 }
 
-// The parsererror detail quotes tag names taken from the input, and it is
-// written through innerHTML, so `<` and `&` have to stop being markup.
-const _escapeXmlErrorText = (text) =>
-  String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function _xmlOwnNode(node, doc) {
+  node._xmlOwnerDocument = doc;
+  if (node.nodeType === 1) node.getElementsByTagName = _xmlElementsByTagName;
+  Object.defineProperties(node, {
+    ownerDocument: { configurable: true, get() { return this._xmlOwnerDocument; } },
+    baseURI: { configurable: true, get() { return "about:blank"; } },
+    isConnected: { configurable: true, get() {
+      let root = this;
+      while (root.parentNode) root = root.parentNode;
+      return root.nodeType === 9;
+    } },
+  });
+  return node;
+}
+
+function _xmlDocument(nodeId, mimeType) {
+  const doc = new XMLDocument(nodeId);
+  doc._contentType = mimeType;
+  doc._xmlDocument = true;
+  _cache.set(nodeId, doc);
+  Object.defineProperties(doc, {
+    isConnected: { get() { return true; } },
+    documentElement: { get() { return this.children[0] || null; } },
+    children: { get() { return HTMLCollection._from(
+        (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean)); } },
+    head: { get() { return null; } },
+    body: { get() { return null; } },
+    title: { get() { return ""; }, set(value) { String(value); } },
+    doctype: { get() { return Array.from(this.childNodes).find(n => n.nodeType === 10) || null; } },
+    URL: { get() { return "about:blank"; } },
+    documentURI: { get() { return "about:blank"; } },
+    baseURI: { get() { return "about:blank"; } },
+    referrer: { get() { return ""; } },
+    location: { get() { return null; } },
+    defaultView: { get() { return null; } },
+    readyState: { get() { return "complete"; } },
+    characterSet: { get() { return "UTF-8"; } },
+    compatMode: { get() { return "CSS1Compat"; } },
+    textContent: { get() { return null; }, set(value) {} },
+    styleSheets: { get() { return { length: 0, item() { return null; }, [Symbol.iterator]: function* () {} }; } },
+  });
+  doc.querySelector = DocumentFragment.prototype.querySelector;
+  doc.querySelectorAll = DocumentFragment.prototype.querySelectorAll;
+  doc.getElementById = DocumentFragment.prototype.getElementById;
+  doc.getElementsByTagName = _xmlElementsByTagName;
+  doc.getElementsByClassName = function(names) { return _getElementsByClassName(this, names); };
+  doc.createElementNS = function(namespace, qualifiedName) {
+    const ns = namespace == null ? "" : String(namespace);
+    const name = String(qualifiedName);
+    _ns_validateQualifiedName(ns, name);
+    const nid = +_dom("create_element_ns", ns + "\0" + name);
+    const el = _wrapEl(nid);
+    el._tagName = name;
+    el._lname = name.includes(":") ? name.slice(name.indexOf(":") + 1) : name;
+    el._ns = ns;
+    Object.defineProperty(el, "prefix", { configurable: true, value: name.includes(":") ? name.split(":")[0] : null });
+    _seedDetachedTreeState(el);
+    return _xmlOwnNode(el, this);
+  };
+  doc.createElement = function(name) { return this.createElementNS(null, name); };
+  for (const method of ["createTextNode", "createComment", "createCDATASection",
+      "createProcessingInstruction", "createDocumentFragment"]) {
+    doc[method] = function(...args) {
+      return _xmlOwnNode(Reflect.apply(Document.prototype[method], this, args), this);
+    };
+  }
+  doc.cloneNode = function(deep) {
+    return deep ? new DOMParser().parseFromString(new XMLSerializer().serializeToString(this), this.contentType)
+      : _xmlDocument(+_dom("create_xml_document"), this.contentType);
+  };
+  return doc;
+}
+
+function _parseXmlDocument(source, mimeType) {
+  const parsed = _domParse("parse_xml", source);
+  if (!parsed || parsed.error) {
+    const doc = _xmlDocument(+_dom("create_xml_document"), mimeType);
+    const root = doc.createElementNS("http://www.w3.org/1999/xhtml", "parsererror");
+    root.appendChild(doc.createTextNode((parsed && parsed.error) || "error while parsing XML"));
+    doc.appendChild(root);
+    return doc;
+  }
+  const doc = _xmlDocument(parsed.nodeId, mimeType);
+  for (const info of parsed.nodes) {
+    let node;
+    if (info.type === 4) node = new CDATASection(info.nodeId);
+    else if (info.type === 7) node = new ProcessingInstruction(info.nodeId, info.name);
+    else if (info.type === 10) node = new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+    else node = _wrap(info.nodeId);
+    if (info.type === 1) {
+      node._tagName = info.name;
+      node._lname = info.name.includes(":") ? info.name.slice(info.name.indexOf(":") + 1) : info.name;
+      node._ns = info.namespace || "";
+      Object.defineProperty(node, "prefix", { configurable: true, value: info.prefix || null });
+    }
+    _cache.set(info.nodeId, _xmlOwnNode(node, doc));
+  }
+  return doc;
+}
 
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
-    const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
-    const root = document.createElement("html");
-
-    // For XML mime types, surface a <parsererror> on clearly-malformed input so
-    // error-detection code (doc.querySelector('parsererror')) works, matching
-    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
-    //
-    // Two checks, one decision. `_xmlWellFormed` is the stricter of the pair --
-    // it also rejects input with no root element at all, and an unterminated
-    // comment/CDATA/PI -- so it decides whether this is an error. What it cannot
-    // do is say why: it returns a bool. `_checkXmlWellFormed` names the fault,
-    // so its message fills the <div> when it has one.
-    //
-    // These used to run as two independent blocks, the second overwriting the
-    // first. Since the stricter check flags everything the descriptive one
-    // flags, the description never reached a caller.
-    const xmlError = isXml ? _checkXmlWellFormed(html) : null;
-    const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
-    if (isParserError) {
-      const detail = (xmlError && xmlError.error) || 'error while parsing XML';
-      try {
-        root.innerHTML =
-          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
-          _escapeXmlErrorText(detail) +
-          '</div></parsererror>';
-      } catch (e) { /* ignore */ }
-    } else {
-      // innerHTML parses children via html5ever fragment-parsing rules. Most
-      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-      // fragment parser strips the outer `<html>` and emits its head+body
-      // children, which is what callers want.
-      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+    const type = String(mimeType);
+    if (!["text/html", "text/xml", "application/xml", "application/xhtml+xml", "image/svg+xml"].includes(type)) {
+      throw new TypeError("Invalid DOMParser MIME type");
     }
+    if (type !== "text/html") return _parseXmlDocument(html, type);
+    const isXml = false;
+    const isParserError = false;
+    const root = document.createElement("html");
+    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -11633,6 +11598,25 @@ globalThis.DOMParser = class DOMParser {
     return docNode;
   }
 };
+function _serializeXmlNode(node) {
+  const escape = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (node.nodeType === 9 || node.nodeType === 11) return Array.from(node.childNodes, _serializeXmlNode).join("");
+  if (node.nodeType === 3) return escape(node.data);
+  if (node.nodeType === 4) return "<![CDATA[" + node.data + "]]>";
+  if (node.nodeType === 8) return "<!--" + node.data + "-->";
+  if (node.nodeType === 7) return "<?" + node.target + (node.data ? " " + node.data : "") + "?>";
+  if (node.nodeType === 10) return XMLSerializer.prototype.serializeToString.call(null, node);
+  if (node.nodeType !== 1) return "";
+  let opening = "<" + node.nodeName;
+  for (const name of _domParse("attribute_names", node._nid) || []) {
+    opening += " " + name + '=\"' + escape(node.getAttribute(name)).replace(/"/g, "&quot;")
+      .replace(/\t/g, "&#9;").replace(/\n/g, "&#10;").replace(/\r/g, "&#13;") + '\"';
+  }
+  const children = Array.from(node.childNodes);
+  return children.length ? opening + ">" + children.map(_serializeXmlNode).join("") + "</" + node.nodeName + ">"
+    : opening + "/>";
+}
+
 globalThis.XMLSerializer = class XMLSerializer {
   serializeToString(node) {
     if (!node) return "";
@@ -11646,6 +11630,7 @@ globalThis.XMLSerializer = class XMLSerializer {
       s += ">";
       return s;
     }
+    if (node._xmlDocument || node._xmlOwnerDocument) return _serializeXmlNode(node);
     if (node.outerHTML !== undefined) return node.outerHTML;
     if (node.nodeType === 9) {
       let s = "";
