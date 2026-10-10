@@ -122,10 +122,12 @@ pub async fn handle(
             Ok(json!({ "nodeIds": ids }))
         }
         "getOuterHTML" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-                .ok_or("nodeId required")?;
+            // go-rod asks for the HTML of an element handle it already holds and
+            // sends `objectId` only (rod/element.go DOMGetOuterHTML). Chromium
+            // accepts all three identifiers here; accepting nodeId alone made
+            // every rod page.HTML() fail with "nodeId required".
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
             let html = page.with_dom(|dom| {
                 dom.outer_html(NodeId::new(node_id as u32))
             }).unwrap_or_default();

@@ -4171,16 +4171,23 @@ impl ObscuraJsRuntime {
 
         for (i, arg) in arguments.iter().enumerate() {
             let arg_name = format!("__arg{}", i);
-            if let Some(value) = arg.get("value") {
-                let json_str =
-                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
-                setup_lines.push(format!("var {} = {};", arg_name, json_str));
-            } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
+            // objectId wins over value. go-rod marshals CallArgument through a
+            // struct, and Go's `omitempty` is a no-op on structs, so every
+            // object handle it sends arrives as `{"value":null,"objectId":...}`.
+            // Chromium reads objectId first and ignores the null; reading value
+            // first passed `null` as the argument and broke rod's JS helpers
+            // (`functions.selectable = ...` → "Cannot set properties of null").
+            if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
                 if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
                 }
+            } else if let Some(value) = arg.get("value") {
+                // No handle: a plain JSON argument, explicit null included.
+                let json_str =
+                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
+                setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
                 // CDP defines UnserializableValue as a closed set. Anything
                 // else is arbitrary source text arriving in a data field;

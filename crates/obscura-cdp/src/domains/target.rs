@@ -218,26 +218,7 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let mut sessions = ctx.sessions.iter()
-                .filter(|(_, page_id)| page_id.as_str() == target_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect::<Vec<_>>();
-            sessions.sort_unstable();
-            for session_id in sessions {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.detachedFromTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetId": target_id,
-                    }),
-                ));
-            }
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.targetDestroyed",
-                json!({ "targetId": target_id }),
-            ));
-
-            ctx.remove_page(target_id);
+            close_target(ctx, target_id);
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => Ok(json!({})),
@@ -335,6 +316,35 @@ pub async fn handle(
         }
         _ => Err(format!("Unknown Target method: {}", method)),
     }
+}
+
+/// Detach every session attached to `target_id`, announce the destruction to
+/// subscribers and drop the page. Shared by `Target.closeTarget` and
+/// `Page.close`: go-rod closes tabs with `Page.close` and then blocks until it
+/// sees `Target.targetDestroyed` (rod/page.go `Close`), so both paths must emit
+/// the same lifecycle events.
+pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
+    let mut sessions = ctx.sessions
+        .iter()
+        .filter(|(_, page_id)| page_id.as_str() == target_id)
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    for session_id in sessions {
+        ctx.pending_events.push(CdpEvent::new(
+            "Target.detachedFromTarget",
+            json!({
+                "sessionId": session_id,
+                "targetId": target_id,
+            }),
+        ));
+    }
+    ctx.pending_events.push(CdpEvent::new(
+        "Target.targetDestroyed",
+        json!({ "targetId": target_id }),
+    ));
+
+    ctx.remove_page(target_id);
 }
 
 #[cfg(test)]

@@ -1444,6 +1444,26 @@ pub async fn handle(
             });
             do_navigate(&current_url, &reload_params, ctx, session_id).await
         }
+        "close" => {
+            // go-rod closes a tab with `Page.close` and then blocks until it
+            // receives `Target.targetDestroyed` for that target (rod/page.go
+            // `Close`). Returning "Unknown Page method" left every crawled page
+            // stuck in rod's session map. Chromium supports Page.close, so
+            // share the teardown with `Target.closeTarget`.
+            let target_id = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?
+                .id
+                .clone();
+            crate::domains::target::close_target(ctx, &target_id);
+            Ok(json!({}))
+        }
+        "stopLoading" => {
+            // Chromium answers `{}` here; go-rod calls it before each navigate.
+            // It only has to look like a success - the in-flight navigation is
+            // cancelled by the navigate that follows.
+            Ok(json!({}))
+        }
         "getFrameTree" => {
             let page = ctx
                 .get_session_page(session_id)
