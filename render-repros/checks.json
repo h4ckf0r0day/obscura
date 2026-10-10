@@ -1,4 +1,7 @@
 {
+  "emulated-color-scheme": [
+    {"name": "default light preference keeps the green block", "color": "#00aa00", "x": 0, "y": 0, "width": 240, "height": 100}
+  ],
   "retained-cssom-raster": [
     {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
     {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},

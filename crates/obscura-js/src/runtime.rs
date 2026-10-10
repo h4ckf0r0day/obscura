@@ -1465,17 +1465,42 @@ impl ObscuraJsRuntime {
         );
     }
 
-    /// Keep JavaScript media queries and CSS selection on the same preference.
-    pub fn set_reduced_motion(&mut self, reduce: bool) {
+    /// Apply preference overrides together so compound query listeners observe
+    /// one media change, including in existing child documents.
+    pub fn set_media_preferences(&mut self, reduce: bool, dark: bool) {
+        self.state.borrow().media_preferences.set((reduce, dark));
+        let realms = self.realm_states().borrow().media_realms();
         #[cfg(feature = "render")]
         {
-            let media = self.state.borrow().render_media.with_reduced_motion(reduce);
+            let media = self.state.borrow().render_media
+                .with_reduced_motion(reduce).with_dark_color_scheme(dark);
             self.set_render_media(media);
+            for (_, state) in &realms {
+                let mut state = state.borrow_mut();
+                let media = state.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+                if state.render_media != media {
+                    state.render_media = media;
+                    state.prepared_render = None;
+                    state.resolved_scroll = None;
+                }
+            }
         }
-        let _ = self.execute_runtime_script("<reduced-motion>", format!(
-            "globalThis.__obscura_reduced_motion={reduce};\
-             globalThis.__obscura_recompute_media_queries();"
-        ));
+        let script = "globalThis.__obscura_update_media_preferences();";
+        let _ = self.execute_runtime_script("<media-preferences>", script.into());
+        for (context, _) in realms {
+            let _ = self.eval_in_realm(&context, script);
+        }
+    }
+
+    #[cfg(feature = "render")]
+    pub fn prefers_dark_color_scheme(&self) -> bool {
+        self.state.borrow().media_preferences.get().1
+    }
+
+    /// Keep JavaScript media queries and CSS selection on the same preference.
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        let dark = self.state.borrow().media_preferences.get().1;
+        self.set_media_preferences(reduce, dark);
     }
 
     /// Override the physical screen metrics exposed to page JavaScript.
@@ -1635,8 +1660,27 @@ impl ObscuraJsRuntime {
         let ObscuraState {
             dom,
             render_resources,
+            render_media,
+            dynamic_fonts,
             ..
         } = &mut *state;
+        // An ad-hoc capture must select the same preference rules as CSSOM.
+        // Keep its viewport-specific cascade separate from the live cache.
+        if *render_media != obscura_render::CssMediaType::Screen {
+            let tree = dom.as_ref()?;
+            let mut cache = obscura_render::StylesheetCache::default();
+            let mut timeline = obscura_render::AnimationTimelineState::default();
+            let mut prepared = obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                tree, viewport, base_url, render_resources, dynamic_fonts,
+                &mut cache, *render_media,
+                obscura_render::AnimationSample::local_override(animation_sample_time.milliseconds),
+                &mut timeline,
+            )?;
+            let resolved = prepared.resolve_scroll_state(tree, scroll, &Default::default());
+            return obscura_render::screenshot_prepared_with_scroll_and_surface_color(
+                tree, &mut prepared, render_resources, &resolved, surface_color,
+            );
+        }
         obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
             dom.as_ref()?,
             viewport,

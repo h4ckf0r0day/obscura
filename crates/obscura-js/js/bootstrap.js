@@ -609,7 +609,6 @@ function _rebaseCssUrls(css, baseUrl) {
 function _cssImportApplies(media) {
   const compact = media.replace(/\s+/g, "").toLowerCase();
   if (!compact) return true;
-  if (compact.includes("prefers-color-scheme:dark")) return false;
   if (compact.includes("print")
     && !compact.includes("screen")
     && !compact.includes("all")) return false;
@@ -9041,6 +9040,9 @@ function _evaluateMediaDimension(feature) {
   return null;
 }
 
+let _prefersDark = false;
+let _prefersReducedMotion = false;
+
 function _evaluateMediaFeature(raw) {
   let feature = raw.trim().toLowerCase();
   if (feature[0] !== '(' || feature[feature.length - 1] !== ')') return false;
@@ -9056,10 +9058,11 @@ function _evaluateMediaFeature(raw) {
     return match[1] === 'portrait' ? height >= width : width > height;
   }
 
+  if (feature === 'prefers-color-scheme') return true;
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
-  if (match) return match[1] === 'light';
+  if (match) return match[1] === (_prefersDark ? 'dark' : 'light');
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
-  if (match) return match[1] === (globalThis.__obscura_reduced_motion ? 'reduce' : 'no-preference');
+  if (match) return match[1] === (_prefersReducedMotion ? 'reduce' : 'no-preference');
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
@@ -9122,6 +9125,11 @@ const _mediaQueries = new Set();
 // code does not retain the object returned from matchMedia().
 const _activeMediaQueries = new Set();
 const _mediaQueryState = new WeakMap();
+globalThis.__obscura_update_media_preferences = () => {
+  _prefersDark = !!_domParse("prefers_dark");
+  _prefersReducedMotion = !!_domParse("prefers_reduced_motion");
+  globalThis.__obscura_recompute_media_queries();
+};
 globalThis.__obscura_recompute_media_queries = () => {
   // Media/viewport changes also invalidate live computed-style snapshots.
   // Keep the epoch in this private scope, not in host-injected page script.
@@ -17221,6 +17229,7 @@ const _documentMembers = Object.freeze(Object.fromEntries([
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  globalThis.__obscura_update_media_preferences();
   const caretMembers = _installCaretGeometry();
   __obscuraCore.ops.op_register_document_realm(
     Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,

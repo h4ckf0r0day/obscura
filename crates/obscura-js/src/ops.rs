@@ -160,6 +160,8 @@ pub struct ObscuraState {
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
     pub title: String,
+    /// (reduced motion, dark scheme), shared by every document in this page.
+    pub(crate) media_preferences: Rc<Cell<(bool, bool)>>,
     /// URL of the document that initiated this document's navigation. Direct
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
@@ -397,6 +399,12 @@ pub struct PendingFrameMessage {
 
 impl ObscuraState {
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
+        self.media_preferences = parent.media_preferences.clone();
+        #[cfg(feature = "render")]
+        {
+            let (reduce, dark) = parent.media_preferences.get();
+            self.render_media = self.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+        }
         self.cookie_jar = parent.cookie_jar.clone();
         self.http_client = parent.http_client.clone();
         self.callbacks = parent.callbacks.clone();
@@ -424,6 +432,7 @@ impl ObscuraState {
             inherited_origin: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
+            media_preferences: Rc::new(Cell::new((false, false))),
             referrer: String::new(),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
@@ -891,6 +900,10 @@ struct FrameTimers {
 }
 
 impl RealmStates {
+    pub(crate) fn media_realms(&self) -> Vec<(v8::Global<v8::Context>, SharedState)> {
+        self.entries.iter().map(|(context, _, state)| (context.clone(), state.clone())).collect()
+    }
+
     pub(crate) fn live_count(&self) -> usize {
         self.entries.len()
     }
@@ -1885,6 +1898,12 @@ fn op_dom(
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "prefers_reduced_motion" {
+        return shared.borrow().media_preferences.get().0.to_string();
+    }
+    if cmd == "prefers_dark" {
+        return shared.borrow().media_preferences.get().1.to_string();
+    }
     if cmd == "performance_time_origin" {
         return shared.borrow().navigation_timing.time_origin.to_string();
     }
