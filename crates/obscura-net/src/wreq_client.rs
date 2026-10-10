@@ -338,6 +338,7 @@ impl StealthHttpClient {
 
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
+        let mut strip_credential_headers = false;
         let mut request_callback_fired = false;
 
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
@@ -379,6 +380,10 @@ impl StealthHttpClient {
 
             for (k, v) in self.extra_headers.read().await.iter() {
                 if k.eq_ignore_ascii_case("origin") {
+                    continue;
+                }
+                if strip_credential_headers && (k.eq_ignore_ascii_case("authorization")
+                    || k.eq_ignore_ascii_case("proxy-authorization") || k.eq_ignore_ascii_case("cookie")) {
                     continue;
                 }
                 req = req.header(k.as_str(), v.as_str());
@@ -444,6 +449,7 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    strip_credential_headers |= current_url.origin() != next_url.origin();
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;
@@ -524,6 +530,27 @@ impl StealthHttpClient {
         store_cookies: bool,
         max_body_bytes: usize,
     ) -> Result<StealthResponseHeaders, ObscuraNetError> {
+        let mut resolved_headers = self.extra_headers.read().await.clone();
+        for (name, value) in headers {
+            resolved_headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+            resolved_headers.insert(name.clone(), value.clone());
+        }
+        self.send_single_resolved_headers_with_context(
+            method, url, &resolved_headers, body, cookie_context, store_cookies, max_body_bytes,
+        ).await
+    }
+
+    /// Send resolved headers without reapplying defaults stripped by redirect policy.
+    pub async fn send_single_resolved_headers_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
             return Ok(StealthResponseHeaders {
@@ -543,9 +570,6 @@ impl StealthHttpClient {
             if !cookie_header.is_empty() {
                 req = req.header("cookie", &cookie_header);
             }
-        }
-        for (k, v) in self.extra_headers.read().await.iter() {
-            req = req.header(k.as_str(), v.as_str());
         }
         for (k, v) in headers.iter() {
             req = req.header(k.as_str(), v.as_str());

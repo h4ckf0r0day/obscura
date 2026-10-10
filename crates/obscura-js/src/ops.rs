@@ -3698,10 +3698,17 @@ async fn fetch_url_inner(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
+    // Resolve browser headers before interception and CORS, not after redirect sanitization.
+    let mut custom_headers: HashMap<String, String> =
+        serde_json::from_str(&headers_json).unwrap_or_default();
+    if let Some(client) = &http_client {
+        for (name, value) in client.extra_headers.read().await.iter() {
+            custom_headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+            custom_headers.insert(name.clone(), value.clone());
+        }
+    }
     let mut was_intercepted = false;
     if let Some(tx) = intercept_tx {
-        let custom_headers: HashMap<String, String> =
-            serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
@@ -3842,8 +3849,7 @@ async fn fetch_url_inner(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
-    let custom_headers: std::collections::HashMap<String, String> =
-        override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    let custom_headers = override_headers.unwrap_or(custom_headers);
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -4346,7 +4352,7 @@ async fn stealth_fetch_all(
             }
         });
         let r = stealth
-            .send_single_headers_with_context(
+            .send_single_resolved_headers_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
