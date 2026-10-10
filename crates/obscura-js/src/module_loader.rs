@@ -15,7 +15,7 @@ use deno_core::ModuleSpecifier;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::ObscuraState;
+use crate::ops::{JsNetworkEvent, ObscuraState};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -252,6 +252,38 @@ impl ModuleLoader for ObscuraModuleLoader {
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
 
+
+/// Attempts for one module fetch. A module load is a single round trip today, so
+/// a transient socket failure strands the whole graph: the entry never runs, or a
+/// lazy chunk throws `error sending request` into the page. Retrying costs
+/// nothing on the happy path and recovers the common transient case (#1222).
+const MODULE_FETCH_ATTEMPTS: u32 = 3;
+const MODULE_FETCH_BACKOFF_MS: u64 = 60;
+
+async fn fetch_module_with_retry<T, E, F, Fut>(mut fetch: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match fetch().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                attempt += 1;
+                if attempt >= MODULE_FETCH_ATTEMPTS {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    MODULE_FETCH_BACKOFF_MS * u64::from(attempt),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
+        let page_state_for_event = self.page_state.clone();
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
             // deno_core propagates `is_dynamic_import` to every dependency edge in
             // the recursive graph, so this excludes parser-discovered/static
@@ -267,39 +299,37 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Ok((client, stealth, callbacks)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-                    let request =
-                        obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    // Rebuilt per attempt below: a retry closure cannot move a
+                    // captured request out.
                     #[cfg(feature = "stealth")]
-                    let resp = match stealth {
-                        Some(stealth) => stealth
-                            .fetch_resource_with_callbacks(
+                    let resp = fetch_module_with_retry(|| {
+                        let request =
+                            obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                        match stealth {
+                            Some(stealth) => stealth.fetch_resource_with_callbacks(
                                 &requested,
                                 request,
                                 callbacks.as_deref(),
-                            )
-                            .await,
-                        None => {
-                            client
-                                .fetch_resource_with_callbacks(
-                                    &requested,
-                                    request,
-                                    callbacks.as_deref(),
-                                )
-                                .await
+                            ),
+                            None => client.fetch_resource_with_callbacks(
+                                &requested,
+                                request,
+                                callbacks.as_deref(),
+                            ),
                         }
-                    }
+                    })
+                    .await
                     .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
                     #[cfg(not(feature = "stealth"))]
                     let resp = {
                         let _ = &stealth;
-                        client
-                            .fetch_resource_with_callbacks(
-                                &requested,
-                                request,
-                                callbacks.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+                        fetch_module_with_retry(|| {
+                            let request =
+                                obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                            client.fetch_resource_with_callbacks(&requested, request, callbacks.as_deref())
+                        })
+                        .await
+                        .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
                     };
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
@@ -316,6 +346,26 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .push(found.to_string());
                     }
                     let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                    // A module load never went through the fetch path that
+                    // records a completed response, so every module script was
+                    // reported as 0 B and looked like an empty body. Publish the
+                    // real size on the same event the request side already
+                    // created (#1222).
+                    if let Some(weak) = page_state_for_event.as_ref() {
+                        if let Some(state) = weak.upgrade() {
+                            if let Ok(mut state) = state.try_borrow_mut() {
+                                if let Some(event) = state
+                                    .js_network_events
+                                    .iter_mut()
+                                    .rev()
+                                    .find(|event| event.url == url)
+                                {
+                                    event.body_size = code.len();
+                                    event.status = resp.status;
+                                }
+                            }
+                        }
+                    }
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,
                         ModuleSourceCode::String(code.into()),
