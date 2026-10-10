@@ -13186,7 +13186,16 @@ class SVGElement extends Element {
   get [Symbol.toStringTag]() { return "SVGElement"; }
 }
 class SVGGraphicsElement extends SVGElement {}
-class SVGGeometryElement extends SVGGraphicsElement {}
+class SVGGeometryElement extends SVGGraphicsElement {
+  getTotalLength() {
+    if (!(this instanceof SVGGeometryElement)) throw new TypeError('Illegal invocation');
+    const length = _dom('svg_total_length', this._nid);
+    if (length === 'null') throw new DOMException('Unable to compute SVG geometry', 'InvalidStateError');
+    return Number(length);
+  }
+}
+_markNative(SVGGeometryElement.prototype.getTotalLength);
+Object.defineProperty(SVGGeometryElement.prototype, 'getTotalLength', { enumerable: true });
 class SVGTextContentElement extends SVGGraphicsElement {}
 class SVGTextPositioningElement extends SVGTextContentElement {}
 class SVGGradientElement extends SVGElement {}
