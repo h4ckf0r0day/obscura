@@ -12156,16 +12156,44 @@ globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 // property access, so `localStorage.foo = x` never updated length before.
 globalThis.Storage = function Storage() {};
 Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
+Storage.prototype.setItem = function(k, v) {
+  this._data[String(k)] = String(v);
+  if (this._isLocal && typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_localstorage_save === 'function') {
+    try { __obscuraCore.ops.op_localstorage_save(JSON.stringify(this._data)); } catch(_) {}
+  }
+};
+Storage.prototype.removeItem = function(k) {
+  delete this._data[String(k)];
+  if (this._isLocal && typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_localstorage_save === 'function') {
+    try { __obscuraCore.ops.op_localstorage_save(JSON.stringify(this._data)); } catch(_) {}
+  }
+};
+Storage.prototype.clear = function() {
+  const d = this._data; for (const k in d) delete d[k];
+  if (this._isLocal && typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_localstorage_save === 'function') {
+    try { __obscuraCore.ops.op_localstorage_save(JSON.stringify(this._data)); } catch(_) {}
+  }
+};
 Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
 Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
 
-const _mkStore = () => {
+const _mkStore = (isLocal = false) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
+  const initData = Object.create(null);
+  if (isLocal && typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_localstorage_load === 'function') {
+    try {
+      const raw = __obscuraCore.ops.op_localstorage_load();
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        for (const [k, v] of Object.entries(parsed)) {
+          initData[String(k)] = String(v);
+        }
+      }
+    } catch (_) {}
+  }
+  Object.defineProperty(target, '_data', { value: initData, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(target, '_isLocal', { value: isLocal, writable: false, enumerable: false, configurable: false });
+  const isReal = (p) => p === '_data' || p === '_isLocal' || p === 'constructor' || (p in Storage.prototype);
   return new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
@@ -12179,8 +12207,35 @@ const _mkStore = () => {
     },
   });
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore(true);
+globalThis.sessionStorage = _mkStore(false);
+
+// The realm bootstrap runs before the browser hands the runtime its document
+// URL and storage directory, so the `_mkStore(true)` above always loads an
+// empty map: `op_localstorage_load` bails out when storage_dir is still unset.
+// The browser calls this hook once both are set (and before any page script
+// runs) to merge what is on disk into the live store. Merging rather than
+// replacing keeps anything a page wrote during setup, and because the merged
+// keys now live in `_data`, the next setItem persists them again instead of
+// overwriting the file with a partial map.
+globalThis.__obscuraRehydrateStorage = function() {
+  try {
+    if (typeof __obscuraCore === 'undefined' || !__obscuraCore.ops ||
+        typeof __obscuraCore.ops.op_localstorage_load !== 'function') return 0;
+    const store = globalThis.localStorage;
+    if (!store || !store._data) return 0;
+    const raw = __obscuraCore.ops.op_localstorage_load();
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw);
+    let added = 0;
+    for (const k of Object.keys(parsed)) {
+      const key = String(k);
+      if (!Object.prototype.hasOwnProperty.call(store._data, key)) added++;
+      store._data[key] = String(parsed[k]);
+    }
+    return added;
+  } catch (_) { return 0; }
+};
 
 globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
@@ -15243,23 +15298,105 @@ function _idbRequest(produceResult) {
   return req;
 }
 
-function _idbObjectStore(name) {
+function _idbObjectStore(name, dbName) {
   const data = new Map();
+  const ops = typeof __obscuraCore !== 'undefined' ? __obscuraCore.ops : null;
+  const hasOps = !!(ops && typeof ops.op_idb_get === 'function');
+  const db = String(dbName || 'default');
+  const store = String(name);
+
   return {
     name,
     keyPath: null,
     autoIncrement: false,
     indexNames: { contains() { return false; }, length: 0, item() { return null; } },
     transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
+    add(value, key) {
+      const k = key ?? Date.now();
+      if (hasOps) {
+        try { ops.op_idb_put(db, store, String(k), JSON.stringify(value)); } catch (_) {}
+      }
+      data.set(k, value);
+      return _idbRequest(() => k);
+    },
+    put(value, key) {
+      const k = key ?? Date.now();
+      if (hasOps) {
+        try { ops.op_idb_put(db, store, String(k), JSON.stringify(value)); } catch (_) {}
+      }
+      data.set(k, value);
+      return _idbRequest(() => k);
+    },
+    get(key) {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try {
+            const raw = ops.op_idb_get(db, store, String(key));
+            if (raw !== null && raw !== undefined && raw !== "") return JSON.parse(raw);
+          } catch (_) {}
+        }
+        return data.get(key) ?? undefined;
+      });
+    },
+    getAll() {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try {
+            const raws = ops.op_idb_get_all(db, store);
+            if (raws && raws.length > 0) return raws.map(r => JSON.parse(r));
+          } catch (_) {}
+        }
+        return Array.from(data.values());
+      });
+    },
+    getAllKeys() {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try {
+            const keys = ops.op_idb_get_all_keys(db, store);
+            if (keys && keys.length > 0) return keys;
+          } catch (_) {}
+        }
+        return Array.from(data.keys());
+      });
+    },
+    getKey(key) {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try {
+            const raw = ops.op_idb_get(db, store, String(key));
+            if (raw !== null && raw !== undefined && raw !== "") return key;
+          } catch (_) {}
+        }
+        return data.has(key) ? key : undefined;
+      });
+    },
+    delete(key) {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try { ops.op_idb_delete(db, store, String(key)); } catch (_) {}
+        }
+        data.delete(key);
+        return undefined;
+      });
+    },
+    clear() {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try { ops.op_idb_clear(db, store); } catch (_) {}
+        }
+        data.clear();
+        return undefined;
+      });
+    },
+    count() {
+      return _idbRequest(() => {
+        if (hasOps) {
+          try { return ops.op_idb_count(db, store); } catch (_) {}
+        }
+        return data.size;
+      });
+    },
     openCursor() { return _idbRequest(() => null); },
     openKeyCursor() { return _idbRequest(() => null); },
     createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
@@ -15268,10 +15405,10 @@ function _idbObjectStore(name) {
   };
 }
 
-function _idbTransaction(storeNames) {
+function _idbTransaction(storeNames, dbName) {
   const stores = new Map();
   const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
+  for (const n of names) stores.set(String(n), _idbObjectStore(String(n), dbName));
   const tx = {
     db: null,
     mode: 'readonly',
@@ -15280,7 +15417,7 @@ function _idbTransaction(storeNames) {
     error: null,
     objectStore(name) {
       let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
+      if (!s) { s = _idbObjectStore(name, dbName); stores.set(name, s); }
       s.transaction = tx;
       return s;
     },
@@ -15302,10 +15439,10 @@ function _idbDatabase(name, version) {
     name,
     version,
     objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
+    createObjectStore(n) { return _idbObjectStore(n, name); },
     deleteObjectStore() {},
     transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
+      const tx = _idbTransaction(storeNames, name);
       tx.mode = mode || 'readonly';
       return tx;
     },
@@ -15330,8 +15467,101 @@ globalThis.IDBKeyRange = {
   bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
 };
 
-// Do not advertise CacheStorage until it can retain responses. A successful
-// no-op cache selects broken persistence paths instead of normal fetch fallbacks.
+class Cache {
+  constructor(name) {
+    this._name = String(name);
+    this._mem = new Map();
+  }
+  async put(request, response) {
+    const url = typeof request === 'string' ? request : (request && request.url ? request.url : String(request));
+    if (!response) throw new TypeError("Response is required");
+    const clone = typeof response.clone === 'function' ? response.clone() : response;
+    const text = await clone.text();
+    const headers = [];
+    if (response.headers && typeof response.headers.forEach === 'function') {
+      response.headers.forEach((v, k) => headers.push([k, v]));
+    }
+    const payload = JSON.stringify({
+      status: response.status || 200,
+      statusText: response.statusText || 'OK',
+      headers,
+      body: text,
+    });
+    this._mem.set(url, payload);
+    if (typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_cache_put === 'function') {
+      try { __obscuraCore.ops.op_cache_put(this._name, url, payload); } catch (_) {}
+    }
+  }
+  async match(request) {
+    const url = typeof request === 'string' ? request : (request && request.url ? request.url : String(request));
+    let raw = null;
+    if (typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_cache_get === 'function') {
+      try { raw = __obscuraCore.ops.op_cache_get(this._name, url); } catch (_) {}
+    }
+    if (!raw) {
+      raw = this._mem.get(url);
+    }
+    if (!raw) return undefined;
+    try {
+      const data = JSON.parse(raw);
+      return new Response(data.body, { status: data.status, statusText: data.statusText, headers: data.headers });
+    } catch (_) {
+      return undefined;
+    }
+  }
+  async delete(request) {
+    const url = typeof request === 'string' ? request : (request && request.url ? request.url : String(request));
+    this._mem.delete(url);
+    if (typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_cache_delete === 'function') {
+      try { return __obscuraCore.ops.op_cache_delete(this._name, url); } catch (_) {}
+    }
+    return true;
+  }
+  async keys() {
+    if (typeof __obscuraCore !== 'undefined' && __obscuraCore.ops && typeof __obscuraCore.ops.op_cache_keys === 'function') {
+      try {
+        const list = __obscuraCore.ops.op_cache_keys(this._name);
+        if (list && list.length) return list.map(u => new Request(u));
+      } catch (_) {}
+    }
+    return Array.from(this._mem.keys()).map(u => new Request(u));
+  }
+}
+
+class CacheStorage {
+  constructor() {
+    this._caches = new Map();
+  }
+  async open(name) {
+    name = String(name);
+    let c = this._caches.get(name);
+    if (!c) {
+      c = new Cache(name);
+      this._caches.set(name, c);
+    }
+    return c;
+  }
+  async has(name) {
+    return this._caches.has(String(name));
+  }
+  async delete(name) {
+    return this._caches.delete(String(name));
+  }
+  async keys() {
+    return Array.from(this._caches.keys());
+  }
+  async match(request) {
+    for (const c of this._caches.values()) {
+      const m = await c.match(request);
+      if (m) return m;
+    }
+    return undefined;
+  }
+}
+
+globalThis.Cache = Cache;
+globalThis.CacheStorage = CacheStorage;
+globalThis.caches = new CacheStorage();
 
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);

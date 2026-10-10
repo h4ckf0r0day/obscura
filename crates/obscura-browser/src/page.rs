@@ -1777,6 +1777,7 @@ impl Page {
             self.context.proxy_url.clone(),
         );
         rt.set_url(&self.url_string());
+        rt.set_storage_dir(self.context.storage_dir.clone());
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);

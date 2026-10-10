@@ -166,6 +166,7 @@ pub struct ObscuraState {
     pub referrer: String,
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
+    pub storage_dir: Option<std::path::PathBuf>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
@@ -427,6 +428,7 @@ impl ObscuraState {
             referrer: String::new(),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
+            storage_dir: None,
             cookie_jar: None,
             http_client: None,
             callbacks: None,
@@ -5652,6 +5654,265 @@ fn op_set_cookie(scope: &mut v8::PinScope, state: &OpState, #[string] cookie_str
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+fn sanitize_origin_for_storage(origin: &str) -> String {
+    let sanitized: String = origin
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "default.json".to_string()
+    } else {
+        format!("{}.json", trimmed)
+    }
+}
+
+#[op2]
+#[string]
+fn op_localstorage_load(scope: &mut v8::PinScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let storage_dir = match &gs.storage_dir {
+        Some(d) => d,
+        None => return String::new(),
+    };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return String::new(),
+    };
+    let file_name = sanitize_origin_for_storage(&origin);
+    let path = storage_dir.join("localStorage").join(file_name);
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+#[op2(fast)]
+fn op_localstorage_save(scope: &mut v8::PinScope, state: &OpState, #[string] data_json: &str) {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let storage_dir = match &gs.storage_dir {
+        Some(d) => d,
+        None => return,
+    };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return,
+    };
+    let ls_dir = storage_dir.join("localStorage");
+    if std::fs::create_dir_all(&ls_dir).is_err() {
+        return;
+    }
+    let file_name = sanitize_origin_for_storage(&origin);
+    let path = ls_dir.join(file_name);
+    let _ = std::fs::write(path, data_json);
+}
+
+#[op2]
+#[string]
+fn op_idb_get(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+    #[string] key: &str,
+) -> Option<String> {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let storage_dir = gs.storage_dir.as_ref()?;
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return None,
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_get(&path, store, key)
+}
+
+#[op2(fast)]
+fn op_idb_put(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+    #[string] key: &str,
+    #[string] val_json: &str,
+) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return false; };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return false,
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_put(&path, store, key, val_json).is_ok()
+}
+
+#[op2(fast)]
+fn op_idb_delete(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+    #[string] key: &str,
+) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return false; };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return false,
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_delete(&path, store, key).is_ok()
+}
+
+#[op2(fast)]
+fn op_idb_clear(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return false; };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return false,
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_clear(&path, store).is_ok()
+}
+
+#[op2]
+#[serde]
+fn op_idb_get_all(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+) -> Vec<String> {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return Vec::new(); };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return Vec::new(),
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_get_all(&path, store)
+}
+
+#[op2]
+#[serde]
+fn op_idb_get_all_keys(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+) -> Vec<String> {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return Vec::new(); };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return Vec::new(),
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_get_all_keys(&path, store)
+}
+
+#[op2(fast)]
+fn op_idb_count(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] db_name: &str,
+    #[string] store: &str,
+) -> u32 {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return 0; };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return 0,
+    };
+    let path = crate::idb::get_db_path(storage_dir, &origin, db_name);
+    crate::idb::idb_count(&path, store) as u32
+}
+
+#[op2]
+#[string]
+fn op_cache_get(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] cache_name: &str,
+    #[string] url: &str,
+) -> Option<String> {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let storage_dir = gs.storage_dir.as_ref()?;
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return None,
+    };
+    let path = crate::idb::get_cache_db_path(storage_dir, &origin);
+    crate::idb::cache_get(&path, cache_name, url)
+}
+
+#[op2(fast)]
+fn op_cache_put(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] cache_name: &str,
+    #[string] url: &str,
+    #[string] val_json: &str,
+) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return false; };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return false,
+    };
+    let path = crate::idb::get_cache_db_path(storage_dir, &origin);
+    crate::idb::cache_put(&path, cache_name, url, val_json).is_ok()
+}
+
+#[op2(fast)]
+fn op_cache_delete(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] cache_name: &str,
+    #[string] url: &str,
+) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return false; };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return false,
+    };
+    let path = crate::idb::get_cache_db_path(storage_dir, &origin);
+    crate::idb::cache_delete(&path, cache_name, url).unwrap_or(false)
+}
+
+#[op2]
+#[serde]
+fn op_cache_keys(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    #[string] cache_name: &str,
+) -> Vec<String> {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let Some(storage_dir) = gs.storage_dir.as_ref() else { return Vec::new(); };
+    let origin = match url::Url::parse(&gs.url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => return Vec::new(),
+    };
+    let path = crate::idb::get_cache_db_path(storage_dir, &origin);
+    crate::idb::cache_keys(&path, cache_name)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionHistory {
     pub urls: Vec<String>,
@@ -6881,6 +7142,19 @@ pub fn build_extension() -> Extension {
         op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
+        op_localstorage_load(),
+        op_localstorage_save(),
+        op_idb_get(),
+        op_idb_put(),
+        op_idb_delete(),
+        op_idb_clear(),
+        op_idb_get_all(),
+        op_idb_get_all_keys(),
+        op_idb_count(),
+        op_cache_get(),
+        op_cache_put(),
+        op_cache_delete(),
+        op_cache_keys(),
         op_navigate(),
         op_session_history(),
         op_history_traverse(),
