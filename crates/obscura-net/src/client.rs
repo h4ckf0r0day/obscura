@@ -1076,7 +1076,11 @@ impl ObscuraHttpClient {
                 .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
-;
+                // hyper's HTTP/2 default is a 64 KiB stream window, which caps a
+                // single download at 64 KiB per round trip. Use Chrome's windows
+                // so large scripts are not throttled on a high-latency path.
+                .http2_initial_stream_window_size(6 * 1024 * 1024)
+                .http2_initial_connection_window_size(15 * 1024 * 1024);
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
