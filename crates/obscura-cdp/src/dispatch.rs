@@ -339,7 +339,12 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.nav_events_emitted.remove(id);
         self.announced_frames.remove(id);
+        self.binding_sessions.retain(|_, owners| {
+            owners.retain(|owner| !removed_sessions.contains(owner));
+            !owners.is_empty()
+        });
         #[cfg(feature = "render")]
         {
             for session_id in &removed_sessions {
@@ -1207,6 +1212,20 @@ mod tests {
             params: json!({}),
             session_id: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_page_releases_per_page_connection_state() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions.insert("s1".into(), page_id.clone());
+        ctx.nav_events_emitted.insert(page_id.clone());
+        ctx.binding_sessions.insert("only".into(), vec!["s1".into()]);
+        ctx.binding_sessions.insert("shared".into(), vec!["s1".into(), "other".into()]);
+        ctx.remove_page(&page_id);
+        assert!(ctx.nav_events_emitted.is_empty());
+        assert!(!ctx.binding_sessions.contains_key("only"));
+        assert_eq!(ctx.binding_sessions["shared"], vec!["other".to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]
