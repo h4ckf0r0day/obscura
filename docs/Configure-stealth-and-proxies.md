@@ -36,6 +36,16 @@ Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-fe
 - Datadome and Akamai bot manager active challenges.
 - CAPTCHAs.
 - IP-based rate limiting (use proxies).
+- **Passive TCP/IP stack fingerprinting.** Classifiers that inspect the raw SYN
+  packet (tcp_options order, window size, window scaling, ip_id) can distinguish
+  Linux from macOS even when the TLS and HTTP layers are identical, because those
+  fields are set by the OS kernel, not by Obscura. The same binary on Linux
+  (`tcp_options: "M1460,S,T,N,W10"`, window 64240) and macOS
+  (`tcp_options: "M1460,N,W6,N,N,T,S,E,E"`, window 65535) produces a different
+  passive fingerprint. Obscura operates in userspace and cannot override these
+  kernel defaults. If TCP/IP passive detection is a concern, run Obscura inside
+  a container or VM whose kernel matches the target fingerprint, or route
+  connections through a proxy whose TCP stack presents the desired profile.
 
 ## Proxies
 
