@@ -143,6 +143,17 @@ await Promise.all([
 
 Pages share one V8 isolate. CPU-bound JS on one page blocks the others.
 
+`page.setExtraHTTPHeaders()` applies to that page's navigation, resources,
+`fetch()` and XHR, including the native stealth transport. It does not change
+other pages in the context. Passing `{}` clears the page's configured headers.
+Cookies, the HTTP connection pool and the resource cache remain context-shared;
+resource cache keys include the configured headers.
+
+For Rust embedders, `Page::http_client` is now a page-scoped client created with
+`ObscuraHttpClient::for_page()`. Its `extra_headers` field uses `ExtraHeaders`
+rather than a raw Tokio lock, retaining async `read()` and `write()` access.
+The user-agent, language and interceptor locks are shared through `Arc`.
+
 ## Screenshots, scrolling, and PDF
 
 ```js

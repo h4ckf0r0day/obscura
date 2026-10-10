@@ -834,18 +834,53 @@ async fn read_reqwest_body_limited(
     Ok(body)
 }
 
+/// Context defaults with a copy-on-write override for each page.
+#[derive(Default)]
+pub struct ExtraHeaders {
+    defaults: Arc<RwLock<HashMap<String, String>>>,
+    override_headers: Option<OnceLock<Arc<RwLock<HashMap<String, String>>>>>,
+}
+
+impl ExtraHeaders {
+    fn current(&self) -> &Arc<RwLock<HashMap<String, String>>> {
+        self.override_headers.as_ref().and_then(OnceLock::get).unwrap_or(&self.defaults)
+    }
+
+    fn for_page(&self) -> Self {
+        Self { defaults: self.current().clone(), override_headers: Some(OnceLock::new()) }
+    }
+
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, HashMap<String, String>> {
+        self.current().read().await
+    }
+
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+        let headers = match &self.override_headers {
+            Some(slot) => match slot.get() {
+                Some(headers) => headers,
+                None => {
+                    let defaults = self.defaults.read().await.clone();
+                    slot.get_or_init(|| Arc::new(RwLock::new(defaults)))
+                }
+            },
+            None => &self.defaults,
+        };
+        headers.write().await
+    }
+}
+
 pub struct ObscuraHttpClient {
-    client: tokio::sync::OnceCell<Client>,
+    client: Arc<tokio::sync::OnceCell<Client>>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
-    pub user_agent: RwLock<String>,
-    pub accept_language: RwLock<String>,
-    pub extra_headers: RwLock<HashMap<String, String>>,
-    pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    pub user_agent: Arc<RwLock<String>>,
+    pub accept_language: Arc<RwLock<String>>,
+    pub extra_headers: ExtraHeaders,
+    pub interceptor: Arc<RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -1048,20 +1083,38 @@ impl ObscuraHttpClient {
         allow_private_network: bool,
     ) -> Self {
         ObscuraHttpClient {
-            client: tokio::sync::OnceCell::new(),
+            client: Arc::new(tokio::sync::OnceCell::new()),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
+            user_agent: Arc::new(RwLock::new(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
-            accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
-            extra_headers: RwLock::new(HashMap::new()),
-            interceptor: RwLock::new(None),
+            )),
+            accept_language: Arc::new(RwLock::new("en-US,en;q=0.9".to_string())),
+            extra_headers: ExtraHeaders::default(),
+            interceptor: Arc::new(RwLock::new(None)),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
+        }
+    }
+
+    /// Share context transport, cookies and cache without sharing page overrides.
+    pub fn for_page(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            proxy_url: self.proxy_url.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            user_agent: self.user_agent.clone(),
+            accept_language: self.accept_language.clone(),
+            extra_headers: self.extra_headers.for_page(),
+            interceptor: self.interceptor.clone(),
+            timeout: self.timeout,
+            in_flight: self.in_flight.clone(),
+            block_trackers: self.block_trackers,
+            resource_loader: self.resource_loader.clone(),
+            allow_private_network: self.allow_private_network,
         }
     }
 
@@ -2767,6 +2820,35 @@ mod ssrf_tests {
         assert_eq!(responses.len(), 16);
         assert!(responses.iter().all(|response| response.status == 200));
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn page_header_overrides_preserve_defaults_and_shared_resource_cache() {
+        let (url, network_requests) =
+            cacheable_resource_fixture(200, "Cache-Control: public, max-age=3600\r\n").await;
+        let context = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let a = context.for_page();
+        let b = context.for_page();
+        context.set_extra_headers(HashMap::from([("X-Test".into(), "default".into())])).await;
+        let initiator = url.join("/page.html").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        for client in [&a, &b] {
+            assert_eq!(client.extra_headers.read().await.get("X-Test").map(String::as_str), Some("default"));
+            assert_eq!(client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap().status, 200);
+        }
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1, "pages must share the context's cache");
+        a.set_extra_headers(HashMap::from([("X-Test".into(), "a-only".into())])).await;
+        for client in [&a, &b] {
+            assert_eq!(client.fetch_resource_with_callbacks(&url, request.clone(), None).await.unwrap().status, 200);
+        }
+        assert_eq!(network_requests.load(Ordering::SeqCst), 2, "different header profiles must not reuse one cache entry");
+        a.set_extra_headers(HashMap::new()).await;
+        a.fetch_resource_with_callbacks(&url, request, None).await.unwrap();
+        assert_eq!(network_requests.load(Ordering::SeqCst), 3, "clearing the override must not restore defaults");
+        assert!(a.extra_headers.read().await.is_empty());
+        for client in [&context, &b] {
+            assert_eq!(client.extra_headers.read().await.get("X-Test").map(String::as_str), Some("default"));
+        }
     }
 
     #[tokio::test]
