@@ -10702,10 +10702,13 @@ globalThis.__obscura_setHovered = function(el) {
   }
 };
 
-// Build a FileList-like object: an array with the DOM's `item(i)` accessor.
+// Build a FileList: indexed File entries plus the DOM's length and `item(i)`
+// accessor. Real instances of the FileList global (issue #1232), not arrays,
+// so `input.files instanceof FileList` holds.
 function _makeFileList(files) {
-  const list = files.slice();
-  Object.defineProperty(list, "item", { value: (i) => list[i] || null, enumerable: false });
+  const list = Object.create(FileList.prototype);
+  for (let i = 0; i < files.length; i++) list[i] = files[i];
+  Object.defineProperty(list, "length", { value: files.length, enumerable: false, writable: false });
   return list;
 }
 function _emptyFileList() { return _makeFileList([]); }
@@ -11237,6 +11240,15 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
     this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
   }
   get [Symbol.toStringTag]() { return "File"; }
+};
+// Issue #1232: `typeof FileList` was `undefined`, so apps that reference it
+// while booting crash with a ReferenceError. Not directly constructible,
+// matching Chrome (`new FileList()` throws "Illegal constructor").
+if (typeof FileList === "undefined") globalThis.FileList = class FileList {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  item(i) { const v = this[i]; return v === undefined ? null : v; }
+  [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
+  get [Symbol.toStringTag]() { return "FileList"; }
 };
 // A FormData value keeps Blob/File objects as-is (the multipart serializer reads
 // their bytes); every other value is coerced to a string per the Fetch spec.

@@ -1572,4 +1572,70 @@ mod tests {
         assert!(!frame.is_same_origin_as("null"));
         assert!(!frame.is_same_origin_as("https://parent.example"));
     }
+
+    #[test]
+    fn file_list_global_exists_and_input_files_is_instance() {
+        // Issue #1232: `typeof FileList` was `undefined`, crashing apps that
+        // reference it while booting.
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate("typeof FileList").unwrap(),
+            serde_json::json!("function")
+        );
+        assert_eq!(
+            rt.evaluate("Object.prototype.toString.call(document.getElementById('f').files)")
+                .unwrap(),
+            serde_json::json!("[object FileList]")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files instanceof FileList")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files.length").unwrap(),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            rt.evaluate("(() => { try { new FileList(); return 'no-throw'; } catch (e) { return e.name + ': ' + e.message; } })()").unwrap(),
+            serde_json::json!("TypeError: Illegal constructor")
+        );
+    }
+
+    #[test]
+    fn file_list_iteration_preserves_uploaded_files() {
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f multiple></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const input = document.getElementById('f');
+            const empty = [...input.files].length;
+            __obscura_setInputFiles(input, [
+                {name: 'first.txt', type: 'text/plain', b64: 'YQ=='},
+                {name: 'second.txt', type: 'text/plain', b64: 'Yg=='}
+            ]);
+            const files = input.files;
+            const names = [];
+            for (const file of files) names.push(file.name);
+            const iterator = files[Symbol.iterator]();
+            return {
+                empty,
+                spread: [...files].map(file => file.name),
+                names,
+                sameFile: [...files][0] === files.item(0),
+                iterableIterator: iterator[Symbol.iterator]() === iterator
+            };
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "empty": 0,
+            "spread": ["first.txt", "second.txt"],
+            "names": ["first.txt", "second.txt"],
+            "sameFile": true,
+            "iterableIterator": true
+        }));
+    }
 }

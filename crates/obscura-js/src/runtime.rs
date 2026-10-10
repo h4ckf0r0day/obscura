@@ -1392,6 +1392,12 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().intercept_page_id = page_id.to_string();
     }
 
+    /// `Fetch.enable` URL patterns that decide which fetch()/XHR requests
+    /// are sent to the interception channel.
+    pub fn set_intercept_url_patterns(&self, patterns: Vec<String>) {
+        self.state.borrow_mut().intercept_url_patterns = patterns;
+    }
+
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
     /// loads honour them like the page's own subresource fetches do.
     #[cfg(feature = "render")]
