@@ -9248,6 +9248,10 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
     // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
     // property instead of adding per-property aliases to the native snapshot.
     if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
+    // `cssFloat` is the CSSOM IDL alias for `float` (`float` being reserved in
+    // early ECMAScript). Naive camelCase splitting yields `css-float`, which
+    // matches no property, so the getter returned ''.
+    if (kebab === 'css-float') kebab = 'float';
     refreshRendered(kebab);
     if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
       return snapshot.rendered[kebab];
