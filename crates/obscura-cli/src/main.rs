@@ -1,3 +1,5 @@
+mod batch;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1482,18 +1484,14 @@ async fn run_batch_fetch(
     }
 
     let start = Instant::now();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let user_agent = Arc::new(user_agent);
     let proxy = Arc::new(proxy);
 
-    let mut handles = Vec::with_capacity(total);
-    for (i, url) in urls.into_iter().enumerate() {
-        let sem = semaphore.clone();
+    let completed = batch::run_bounded(urls.into_iter().enumerate(), concurrency, |(i, url)| {
         let user_agent = user_agent.clone();
         let proxy = proxy.clone();
 
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+        async move {
             let task_start = Instant::now();
             let result = fetch_original_response(
                 &url,
@@ -1522,13 +1520,14 @@ async fn run_batch_fetch(
                 }),
             };
             (i, line)
-        }));
-    }
+        }
+    })
+    .await;
 
     let mut results: Vec<Option<serde_json::Value>> = vec![None; total];
     let mut failures = 0usize;
-    for handle in handles {
-        if let Ok((i, line)) = handle.await {
+    for result in completed {
+        if let Ok((i, line)) = result {
             if !line["ok"].as_bool().unwrap_or(false) {
                 failures += 1;
             }
@@ -1858,23 +1857,18 @@ async fn run_parallel_scrape(
         );
     }
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let eval = Arc::new(eval);
     let worker_path = Arc::new(worker_path);
     let worker_timeout = Duration::from_secs(timeout_secs);
     let read_timeout = Duration::from_secs(timeout_secs.min(30));
     let shutdown_timeout = Duration::from_secs(5);
 
-    let mut handles = Vec::new();
-
-    for (i, url) in urls.into_iter().enumerate() {
-        let sem = semaphore.clone();
+    let completed = batch::run_bounded(urls.into_iter().enumerate(), concurrency, |(i, url)| {
         let eval = eval.clone();
         let worker_path = worker_path.clone();
         let proxy = proxy.clone();
 
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+        async move {
             let task_start = Instant::now();
 
             let mut child = match TokioCommand::new(worker_path.as_ref())
@@ -2012,14 +2006,13 @@ async fn run_parallel_scrape(
                     })
                 }
             }
-        });
-
-        handles.push(handle);
-    }
+        }
+    })
+    .await;
 
     let mut results = Vec::new();
-    for handle in handles {
-        match handle.await {
+    for result in completed {
+        match result {
             Ok(result) => results.push(result),
             Err(e) => results.push(serde_json::json!({"error": e.to_string()})),
         }
