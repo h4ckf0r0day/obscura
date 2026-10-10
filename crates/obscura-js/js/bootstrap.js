@@ -5736,6 +5736,11 @@ class Document extends Node {
     super(nid);
     _documentInstances.add(this);
   }
+  cloneNode(deep) {
+    const doctype = this.doctype ? new XMLSerializer().serializeToString(this.doctype) : "";
+    const documentElement = deep ? this.documentElement?.outerHTML || "" : "";
+    return new DOMParser().parseFromString(doctype + documentElement, this.contentType || "text/html");
+  }
   get timeline() {
     if (!this._timeline) {
       this._timeline = new DocumentTimeline();
@@ -11527,6 +11532,7 @@ globalThis.DOMParser = class DOMParser {
       _root: root,
       nodeName: "#document",
       nodeType: 9,
+      get [Symbol.toStringTag]() { return isXml ? "XMLDocument" : "HTMLDocument"; },
       queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
       get documentElement() {
@@ -17459,6 +17465,8 @@ if (!globalThis.Attr) {
     get nodeValue() { return this.value; }
     set nodeValue(v) { this.value = v; }
     get nodeType() { return 2; }
+    get [Symbol.toStringTag]() { return "Attr"; }
+    cloneNode() { return new Attr(this.name, this.value, this.namespaceURI, this.prefix); }
   };
 }
 
