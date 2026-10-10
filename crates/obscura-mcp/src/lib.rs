@@ -258,8 +258,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
     state.operator_network_hints = true;
-    // Cookies and Web Storage are written on every navigation; this covers the
-    // writes an agent makes after a page has settled, on the way out.
+    // Save cookies changed after navigation when the transport closes.
     let mut runtime_pump_armed = false;
 
     loop {
@@ -287,7 +286,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             continue;
         };
         if n == 0 {
-            state.context.save_storage();
+            state.context.save_cookies();
             return Ok(());
         }
 
