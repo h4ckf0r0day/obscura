@@ -1569,7 +1569,7 @@ impl PreparedRender {
             width: 0.001,
             height: 0.001,
         };
-        let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
+        let mut best: Option<(Vec<i32>, bool, usize, obscura_dom::tree::NodeId)> = None;
         for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
             .into_iter()
             .enumerate()
@@ -1598,10 +1598,9 @@ impl PreparedRender {
             }
             let path = stacking_path(tree, &self.layout, id);
             let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
-            let depth = tree.ancestors(id).len();
             let replace = best
                 .as_ref()
-                .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
+                .is_none_or(|(best_path, best_positioned, best_order, best_id)| {
                     let stacking = compare_stacking_paths(&path, best_path);
                     if stacking != std::cmp::Ordering::Equal {
                         return stacking.is_gt();
@@ -1614,15 +1613,14 @@ impl PreparedRender {
                     }
                     positioned
                         .cmp(best_positioned)
-                        .then_with(|| depth.cmp(best_depth))
                         .then_with(|| order.cmp(best_order))
                         .is_gt()
                 });
             if replace {
-                best = Some((path, positioned, depth, order, id));
+                best = Some((path, positioned, order, id));
             }
         }
-        best.map(|(_, _, _, _, id)| id)
+        best.map(|(_, _, _, id)| id)
     }
 
     /// Shaped-text caret in the viewport. Hit testing selects the painted
@@ -12071,6 +12069,32 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn hit_testing_uses_sibling_paint_order_not_subtree_depth() {
+        for (positioned, nested_front) in [(true, false), (false, false), (true, true)] {
+            let placement = if positioned { "position:absolute;top:0;left:0" } else { "position:static" };
+            let overlap = if positioned { "" } else { "margin-top:-40px" };
+            let front_child = if nested_front { "<div id=front-leaf></div>" } else { "" };
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                html,body {{margin:0}}
+                #root {{position:relative;width:100px;height:40px}}
+                #back,#deep,#front,#front-leaf {{width:100px;height:40px}}
+                #back,#deep,#front {{{placement}}}
+                #front {{{overlap}}}
+                </style><div id=root><div id=back><div><div id=deep></div></div></div>
+                <div id=front>{front_child}</div></div>"#));
+            let mut cache = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let front = tree.get_element_by_id("front").unwrap();
+            let rect = prepared.viewport_rect_with_scroll(front, &scroll).unwrap();
+            assert_eq!((rect.x, rect.y, rect.width, rect.height), (0.0, 0.0, 100.0, 40.0));
+            let expected = tree.get_element_by_id(if nested_front { "front-leaf" } else { "front" }).unwrap();
+            assert_eq!(prepared.hit_test(&tree, &scroll, 20.0, 20.0), Some(expected),
+                "positioned={positioned}, nested_front={nested_front}");
+        }
+    }
 
     #[test]
     fn hit_testing_excludes_bottom_and_right_box_edges() {
