@@ -270,6 +270,23 @@ impl Buffer {
         buffer
     }
 
+    /// Release spare capacity held by the shaped and laid out lines. Call
+    /// after the buffer's content has settled; later edits regrow as needed.
+    pub fn shrink_to_fit(&mut self) {
+        self.lines.shrink_to_fit();
+        for line in &mut self.lines {
+            line.shrink_to_fit();
+        }
+    }
+
+    /// Drop each laid out line's shaped glyph cache to save memory once the
+    /// layout is final. A later relayout reshapes the line.
+    pub fn release_shapes(&mut self) {
+        for line in &mut self.lines {
+            line.release_shape();
+        }
+    }
+
     /// Mutably borrows the buffer together with an [`FontSystem`] for more convenient methods
     pub fn borrow_with<'a>(
         &'a mut self,
