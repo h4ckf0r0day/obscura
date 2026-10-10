@@ -85,6 +85,11 @@ page.on('request', req => {
 
 See [Intercept and modify requests](Intercept-and-modify-requests.md).
 
+Scripted fetch/XHR requests in stealth mode report Network events and retained
+response bodies using the same request IDs as the normal transport. The existing
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`
+settings still control retention; disabling retention does not disable events.
+
 ## Expose a Node callback
 
 ```js
@@ -111,14 +116,67 @@ await Promise.all([
 
 Pages share one V8 isolate. Concurrent JS execution serializes through a lock. CPU-bound JS on one page blocks the others.
 
+## Screenshots, scrolling, and PDF
+
+```js
+await page.setViewport({ width: 1440, height: 1000, deviceScaleFactor: 1 });
+await page.screenshot({ path: 'viewport.png' });
+
+await page.evaluate(() => window.scrollTo(0, 1200));
+await page.screenshot({ path: 'scrolled.png' });
+
+await page.screenshot({ path: 'full-page.png', fullPage: true });
+await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
+```
+
+A normal screenshot captures the live viewport and scroll position;
+`fullPage: true` captures document space. PDF output is raster-backed.
+
+## Screencasting
+
+Attach a raw CDP session to the page, acknowledge every frame, and detach it
+when finished:
+
+```js
+const client = await page.createCDPSession();
+
+client.on('Page.screencastFrame', async ({ data, sessionId }) => {
+  const jpeg = Buffer.from(data, 'base64');
+  // Consume or forward `jpeg` here.
+  await client.send('Page.screencastFrameAck', { sessionId });
+});
+
+await client.send('Page.startScreencast', {
+  format: 'jpeg',
+  quality: 80,
+  maxWidth: 1280,
+  maxHeight: 720,
+});
+
+// ...navigate, scroll, and interact...
+
+await client.send('Page.stopScreencast');
+await client.detach();
+```
+
+Frames are activity-driven page captures, not fixed-rate desktop video.
+
 ## Disconnect
 
 ```js
 await browser.disconnect();  // leaves obscura serve running
 ```
 
-## Not supported
+## Current limits
 
-- `page.screenshot()` and `page.pdf()`: no pixel rendering.
-- `page.emulate()` device emulation: viewport metadata only, no real layout.
-- Service workers: not implemented.
+- Some device emulation, service-worker, native media, long-tail CSS, and
+  compositor behavior remains incomplete relative to Chromium.
+- Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
+- PDF text is not selectable/searchable and tagged PDF is not yet available.
+
+Network events are shared by sessions attached to the same target. An additional
+CDP session can observe navigation and later fetch/XHR traffic without issuing a
+second navigation. Request IDs and loader IDs match the driving session, so
+`Network.getResponseBody` uses the same ID. Fetch interception control and the
+navigation lifecycle keep their existing owner; sessions on other targets do
+not receive this traffic.

@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>list indentation belongs to the list container</title>
+  <style>
+    html, body { margin: 0; }
+    .host {
+      width: 400px;
+      height: 40px;
+      background: #fff3bf;
+    }
+    ul, ol { margin: 0; }
+    li { height: 20px; }
+    #default li { background: #087f5b; }
+    #reset {
+      padding: 0;
+      list-style: none;
+    }
+    #reset li { background: #1971c2; }
+    #ordered-reset {
+      padding: 0;
+      list-style: none;
+    }
+    #ordered-reset li { background: #862e9c; }
+    #font-relative {
+      display: flex;
+      width: 400px;
+      height: 40px;
+      font-size: 16px;
+      font-family: Arial, sans-serif;
+      background: #e7f5ff;
+    }
+    #font-relative div {
+      box-sizing: content-box;
+      width: 20px;
+      height: 10px;
+      padding: 0.7ex 1.4ex;
+    }
+    #ex-box { background: #e8590c; }
+  </style>
+</head>
+<body>
+  <div class="host"><ul id="default"><li></li></ul></div>
+  <div class="host"><ul id="reset"><li></li></ul></div>
+  <div class="host"><ol id="ordered-reset"><li></li></ol></div>
+  <div class="host"><div id="font-relative"><div id="ex-box"></div></div></div>
+</body>
+</html>

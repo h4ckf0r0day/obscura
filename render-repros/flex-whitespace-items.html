@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>flex whitespace items</title>
+  <style>
+    html, body { margin: 0; }
+    .document { display: flex; }
+    /* A float left over from a legacy layout must be ignored on a flex item. */
+    .main { float: left; width: 100%; background: #e8590c; }
+    .body { background: #2b8a3e; }
+    .sidebar { display: flex; }
+
+    #direct { width: 900px; height: 220px; }
+    #direct .main, #direct .body { height: 200px; }
+    #direct .body { margin-left: 225px; }
+    #direct .sidebar {
+      width: 225px;
+      height: 180px;
+      margin-left: -100%;
+      background: #1971c2;
+    }
+
+    #transparent { width: 600px; height: 180px; margin-top: 40px; }
+    #transparent .contents { display: contents; }
+    #transparent .main, #transparent .body { height: 160px; }
+    #transparent .body { margin-left: 150px; background: #c2255c; }
+    #transparent .sidebar {
+      width: 150px;
+      height: 140px;
+      margin-left: -100%;
+      background: #7048e8;
+    }
+  </style>
+</head>
+<body>
+  <div id="direct" class="document">
+    <div class="main"><div class="body"></div></div>
+    <div class="sidebar"></div>
+  </div>
+  <div id="transparent" class="document">
+    <div class="contents">
+      <div class="main"><div class="body"></div></div>
+      <div class="sidebar"></div>
+    </div>
+  </div>
+</body>
+</html>

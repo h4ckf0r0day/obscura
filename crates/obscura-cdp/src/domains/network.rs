@@ -50,11 +50,11 @@ pub async fn handle(
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map.clone()).await;
                     #[cfg(feature = "stealth")]
-                    if let Some(stealth_client) = &page.stealth_client {
-                        stealth_client.set_extra_headers(header_map).await;
+                    if let Some(client) = &page.stealth_client {
+                        client.set_extra_headers(header_map.clone()).await;
                     }
+                    page.http_client.set_extra_headers(header_map).await;
                 }
             }
             Ok(json!({}))
@@ -74,13 +74,18 @@ pub async fn handle(
         "setCookie" => {
             let cookie = parse_cdp_cookie(params)
                 .ok_or("setCookie: missing required name/domain (or url)")?;
-            cookie_jar_for(ctx, session_id).set_cookies_from_cdp(vec![cookie]);
+            cookie_jar_for(ctx, session_id)
+                .set_cookies_from_cdp_with_scope([(cookie.cookie, cookie.host_only)]);
             Ok(json!({ "success": true }))
         }
         "setCookies" => {
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
                 let parsed: Vec<_> = cookies.iter().filter_map(parse_cdp_cookie).collect();
-                cookie_jar_for(ctx, session_id).set_cookies_from_cdp(parsed);
+                cookie_jar_for(ctx, session_id).set_cookies_from_cdp_with_scope(
+                    parsed
+                        .into_iter()
+                        .map(|cookie| (cookie.cookie, cookie.host_only)),
+                );
             }
             Ok(json!({}))
         }
@@ -149,6 +154,68 @@ pub async fn handle(
 mod tests {
     use super::*;
     use obscura_net::CookieInfo;
+
+    async fn check_extra_headers_on_navigation_fetch_and_xhr(stealth: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0u8; 1024];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "request ended before its headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() < 8192);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            }
+            requests
+        });
+        let mut ctx = CdpContext::new();
+        ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+            "headers".into(), None, stealth, None, None, true,
+        ));
+        let page_id = ctx.create_page();
+        let session = Some("headers-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        handle("setExtraHTTPHeaders", &json!({"headers": {"X-Obscura-Test": "retained"}}), &mut ctx, &session).await.unwrap();
+        ctx.get_session_page_mut(&session).unwrap().navigate(&url).await.unwrap();
+        for expression in [
+            "fetch('/fetch', {headers: {'x-obscura-test': 'local'}}).then(response => response.text())",
+            "new Promise((resolve, reject) => { const xhr = new XMLHttpRequest(); xhr.open('GET', '/xhr'); xhr.setRequestHeader('x-obscura-test', 'local'); xhr.onload = () => resolve(xhr.responseText); xhr.onerror = reject; xhr.send(); })",
+        ] {
+            let result = ctx.get_session_page_mut(&session).unwrap()
+                .evaluate_for_cdp_with_timeout(expression, true, true, 5_000).await.unwrap();
+            assert_eq!(result.value, Some(json!("ok")));
+        }
+        handle("setExtraHTTPHeaders", &json!({"headers": {}}), &mut ctx, &session).await.unwrap();
+        let result = ctx.get_session_page_mut(&session).unwrap()
+            .evaluate_for_cdp_with_timeout("fetch('/cleared').then(response => response.text())", true, true, 5_000).await.unwrap();
+        assert_eq!(result.value, Some(json!("ok")));
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+        let header = |request: &String| request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)|
+                name.eq_ignore_ascii_case("X-Obscura-Test") && value.trim() == "retained")
+        });
+        assert!(requests[..3].iter().all(header), "navigation, fetch and XHR must carry the header: {requests:?}");
+        assert!(!header(&requests[3]), "clearing headers must affect subsequent requests");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extra_headers_reach_navigation_fetch_and_xhr() {
+        check_extra_headers_on_navigation_fetch_and_xhr(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_extra_headers_reach_navigation_fetch_and_xhr() {
+        check_extra_headers_on_navigation_fetch_and_xhr(true).await;
+    }
 
     fn sample_cookie(name: &str) -> CookieInfo {
         CookieInfo {

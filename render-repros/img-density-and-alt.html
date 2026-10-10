@@ -1,0 +1,18 @@
+<!DOCTYPE html><html><head><title>img density + alt</title><style>body{margin:0;font-family:sans-serif}
+.box{border:2px solid red;margin:6px;display:inline-block}</style></head><body>
+<p>Density: A raw 648px, B srcset 2x -> ~324 CSS px, C 648w + sizes:300px -> ~300px</p>
+<div><span>A:</span><div class="box"><img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDgiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgNjQ4IDEyMCI+CiAgPHJlY3Qgd2lkdGg9IjY0OCIgaGVpZ2h0PSIxMjAiIGZpbGw9IiMyODZmOWUiLz4KICA8cmVjdCB4PSIyNCIgeT0iMjQiIHdpZHRoPSI2MDAiIGhlaWdodD0iNzIiIGZpbGw9IiM4ZWNhZTYiLz4KPC9zdmc+Cg=="></div></div>
+<div><span>B:</span><div class="box"><img srcset="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDgiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgNjQ4IDEyMCI+CiAgPHJlY3Qgd2lkdGg9IjY0OCIgaGVpZ2h0PSIxMjAiIGZpbGw9IiMyODZmOWUiLz4KICA8cmVjdCB4PSIyNCIgeT0iMjQiIHdpZHRoPSI2MDAiIGhlaWdodD0iNzIiIGZpbGw9IiM4ZWNhZTYiLz4KPC9zdmc+Cg== 2x"></div></div>
+<div><span>C:</span><div class="box"><img srcset="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDgiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgNjQ4IDEyMCI+CiAgPHJlY3Qgd2lkdGg9IjY0OCIgaGVpZ2h0PSIxMjAiIGZpbGw9IiMyODZmOWUiLz4KICA8cmVjdCB4PSIyNCIgeT0iMjQiIHdpZHRoPSI2MDAiIGhlaWdodD0iNzIiIGZpbGw9IiM4ZWNhZTYiLz4KPC9zdmc+Cg== 648w" sizes="300px"></div></div>
+<p>Broken-image fallback: D alt text only, E alt="" nothing, F no alt -> grey box</p>
+<div>D: <img src="missing-image.png" alt="a description of the missing photo" style="width:200px;height:60px"></div>
+<div>E: <img src="missing-image.png" alt="" style="width:200px;height:60px"></div>
+<div>F: <img src="missing-image.png" style="width:200px;height:60px"></div>
+<p>G: cover img half-outside an overflow:hidden viewport must not bleed past the red border:</p>
+<div style="width:300px;height:100px;overflow:hidden;border:2px solid red;margin-left:120px">
+  <div style="display:flex;transform:translate(-150px,0)">
+    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDgiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgNjQ4IDEyMCI+CiAgPHJlY3Qgd2lkdGg9IjY0OCIgaGVpZ2h0PSIxMjAiIGZpbGw9IiMyODZmOWUiLz4KICA8cmVjdCB4PSIyNCIgeT0iMjQiIHdpZHRoPSI2MDAiIGhlaWdodD0iNzIiIGZpbGw9IiM4ZWNhZTYiLz4KPC9zdmc+Cg==" style="width:300px;height:100px;object-fit:cover;flex-shrink:0">
+    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDgiIGhlaWdodD0iMTIwIiB2aWV3Qm94PSIwIDAgNjQ4IDEyMCI+CiAgPHJlY3Qgd2lkdGg9IjY0OCIgaGVpZ2h0PSIxMjAiIGZpbGw9IiMyODZmOWUiLz4KICA8cmVjdCB4PSIyNCIgeT0iMjQiIHdpZHRoPSI2MDAiIGhlaWdodD0iNzIiIGZpbGw9IiM4ZWNhZTYiLz4KPC9zdmc+Cg==" style="width:300px;height:100px;object-fit:cover;flex-shrink:0">
+  </div>
+</div>
+</body></html>

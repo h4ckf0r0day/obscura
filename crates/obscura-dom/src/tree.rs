@@ -1,7 +1,8 @@
 use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -25,6 +26,45 @@ impl fmt::Display for NodeId {
         write!(f, "NodeId({})", self.0)
     }
 }
+
+/// The encapsulation mode recorded by a native shadow root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShadowRootMode {
+    Open,
+    Closed,
+}
+
+/// Stable metadata for a shadow-root node in this tree.
+///
+/// A shadow root owns an ordinary child list, but is not an ordinary child of
+/// its host. The separate host edge keeps `parentNode`-style walks scoped to
+/// one tree while still allowing composed-tree operations to cross explicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShadowRoot {
+    pub id: NodeId,
+    pub host: NodeId,
+    pub mode: ShadowRootMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachShadowError {
+    HostIsNotElement,
+    HostAlreadyHasShadowRoot,
+    InvalidShadowRoot,
+}
+
+impl fmt::Display for AttachShadowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::HostIsNotElement => "shadow host is not an element",
+            Self::HostAlreadyHasShadowRoot => "shadow host already has a shadow root",
+            Self::InvalidShadowRoot => "shadow root is not a detached fragment node",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for AttachShadowError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
@@ -82,6 +122,9 @@ pub enum NodeData {
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: NodeId,
+    /// Shadow-including document connectivity, maintained incrementally on
+    /// insertion/removal so hot DOM mutation paths do not walk every ancestor.
+    pub connected: bool,
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
@@ -136,7 +179,11 @@ impl Node {
 
     pub fn set_attribute(&mut self, name: &str, value: String) {
         if let NodeData::Element { attrs, .. } = &mut self.data {
-            if let Some(attr) = attrs.iter_mut().find(|a| a.name.local.as_ref() == name) {
+            // Match by qualified name, consistent with get_attribute and the
+            // remove_attribute op. A parsed namespaced attribute is stored with
+            // a separate prefix (e.g. xlink:href -> prefix="xlink", local="href");
+            // matching on local name alone would miss it and push a duplicate.
+            if let Some(attr) = attrs.iter_mut().find(|a| a.qualified_name_eq(name)) {
                 attr.value = value;
             } else {
                 attrs.push(Attribute {
@@ -202,11 +249,44 @@ pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
 
+/// Host-fetched author CSS kept outside the page-visible DOM.
+///
+/// A linked stylesheet may participate in rendering even when the response is
+/// not origin-clean. Keeping those bytes here prevents a synthetic `<style>`
+/// node from exposing them through ordinary DOM APIs.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalStylesheet {
+    pub sources: Vec<Arc<str>>,
+    pub origin_clean: bool,
+    /// CSSOM edits are rule-owned, never mutations of the owner's DOM text.
+    pub cssom_rules: Option<Vec<Arc<str>>>,
+}
+
+/// Live control state is separate from content attributes and serialization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormControlState {
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub indeterminate: bool,
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    form_controls: HashMap<NodeId, FormControlState>,
+    external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
+    external_stylesheet_generation: u64,
+    hovered: Option<NodeId>,
+    /// Shadow roots are arena nodes with their own child list. They are kept
+    /// outside the ordinary parent links so light-tree traversal never crosses
+    /// into a shadow tree by accident.
+    shadow_roots: HashMap<NodeId, ShadowRoot>,
+    shadow_roots_by_host: HashMap<NodeId, NodeId>,
+    /// Full-document HTML parsing enables declarative shadow roots. Fragment
+    /// parsing (including innerHTML) deliberately leaves this false.
+    pub(crate) allow_declarative_shadow_roots: bool,
     // Whether the document was parsed in (full) quirks mode. In quirks mode CSS
     // class and id selectors match ASCII-case-insensitively.
     pub(crate) quirks: bool,
@@ -216,6 +296,7 @@ impl DomTree {
     pub fn new() -> Self {
         let doc_node = Node {
             id: NodeId(0),
+            connected: true,
             parent: None,
             first_child: None,
             last_child: None,
@@ -229,6 +310,13 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                form_controls: HashMap::new(),
+                external_stylesheets: HashMap::new(),
+                external_stylesheet_generation: 0,
+                hovered: None,
+                shadow_roots: HashMap::new(),
+                shadow_roots_by_host: HashMap::new(),
+                allow_declarative_shadow_roots: false,
                 quirks: false,
             }),
         }
@@ -236,6 +324,200 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn replace_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        inner.external_stylesheets.insert(
+            owner,
+            ExternalStylesheet {
+                sources: vec![Arc::from(source)],
+                origin_clean,
+                cssom_rules: None,
+            },
+        );
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn append_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        let sheet = inner
+            .external_stylesheets
+            .entry(owner)
+            .or_insert_with(|| ExternalStylesheet {
+                sources: Vec::new(),
+                origin_clean: true,
+                cssom_rules: None,
+            });
+        sheet.sources.push(Arc::from(source));
+        sheet.origin_clean &= origin_clean;
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn remove_external_stylesheet(&self, owner: NodeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let removed = inner.external_stylesheets.remove(&owner).is_some();
+        if removed {
+            inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        }
+        removed
+    }
+
+    pub fn external_stylesheet_generation(&self) -> u64 {
+        self.inner.borrow().external_stylesheet_generation
+    }
+
+    pub fn has_cssom_stylesheet(&self, owner: NodeId) -> bool {
+        self.inner.borrow().external_stylesheets.get(&owner)
+            .is_some_and(|sheet| sheet.cssom_rules.is_some())
+    }
+
+    pub fn update_cssom_stylesheet(
+        &self, owner: NodeId, index: usize, delete_count: usize,
+        rules: Vec<String>, reset: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(element) = inner.nodes.get(owner.index()).and_then(Option::as_ref)
+            .and_then(Node::as_element) else { return false };
+        if element.local.as_ref() != "style" { return false; }
+        let sheet = inner.external_stylesheets.entry(owner).or_insert_with(|| ExternalStylesheet {
+            origin_clean: true, ..ExternalStylesheet::default()
+        });
+        // Only inline owners reach this path. A cross-origin @import is kept
+        // in sources, but does not make the owner's own CSS rules opaque.
+        if reset {
+            sheet.cssom_rules = Some(rules.into_iter().map(Arc::from).collect());
+        } else {
+            let Some(existing) = sheet.cssom_rules.as_mut() else { return false };
+            if index > existing.len() || delete_count > existing.len() - index { return false; }
+            existing.splice(index..index + delete_count, rules.into_iter().map(Arc::from));
+        }
+        true
+    }
+
+    pub fn clear_cssom_stylesheet(&self, owner: NodeId) -> bool {
+        Self::clear_cssom_stylesheet_inner(&mut self.inner.borrow_mut(), owner)
+    }
+
+    fn clear_cssom_stylesheet_inner(inner: &mut DomTreeInner, owner: NodeId) -> bool {
+        let removed = inner.external_stylesheets.get_mut(&owner)
+            .is_some_and(|sheet| sheet.cssom_rules.take().is_some());
+        if removed {
+            inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+            if inner.external_stylesheets.get(&owner).is_some_and(|sheet| sheet.sources.is_empty()) {
+                inner.external_stylesheets.remove(&owner);
+            }
+        }
+        removed
+    }
+
+    fn invalidate_cssom_source(inner: &mut DomTreeInner, node: NodeId) {
+        if inner.external_stylesheets.is_empty() { return; }
+        let mut current = Some(node);
+        for _ in 0..inner.nodes.len() {
+            let Some(id) = current else { break };
+            Self::clear_cssom_stylesheet_inner(inner, id);
+            current = inner.nodes.get(id.index()).and_then(Option::as_ref).and_then(|node| node.parent);
+        }
+    }
+
+    pub fn external_stylesheet(&self, owner: NodeId) -> Option<ExternalStylesheet> {
+        self.inner
+            .borrow()
+            .external_stylesheets
+            .get(&owner)
+            .cloned()
+    }
+
+    pub fn external_stylesheets(&self) -> HashMap<NodeId, ExternalStylesheet> {
+        self.inner.borrow().external_stylesheets.clone()
+    }
+
+    pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {
+        self.inner.borrow().form_controls.get(&node).cloned()
+    }
+
+    pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.value.as_deref())
+            == Some(value)
+    }
+
+    pub fn form_control_checked(&self, node: NodeId) -> Option<bool> {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.checked)
+    }
+
+    pub fn form_control_indeterminate(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .is_some_and(|control| control.indeterminate)
+    }
+
+    pub fn set_hovered(&self, node: Option<NodeId>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.hovered == node {
+            return false;
+        }
+        inner.hovered = node;
+        true
+    }
+
+    pub fn is_hovered(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = inner.hovered;
+        while let Some(id) = current {
+            if id == node {
+                return true;
+            }
+            current = inner.nodes.get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
+    }
+
+    pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.nodes.get(node.index()).is_some_and(|entry| entry.as_ref().is_some_and(Node::is_element)) {
+            update(inner.form_controls.entry(node).or_default());
+        }
     }
 
     /// Record whether the document was parsed in (full) quirks mode.
@@ -249,8 +531,264 @@ impl DomTree {
         self.inner.borrow().quirks
     }
 
+    pub(crate) fn set_allow_declarative_shadow_roots(&self, allow: bool) {
+        self.inner.borrow_mut().allow_declarative_shadow_roots = allow;
+    }
+
+    pub(crate) fn allows_declarative_shadow_roots(&self) -> bool {
+        self.inner.borrow().allow_declarative_shadow_roots
+    }
+
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
         self.inner.borrow()
+    }
+
+
+    /// Create and attach a native shadow-root node to `host`.
+    pub fn attach_shadow_root(
+        &self,
+        host: NodeId,
+        mode: ShadowRootMode,
+    ) -> Result<NodeId, AttachShadowError> {
+        {
+            let inner = self.inner.borrow();
+            let host_is_element = inner
+                .nodes
+                .get(host.index())
+                .and_then(|node| node.as_ref())
+                .is_some_and(Node::is_element);
+            if !host_is_element {
+                return Err(AttachShadowError::HostIsNotElement);
+            }
+            if inner.shadow_roots_by_host.contains_key(&host) {
+                return Err(AttachShadowError::HostAlreadyHasShadowRoot);
+            }
+        }
+
+        let root = self.new_node(NodeData::Document);
+        // A freshly allocated document-fragment backing node satisfies every
+        // invariant below. If this ever fails, remove it so the arena does not
+        // retain an unreachable allocation.
+        if let Err(error) = self.attach_shadow_root_node(host, root, mode) {
+            self.remove(root);
+            return Err(error);
+        }
+        Ok(root)
+    }
+
+    /// Attach an existing detached fragment node as a shadow root. html5ever's
+    /// declarative-shadow hook supplies the template-contents fragment through
+    /// this path, but the hook remains disabled until style/layout integration
+    /// is ready.
+    pub(crate) fn attach_shadow_root_node(
+        &self,
+        host: NodeId,
+        root: NodeId,
+        mode: ShadowRootMode,
+    ) -> Result<(), AttachShadowError> {
+        let mut inner = self.inner.borrow_mut();
+        let host_is_element = inner
+            .nodes
+            .get(host.index())
+            .and_then(|node| node.as_ref())
+            .is_some_and(Node::is_element);
+        if !host_is_element {
+            return Err(AttachShadowError::HostIsNotElement);
+        }
+        if inner.shadow_roots_by_host.contains_key(&host) {
+            return Err(AttachShadowError::HostAlreadyHasShadowRoot);
+        }
+
+        let valid_root = root != inner.document
+            && !inner.shadow_roots.contains_key(&root)
+            && inner
+                .nodes
+                .get(root.index())
+                .and_then(|node| node.as_ref())
+                .is_some_and(|node| {
+                    matches!(node.data, NodeData::Document)
+                        && node.parent.is_none()
+                        && node.prev_sibling.is_none()
+                        && node.next_sibling.is_none()
+                });
+        if !valid_root {
+            return Err(AttachShadowError::InvalidShadowRoot);
+        }
+
+        let info = ShadowRoot {
+            id: root,
+            host,
+            mode,
+        };
+        inner.shadow_roots.insert(root, info);
+        inner.shadow_roots_by_host.insert(host, root);
+        let connected = inner
+            .nodes
+            .get(host.index())
+            .and_then(|node| node.as_ref())
+            .is_some_and(|node| node.connected);
+        Self::set_subtree_connected(&mut inner, root, connected);
+        Ok(())
+    }
+
+    /// Return the native root hosted by `host`, including closed roots. Web API
+    /// visibility is intentionally left to the caller.
+    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        self.inner.borrow().shadow_roots_by_host.get(&host).copied()
+    }
+
+    pub fn shadow_root_info(&self, root: NodeId) -> Option<ShadowRoot> {
+        self.inner.borrow().shadow_roots.get(&root).copied()
+    }
+
+    pub fn is_shadow_root(&self, node: NodeId) -> bool {
+        self.inner.borrow().shadow_roots.contains_key(&node)
+    }
+
+    /// Return the root of `node`'s local tree scope. This follows ordinary
+    /// parent links only, so a shadow descendant resolves to its ShadowRoot and
+    /// a light descendant resolves to its document or detached subtree root.
+    pub fn tree_scope_root(&self, node: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            let current_node = inner.nodes.get(current.index())?.as_ref()?;
+            match current_node.parent {
+                Some(parent) => current = parent,
+                None => return Some(current),
+            }
+        }
+        None
+    }
+
+    pub fn containing_shadow_root(&self, node: NodeId) -> Option<NodeId> {
+        let root = self.tree_scope_root(node)?;
+        self.is_shadow_root(root).then_some(root)
+    }
+
+    /// Return the topmost root after crossing ShadowRoot-to-host edges. This is
+    /// the native counterpart of `getRootNode({ composed: true })`.
+    pub fn shadow_including_root(&self, node: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            let current_node = inner.nodes.get(current.index())?.as_ref()?;
+            if let Some(parent) = current_node.parent {
+                current = parent;
+            } else if let Some(root) = inner.shadow_roots.get(&current) {
+                current = root.host;
+            } else {
+                return Some(current);
+            }
+        }
+        None
+    }
+
+    /// Constant-time shadow-including connectivity. The bit is propagated over
+    /// ordinary children and hosted shadow roots whenever a subtree moves.
+    pub fn is_connected(&self, node: NodeId) -> bool {
+        self.inner
+            .borrow()
+            .nodes
+            .get(node.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|node| node.connected)
+    }
+
+    fn set_subtree_connected(inner: &mut DomTreeInner, root: NodeId, connected: bool) {
+        // Fresh parser/framework insertions are overwhelmingly leaves. Avoid
+        // allocating traversal state for the one-node case.
+        let is_leaf = inner
+            .nodes
+            .get(root.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|node| node.first_child.is_none())
+            && !inner.shadow_roots_by_host.contains_key(&root);
+        if is_leaf {
+            if !connected { Self::clear_cssom_stylesheet_inner(inner, root); }
+            if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
+                node.connected = connected;
+            }
+            return;
+        }
+
+        let mut stack = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(node_id) = stack.pop() {
+            if !seen.insert(node_id) {
+                continue;
+            }
+            if !connected { Self::clear_cssom_stylesheet_inner(inner, node_id); }
+            let (mut child, shadow_root) = match inner
+                .nodes
+                .get_mut(node_id.index())
+                .and_then(|entry| entry.as_mut())
+            {
+                Some(node) => {
+                    node.connected = connected;
+                    (node.first_child, inner.shadow_roots_by_host.get(&node_id).copied())
+                }
+                None => continue,
+            };
+            if let Some(root) = shadow_root {
+                stack.push(root);
+            }
+            // Valid trees terminate naturally. The bound is defense in depth
+            // against a corrupt sibling cycle, which must not spin here.
+            for _ in 0..=inner.nodes.len() {
+                let Some(child_id) = child else { break };
+                stack.push(child_id);
+                child = inner
+                    .nodes
+                    .get(child_id.index())
+                    .and_then(|entry| entry.as_ref())
+                    .and_then(|node| node.next_sibling);
+            }
+        }
+    }
+
+    fn host_including_parent(inner: &DomTreeInner, node: NodeId) -> Option<NodeId> {
+        inner
+            .nodes
+            .get(node.index())
+            .and_then(|entry| entry.as_ref())
+            .and_then(|entry| entry.parent)
+            .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
+    }
+
+    /// DOM insertion rejects a node when it is a host-including inclusive
+    /// ancestor of the destination parent. Ordinary parent links are not enough
+    /// for this check because a ShadowRoot's parent is intentionally null.
+    fn would_create_host_including_cycle(
+        inner: &DomTreeInner,
+        parent: NodeId,
+        child: NodeId,
+    ) -> bool {
+        let child_can_be_ancestor = inner
+            .nodes
+            .get(child.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|entry| entry.first_child.is_some())
+            || inner.shadow_roots_by_host.contains_key(&child);
+        if !child_can_be_ancestor {
+            return false;
+        }
+
+        let mut current = Some(parent);
+        for _ in 0..=inner.nodes.len() {
+            let node = match current {
+                Some(node) => node,
+                None => return false,
+            };
+            if node == child {
+                return true;
+            }
+            current = Self::host_including_parent(inner, node);
+        }
+
+        // A valid host-including chain cannot be longer than the arena. Refuse
+        // mutation if pre-existing corruption ever violates that invariant.
+        true
     }
 
     pub fn new_node(&self, data: NodeData) -> NodeId {
@@ -274,6 +812,7 @@ impl DomTree {
 
         inner.nodes[id.index()] = Some(Node {
             id,
+            connected: false,
             parent: None,
             first_child: None,
             last_child: None,
@@ -286,6 +825,14 @@ impl DomTree {
 
     pub fn get_node(&self, id: NodeId) -> Option<Node> {
         self.inner.borrow().nodes.get(id.index())?.clone()
+    }
+
+    /// Read a node without copying its text or attributes. Drop the guard
+    /// before mutating this tree; use `get_node` when an owned snapshot is needed.
+    pub fn borrow_node(&self, id: NodeId) -> Option<std::cell::Ref<'_, Node>> {
+        std::cell::Ref::filter_map(self.inner.borrow(), |inner| {
+            inner.nodes.get(id.index())?.as_ref()
+        }).ok()
     }
 
     pub fn with_node<F, R>(&self, id: NodeId, f: F) -> Option<R>
@@ -301,6 +848,10 @@ impl DomTree {
         F: FnOnce(&mut Node) -> R,
     {
         let mut inner = self.inner.borrow_mut();
+        if inner.nodes.get(id.index()).and_then(Option::as_ref)
+            .is_some_and(|node| matches!(node.data, NodeData::Text { .. })) {
+            Self::invalidate_cssom_source(&mut inner, id);
+        }
         inner.nodes.get_mut(id.index())?.as_mut().map(f)
     }
 
@@ -313,43 +864,55 @@ impl DomTree {
         if parent_id == child_id {
             return;
         }
-        // Appending an ancestor of the parent under that parent makes the
-        // parent/child graph cyclic, and every later descendants()/children()/
-        // textContent walk (none carry a visited set) would loop forever, pinning
-        // the thread in native Rust where neither tokio nor the V8 watchdog can
-        // interrupt it. Per the DOM spec this is a HierarchyRequestError; treat it
-        // as a no-op, like the self-append guard above. Only a node that already
-        // has children can be an ancestor, so a fresh/leaf child (the common
-        // append) skips the walk: O(1) hot path, O(depth) only when relocating a
-        // populated subtree.
-        {
+        // A ShadowRoot is never itself an ordinary child, and moving a host
+        // below its own root would create a cycle even though the root's parent
+        // pointer is null. Follow both ordinary parents and root-to-host edges.
+        let (parent_connected, child_connected) = {
             let inner = self.inner.borrow();
-            let child_has_children = inner.nodes.get(child_id.index())
-                .and_then(|n| n.as_ref())
-                .map(|n| n.first_child.is_some())
-                .unwrap_or(false);
-            if child_has_children {
-                let mut cur = inner.nodes.get(parent_id.index())
-                    .and_then(|n| n.as_ref())
-                    .and_then(|n| n.parent);
-                let mut steps = 0usize;
-                while let Some(p) = cur {
-                    if p == child_id {
-                        return;
-                    }
-                    steps += 1;
-                    if steps > inner.nodes.len() {
-                        return; // pre-existing corruption: refuse rather than risk a cycle
-                    }
-                    cur = inner.nodes.get(p.index())
-                        .and_then(|n| n.as_ref())
-                        .and_then(|n| n.parent);
-                }
+            let parent_exists = inner
+                .nodes
+                .get(parent_id.index())
+                .is_some_and(Option::is_some);
+            let child_exists = inner
+                .nodes
+                .get(child_id.index())
+                .is_some_and(Option::is_some);
+            // A leaf which is not a shadow host cannot be an inclusive
+            // ancestor of the destination parent. Detached framework tree
+            // construction appends thousands of freshly-created leaves; doing
+            // a complete parent walk for each one makes a deep chain O(n²).
+            // Non-leaves and shadow hosts retain the full host-including cycle
+            // check, where reparenting really can create a cycle.
+            let child_can_be_ancestor = inner
+                .nodes
+                .get(child_id.index())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|child| child.first_child.is_some())
+                || inner.shadow_roots_by_host.contains_key(&child_id);
+            if !parent_exists
+                || !child_exists
+                || inner.shadow_roots.contains_key(&child_id)
+                || (child_can_be_ancestor
+                    && Self::would_create_host_including_cycle(&inner, parent_id, child_id))
+            {
+                return;
             }
-        }
-        self.detach(child_id);
+            let parent_connected = inner
+                .nodes
+                .get(parent_id.index())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|parent| parent.connected);
+            let child_connected = inner
+                .nodes
+                .get(child_id.index())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|child| child.connected);
+            (parent_connected, child_connected)
+        };
+        self.detach_for_reparent(child_id, child_connected && !parent_connected);
 
         let mut inner = self.inner.borrow_mut();
+        Self::invalidate_cssom_source(&mut inner, parent_id);
 
         let old_last = inner.nodes.get(parent_id.index())
             .and_then(|n| n.as_ref())
@@ -373,6 +936,9 @@ impl DomTree {
             }
             parent.last_child = Some(child_id);
         }
+        if parent_connected && !child_connected {
+            Self::set_subtree_connected(&mut inner, child_id, true);
+        }
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
@@ -385,44 +951,43 @@ impl DomTree {
         if existing_id == new_sibling_id {
             return;
         }
-        let parent_id = {
+        let (parent_id, parent_connected) = {
             let inner = self.inner.borrow();
             match inner.nodes.get(existing_id.index()).and_then(|n| n.as_ref()).and_then(|n| n.parent) {
-                Some(p) => p,
+                Some(parent) => {
+                    let connected = inner
+                        .nodes
+                        .get(parent.index())
+                        .and_then(|entry| entry.as_ref())
+                        .is_some_and(|node| node.connected);
+                    (parent, connected)
+                }
                 None => return,
             }
         };
 
-        // Inserting the parent itself, or any ancestor of the parent, as a child
-        // of that parent would create a cycle (same non-terminating-walk hang as
-        // append_child). Reject it, matching the self-insert guard above. Gate on
-        // the inserted node actually having children, so the common case (insert a
-        // fresh node) stays O(1).
+        // Apply the same host-including cycle and root-node constraints as
+        // append_child. A leaf host still needs this check because its hosted
+        // root is not present in the ordinary child list.
         {
             let inner = self.inner.borrow();
-            let new_has_children = inner.nodes.get(new_sibling_id.index())
-                .and_then(|n| n.as_ref())
-                .map(|n| n.first_child.is_some())
-                .unwrap_or(false);
-            if new_has_children {
-                let mut cur = Some(parent_id);
-                let mut steps = 0usize;
-                while let Some(p) = cur {
-                    if p == new_sibling_id {
-                        return;
-                    }
-                    steps += 1;
-                    if steps > inner.nodes.len() {
-                        return;
-                    }
-                    cur = inner.nodes.get(p.index())
-                        .and_then(|n| n.as_ref())
-                        .and_then(|n| n.parent);
-                }
+            let new_exists = inner
+                .nodes
+                .get(new_sibling_id.index())
+                .is_some_and(Option::is_some);
+            if !new_exists
+                || inner.shadow_roots.contains_key(&new_sibling_id)
+                || Self::would_create_host_including_cycle(&inner, parent_id, new_sibling_id)
+            {
+                return;
             }
         }
 
-        self.detach(new_sibling_id);
+        let child_connected = self.is_connected(new_sibling_id);
+        self.detach_for_reparent(
+            new_sibling_id,
+            child_connected && !parent_connected,
+        );
 
         // Read existing's prev AFTER detaching new. If new was existing's
         // immediate previous sibling, detach moved that pointer; using the
@@ -442,6 +1007,7 @@ impl DomTree {
             node.prev_sibling = prev_id;
             node.next_sibling = Some(existing_id);
         }
+        Self::invalidate_cssom_source(&mut inner, parent_id);
 
         if let Some(Some(node)) = inner.nodes.get_mut(existing_id.index()) {
             node.prev_sibling = Some(new_sibling_id);
@@ -454,15 +1020,37 @@ impl DomTree {
         } else if let Some(Some(parent)) = inner.nodes.get_mut(parent_id.index()) {
             parent.first_child = Some(new_sibling_id);
         }
+        if parent_connected && !child_connected {
+            Self::set_subtree_connected(&mut inner, new_sibling_id, true);
+        }
     }
 
     pub fn detach(&self, node_id: NodeId) {
+        self.detach_for_reparent(node_id, true);
+    }
+
+    fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         let mut inner = self.inner.borrow_mut();
+
+        // The document and registered ShadowRoots have no ordinary parent and
+        // cannot be detached through light-tree mutation APIs.
+        if node_id == inner.document || inner.shadow_roots.contains_key(&node_id) {
+            return;
+        }
 
         let (parent_id, prev_id, next_id) = match inner.nodes.get(node_id.index()).and_then(|n| n.as_ref()) {
             Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
             None => return,
         };
+        Self::invalidate_cssom_source(&mut inner, node_id);
+        if disconnect && inner
+            .nodes
+            .get(node_id.index())
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|node| node.connected)
+        {
+            Self::set_subtree_connected(&mut inner, node_id, false);
+        }
 
         if let Some(prev) = prev_id {
             if let Some(Some(node)) = inner.nodes.get_mut(prev.index()) {
@@ -526,21 +1114,19 @@ impl DomTree {
     }
 
     pub fn remove(&self, node_id: NodeId) {
+        let nodes_to_remove = self.inclusive_owned_subtrees(node_id);
+        if nodes_to_remove.is_empty() {
+            return;
+        }
         self.detach(node_id);
-        let descendants = self.descendants(node_id);
         let mut inner = self.inner.borrow_mut();
 
         let mut ids_to_remove = Vec::new();
-        for &desc_id in &descendants {
-            if let Some(Some(node)) = inner.nodes.get(desc_id.index()) {
+        for &id in &nodes_to_remove {
+            if let Some(Some(node)) = inner.nodes.get(id.index()) {
                 if let Some(id_val) = node.get_attribute("id") {
                     ids_to_remove.push(id_val.to_string());
                 }
-            }
-        }
-        if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
-            if let Some(id_val) = node.get_attribute("id") {
-                ids_to_remove.push(id_val.to_string());
             }
         }
 
@@ -548,20 +1134,81 @@ impl DomTree {
             inner.id_index.remove(&id_str);
         }
 
+        // Remove both directions before freeing any arena slot. Otherwise a
+        // reused NodeId could inherit an old host/root relationship.
+        for &id in &nodes_to_remove {
+            if let Some(root) = inner.shadow_roots.remove(&id) {
+                if inner.shadow_roots_by_host.get(&root.host) == Some(&id) {
+                    inner.shadow_roots_by_host.remove(&root.host);
+                }
+            }
+            if let Some(root_id) = inner.shadow_roots_by_host.remove(&id) {
+                inner.shadow_roots.remove(&root_id);
+            }
+        }
+
         // Only free slots that are currently live. Freeing an out-of-range id
         // would panic on direct indexing, and freeing an already-freed slot
         // would push it onto the free list a second time — later handing the
         // same NodeId to two live nodes (aliasing).
-        for desc_id in descendants {
-            if matches!(inner.nodes.get(desc_id.index()), Some(Some(_))) {
-                inner.nodes[desc_id.index()] = None;
-                inner.free_list.push(desc_id.0);
+        for id in nodes_to_remove {
+            if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
+                inner.form_controls.remove(&id);
+                inner.nodes[id.index()] = None;
+                inner.free_list.push(id.0);
             }
         }
-        if matches!(inner.nodes.get(node_id.index()), Some(Some(_))) {
-            inner.nodes[node_id.index()] = None;
-            inner.free_list.push(node_id.0);
+    }
+
+    /// Collect an ordinary subtree plus every shadow tree owned by a host in
+    /// that subtree. This is used only by the arena-freeing path; normal DOM
+    /// traversal must remain tree-scoped and therefore never follows host edges.
+    fn inclusive_owned_subtrees(&self, node_id: NodeId) -> Vec<NodeId> {
+        let inner = self.inner.borrow();
+        if !inner
+            .nodes
+            .get(node_id.index())
+            .is_some_and(Option::is_some)
+        {
+            return Vec::new();
         }
+
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![node_id];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(node) = inner
+                .nodes
+                .get(current.index())
+                .and_then(|entry| entry.as_ref())
+            else {
+                continue;
+            };
+            result.push(current);
+
+            if let Some(root) = inner.shadow_roots_by_host.get(&current) {
+                stack.push(*root);
+            }
+
+            let mut children = Vec::new();
+            let mut child = node.first_child;
+            while let Some(child_id) = child {
+                children.push(child_id);
+                if children.len() > inner.nodes.len() {
+                    break;
+                }
+                child = inner
+                    .nodes
+                    .get(child_id.index())
+                    .and_then(|entry| entry.as_ref())
+                    .and_then(|entry| entry.next_sibling);
+            }
+            stack.extend(children.into_iter().rev());
+        }
+        result
     }
 
     pub fn children(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -572,11 +1219,56 @@ impl DomTree {
             .and_then(|n| n.first_child);
         while let Some(child_id) = current {
             result.push(child_id);
+            // Defense in depth: a valid sibling chain is at most nodes.len()
+            // long. Exceeding that means next_sibling forms a cycle (which the
+            // append_child / insert_before guards prevent); stop rather than
+            // loop forever. On a valid tree this bound is never reached.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
             current = inner.nodes.get(child_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.next_sibling);
         }
         result
+    }
+
+    /// Snapshot the direct children of `host`'s shadow root. Ordinary
+    /// `children(host)` continues to return only light children.
+    pub fn shadow_children(&self, host: NodeId) -> Option<Vec<NodeId>> {
+        let root = self.shadow_root(host)?;
+        Some(self.children(root))
+    }
+
+    /// Internal preorder traversal for synchronous reads such as selectors.
+    /// Unlike `descendants`, this does not allocate a snapshot of the subtree
+    /// before the first result. Only deferred siblings on the current ancestor
+    /// path are retained, and no RefCell borrow survives an iterator step.
+    pub(crate) fn descendants_iter(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let mut next = self.with_node(node_id, |node| node.first_child).flatten();
+        let mut siblings = Vec::new();
+        let mut remaining = self.node_slot_count();
+        std::iter::from_fn(move || {
+            let current = next.take()?;
+            if remaining == 0 {
+                eprintln!("obscura: descendants iterator cap hit at node {} - tree has a cycle", node_id.index());
+                siblings.clear();
+                return None;
+            }
+            remaining -= 1;
+            let (child, sibling) = self
+                .with_node(current, |node| (node.first_child, node.next_sibling))
+                .unwrap_or_default();
+            if let Some(child) = child {
+                if let Some(sibling) = sibling {
+                    siblings.push(sibling);
+                }
+                next = Some(child);
+            } else {
+                next = sibling.or_else(|| siblings.pop());
+            }
+            Some(current)
+        })
     }
 
     pub fn descendants(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -638,6 +1330,107 @@ impl DomTree {
         }
 
         result
+    }
+
+    /// Snapshot the descendants of `host`'s shadow tree without including the
+    /// ShadowRoot node itself.
+    pub fn shadow_descendants(&self, host: NodeId) -> Option<Vec<NodeId>> {
+        let root = self.shadow_root(host)?;
+        Some(self.descendants(root))
+    }
+
+    /// Whether `node` is an HTML `<slot>` element. Slot assignment is defined
+    /// only for HTML slots; same-local-name elements in other namespaces do
+    /// not participate in the flattened tree.
+    pub fn is_html_slot_element(&self, node: NodeId) -> bool {
+        self.with_node(node, |node| {
+            node.as_element().is_some_and(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                    && name.local.as_ref() == "slot"
+            })
+        }).unwrap_or(false)
+    }
+
+    /// Return the first slot to which `node` is assigned.
+    ///
+    /// The node must be a direct light child of a shadow host. Element slot
+    /// names and slot `name` values compare as exact strings; text nodes use
+    /// the empty/default name. The first same-name slot in shadow-tree order
+    /// wins, matching the HTML slot assignment algorithm.
+    pub fn assigned_slot(&self, node: NodeId) -> Option<NodeId> {
+        let parent = self.with_node(node, |node| node.parent).flatten()?;
+        let root = self.shadow_root(parent)?;
+        self.with_node(node, |node| {
+            let name = if node.is_element() {
+                node.get_attribute("slot").unwrap_or("")
+            } else if node.text_content_of_text_node().is_some() {
+                ""
+            } else {
+                return None;
+            };
+            self.descendants(root).into_iter().find(|candidate| {
+                self.is_html_slot_element(*candidate)
+                    && self.with_node(*candidate, |slot| {
+                        slot.get_attribute("name").unwrap_or("") == name
+                    }).unwrap_or(false)
+            })
+        }).flatten()
+    }
+
+    /// Nodes directly assigned to an HTML slot. The first same-name slot wins;
+    /// later duplicate slots and slots with no matching light children return
+    /// an empty list. `None` means `slot` is not a slot in a shadow tree.
+    pub fn assigned_nodes(&self, slot: NodeId) -> Option<Vec<NodeId>> {
+        if !self.is_html_slot_element(slot) {
+            return None;
+        }
+        let root = self.containing_shadow_root(slot)?;
+        let host = self.shadow_root_info(root)?.host;
+        let name = self
+            .with_node(slot, |slot| slot.get_attribute("name").unwrap_or("").to_owned())
+            .unwrap_or_default();
+        let is_same_name_slot = |candidate: NodeId| {
+            self.is_html_slot_element(candidate)
+                && self
+                    .with_node(candidate, |slot| slot.get_attribute("name").unwrap_or("") == name)
+                    .unwrap_or(false)
+        };
+        if self
+            .descendants(root)
+            .into_iter()
+            .take_while(|candidate| *candidate != slot)
+            .any(is_same_name_slot)
+        {
+            return Some(Vec::new());
+        }
+        Some(
+            self.children(host)
+                .into_iter()
+                .filter(|candidate| {
+                    self.with_node(*candidate, |node| {
+                        let candidate_name = if node.is_element() {
+                            node.get_attribute("slot").unwrap_or("")
+                        } else if node.text_content_of_text_node().is_some() {
+                            ""
+                        } else {
+                            return false;
+                        };
+                        candidate_name == name
+                    }).unwrap_or(false)
+                })
+                .collect(),
+        )
+    }
+
+    /// Flattened children for an HTML slot. Assigned nodes replace fallback
+    /// children; an unassigned slot exposes its ordinary child list.
+    pub fn slot_rendered_children(&self, slot: NodeId) -> Option<Vec<NodeId>> {
+        let assigned = self.assigned_nodes(slot)?;
+        Some(if assigned.is_empty() {
+            self.children(slot)
+        } else {
+            assigned
+        })
     }
 
     /// Returns the node after `current` in document order, without leaving the
@@ -768,6 +1561,12 @@ impl DomTree {
             .and_then(|n| n.parent);
         while let Some(parent_id) = current {
             result.push(parent_id);
+            // Defense in depth: a valid parent chain is at most nodes.len()
+            // long. Exceeding that means parent forms a cycle (which the
+            // reparenting guards prevent); stop rather than loop forever.
+            if result.len() > inner.nodes.len() {
+                break;
+            }
             current = inner.nodes.get(parent_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.parent);
@@ -776,7 +1575,20 @@ impl DomTree {
     }
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.inner.borrow().id_index.get(id).copied()
+        let indexed = self.inner.borrow().id_index.get(id).copied();
+        if indexed.is_some_and(|node| self.containing_shadow_root(node).is_none()) {
+            return indexed;
+        }
+
+        // Creation happens before insertion, so the O(1) best-effort index can
+        // point at a shadow descendant. Never expose that node through
+        // document.getElementById; recover the first matching light-tree
+        // element in document order instead. Detached and template-content
+        // nodes retain the legacy best-effort lookup behavior used internally.
+        self.descendants(self.document()).into_iter().find(|node_id| {
+            self.with_node(*node_id, |node| node.get_attribute("id") == Some(id))
+                .unwrap_or(false)
+        })
     }
 
     pub fn text_content(&self, node_id: NodeId) -> String {
@@ -839,18 +1651,22 @@ impl DomTree {
         self.append_child(parent_id, text_id);
     }
 
-    pub fn find_body_or_root(&self) -> NodeId {
+    /// The node whose children are a parsed fragment's top-level nodes: the
+    /// synthetic root `<html>` element html5ever wraps a fragment in, or the
+    /// document if there is none. Importing this node's children reproduces the
+    /// fragment as written.
+    ///
+    /// This must NOT descend into a synthesized `<body>`. A `<body>` child of the
+    /// root only appears when the fragment is parsed in the `<html>` context
+    /// (documentElement.innerHTML), where html5ever's "before head" mode
+    /// synthesizes both `<head>` and `<body>`; returning the body there dropped
+    /// the head siblings. Every other element context leaves the parsed content
+    /// directly under the root, so it is unaffected.
+    pub fn fragment_root(&self) -> NodeId {
         let doc = self.document();
         for child in self.children(doc) {
             if let Some(n) = self.get_node(child) {
                 if n.as_element().map(|name| name.local.as_ref() == "html").unwrap_or(false) {
-                    for html_child in self.children(child) {
-                        if let Some(hc) = self.get_node(html_child) {
-                            if hc.as_element().map(|name| name.local.as_ref() == "body").unwrap_or(false) {
-                                return html_child;
-                            }
-                        }
-                    }
                     return child;
                 }
             }
@@ -861,16 +1677,100 @@ impl DomTree {
     pub fn import_children_from(&self, parent_id: NodeId, source: &DomTree, source_node: NodeId) {
         let source_children = source.children(source_node);
         for source_child_id in source_children {
-            self.import_node_from(parent_id, source, source_child_id);
+            let _ = self.import_node_from(parent_id, source, source_child_id);
         }
     }
 
-    fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
+    /// Clone one node within this tree without attaching the clone.
+    ///
+    /// This operates on node data directly instead of serializing and parsing
+    /// HTML. Besides avoiding context-sensitive fragment parsing (`<html>`,
+    /// table children, and foreign content), it preserves the cloned root's
+    /// element type and namespace. Template contents are stored in a separate
+    /// document node and therefore need their own remapped clone.
+    pub fn clone_node(&self, source_node_id: NodeId, deep: bool) -> Option<NodeId> {
+        // DOM cloneNode is not defined for ShadowRoot nodes. A host clone keeps
+        // its light subtree only; the separate registry means the shadow root
+        // is naturally omitted from that traversal.
+        if self.is_shadow_root(source_node_id) {
+            return None;
+        }
+        let source_data = self.get_node(source_node_id)?.data;
+        let cloned_root = self.new_node(source_data);
+        if let Some(mut state) = self.form_control_state(source_node_id) {
+            state.indeterminate = false;
+            self.update_form_control_state(cloned_root, |control| *control = state);
+        }
+        let mut stack = Vec::new();
+        self.prepare_cloned_children(source_node_id, cloned_root, deep, &mut stack);
+
+        while let Some((dest_parent, source_node)) = stack.pop() {
+            let source_data = match self.get_node(source_node) {
+                Some(node) => node.data,
+                None => continue,
+            };
+            let cloned_node = self.new_node(source_data);
+            if let Some(mut state) = self.form_control_state(source_node) {
+                state.indeterminate = false;
+                self.update_form_control_state(cloned_node, |control| *control = state);
+            }
+            self.append_child(dest_parent, cloned_node);
+            self.prepare_cloned_children(source_node, cloned_node, true, &mut stack);
+        }
+
+        Some(cloned_root)
+    }
+
+    fn prepare_cloned_children(
+        &self,
+        source_node: NodeId,
+        cloned_node: NodeId,
+        deep: bool,
+        stack: &mut Vec<(NodeId, NodeId)>,
+    ) {
+        let source_contents = self
+            .with_node(source_node, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            })
+            .flatten();
+
+        if let Some(source_contents) = source_contents {
+            let cloned_contents = self.new_node(NodeData::Document);
+            self.with_node_mut(cloned_node, |node| {
+                if let NodeData::Element { template_contents, .. } = &mut node.data {
+                    *template_contents = Some(cloned_contents);
+                }
+            });
+            if deep {
+                for child in self.children(source_contents).into_iter().rev() {
+                    stack.push((cloned_contents, child));
+                }
+            }
+        }
+
+        if deep {
+            for child in self.children(source_node).into_iter().rev() {
+                stack.push((cloned_node, child));
+            }
+        }
+    }
+
+    /// Copies a node together with its subtree from `source` and attaches it to `parent_id`.
+    /// Returns the copy of `source_node_id` itself, so that a caller that keeps parsing into
+    /// `source` can map the source to its copy.
+    pub fn import_node_from(
+        &self,
+        parent_id: NodeId,
+        source: &DomTree,
+        source_node_id: NodeId,
+    ) -> Option<NodeId> {
         // Iterative DFS with an explicit (dest_parent, source_node) stack so a
         // deeply nested source tree cannot overflow the thread stack and abort
         // the process. Children are pushed in reverse so they are appended in
         // document order (append_child always appends to the end, so each level
         // keeps the source ordering).
+        let mut imported_root = None;
         let mut stack = vec![(parent_id, source_node_id)];
         while let Some((dest_parent, src_id)) = stack.pop() {
             let node_data = {
@@ -883,6 +1783,10 @@ impl DomTree {
 
             let new_id = self.new_node(node_data);
             self.append_child(dest_parent, new_id);
+            // The first node off the stack is source_node_id itself.
+            if imported_root.is_none() {
+                imported_root = Some(new_id);
+            }
 
             // A <template>'s children hang off a separate contents document, so
             // the child walk below never reaches them. Worse, the cloned data
@@ -920,10 +1824,12 @@ impl DomTree {
                 stack.push((new_id, child_id));
             }
         }
+        imported_root
     }
 
     pub fn len(&self) -> usize {
-        self.inner.borrow().nodes.iter().filter(|n| n.is_some()).count()
+        let inner = self.inner.borrow();
+        inner.nodes.len() - inner.free_list.len()
     }
 
     // Number of node slots (live plus freed), i.e. the same upper bound
@@ -1012,11 +1918,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cssom_stylesheet_storage_is_released_when_owner_is_detached() {
+        let tree = DomTree::new();
+        for _ in 0..128 {
+            let parent = element(&tree, "div");
+            let owner = element(&tree, "style");
+            tree.append_child(tree.document(), parent);
+            tree.append_child(parent, owner);
+            assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![".x { width: 3px }".into()], true));
+            tree.detach(parent);
+        }
+        assert!(tree.external_stylesheets().is_empty(), "detached inline sheets retained native storage");
+    }
+
+    #[test]
+    fn cssom_inline_rules_survive_cross_origin_import_loading() {
+        let tree = DomTree::new();
+        let owner = element(&tree, "style");
+        tree.append_child(tree.document(), owner);
+        assert!(tree.append_external_stylesheet(owner, ".import { color: red }".into(), false));
+        assert!(tree.update_cssom_stylesheet(owner, 0, 0, vec![".own { width: 3px }".into()], true),
+            "a foreign import does not taint its inline owner's own rules");
+        assert!(tree.append_external_stylesheet(owner, ".late { color: blue }".into(), false));
+        let sheet = tree.external_stylesheet(owner).unwrap();
+        assert_eq!(sheet.cssom_rules.unwrap()[0].as_ref(), ".own { width: 3px }");
+        assert_eq!(sheet.sources.len(), 2);
+        assert!(!sheet.origin_clean);
+    }
+
+    #[test]
+    fn streaming_descendants_match_snapshots_and_keep_shadow_roots_separate() {
+        let tree = crate::parse_html("<!doctype html><main id='root'>text<!--gap--><div><i></i><b></b></div><p></p></main><aside id='host'></aside>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let child = element(&tree, "span");
+        tree.append_child(shadow, child);
+        let mut roots = tree.descendants(tree.document());
+        roots.extend([tree.document(), shadow, child]);
+        for root in roots {
+            assert_eq!(tree.descendants_iter(root).collect::<Vec<_>>(), tree.descendants(root));
+        }
+        assert!(!tree.descendants_iter(tree.document()).any(|node| node == child));
+        assert_eq!(tree.descendants_iter(shadow).collect::<Vec<_>>(), vec![child]);
+        tree.detach(child);
+        assert_eq!(tree.descendants_iter(shadow).count(), 0);
+        assert_eq!(tree.descendants_iter(child).count(), 0);
+    }
+
+    #[test]
+    fn streaming_descendants_bound_broken_child_and_sibling_cycles() {
+        for sibling_cycle in [false, true] {
+            let tree = DomTree::new();
+            let child = element(&tree, "div");
+            tree.append_child(tree.document(), child);
+            tree.with_node_mut(child, |node| {
+                if sibling_cycle { node.next_sibling = Some(child); }
+                else { node.first_child = Some(child); }
+            });
+            let mut walk = tree.descendants_iter(tree.document());
+            assert_eq!(walk.by_ref().count(), tree.node_slot_count());
+            assert_eq!(walk.next(), None);
+        }
+    }
+
+    fn element(tree: &DomTree, local: &str) -> NodeId {
+        tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from(local)),
+            attrs: vec![],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        })
+    }
+
+    fn element_with_id(tree: &DomTree, local: &str, id: &str) -> NodeId {
+        tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from(local)),
+            attrs: vec![Attribute {
+                name: QualName::new(None, Namespace::default(), LocalName::from("id")),
+                value: id.into(),
+            }],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        })
+    }
+
+    #[test]
     fn test_new_tree_has_document() {
         let tree = DomTree::new();
         assert_eq!(tree.len(), 1);
         let node = tree.get_node(tree.document()).unwrap();
         assert!(node.is_document());
+    }
+
+    #[test]
+    fn live_node_count_does_not_scan_the_arena() {
+        let tree = DomTree::new();
+        let nodes: Vec<_> = (0..100_000)
+            .map(|_| tree.new_node(NodeData::Text { contents: String::new() }))
+            .collect();
+        assert_eq!(tree.len(), 100_001, "detached nodes are still live");
+        for &node in nodes.iter().step_by(2) {
+            tree.remove(node);
+            tree.remove(node);
+        }
+        assert_eq!(tree.len(), 50_001, "a repeated removal cannot free another slot");
+        for _ in 0..100 {
+            tree.new_node(NodeData::Text { contents: String::new() });
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(std::hint::black_box(&tree).len(), 50_101);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500),
+            "repeated live-node counts scanned the arena: {:?}", started.elapsed());
     }
 
     #[test]
@@ -1044,12 +2058,304 @@ mod tests {
     }
 
     #[test]
+    fn native_shadow_root_keeps_light_and_shadow_tree_scopes_separate() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(document, host);
+        tree.append_child(host, light);
+
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Closed)
+            .expect("element can host one shadow root");
+        let shadow = element(&tree, "button");
+        tree.append_child(root, shadow);
+
+        assert_eq!(
+            tree.shadow_root_info(root),
+            Some(ShadowRoot {
+                id: root,
+                host,
+                mode: ShadowRootMode::Closed,
+            })
+        );
+        assert!(tree.is_shadow_root(root));
+        assert_eq!(tree.shadow_root(host), Some(root));
+        assert_eq!(tree.get_node(root).unwrap().parent, None);
+        assert_eq!(tree.children(host), vec![light]);
+        assert_eq!(tree.shadow_children(host), Some(vec![shadow]));
+        assert_eq!(tree.shadow_descendants(host), Some(vec![shadow]));
+
+        let document_nodes = tree.descendants(document);
+        assert!(!document_nodes.contains(&root));
+        assert!(!document_nodes.contains(&shadow));
+        assert_eq!(tree.tree_scope_root(light), Some(document));
+        assert_eq!(tree.tree_scope_root(root), Some(root));
+        assert_eq!(tree.tree_scope_root(shadow), Some(root));
+        assert_eq!(tree.containing_shadow_root(light), None);
+        assert_eq!(tree.containing_shadow_root(shadow), Some(root));
+        assert_eq!(tree.shadow_including_root(shadow), Some(document));
+        assert_eq!(
+            tree.attach_shadow_root(host, ShadowRootMode::Open),
+            Err(AttachShadowError::HostAlreadyHasShadowRoot)
+        );
+    }
+
+    #[test]
+    fn slot_assignment_uses_exact_names_first_slot_and_fallback_children() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let named = element(&tree, "span");
+        tree.with_node_mut(named, |node| node.set_attribute("slot", "title".into()));
+        let default_text = tree.new_node(NodeData::Text {
+            contents: "default".into(),
+        });
+        tree.append_child(host, named);
+        tree.append_child(host, default_text);
+
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let first_named = element(&tree, "slot");
+        tree.with_node_mut(first_named, |node| node.set_attribute("name", "title".into()));
+        let duplicate_named = element(&tree, "slot");
+        tree.with_node_mut(duplicate_named, |node| node.set_attribute("name", "title".into()));
+        let fallback = element(&tree, "b");
+        tree.append_child(duplicate_named, fallback);
+        let default_slot = element(&tree, "slot");
+        tree.append_child(root, first_named);
+        tree.append_child(root, duplicate_named);
+        tree.append_child(root, default_slot);
+
+        assert_eq!(tree.assigned_slot(named), Some(first_named));
+        assert_eq!(tree.assigned_slot(default_text), Some(default_slot));
+        assert_eq!(tree.slot_rendered_children(first_named), Some(vec![named]));
+        assert_eq!(
+            tree.slot_rendered_children(duplicate_named),
+            Some(vec![fallback])
+        );
+        assert_eq!(
+            tree.slot_rendered_children(default_slot),
+            Some(vec![default_text])
+        );
+    }
+
+    #[test]
+    fn slot_assignment_tracks_renames_reordering_and_non_slottable_nodes() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let light = element(&tree, "span");
+        let text = tree.new_node(NodeData::Text { contents: "text ".repeat(32_768) });
+        let comment = tree.new_node(NodeData::Comment { contents: "comment".into() });
+        for child in [light, text, comment] {
+            tree.append_child(host, child);
+            assert_eq!(tree.assigned_slot(child), None);
+        }
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let first = element(&tree, "slot");
+        let second = element(&tree, "slot");
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(svg), LocalName::from("slot")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        for child in [foreign, first, second] { tree.append_child(root, child); }
+        assert!(!tree.is_html_slot_element(foreign));
+        assert_eq!(tree.assigned_nodes(foreign), None);
+        assert_eq!(tree.assigned_nodes(first), Some(vec![light, text]));
+        assert_eq!(tree.assigned_slot(comment), None);
+        assert_eq!(tree.assigned_slot(text), Some(first));
+
+        tree.with_node_mut(first, |node| node.set_attribute("name", "Title".into()));
+        tree.with_node_mut(light, |node| node.set_attribute("slot", "title".into()));
+        assert_eq!(tree.assigned_slot(light), None);
+        assert_eq!(tree.assigned_slot(text), Some(second));
+        tree.with_node_mut(first, |node| node.set_attribute("name", "title".into()));
+        assert_eq!(tree.assigned_nodes(first), Some(vec![light]));
+        tree.with_node_mut(second, |node| node.set_attribute("name", "title".into()));
+        tree.insert_before(first, second);
+        assert_eq!(tree.assigned_slot(light), Some(second));
+        assert_eq!(tree.assigned_nodes(first), Some(vec![]));
+        assert_eq!(tree.assigned_slot(text), None);
+        tree.remove(second);
+        assert_eq!(tree.assigned_slot(light), Some(first));
+        tree.append_child(tree.document(), light);
+        assert_eq!(tree.assigned_slot(light), None);
+        assert_eq!(tree.assigned_nodes(first), Some(vec![]));
+    }
+
+    #[test]
+    fn document_id_lookup_never_exposes_a_shadow_descendant() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let host = element(&tree, "x-card");
+        tree.append_child(document, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+
+        // The shadow element is created first, so it owns the best-effort
+        // global id-index entry. Public document lookup still has to recover
+        // the light-tree match rather than leak across the tree scope.
+        let shadow_match = element_with_id(&tree, "span", "shared");
+        tree.append_child(root, shadow_match);
+        let light_match = element_with_id(&tree, "span", "shared");
+        tree.append_child(host, light_match);
+
+        assert_eq!(tree.get_element_by_id("shared"), Some(light_match));
+        assert_eq!(
+            tree.query_selector_from(document, "#shared").unwrap(),
+            Some(light_match)
+        );
+        assert_eq!(
+            tree.query_selector_from(root, "#shared").unwrap(),
+            Some(shadow_match)
+        );
+    }
+
+    #[test]
+    fn shadow_host_edges_participate_in_cycle_rejection() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let host = element(&tree, "x-card");
+        tree.append_child(document, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        // Root nodes cannot become ordinary children.
+        tree.append_child(host, root);
+        assert_eq!(tree.get_node(root).unwrap().parent, None);
+        assert!(tree.children(host).is_empty());
+
+        // A host is a host-including ancestor of every node in its shadow
+        // tree, even when it has no light children.
+        tree.append_child(root, host);
+        tree.insert_before(shadow_child, host);
+        assert_eq!(tree.get_node(host).unwrap().parent, Some(document));
+        assert_eq!(tree.children(root), vec![shadow_child]);
+    }
+
+    #[test]
+    fn connectivity_propagates_across_light_and_shadow_subtrees() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow = element(&tree, "button");
+        tree.append_child(root, shadow);
+        for node in [host, light, root, shadow] {
+            assert!(!tree.is_connected(node));
+        }
+
+        tree.append_child(tree.document(), host);
+        for node in [host, light, root, shadow] {
+            assert!(tree.is_connected(node));
+        }
+
+        tree.detach(host);
+        for node in [host, light, root, shadow] {
+            assert!(!tree.is_connected(node));
+        }
+    }
+
+    #[test]
+    fn connectivity_survives_connected_moves_and_root_detach_attempts() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let left = element(&tree, "section");
+        let right = element(&tree, "section");
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(document, left);
+        tree.append_child(document, right);
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow = element(&tree, "button");
+        tree.append_child(root, shadow);
+        tree.append_child(left, host);
+
+        tree.append_child(right, host);
+        assert!(tree.children(left).is_empty());
+        assert_eq!(tree.children(right), vec![host]);
+        for node in [document, left, right, host, light, root, shadow] {
+            assert!(tree.is_connected(node));
+        }
+
+        // Neither root participates in the ordinary child list, so a generic
+        // detach must not corrupt the cached connectivity invariant.
+        tree.detach(document);
+        tree.detach(root);
+        for node in [document, left, right, host, light, root, shadow] {
+            assert!(tree.is_connected(node));
+        }
+    }
+
+    #[test]
+    fn freeing_a_host_reclaims_shadow_nodes_and_registry_entries() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_host = element(&tree, "nested-card");
+        tree.append_child(root, shadow_host);
+        let nested_root = tree
+            .attach_shadow_root(shadow_host, ShadowRootMode::Closed)
+            .unwrap();
+        let nested_child = element(&tree, "span");
+        tree.append_child(nested_root, nested_child);
+
+        assert_eq!(tree.len(), 6);
+        tree.remove(host);
+        assert_eq!(tree.len(), 1);
+        for removed in [host, root, shadow_host, nested_root, nested_child] {
+            assert!(tree.get_node(removed).is_none());
+            assert!(!tree.is_shadow_root(removed));
+        }
+
+        // Reusing freed slots must not resurrect either registry direction.
+        let replacement = element(&tree, "div");
+        assert_eq!(tree.shadow_root(replacement), None);
+        assert_eq!(tree.shadow_root_info(replacement), None);
+    }
+
+    #[test]
+    fn cloning_a_host_omits_its_shadow_tree_and_a_root_is_not_clonable() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        let light = element(&tree, "span");
+        tree.append_child(host, light);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        tree.append_child(root, element(&tree, "button"));
+
+        assert_eq!(tree.clone_node(root, true), None);
+        let clone = tree.clone_node(host, true).expect("host itself is clonable");
+        assert_eq!(tree.shadow_root(clone), None);
+        assert_eq!(tree.children(clone).len(), 1);
+    }
+
+    #[test]
     fn test_append_child() {
         let tree = DomTree::new();
         let child = tree.new_node(NodeData::Text {
             contents: "hello".into(),
         });
         let doc = tree.document();
+        assert!(!tree.is_connected(child));
         tree.append_child(doc, child);
 
         assert_eq!(tree.len(), 2);
@@ -1059,6 +2365,7 @@ mod tests {
 
         let child_node = tree.get_node(child).unwrap();
         assert_eq!(child_node.parent, Some(doc));
+        assert!(tree.is_connected(child));
     }
 
     #[test]
@@ -1086,6 +2393,8 @@ mod tests {
 
         tree.detach(c1);
         assert_eq!(tree.children(doc), vec![c2]);
+        assert!(!tree.is_connected(c1));
+        assert!(tree.is_connected(c2));
     }
 
     #[test]
@@ -1368,5 +2677,76 @@ mod tests {
         dest.import_children_from(dest_doc, &source, source.document());
 
         assert!(dest.len() >= 100_000);
+    }
+
+    /// SEC-008 / #582 — children() must terminate on a corrupted cyclic sibling
+    /// chain, the same way descendants() already does. The public mutation API
+    /// cannot create such a cycle, so we forge one by writing the node arena
+    /// directly, then assert the walk stays bounded instead of hanging forever.
+    #[test]
+    fn children_walk_is_bounded_on_corrupted_sibling_cycle() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk("root");
+        let a = mk("a");
+        let b = mk("b");
+        tree.append_child(doc, root);
+        tree.append_child(root, a);
+        tree.append_child(root, b);
+
+        // Forge a sibling cycle a -> a that append_child never produces.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.nodes[a.index()].as_mut().unwrap().next_sibling = Some(a);
+        }
+
+        let node_count = tree.inner.borrow().nodes.len();
+        let kids = tree.children(root);
+        assert!(
+            kids.len() <= node_count + 1,
+            "children() must stay bounded on a cyclic sibling chain, got {}",
+            kids.len()
+        );
+    }
+
+    /// SEC-008 / #582 — ancestors() companion to the children() cycle test.
+    #[test]
+    fn ancestors_walk_is_bounded_on_corrupted_parent_cycle() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let mk = |n: &str| {
+            tree.new_node(NodeData::Element {
+                name: QualName::new(None, ns!(html), LocalName::from(n)),
+                attrs: vec![],
+                template_contents: None,
+                mathml_annotation_xml_integration_point: false,
+            })
+        };
+        let root = mk("root");
+        let child = mk("child");
+        tree.append_child(doc, root);
+        tree.append_child(root, child);
+
+        // Forge a parent cycle child -> child.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.nodes[child.index()].as_mut().unwrap().parent = Some(child);
+        }
+
+        let node_count = tree.inner.borrow().nodes.len();
+        let ancestors = tree.ancestors(child);
+        assert!(
+            ancestors.len() <= node_count + 1,
+            "ancestors() must stay bounded on a cyclic parent chain, got {}",
+            ancestors.len()
+        );
     }
 }

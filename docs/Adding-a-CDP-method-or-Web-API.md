@@ -63,7 +63,7 @@ async fn my_domain_do_thing_returns_ok() {
 Run:
 
 ```bash
-cargo test -p obscura-cdp my_domain
+cargo nextest run --release --features render -p obscura-cdp my_domain
 ```
 
 ## Adding a Web API
@@ -131,7 +131,7 @@ sha2 = "0.10"
 ### 5. Smoke test
 
 ```bash
-cargo build --release
+cargo build --release --features render
 ./target/release/obscura fetch https://example.com --eval "
   crypto.subtle.digest('SHA-256', new TextEncoder().encode('hi'))
     .then(buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join(''))

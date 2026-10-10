@@ -11,9 +11,9 @@
 //! silently did nothing and scroll-driven feeds stalled after their first batch.
 //!
 //! Checked against a real Chrome over CDP with this same probe: assigning
-//! `scrollTop` fires exactly one `scroll` event there. These tests assert the
-//! same observable behaviour, not the synthetic geometry around it — the offset
-//! is intentionally not clamped, since without layout any maximum is a guess.
+//! `scrollTop` fires exactly one `scroll` event when the element can actually
+//! scroll. The fixture therefore has explicit viewport and content dimensions;
+//! Chromium clamps a non-overflowing element to zero and dispatches no event.
 
 use obscura_cdp::dispatch::{dispatch, CdpContext};
 use obscura_cdp::types::CdpRequest;
@@ -29,7 +29,10 @@ async fn serve_once() -> String {
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let _ = socket.read(&mut buf).await.unwrap();
-            let body = "<html><body><div id=\"box\"><p>a</p><p>b</p></div></body></html>";
+            let body = r#"<html><head><style>
+                #box { width: 100px; height: 100px; overflow: scroll; }
+                #content { width: 1000px; height: 2000px; }
+            </style></head><body><div id="box"><div id="content"><p>a</p><p>b</p></div></div></body></html>"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

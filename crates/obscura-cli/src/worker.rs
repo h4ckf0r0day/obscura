@@ -54,7 +54,12 @@ async fn main() {
     let stealth = std::env::var("OBSCURA_STEALTH")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let context = Arc::new(BrowserContext::with_options("worker".to_string(), proxy, stealth));
+    let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
+    context.obey_robots = obey_robots;
+    let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
 
     let stdin = tokio::io::stdin();
@@ -93,15 +98,44 @@ async fn main() {
         let resp = match cmd {
             WorkerCommand::Navigate { url } => {
                 match page.navigate(&url).await {
-                    Ok(()) => WorkerResponse::success(serde_json::json!({
-                        "title": page.title,
-                        "url": page.url_string(),
-                    })),
+                    Ok(()) => {
+                        // Navigation clears the event list and records the main
+                        // Document response before scripts and child frames.
+                        // Its status is the final response after HTTP redirects.
+                        // Zero denotes a blocked request, not an HTTP response.
+                        let status = page.network_events.iter()
+                            .find(|event| event.resource_type == "Document")
+                            .filter(|event| {
+                                event.status != 0
+                                    && (event.url.starts_with("http://") || event.url.starts_with("https://"))
+                            })
+                            .map(|event| event.status);
+                        WorkerResponse::success(serde_json::json!({
+                            "title": page.title,
+                            "url": page.url_string(),
+                            "status": status,
+                        }))
+                    },
                     Err(e) => WorkerResponse::error(e.to_string()),
                 }
             }
             WorkerCommand::Evaluate { expression } => {
-                let result = page.evaluate(&expression);
+                // Await promise-returning expressions so async IIFEs resolve
+                // before serialization. Previously the sync path serialized an
+                // unresolved Promise as `{}`, making single-invocation flows
+                // that call async app APIs impossible (issue #693). A 30s cap
+                // matches the CDP await timeout so a never-settling promise
+                // cannot hang the worker.
+                let result = match page
+                    .evaluate_for_cdp_with_timeout(&expression, true, true, 30_000)
+                    .await
+                {
+                    Ok(info) => match info.value {
+                        Some(v) => v,
+                        None => serde_json::Value::String(info.description),
+                    },
+                    Err(_) => serde_json::Value::Null,
+                };
                 WorkerResponse::success(result)
             }
             WorkerCommand::Title => {

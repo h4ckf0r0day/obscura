@@ -43,13 +43,41 @@ body:
     validations:
       required: true
   - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - JavaScript or DOM behavior
+        - Rendering, layout, or paint
+        - Screenshot, screencast, or PDF output
+        - CDP, Puppeteer, or Playwright compatibility
+        - Networking, cookies, or proxies
+        - CLI or MCP
+        - Build, packaging, or installation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build variant
+      description: Official default and stealth archives include rendering. No-render archives and source builds without the render feature do not.
+      options:
+        - Render-enabled (official default archive or --features render)
+        - Render-enabled with stealth (official stealth archive or --features render,stealth)
+        - No-render (official no-render archive or source build without render)
+        - No-render with stealth (official no-render-stealth archive or --features stealth)
+        - I do not know
+    validations:
+      required: true
+  - type: dropdown
     id: stealth
     attributes:
       label: Stealth mode
       options:
-        - "Off (default build)"
-        - "On (--stealth, default build)"
-        - "On (--stealth, --features stealth build)"
+        - "Off"
+        - "On (--stealth)"
+        - "Not applicable"
     validations:
       required: false
   - type: textarea
@@ -73,6 +101,17 @@ body:
       label: Actual behavior
     validations:
       required: true
+  - type: textarea
+    id: render_details
+    attributes:
+      label: Rendering details
+      description: For layout, screenshot, screencast, or PDF bugs, include viewport size, device scale factor, output options, and before/after or Chrome reference images. Drag images or output files here.
+      placeholder: |
+        Viewport: 1280x720, DPR 1
+        Output: full-page PNG / A4 PDF / screencast frame
+        Options: --screenshot page.png, printBackground=true, etc.
+    validations:
+      required: false
   - type: dropdown
     id: chrome
     attributes:

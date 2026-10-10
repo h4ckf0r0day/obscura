@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>contextual css math</title>
+  <style>
+    html, body { margin: 0; font-size: 16px; }
+    .row { width: 900px; height: 60px; overflow: hidden; }
+    .min-width { width: min(25vw, 350px); height: 40px; background: #087f5b; }
+    .min-margin { width: 100px; height: 40px; margin-left: min(25vw, 350px); background: #1971c2; }
+    .clamped { width: clamp(200px, 30vw, 320px); height: 40px; background: #e8590c; }
+    .calculated { width: 100px; height: 40px; margin-left: calc(10vw + 2rem); background: #7048e8; }
+    .padded { box-sizing: border-box; width: 200px; height: 40px; padding-left: max(5vw, 60px); background: #f08c00; }
+    .inner { width: 20px; height: 40px; background: #c2255c; }
+    .rounded {
+      --media-width: 247px;
+      width: calc(round(var(--media-width) * 1, 10px));
+      height: 40px;
+      background: #2f9e44;
+    }
+  </style>
+</head>
+<body>
+  <div class="row"><div class="min-width"></div></div>
+  <div class="row"><div class="min-margin"></div></div>
+  <div class="row"><div class="clamped"></div></div>
+  <div class="row"><div class="calculated"></div></div>
+  <div class="row"><div class="padded"><div class="inner"></div></div></div>
+  <div class="row"><div class="rounded"></div></div>
+</body>
+</html>

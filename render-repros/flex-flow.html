@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 900px; min-height: 1000px; }
+  .case { display: flex; position: absolute; width: 150px; height: 80px; }
+  .item { flex: none; width: 100px; height: 40px; }
+
+  #direction-first { left: 0; top: 0; flex-flow: column wrap; }
+  #wrap-first { left: 200px; top: 0; flex-flow: wrap column; }
+
+  /* A one-token shorthand resets the omitted longhand to its initial value. */
+  #direction-only { left: 400px; top: 0; flex-wrap: wrap; flex-flow: row; }
+  #wrap-only { left: 0; top: 120px; flex-direction: column; flex-flow: wrap; }
+
+  /* The invalid later shorthand must not partially replace either longhand. */
+  #invalid-later { left: 200px; top: 120px; flex-flow: column wrap; flex-flow: row column; }
+
+  #a1 { background: #087f5b; } #a2 { background: #0ca678; }
+  #b1 { background: #1971c2; } #b2 { background: #1c7ed6; }
+  #c1 { background: #e8590c; } #c2 { background: #f76707; }
+  #d1 { background: #7048e8; } #d2 { background: #7950f2; }
+  #e1 { background: #c2255c; } #e2 { background: #d6336c; }
+  #supports { position: absolute; left: 400px; top: 120px; width: 180px; height: 40px; background: #c92a2a; }
+</style>
+
+<div id="direction-first" class="case"><div id="a1" class="item"></div><div id="a2" class="item"></div></div>
+<div id="wrap-first" class="case"><div id="b1" class="item"></div><div id="b2" class="item"></div></div>
+<div id="direction-only" class="case"><div id="c1" class="item"></div><div id="c2" class="item"></div></div>
+<div id="wrap-only" class="case"><div id="d1" class="item"></div><div id="d2" class="item"></div></div>
+<div id="invalid-later" class="case"><div id="e1" class="item"></div><div id="e2" class="item"></div></div>
+<div id="supports"></div>
+
+<script>
+  const valid = ["column", "wrap", "column wrap", "wrap column"];
+  const invalid = ["row column", "nowrap wrap-reverse", "none"];
+  if (valid.every(value => CSS.supports("flex-flow", value)) &&
+      invalid.every(value => !CSS.supports("flex-flow", value))) {
+    document.querySelector("#supports").style.background = "#18723a";
+  }
+</script>

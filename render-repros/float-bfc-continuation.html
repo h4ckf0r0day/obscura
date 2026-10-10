@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>float continuation through block wrappers</title>
+  <style>
+    html, body { margin: 0; }
+    #bfc { width: 900px; display: flow-root; }
+    #intro-float {
+      float: right;
+      width: 250px;
+      height: 400px;
+      background: #1971c2;
+    }
+    #lead {
+      height: 250px;
+      background: #087f5b;
+    }
+    #heading {
+      margin: 0;
+      height: 50px;
+      background: #e8590c;
+    }
+    #beside {
+      height: 100px;
+      background: #7048e8;
+    }
+    #after {
+      height: 70px;
+      background: #a61e4d;
+    }
+  </style>
+</head>
+<body>
+  <main id="bfc">
+    <section id="intro">
+      <aside id="intro-float"></aside>
+      <div id="lead"></div>
+    </section>
+    <section id="following">
+      <h2 id="heading"></h2>
+      <div id="beside"></div>
+      <div id="after"></div>
+    </section>
+  </main>
+</body>
+</html>

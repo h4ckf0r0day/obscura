@@ -24,7 +24,7 @@ Load a URL and print its content or an evaluated expression.
     --dump <FORMAT>          html | text | links | markdown | original | assets | cookies
                              (default html)
     --selector <CSS>         Narrow output to a CSS selector
-    --wait <SECONDS>         Extra wait after settle (default 5)
+    --wait <SECONDS>         Fixed post-load delay; omitted uses adaptive settle (5s cap)
     --timeout <SECONDS>      Navigation timeout (default 30)
     --wait-until <LEVEL>     domcontentloaded | load | networkidle2 | networkidle0
                              (default load)
@@ -33,9 +33,19 @@ Load a URL and print its content or an evaluated expression.
     --stealth                Consistent browser fingerprint + tracker blocking (global)
 -e, --eval <JS>              Evaluate JS, print the result as JSON
 -o, --output <FILE>          Write to a file instead of stdout
+-s, --screenshot <FILE>      Capture the settled page as PNG (single URL)
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```
+
+`--screenshot` requires a render-enabled build. It uses a 1280×720 viewport by
+default and may be combined with `--eval`; the expression runs before capture,
+which is useful for scrolling or preparing page state. It is not available in
+`--file` batch mode.
+
+When `--wait` is omitted, Obscura drives timers and async work until the page
+becomes quiescent, with a five-second ceiling. Supplying `--wait N` instead
+requests a fixed `N`-second delay. `--timeout` separately bounds navigation.
 
 `--dump` values:
 
@@ -60,6 +70,7 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
@@ -110,6 +121,37 @@ Run obscura as an MCP server.
 -v, --verbose                Enable info logging
 ```
 
-`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only; set `0.0.0.0` to bind all interfaces (for example a Docker Compose sidecar) and pair it with `OBSCURA_MCP_ALLOWED_ORIGINS`.
+`--host` only applies with `--http`. The default `127.0.0.1` keeps the server loopback-only. A non-loopback bind requires `OBSCURA_MCP_TOKEN` (at least 32 bytes); use `OBSCURA_MCP_ALLOWED_ORIGINS` as well when a browser-based client needs access.
 
 Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
+
+Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
+tool list. Streaming screencasts are available through CDP rather than MCP.
+
+## Worker navigation responses
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and emits one
+JSON response per command on stdout. For example:
+
+```json
+{"cmd":"navigate","url":"https://example.com/"}
+```
+
+A completed navigation includes the final document's HTTP status alongside the
+existing title and URL:
+
+```json
+{"ok":true,"result":{"title":"Example Domain","url":"https://example.com/","status":200}}
+```
+
+`status` is the main document's final HTTP response code after redirects, not a
+script, image, or child frame's response. HTTP errors such as 404 and 503 still
+return `ok: true`: the server responded and the error document can be inspected
+with `dump_html`, `dump_text`, or `evaluate`. Navigation without an HTTP response,
+such as `about:blank`, a `data:` URL, or a tracker blocked before the request,
+returns `status: null`. A transport or
+navigation failure retains the existing `{"ok":false,"error":"..."}` envelope
+without a `result` object.
+
+The status field is additive. Navigation timing and the other worker commands
+are unchanged.

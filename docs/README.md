@@ -5,12 +5,17 @@ Obscura is an open-source headless browser engine written in Rust. It runs JavaS
 | Metric      | Obscura  | Headless Chrome |
 | ----------- | -------- | --------------- |
 | Memory      | 30 MB    | 200+ MB         |
-| Binary size | 70 MB    | 300+ MB         |
+| Binary size | ~70 MiB  | 300+ MB         |
 | Startup     | Instant  | ~2s             |
 | Page load   | 85 ms    | ~500 ms         |
 | Anti-detect | Built-in | None            |
 | Puppeteer   | Yes      | Yes             |
 | Playwright  | Yes      | Yes             |
+
+Rendering and stealth are both first-class capabilities. Release builds
+support screenshots, scroll-aware layout, activity-driven CDP screencasting,
+and raster PDF export; stealth builds retain all of those surfaces while adding
+the wreq/BoringSSL transport and browser-identity protections.
 
 ## Quickstart
 

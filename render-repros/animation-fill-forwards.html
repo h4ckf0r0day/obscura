@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Animation fill forwards</title>
+  <style>
+    html, body { margin: 0; }
+    #content {
+      width: 360px;
+      height: 180px;
+      background: #18723a;
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      width: 360px;
+      height: 180px;
+      background: #a22;
+    }
+    @keyframes dismiss-overlay {
+      from { opacity: 1; }
+      to { opacity: 0; visibility: hidden; }
+    }
+    #overlay.dismissed {
+      animation: dismiss-overlay 100ms ease-out forwards;
+    }
+  </style>
+</head>
+<body>
+  <div id="content"></div>
+  <div id="overlay"></div>
+  <script>document.getElementById("overlay").classList.add("dismissed");</script>
+</body>
+</html>

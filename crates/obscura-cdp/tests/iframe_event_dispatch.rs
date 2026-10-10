@@ -168,3 +168,55 @@ async fn iframe_load_reaches_onload_and_addeventlistener() {
         "both onload property and addEventListener('load') run exactly once, in order"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn dom_events_follow_capture_target_and_bubble_order() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(function () {
+            const outer = document.createElement('div');
+            const target = document.createElement('button');
+            outer.appendChild(target);
+            document.body.appendChild(outer);
+            const calls = [];
+            const listen = (node, name, capture) => node.addEventListener('probe', (event) => {
+                calls.push([name, event.eventPhase, event.currentTarget === node, event.target === target]);
+            }, capture);
+            listen(window, 'window-capture', true);
+            listen(document, 'document-capture', true);
+            listen(outer, 'outer-capture', true);
+            listen(target, 'target-capture', true);
+            listen(target, 'target-bubble', false);
+            listen(outer, 'outer-bubble', false);
+            listen(document, 'document-bubble', false);
+            listen(window, 'window-bubble', false);
+            target.dispatchEvent(new Event('probe', { bubbles: true }));
+            let redispatches = 0;
+            target.addEventListener('reused', () => redispatches++);
+            const reused = new Event('reused');
+            target.dispatchEvent(reused);
+            target.dispatchEvent(reused);
+            return JSON.stringify({ calls, redispatches, reusedTarget: reused.target === target });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        val["calls"],
+        json!([
+            ["window-capture", 1, true, true],
+            ["document-capture", 1, true, true],
+            ["outer-capture", 1, true, true],
+            ["target-capture", 2, true, true],
+            ["target-bubble", 2, true, true],
+            ["outer-bubble", 3, true, true],
+            ["document-bubble", 3, true, true],
+            ["window-bubble", 3, true, true]
+        ])
+    );
+    assert_eq!(val["redispatches"], 2);
+    assert_eq!(val["reusedTarget"], true);
+}

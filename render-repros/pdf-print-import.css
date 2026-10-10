@@ -1,0 +1,9 @@
+.print-import-marker {
+  display: block !important;
+  width: 320px;
+  height: 120px;
+  margin-top: 40px;
+  padding: 32px;
+  background: #9020d0;
+  color: white;
+}

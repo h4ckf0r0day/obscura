@@ -1,0 +1,9 @@
+# Stable-ish pages for a quick real-world regression spot set.
+https://example.com/
+https://news.ycombinator.com/
+https://www.sqlite.org/index.html
+https://blog.rust-lang.org/
+https://docs.python.org/3/
+https://web.dev/
+https://jvns.ca/
+https://en.wikipedia.org/wiki/Rust_(programming_language)

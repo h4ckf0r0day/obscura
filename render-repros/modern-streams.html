@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Modern hydration streams</title>
+  <style>
+    html, body { margin: 0; padding: 0; }
+    body { padding: 24px; font: 16px sans-serif; }
+    #result {
+      box-sizing: border-box;
+      width: 360px;
+      height: 90px;
+      padding: 20px;
+      background: #aa3333;
+      color: white;
+    }
+    #result.passed { background: #186aa5; }
+  </style>
+</head>
+<body>
+  <div id="result">streamed hydration failed</div>
+  <script>
+    const hydration = {};
+    hydration.stream = new ReadableStream({
+      start(controller) { hydration.controller = controller; }
+    }).pipeThrough(new TextEncoderStream());
+    hydration.controller.enqueue('["server",{"hydrated":true}]\n');
+    hydration.controller.close();
+
+    (async () => {
+      const decoder = new TextDecoder();
+      let tail = "";
+      const lines = hydration.stream.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+          const complete = (tail + decoder.decode(chunk, {stream: true})).split("\n");
+          tail = complete.pop() || "";
+          for (const line of complete) controller.enqueue(line);
+        },
+        flush(controller) { if (tail) controller.enqueue(tail); }
+      }));
+      const first = await lines.getReader().read();
+      const parsed = JSON.parse(first.value);
+      const passed =
+        !first.done &&
+        parsed[0] === "server" &&
+        parsed[1].hydrated === true;
+      const result = document.getElementById("result");
+      result.textContent = passed ? "streamed hydration passed" : "streamed hydration failed";
+      result.className = passed ? "passed" : "";
+      globalThis.__modernStreamContracts = passed;
+    })().catch((error) => {
+      globalThis.__modernStreamError = String(error);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>table row geometry</title>
+  <style>
+    html, body { margin: 0; }
+    body { font-family: sans-serif; font-size: 13px; }
+    table { position: absolute; border-spacing: 0; }
+    td { padding: 0; }
+
+    #cell-height-is-minimum { left: 0; top: 0; }
+    #cell-height-is-minimum .short {
+      width: 40px;
+      height: 10px;
+      background: #1971c2;
+    }
+    #cell-height-is-minimum .tall { background: #f783ac; }
+    #cell-height-is-minimum .short div { width: 40px; height: 20px; }
+    #cell-height-is-minimum .tall div { width: 50px; height: 30px; }
+
+    #text-over-height { left: 0; top: 60px; }
+    #text-over-height td {
+      width: 100px;
+      height: 10px;
+      line-height: 15px;
+      background: #2b8a3e;
+    }
+
+    #row-height-is-minimum { left: 0; top: 110px; }
+    #row-height-is-minimum tr { height: 40px; }
+    #row-height-is-minimum td { width: 70px; background: #e8590c; }
+    #row-height-is-minimum td div { width: 20px; height: 20px; }
+
+    #rowspan { left: 0; top: 180px; }
+    #rowspan .spanning { background: #7048e8; }
+    #rowspan .spanning div { width: 30px; height: 80px; }
+    #rowspan .row-one { width: 60px; height: 20px; background: #15aabf; }
+    #rowspan .row-two { width: 60px; height: 20px; background: #fab005; }
+
+    #nested-row-reflow {
+      left: 180px;
+      top: 0;
+      width: 700px;
+      background: #f6f6ef;
+    }
+    #nested-row-reflow .header { background: #ff6600; }
+    #nested-row-reflow table { position: static; }
+    #nested-row-reflow .header table {
+      width: 100%;
+      padding: 2px;
+    }
+    #nested-row-reflow .logo {
+      width: 18px;
+      height: 18px;
+      border: 1px solid white;
+      background: #1971c2;
+    }
+    #nested-row-reflow .label {
+      height: 10px;
+      line-height: 16px;
+    }
+    #nested-row-reflow .content table { color: #555; }
+  </style>
+</head>
+<body>
+  <table id="cell-height-is-minimum">
+    <tr>
+      <td class="short"><div></div></td>
+      <td class="tall"><div></div></td>
+    </tr>
+  </table>
+
+  <table id="text-over-height">
+    <tr><td>one line</td></tr>
+  </table>
+
+  <table id="row-height-is-minimum">
+    <tr><td><div></div></td></tr>
+  </table>
+
+  <table id="rowspan">
+    <tr>
+      <td class="spanning" rowspan="2"><div></div></td>
+      <td><div class="row-one"></div></td>
+    </tr>
+    <tr><td><div class="row-two"></div></td></tr>
+  </table>
+
+  <table id="nested-row-reflow">
+    <tr class="header">
+      <td>
+        <table>
+          <tr>
+            <td><div class="logo"></div></td>
+            <td class="label">Header links remain on one line</td>
+            <td>account</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr class="content">
+      <td>
+        <table>
+          <tr><td colspan="2"></td><td>More</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

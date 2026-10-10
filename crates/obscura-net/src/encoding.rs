@@ -13,7 +13,7 @@
 //!
 //! For non-HTML resources (JS, CSS, JSON), only steps 1 and 3 apply.
 
-use encoding_rs::{DecoderResult, EncoderResult, Encoding, UTF_8};
+use encoding_rs::{CoderResult, DecoderResult, EncoderResult, Encoding, UTF_8};
 
 /// WHATWG canonical (lowercased) name for an encoding label, or None if the
 /// label is not a known encoding. Backs `TextDecoder`'s label validation and
@@ -32,17 +32,39 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     } else {
         enc.new_decoder()
     };
+    // Both decode calls write only into the string's spare capacity and stop
+    // with OutputFull when it runs out. Legacy encodings can expand one byte into
+    // three UTF-8 bytes, so grow the buffer and continue until the input is
+    // consumed instead of truncating (or, in fatal mode, rejecting valid input).
+    let mut out = String::with_capacity(bytes.len() + 1);
+    let mut src = bytes;
     if fatal {
-        let mut out = String::with_capacity(bytes.len() + 1);
-        let (res, _) = dec.decode_to_string_without_replacement(bytes, &mut out, true);
-        match res {
-            DecoderResult::InputEmpty => Some(out),
-            _ => None,
+        loop {
+            let (res, read) = dec.decode_to_string_without_replacement(src, &mut out, true);
+            src = &src[read..];
+            match res {
+                DecoderResult::InputEmpty => return Some(out),
+                DecoderResult::OutputFull => out.reserve(
+                    dec.max_utf8_buffer_length_without_replacement(src.len())
+                        .unwrap_or(src.len().saturating_mul(3))
+                        .max(4),
+                ),
+                DecoderResult::Malformed(..) => return None,
+            }
         }
     } else {
-        let mut out = String::with_capacity(bytes.len() * 2 + 1);
-        let _ = dec.decode_to_string(bytes, &mut out, true);
-        Some(out)
+        loop {
+            let (res, read, _) = dec.decode_to_string(src, &mut out, true);
+            src = &src[read..];
+            match res {
+                CoderResult::InputEmpty => return Some(out),
+                CoderResult::OutputFull => out.reserve(
+                    dec.max_utf8_buffer_length(src.len())
+                        .unwrap_or(src.len().saturating_mul(3))
+                        .max(4),
+                ),
+            }
+        }
     }
 }
 
@@ -203,6 +225,71 @@ fn charset_from_content_type(header: &str) -> Option<String> {
     None
 }
 
+/// Return an exact attribute value from a lowercased `<meta ...>` tag.
+///
+/// This deliberately tokenizes attribute names instead of searching for a
+/// substring: `data-charset` and a description containing `charset=...` are
+/// not character encoding declarations.
+fn meta_attribute<'a>(tag: &'a str, target: &str) -> Option<&'a str> {
+    let mut rest = tag.strip_prefix("<meta")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii_whitespace() && !matches!(c, '>' | '/'))
+    {
+        return None;
+    }
+
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+        if rest.is_empty() || rest.starts_with('>') {
+            break;
+        }
+
+        let name_end = rest
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '>' | '/'))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            rest = &rest[rest.chars().next()?.len_utf8()..];
+            continue;
+        }
+
+        let name = &rest[..name_end];
+        rest = rest[name_end..].trim_start();
+
+        let mut value = "";
+        if let Some(after_equals) = rest.strip_prefix('=') {
+            let after_equals = after_equals.trim_start();
+            if let Some(quote) = after_equals
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '"' | '\''))
+            {
+                let quoted = &after_equals[quote.len_utf8()..];
+                if let Some(end) = quoted.find(quote) {
+                    value = &quoted[..end];
+                    rest = &quoted[end + quote.len_utf8()..];
+                } else {
+                    value = quoted;
+                    rest = "";
+                }
+            } else {
+                let end = after_equals
+                    .find(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '/'))
+                    .unwrap_or(after_equals.len());
+                value = &after_equals[..end];
+                rest = &after_equals[end..];
+            }
+        }
+
+        if name.eq_ignore_ascii_case(target) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
 /// Scan the first 1024 bytes for a `<meta charset="...">` or
 /// `<meta http-equiv="Content-Type" content="...; charset=...">` declaration.
 /// We only look at ASCII bytes; valid meta-charset declarations are always
@@ -223,21 +310,21 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
         let end = s[abs..].find('>').map(|e| abs + e).unwrap_or(s.len());
         let tag = &s[abs..end];
 
-        if let Some(charset_pos) = tag.find("charset") {
-            let after = &tag[charset_pos + "charset".len()..];
-            let after = after.trim_start();
-            if let Some(eq_rest) = after.strip_prefix('=') {
-                let value = eq_rest
-                    .trim_start()
-                    .trim_start_matches(|c: char| c == '"' || c == '\'')
-                    .split(|c: char| c == '"' || c == '\'' || c == ';' || c.is_whitespace() || c == '/')
-                    .next()
-                    .unwrap_or("");
-                if !value.is_empty() {
-                    if let Some(enc) = Encoding::for_label(value.as_bytes()) {
-                        return Some(enc);
-                    }
-                }
+        if let Some(enc) = meta_attribute(tag, "charset")
+            .filter(|value| !value.is_empty())
+            .and_then(|value| Encoding::for_label(value.as_bytes()))
+        {
+            return Some(enc);
+        }
+
+        let is_legacy_declaration = meta_attribute(tag, "http-equiv")
+            .is_some_and(|value| value.eq_ignore_ascii_case("content-type"));
+        if is_legacy_declaration {
+            if let Some(enc) = meta_attribute(tag, "content")
+                .and_then(charset_from_content_type)
+                .and_then(|value| Encoding::for_label(value.as_bytes()))
+            {
+                return Some(enc);
             }
         }
 
@@ -253,6 +340,34 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Legacy single-byte encodings can expand one input byte into three UTF-8
+    // bytes (windows-1252 0x80 is U+20AC). The decoder only writes into spare
+    // capacity, so an undersized buffer used to truncate the text or, in fatal
+    // mode, reject valid input.
+    #[test]
+    fn decode_with_label_does_not_truncate_expanding_input() {
+        let euros = [0x80u8; 12];
+        let expected = "€".repeat(12);
+        assert_eq!(
+            decode_with_label("windows-1252", &euros, false, false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decode_with_label("windows-1252", &euros, true, false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decode_with_label("windows-1252", &[0xE9; 4], true, false).as_deref(),
+            Some("éééé")
+        );
+        // Malformed input is still rejected in fatal mode and replaced otherwise.
+        assert_eq!(decode_with_label("utf-8", &[0x61, 0xFF], true, false), None);
+        assert_eq!(
+            decode_with_label("utf-8", &[0x61, 0xFF], false, false).as_deref(),
+            Some("a\u{FFFD}")
+        );
+    }
 
     #[test]
     fn content_type_charset_wins() {
@@ -281,6 +396,19 @@ mod tests {
         let bytes = b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=EUC-KR\"></head></html>";
         let (enc, _) = detect_encoding(bytes, None);
         assert_eq!(enc.name(), "EUC-KR");
+    }
+
+    #[test]
+    fn unrelated_meta_attributes_do_not_declare_a_charset() {
+        for bytes in [
+            &b"<meta name=\"description\" content=\"charset=gbk\">"[..],
+            &b"<meta data-charset=\"gbk\">"[..],
+            &b"<metadata charset=\"gbk\">"[..],
+        ] {
+            let (enc, source) = detect_encoding(bytes, None);
+            assert_eq!(enc.name(), "UTF-8");
+            assert_eq!(source, "default-utf8");
+        }
     }
 
     #[test]

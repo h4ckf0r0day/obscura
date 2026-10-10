@@ -1,0 +1,27 @@
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>quirks form control geometry</title>
+  <style>
+    html, body { margin: 0; }
+    .form-case { width: 300px; }
+    .form-marker { width: 100px; height: 20px; background: #087f5b; }
+    .row {
+      position: absolute;
+      left: 350px;
+      top: 0;
+      display: flex;
+      align-items: flex-start;
+    }
+    .row input { width: 100px; height: 30px; }
+    .override-marker { width: 20px; height: 30px; background: #e8590c; }
+  </style>
+</head>
+<body>
+  <div class="form-case">
+    <form><input size="17"></form>
+    <div class="form-marker"></div>
+  </div>
+  <div class="row"><input size="40"><div class="override-marker"></div></div>
+</body>
+</html>

@@ -1,0 +1,13 @@
+<!DOCTYPE html><html><head><title>box sizing</title><style>
+html{box-sizing:border-box}*,:before,:after{box-sizing:inherit}
+body{margin:0;font-family:sans-serif}.row{display:flex;gap:20px;margin:10px}.box{width:200px;height:70px;padding:10px;border:5px solid #111;background:#2a5;color:white}
+.content{box-sizing:content-box}.border{box-sizing:border-box;background:#286}.parent{box-sizing:content-box;width:400px;border:2px solid #111;margin:10px}.half{width:50%;height:50px;padding:10px;border:5px solid #111;background:#682;color:white}
+.reset{width:200px;height:70px;padding:10px;border:5px solid #111;background:#a37;color:white;margin:10px}
+</style></head><body>
+<p>Left content-box outer size: 230x100. Right border-box outer size: 200x70.</p>
+<div class="row"><div class="box content">content-box</div><div class="box border">border-box</div></div>
+<p>Inside a 400px parent: content-box 50% outer width 230; border-box 50% outer width 200.</p>
+<div class="parent"><div class="half content">50% content-box</div><div class="half border">50% border-box</div></div>
+<p>The common html border-box / universal inherit reset stays 200x70.</p>
+<div class="reset">inherited border-box</div>
+</body></html>

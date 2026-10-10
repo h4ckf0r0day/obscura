@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>video poster replaced content</title>
+<style>
+  html, body { margin: 0; background: white; }
+  video { position: absolute; }
+  #intrinsic { left: 20px; top: 20px; }
+  #positioned {
+    left: 20px;
+    top: 150px;
+    width: 100px;
+    height: 100px;
+    object-fit: cover;
+    object-position: right center;
+    border-radius: 20px;
+    opacity: .5;
+  }
+  #position-only {
+    left: 150px;
+    top: 150px;
+    width: 100px;
+    height: 100px;
+    object-fit: cover;
+    object-position: right center;
+  }
+</style>
+<video id="intrinsic" poster="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='300'%20height='100'%3E%3Crect%20width='100'%20height='100'%20fill='%23ff0000'/%3E%3Crect%20x='100'%20width='100'%20height='100'%20fill='%2300ff00'/%3E%3Crect%20x='200'%20width='100'%20height='100'%20fill='%230000ff'/%3E%3C/svg%3E"></video>
+<video id="positioned" poster="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='300'%20height='100'%3E%3Crect%20width='100'%20height='100'%20fill='%23ff0000'/%3E%3Crect%20x='100'%20width='100'%20height='100'%20fill='%2300ff00'/%3E%3Crect%20x='200'%20width='100'%20height='100'%20fill='%230000ff'/%3E%3C/svg%3E"></video>
+<video id="position-only" poster="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='300'%20height='100'%3E%3Crect%20width='100'%20height='100'%20fill='%23ff0000'/%3E%3Crect%20x='100'%20width='100'%20height='100'%20fill='%2300ff00'/%3E%3Crect%20x='200'%20width='100'%20height='100'%20fill='%230000ff'/%3E%3C/svg%3E"></video>

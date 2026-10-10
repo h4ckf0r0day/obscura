@@ -36,8 +36,16 @@ pub async fn handle(
         "setCookies" => {
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
                 let parsed: Vec<_> = cookies.iter().filter_map(parse_cdp_cookie).collect();
-                cookie_jar_for(ctx, params, session_id)?.set_cookies_from_cdp(parsed);
+                cookie_jar_for(ctx, params, session_id)?.set_cookies_from_cdp_with_scope(
+                    parsed
+                        .into_iter()
+                        .map(|cookie| (cookie.cookie, cookie.host_only)),
+                );
             }
+            Ok(json!({}))
+        }
+        "clearCookies" => {
+            cookie_jar_for(ctx, params, session_id)?.clear();
             Ok(json!({}))
         }
         "deleteCookies" => {
@@ -51,5 +59,70 @@ pub async fn handle(
             Ok(json!({}))
         }
         _ => Ok(json!({})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obscura_net::CookieInfo;
+
+    fn sample_cookie(value: &str) -> CookieInfo {
+        CookieInfo {
+            name: "sid".to_string(),
+            value: value.to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_cookies_is_scoped_to_browser_context() {
+        let mut ctx = CdpContext::new();
+        let browser_context_id = ctx.create_browser_context();
+        ctx.browser_context(&browser_context_id)
+            .unwrap()
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("isolated")]);
+        ctx.default_context
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("default")]);
+
+        handle(
+            "clearCookies",
+            &json!({ "browserContextId": browser_context_id }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx
+            .browser_context(&browser_context_id)
+            .unwrap()
+            .cookie_jar
+            .get_all_cookies()
+            .is_empty());
+        let default = ctx.default_context.cookie_jar.get_all_cookies();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].value, "default");
+    }
+
+    #[tokio::test]
+    async fn clear_cookies_without_context_clears_default_context() {
+        let mut ctx = CdpContext::new();
+        ctx.default_context
+            .cookie_jar
+            .set_cookies_from_cdp(vec![sample_cookie("default")]);
+
+        handle("clearCookies", &json!({}), &mut ctx, &None)
+            .await
+            .unwrap();
+
+        assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
     }
 }

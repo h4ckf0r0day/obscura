@@ -15,14 +15,15 @@ What `--stealth` changes:
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
 - Bundles webpki roots instead of relying on the system store.
 
-Requires a build that includes the stealth feature. The Releases page provides
-explicitly named `-stealth` archives alongside the lean default archives, so
-users who do not need wreq/BoringSSL do not pay its binary-size or RSS cost. To
-build the stealth variant yourself:
+Requires a build that includes the stealth feature. Use a `-stealth` archive
+with rendering or a `-no-render-stealth` archive without it. To build the
+rendering variant yourself:
 
 ```bash
-cargo build --release --features stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
 ```
+
+Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-features --features stealth`.
 
 ## What stealth handles
 
@@ -68,7 +69,7 @@ Default UA matches a recent Chrome on the build platform.
 
 ## Browser profile, timezone, and geolocation
 
-The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), the UA string, and the WebGL/GPU renderer internally consistent, so the surfaces a site fingerprints agree with each other. Windows profiles report ANGLE Direct3D11 renderers, macOS profiles report ANGLE Metal renderers.
+The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), and the UA string internally consistent, so the surfaces a site fingerprints agree with each other. There is no GPU renderer among them: `canvas.getContext('webgl')` returns `null`, so a page cannot read a renderer string at all.
 
 A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
 

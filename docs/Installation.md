@@ -48,7 +48,10 @@ yay -S obscura-browser
 docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
 ```
 
-Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc`, ~57 MB compressed.
+Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc:nonroot`, with no shell or package manager in the runtime image, running as uid 65532. Note the `-p 127.0.0.1:...` above: it publishes the port to host loopback only. A mounted `--storage-dir` must be writable by uid 65532 — see [Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
+
+Official archives and the Docker image include the rendering engine. Source
+builders must pass `--features render`; see [Build from source](Build-from-source.md).
 
 ## From source
 
@@ -59,17 +62,18 @@ See [Build from source](Build-from-source.md).
 - `obscura`: CLI and CDP server.
 - `obscura-worker`: helper for the parallel `scrape` command. Keep both in the same directory.
 
-The standard archive names contain the lean default build. Choose the matching
-archive with a `-stealth` suffix when you need the wreq/BoringSSL transport for
-TLS impersonation.
+Archive suffixes identify the feature set: no suffix includes rendering,
+`-stealth` includes rendering and stealth, `-no-render` includes neither, and
+`-no-render-stealth` includes stealth without rendering.
 
 ## Smoke test
 
 ```bash
 ./obscura fetch https://example.com --eval "document.title"
+./obscura fetch https://example.com --screenshot smoke.png
 ```
 
-Expected output: `"Example Domain"`.
+Expected output: `"Example Domain"`, followed by a nonempty PNG at `smoke.png`.
 
 ## Troubleshooting
 

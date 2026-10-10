@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>opposing header floats</title>
+  <style>
+    html, body { margin: 0; }
+    #header { width: 900px; }
+    #logo {
+      float: left;
+      width: 200px;
+      height: 100px;
+      background: #1971c2;
+    }
+    #tagline {
+      float: right;
+      width: 300px;
+      height: 40px;
+      margin-top: 60px;
+      background: #e8590c;
+    }
+    #menu {
+      clear: both;
+      height: 50px;
+      background: #087f5b;
+    }
+  </style>
+</head>
+<body>
+  <header id="header">
+    <a id="logo-link"><div id="logo"></div></a>
+    <div id="legacy-empty"></div>
+    <div id="tagline"></div>
+    <nav id="menu"></nav>
+  </header>
+</body>
+</html>

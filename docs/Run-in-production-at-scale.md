@@ -1,16 +1,52 @@
 ## Docker
 
 ```bash
+# The container runs as uid 65532, so a mounted storage dir must be writable
+# by it. Without this the cookie jar silently fails to persist.
+sudo install -d -o 65532 -g 65532 /srv/obscura/data
+
 docker run -d \
   --name obscura \
   --restart unless-stopped \
   -p 127.0.0.1:9222:9222 \
+  -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/obscura/data:/data \
   h4ckf0r0day/obscura \
   serve --host 0.0.0.0 --storage-dir /data --stealth
 ```
 
 The image runs `obscura serve` by default. Override with arguments after the image name.
+
+### The container does not run as root
+
+The image is built on `gcr.io/distroless/cc-debian12:nonroot` and runs as
+uid/gid **65532**. Obscura executes untrusted page JavaScript in-process through
+V8, so a V8 exploit lands with the process's privileges — there is no reason for
+those to be root's.
+
+Two consequences worth knowing:
+
+- **A mounted `--storage-dir` must be writable by uid 65532**, as above. This is
+  the one thing that breaks quietly rather than loudly. Verified: with an
+  unwritable storage dir Obscura completes the run, exits `0`, and prints no
+  warning — the cookie jar simply never persists. Check that
+  `{storage-dir}/cookies.json` exists after your first run rather than assuming
+  it does.
+- **Nothing in the image needs a privileged operation.** It binds an
+  unprivileged port, reads the CA bundle, and writes only to the storage dir and
+  a temp dir. Verified in the non-root image: an HTTPS fetch succeeds, so the CA
+  bundle is readable, and a writable storage dir is populated.
+
+### Why the in-container bind is `0.0.0.0`
+
+A container-loopback bind is unreachable through `-p`, so `--host 0.0.0.0` is
+required for the published port to work at all. Publish to **host loopback**
+(`-p 127.0.0.1:9222:9222`, as above) rather than `-p 9222:9222`: the latter
+exposes the port on every host interface, and Docker's iptables rules bypass
+most host firewalls.
+
+The container bind requires `OBSCURA_CDP_TOKEN`. Send it as a bearer token from
+the CDP client and still publish the port to host loopback where possible.
 
 ## Systemd
 
@@ -50,13 +86,13 @@ Use one worker per CPU core. Each worker handles its own pool of pages. Sessions
 
 ## V8 heap
 
-Default V8 heap is 4 GB on 64-bit systems. The defaults also cap the young generation (`--max-semi-space-size=4`) and pass `--optimize-for-size` to hold RSS down. Override:
+The V8 old-generation ceiling is 4 GB on 64-bit systems. The defaults request `--max-semi-space-size=4`, but the current V8's `--optimize-for-size` implication overrides the effective semi-space cap to 1 MiB. Override the old-generation ceiling with:
 
 ```bash
-obscura serve --v8-flags "--max-old-space-size=2048"
+obscura --v8-flags "--max-old-space-size=2048" serve
 ```
 
-Flags you pass are appended after the defaults, and V8 uses the last value for a repeated flag, so your `--max-old-space-size` wins while the memory-tuning defaults stay in effect. Lower for memory-constrained hosts, raise for heavy SPAs.
+Flags you pass are appended after the defaults, so this old-generation override retains memory tuning. To change the young-generation cap, also pass `--no-optimize-for-size`; V8's flag implications otherwise override your cap. Disabling size optimization can save GC CPU but increase peak memory. Benchmark both before changing production defaults.
 
 ## Parallel scrape
 
@@ -112,24 +148,26 @@ CDP needs WebSocket upgrade and long read timeouts.
 
 ## Authentication
 
-Obscura's CDP server has no built-in auth. Anyone who can reach the port can drive the browser. Options:
+Obscura requires `OBSCURA_CDP_TOKEN` (at least 32 bytes) for every non-loopback
+CDP bind. Pass it in the client's `Authorization` header. Also:
 
 - Bind to `127.0.0.1` and require SSH for access (default).
-- Put it behind a reverse proxy that enforces auth.
+- Put it behind a reverse proxy that enforces an additional auth boundary.
 - Use Docker network isolation.
 
 Never bind `0.0.0.0` on a public IP without one of the above.
 
 ## MCP HTTP transport
 
-`obscura mcp --http` binds `127.0.0.1` by default. To reach it from another container, bind with `--host 0.0.0.0` and set an `Origin` allowlist so a browser page cannot drive it cross-origin:
+`obscura mcp --http` binds `127.0.0.1` by default. A non-loopback bind requires a bearer token. Browser origins are denied by default; set an allowlist only when a browser-based MCP client needs access:
 
 ```bash
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" \
 OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
   obscura mcp --http --host 0.0.0.0 --port 3000
 ```
 
-Request bodies are capped at 16 MiB. Like the CDP server it has no built-in auth, so keep it on an internal network or behind an authenticating proxy. See [Use the MCP server](Use-the-MCP-server.md).
+Request bodies and headers, batch size, pending requests, and connections are bounded. Keep the service on an internal network even with authentication. See [Use the MCP server](Use-the-MCP-server.md).
 
 ## Observability
 
@@ -148,9 +186,11 @@ Tune the bounds with environment variables (see [Environment variables](Environm
 
 ```bash
 OBSCURA_NAV_TIMEOUT_MS=60000 \
-OBSCURA_CDP_COMMAND_TIMEOUT_MS=30000 \
+OBSCURA_SCRIPT_DEADLINE_MS=45000 \
+OBSCURA_MODULE_BUDGET_MS=10000 \
+OBSCURA_CDP_COMMAND_TIMEOUT_MS=70000 \
 OBSCURA_FETCH_TIMEOUT_MS=20000 \
   obscura serve
 ```
 
-`OBSCURA_NAV_TIMEOUT_MS` is the per-navigation ceiling (default 30000). `OBSCURA_CDP_COMMAND_TIMEOUT_MS` is the per-CDP-command V8 deadline (default 60000, `0` disables). `OBSCURA_FETCH_TIMEOUT_MS` bounds scripted fetch/XHR and module loads (default 30000).
+`OBSCURA_NAV_TIMEOUT_MS` is the per-navigation ceiling (default 30000). `OBSCURA_SCRIPT_DEADLINE_MS` bounds the complete script phase (default 30000), while `OBSCURA_MODULE_BUDGET_MS` bounds each enhancement module's graph loading and evaluation (default 3000; unmounted SPA shells use the full script deadline). `OBSCURA_CDP_COMMAND_TIMEOUT_MS` is the outer per-CDP-command V8 deadline (default 60000, `0` disables), so keep it above the navigation ceiling. `OBSCURA_FETCH_TIMEOUT_MS` bounds scripted fetch/XHR and module network requests (default 30000).

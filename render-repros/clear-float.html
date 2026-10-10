@@ -1,0 +1,12 @@
+<!DOCTYPE html><html><head><title>clear</title><style>body{margin:0;font-family:sans-serif;width:500px}
+.thumb{float:left;width:120px;height:80px;background:#8bd}
+.cleared{clear:both;background:#fc6;height:40px}
+</style></head><body>
+<p>clear:both must drop BELOW the float at full width (orange bar under the blue thumb):</p>
+<div>
+  <div class="thumb"></div>
+  <p style="margin:4px 0">short text beside the float.</p>
+  <div class="cleared">CLEARED: full width below</div>
+  <p>after content flows normally.</p>
+</div>
+</body></html>

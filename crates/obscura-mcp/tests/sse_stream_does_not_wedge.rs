@@ -72,7 +72,6 @@ async fn open_sse_stream_does_not_block_other_requests() {
                 .expect("second connection refused");
             let req = b"OPTIONS /mcp HTTP/1.1\r\n\
                         Host: 127.0.0.1\r\n\
-                        Origin: https://dashboard.example.com\r\n\
                         Access-Control-Request-Method: POST\r\n\
                         \r\n";
             stream.write_all(req).await.unwrap();

@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>viewport consistency</title>
+<style>
+  html, body { margin: 0; }
+  .probe {
+    position: absolute;
+    left: 10px;
+    width: 200px;
+    height: 80px;
+    background: #c92a2a;
+  }
+  #width-probe { top: 10px; }
+  #height-probe { top: 110px; }
+  #script-probe { top: 210px; }
+  @media (max-width: 950px) {
+    #width-probe { background: #087f5b; }
+  }
+  @media (min-height: 900px) {
+    #height-probe { background: #1971c2; }
+  }
+  #script-probe.viewport-match { background: #7048e8; }
+</style>
+<div id="width-probe" class="probe"></div>
+<div id="height-probe" class="probe"></div>
+<div id="script-probe" class="probe"></div>
+<script>
+  if (innerWidth === 900 && innerHeight === 1000 &&
+      visualViewport.width === 900 && visualViewport.height === 1000) {
+    document.getElementById('script-probe').classList.add('viewport-match');
+  }
+</script>

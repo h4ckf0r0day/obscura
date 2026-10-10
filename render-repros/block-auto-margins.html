@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>block auto margins</title>
+  <style>
+    html, body { margin: 0; }
+    .row { display: block; width: 100%; height: 80px; overflow: hidden; }
+    .box { height: 40px; margin-top: 20px; }
+    .center-fixed { width: 300px; margin-left: auto; margin-right: auto; background: #087f5b; }
+    .center-capped { width: 70%; max-width: 500px; margin-left: auto; margin-right: auto; background: #1971c2; }
+    .push-end { width: 200px; margin-left: auto; margin-right: 50px; background: #e8590c; }
+    .push-start { width: 200px; margin-left: 50px; margin-right: auto; background: #7048e8; }
+    .auto-width { width: auto; margin-left: auto; margin-right: auto; background: #c2255c; }
+  </style>
+</head>
+<body>
+  <div class="row"><div class="box center-fixed"></div></div>
+  <div class="row"><div class="box center-capped"></div></div>
+  <div class="row"><div class="box push-end"></div></div>
+  <div class="row"><div class="box push-start"></div></div>
+  <div class="row"><div class="box auto-width"></div></div>
+</body>
+</html>

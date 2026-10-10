@@ -1,0 +1,21 @@
+<!DOCTYPE html><html><head><title>tables</title><style>
+body{margin:0;font-family:sans-serif;font-size:13px}
+table{border-collapse:separate;border-spacing:2px;background:#eee}
+td,th{background:#cde;padding:4px}
+.w1 td.fixed{width:200px;background:#fc9}
+.rowbg tr.hl{background:#f66}
+.va td{height:70px}
+</style></head><body>
+<p>T1: td width:200px must set the whole COLUMN to 200px:</p>
+<table class="w1"><tr><td class="fixed">fixed 200</td><td>auto col</td></tr>
+<tr><td>second row same col</td><td>x</td></tr></table>
+<p>T2: tr background must show behind its cells' gaps:</p>
+<table class="rowbg"><tr><td>normal</td><td>row</td></tr>
+<tr class="hl"><td style="background:transparent">HIGHLIGHTED</td><td style="background:transparent">ROW</td></tr></table>
+<p>T3: cell text CENTERS vertically by default; top/bottom explicit:</p>
+<table class="va"><tr><td>default middle</td><td style="vertical-align:top">explicit top</td><td style="vertical-align:bottom">explicit bottom</td></tr></table>
+<p>T4: col width=150 must size column 1:</p>
+<table><colgroup><col style="width:150px"><col></colgroup><tr><td>col 150</td><td>auto</td></tr></table>
+<p>T5: percent width cell 50% of a 400px table (~198px):</p>
+<table style="width:400px"><tr><td style="width:50%;background:#9f9">half</td><td>rest</td></tr></table>
+</body></html>

@@ -29,16 +29,33 @@ A few notes to keep the project maintainable:
 
 ## Building
 
+Obscura supports four release configurations. Keep all four building when you
+change feature gates or shared code:
+
+| Configuration | Command |
+| --- | --- |
+| Rendering | `cargo build --release -p obscura-cli --bins --features render` |
+| Rendering and stealth | `cargo build --release -p obscura-cli --bins --features render,stealth` |
+| No rendering | `cargo build --release -p obscura-cli --bins --no-default-features` |
+| No rendering, with stealth | `cargo build --release -p obscura-cli --bins --no-default-features --features stealth` |
+
+The standard release archives and Docker image include rendering. The
+`-no-render` release variants keep the smaller DOM, JavaScript, networking,
+CDP, and automation runtime but intentionally omit screenshots, screencast,
+and PDF output.
+
 ```bash
-cargo build --release        # binary at ./target/release/obscura
+cargo build --release -p obscura-cli --bins --features render
+# binary at ./target/release/obscura
 ```
 
 - The first build compiles V8 from source: roughly 5 minutes and a few GB of
   disk. Incremental builds are seconds.
 - Iterating on one crate? Scope it: `cargo build -p obscura-cli`.
-- **Stealth** (`--features stealth`) pulls in BoringSSL through CMake, so `cmake`
-  must be installed. The default build uses rustls and needs neither CMake nor
-  OpenSSL.
+- **Stealth** (`--features render,stealth`) retains rendering and adds the
+  wreq/BoringSSL transport, browser-identity protections, and tracker blocklist.
+  BoringSSL builds through CMake, so `cmake` must be installed. The rendering
+  build uses rustls and needs neither CMake nor OpenSSL.
 - If the vendored OpenSSL build hits an AVX-512 assembler error on your host,
   build with `OPENSSL_NO_VENDOR=1`.
 
@@ -47,8 +64,14 @@ cargo build --release        # binary at ./target/release/obscura
 Run tests with **`cargo nextest`, not `cargo test`**:
 
 ```bash
-cargo nextest run --workspace        # or -p <crate> while iterating
+cargo nextest run --release --features render -p <crate>
+cargo nextest run --release --features render --no-fail-fast
 ```
+
+If you changed shared DOM, JavaScript, CDP, CLI, or feature-gated code, also
+run the affected tests without rendering and build the no-render variant. A
+render-only request made through a no-render binary must return a clear
+unsupported error rather than panic or silently produce an invalid result.
 
 `cargo test` runs the whole test binary in one process, but the engine holds a
 single V8 isolate per process, so the runtime tests fail under it. `nextest`
@@ -64,19 +87,67 @@ OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --w
 
 It serves local fixtures, so it is deterministic and offline.
 
+## Rendering changes
+
+The native renderer is shared by every capture surface:
+
+- CLI `fetch --screenshot` (`-s`), including viewport and full-page captures.
+- CDP `Page.captureScreenshot`, `Page.startScreencast`,
+  `Page.stopScreencast`, and `Page.printToPDF`.
+- Puppeteer and Playwright screenshot and PDF calls made through CDP.
+- MCP `browser_screenshot` and `browser_pdf`.
+
+It currently covers block, inline, flex, grid, table, float, positioned,
+overflow, and transformed layout, plus text, images, SVG, canvas, backgrounds,
+borders, animation, fixed and sticky elements, and screen and print output.
+This is an independent engine, not Chromium, so long-tail CSS, media,
+compositor behavior, and platform font rasterization can still differ. Fix the
+underlying layout or paint rule instead of adding site-specific behavior.
+
+For layout, style, paint, image, animation, viewport, scrolling, or pagination
+changes:
+
+1. Add or update a small deterministic fixture in `render-repros/` that
+   isolates the behavior.
+2. Build the render binary, then run `render-repros/run.sh`. This captures each
+   fixture in Obscura and Chromium and runs the structural checks.
+3. Run `render-repros/representative-suite/run.sh <new-output-dir>` at the top
+   of the configured pages, then run it again with `bottom` as the second
+   argument. The output directory must not already exist.
+4. Exercise the affected public surface, not just the renderer internally. In
+   particular, cover clipped and full-page screenshots, viewport size and
+   device-pixel ratio, and a scrolled page when geometry is involved.
+5. If lifecycle or animation scheduling changed, verify screencast frame
+   delivery and acknowledgment. If print layout changed, verify PDF page size,
+   margins, backgrounds, page ranges, and stream output where relevant.
+6. Compare old and new revisions with identical release builds, fixtures,
+   viewport, device-pixel ratio, fonts, network state, settle time, scroll
+   position, and capture options. Confirm resources loaded successfully before
+   interpreting image differences.
+
+Pixel deltas are useful tripwires, but they are not a fidelity score by
+themselves. Include the focused repro, before and after images, structural
+metrics, and any remaining expected difference in the PR. Rendering work must
+also preserve non-render automation behavior and the no-render build.
+
 ## Before you open a PR
 
 For any code change:
 
-1. `cargo build --release` (or `-p <crate>`) compiles clean.
-2. `cargo nextest run` passes for the crates you touched.
-3. The obstacle course still reports **33/33**.
-4. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
-   about 6x less memory than headless Chrome on framework pages. Keep the native
+1. `cargo nextest run --release --features render` passes for the crates you touched.
+2. The full render-feature nextest command above passes.
+3. `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render` compiles clean.
+4. The obstacle course still reports **33/33**.
+5. **Performance is a hard constraint.** Obscura is roughly 12x faster and uses
+   about 6x less memory than headless Chrome on framework pages. Keep native
    Rust fast paths and add a JS fallback only for real spec edge cases. If your
-   change could affect performance, benchmark old vs new interleaved, min-of-N
-   (the noise floor is about plus or minus 10%).
-5. For stealth changes, re-test with `--stealth`. A non-stealth binary does not
+   change could affect performance, benchmark old and new revisions interleaved
+   with identical release builds, fixtures, networks, viewport, settle policy,
+   and capture path. Report a distribution and memory use; the noise floor is
+   about plus or minus 10%.
+6. For rendering changes, complete the rendering checks above. For shared or
+   feature-gated changes, also build and test without the `render` feature.
+7. For stealth changes, re-test with `--stealth`. A non-stealth binary does not
    exercise the `wreq` path.
 
 Keep ops panic-safe: a panic in an op must degrade to a null result, never
@@ -120,11 +191,15 @@ Fixes #316.
 Open an issue with enough detail to reproduce:
 
 - The obscura version or commit, plus OS and architecture.
+- The build configuration: render, render and stealth, no-render, or no-render
+  and stealth.
 - A repro: a URL, an `--eval` snippet, or a short CDP sequence.
 - What you expected and what actually happened.
 - If it is a rendering or compatibility issue, whether headless Chrome behaves
-  the same. Anti-bot, CAPTCHA, and login walls block headless Chrome too from a
-  datacenter IP, so those are not engine bugs.
+  the same. Include the viewport, device-pixel ratio, scroll position, capture
+  mode, screenshot clip or full-page setting, and PDF options where applicable.
+  Anti-bot, CAPTCHA, and login walls block headless Chrome too from a datacenter
+  IP, so those are not engine bugs.
 
 Multi-statement `--eval` that starts with `const` returns `null` (V8 gives
 `const` an empty completion value). Wrap repro snippets in an IIFE:

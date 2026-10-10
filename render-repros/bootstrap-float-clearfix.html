@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box }
+  html, body { margin: 0 }
+  .row { width: 100%; min-height: 720px; background: #212326 }
+  .row::before, .row::after { content: " "; display: table }
+  .row::after { clear: both }
+  .column { float: left; width: 100%; min-height: 1px; height: 100vh; background: #087f5b }
+  .centered {
+    position: relative;
+    min-height: 900px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #1971c2;
+  }
+  .card { width: 400px; height: 500px; background: #f8f9fa }
+</style>
+<section class="row">
+  <div class="column">
+    <div class="centered">
+      <div class="card"></div>
+    </div>
+  </div>
+</section>

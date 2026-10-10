@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PDF print media oracle</title>
+<style>
+  @import url("./pdf-print-import.css") print;
+  * { box-sizing: border-box }
+  html, body { margin: 0; width: 800px; min-height: 1000px }
+  body { background: #e02020; color: white; font: 32px/1.2 sans-serif }
+  .page { width: 800px; min-height: 1000px; padding: 80px }
+  .screen-only { display: block }
+  .print-only { display: none }
+  .screen-marker { display: none }
+  .print-marker { display: none }
+  .print-import-marker { display: none }
+  @media screen {
+    .screen-marker { display: block }
+  }
+  @media print {
+    body { background: #2050e0 }
+    .screen-only { display: none }
+    .print-only { display: block }
+  }
+</style>
+<style media="print">
+  .print-marker {
+    display: block;
+    width: 320px;
+    height: 180px;
+    margin-top: 80px;
+    padding: 40px;
+    background: #f0d020;
+    color: #101010;
+  }
+</style>
+<style media="screen">
+  .screen-marker {
+    width: 320px;
+    height: 180px;
+    margin-top: 80px;
+    padding: 40px;
+    background: #20c040;
+  }
+</style>
+<main class="page">
+  <div class="screen-only">SCREEN ONLY</div>
+  <div class="print-only">PRINT ONLY</div>
+  <div class="screen-marker">SCREEN STYLESHEET</div>
+  <div class="print-marker">PRINT STYLESHEET</div>
+  <div class="print-import-marker">PRINT IMPORT</div>
+</main>

@@ -19,9 +19,10 @@ pub struct BrowserContext {
     /// Default is false: a remote CDP client cannot point the browser
     /// at /etc/shadow even if Obscura is running as a privileged user.
     /// Flip on via `obscura serve --allow-file-access` for legitimate
-    /// local-HTML testing workflows. The CLI's own `obscura fetch
-    /// file://...` path is unaffected because it does not go through
-    /// the CDP server.
+    /// local-HTML testing workflows. Enforced by `Page` navigation itself,
+    /// so every CDP and MCP route is covered; the CLI's own `obscura fetch
+    /// file://...` opts its local context in. A page can never drive
+    /// itself from a web origin into file:// regardless of this flag.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     /// When true, the http client allows fetching localhost / RFC1918 /
@@ -160,7 +161,7 @@ impl BrowserContext {
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         if persistent {
-            cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
+            cookie_jar.copy_from(&self.cookie_jar);
         }
 
         let mut client = ObscuraHttpClient::with_full_options(
@@ -260,6 +261,10 @@ mod tests {
 
         assert_eq!(persistent.cookie_jar.get_all_cookies().len(), 1);
         assert!(incognito.cookie_jar.get_all_cookies().is_empty());
+        assert!(persistent
+            .cookie_jar
+            .get_cookie_header(&url::Url::parse("https://sub.example.com").unwrap())
+            .is_empty());
         persistent.cookie_jar.clear();
         persistent.http_client.set_user_agent("Changed-UA/2.0").await;
 

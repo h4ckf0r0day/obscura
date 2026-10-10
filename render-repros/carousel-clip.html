@@ -1,0 +1,16 @@
+<!DOCTYPE html><html><head><title>carousel clip</title><style>
+body{margin:0;font-family:sans-serif}
+.viewport{width:300px;height:110px;overflow:hidden;border:2px solid red;margin:8px;position:relative}
+.track{display:flex;width:900px;transform:translate(-300px,0)}
+.slide{width:300px;height:100px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:24px}
+.s1{background:#e33}.s2{background:#3a3}.s3{background:#36e}
+</style></head><body>
+<p>Track translated -300px: ONLY slide TWO (green) may be visible.</p>
+<div class="viewport"><div class="track">
+  <div class="slide s1">ONE</div><div class="slide s2">TWO</div><div class="slide s3">THREE</div>
+</div></div>
+<p>Control (transform:none): only slide ONE (red) visible.</p>
+<div class="viewport"><div class="track" style="transform:none">
+  <div class="slide s1">ONE</div><div class="slide s2">TWO</div><div class="slide s3">THREE</div>
+</div></div>
+</body></html>

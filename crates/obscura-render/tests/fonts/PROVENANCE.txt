@@ -1,0 +1,14 @@
+obscura-vf-test.woff2.b64
+
+Source: Inter variable Roman Latin webfont served by https://vuejs.org/
+Upstream: https://github.com/rsms/inter
+Upstream version recorded in the font: 4.001;git-9221beed3
+License: SIL Open Font License 1.1 (see LICENSE-OFL-1.1.txt)
+
+The test fixture was subset with fontTools 4.29.1 to U+0020, U+0041,
+U+004D, U+0061, and U+006D while retaining the opsz and wght variation axes.
+All family, full, PostScript, unique, and named-instance records were renamed
+from the OFL reserved name to "Obscura VF Test" / "ObscuraVFTest" variants.
+The original copyright attribution remains in the font's copyright record.
+
+The WOFF2 is stored as base64 text so repository edits remain reviewable.

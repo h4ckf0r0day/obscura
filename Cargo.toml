@@ -2,11 +2,13 @@
 resolver = "2"
 members = [
     "crates/obscura-dom",
+    "crates/obscura-ssrf",
     "crates/obscura-net",
     "crates/obscura-browser",
     "crates/obscura-cdp",
     "crates/obscura-js",
     "crates/obscura-mcp",
+    "crates/obscura-render",
     "crates/obscura-cli",
     "crates/obscura",
 ]
@@ -19,17 +21,25 @@ repository = "https://github.com/h4ckf0r0day/obscura"
 
 [workspace.dependencies]
 obscura-dom = { path = "crates/obscura-dom" }
+obscura-ssrf = { path = "crates/obscura-ssrf" }
 obscura-net = { path = "crates/obscura-net" }
 obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
+obscura-render = { path = "crates/obscura-render" }
 
-html5ever = "0.29"
-markup5ever = "0.14"
+html5ever = "0.39"
+markup5ever = "0.39"
 selectors = "0.26"
 servo_arc = "0.4"
 cssparser = "0.34"
+# Layout engine for the optional render layer (obscura-render). Pure Rust.
+taffy = "0.12"
+# CPU-only pure-Rust 2D rasterizer for the render layer's paint step.
+tiny-skia = "0.12"
+# Pure-Rust glyph rasterizer for the render layer's text step.
+ab_glyph = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
 # No "cookies" feature: obscura manages cookies through its own CookieJar
@@ -48,9 +58,23 @@ thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
 
+[patch.crates-io]
+# Keep the grid shrink-to-fit correction local until it lands upstream.
+taffy = { path = "vendor/taffy" }
+# Carry the same canonical variable-font coordinates through shaping and
+# rasterization until the upstream API exposes them.
+cosmic-text = { path = "vendor/cosmic-text" }
+
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return
 # instead of unwinding into V8's FFI frame and aborting the process. panic="abort"
 # would turn every catchable op panic into a hard crash.
 [profile.release]
 panic = "unwind"
+
+[profile.release-dist]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

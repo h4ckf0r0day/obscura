@@ -211,6 +211,9 @@ fn is_raw_text_element(tag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use html5ever::{LocalName, QualName};
+
+    use crate::tree::{NodeData, ShadowRootMode};
     use crate::tree_sink::parse_html;
 
     #[test]
@@ -299,5 +302,30 @@ mod tests {
                 "comment data still contains a raw '>': {serialized}"
             );
         }
+    }
+
+    #[test]
+    fn host_serialization_excludes_its_native_shadow_tree() {
+        let tree = parse_html(r#"<x-card id="host"><span id="light">light</span></x-card>"#);
+        let host = tree.get_element_by_id("host").unwrap();
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let shadow = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from("strong")),
+            attrs: Vec::new(),
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        let shadow_text = tree.new_node(NodeData::Text {
+            contents: "shadow".to_string(),
+        });
+        tree.append_child(root, shadow);
+        tree.append_child(shadow, shadow_text);
+
+        assert_eq!(tree.inner_html(host), r#"<span id="light">light</span>"#);
+        assert_eq!(
+            tree.outer_html(host),
+            r#"<x-card id="host"><span id="light">light</span></x-card>"#
+        );
+        assert_eq!(tree.inner_html(root), "<strong>shadow</strong>");
     }
 }

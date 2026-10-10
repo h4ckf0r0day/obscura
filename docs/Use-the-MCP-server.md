@@ -28,16 +28,17 @@ obscura mcp --stealth --proxy http://proxy.example.com:8080
 
 ## Security
 
-The HTTP transport has no built-in auth, so anyone who can reach the port can drive the browser. Two guards ship for the HTTP transport:
+The HTTP transport exposes a privileged browser session. Its guards are:
 
-- **Origin allowlist.** Set `OBSCURA_MCP_ALLOWED_ORIGINS` to a comma-separated list of allowed `Origin` values. When set, a browser request from an unlisted origin is refused with `403` before it can drive the server, which blocks a malicious page from POSTing to a loopback MCP port. Native, non-browser clients send no `Origin` and are always allowed. Unset (the default) keeps the permissive behavior.
-- **Body cap.** A single request body is capped at 16 MiB, so an unauthenticated caller cannot force a large allocation with an oversized `Content-Length`.
+- **Bearer authentication.** Set `OBSCURA_MCP_TOKEN` and send it in the `Authorization: Bearer ...` header. A non-loopback bind is refused without a token of at least 32 bytes.
+- **Origin allowlist.** Browser requests are refused by default. Set `OBSCURA_MCP_ALLOWED_ORIGINS` to permit specific browser origins. Native clients send no `Origin` and are unaffected.
+- **Resource bounds.** Request bodies, headers, JSON-RPC batches, pending work, and live connections are bounded.
 
 ```bash
-OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" obscura mcp --http --host 0.0.0.0
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" \
+OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
+  obscura mcp --http --host 0.0.0.0
 ```
-
-When you expose the HTTP transport beyond loopback, set the allowlist and put it behind a reverse proxy or network isolation that enforces auth.
 
 ## Tools exposed
 
@@ -49,7 +50,8 @@ Navigation and lifecycle:
 
 Read the page:
 
-- `browser_snapshot`: accessibility/DOM snapshot of the current page.
+- `browser_snapshot`: current URL, title, readable body text, and interactive
+  element references. Optional `max_chars` limits the returned text.
 - `browser_markdown`, `browser_links`, `browser_extract`: page as markdown, link list, or structured content.
 - `browser_interactive_elements`, `browser_detect_forms`: actionable elements and form fields.
 - `browser_get_attribute`, `browser_count`, `browser_search`: read an attribute, count matches, find text.
@@ -66,6 +68,16 @@ Diagnostics:
 
 - `browser_network_requests`, `browser_console_messages`
 
+Visual output (render-enabled builds):
+
+- `browser_screenshot`: current viewport as an MCP `image/png` content block.
+- `browser_pdf`: current page as an embedded `application/pdf` resource.
+
+`browser_screenshot` accepts optional positive `width` and `height` values in
+CSS pixels and enforces a bounded capture size. `browser_pdf` accepts
+`landscape`, `print_background`, `scale`, paper width/height, and top, bottom,
+left, and right margins. Paper dimensions and margins are measured in inches.
+
 Cookies and storage:
 
 - `browser_get_cookies`, `browser_set_cookie`, `browser_clear_cookies`, `browser_storage_state`, `browser_set_storage_state`
@@ -73,6 +85,13 @@ Cookies and storage:
 Tabs:
 
 - `browser_tab_new`, `browser_tab_list`, `browser_tab_switch`, `browser_tab_close`
+
+Element references describe the current rendered page state and can become
+stale after navigation, interaction, scrolling, or a framework rerender. Take
+a fresh snapshot or interactive-element listing before acting again.
+
+MCP exposes still-image and PDF output. It does not stream video frames; use
+CDP `Page.startScreencast` for activity-driven screencasting.
 
 ## Claude Desktop
 
@@ -109,3 +128,9 @@ claude mcp add obscura /path/to/obscura mcp
   }
 }
 ```
+
+Local and private network addresses are blocked by default. CLI and stdio MCP
+navigation errors explain the existing `--allow-private-network` /
+`OBSCURA_ALLOW_PRIVATE_NETWORK=1` opt-in for your own local services. The hint
+does not grant access, is omitted for known metadata endpoints and special
+address ranges, and is not shown by the HTTP MCP transport.

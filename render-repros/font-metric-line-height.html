@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>font metric line-height geometry</title>
+  <style>
+    html, body { margin: 0; }
+    .column {
+      position: absolute;
+      top: 0;
+      width: 120px;
+    }
+    .sans-small {
+      left: 0;
+      font: 9.3333px/normal "Liberation Sans", sans-serif;
+    }
+    .sans-medium {
+      left: 150px;
+      font: 12px/normal "Liberation Sans", sans-serif;
+    }
+    .serif {
+      left: 300px;
+      font: 13px/normal "Liberation Serif", serif;
+    }
+    .mono {
+      left: 450px;
+      font: 13px/normal "Liberation Mono", monospace;
+    }
+    .explicit {
+      left: 600px;
+      font: 9px/10.75px "Liberation Sans", sans-serif;
+    }
+    .tight {
+      left: 750px;
+      font: 20px/10px "Liberation Sans", sans-serif;
+    }
+    .marker { width: 100px; height: 20px; }
+    .sans-small .marker { background: #087f5b; }
+    .sans-medium .marker { background: #1971c2; }
+    .serif .marker { background: #e8590c; }
+    .mono .marker { background: #7048e8; }
+    .explicit .marker { background: #c2255c; }
+    .tight .marker { background: #2b8a3e; }
+  </style>
+</head>
+<body>
+  <div class="column sans-small">
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div class="marker"></div>
+  </div>
+  <div class="column sans-medium">
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div class="marker"></div>
+  </div>
+  <div class="column serif">
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div class="marker"></div>
+  </div>
+  <div class="column mono">
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div class="marker"></div>
+  </div>
+  <div class="column explicit">
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div class="marker"></div>
+  </div>
+  <div class="column tight">
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div><div>Ag</div>
+    <div class="marker"></div>
+  </div>
+</body>
+</html>

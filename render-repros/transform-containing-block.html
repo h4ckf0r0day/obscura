@@ -1,0 +1,20 @@
+<!DOCTYPE html><html><head><title>transform containing block</title><style>
+html,body{margin:0}
+.outer{position:relative;margin:40px 0 0 50px;width:600px;height:400px;border:10px solid #111;padding:20px;box-sizing:border-box;background:#eee}
+.transformer{transform:translate(30px,20px);margin:40px 0 0 70px;width:300px;height:200px;border:5px solid #333;padding:10px;box-sizing:border-box;background:#ccc}
+.static{position:static;margin:20px;width:80px;height:50px;background:#aaa}
+.absolute{position:absolute;left:20px;top:25px;width:70px;height:55px;background:#087f5b}
+.fixed-transformed{position:fixed;left:150px;top:100px;width:80px;height:50px;background:#1971c2}
+.identity-transform{transform:rotate(0deg);margin:-80px 0 0 400px;width:100px;height:80px;background:#bbb}
+.identity-absolute{position:absolute;right:10px;bottom:10px;width:20px;height:20px;background:#7048e8}
+.fixed-viewport{position:fixed;left:700px;top:40px;width:90px;height:60px;background:#a61e4d}
+</style></head><body>
+<div class="outer">
+  <div class="transformer"><div class="static">
+    <span class="absolute"></span>
+    <div class="fixed-transformed"></div>
+  </div></div>
+  <div class="identity-transform"><div class="identity-absolute"></div></div>
+  <div class="fixed-viewport"></div>
+</div>
+</body></html>

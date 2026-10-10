@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Media text track</title>
+  <style>
+    html, body { margin: 0; }
+    video { display: none; }
+    #result {
+      box-sizing: border-box;
+      width: 420px;
+      height: 120px;
+      padding: 32px;
+      background: #a22;
+      color: white;
+      font: 18px sans-serif;
+    }
+    #result.passed { background: #18723a; }
+  </style>
+</head>
+<body>
+  <video>
+    <track id="captions" kind="captions" srclang="en" default
+      src="data:text/vtt,WEBVTT%0A%0A00%3A00%3A01.000%20--%3E%2000%3A00%3A03.000%0AHello">
+  </video>
+  <div id="result">text track unavailable</div>
+  <script>
+    const element = document.getElementById("captions");
+    function complete() {
+      const cue = element.track.cues && element.track.cues[0];
+      if (!cue) return;
+      cue.line = -2;
+      cue.size = 80;
+      const videoTrack = document.querySelector("video").textTracks[0];
+      if (videoTrack === element.track && cue.text === "Hello") {
+        const result = document.getElementById("result");
+        result.textContent = "media text track completed";
+        result.className = "passed";
+      }
+    }
+    complete();
+    element.addEventListener("load", complete, { once: true });
+  </script>
+</body>
+</html>

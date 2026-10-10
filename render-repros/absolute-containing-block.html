@@ -1,0 +1,16 @@
+<!DOCTYPE html><html><head><title>absolute containing block</title><style>
+html,body{margin:0}
+.cb{position:relative;margin:40px 0 0 60px;width:400px;height:240px;padding:20px;border:10px solid #111;box-sizing:border-box;background:#ddd}
+.static{position:static;margin:50px 0 0 70px;width:120px;height:80px;background:#bbb}
+.absolute{position:absolute;left:15px;top:25px;width:80px;height:60px;background:#087f5b}
+.absolute-end{position:absolute;right:30px;bottom:20px;width:70px;height:50px;background:#1971c2}
+.absolute-percent{position:absolute;left:50%;top:50%;width:30px;height:30px;background:#f08c00}
+.fixed{position:fixed;left:520px;top:40px;width:90px;height:55px;background:#a61e4d}
+</style></head><body>
+<div class="cb"><div class="static">
+  <span class="absolute"></span>
+  <div class="absolute-end"></div>
+  <div class="absolute-percent"></div>
+  <div class="fixed"></div>
+</div></div>
+</body></html>
