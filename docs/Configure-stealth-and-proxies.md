@@ -90,6 +90,8 @@ OBSCURA_TIMEZONE=America/New_York obscura serve
 OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
 ```
 
+Setting it grants the geolocation permission, so `navigator.permissions.query({name: 'geolocation'})` reports `granted` and `getCurrentPosition` resolves. Without it the permission stays undecided: `permissions.query` reports `prompt` and `getCurrentPosition` fails with `PERMISSION_DENIED` (code 1), as Chrome does when no prompt has been answered.
+
 Keep these aligned. A rotated or mismatched profile carries no matching TLS or timezone fingerprint, so when you pin a proxy region or TLS fingerprint, leave rotation off and set the timezone and geolocation to the same region. See [Environment variables](Environment-variables.md) for the full list.
 
 ## Combine

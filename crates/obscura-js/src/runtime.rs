@@ -24575,4 +24575,113 @@ mod tests {
             "label association must follow the HTML labelable-element rules"
         );
     }
+
+    // ── Issue #1207 regression tests ────────────────────────────────────────
+
+    /// The geolocation shim answered with coordinates while
+    /// permissions.query reported "prompt", a combination Chrome cannot
+    /// produce. Without OBSCURA_GEOLOCATION nothing grants the permission, so
+    /// the call has to fail the way Chrome fails it.
+    #[test]
+    fn geolocation_denies_without_configured_coordinates() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    globalThis.__perm = 'pending';
+                    navigator.permissions.query({name: 'geolocation'}).then(function(s) {
+                        globalThis.__perm = s.state;
+                    });
+                    var fired = 'none';
+                    navigator.geolocation.getCurrentPosition(
+                        function() { fired = 'position'; },
+                        function() { fired = 'error'; });
+                    var watched = 'none';
+                    navigator.geolocation.watchPosition(
+                        function() { watched = 'position'; },
+                        function() { watched = 'error'; });
+                    return fired + '|' + watched;
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("none|none"),
+            "no callback may run synchronously, and no position may come \
+             back while the permission is undecided"
+        );
+        assert_eq!(
+            rt.evaluate("globalThis.__perm").unwrap(),
+            serde_json::json!("prompt"),
+            "without OBSCURA_GEOLOCATION the permission was never granted"
+        );
+    }
+
+    /// The denial has to reach the page: the error callback fires with
+    /// PERMISSION_DENIED (1), which is what Chrome reports, and no success
+    /// callback ever runs.
+    #[test]
+    fn geolocation_reports_permission_denied_to_the_page() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    globalThis.__geo = 'pending';
+                    navigator.geolocation.getCurrentPosition(
+                        function() { globalThis.__geo = 'position'; },
+                        function(e) { globalThis.__geo = e.code + ':' + e.message; });
+                    return 'armed';
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("armed"));
+        assert_eq!(
+            rt.evaluate("globalThis.__geo").unwrap(),
+            serde_json::json!("1:User denied Geolocation"),
+            "the page must see Chrome's PERMISSION_DENIED, not a position"
+        );
+    }
+
+    /// OBSCURA_GEOLOCATION is the operator granting the permission, so the two
+    /// surfaces have to agree in the other direction as well.
+    #[test]
+    fn geolocation_grants_when_coordinates_are_configured() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_geolocation(40.7128, -74.006);
+        let result = rt
+            .evaluate(
+                r#"(function() {
+                    globalThis.__geo = 'pending';
+                    navigator.permissions.query({name: 'geolocation'}).then(function(s) {
+                        globalThis.__perm = s.state;
+                    });
+                    navigator.geolocation.getCurrentPosition(
+                        function(p) { globalThis.__geo = p.coords.latitude + ',' + p.coords.longitude; },
+                        function(e) { globalThis.__geo = 'error ' + e.code; });
+                    return 'armed';
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("armed"));
+        let perm = rt.evaluate("globalThis.__perm").unwrap();
+        let pos = rt.evaluate("globalThis.__geo").unwrap();
+        assert_eq!(
+            perm,
+            serde_json::json!("granted"),
+            "a configured position must also grant the permission"
+        );
+        let lat: f64 = pos
+            .as_str()
+            .expect("a coordinate pair")
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (lat - 40.7128).abs() < 0.05,
+            "the configured latitude must be reported, got {}",
+            pos
+        );
+    }
 }

@@ -7438,6 +7438,28 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
+// The geolocation permission is granted exactly when coordinates were
+// configured for this page (OBSCURA_GEOLOCATION). Answering with a position
+// while permissions.query still says "prompt" is impossible in Chrome and
+// gives a page two lines of JS that separate a real browser from this one.
+function _geoGranted() {
+  return typeof globalThis.__obscura_geo_lat === 'number' &&
+         typeof globalThis.__obscura_geo_lon === 'number';
+}
+
+// Chrome fails the call with PERMISSION_DENIED (code 1) when the permission
+// was never granted, and never hands out a position. The error is not a
+// DOMException: it carries the GeolocationPositionError code space.
+function _geoDenied(error) {
+  if (typeof error !== 'function') return;
+  var err = new Error('User denied Geolocation');
+  err.code = 1;
+  err.PERMISSION_DENIED = 1;
+  err.POSITION_UNAVAILABLE = 2;
+  err.TIMEOUT = 3;
+  Promise.resolve().then(function() { error(err); });
+}
+
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
@@ -7488,7 +7510,8 @@ globalThis.navigator = {
     // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
     // returning "granted" for camera/microphone is a bot tell.
     if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
+    if (n === 'geolocation') return Promise.resolve({state: _geoGranted() ? 'granted' : 'prompt', onchange: null});
+    if (n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
     return Promise.resolve({state: 'granted', onchange: null});
   } },
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
@@ -7497,9 +7520,10 @@ globalThis.navigator = {
   javaEnabled() { return false; },
   geolocation: {
     getCurrentPosition(success, error) {
+      if (!_geoGranted()) { _geoDenied(error); return; }
       const coords = {
-        latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
-        longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(501) - 0.5) * 0.1,
+        latitude: globalThis.__obscura_geo_lat + (_fpRand(500) - 0.5) * 0.1,
+        longitude: globalThis.__obscura_geo_lon + (_fpRand(501) - 0.5) * 0.1,
         accuracy: 10 + _fpRand(502) * 40,
         altitude: null,
         altitudeAccuracy: null,
@@ -7510,10 +7534,11 @@ globalThis.navigator = {
       if (typeof success === 'function') success(pos);
     },
     watchPosition(success, error) {
+      if (!_geoGranted()) { _geoDenied(error); return 0; }
       if (typeof success === 'function') {
         const coords = {
-          latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(503) - 0.5) * 0.1,
-          longitude: (globalThis.__obscura_geo_lon ?? 8.6821) + (_fpRand(504) - 0.5) * 0.1,
+          latitude: globalThis.__obscura_geo_lat + (_fpRand(503) - 0.5) * 0.1,
+          longitude: globalThis.__obscura_geo_lon + (_fpRand(504) - 0.5) * 0.1,
           accuracy: 10 + _fpRand(505) * 40,
           altitude: null,
           altitudeAccuracy: null,
