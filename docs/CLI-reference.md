@@ -70,6 +70,10 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --worker-max-connections <N>  Recycle a worker after N CDP connections (--workers > 1)
+    --worker-max-rss <MB>    Recycle a worker above this resident size (Linux)
+    --worker-max-age <SECS>  Recycle a worker after this long
+    --worker-drain-timeout <SECS>  Let a replaced worker finish live connections (default 120)
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage

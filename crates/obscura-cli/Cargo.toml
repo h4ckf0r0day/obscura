@@ -39,3 +39,5 @@ libc = "0.2"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"

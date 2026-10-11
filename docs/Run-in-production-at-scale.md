@@ -84,6 +84,12 @@ obscura serve --workers 4
 
 Use one worker per CPU core. Each worker handles its own pool of pages. Sessions are sticky to a worker.
 
+Worker memory can grow over days. Recycle workers with `--worker-max-connections`, `--worker-max-rss` (MB, Linux) or `--worker-max-age` (seconds). A replacement starts first and takes all new connections; the old worker finishes its live connections, then exits. `--worker-drain-timeout` (default 120 s) bounds that wait, after which remaining connections are closed, so set it above your longest session.
+
+```bash
+obscura serve --workers 50 --worker-max-connections 500 --worker-max-rss 1500
+```
+
 ## V8 heap
 
 The V8 old-generation ceiling is 4 GB on 64-bit systems. The defaults request `--max-semi-space-size=4`, but the current V8's `--optimize-for-size` implication overrides the effective semi-space cap to 1 MiB. Override the old-generation ceiling with:
