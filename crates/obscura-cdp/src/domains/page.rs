@@ -1945,6 +1945,24 @@ pub async fn handle(
             #[cfg(not(feature = "render"))]
             Err("Page.captureScreenshot requires a build with the render feature".to_string())
         }
+        "close" => {
+            // Chrome's primary page teardown path, and what Puppeteer-style
+            // clients call to confirm a close. Before this existed they got
+            // -32601 and kept the page. Alias it to Target.closeTarget for
+            // this session's own page so the detach and destroyed events
+            // fire exactly once (#1237).
+            let target_id = ctx
+                .get_session_page(session_id)
+                .map(|page| page.id.clone())
+                .ok_or("Page.close requires a session with an attached page")?;
+            crate::domains::target::handle(
+                "closeTarget",
+                &json!({ "targetId": target_id }),
+                ctx,
+                session_id,
+            )
+            .await
+        }
         "captureSnapshot" => {
             // A DOM/layer-tree snapshot (not a raster image). Distinct from
             // captureScreenshot; keep the clear error so clients fail fast.
@@ -3867,6 +3885,55 @@ mod tests {
         let page = ctx.get_session_page(&session).expect("page");
         assert_eq!(page.viewport, (100.0, 80.0));
         assert_eq!(page.device_scale_factor, 2.0);
+    }
+
+    /// Regression for #1237: Page.close is the primary teardown call for
+    /// Puppeteer-style clients. Without an explicit arm they saw
+    /// -32601 "Unknown Page method" and never got a confirmed close.
+    #[tokio::test]
+    async fn page_close_aliases_target_close_target() {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let bystander = ctx.create_page();
+        let session = Some("close-driver".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page.clone());
+
+        let result = handle("close", &json!({}), &mut ctx, &session)
+            .await
+            .expect("Page.close must succeed");
+        assert_eq!(result, json!({ "success": true }));
+
+        assert!(
+            !ctx.pages.iter().any(|candidate| candidate.id == page),
+            "the closed page must be removed from the context"
+        );
+        assert!(
+            ctx.pages.iter().any(|candidate| candidate.id == bystander),
+            "Page.close must only close its own session's page"
+        );
+        assert!(
+            ctx.get_session_page(&session).is_none(),
+            "the closed page's sessions must stop resolving"
+        );
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Target.targetDestroyed"
+                && event.params.get("targetId").and_then(Value::as_str) == Some(page.as_str())),
+            "Page.close must emit Target.targetDestroyed for its own target"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_close_without_a_page_session_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle("close", &json!({}), &mut ctx, &None)
+            .await
+            .expect_err("Page.close without a page session must error");
+        assert!(
+            !err.contains("Unknown Page method"),
+            "Page.close must NOT fall through to the catch-all: {err}"
+        );
     }
 
     #[tokio::test]
