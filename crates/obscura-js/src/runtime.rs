@@ -6933,6 +6933,79 @@ mod tests {
     }
 
     #[test]
+    fn document_clone_node_returns_an_independent_html_document() {
+        let mut rt = setup_runtime(
+            r#"<!doctype html><html><head><title>Article</title></head><body><main id="article"><p>Original</p></main></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const clone = document.cloneNode(true);
+                const paragraph = clone.querySelector("p");
+                paragraph.textContent = "Cloned";
+                return [
+                    String(clone),
+                    clone.nodeType,
+                    Object.prototype.toString.call(clone),
+                    clone.documentElement.tagName,
+                    clone.title,
+                    paragraph.textContent,
+                    document.querySelector("p").textContent,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object HTMLDocument]",
+                9,
+                "[object HTMLDocument]",
+                "HTML",
+                "Article",
+                "Cloned",
+                "Original"
+            ])
+        );
+    }
+
+    #[test]
+    fn attribute_nodes_clone_with_attr_brand_and_value() {
+        let mut rt = setup_runtime(r#"<html><body><div data-id="42"></div></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const attr = document.querySelector("div").attributes[0];
+                const clone = attr.cloneNode();
+                return [
+                    attr instanceof Attr,
+                    typeof attr.cloneNode,
+                    Object.prototype.toString.call(attr),
+                    clone instanceof Attr,
+                    clone.name,
+                    clone.value,
+                    clone.ownerElement,
+                    clone !== attr,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                "function",
+                "[object Attr]",
+                true,
+                "data-id",
+                "42",
+                null,
+                true
+            ])
+        );
+    }
+
+    #[test]
     fn clone_node_deep_preserves_table_rows() {
         let mut rt = setup_runtime(
             r#"<html><body><table id="t"><tbody><tr><td>1</td><td>2</td></tr></tbody></table></body></html>"#,
