@@ -535,6 +535,7 @@ Optional flags (both transports):
 |------|-------------|
 | `--proxy <URL>` | HTTP/SOCKS5 proxy |
 | `--user-agent <UA>` | Custom User-Agent string |
+| `--font-dir <DIR>` | Load additional fonts before rendering (repeatable; render build) |
 | `--stealth` | Enable anti-detection mode |
 
 ### Claude Desktop config

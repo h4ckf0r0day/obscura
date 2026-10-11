@@ -1,5 +1,17 @@
 `obscura mcp` exposes obscura as a Model Context Protocol server so MCP-capable clients (Claude Desktop, Claude Code, etc.) can drive it.
 
+Render-enabled builds can load additional fonts for screenshots and PDF output:
+
+```bash
+obscura mcp --font-dir /path/to/fonts
+```
+
+Repeat `--font-dir` to load multiple directories. It recursively loads TTF, TTC,
+OTF, and OTC files once before rendering, using the same opt-in font database as
+`obscura serve`. System fonts are not scanned automatically. Invalid directories
+fail at startup, and no-render builds reject a nonempty font directory option.
+The option works with both stdio and HTTP transports.
+
 ## Run
 
 Stdio (default, for direct client integration):

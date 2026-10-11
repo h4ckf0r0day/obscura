@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -722,13 +722,22 @@ fn publish_ready_file(path: &Path, address: SocketAddr) -> anyhow::Result<()> {
 fn cap_malloc_arenas() {
     #[cfg(target_env = "gnu")]
     {
+        // Pin the mmap threshold. glibc otherwise raises it (up to 32 MiB) each
+        // time a large mmapped block is freed, so later large buffers (response
+        // bodies, render surfaces, V8 backing stores) land in the arena and
+        // fragment it. Skipped when the operator tuned it.
+        if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+            const M_MMAP_THRESHOLD: libc::c_int = -3;
+            // SAFETY: mallopt is thread-safe; called once here before any
+            // connection thread exists.
+            unsafe { libc::mallopt(M_MMAP_THRESHOLD, 1 << 20) };
+        }
         if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
             return;
         }
         // M_ARENA_MAX is not exported by the libc crate.
         const M_ARENA_MAX: libc::c_int = -8;
-        // SAFETY: mallopt is thread-safe; called once here before any
-        // connection thread exists.
+        // SAFETY: as above.
         if unsafe { libc::mallopt(M_ARENA_MAX, 2) } != 1 {
             warn!("mallopt(M_ARENA_MAX) failed; memory will scale with peak concurrency");
         }
@@ -740,8 +749,9 @@ fn cap_malloc_arenas() {
 /// A connection owns its pages, DOMs, render buffers, and V8 isolates. Dropping
 /// those objects releases the allocations, but glibc normally keeps the freed
 /// pages mapped for reuse, so a server that becomes idle can retain its peak RSS
-/// indefinitely (#873). Trimming only when this is the final live connection
-/// avoids imposing a process-wide allocator pause on active clients.
+/// indefinitely (#873). Trimming is a process-wide allocator pause, so callers
+/// go through `release_connection_memory`, which rate-limits it while other
+/// connections are live.
 fn release_idle_connection_memory() {
     #[cfg(target_env = "gnu")]
     {
@@ -751,6 +761,31 @@ fn release_idle_connection_memory() {
             libc::malloc_trim(0);
         }
     }
+}
+
+/// Trim after a connection closes: always when it was the last one, otherwise
+/// at most every `BUSY_TRIM_INTERVAL_MS` so a busy worker (which never reaches
+/// zero connections) still returns the closed connection's free heap pages
+/// instead of holding its peak RSS for days.
+fn release_connection_memory(idle: bool) {
+    static LAST_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    if claim_connection_memory_trim(&LAST_TRIM_MS, now, idle) {
+        release_idle_connection_memory();
+    }
+}
+
+fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> bool {
+    const BUSY_TRIM_INTERVAL_MS: u64 = 5_000;
+    // Claim the interval atomically; a delayed closer cannot roll its timestamp back.
+    last_trim.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        if idle || last == 0 || now.saturating_sub(last) >= BUSY_TRIM_INTERVAL_MS {
+            Some(now.max(last))
+        } else {
+            None
+        }
+    }).is_ok()
 }
 
 /// Run each connection's `cdp_processor` (with its own `CdpContext` and pages)
@@ -891,9 +926,8 @@ fn run_connection(
             }
 
             drop(persisted_context);
-            if slot_guard.release() == Some(0) {
-                release_idle_connection_memory();
-            }
+            let idle = slot_guard.release() == Some(0);
+            release_connection_memory(idle);
         });
 
     // The closure never ran, so its `SlotGuard` never existed: release the
@@ -2277,6 +2311,46 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn connection_memory_trim_preserves_interval_and_idle_behavior() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last = AtomicU64::new(0);
+        for (now, idle, expected, timestamp) in [
+            (100, false, true, 100),
+            (100, false, false, 100),
+            (5_099, false, false, 100),
+            (5_100, false, true, 5_100),
+            (5_101, true, true, 5_101),
+            (100, true, true, 5_101),
+            (5_102, false, false, 5_101),
+        ] {
+            assert_eq!(super::claim_connection_memory_trim(&last, now, idle), expected);
+            assert_eq!(last.load(Ordering::Relaxed), timestamp);
+        }
+    }
+
+    #[test]
+    fn busy_connection_memory_trim_has_one_winner_per_interval() {
+        use std::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Barrier};
+        let last = AtomicU64::new(0);
+        let winners = AtomicUsize::new(0);
+        let barrier = Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for round in 1..=2_000 {
+                        barrier.wait();
+                        if super::claim_connection_memory_trim(&last, round * 5_000, false) {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(Ordering::Relaxed), 2_000);
+    }
 
     #[test]
     fn intercepted_request_is_observable_without_sharing_fetch_control() {

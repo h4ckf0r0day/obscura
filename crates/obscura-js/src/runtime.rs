@@ -1260,6 +1260,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().encoding = encoding.to_string();
     }
 
+    /// Set the document's MIME type. Backs `document.contentType`, which
+    /// reports the type of the main resource rather than one guessed from
+    /// the URL.
+    pub fn set_content_type(&self, content_type: &str) {
+        self.state.borrow_mut().content_type = content_type.to_string();
+    }
+
     pub fn set_title(&self, title: &str) {
         self.state.borrow_mut().title = title.to_string();
     }
@@ -1390,6 +1397,12 @@ impl ObscuraJsRuntime {
 
     pub fn set_intercept_page_id(&self, page_id: &str) {
         self.state.borrow_mut().intercept_page_id = page_id.to_string();
+    }
+
+    /// `Fetch.enable` URL patterns that decide which fetch()/XHR requests
+    /// are sent to the interception channel.
+    pub fn set_intercept_url_patterns(&self, patterns: Vec<String>) {
+        self.state.borrow_mut().intercept_url_patterns = patterns;
     }
 
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
@@ -4534,6 +4547,16 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn document_content_type_retains_url_fallback_without_response_metadata() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/document.xhtml");
+        rt.run_page_init();
+        assert_eq!(rt.evaluate("document.contentType").unwrap(),
+            serde_json::json!("application/xhtml+xml"));
     }
 
     #[test]

@@ -112,6 +112,7 @@ Run obscura as an MCP server.
 
 ```
     --http                   HTTP transport instead of stdio
+    --font-dir <DIR>         Load additional fonts before rendering (repeatable; render build)
     --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
@@ -155,3 +156,25 @@ without a `result` object.
 
 The status field is additive. Navigation timing and the other worker commands
 are unchanged.
+
+## Worker navigation readiness
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and writes
+one response per command to stdout. Select a readiness mode per navigation:
+
+```json
+{"cmd":"navigate","url":"https://example.com","waitUntil":"domcontentloaded"}
+```
+
+`waitUntil` accepts `load`, `domcontentloaded`, `networkidle0`, or `networkidle2`.
+Omitting it preserves the existing `load` default. The option applies only to
+that request. Invalid values return an `ok: false` response without navigating;
+the worker remains available for subsequent commands.
+
+These modes use the existing `Page::navigate_with_wait` behavior. Parser scripts
+run in every mode. Network-idle modes additionally drive the event loop until
+active requests remain at or below zero or two, respectively, for 500 ms, with
+the engine's existing five-second idle deadline. `domcontentloaded` uses the
+engine's DOM readiness boundary; it does not change script execution or resource
+warmup semantics. Successful responses retain their existing `title`, `url`, and `status`
+fields.

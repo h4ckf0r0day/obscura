@@ -27,6 +27,10 @@ await page.goto('https://example.com', { waitUntil: 'networkidle' });
 
 Default is `domcontentloaded`. Other values: `load`, `networkidle`.
 
+Navigating to `text/plain`, `text/markdown`, or `text/x-markdown` responses
+preserves literal markup as text instead of parsing it as HTML.
+`document.contentType` reports the response MIME type without parameters.
+
 ## Evaluate
 
 ```js

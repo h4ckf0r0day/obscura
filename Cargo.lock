@@ -2032,6 +2032,7 @@ dependencies = [
  "anyhow",
  "clap",
  "image",
+ "libc",
  "obscura-browser",
  "obscura-cdp",
  "obscura-dom",

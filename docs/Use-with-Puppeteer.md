@@ -85,6 +85,11 @@ page.on('request', req => {
 
 See [Intercept and modify requests](Intercept-and-modify-requests.md).
 
+Scripted fetch/XHR requests in stealth mode report Network events and retained
+response bodies using the same request IDs as the normal transport. The existing
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`
+settings still control retention; disabling retention does not disable events.
+
 ## Expose a Node callback
 
 ```js

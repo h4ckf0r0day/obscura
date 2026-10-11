@@ -279,6 +279,10 @@ pub struct Page {
     /// Exposed to JS as `document.characterSet` and used for the URL query
     /// encoding override on `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
+    /// MIME type of the current document's main resource, lowercased and
+    /// without parameters, or empty when no type was supplied.
+    /// Exposed to JS as `document.contentType`.
+    pub content_type: String,
     /// Monotonic origin for the current document's CSS animation timeline.
     /// It is reset once author styles are installed, so stylesheet download
     /// latency does not incorrectly advance newly-created animations.
@@ -1113,6 +1117,7 @@ impl Page {
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
+            content_type: String::new(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timing: NavigationTiming::default(),
             navigation_timeout: None,
@@ -1778,6 +1783,7 @@ impl Page {
         );
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
+        rt.set_content_type(&self.content_type);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
         let (session_history, session_index) = self.predicted_session_history();
@@ -1844,6 +1850,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_intercept_url_patterns(self.intercept_block_patterns.clone());
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
@@ -3499,7 +3506,17 @@ impl Page {
             obscura_net::decode_response_with_name(&response.body, response.content_type());
         self.encoding = encoding_name.to_string();
         self.navigation_timing.record("domLoading");
-        let dom = parse_html(&body_text);
+        // A non-HTML text response is a plain-text document, not an HTML one
+        // that happens to hold text: every `<word>` in a .txt or .md body
+        // would otherwise be parsed as an element and its contents dropped
+        // from textContent (#1231). Chrome wraps the decoded text in a
+        // single <pre> instead.
+        let (dom, document_content_type) = match plain_text_document_type(response.content_type())
+        {
+            Some(mime) => (parse_plain_text_document(&body_text), mime),
+            None => (parse_html(&body_text), base_content_type(response.content_type()).unwrap_or_default()),
+        };
+        self.content_type = document_content_type;
 
         self.title = dom
             .query_selector("title")
@@ -3759,6 +3776,7 @@ impl Page {
             "<html><head></head><body></body></html>",
         ));
         self.title = String::new();
+        self.content_type.clear();
         self.lifecycle = LifecycleState::Loaded;
         self.document_timeline_origin = std::time::Instant::now();
     }
@@ -4947,6 +4965,7 @@ impl Page {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
+            js.set_intercept_url_patterns(self.intercept_block_patterns.clone());
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
@@ -4959,32 +4978,7 @@ fn script_response_is_executable(status: u16) -> bool {
     (200..=299).contains(&status)
 }
 
-fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let mut remainder = url;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() {
-            continue;
-        }
-
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-
-        if first && !pattern.starts_with('*') && index != 0 {
-            return false;
-        }
-
-        remainder = &remainder[index + part.len()..];
-        first = false;
-    }
-
-    pattern.ends_with('*') || remainder.is_empty()
-}
+pub use obscura_js::ops::url_matches_cdp_pattern;
 
 impl Drop for Page {
     fn drop(&mut self) {
@@ -5681,6 +5675,179 @@ mod tests {
         assert_eq!(
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
+        );
+    }
+
+    // #1231: a text/plain or text/markdown response is a plain-text document.
+    // Parsing it as HTML turned every <word> in the body into an element and
+    // dropped its text, and document.contentType reported text/html.
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_text_response_builds_a_pre_document() {
+        let body = "RFC 9110 <URI-reference>: see <https://example.com/>\n2nd line";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "plain-text".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("plain-text".to_string(), context);
+        page.navigate(&format!("http://{address}/rfc9110.txt")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){return [document.contentType, \
+                 document.body.firstElementChild.tagName, \
+                 document.body.childNodes.length, \
+                 document.body.textContent];})()",
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!(["text/plain", "PRE", 1, body])
+        );
+    }
+
+    #[test]
+    fn plain_text_document_preserves_leading_newlines_and_literal_markup() {
+        for (text, expected) in [
+            ("\nfirst\nlast", "\nfirst\nlast"),
+            ("\r\nfirst\rsecond", "\nfirst\nsecond"),
+            ("\n\n", "\n\n"),
+            ("<&amp;> </pre><script>bad()</script>", "<&amp;> </pre><script>bad()</script>"),
+        ] {
+            let dom = super::parse_plain_text_document(text);
+            let pre = dom.query_selector("pre").unwrap().unwrap();
+            assert_eq!(dom.text_content(pre), expected, "input {text:?}");
+            assert!(dom.query_selector("script").unwrap().is_none());
+        }
+        let empty = super::parse_plain_text_document("");
+        assert_eq!(empty.text_content(empty.document()), "");
+        assert!(empty.query_selector("pre").unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_text_navigation_resets_content_type_on_about_blank() {
+        let mut page = super::Page::new(
+            "plain-text-blank".to_string(),
+            std::sync::Arc::new(crate::BrowserContext::new("plain-text-blank".to_string())),
+        );
+        page.navigate("data:text/plain,first%0Alast").await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[document.contentType, document.body.textContent]"
+        ).unwrap(), serde_json::json!(["text/plain", "first\nlast"]));
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[document.contentType, document.body.textContent]"
+        ).unwrap(), serde_json::json!(["text/html", ""]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_markdown_response_keeps_markup_as_text() {
+        let body = "# Title\n\nSee <Component prop={1} /> and 3 < 4.";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "markdown-text".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("markdown-text".to_string(), context);
+        page.navigate(&format!("http://{address}/settings-reference")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){return [document.contentType, \
+                 document.body.textContent, \
+                 document.body.querySelectorAll('component').length];})()",
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!(["text/markdown", body, 0])
+        );
+    }
+
+    // The HTML parse path is unchanged, including the URL-derived contentType
+    // sniffing for documents served without a usable Content-Type.
+    #[tokio::test(flavor = "current_thread")]
+    async fn html_response_still_builds_an_html_document() {
+        let body = "<!doctype html><title>page</title><p>hello <b>world</b></p>";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "html-doc".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("html-doc".to_string(), context);
+        page.navigate(&format!("http://{address}/index")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){return [document.contentType, \
+                 document.body.firstElementChild.tagName, \
+                 document.body.querySelectorAll('b').length, \
+                 document.body.textContent];})()",
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!(["text/html", "P", 1, "hello world"])
         );
     }
 
@@ -10210,6 +10377,60 @@ fn is_text_like_content_type(content_type: Option<&str>) -> bool {
         || ct == "image/svg+xml"
         || ct.ends_with("+json")
         || ct.ends_with("+xml")
+}
+
+/// Lowercased MIME type of a Content-Type header, without parameters.
+fn base_content_type(content_type: Option<&str>) -> Option<String> {
+    let ct = content_type?.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if ct.is_empty() { None } else { Some(ct) }
+}
+
+/// A response whose body is text but not markup gets a plain-text document
+/// rather than an HTML parse of its content (`text/plain`, `text/markdown`).
+/// Returns the MIME type to report as `document.contentType`.
+fn plain_text_document_type(content_type: Option<&str>) -> Option<String> {
+    let ct = base_content_type(content_type)?;
+    // XML and HTML families keep their existing parse path, including the
+    // `.xhtml`/`.xml` URL sniffing that `contentType` still applies.
+    if ct == "text/html"
+        || ct == "application/xhtml+xml"
+        || ct == "text/xml"
+        || ct == "application/xml"
+        || ct.ends_with("+xml")
+    {
+        return None;
+    }
+    matches!(ct.as_str(), "text/plain" | "text/markdown" | "text/x-markdown")
+        .then_some(ct)
+}
+
+/// Escape text for insertion as HTML character data, then build the document
+/// Chrome builds for a plain-text response: `<body>` holding one `<pre>` with
+/// the whole text. Serializing through the HTML parser keeps one code path for
+/// document construction instead of a second native tree builder.
+fn parse_plain_text_document(text: &str) -> DomTree {
+    if text.is_empty() {
+        return parse_html("<!DOCTYPE html>");
+    }
+    let mut html = String::with_capacity(text.len() + 64);
+    // The parser discards the synthetic newline, not the document's first one.
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title></title></head><body><pre>\n");
+    html.push_str(&escape_html_text(text));
+    html.push_str("</pre></body></html>");
+    parse_html(&html)
+}
+
+fn escape_html_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn response_body_entry_limit() -> usize {
