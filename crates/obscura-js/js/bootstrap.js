@@ -17121,9 +17121,37 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     }
     return best || this.body || this.documentElement || null;
   };
+  // The real front-to-back stack, not just the topmost element. Render builds
+  // ask the native hit test for every element under the point, ranked the way
+  // elementFromPoint ranks them, so the stack starts with elementFromPoint's
+  // answer. Chrome ends it with <body> then <html>: both contain any
+  // in-viewport point. They are appended rather than ranked because they span
+  // the viewport, and ranking them would let them shadow every descendant.
   Document.prototype.elementsFromPoint = function(x, y) {
-    var el = this.elementFromPoint(x, y);
-    return el ? [el] : [];
+    const method = _documentRealmMember(this, 'elementsFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
+    var top = this.elementFromPoint(x, y);
+    if (!top) return [];
+    var roots = [this.body, this.documentElement];
+    var stack = [];
+    if (typeof __obscuraCore.ops.op_layout_hit_test_stack === 'function') {
+      var ids = __obscuraCore.ops.op_layout_hit_test_stack(x, y, _realmFrameId);
+      var parts = ids ? ids.split(',') : [];
+      for (var i = 0; i < parts.length; i++) {
+        var el = _wrapEl(parseInt(parts[i], 10));
+        if (el && roots.indexOf(el) === -1 && stack.indexOf(el) === -1) stack.push(el);
+      }
+    }
+    // No-render builds have no native stack; report the hit itself first.
+    if (roots.indexOf(top) === -1 && stack[0] !== top) {
+      var at = stack.indexOf(top);
+      if (at !== -1) stack.splice(at, 1);
+      stack.unshift(top);
+    }
+    for (var r = 0; r < roots.length; r++) {
+      if (roots[r] && stack.indexOf(roots[r]) === -1) stack.push(roots[r]);
+    }
+    return stack;
   };
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
@@ -17243,7 +17271,7 @@ function _installCaretGeometry() {
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'elementsFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),

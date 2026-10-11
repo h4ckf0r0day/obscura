@@ -1504,52 +1504,45 @@ impl PreparedRender {
         x: f32,
         y: f32,
     ) -> Option<obscura_dom::tree::NodeId> {
-        fn stacking_path(
-            tree: &DomTree,
-            laid: &crate::DomLayout,
-            id: obscura_dom::tree::NodeId,
-        ) -> Vec<i32> {
-            // Stacking contexts are inherited through the DOM ancestor chain.
-            // The rendered-parent helper deliberately skips some framework
-            // wrapper boxes; using it here can detach a control from a fixed
-            // ancestor's context and make the ancestor win its own hit test.
-            let mut ancestors = tree.ancestors(id);
-            ancestors.insert(0, id);
-            ancestors.reverse();
-            ancestors
-                .into_iter()
-                .filter_map(|node| stacking_z_index(tree, laid, node))
-                .collect()
-        }
+        let candidates = self.hit_candidates(tree, scroll, x, y)?;
+        topmost_hit(tree, &candidates).map(|index| candidates[index].id)
+    }
 
-        fn compare_stacking_paths(a: &[i32], b: &[i32]) -> std::cmp::Ordering {
-            use std::cmp::Ordering;
-            let common = a.len().min(b.len());
-            for index in 0..common {
-                let order = a[index].cmp(&b[index]);
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            if a.len() == b.len() {
-                return Ordering::Equal;
-            }
-            // Ending the path means normal-flow content in this stacking
-            // context: it paints after a negative child context and before a
-            // zero-or-positive child context.
-            if a.len() == common {
-                if b[common] < 0 {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            } else if a[common] < 0 {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
+    /// Every element under a viewport point, front to back, for
+    /// `elementsFromPoint`. The first entry is always `hit_test`'s answer:
+    /// both start from the same candidates, and each next entry is the
+    /// topmost of those still left, by the same ranking. Repeated selection
+    /// rather than a sort, because the ancestor rule in `ranks_above` is not
+    /// a total order and a sort would be free to disagree with `hit_test`.
+    pub fn hit_test_stack(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Vec<obscura_dom::tree::NodeId> {
+        let Some(mut candidates) = self.hit_candidates(tree, scroll, x, y) else {
+            return Vec::new();
+        };
+        let mut stack = Vec::with_capacity(candidates.len());
+        while let Some(index) = topmost_hit(tree, &candidates) {
+            // `remove`, not `swap_remove`: candidates stay in document order,
+            // which is the order `hit_test` visits them in.
+            stack.push(candidates.remove(index).id);
         }
+        stack
+    }
 
+    /// The elements whose box contains the point, in document order, with the
+    /// keys the hit test ranks them by. `None` when the point is outside the
+    /// viewport.
+    fn hit_candidates(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Option<Vec<HitCandidate>> {
         if !x.is_finite()
             || !y.is_finite()
             || x < 0.0
@@ -1569,7 +1562,7 @@ impl PreparedRender {
             width: 0.001,
             height: 0.001,
         };
-        let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
+        let mut candidates = Vec::new();
         for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
             .into_iter()
             .enumerate()
@@ -1596,33 +1589,15 @@ impl PreparedRender {
             {
                 continue;
             }
-            let path = stacking_path(tree, &self.layout, id);
-            let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
-            let depth = tree.ancestors(id).len();
-            let replace = best
-                .as_ref()
-                .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
-                    let stacking = compare_stacking_paths(&path, best_path);
-                    if stacking != std::cmp::Ordering::Equal {
-                        return stacking.is_gt();
-                    }
-                    if tree.ancestors(id).contains(best_id) {
-                        return true;
-                    }
-                    if tree.ancestors(*best_id).contains(&id) {
-                        return false;
-                    }
-                    positioned
-                        .cmp(best_positioned)
-                        .then_with(|| depth.cmp(best_depth))
-                        .then_with(|| order.cmp(best_order))
-                        .is_gt()
-                });
-            if replace {
-                best = Some((path, positioned, depth, order, id));
-            }
+            candidates.push(HitCandidate {
+                path: hit_stacking_path(tree, &self.layout, id),
+                positioned: style.position.is_some() || style.position_fixed || style.position_sticky,
+                depth: tree.ancestors(id).len(),
+                order,
+                id,
+            });
         }
-        best.map(|(_, _, _, _, id)| id)
+        Some(candidates)
     }
 
     /// Shaped-text caret in the viewport. Hit testing selects the painted
@@ -3573,6 +3548,92 @@ fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> boo
 /// otherwise-static flex and grid items. `display:contents` boxes are skipped
 /// while finding the item's formatting-context parent because they generate no
 /// box of their own.
+/// One element under a hit-test point, with the keys `ranks_above` orders by.
+struct HitCandidate {
+    path: Vec<i32>,
+    positioned: bool,
+    depth: usize,
+    order: usize,
+    id: obscura_dom::tree::NodeId,
+}
+
+/// The index of the topmost candidate: one pass in document order, where a
+/// later candidate replaces the current best when it ranks above it.
+fn topmost_hit(tree: &DomTree, candidates: &[HitCandidate]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if best.is_none_or(|best| ranks_above(tree, candidate, &candidates[best])) {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+fn ranks_above(tree: &DomTree, candidate: &HitCandidate, best: &HitCandidate) -> bool {
+    let stacking = compare_hit_stacking_paths(&candidate.path, &best.path);
+    if stacking != std::cmp::Ordering::Equal {
+        return stacking.is_gt();
+    }
+    if tree.ancestors(candidate.id).contains(&best.id) {
+        return true;
+    }
+    if tree.ancestors(best.id).contains(&candidate.id) {
+        return false;
+    }
+    candidate
+        .positioned
+        .cmp(&best.positioned)
+        .then_with(|| candidate.depth.cmp(&best.depth))
+        .then_with(|| candidate.order.cmp(&best.order))
+        .is_gt()
+}
+
+fn hit_stacking_path(
+    tree: &DomTree,
+    laid: &crate::DomLayout,
+    id: obscura_dom::tree::NodeId,
+) -> Vec<i32> {
+    // Stacking contexts are inherited through the DOM ancestor chain.
+    // The rendered-parent helper deliberately skips some framework
+    // wrapper boxes; using it here can detach a control from a fixed
+    // ancestor's context and make the ancestor win its own hit test.
+    let mut ancestors = tree.ancestors(id);
+    ancestors.insert(0, id);
+    ancestors.reverse();
+    ancestors
+        .into_iter()
+        .filter_map(|node| stacking_z_index(tree, laid, node))
+        .collect()
+}
+
+fn compare_hit_stacking_paths(a: &[i32], b: &[i32]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let common = a.len().min(b.len());
+    for index in 0..common {
+        let order = a[index].cmp(&b[index]);
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    if a.len() == b.len() {
+        return Ordering::Equal;
+    }
+    // Ending the path means normal-flow content in this stacking
+    // context: it paints after a negative child context and before a
+    // zero-or-positive child context.
+    if a.len() == common {
+        if b[common] < 0 {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }
+    } else if a[common] < 0 {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
 fn stacking_z_index(
     tree: &DomTree,
     laid: &crate::DomLayout,
@@ -12094,6 +12155,32 @@ mod tests {
                     "{placement}, point ({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn hit_test_stack_starts_with_the_hit_and_runs_front_to_back() {
+        // The #738 layout: a z-index 1002 close button precedes a z-index 1001
+        // overlay in the DOM, inside a z-index 1000 dialog.
+        let tree = parse_html(r#"<style>
+            body {margin:0}
+            #dialog {position:fixed;top:100px;left:100px;width:400px;height:200px;z-index:1000}
+            #close {position:absolute;top:10px;right:10px;width:32px;height:32px;z-index:1002}
+            #overlay {position:absolute;inset:0;z-index:1001}
+            </style><div id="dialog"><button id="close">x</button><div id="overlay"></div></div>"#);
+        let mut cache = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let close = tree.get_element_by_id("close").unwrap();
+        let overlay = tree.get_element_by_id("overlay").unwrap();
+        let dialog = tree.get_element_by_id("dialog").unwrap();
+
+        // The centre of the close button.
+        let (x, y) = (474.0, 126.0);
+        let stack = prepared.hit_test_stack(&tree, &scroll, x, y);
+        assert_eq!(stack.first().copied(), prepared.hit_test(&tree, &scroll, x, y));
+        assert_eq!(&stack[..3], &[close, overlay, dialog]);
+
+        assert!(prepared.hit_test_stack(&tree, &scroll, -1.0, 10.0).is_empty());
     }
 
     #[test]
