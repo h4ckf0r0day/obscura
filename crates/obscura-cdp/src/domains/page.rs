@@ -1589,6 +1589,17 @@ pub async fn handle(
         // Obscura does not download files to disk, so there is no behavior to
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
+        // Obscura never enforces Content-Security-Policy: it reports no
+        // securitypolicyviolation and blocks no resource, so a document's CSP
+        // already has no effect on fetches or script execution. There is
+        // nothing to bypass, so both values ack. Validate the parameter
+        // anyway, so a client sending the wrong type fails on the wire the way
+        // Chrome fails instead of silently ignoring it (issue #1224).
+        "setBypassCSP" => {
+            params.get("enabled").and_then(Value::as_bool)
+                .ok_or("enabled must be a boolean")?;
+            Ok(json!({}))
+        }
         "getLayoutMetrics" => {
             // Playwright calls this before every page.screenshot(). Report the
             // same live CSS viewport that responsive page code and paint use.
@@ -3876,6 +3887,37 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    /// Regression for #1224: a Playwright context created with
+    /// bypass_csp=True sends Page.setBypassCSP, and the catch-all rejected it
+    /// with "Unknown Page method: setBypassCSP", so new_page() failed before
+    /// it could navigate. Obscura enforces no CSP, so both values ack.
+    #[tokio::test]
+    async fn set_bypass_csp_acks_both_values() {
+        for enabled in [true, false] {
+            let mut ctx = CdpContext::new();
+            let result = handle("setBypassCSP", &json!({ "enabled": enabled }), &mut ctx, &None)
+                .await
+                .unwrap_or_else(|err| panic!("setBypassCSP({enabled}) must ack: {err}"));
+            assert_eq!(result, json!({}));
+        }
+    }
+
+    /// The catch-all is fixed for setBypassCSP only; other unknown methods keep
+    /// erroring, and a malformed parameter still fails on the wire.
+    #[tokio::test]
+    async fn set_bypass_csp_rejects_a_missing_or_non_boolean_enabled() {
+        for params in [json!({}), json!({ "enabled": "yes" })] {
+            let mut ctx = CdpContext::new();
+            let err = handle("setBypassCSP", &params, &mut ctx, &None)
+                .await
+                .expect_err("a non-boolean enabled must error");
+            assert!(
+                err.contains("enabled must be a boolean"),
+                "unexpected error for {params}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
