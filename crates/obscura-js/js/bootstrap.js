@@ -673,7 +673,13 @@ async function _loadLinkedStylesheet(c) {
   // Read both so the property-assignment form (the common framework pattern)
   // and the parsed-from-HTML form are both recognized.
   const rel = (c.getAttribute('rel') || c.rel || '').toString().toLowerCase();
-  if (!rel.split(/\s+/).includes('stylesheet')) return;
+  const rels = rel.split(/\s+/);
+  if (!rels.includes('stylesheet')) {
+    if (rels.includes('preload') || rels.includes('modulepreload')) {
+      _loadPreloadLink(c, rels.includes('modulepreload'));
+    }
+    return;
+  }
   const href = c.getAttribute('href');
   if (!href) return;
   if (!c.getAttribute('rel') && c.rel) c.setAttribute('rel', String(c.rel));
@@ -699,6 +705,45 @@ async function _loadLinkedStylesheet(c) {
   } catch(e) {
     try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
   }
+}
+
+// Fetch destinations for the `as` values a preload link can carry. Chrome does
+// not fetch at all when `as` is missing or unknown.
+const _preloadDestinations = {
+  style: "Stylesheet",
+  script: "Script",
+  font: "Fetch",
+  image: "Fetch",
+  fetch: "Fetch",
+};
+
+// A dynamically-inserted <link rel="preload" as> must fetch and then fire load
+// or error, without applying anything. relList.supports('preload') reports
+// true, so loaders that feature-detect it (React's stylesheet resources among
+// them) wait on this event before inserting the real resource. Issue #1244.
+async function _loadPreloadLink(c, modulePreload) {
+  const href = c.getAttribute('href');
+  if (!href) return;
+  const as = (c.getAttribute('as') || c.as || '').toString().toLowerCase();
+  const destination = modulePreload ? "Script" : _preloadDestinations[as];
+  if (!destination) return;
+  let pageOrigin = "";
+  try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
+  let loaded = false;
+  try {
+    const raw = await __obscuraCore.ops.op_fetch_url(
+      _resolveResourceUrl(href), "GET", "{}", new Uint8Array(0), pageOrigin,
+      "no-cors", "same-origin", destination
+    );
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.bodyRid === 'number') {
+      // Nothing reads a preloaded body, so drain it to release the resource.
+      await __obscuraCore.ops.op_fetch_body(parsed.bodyRid).catch(() => {});
+    }
+    loaded = !parsed.blocked
+      && (parsed.opaque || (parsed.status > 0 && parsed.status < 400));
+  } catch(e) {}
+  try { c.dispatchEvent(new Event(loaded ? 'load' : 'error', { bubbles: true })); } catch(e) {}
 }
 
 function _fpRand(salt) {
