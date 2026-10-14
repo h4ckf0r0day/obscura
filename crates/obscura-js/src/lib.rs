@@ -1,6 +1,8 @@
 pub mod cdp_watchdog;
 pub mod frame;
 mod import_map;
+mod message;
+mod message_port;
 pub mod markdown;
 pub mod module_loader;
 pub mod ops;
@@ -9,6 +11,7 @@ pub mod v8_flags;
 mod write_stream;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
+pub use message::SerializedMessage;
 pub use v8_flags::set_v8_flags;
 
 // Screenshot rasterization (PNG bytes) from the render layer. Available when the

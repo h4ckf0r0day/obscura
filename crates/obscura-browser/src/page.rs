@@ -1374,17 +1374,26 @@ impl Page {
             return false;
         }
 
-        for message in pending {
-            let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
+        for mut message in pending {
             let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
             let escaped_target_origin =
                 serde_json::to_string(&message.target_origin).unwrap_or_default();
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
-                let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
-                    message.source_frame_id,
-                );
+                let script = if let Some(packet) = message.take_packet() {
+                    let packet = js.store_cross_realm_message(packet);
+                    format!(
+                        "globalThis.__obscura_deliverMessagePacket({packet}, {escaped_origin}, {}, {escaped_target_origin});",
+                        message.source_frame_id,
+                    )
+                } else {
+                    let escaped_data =
+                        serde_json::to_string(&message.data_json).unwrap_or_default();
+                    format!(
+                        "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
+                        message.source_frame_id,
+                    )
+                };
                 if let Err(error) = js.execute_script("<frame-message>", &script) {
                     tracing::debug!("message to the page failed: {error}");
                 }
@@ -1401,13 +1410,24 @@ impl Page {
                 continue;
             };
             let Some(js) = self.js.as_mut() else { continue };
-            if let Err(error) = self.frames[index].deliver_message(
-                js,
-                &message.data_json,
-                &message.origin,
-                message.source_frame_id,
-                &message.target_origin,
-            ) {
+            let delivered = if let Some(packet) = message.take_packet() {
+                self.frames[index].deliver_message_packet(
+                    js,
+                    packet,
+                    &message.origin,
+                    message.source_frame_id,
+                    &message.target_origin,
+                )
+            } else {
+                self.frames[index].deliver_message(
+                    js,
+                    &message.data_json,
+                    &message.origin,
+                    message.source_frame_id,
+                    &message.target_origin,
+                )
+            };
+            if let Err(error) = delivered {
                 tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
             }
         }

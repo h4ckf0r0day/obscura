@@ -204,6 +204,27 @@ impl FrameRealm {
         )
     }
 
+    /// Delivers a structured `postMessage` packet, including transferred
+    /// MessagePorts, into this frame's realm.
+    pub fn deliver_message_packet(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        message: crate::SerializedMessage,
+        origin: &str,
+        source_frame_id: u32,
+        target_origin: &str,
+    ) -> Result<(), String> {
+        let packet = parent.store_cross_realm_message(message);
+        self.execute_script(
+            parent,
+            &format!(
+                "globalThis.__obscura_deliverMessagePacket({packet}, {}, {source_frame_id}, {});",
+                encode_json_argument(origin),
+                encode_json_argument(target_origin),
+            ),
+        )
+    }
+
     pub fn frame_id(&self) -> u32 {
         self.frame_id
     }
@@ -1241,6 +1262,64 @@ mod tests {
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
             serde_json::json!([[{"token": "ok"}, "https://child.example", true]]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_can_transfer_a_message_port_to_its_parent() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        parent
+            .execute_script(
+                "parent-port-listener",
+                "globalThis.got = [];
+                 addEventListener('message', event => {
+                   const port = event.ports[0];
+                   got.push([event.ports.length, port === event.data.port]);
+                   port.onmessage = reply => { got.push(reply.data); port.close(); };
+                   port.postMessage('ping');
+                 });",
+            )
+            .unwrap();
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(
+                &mut parent,
+                "const channel = new MessageChannel();
+                 channel.port1.onmessage = event => {
+                   channel.port1.postMessage('echo:' + event.data);
+                   channel.port1.close();
+                 };
+                 parent.postMessage({ port: channel.port2 }, '*', [channel.port2]);",
+            )
+            .unwrap();
+
+        let mut queued = parent.take_pending_frame_messages();
+        assert_eq!(queued.len(), 1);
+        let message = &mut queued[0];
+        let packet = parent.store_cross_realm_message(message.take_packet().unwrap());
+        parent
+            .execute_script(
+                "<frame-message-packet>",
+                &format!(
+                    "globalThis.__obscura_deliverMessagePacket({packet}, {}, {}, {});",
+                    serde_json::to_string(&message.origin).unwrap(),
+                    message.source_frame_id,
+                    serde_json::to_string(&message.target_origin).unwrap(),
+                ),
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(500).await.unwrap();
+
+        assert_eq!(
+            parent.evaluate("globalThis.got").unwrap(),
+            serde_json::json!([[1, true], "echo:ping"]),
         );
     }
 

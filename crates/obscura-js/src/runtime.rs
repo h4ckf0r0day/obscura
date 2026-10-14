@@ -1106,6 +1106,16 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut state.pending_frame_messages)
     }
 
+    /// Places a structured cross-realm packet back in the shared resource
+    /// table so the destination realm can deserialize it.
+    pub fn store_cross_realm_message(&mut self, message: crate::SerializedMessage) -> u32 {
+        self.js_runtime
+            .op_state()
+            .borrow_mut()
+            .resource_table
+            .add(crate::message::MessageResource::new(message))
+    }
+
     /// Restore the configured V8 heap limit after the emergency headroom has
     /// allowed a terminated allocation to unwind. The callback is then armed
     /// again so a second hostile script cannot grow the isolate without bound.
@@ -5806,6 +5816,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_can_create_and_transfer_a_message_port_to_its_parent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const dependency = 'data:text/javascript,' + encodeURIComponent(
+                        'globalThis.workerEcho = value => "echo:" + value;');
+                    const url = URL.createObjectURL(new Blob([`
+                        importScripts(${JSON.stringify(dependency)});
+                        const channel = new MessageChannel();
+                        channel.port1.onmessage = event => {
+                            channel.port1.postMessage(workerEcho(event.data));
+                            channel.port1.close();
+                        };
+                        channel.port1.postMessage('queued');
+                        postMessage({ port: channel.port2 }, [channel.port2]);
+                    `]));
+                    const worker = new Worker(url);
+                    const result = await new Promise((resolve, reject) => {
+                        const timer = setTimeout(() => reject(new Error('MessagePort timed out')), 1000);
+                        worker.onerror = event => reject(new Error('Worker error: ' + event.message));
+                        worker.onmessage = event => {
+                            const port = event.ports[0];
+                            const samePort = port === event.data.port;
+                            const messages = [];
+                            port.onmessage = reply => {
+                                messages.push(reply.data);
+                                if (messages.length === 2) {
+                                    clearTimeout(timer);
+                                    port.close();
+                                    resolve({ samePort, messages });
+                                }
+                            };
+                            port.postMessage('ping');
+                        };
+                    });
+                    worker.terminate(); URL.revokeObjectURL(url);
+                    return result;
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        let value = result.value.clone().unwrap_or_else(|| {
+            panic!("worker-created MessagePort round trip failed: {result:?}")
+        });
+        assert_eq!(
+            value,
+            serde_json::json!({"samePort": true, "messages": ["queued", "echo:ping"]})
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_onmessage_bindings_do_not_mutate_window() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("worker-onmessage-bindings", r#"
@@ -6328,16 +6394,29 @@ mod tests {
                 r#"(() => {
                     let constructorError = "";
                     let cloneError = "";
+                    let closedCloneError = "";
+                    let closedPeerError = "";
                     try { new MessagePort(); } catch (error) { constructorError = error.name; }
                     try { new MessageChannel().port1.postMessage(() => {}); }
                     catch (error) { cloneError = error.name; }
-                    return [constructorError, cloneError, Object.prototype.toString.call(new MessageChannel().port1)];
+                    const closed = new MessageChannel();
+                    closed.port1.close();
+                    try { closed.port1.postMessage(() => {}); }
+                    catch (error) { closedCloneError = error.name; }
+                    const peerClosed = new MessageChannel();
+                    peerClosed.port2.close();
+                    try { peerClosed.port1.postMessage('discarded'); }
+                    catch (error) { closedPeerError = error.name; }
+                    return [constructorError, cloneError, closedCloneError, closedPeerError,
+                        Object.prototype.toString.call(new MessageChannel().port1)];
                 })()"#,
             )
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!(["TypeError", "DataCloneError", "[object MessagePort]"])
+            serde_json::json!([
+                "TypeError", "DataCloneError", "DataCloneError", "", "[object MessagePort]"
+            ])
         );
     }
 

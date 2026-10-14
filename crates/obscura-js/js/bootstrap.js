@@ -29,6 +29,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_viewport_w', '__obscura_viewport_h',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
+    '__obscura_deliverMessagePacket',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
@@ -308,6 +309,7 @@ let __parserBlockingScriptQueue = [];
 let __parserBlockingScriptBusy = false;
 let __parserBlockingScriptPending = 0;
 const __documentWriteScripts = new WeakSet();
+const __classicScriptSources = new Map();
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
   value: function() {
     return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
@@ -386,6 +388,7 @@ globalThis.__markParserScripts = function(nids) {
 };
 async function __fetchDynClassicScript(task) {
   let body;
+  let responseUrl = task.url;
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
@@ -401,7 +404,10 @@ async function __fetchDynClassicScript(task) {
       throw new Error('HTTP ' + (parsed.status || 0));
     }
     body = parsed.body;
+    responseUrl = parsed.url || task.url;
   }
+  __classicScriptSources.set(task.url, body);
+  __classicScriptSources.set(responseUrl, body);
   return body;
 }
 function __startDynClassicFetch(task) {
@@ -1520,6 +1526,11 @@ Object.defineProperty(globalThis, "scheduler", {
 // one message per task so every delivery gets its own microtask checkpoint.
 const _messagePortConstructionKey = {};
 const _messagePortState = new WeakMap();
+const _messagePortFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry(handle => {
+      try { __obscuraCore.ops.op_message_port_close(handle.id, handle.owner); } catch (_) {}
+    })
+  : null;
 function _messagePortStateFor(port) {
   const state = _messagePortState.get(port);
   if (!state) throw new TypeError("Illegal invocation");
@@ -1552,7 +1563,7 @@ function _messagePortInstallEventHandler(port, type, callback) {
 }
 function _messagePortScheduleDelivery(port) {
   const state = _messagePortStateFor(port);
-  if (state.closed || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
+  if (state.closed || state.transferred || !state.messageQueueEnabled || state.messageDeliveryPending || !state.messageQueue.length) return;
   const deliveryGeneration = state.messageQueue[0].generation;
   state.messageDeliveryPending = true;
   // User-visible ordinary rank. Scheduler continuations at the same priority
@@ -1562,13 +1573,13 @@ function _messagePortScheduleDelivery(port) {
     if (!current) return;
     current.messageDeliveryPending = false;
     if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
-    const data = current.messageQueue.shift().data;
+    const message = current.messageQueue.shift();
     const event = new MessageEvent("message", {
-      data,
+      data: message.data,
       origin: "",
       lastEventId: "",
       source: null,
-      ports: [],
+      ports: message.ports,
     });
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
@@ -1581,59 +1592,138 @@ function _messagePortScheduleDelivery(port) {
     _messagePortScheduleDelivery(port);
   });
 }
+
+function _messageTransferList(options) {
+  if (options == null) return [];
+  let transfer = options;
+  if (!Array.isArray(options) && typeof options === "object"
+      && Object.prototype.hasOwnProperty.call(options, "transfer")) {
+    transfer = options.transfer;
+  }
+  if (transfer == null) return [];
+  try { return Array.from(transfer); }
+  catch (_) { throw new TypeError("Transfer list is not iterable"); }
+}
+
+function _messagePortStartReceiving(port) {
+  const state = _messagePortStateFor(port);
+  if (state.closed || state.transferred || state.receiving) return;
+  state.receiving = true;
+  const generation = state.receiveGeneration;
+  const id = state.id;
+  const owner = state.owner;
+  (async () => {
+    try {
+      while (true) {
+        const deliveryGeneration = _browserPostedTaskGeneration();
+        const packet = await __obscuraCore.ops.op_message_port_receive(id, owner);
+        const current = _messagePortState.get(port);
+        if (!current || current.closed || current.transferred
+            || current.receiveGeneration !== generation) return;
+        if (packet === null) {
+          current.receiving = false;
+          return;
+        }
+        let message;
+        try {
+          message = _deserializeMessage(packet);
+        } catch (_) {
+          _eventTargetDispatch(port, new MessageEvent("messageerror"));
+          continue;
+        }
+        current.messageQueue.push({
+          data: message.data,
+          ports: message.ports,
+          generation: deliveryGeneration,
+        });
+        _messagePortScheduleDelivery(port);
+      }
+    } catch (_) {
+      const current = _messagePortState.get(port);
+      if (current && !current.closed && !current.transferred
+          && current.receiveGeneration === generation) {
+        current.receiving = false;
+        _eventTargetDispatch(port, new MessageEvent("messageerror"));
+      }
+    }
+  })();
+}
+
+function _messagePortHandle(port) {
+  const state = _messagePortStateFor(port);
+  if (state.closed || state.transferred) {
+    throw new DOMException("MessagePort is already transferred or closed", "DataCloneError");
+  }
+  return { id: state.id, owner: state.owner };
+}
+
+function _messagePortDetach(port, handle) {
+  const state = _messagePortStateFor(port);
+  if (_messagePortFinalizer) _messagePortFinalizer.unregister(port);
+  state.transferred = true;
+  state.closed = true;
+  state.receiving = false;
+  state.receiveGeneration++;
+  state.messageQueue.length = 0;
+  state.id = handle.id;
+  state.owner = handle.owner;
+}
+
+function _messagePortFromHandle(handle) {
+  return new MessagePort(_messagePortConstructionKey, handle);
+}
+
 class MessagePort {
-  constructor(key) {
+  constructor(key, handle) {
     if (key !== _messagePortConstructionKey) throw new TypeError("Illegal constructor");
     _messagePortState.set(this, {
-      entangled: null,
+      id: handle.id >>> 0,
+      owner: handle.owner >>> 0,
       messageQueue: [],
       messageQueueEnabled: false,
       messageDeliveryPending: false,
+      receiving: false,
+      receiveGeneration: 0,
       closed: false,
+      transferred: false,
       onmessage: null,
       onmessageerror: null,
       messageHandlerWrapper: null,
       messageErrorHandlerWrapper: null,
     });
+    if (_messagePortFinalizer) {
+      _messagePortFinalizer.register(
+        this,
+        { id: handle.id >>> 0, owner: handle.owner >>> 0 },
+        this,
+      );
+    }
   }
   postMessage(message, options) {
-    // Structured serialization happens before inspecting the entanglement.
-    // This preserves the browser-observable DataCloneError on closed ports and
-    // prevents mutations after postMessage from changing the delivered value.
-    let cloned;
-    try {
-      cloned = globalThis.structuredClone(message, options);
-    } catch (error) {
-      throw error;
-    }
     const state = _messagePortStateFor(this);
-    const target = state.entangled;
-    const targetState = target && _messagePortState.get(target);
-    if (state.closed || !targetState || targetState.closed) return;
-    targetState.messageQueue.push({
-      data: cloned,
-      generation: _browserPostedTaskGeneration(),
-    });
-    _messagePortScheduleDelivery(target);
+    const packet = _serializeMessage(message, options);
+    if (state.closed || state.transferred) {
+      __obscuraCore.ops.op_try_close(packet);
+      return;
+    }
+    __obscuraCore.ops.op_message_port_post(state.id, state.owner, packet);
   }
   start() {
     const state = _messagePortStateFor(this);
-    if (state.messageQueueEnabled || state.closed) return;
+    if (state.messageQueueEnabled || state.closed || state.transferred) return;
     state.messageQueueEnabled = true;
+    _messagePortStartReceiving(this);
     _messagePortScheduleDelivery(this);
   }
   close() {
     const state = _messagePortStateFor(this);
     if (state.closed) return;
     state.closed = true;
+    state.receiveGeneration++;
+    if (_messagePortFinalizer) _messagePortFinalizer.unregister(this);
     state.messageQueue.length = 0;
     state.messageQueueEnabled = false;
-    const peer = state.entangled;
-    state.entangled = null;
-    const peerState = peer && _messagePortState.get(peer);
-    if (peerState?.entangled === this) peerState.entangled = null;
-    // A previously scheduled task cannot be removed from the shared task
-    // source, but it observes `closed` and therefore cannot dispatch.
+    __obscuraCore.ops.op_message_port_close(state.id, state.owner);
   }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
@@ -1667,10 +1757,9 @@ class MessagePort {
 
 class MessageChannel {
   constructor() {
-    this.port1 = new MessagePort(_messagePortConstructionKey);
-    this.port2 = new MessagePort(_messagePortConstructionKey);
-    _messagePortStateFor(this.port1).entangled = this.port2;
-    _messagePortStateFor(this.port2).entangled = this.port1;
+    const handles = __obscuraCore.ops.op_message_port_create_pair();
+    this.port1 = new MessagePort(_messagePortConstructionKey, handles[0]);
+    this.port2 = new MessagePort(_messagePortConstructionKey, handles[1]);
   }
 }
 globalThis.MessageChannel = MessageChannel;
@@ -12139,6 +12228,9 @@ function _structuredClone(value, seen) {
   }
   if (value === null || typeof value !== "object") return value;
   if (seen.has(value)) return seen.get(value);
+  if (value instanceof MessagePort) {
+    throw new DOMException("MessagePort must be listed in the transfer list", "DataCloneError");
+  }
   // Typed arrays: copy the underlying buffer slice. DataView has no .slice(),
   // so slice its buffer over the view's range and wrap a fresh view.
   if (ArrayBuffer.isView(value)) {
@@ -12226,7 +12318,11 @@ function _structuredClone(value, seen) {
   }
   return out;
 }
-globalThis.structuredClone = globalThis.structuredClone || ((v) => _structuredClone(v, new Map()));
+globalThis.structuredClone = globalThis.structuredClone
+  || ((value, options) => {
+    const packet = _serializeMessage(value, options);
+    return _deserializeMessage(packet).data;
+  });
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
 // WHATWG Storage as a legacy platform object: a Proxy routes property access
@@ -14432,7 +14528,38 @@ function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
   return receiverOrigin === expected;
 }
 
-function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+function _sendRealmMessage(targetFrameId, data, targetOrigin, transfer) {
+  if (targetOrigin && typeof targetOrigin === 'object' && !Array.isArray(targetOrigin)) {
+    transfer = targetOrigin.transfer;
+    targetOrigin = targetOrigin.targetOrigin;
+  }
+  const transferList = _messageTransferList(transfer);
+  const usesPacket = transferList.length > 0;
+  // An unspecified targetOrigin stays permissive (empty string); the receiver
+  // enforces a specified one at delivery time.
+  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
+  if (usesPacket) {
+    const packet = _serializeMessage(data, transferList);
+    if (__obscuraCore.ops.op_post_frame_message_packet(
+        targetFrameId >>> 0, to, packet)) return;
+    const origin = _realmOrigin();
+    if (!_targetOriginAllows(targetOrigin, origin, origin)) {
+      __obscuraCore.ops.op_try_close(packet);
+      return;
+    }
+    setTimeout(() => {
+      try {
+        const message = _deserializeMessage(packet);
+        globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+          new MessageEvent('message', {
+            data: message.data, origin, source: globalThis, ports: message.ports,
+          })));
+      } catch (_) {
+        try { globalThis.dispatchEvent(new MessageEvent('messageerror')); } catch (_) {}
+      }
+    }, 0);
+    return;
+  }
   let json;
   // Structured clone cannot cross realms here. JSON carries what postMessage is
   // actually used for; anything else throws the same DataCloneError a browser
@@ -14443,9 +14570,6 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
-  // An unspecified targetOrigin stays permissive (empty string); the receiver
-  // enforces a specified one against its own origin in __obscura_deliverMessage.
-  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
   if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
   // Top-level self-posts also work in a standalone runtime without a Page to
   // drain cross-realm messages. Serialize only once, before scheduling.
@@ -14541,7 +14665,7 @@ function _frameWindowFor(frameId) {
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
   const post = _markNative(function (data, targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data, targetOrigin);
+    _sendRealmMessage(frameId, data, targetOrigin, _transfer);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -14584,6 +14708,40 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
   }
 };
 
+globalThis.__obscura_deliverMessagePacket = function(
+  packet,
+  origin,
+  sourceFrameId,
+  targetOrigin,
+) {
+  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) {
+    __obscuraCore.ops.op_try_close(packet);
+    return;
+  }
+  let message;
+  try {
+    message = _deserializeMessage(packet);
+  } catch (_) {
+    try { globalThis.dispatchEvent(new MessageEvent('messageerror')); } catch (_) {}
+    return;
+  }
+  const source = (globalThis.__obscura_frameId !== 0
+                  && sourceFrameId === globalThis.__obscura_parentFrameId)
+    ? globalThis.parent
+    : _frameWindowFor(sourceFrameId);
+  try {
+    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      new MessageEvent('message', {
+        data: message.data,
+        origin,
+        source,
+        ports: message.ports,
+      })));
+  } catch (error) {
+    console.error('message listener failed:', error && error.message || error);
+  }
+};
+
 // A window in another browsing context, as seen from this one.
 //
 // Only the cross-origin surface is exposed: reaching synchronously into another
@@ -14594,7 +14752,9 @@ class _RemoteWindow {
   constructor(frameId) {
     Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
   }
-  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
+  postMessage(data, targetOrigin, _transfer) {
+    _sendRealmMessage(this._frameId, data, targetOrigin, _transfer);
+  }
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
@@ -14689,7 +14849,7 @@ class _IframeWindow {
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
     if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data, targetOrigin);
+    _sendRealmMessage(this._frameId, data, targetOrigin, _transfer);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -15601,6 +15761,190 @@ navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not a
 
 globalThis.opener = null;
 
+const _workerImportRequestKey = {};
+let _messageKeyCodec;
+
+function _messageGraph(value, seen, platform) {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return seen.get(value);
+  // Leave native structured-clone values intact so V8 preserves their types
+  // and backing-buffer relationships.
+  if (__obscuraCore.isProxy(value) || __obscuraCore.isPromise(value)
+      || __obscuraCore.isWeakMap(value) || __obscuraCore.isWeakSet(value)
+      || __obscuraCore.isMapIterator(value) || __obscuraCore.isSetIterator(value)
+      || __obscuraCore.isGeneratorObject(value)
+      || __obscuraCore.isArgumentsObject(value) || __obscuraCore.isModuleNamespaceObject(value)
+      || __obscuraCore.isBoxedPrimitive(value) || __obscuraCore.isArrayBufferView(value)
+      || __obscuraCore.isAnyArrayBuffer(value) || __obscuraCore.isDate(value)
+      || __obscuraCore.isRegExp(value) || value instanceof WebAssembly.Module) return value;
+  const replacement = platform && platform(value);
+  if (replacement) {
+    seen.set(value, replacement);
+    return replacement;
+  }
+  let copy;
+  if (__obscuraCore.isMap(value)) {
+    copy = new Map();
+    seen.set(value, copy);
+    for (const [key, item] of Array.from(Map.prototype.entries.call(value))) {
+      copy.set(_messageGraph(key, seen, platform), _messageGraph(item, seen, platform));
+    }
+  } else if (__obscuraCore.isSet(value)) {
+    copy = new Set();
+    seen.set(value, copy);
+    for (const item of Array.from(Set.prototype.values.call(value))) {
+      copy.add(_messageGraph(item, seen, platform));
+    }
+  } else if (__obscuraCore.isNativeError(value)) {
+    const constructors = {
+      __proto__: null,
+      Error,
+      TypeError,
+      RangeError,
+      ReferenceError,
+      SyntaxError,
+      EvalError,
+      URIError,
+    };
+    const name = value.name;
+    const Constructor = (typeof name === 'string' && constructors[name]) || Error;
+    const message = Object.getOwnPropertyDescriptor(value, 'message');
+    copy = new Constructor(message && 'value' in message ? message.value : undefined);
+    seen.set(value, copy);
+    copy.stack = value.stack;
+    const cause = Object.getOwnPropertyDescriptor(value, 'cause');
+    if (cause && 'value' in cause) {
+      Object.defineProperty(copy, 'cause', {
+        value: _messageGraph(cause.value, seen, platform),
+        writable: true,
+        configurable: true,
+      });
+    }
+  } else {
+    if (value instanceof Node || value instanceof EventTarget || value instanceof Event) {
+      throw new DOMException('Object cannot be cloned', 'DataCloneError');
+    }
+    copy = Array.isArray(value) ? new Array(value.length) : {};
+    seen.set(value, copy);
+    for (const key of Object.keys(value)) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      Object.defineProperty(copy, key, {
+        value: _messageGraph(value[key], seen, platform),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  return copy;
+}
+
+function _serializeMessage(value, options) {
+  const transfer = _messageTransferList(options);
+  const portDescriptors = new Map();
+  const transferredPorts = [];
+  const oldHandles = [];
+  const sourcePorts = [];
+  for (const item of transfer) {
+    if (!(item instanceof MessagePort)) continue;
+    if (portDescriptors.has(item)) {
+      throw new DOMException(
+        'MessagePort occurs more than once in the transfer list',
+        'DataCloneError',
+      );
+    }
+    const oldHandle = _messagePortHandle(item);
+    const owner = ((oldHandle.owner + 1) >>> 0) || 1;
+    const descriptor = { kind: 'MessagePort', id: oldHandle.id, owner };
+    portDescriptors.set(item, descriptor);
+    transferredPorts.push(descriptor);
+    oldHandles.push(oldHandle);
+    sourcePorts.push(item);
+  }
+  const hosts = [];
+  const metadata = [];
+  const root = _messageGraph(value, new Map(), source => {
+    let data = _messageKeyCodec?.encode(source);
+    if (!data && source instanceof File) {
+      data = {
+        kind: 'File',
+        bytes: source._bytes,
+        type: source.type,
+        name: source.name,
+        lastModified: source.lastModified,
+      };
+    } else if (!data && source instanceof Blob) {
+      data = { kind: 'Blob', bytes: source._bytes, type: source.type };
+    } else if (!data && source instanceof DOMException) {
+      data = { kind: 'DOMException', name: source.name, message: source.message };
+    } else if (!data && source instanceof MessagePort) {
+      data = portDescriptors.get(source);
+      if (!data) {
+        throw new DOMException('MessagePort must be listed in the transfer list', 'DataCloneError');
+      }
+    }
+    if (!data) return null;
+    const placeholder = {};
+    hosts.push(placeholder);
+    metadata.push(data);
+    return placeholder;
+  });
+  const packet = __obscuraCore.ops.op_message_serialize(
+    { root, hosts, metadata, ports: transferredPorts },
+    message => { throw new DOMException(message, 'DataCloneError'); },
+  );
+  if (!oldHandles.length) return packet;
+  let handles;
+  try {
+    handles = __obscuraCore.ops.op_message_port_transfer(oldHandles);
+    if (!Array.isArray(handles) || handles.length !== oldHandles.length) {
+      throw new DOMException('MessagePort transfer failed', 'DataCloneError');
+    }
+    for (let i = 0; i < handles.length; i++) {
+      const expected = transferredPorts[i];
+      if (handles[i].id !== expected.id || handles[i].owner !== expected.owner) {
+        throw new DOMException('MessagePort ownership changed during transfer', 'DataCloneError');
+      }
+    }
+  } catch (error) {
+    __obscuraCore.ops.op_try_close(packet);
+    throw error;
+  }
+  for (let i = 0; i < handles.length; i++) _messagePortDetach(sourcePorts[i], handles[i]);
+  return packet;
+}
+
+function _deserializeMessage(packet) {
+  const message = __obscuraCore.ops.op_message_deserialize(packet);
+  const replacements = new Map();
+  const ports = new Map();
+  const revivePort = data => {
+    const key = data.id + ':' + data.owner;
+    let port = ports.get(key);
+    if (!port) {
+      port = _messagePortFromHandle(data);
+      ports.set(key, port);
+    }
+    return port;
+  };
+  for (let i = 0; i < message.hosts.length; i++) {
+    const data = message.metadata[i];
+    let value;
+    if (data.kind === 'CryptoKey') value = _messageKeyCodec.decode(data);
+    else if (data.kind === 'Blob') value = new Blob([data.bytes], { type: data.type });
+    else if (data.kind === 'File') value = new File([data.bytes], data.name,
+      { type: data.type, lastModified: data.lastModified });
+    else if (data.kind === 'DOMException') value = new DOMException(data.message, data.name);
+    else if (data.kind === 'MessagePort') value = revivePort(data);
+    else throw new DOMException('Unknown message type', 'DataCloneError');
+    replacements.set(message.hosts[i], value);
+  }
+  return {
+    data: _messageGraph(message.root, replacements, null),
+    ports: (message.ports || []).map(revivePort),
+  };
+}
+
 globalThis.Worker = class Worker {
   constructor(url) {
     this.onmessage = null;
@@ -15615,6 +15959,7 @@ globalThis.Worker = class Worker {
     if (typeof url === 'string') {
       const blob = globalThis.__blobStore?.[url];
       if (blob) {
+        worker._url = url;
         worker._code = blob;
         // Auto-start on next tick so caller can set onmessage first.
         setTimeout(() => worker._autoRun(), 0);
@@ -15627,6 +15972,7 @@ globalThis.Worker = class Worker {
       (async () => {
         try {
           const resp = await fetch(resolvedUrl);
+          worker._url = resp.url || resolvedUrl;
           worker._code = await resp.text();
           if (!worker._terminated) worker._autoRun();
         } catch(e) { if (worker.onerror) worker.onerror(e); }
@@ -15639,12 +15985,40 @@ globalThis.Worker = class Worker {
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
-      postMessage: (msg) => {
+      importScripts: (...values) => {
+        const scripts = values.map(value => {
+          if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to a string');
+          let url;
+          try { url = new URL(String(value), worker._url || globalThis.location?.href || '').href; }
+          catch (_) { throw new DOMException('Invalid importScripts URL', 'SyntaxError'); }
+          let source;
+          if (url.startsWith('data:')) source = _decodeDataScriptUrl(url);
+          else if (Object.prototype.hasOwnProperty.call(globalThis.__blobStore || {}, url)) {
+            source = globalThis.__blobStore[url];
+          } else source = __classicScriptSources.get(url);
+          return { url, source };
+        });
+        const missing = scripts.filter(script => script.source === undefined);
+        if (missing.length) {
+          throw {
+            key: _workerImportRequestKey,
+            urls: Array.from(new Set(missing.map(script => script.url))),
+          };
+        }
+        for (const { source } of scripts) {
+          worker._runInScope(scope, source);
+        }
+      },
+      postMessage: (msg, options) => {
         if (worker._terminated) return;
-        const evt = { data: msg };
-        if (worker.onmessage) worker.onmessage(evt);
-        const ls = worker._listeners['message'] || [];
-        for (const h of ls) h(evt);
+        const message = _deserializeMessage(_serializeMessage(msg, options));
+        _browserPostedTaskEnqueue(() => {
+          if (worker._terminated) return;
+          const evt = { data: message.data, ports: message.ports };
+          if (worker.onmessage) worker.onmessage(evt);
+          const ls = worker._listeners['message'] || [];
+          for (const h of ls) h(evt);
+        }, _schedulerPriorityRank['user-visible'] * 2);
       },
       addEventListener: (type, fn) => {
         if (!scope._ev) scope._ev = {};
@@ -15664,44 +16038,95 @@ globalThis.Worker = class Worker {
       clearInterval: globalThis.clearInterval,
       scheduler: globalThis.scheduler,
       Scheduler: globalThis.Scheduler,
+      MessageChannel: globalThis.MessageChannel,
+      MessagePort: globalThis.MessagePort,
       fetch: globalThis.fetch,
       console: globalThis.console,
       performance: globalThis.performance,
-      location: globalThis.location,
+      location: new URL(worker._url || globalThis.location?.href || 'about:blank'),
+      Reflect: globalThis.Reflect,
+      window: undefined,
+      document: undefined,
     };
     scope.self = scope;
+    scope.globalThis = scope;
+    for (const name of [
+      'Object', 'Function', 'Array', 'Number', 'Boolean', 'String', 'Symbol',
+      'BigInt', 'Date', 'RegExp', 'Promise', 'Proxy', 'Reflect', 'JSON', 'Math',
+      'Intl', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
+      'FinalizationRegistry', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView',
+      'Atomics', 'WebAssembly', 'Uint8Array', 'Uint8ClampedArray', 'Uint16Array',
+      'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'BigInt64Array',
+      'BigUint64Array', 'Float32Array', 'Float64Array', 'Error', 'AggregateError',
+      'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError',
+      'URIError', 'parseFloat', 'parseInt', 'isFinite', 'isNaN', 'decodeURI',
+      'decodeURIComponent', 'encodeURI', 'encodeURIComponent', 'escape', 'unescape',
+    ]) scope[name] = globalThis[name];
     return scope;
+  }
+  _runInScope(scope, source) {
+    const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
+    fn.call(scope, scope, source);
   }
   _autoRun() {
     if (this._terminated || this._scope || this._code === undefined) return;
     const scope = this._makeScope();
+    let waitingForImports = false;
     try {
       // Direct eval preserves script directives and resolves bare handler names
       // against the worker scope. Run once so message closures retain their state.
-      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      this._runInScope(scope, this._code);
     } catch(e) {
-      console.error('Worker error:', e.message);
-      if (this.onerror) this.onerror(e);
+      if (e?.key === _workerImportRequestKey) {
+        waitingForImports = true;
+        this._loadImports(e.urls);
+      } else {
+        this._reportError(e);
+      }
     } finally {
-      if (!this._terminated) {
+      if (!waitingForImports && !this._terminated) {
         this._scope = scope;
-        for (const data of this._pendingMessages.splice(0)) this.postMessage(data);
+        for (const message of this._pendingMessages.splice(0)) this._deliverMessage(message);
       }
     }
   }
-  postMessage(data) {
+  _loadImports(urls) {
+    if (this._loadingImports) return;
+    this._loadingImports = true;
+    const pageOrigin = globalThis.location?.origin || '';
+    Promise.all(urls.map(url => __fetchDynClassicScript({ url, pageOrigin })))
+      .then(() => {
+        this._loadingImports = false;
+        if (!this._terminated) this._autoRun();
+      })
+      .catch(error => {
+        this._loadingImports = false;
+        this._reportError(new DOMException(
+          error?.message || 'Imported Worker script could not be loaded',
+          'NetworkError',
+        ));
+      });
+  }
+  _reportError(error) {
+    console.error('Worker error:', error?.message || String(error));
+    if (this.onerror) this.onerror(error);
+  }
+  postMessage(data, options) {
     if (this._terminated) return;
+    const message = _deserializeMessage(_serializeMessage(data, options));
     if (!this._scope) {
-      this._pendingMessages.push(data);
+      this._pendingMessages.push(message);
       return;
     }
+    this._deliverMessage(message);
+  }
+  _deliverMessage(message) {
     const worker = this;
     setTimeout(() => {
       if (worker._terminated || !worker._scope) return;
       const scope = worker._scope;
       try {
-        const event = { data };
+        const event = { data: message.data, ports: message.ports };
         if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
         const evs = (scope._ev && scope._ev['message']) || [];
         for (const handler of evs.slice()) handler.call(scope, event);
@@ -15857,7 +16282,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
 globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  _sendRealmMessage(_realmFrameId, data, targetOrigin);
+  _sendRealmMessage(_realmFrameId, data, targetOrigin, _transfer);
 };
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
@@ -16156,6 +16581,21 @@ if (!globalThis.crypto.subtle) {
     const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
     if (seen) seen.set(src, copy);
     return copy;
+  };
+
+  // Message metadata remains inside the bootstrap closure and native resource;
+  // no public key method exposes non-extractable key material.
+  _messageKeyCodec = {
+    encode(key) {
+      if (!keyMaterial.has(key)) return null;
+      return {
+        kind: 'CryptoKey', type: key.type, extractable: key.extractable,
+        algorithm: key.algorithm, usages: key.usages, bytes: keyBytes(key),
+      };
+    },
+    decode(data) {
+      return makeKey(data.type, data.extractable, data.algorithm, data.usages, data.bytes.slice());
+    },
   };
 
   const toBytes = (data) => {
