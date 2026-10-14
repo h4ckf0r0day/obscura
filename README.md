@@ -302,6 +302,10 @@ platform font rasterization may differ from Chromium. The existing
 [Playwright](docs/Use-with-Playwright.md), and
 [MCP](docs/Use-the-MCP-server.md) guides cover their capture APIs and limits.
 
+SVG path and shape lengths are available through `getTotalLength()` in both
+render and no-render builds. See [SVG geometry](docs/SVG-geometry.md) for supported
+inputs and current limits.
+
 ### Start the CDP server
 
 ```bash
