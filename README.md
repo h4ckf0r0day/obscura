@@ -279,6 +279,8 @@ See [docs/Environment-variables.md](docs/Environment-variables.md) for the
 full allow/deny rules (DNS-resolution-time checks included).
 ```
 
+See [XML parsing](docs/XML-parsing.md) for `DOMParser` support used by XML-backed applications and feeds.
+
 ## Rendering
 
 Official release archives and the Docker image include the rendering engine.
