@@ -8754,6 +8754,29 @@ mod tests {
     }
 
     #[test]
+    fn embed_and_object_elements_have_dedicated_interfaces() {
+        let mut rt = setup_runtime(
+            r#"<html><body><embed id="embed"><object id="object"></object></body></html>"#,
+        );
+        assert_eq!(
+            rt.evaluate(
+                r#"[
+                    document.getElementById('embed') instanceof HTMLEmbedElement,
+                    document.getElementById('object') instanceof HTMLObjectElement,
+                    document.createElement('embed').constructor === HTMLEmbedElement,
+                    document.createElement('object').constructor === HTMLObjectElement,
+                    document.createElementNS('urn:test', 'embed') instanceof HTMLEmbedElement,
+                    Object.prototype.toString.call(document.getElementById('embed')),
+                    Object.prototype.toString.call(document.getElementById('object')),
+                ]"#,
+            )
+            .unwrap(),
+            serde_json::json!([true, true, true, true, false,
+                "[object HTMLEmbedElement]", "[object HTMLObjectElement]"])
+        );
+    }
+
+    #[test]
     fn input_brand_separates_button_labels_and_preserves_native_setters() {
         let mut rt = setup_runtime(
             r#"<html><body><button id="button" type="button">Visible label</button>

@@ -7091,6 +7091,12 @@ function _elementClassFor(nid) {
   if (tag === "META" && globalThis.HTMLMetaElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
+  if (tag === "EMBED" && globalThis.HTMLEmbedElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "embed") return globalThis.HTMLEmbedElement;
+  if (tag === "OBJECT" && globalThis.HTMLObjectElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "object") return globalThis.HTMLObjectElement;
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
@@ -7119,6 +7125,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
+    if (localName === "embed" && globalThis.HTMLEmbedElement) return globalThis.HTMLEmbedElement;
+    if (localName === "object" && globalThis.HTMLObjectElement) return globalThis.HTMLObjectElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
@@ -13226,6 +13234,73 @@ for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype])
 }
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
+globalThis.HTMLEmbedElement = class HTMLEmbedElement extends Element {
+  get [Symbol.toStringTag]() { return 'HTMLEmbedElement'; }
+  get src() {
+    const value = this.getAttribute('src');
+    if (value === null) return '';
+    try { return new URL(value, _documentBase() || 'about:blank').href; }
+    catch (_) { return value; }
+  }
+  set src(value) { this.setAttribute('src', String(value)); }
+  get type() { return this.getAttribute('type') || ''; }
+  set type(value) { this.setAttribute('type', String(value)); }
+  get width() { return this.getAttribute('width') || ''; }
+  set width(value) { this.setAttribute('width', String(value)); }
+  get height() { return this.getAttribute('height') || ''; }
+  set height(value) { this.setAttribute('height', String(value)); }
+};
+for (const name of ['src', 'type', 'width', 'height']) {
+  Object.defineProperty(HTMLEmbedElement.prototype, name, { enumerable: true });
+}
+globalThis.HTMLObjectElement = class HTMLObjectElement extends Element {
+  get [Symbol.toStringTag]() { return 'HTMLObjectElement'; }
+  get data() {
+    const value = this.getAttribute('data');
+    if (value === null) return '';
+    try { return new URL(value, _documentBase() || 'about:blank').href; }
+    catch (_) { return value; }
+  }
+  set data(value) { this.setAttribute('data', String(value).toWellFormed()); }
+  get type() { return this.getAttribute('type') || ''; }
+  set type(value) { this.setAttribute('type', String(value)); }
+  get name() { return this.getAttribute('name') || ''; }
+  set name(value) { this.setAttribute('name', String(value)); }
+  get useMap() { return this.getAttribute('usemap') || ''; }
+  set useMap(value) { this.setAttribute('usemap', String(value)); }
+  get width() { return this.getAttribute('width') || ''; }
+  set width(value) { this.setAttribute('width', String(value)); }
+  get height() { return this.getAttribute('height') || ''; }
+  set height(value) { this.setAttribute('height', String(value)); }
+  get form() {
+    const id = this.getAttribute('form');
+    if (id !== null && this.isConnected) {
+      const candidate = id === '' ? null : this.getRootNode().getElementById(id);
+      return candidate && candidate.localName === 'form'
+        && candidate.namespaceURI === 'http://www.w3.org/1999/xhtml' ? candidate : null;
+    }
+    for (let parent = this.parentNode; parent; parent = parent.parentNode) {
+      if (parent.localName === 'form'
+          && parent.namespaceURI === 'http://www.w3.org/1999/xhtml') return parent;
+    }
+    return null;
+  }
+  get willValidate() { return false; }
+  get validationMessage() { return ''; }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
+  setCustomValidity(message) {
+    Element.prototype.setCustomValidity.call(this, String(message));
+  }
+  get contentDocument() { return null; }
+  get contentWindow() { return null; }
+  getSVGDocument() { return null; }
+};
+for (const name of ['data', 'type', 'name', 'useMap', 'width', 'height', 'form',
+    'willValidate', 'validationMessage', 'checkValidity', 'reportValidity',
+    'setCustomValidity', 'contentDocument', 'contentWindow', 'getSVGDocument']) {
+  Object.defineProperty(HTMLObjectElement.prototype, name, { enumerable: true });
+}
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
