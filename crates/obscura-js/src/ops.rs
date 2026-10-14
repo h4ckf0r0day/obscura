@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 
 use crate::import_map::ImportMap;
+use crate::message::{MessageResource, SerializedMessage};
 use crate::write_stream::DocumentWriteStream;
 
 pub type InterceptCallback = Arc<
@@ -577,11 +578,16 @@ pub struct PendingFrameMessage {
     /// receiver's own origin, and a mismatch drops the message. An empty string
     /// means the sender did not specify one and delivery stays permissive.
     pub target_origin: String,
-    /// The payload, JSON encoded. Structured clone is not available across
-    /// realms here, and JSON covers what postMessage is used for in practice:
-    /// a widget reporting a result. Anything it cannot encode is rejected by
-    /// the sender rather than silently arriving as null.
+    /// Legacy payloads are serialized as JSON. Values that need structured
+    /// cloning or transfers use `packet` instead.
     pub data_json: String,
+    packet: Option<SerializedMessage>,
+}
+
+impl PendingFrameMessage {
+    pub fn take_packet(&mut self) -> Option<SerializedMessage> {
+        self.packet.take()
+    }
 }
 
 impl ObscuraState {
@@ -6360,8 +6366,66 @@ fn op_post_frame_message(
         origin,
         target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
+        packet: None,
     });
     true
+}
+
+#[op2(fast)]
+fn op_post_frame_message_packet(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    target_frame_id: u32,
+    #[string] target_origin: &str,
+    packet: u32,
+) -> Result<bool, deno_error::JsErrorBox> {
+    let source = realm_state(scope, state);
+    let source = source.borrow();
+    let source_frame_id = source.frame_id;
+    if source_frame_id == 0 && target_frame_id == 0 {
+        return Ok(false);
+    }
+    let origin = source.inherited_origin.clone().unwrap_or_else(|| {
+        url::Url::parse(&source.url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "null".to_string())
+    });
+    drop(source);
+
+    let resource = state
+        .resource_table
+        .take::<MessageResource>(packet)
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+    let message = resource.take()?;
+    let message_bytes = message.byte_len();
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
+    let over_bytes = gs
+        .pending_frame_message_bytes
+        .saturating_add(message_bytes)
+        > frame_message_queue_byte_limit();
+    if over_entries || over_bytes {
+        tracing::warn!(
+            "dropping a structured postMessage for frame {}: {} already queued, {} bytes",
+            target_frame_id,
+            gs.pending_frame_messages.len(),
+            gs.pending_frame_message_bytes,
+        );
+        return Ok(true);
+    }
+    gs.pending_frame_message_bytes = gs
+        .pending_frame_message_bytes
+        .saturating_add(message_bytes);
+    gs.pending_frame_messages.push(PendingFrameMessage {
+        target_frame_id,
+        source_frame_id,
+        origin,
+        target_origin: target_origin.to_string(),
+        data_json: String::new(),
+        packet: Some(message),
+    });
+    Ok(true)
 }
 
 /// Resolves after `millis`, as the timer source for child frame realms.
@@ -7479,6 +7543,7 @@ pub fn build_extension() -> Extension {
         op_document_realm_member(),
         op_register_document_realm(),
         op_post_frame_message(),
+        op_post_frame_message_packet(),
         op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),
@@ -7502,6 +7567,8 @@ pub fn build_extension() -> Extension {
         op_url_encode_query(),
         op_begin_render_task(),
     ];
+    ops.extend(crate::message::ops());
+    ops.extend(crate::message_port::ops());
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
