@@ -641,6 +641,65 @@ impl DomTree {
         self.inner.borrow().shadow_roots.get(&root).copied()
     }
 
+    /// One allocation-free pass over `root` and its descendants. Bit 0: a
+    /// `style` or `link` element (stylesheet owners). Bit 1: an element that
+    /// can supply a window named property (`id`, or `name` on
+    /// embed/form/iframe/img/object). Callers use a zero result to skip
+    /// per-subtree bookkeeping that would otherwise cost several selector
+    /// queries; the bits are a superset, never a proof of a match.
+    pub fn subtree_flags(&self, root: NodeId) -> u8 {
+        let inner = self.inner.borrow();
+        let mut flags = 0u8;
+        let mut current = root;
+        let mut budget = inner.nodes.len() + 1;
+        loop {
+            let Some(Some(node)) = inner.nodes.get(current.index()) else {
+                return flags;
+            };
+            if let NodeData::Element { name, .. } = &node.data {
+                let local = name.local.as_ref();
+                if local.eq_ignore_ascii_case("style") || local.eq_ignore_ascii_case("link") {
+                    flags |= 1;
+                }
+                if node.get_attribute("id").is_some()
+                    || (["embed", "form", "iframe", "img", "object"]
+                        .iter()
+                        .any(|tag| local.eq_ignore_ascii_case(tag))
+                        && node.get_attribute("name").is_some())
+                {
+                    flags |= 2;
+                }
+                if flags == 3 {
+                    return flags;
+                }
+            }
+            if let Some(child) = node.first_child {
+                current = child;
+            } else {
+                // Climb to the next unvisited sibling without leaving `root`.
+                let mut at = node;
+                loop {
+                    if at.id == root {
+                        return flags;
+                    }
+                    if let Some(next) = at.next_sibling {
+                        current = next;
+                        break;
+                    }
+                    let Some(parent) = at.parent else { return flags };
+                    let Some(Some(parent_node)) = inner.nodes.get(parent.index()) else {
+                        return flags;
+                    };
+                    at = parent_node;
+                }
+            }
+            budget -= 1;
+            if budget == 0 {
+                return flags;
+            }
+        }
+    }
+
     pub fn is_shadow_root(&self, node: NodeId) -> bool {
         self.inner.borrow().shadow_roots.contains_key(&node)
     }
@@ -713,11 +772,14 @@ impl DomTree {
         }
 
         let mut stack = vec![root];
-        let mut seen = HashSet::new();
+        // A valid tree visits each node once; the budget replaces a per-call
+        // HashSet as the guard against a corrupt (cyclic) sibling chain.
+        let mut budget = inner.nodes.len();
         while let Some(node_id) = stack.pop() {
-            if !seen.insert(node_id) {
-                continue;
+            if budget == 0 {
+                break;
             }
+            budget -= 1;
             if !connected { Self::clear_cssom_stylesheet_inner(inner, node_id); }
             let (mut child, shadow_root) = match inner
                 .nodes
