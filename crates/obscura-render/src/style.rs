@@ -87,9 +87,11 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // not lay out as a real box (news CDNs put dimensions on `<source>`,
         // which otherwise paints an empty box the size of the image).
         style.display = crate::Display::None;
-    } else if tag == "pre" {
-        // HTML's UA sheet preserves source whitespace in preformatted blocks.
-        style.white_space = Some(crate::WhiteSpace::Pre);
+    } else if matches!(tag, "code" | "kbd" | "samp" | "tt" | "pre") {
+        style.font_family = Some("monospace".to_string());
+        if tag == "pre" {
+            style.white_space = Some(crate::WhiteSpace::Pre);
+        }
     } else if tag == "body" {
         style.margin = Edges {
             top: 8.0,
