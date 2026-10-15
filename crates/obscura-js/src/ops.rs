@@ -6282,6 +6282,12 @@ fn op_navigate(
     #[string] method: &str,
     #[string] body: &str,
 ) {
+    // A javascript: URL is run by the document, never fetched. The bootstrap
+    // runs it itself; one that still got here would only fail the navigation
+    // of a page that loaded fine (#1245).
+    if url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "javascript") {
+        return;
+    }
     let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is

@@ -5337,6 +5337,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // A javascript: URL is run by the document it targets, never fetched, so
+    // no route that assigns one may queue it as a navigation: following it
+    // failed Page.navigate for a page that had loaded fine (#1245). A page
+    // assigning one to a frame's location is the frame's navigation, so the
+    // script runs against the frame's document, not the page's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn javascript_urls_run_instead_of_queueing_a_navigation() {
+        let mut page = frame_page("javascript-url-navigation");
+        page.navigate("data:text/html,<body></body>").await.expect("web page");
+        let web_url = page.url_string();
+
+        let assigned = page.evaluate(
+            "(function () {\
+               location.href = \"javascript:void(document.body.setAttribute('data-top', 'ran'))\";\
+               globalThis.frameProbe = document.createElement('iframe');\
+               document.body.appendChild(frameProbe);\
+               frameProbe.contentWindow.location.replace(\
+                   \"javascript:void(document.body.setAttribute('data-frame', 'ran'))\");\
+               return true;\
+             })()",
+        );
+        assert_eq!(assigned, serde_json::json!(true));
+        assert!(!page.has_pending_navigation(), "a javascript: URL was queued as a navigation");
+
+        page.settle(500).await;
+        assert_eq!(
+            page.evaluate(
+                "[location.href, document.body.getAttribute('data-top'),\
+                  document.body.getAttribute('data-frame'),\
+                  frameProbe.contentDocument.body.getAttribute('data-frame')]"
+            ),
+            serde_json::json!([web_url, "ran", null, "ran"]),
+        );
+        assert_eq!(page.url_string(), web_url);
+    }
+
     #[test]
     fn navigation_timeout_environment_default_remains_thirty_seconds() {
         assert_eq!(

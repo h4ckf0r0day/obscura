@@ -29,7 +29,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_viewport_w', '__obscura_viewport_h',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
-    '__obscura_liveFrameIds', '__obscura_forgetFrame',
+    '__obscura_liveFrameIds', '__obscura_forgetFrame', '__obscura_runJavascriptUrl',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__obscura_inputChecked', '__obscura_setInputChecked',
@@ -2298,11 +2298,17 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Iframes whose javascript: src waits for them to be connected, mapped to that
+// navigation. The script runs in the frame's realm, which only a connected
+// iframe has.
+const _pendingJavascriptFrames = new Map();
+
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
+  if (_pendingJavascriptFrames.size) _queueConnectedJavascriptFrames();
   const scripts = [];
   const seen = new Set();
   if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
@@ -4693,6 +4699,11 @@ class Element extends Node {
     // Both the src setter and the parser sweep in __obscura_init reach here, so
     // a frame the page assigned before init must not be fetched a second time.
     if (this._iframeLoadingUrl === fullUrl) return;
+    const javascriptSource = _javascriptUrlSource(fullUrl);
+    if (javascriptSource !== null) {
+      _loadIframeJavascriptUrl(this, fullUrl, javascriptSource);
+      return;
+    }
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
     const el = this;
@@ -4935,6 +4946,7 @@ class Element extends Node {
     const baseUrl = globalThis.location?.href || 'about:blank';
     let targetUrl;
     try { targetUrl = new URL(action, baseUrl).href; } catch(e) { targetUrl = action; }
+    if (_runJavascriptUrlNavigation(targetUrl)) return;
 
     const encoded = pairs.join('&');
     if (method === 'POST') {
@@ -5830,7 +5842,11 @@ class Document extends Node {
   }
   get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
-  set location(url) { __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  set location(url) {
+    const resolved = _resolveUrl(String(url));
+    if (_runJavascriptUrlNavigation(resolved)) return;
+    __obscuraCore.ops.op_navigate(resolved, 'GET', '');
+  }
   get defaultView() {
     const get = _documentRealmMember(this, 'defaultView');
     return get ? Reflect.apply(get, this, []) : globalThis;
@@ -6348,6 +6364,9 @@ class Document extends Node {
   write(...args) {
     const method = _documentRealmMember(this, 'write');
     if (method) return Reflect.apply(method, this, args);
+    // Like the open a write implies, it aborts a javascript: URL navigation of
+    // this document that has not run yet (see _documentWrites).
+    this._writes = (this._writes || 0) + 1;
     var html = args.join('');
     if (!html) return;
     // The host parses into the input stream and returns [[parent, node], …], parents first. The
@@ -7175,9 +7194,65 @@ globalThis.__virtualUrl = null;
 function __currentUrl() {
   return globalThis.__virtualUrl || _domParse("document_url") || "about:blank";
 }
+// The script a javascript: URL carries, or null for any other URL: the
+// serialized URL minus its scheme, percent-decoded as UTF-8. An invalid escape
+// stays literal, as the URL standard's percent-decode leaves it.
+function _javascriptUrlSource(url) {
+  let href;
+  try { href = new URL(url).href; } catch (_) { return null; }
+  if (!href.startsWith('javascript:')) return null;
+  const encoded = href.slice('javascript:'.length);
+  if (!encoded.includes('%')) return encoded;
+  // A serialized URL is ASCII, so every code unit is one byte.
+  const bytes = new Uint8Array(encoded.length);
+  let length = 0;
+  for (let i = 0; i < encoded.length; i++) {
+    const high = encoded.charCodeAt(i) === 0x25 ? _hexv(encoded.charCodeAt(i + 1)) : -1;
+    const low = high >= 0 ? _hexv(encoded.charCodeAt(i + 2)) : -1;
+    if (low >= 0) { bytes[length++] = high * 16 + low; i += 2; }
+    else bytes[length++] = encoded.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes.subarray(0, length));
+}
+// How often a document has been opened or written to. Either aborts a
+// javascript: URL navigation of it that has not run yet, as document.open()
+// aborts any ongoing navigation, so what the page wrote in the meantime stays.
+function _documentWrites(doc) {
+  return (doc._writeGeneration || 0) + (doc._writes || 0);
+}
+// Runs a javascript: URL's script against this realm's document, as navigating
+// to the URL does: a string result becomes the document, anything else leaves
+// the document as it is. `writes` is _documentWrites when the navigation began.
+// Callers run this as this realm's own code, so the ops the script reaches
+// resolve to this document, whichever realm set the URL.
+function _evaluateJavascriptUrl(source, writes) {
+  const doc = globalThis.document;
+  if (_documentWrites(doc) !== writes) return;
+  try {
+    const result = (0, eval)(source);
+    if (typeof result !== 'string') return;
+    Document.prototype.open.call(doc);
+    Document.prototype.write.call(doc, result);
+    Document.prototype.close.call(doc);
+  } catch (error) {
+    globalThis.reportError(error);
+  }
+}
+// Navigating to a javascript: URL runs it in a task against this document and
+// loads nothing, so it must never reach the host's navigation queue, where it
+// failed Page.navigate (issue #1245). Scheduling on this realm's timers keeps
+// the script this realm's code even when another realm assigned the URL.
+// Reports whether `url` was a javascript: URL.
+function _runJavascriptUrlNavigation(url) {
+  const source = _javascriptUrlSource(url);
+  if (source === null) return false;
+  const writes = _documentWrites(globalThis.document);
+  _scheduleAfter(0, () => _evaluateJavascriptUrl(source, writes));
+  return true;
+}
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); if (_runJavascriptUrlNavigation(r)) return; globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -7187,14 +7262,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); if (_runJavascriptUrlNavigation(r)) return; globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); if (_runJavascriptUrlNavigation(r)) return; globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); if (_runJavascriptUrlNavigation(r)) return; globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -14346,6 +14421,14 @@ globalThis.__obscura_forgetFrame = function (frameId) {
   delete globalThis.__obscura_frameWindows[frameId];
 };
 
+// Runs a javascript: src handed over by the realm that embeds this one. A
+// promise reaction belongs to the realm of its handler, so the script runs as
+// this realm's code and its ops resolve to this frame's document, not to the
+// page that set the src.
+globalThis.__obscura_runJavascriptUrl = function (source, writes) {
+  return Promise.resolve().then(() => _evaluateJavascriptUrl(source, writes));
+};
+
 function _realmOrigin() {
   return _domParse('document_origin') || 'null';
 }
@@ -14457,6 +14540,48 @@ function _resetIframeElement(element) {
   element._iframeDoc = new _IframeDocument(
     '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
   element._iframeWin = new _IframeWindow(element._iframeDoc, 'about:blank');
+}
+
+// A javascript: src runs instead of being fetched (issue #1245), in the
+// frame's initial about:blank realm. That realm is kept, as Chrome keeps it:
+// it is same-origin with this page, so the script reaches `parent` and this
+// page reaches the frame's document afterwards. A frame showing another
+// document starts over from a fresh initial realm.
+function _loadIframeJavascriptUrl(frame, url, source) {
+  if (!_frameObjectsFor(frame)?.initial) _resetIframeElement(frame);
+  const doc = _frameObjectsFor(frame)?.document;
+  frame._iframeLoadingUrl = url;
+  _pendingJavascriptFrames.set(frame, { url, source, writes: doc ? _documentWrites(doc) : 0 });
+  _queueConnectedJavascriptFrames();
+}
+
+function _queueConnectedJavascriptFrames() {
+  for (const [frame, navigation] of _pendingJavascriptFrames) {
+    if (!frame.isConnected) continue;
+    _pendingJavascriptFrames.delete(frame);
+    _scheduleAfter(0, () => _runIframeJavascriptUrl(frame, navigation));
+  }
+}
+
+function _runIframeJavascriptUrl(frame, navigation) {
+  if (frame._iframeLoadingUrl !== navigation.url) return;
+  if (!frame.isConnected) {
+    _pendingJavascriptFrames.set(frame, navigation);
+    return;
+  }
+  // A sandboxed frame without allow-scripts runs nothing, and one without
+  // allow-same-origin gets no realm this page may enter.
+  const sandbox = frame.getAttribute('sandbox');
+  const scripted = sandbox === null || sandbox.split(/\s+/).includes('allow-scripts');
+  if (scripted) _ensureInitialFrameRealm(frame);
+  const realm = scripted ? _frameObjectsFor(frame) : null;
+  const evaluated = realm?.initial
+    ? realm.window.__obscura_runJavascriptUrl(navigation.source, navigation.writes)
+    : Promise.resolve();
+  // This page's own handler, so load listeners run as this page's code.
+  evaluated.then(() => {
+    if (frame._iframeLoadingUrl === navigation.url) frame.dispatchEvent(new Event('load'));
+  });
 }
 
 // The window object this realm uses to stand for frame `frameId`, built once
