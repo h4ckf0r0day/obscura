@@ -16390,7 +16390,20 @@ globalThis.Worker = class Worker {
       performance: globalThis.performance,
       location: globalThis.location,
     };
-    scope.self = scope;
+    // A real worker's global object exposes the built-ins, so self.Object and
+    // 'Uint8Array' in self work. The scope is a plain object, so reads that miss
+    // it fall back to the page global while writes stay in the worker.
+    // Issue #1247.
+    const self = new Proxy(scope, {
+      get(target, key) {
+        return key in target ? target[key] : Reflect.get(globalThis, key);
+      },
+      has(target, key) {
+        return key in target || key in globalThis;
+      },
+    });
+    scope.self = self;
+    scope.globalThis = self;
     return scope;
   }
   _autoRun() {
@@ -16400,7 +16413,7 @@ globalThis.Worker = class Worker {
       // Direct eval preserves script directives and resolves bare handler names
       // against the worker scope. Run once so message closures retain their state.
       const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      fn.call(scope.self, scope, this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
       if (this.onerror) this.onerror(e);
@@ -16423,9 +16436,9 @@ globalThis.Worker = class Worker {
       const scope = worker._scope;
       try {
         const event = { data };
-        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
+        if (typeof scope.onmessage === 'function') scope.onmessage.call(scope.self, event);
         const evs = (scope._ev && scope._ev['message']) || [];
-        for (const handler of evs.slice()) handler.call(scope, event);
+        for (const handler of evs.slice()) handler.call(scope.self, event);
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
