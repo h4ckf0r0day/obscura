@@ -1425,6 +1425,7 @@ impl TextEngine {
         );
         self.push_shaped_item(
             base,
+            base.white_space.unwrap_or_default(),
             line_height,
             spans,
             collector.clip_fills,
@@ -1481,6 +1482,7 @@ impl TextEngine {
         }
         let index = self.push_shaped_item(
             base,
+            base.white_space.unwrap_or_default(),
             line_height,
             spans,
             collector.clip_fills,
@@ -1500,6 +1502,17 @@ impl TextEngine {
     /// inline formatting context. The caller measures/finalizes/paints the
     /// returned item immediately against the pseudo's resolved content box.
     pub(crate) fn push_generated_text(&mut self, text: &str, style: &LayoutStyle) -> Option<usize> {
+        self.push_generated_text_with_white_space(text, style, None)
+    }
+
+    /// [`push_generated_text`] with `style.white_space` replaced, so a caller
+    /// needing one different value does not have to clone the whole style.
+    pub(crate) fn push_generated_text_with_white_space(
+        &mut self,
+        text: &str,
+        style: &LayoutStyle,
+        white_space: Option<crate::WhiteSpace>,
+    ) -> Option<usize> {
         let mut collector = Collector::new();
         let font = resolve_loaded_font(
             style.font_family.as_deref(),
@@ -1507,7 +1520,10 @@ impl TextEngine {
             style.font_style_italic.unwrap_or(false),
             &self.loaded_families,
         );
-        let context = base_span_ctx(style, font, &mut collector);
+        let mut context = base_span_ctx(style, font, &mut collector);
+        if let Some(white_space) = white_space {
+            context.white_space = white_space;
+        }
         let line_height = context.line_height;
         let attrs = SpanAttrs {
             font_size: context.font_size,
@@ -1543,6 +1559,7 @@ impl TextEngine {
         );
         self.push_shaped_item(
             style,
+            context.white_space,
             line_height,
             spans,
             collector.clip_fills,
@@ -1558,6 +1575,7 @@ impl TextEngine {
     fn push_shaped_item(
         &mut self,
         base: &LayoutStyle,
+        white_space: crate::WhiteSpace,
         line_h: f32,
         mut spans: Vec<(String, SpanAttrs)>,
         clip_fills: Vec<ClipTextFill>,
@@ -1565,7 +1583,6 @@ impl TextEngine {
         mut owner_boxes: Vec<InlineOwnerBox>,
         mut boundary_events: Vec<InlineBoundaryEvent>,
     ) -> Option<usize> {
-        let white_space = base.white_space.unwrap_or_default();
         let layout_wrap = if spans
             .iter()
             .any(|(_, attrs)| attrs.has_layout_emergency_breaks())
@@ -1753,6 +1770,7 @@ impl TextEngine {
             }
         }
 
+        buffer.shrink_to_fit();
         let marker_buffer = marker_attrs.map(|attrs| {
             let variation_index = attrs
                 .variations
@@ -2077,6 +2095,9 @@ impl TextEngine {
         }
         item.origin = (content_origin.0 + alignment_inset, content_origin.1);
         item.clip = clip;
+        // The final layout is what paint reads; the shaped glyphs behind it
+        // are rebuilt on demand if this item is ever laid out again.
+        item.buffer.release_shapes();
     }
 
     /// Replace only the finalized clip without reshaping. Used when canonical
@@ -4159,6 +4180,52 @@ mod tests {
             engine.measure(first_item, Some(120.0)),
             engine.measure(second_item, Some(120.0))
         );
+    }
+
+    #[test]
+    fn finalized_text_releases_shapes_and_reflows_without_losing_glyphs() {
+        for (html, indent, balance) in [
+            ("<p id='copy'>alpha beta gamma delta epsilon zeta</p>", 0.0, false),
+            ("<p id='copy'>one two three four five six seven eight nine ten</p>", 0.0, true),
+            ("<p id='copy'>مرحبا بالعالم هذا نص للاختبار</p>", 0.0, false),
+            ("<p id='copy'>alpha <span>beta gamma</span> delta epsilon zeta</p>", 7.0, false),
+        ] {
+            let tree = obscura_dom::parse_html(html);
+            let copy = tree.get_element_by_id("copy").unwrap();
+            let style = LayoutStyle {
+                display: Display::Block,
+                font_size: Some(20.0),
+                line_height: Some(crate::LineHeight::Px(28.0)),
+                text_indent: Some(Dimension::Px(indent)),
+                text_wrap_style: balance.then_some(crate::TextWrapStyle::Balance),
+                ..Default::default()
+            };
+            let mut styles = HashMap::from([(copy, style.clone())]);
+            if let Some(span) = tree.query_selector("span").unwrap() {
+                styles.insert(span, LayoutStyle { display: Display::Inline, ..style });
+            }
+            let mut engine = TextEngine::new();
+            let item = engine.try_build(&tree, copy, &styles).unwrap();
+            for width in [260.0, 90.0, 180.0, 90.0] {
+                engine.measure(item, Some(width));
+                engine.finalize(item, (0.0, 0.0), width, None);
+                let buffer = &engine.items[item].buffer;
+                assert!(buffer.layout_runs().any(|run| !run.glyphs.is_empty()), "{html}");
+                assert!(buffer.lines.iter().all(|line| {
+                    line.shape_opt().is_some_and(|shape| shape.spans.is_empty())
+                }), "finalized buffers must not retain shaped glyphs: {html}");
+
+                let mut fresh = TextEngine::new();
+                let fresh_item = fresh.try_build(&tree, copy, &styles).unwrap();
+                fresh.finalize(fresh_item, (0.0, 0.0), width, None);
+                let mut actual = tiny_skia::Pixmap::new(300, 400).unwrap();
+                let mut expected = tiny_skia::Pixmap::new(300, 400).unwrap();
+                engine.paint_item(item, &mut actual, (0.0, 0.0));
+                fresh.paint_item(fresh_item, &mut expected, (0.0, 0.0));
+                assert!(actual.pixels().iter().any(|pixel| pixel.alpha() != 0), "{html}");
+                assert_eq!(actual.data(), expected.data(), "width {width}: {html}");
+            }
+        }
     }
 
     #[test]
