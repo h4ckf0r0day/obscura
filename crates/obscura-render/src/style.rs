@@ -1285,7 +1285,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "font-family" => {
             let v = value.trim().to_ascii_lowercase();
-            if !v.is_empty() && v != "inherit" {
+            if matches!(v.as_str(), "inherit" | "unset") {
+                style.font_family = Some("inherit".to_string());
+            } else if !v.is_empty() {
                 style.font_family = Some(v);
             }
         }
