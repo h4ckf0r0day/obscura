@@ -944,7 +944,7 @@ pub fn emit_navigation_events(
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request_will_be_sent_request(net_event), "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
         if fetch_pause_matches(ctx, &net_event.url) {
@@ -1028,7 +1028,7 @@ pub fn emit_navigation_events(
         if Some(i) != nav_idx && !net_event.intercepted {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": request_will_be_sent_request(net_event), "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: es.clone(),
             });
         }
@@ -1208,11 +1208,7 @@ pub(crate) fn emit_runtime_network_events(
                     "requestId": request_id,
                     "loaderId": loader_id,
                     "documentURL": page_url,
-                    "request": {
-                        "url": network_event.url,
-                        "method": network_event.method,
-                        "headers": network_event.headers,
-                    },
+                    "request": request_will_be_sent_request(network_event),
                     "timestamp": network_event.timestamp,
                     "wallTime": network_event.timestamp,
                     "initiator": {"type": "script"},
@@ -1258,6 +1254,19 @@ pub(crate) fn emit_runtime_network_events(
         });
     }
     fan_out_network_events(ctx, page_id, session_id, event_start);
+}
+
+/// The `request` object of Network.requestWillBeSent, including the body a
+/// script request sent (#1246).
+fn request_will_be_sent_request(event: &obscura_browser::NetworkEvent) -> Value {
+    let mut request = json!({"url": event.url, "method": event.method, "headers": event.headers});
+    if event.has_post_data {
+        request["hasPostData"] = json!(true);
+        if let Some(post_data) = &event.post_data {
+            request["postData"] = json!(post_data);
+        }
+    }
+    request
 }
 
 fn network_loading_failed(
@@ -2053,6 +2062,7 @@ mod tests {
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
                 request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
                 resource_type: kind.into(), status, headers: Default::default(),
+                has_post_data: false, post_data: None,
                 response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
                 error_text: None,
             }).collect();
@@ -2399,6 +2409,8 @@ mod tests {
             resource_type: "Fetch".into(),
             status: 200,
             headers: std::collections::HashMap::new(),
+            has_post_data: false,
+            post_data: None,
             response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
                 "content-type".into(),
                 "application/json".into(),
@@ -2496,6 +2508,8 @@ mod tests {
             resource_type: kind.into(),
             status: 200,
             headers: std::collections::HashMap::new(),
+            has_post_data: false,
+            post_data: None,
             response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
             error_text: None,
             body_size: 10,
@@ -2557,6 +2571,8 @@ mod tests {
             resource_type: "Document".into(),
             status: 200,
             headers: std::collections::HashMap::new(),
+            has_post_data: false,
+            post_data: None,
             response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
             body_size: 0,
             timestamp: 42.0,

@@ -95,11 +95,34 @@ pub struct JsNetworkEvent {
     pub url: String,
     pub method: String,
     pub resource_type: String,
+    /// Headers the page asked to send, after any Fetch.continueRequest
+    /// override, reported on Network.requestWillBeSent (#1246).
+    pub request_headers: HashMap<String, String>,
+    pub has_post_data: bool,
+    /// The request body when it fits in `MAX_POST_DATA_BYTES`.
+    pub post_data: Option<String>,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
     pub error_text: Option<String>,
+}
+
+/// Larger request bodies set hasPostData without postData, which the protocol
+/// allows, so an upload is not copied into every queued network event.
+const MAX_POST_DATA_BYTES: usize = 64 * 1024;
+
+impl JsNetworkEvent {
+    fn record_request(&mut self, headers: HashMap<String, String>, body: &[u8]) {
+        self.request_headers = headers;
+        self.has_post_data = !body.is_empty();
+        // Like Chrome, decode as UTF-8 and fall back to Latin-1 for bytes
+        // that are not valid UTF-8.
+        self.post_data = (self.has_post_data && body.len() <= MAX_POST_DATA_BYTES).then(|| {
+            String::from_utf8(body.to_vec())
+                .unwrap_or_else(|_| body.iter().map(|&byte| char::from(byte)).collect())
+        });
+    }
 }
 
 #[cfg(feature = "render")]
@@ -3979,6 +4002,7 @@ async fn fetch_url_inner(
             request_id: request_id.clone(), intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
+            request_headers: HashMap::new(), has_post_data: false, post_data: None,
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
         cancel: cancel.clone(),
@@ -3992,7 +4016,6 @@ async fn fetch_url_inner(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    let mut was_intercepted = false;
     if let Some(tx) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
@@ -4007,7 +4030,6 @@ async fn fetch_url_inner(
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            was_intercepted = true;
             network_guard.event.as_mut().unwrap().intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
@@ -4026,6 +4048,7 @@ async fn fetch_url_inner(
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
                         resource_type: resource_type_name.to_string(),
+                        request_headers: HashMap::new(), has_post_data: false, post_data: None,
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
@@ -4138,6 +4161,9 @@ async fn fetch_url_inner(
 
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    if let Some(event) = network_guard.event.as_mut() {
+        event.record_request(custom_headers.clone(), &body);
+    }
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -4533,18 +4559,18 @@ async fn fetch_url_inner(
                 cbs.fire_response(&info, &resp).await;
             }
         }
-        if let Some(state) = body_state.upgrade() {
-            record_js_network_completion(&state, JsNetworkEvent {
-                request_id, intercepted: was_intercepted,
-                error_text: None,
-                url: current_url, method: current_method.as_str().to_string(), status,
-                resource_type: resource_type_name.to_string(),
-                response_headers: resp_headers, body_size: resp_bytes.len(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+        // Complete the guard's event so the request headers and body recorded
+        // before sending reach Network.requestWillBeSent (#1246).
+        if let (Some(state), Some(mut event)) = (body_state.upgrade(), network_guard.event.take()) {
+            event.url = current_url;
+            event.method = current_method.as_str().to_string();
+            event.status = status;
+            event.response_headers = resp_headers;
+            event.body_size = resp_bytes.len();
+            event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64();
+            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
         }
-        network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
         Ok(resp_bytes)
     });
