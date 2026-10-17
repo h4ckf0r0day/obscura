@@ -86,7 +86,12 @@ async fn main() {
     let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
+    let user_agent = std::env::var("OBSCURA_USER_AGENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut context =
+        BrowserContext::with_full_options("worker".to_string(), proxy, stealth, user_agent);
     context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
