@@ -1093,11 +1093,13 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            let mut client = StealthHttpClient::with_proxy(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            )))
+            );
+            client.allow_file_access = context.allow_file_access;
+            Some(Arc::new(client))
         } else {
             None
         };
@@ -5346,7 +5348,7 @@ mod tests {
             None,
             true,
         );
-        context.allow_file_access = allow_file_access;
+        context.set_allow_file_access(allow_file_access);
         std::sync::Arc::new(context)
     }
 
@@ -5370,6 +5372,27 @@ mod tests {
         let mut open = super::Page::new("file-gate-open".to_string(), file_gate_context("file-gate-open", true));
         open.navigate(&file_url).await.expect("an opted-in context reads local files");
         assert_eq!(open.url_string(), file_url);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Server connections navigate through an isolated copy of the startup
+    // context, so the copy's own http client must carry the opt-in too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_context_copy_keeps_the_file_access_setting() {
+        let (path, file_url) = local_html_fixture("copy");
+
+        let open_copy = std::sync::Arc::new(
+            file_gate_context("file-gate-copy", true).isolated_copy("copy-open".to_string(), false),
+        );
+        let mut open = super::Page::new("file-gate-copy-open".to_string(), open_copy);
+        open.navigate(&file_url).await.expect("the copy keeps the opt-in");
+
+        let locked_copy = std::sync::Arc::new(
+            file_gate_context("file-gate-copy-locked", false)
+                .isolated_copy("copy-locked".to_string(), false),
+        );
+        assert!(locked_copy.http_client.fetch(&url::Url::parse(&file_url).unwrap()).await.is_err());
 
         let _ = std::fs::remove_file(&path);
     }

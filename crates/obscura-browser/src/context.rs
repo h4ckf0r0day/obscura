@@ -217,6 +217,14 @@ impl BrowserContext {
         }
     }
 
+    /// Sets the file:// opt-in on the context and on its http client, whose
+    /// loader enforces it for every fetch, not only for navigation. Assigning
+    /// the field directly leaves the client refusing file://.
+    pub fn set_allow_file_access(&mut self, allow: bool) {
+        self.allow_file_access = allow;
+        self.http_client.set_allow_file_access(allow);
+    }
+
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
         Self::with_full_options(id, proxy_url, stealth, None)
     }
@@ -252,6 +260,7 @@ impl BrowserContext {
         if self.stealth {
             client.block_trackers = true;
         }
+        client.set_allow_file_access(self.allow_file_access);
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = self.user_agent.clone();
         }
