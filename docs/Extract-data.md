@@ -82,3 +82,19 @@ obscura fetch https://my-spa.example --wait-until load --dump markdown
 obscura fetch https://example.com --dump markdown > example.md
 obscura fetch https://example.com --dump text --quiet | wc -w
 ```
+
+## Reader libraries
+
+After loading a reader library such as [Mozilla Readability](https://github.com/mozilla/readability),
+run it on a document clone to leave the page unchanged:
+
+```javascript
+const article = new Readability(document.cloneNode(true)).parse();
+```
+
+Obscura does not bundle Readability. Supply the library through your automation
+client before evaluating this expression. Document clones preserve metadata and
+live form-control state. Attribute clones retain their value and namespace.
+`DOMParser` HTML documents preserve the document structure and root attributes,
+inherit the parser's document URL, and do not execute scripts. XML parsing still
+uses the existing limited XML implementation.

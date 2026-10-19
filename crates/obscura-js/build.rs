@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -13,7 +14,9 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
 
-    let bootstrap_js = include_str!("js/bootstrap.js");
+    let bootstrap_source = include_str!("js/bootstrap.js")
+        .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"));
+    let bootstrap_js = bootstrap_source.as_str();
 
     if is_cross {
         // Cross-compilation: the host V8 (linked into this build script) produces
@@ -63,6 +66,7 @@ fn main() {
         // The sidecar contains only fixed-size types (i32, u32, String, Vec) so it
         // is architecture-independent and can be reused with the target blob.
         eprintln!("[obscura-js build.rs] Extracting deno_core sidecar from host snapshot...");
+        let host_bootstrap = bootstrap_js.to_string();
         let host_output = deno_core::snapshot::create_snapshot(
             deno_core::snapshot::CreateSnapshotOptions {
                 cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
@@ -72,7 +76,7 @@ fn main() {
                 extension_transpiler: None,
                 with_runtime_cb: Some(Box::new(move |runtime| {
                     runtime
-                        .execute_script("<obscura:bootstrap>", bootstrap_js.to_string())
+                        .execute_script("<obscura:bootstrap>", host_bootstrap.clone())
                         .expect("bootstrap.js should not fail during snapshot creation");
                 })),
             },

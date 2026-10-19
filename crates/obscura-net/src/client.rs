@@ -824,7 +824,7 @@ async fn read_reqwest_body_limited(
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error))
+        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
@@ -926,6 +926,7 @@ impl ResourceCache {
         if entry.expires_at <= Instant::now() {
             let expired = self.entries.remove(key)?;
             self.body_bytes = self.body_bytes.saturating_sub(expired.response.body.len());
+            self.insertion_order.retain(|queued| queued != key);
             return None;
         }
         Some(entry.response.clone())
@@ -1575,7 +1576,7 @@ impl ObscuraHttpClient {
 
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
             let status = resp.status();
@@ -1681,6 +1682,25 @@ impl Default for ObscuraHttpClient {
     }
 }
 
+/// `error` followed by the message of each error in its `source()` chain, joined
+/// with ": ". reqwest and wreq only say "error sending request" at the top level;
+/// the cause (expired certificate, handshake failure, refused connection, DNS)
+/// is further down the chain.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers already include their source's message in their own.
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObscuraNetError {
     #[error("Network error: {0}")]
@@ -1697,6 +1717,78 @@ pub enum ObscuraNetError {
 
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
+}
+
+#[cfg(test)]
+mod resource_cache_tests {
+    use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
+        RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use url::Url;
+
+    fn cache_test_resource(name: &str) -> (ResourceCacheKey, Response) {
+        let url = Url::parse(&format!("https://example.test/{name}.js")).unwrap();
+        let key = ResourceCacheKey {
+            url: url.to_string(),
+            resource_type: ResourceType::Script,
+            mode: RequestMode::NoCors,
+            credentials: RequestCredentials::Omit,
+            initiator: None,
+            referrer: None,
+            user_agent: "cache-test".into(),
+            extra_headers: Vec::new(),
+            max_response_bytes: 1024,
+        };
+        let response = Response {
+            url,
+            status: 200,
+            headers: HashMap::new(),
+            body: vec![1],
+            redirected_from: Vec::new(),
+        };
+        (key, response)
+    }
+
+    #[test]
+    fn expired_resource_cache_keys_do_not_accumulate() {
+        let (key, response) = cache_test_resource("reused");
+        let mut cache = ResourceCache::default();
+        for _ in 0..10_000 {
+            cache.insert(key.clone(), response.clone(), Duration::from_secs(60));
+            cache.entries.get_mut(&key).unwrap().expires_at = Instant::now();
+            assert!(cache.get(&key).is_none());
+            assert!(cache.entries.is_empty());
+            assert!(cache.insertion_order.is_empty());
+            assert_eq!(cache.body_bytes, 0);
+        }
+        cache.insert(key.clone(), response, Duration::from_secs(60));
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.insertion_order.len(), 1);
+        assert_eq!(cache.body_bytes, 1);
+    }
+
+    #[test]
+    fn expired_then_reinserted_resource_keeps_its_new_eviction_position() {
+        let (reused, response) = cache_test_resource("reused");
+        let (oldest, oldest_response) = cache_test_resource("oldest");
+        let mut cache = ResourceCache::default();
+        cache.insert(reused.clone(), response.clone(), Duration::from_secs(60));
+        cache.entries.get_mut(&reused).unwrap().expires_at = Instant::now();
+        assert!(cache.get(&reused).is_none());
+        cache.insert(oldest.clone(), oldest_response, Duration::from_secs(60));
+        cache.insert(reused.clone(), response, Duration::from_secs(60));
+        for index in 0..RESOURCE_CACHE_MAX_ENTRIES - 1 {
+            let (key, response) = cache_test_resource(&format!("fill-{index}"));
+            cache.insert(key, response, Duration::from_secs(60));
+        }
+        assert!(cache.get(&oldest).is_none(), "evict the oldest live entry");
+        assert!(cache.get(&reused).is_some(), "keep the refreshed entry");
+        assert_eq!(cache.entries.len(), RESOURCE_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
+    }
+
 }
 
 #[cfg(test)]
@@ -2826,7 +2918,38 @@ mod ssrf_tests {
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-        assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
+        let error = client.fetch(&url).await.expect_err("unknown CA must be rejected");
+        // The message must carry the TLS cause, not only "error sending request".
+        let message = error.to_string();
+        assert!(message.contains("invalid peer certificate"), "{message}");
+    }
+
+    #[test]
+    fn error_chain_appends_each_source_once() {
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl fmt::Display for Layer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+
+        let leaf = Layer("certificate expired", None);
+        // The middle layer already quotes the leaf, so the leaf is not repeated.
+        let middle = Layer("tls: certificate expired", Some(Box::new(leaf)));
+        let top = Layer("error sending request", Some(Box::new(middle)));
+        assert_eq!(
+            super::error_chain(&top),
+            "error sending request: tls: certificate expired"
+        );
+        assert_eq!(super::error_chain(&Layer("alone", None)), "alone");
     }
 }
 

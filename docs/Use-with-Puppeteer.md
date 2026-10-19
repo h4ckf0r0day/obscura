@@ -85,6 +85,11 @@ page.on('request', req => {
 
 See [Intercept and modify requests](Intercept-and-modify-requests.md).
 
+Scripted fetch/XHR requests in stealth mode report Network events and retained
+response bodies using the same request IDs as the normal transport. The existing
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`
+settings still control retention; disabling retention does not disable events.
+
 ## Expose a Node callback
 
 ```js
@@ -162,6 +167,21 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 await browser.disconnect();  // leaves obscura serve running
 ```
 
+## Page lifecycle
+
+`Page.stopLoading` cancels an in-flight document or parser-resource request,
+clears queued document navigation, and leaves the target usable. Rendering
+builds also cancel pending image/font loads, including `Image`/`decode()`
+requests, without restarting those URLs on the next render turn. Already-loaded
+resources are preserved. Ordinary JavaScript `fetch()` calls are not canceled.
+
+`Page.close` runs the top-level document's `beforeunload` handlers. A document
+activated through native input can request confirmation, reported through
+`Page.javascriptDialogOpening` with type `beforeunload`. Use
+`Page.handleJavaScriptDialog` to accept or dismiss it. `Target.closeTarget`
+remains a force-close path. Other dialog types and child-frame unload hooks
+are not implemented by this change.
+
 ## Current limits
 
 - Some device emulation, service-worker, native media, long-tail CSS, and
@@ -175,3 +195,9 @@ second navigation. Request IDs and loader IDs match the driving session, so
 `Network.getResponseBody` uses the same ID. Fetch interception control and the
 navigation lifecycle keep their existing owner; sessions on other targets do
 not receive this traffic.
+
+ES-module roots, dependencies, and dynamic imports report their actual HTTP
+status, response headers, and body size. Retained bodies remain readable by
+request ID when a page's JavaScript runtime is suspended, subject to
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`.
+Cached imports do not produce another network request.

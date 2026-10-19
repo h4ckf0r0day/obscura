@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, StoredNetworkResponseBody,
+    ObscuraState, OriginStorage, RuntimeEvent, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -130,7 +130,8 @@ fn enter_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
     Some(FALLBACK.enter())
 }
 
-const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
+#[doc(hidden)]
+pub const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(feature = "render")]
 const MAX_PENDING_RENDER_RESOURCES: usize = 128;
@@ -230,6 +231,19 @@ pub struct RemoteObjectInfo {
     pub unserializable_value: Option<String>,
 }
 
+/// A started CDP command, so the browser can service frame work while awaiting it.
+#[doc(hidden)]
+pub enum CdpEvaluation {
+    Complete(RemoteObjectInfo),
+    Pending(PendingCdpEvaluation),
+}
+
+#[doc(hidden)]
+pub struct PendingCdpEvaluation {
+    object_id: String,
+    recipe: Option<String>,
+}
+
 /// CDP remote objects that can be rebuilt when a page's V8 runtime is
 /// temporarily replaced during tab switching.
 ///
@@ -279,6 +293,8 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    // Pending commands are runtime-owned, not client handles that releaseObjectGroup can discard.
+    pending_cdp_evaluations: HashMap<String, v8::Global<v8::Value>>,
     // Keep the runtime last: custom `Drop` enters its isolate, then every
     // V8-backed field above is released before `OwnedIsolate` performs the
     // matching exit and disposes the isolate.
@@ -556,6 +572,29 @@ impl ObscuraJsRuntime {
         // caller that triggered it did not need the error value.
         self.recover_heap_limit();
         begin_animation_task(&mut self.state.borrow_mut());
+        self.poll_indexed_db_notifications();
+    }
+
+    fn poll_indexed_db_notifications(&mut self) {
+        if !self.state.borrow().indexed_db.has_pending_notifications() { return; }
+        let root_notices = self.state.borrow().indexed_db_owner.as_ref()
+            .map(|owner| owner.take_notices()).unwrap_or_default();
+        let realms = self.realm_states().borrow().media_realms();
+        let mut deliveries = Vec::new();
+        if !root_notices.is_empty() {
+            deliveries.push((self.runtime().main_context(), root_notices));
+        }
+        for (context, state) in realms {
+            let notices = state.borrow().indexed_db_owner.as_ref()
+                .map(|owner| owner.take_notices()).unwrap_or_default();
+            if !notices.is_empty() { deliveries.push((context, notices)); }
+        }
+        for (context, notices) in deliveries {
+            let script = format!("globalThis.__obscura_poll_indexeddb({});", serde_json::json!(notices));
+            if let Err(error) = self.eval_in_realm(&context, &script) {
+                tracing::warn!("IndexedDB notification failed: {error}");
+            }
+        }
     }
     pub fn new() -> Self {
         Self::with_base_url("about:blank")
@@ -649,6 +688,7 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            pending_cdp_evaluations: HashMap::new(),
             js_runtime: runtime,
         };
         // Take the op table before any page script can run, and drop the global
@@ -973,6 +1013,11 @@ impl ObscuraJsRuntime {
         self.realm_states().borrow_mut().forget_frame(frame_id);
     }
 
+    /// Pending initial realms can already own children before Page adopts them.
+    pub fn frame_is_active(&self, frame_id: u32) -> bool {
+        self.realm_states().borrow().frame_timers_active(frame_id) != Some(false)
+    }
+
     /// The origin of the document this runtime is running, or `"null"` for a
     /// scheme that has no tuple origin.
     pub(crate) fn page_origin(&self) -> String {
@@ -1099,6 +1144,12 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut state.pending_frames)
     }
 
+    #[doc(hidden)]
+    pub fn has_pending_frame_tasks(&self) -> bool {
+        let state = self.state.borrow();
+        !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
+    }
+
     /// postMessage traffic waiting to be delivered to another realm.
     pub fn take_pending_frame_messages(&self) -> Vec<crate::ops::PendingFrameMessage> {
         let mut state = self.state.borrow_mut();
@@ -1168,6 +1219,25 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    /// Install the context-scoped `localStorage` backing store. The Arc lives on
+    /// the BrowserContext, so entries outlive the V8 realm that wrote them.
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
+    }
+
+    pub fn set_indexed_db(&self, storage: std::sync::Arc<crate::indexed_db::IndexedDbStorage>) {
+        let mut state = self.state.borrow_mut();
+        state.indexed_db_owner = None;
+        state.indexed_db = storage;
+    }
+
+    /// Install the page-owned `sessionStorage` backing store, so an entry
+    /// survives realm teardown on a same-origin navigation and on CDP target
+    /// switching while staying inside the tab (issue #678).
+    pub fn set_session_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().session_storage = Some(storage);
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         let mut state = self.state.borrow_mut();
         state.http_client = Some(client);
@@ -1204,6 +1274,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             gs.prepared_render = None;
+            gs.style_query_cache = None;
             gs.animation_sample = obscura_render::AnimationSample::default();
             gs.animation_timeline = obscura_render::AnimationTimelineState::default();
             gs.animation_timeline_origin = std::time::Instant::now();
@@ -1253,11 +1324,22 @@ impl ObscuraJsRuntime {
         }
     }
 
+    pub fn document_url(&self) -> String {
+        self.state.borrow().url.clone()
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
     pub fn set_encoding(&self, encoding: &str) {
         self.state.borrow_mut().encoding = encoding.to_string();
+    }
+
+    /// Set the document's MIME type. Backs `document.contentType`, which
+    /// reports the type of the main resource rather than one guessed from
+    /// the URL.
+    pub fn set_content_type(&self, content_type: &str) {
+        self.state.borrow_mut().content_type = content_type.to_string();
     }
 
     pub fn set_title(&self, title: &str) {
@@ -1364,6 +1446,15 @@ impl ObscuraJsRuntime {
             .cloned()
     }
 
+    /// Move retained bodies in completion order before the runtime is suspended.
+    pub fn take_network_response_bodies(&self) -> Vec<(String, StoredNetworkResponseBody)> {
+        let mut state = self.state.borrow_mut();
+        let order = std::mem::take(&mut state.network_response_body_order);
+        order.into_iter().filter_map(|id| {
+            state.network_response_bodies.remove(&id).map(|body| (id, body))
+        }).collect()
+    }
+
     pub fn clear_network_response_bodies(&self) {
         let mut state = self.state.borrow_mut();
         state.network_response_bodies.clear();
@@ -1390,6 +1481,12 @@ impl ObscuraJsRuntime {
 
     pub fn set_intercept_page_id(&self, page_id: &str) {
         self.state.borrow_mut().intercept_page_id = page_id.to_string();
+    }
+
+    /// `Fetch.enable` URL patterns that decide which fetch()/XHR requests
+    /// are sent to the interception channel.
+    pub fn set_intercept_url_patterns(&self, patterns: Vec<String>) {
+        self.state.borrow_mut().intercept_url_patterns = patterns;
     }
 
     /// `Fetch.enable` URL patterns of the owning page. Renderer resource
@@ -1465,17 +1562,42 @@ impl ObscuraJsRuntime {
         );
     }
 
-    /// Keep JavaScript media queries and CSS selection on the same preference.
-    pub fn set_reduced_motion(&mut self, reduce: bool) {
+    /// Apply preference overrides together so compound query listeners observe
+    /// one media change, including in existing child documents.
+    pub fn set_media_preferences(&mut self, reduce: bool, dark: bool) {
+        self.state.borrow().media_preferences.set((reduce, dark));
+        let realms = self.realm_states().borrow().media_realms();
         #[cfg(feature = "render")]
         {
-            let media = self.state.borrow().render_media.with_reduced_motion(reduce);
+            let media = self.state.borrow().render_media
+                .with_reduced_motion(reduce).with_dark_color_scheme(dark);
             self.set_render_media(media);
+            for (_, state) in &realms {
+                let mut state = state.borrow_mut();
+                let media = state.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+                if state.render_media != media {
+                    state.render_media = media;
+                    state.prepared_render = None;
+                    state.resolved_scroll = None;
+                }
+            }
         }
-        let _ = self.execute_runtime_script("<reduced-motion>", format!(
-            "globalThis.__obscura_reduced_motion={reduce};\
-             globalThis.__obscura_recompute_media_queries();"
-        ));
+        let script = "globalThis.__obscura_update_media_preferences();";
+        let _ = self.execute_runtime_script("<media-preferences>", script.into());
+        for (context, _) in realms {
+            let _ = self.eval_in_realm(&context, script);
+        }
+    }
+
+    #[cfg(feature = "render")]
+    pub fn prefers_dark_color_scheme(&self) -> bool {
+        self.state.borrow().media_preferences.get().1
+    }
+
+    /// Keep JavaScript media queries and CSS selection on the same preference.
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        let dark = self.state.borrow().media_preferences.get().1;
+        self.set_media_preferences(reduce, dark);
     }
 
     /// Override the physical screen metrics exposed to page JavaScript.
@@ -1635,8 +1757,27 @@ impl ObscuraJsRuntime {
         let ObscuraState {
             dom,
             render_resources,
+            render_media,
+            dynamic_fonts,
             ..
         } = &mut *state;
+        // An ad-hoc capture must select the same preference rules as CSSOM.
+        // Keep its viewport-specific cascade separate from the live cache.
+        if *render_media != obscura_render::CssMediaType::Screen {
+            let tree = dom.as_ref()?;
+            let mut cache = obscura_render::StylesheetCache::default();
+            let mut timeline = obscura_render::AnimationTimelineState::default();
+            let mut prepared = obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                tree, viewport, base_url, render_resources, dynamic_fonts,
+                &mut cache, *render_media,
+                obscura_render::AnimationSample::local_override(animation_sample_time.milliseconds),
+                &mut timeline,
+            )?;
+            let resolved = prepared.resolve_scroll_state(tree, scroll, &Default::default());
+            return obscura_render::screenshot_prepared_with_scroll_and_surface_color(
+                tree, &mut prepared, render_resources, &resolved, surface_color,
+            );
+        }
         obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
             dom.as_ref()?,
             viewport,
@@ -2079,6 +2220,29 @@ impl ObscuraJsRuntime {
         state.render_resource_rx = rx;
     }
 
+    /// Cancel this document's current loads without letting the next render
+    /// turn rediscover and restart them. Future new URLs can still load.
+    #[cfg(feature = "render")]
+    pub fn stop_render_resource_loading(&mut self) {
+        self.service_render_resources();
+        let (pending, backlog, queued, images) = {
+            let mut state = self.state.borrow_mut();
+            (std::mem::take(&mut state.render_resource_in_flight),
+                std::mem::take(&mut state.render_resource_backlog),
+                state.render_resources.take_sync_misses(),
+                std::mem::take(&mut state.render_image_in_flight))
+        };
+        self.abandon_render_resources();
+        let mut state = self.state.borrow_mut();
+        for (url, profile, _) in pending.into_iter().chain(backlog).chain(queued) {
+            state.render_resources.stop_resource(&url, profile);
+        }
+        for ((_, url, profile), (cancel, _)) in images {
+            state.render_resources.stop_resource(&url, Some(profile));
+            let _ = cancel.send(());
+        }
+    }
+
     /// Whether a page transport (plain or stealth client) is installed.
     #[cfg(feature = "render")]
     pub fn has_page_transport(&self) -> bool {
@@ -2414,6 +2578,15 @@ impl ObscuraJsRuntime {
         self.v8_to_json(result)
     }
 
+    /// Evaluate a script without converting an exception into a null result.
+    pub fn evaluate_script(&mut self, script: &str) -> Result<serde_json::Value, String> {
+        #[cfg(feature = "render")]
+        self.service_render_resources();
+        self.begin_javascript_task();
+        let result = self.execute_runtime_script("<eval-script>", script.to_owned())?;
+        self.v8_to_json(result)
+    }
+
     pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
@@ -2436,6 +2609,17 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        let evaluation = self.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_evaluation(
+        &mut self,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
         // Every shape of this command now travels the same path. The
         // by-value sync case used to short-circuit through `evaluate`,
         // whose wrapper answers an exception with `null` — indistinguishable
@@ -2464,32 +2648,20 @@ impl ObscuraJsRuntime {
         // where `var` lands on `globalThis` the way it does in Chrome, and
         // cannot see this wrapper's `__result`.
         let source_literal = serde_json::Value::String(expression.to_string());
-        let done_counter = self.object_counter;
         let meta_code = if await_promise {
             format!(
-                "(async function() {{\n\
-                    try {{\n\
-                        var __result = await (0, eval)({src});\n\
-                        globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
-                    }} catch(e) {{\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                    }}\n\
-                    globalThis.__obscura_done_{done_counter} = true;\n\
+                "(function() {{\n\
+                    var pending = {{done:false,rejected:false,value:undefined}};\n\
+                    (async function() {{\n\
+                        try {{ pending.value = await (0, eval)({src}); }}\n\
+                        catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
+                        pending.done = true;\n\
+                    }})();\n\
+                    return pending;\n\
                 }})()",
                 src = source_literal,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = Self::meta_extract_js("e"),
-                done_counter = done_counter,
             )
         } else {
-            // The synchronous half writes the same two globals as the await
-            // half above, so one outcome protocol covers both and the reply
-            // builder does not have to care which path produced the value.
             // Before this, a throw here became `__result = undefined`: the
             // command answered successfully with `undefined`, so a page error
             // was indistinguishable from an expression with no value.
@@ -2519,44 +2691,14 @@ impl ObscuraJsRuntime {
             .execute_runtime_script("<eval-remote>", meta_code)
             .map_err(|e| format!("JS error: {}", e))?;
 
-        let meta_str = if await_promise {
-            let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true && delete globalThis.__obscura_done_{done_counter}");
-            let settled = self
-                .resolve_promises_until(
-                    |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
-                    },
-                    await_timeout_ms,
-                )
-                .await;
-            if !settled {
-                return Err(format!(
-                    "Runtime.evaluate promise did not settle within {await_timeout_ms}ms"
-                ));
-            }
-            let __dt = __t0.elapsed();
-            if __dt > std::time::Duration::from_secs(1) {
-                let preview: String = expression
-                    .chars()
-                    .take(200)
-                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-                    .collect();
-                tracing::debug!(
-                    "Runtime.evaluate awaitPromise took {}ms; expr={}",
-                    __dt.as_millis(),
-                    preview,
-                );
-            }
-            self.execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?
-        } else {
-            result
-        };
+        if await_promise {
+            self.pending_cdp_evaluations.insert(oid.clone(), result);
+            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
+                object_id: oid,
+                recipe: if return_by_value { None } else { Some(expression.to_string()) },
+            }));
+        }
+        let meta_str = result;
 
         // Neither a rejection nor a synchronous throw is a protocol failure.
         // CDP answers the command and puts the value in `exceptionDetails`,
@@ -2572,10 +2714,10 @@ impl ObscuraJsRuntime {
             )
             .map_err(|e| format!("JS error: {}", e))?;
         if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
-            return self.thrown_info(&oid);
+            return self.thrown_info(&oid).map(CdpEvaluation::Complete);
         }
         if return_by_value {
-            return self.take_cdp_result_by_value(&oid);
+            return self.take_cdp_result_by_value(&oid).map(CdpEvaluation::Complete);
         }
         let meta_str = self.v8_to_json(meta_str)?;
         let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -2588,7 +2730,7 @@ impl ObscuraJsRuntime {
         if info.object_id.is_some() {
             self.evaluation_recipes.insert(oid, expression.to_string());
         }
-        Ok(info)
+        Ok(CdpEvaluation::Complete(info))
     }
 
     pub async fn call_function_on_for_cdp(
@@ -2619,6 +2761,19 @@ impl ObscuraJsRuntime {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
+        let evaluation = self.start_cdp_call(function_declaration, object_id, arguments, return_by_value, await_promise)?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.callFunctionOn").await
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_call(
+        &mut self,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
         self.begin_javascript_task();
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
@@ -2627,104 +2782,33 @@ impl ObscuraJsRuntime {
         let oid = self.make_oid(self.object_counter);
 
         if await_promise {
-            let done_counter = self.object_counter;
-            let err_meta_fn = Self::meta_extract_js("__result");
             let code = format!(
-                "(async function() {{\n\
-                    {setup}\n\
-                    var __fn = ({fn_decl});\n\
-                    var __this = ({this_expr});\n\
-                    var __result;\n\
-                    try {{\n\
-                        __result = await __fn.call(__this, {args});\n\
-                        globalThis.__obscura_objects[{oid}] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
-                    }} catch(e) {{\n\
-                        __result = e;\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                    }} finally {{\n\
-                        globalThis.__obscura_done_{done_counter} = true;\n\
-                    }}\n\
+                "(function() {{\n\
+                    var pending = {{done:false,rejected:false,value:undefined}};\n\
+                    (async function() {{\n\
+                        try {{\n\
+                            {setup}\n\
+                            var __fn = ({fn_decl});\n\
+                            var __this = ({this_expr});\n\
+                            pending.value = await __fn.call(__this, {args});\n\
+                        }} catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
+                        pending.done = true;\n\
+                    }})();\n\
+                    return pending;\n\
                 }})()",
                 setup = setup,
                 fn_decl = function_declaration,
                 this_expr = this_expr,
                 args = args_list,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = err_meta_fn,
-                done_counter = done_counter,
             );
 
-            self.execute_runtime_script("<callFnAsync>", code)
+            let record = self.execute_runtime_script("<callFnAsync>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
+            self.pending_cdp_evaluations.insert(oid.clone(), record);
 
-            let __t0 = std::time::Instant::now();
-            let sentinel = format!("globalThis.__obscura_done_{done_counter} === true && delete globalThis.__obscura_done_{done_counter}");
-            let settled = self
-                .resolve_promises_until(
-                    |rt| {
-                        rt.execute_runtime_script("<done?>", sentinel.clone())
-                            .ok()
-                            .and_then(|v| rt.v8_to_json(v).ok())
-                            .and_then(|j| j.as_bool())
-                            .unwrap_or(false)
-                    },
-                    await_timeout_ms,
-                )
-                .await;
-            if !settled {
-                return Err(format!(
-                    "Runtime.callFunctionOn promise did not settle within {await_timeout_ms}ms"
-                ));
-            }
-            let __dt = __t0.elapsed();
-            if __dt > std::time::Duration::from_secs(1) {
-                let preview: String = function_declaration
-                    .chars()
-                    .take(300)
-                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-                    .collect();
-                tracing::debug!(
-                    "Runtime.callFunctionOn awaitPromise took {}ms; fn={}",
-                    __dt.as_millis(),
-                    preview,
-                );
-            }
-
-            // Same rule as evaluate: a rejected call is answered, not failed,
-            // and the value is never serialized by value. Without this the
-            // wrapper stored the error under the object id a success uses, so
-            // a rejection came back as an ordinary result: an Error as `{}`,
-            // and `Promise.reject({code: 42})` as `{code: 42}`, which is
-            // indistinguishable from resolving with it.
-            let rejected = self
-                .execute_runtime_script(
-                    "<readRejected>",
-                    "globalThis.__obscura_await_rejected".to_string(),
-                )
-                .map_err(|e| format!("JS error: {}", e))?;
-            if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                return self.thrown_info(&oid);
-            }
-
-            if return_by_value {
-                return self.take_cdp_result_by_value(&oid);
-            }
-
-            let meta_result = self
-                .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
-            let meta_str = self.v8_to_json(meta_result)?;
-            let meta_json = if let serde_json::Value::String(s) = &meta_str {
-                serde_json::from_str(s).unwrap_or(meta_str.clone())
-            } else {
-                meta_str
-            };
-            return self.finish_cdp_result(&meta_json, &oid);
+            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
+                object_id: oid, recipe: None,
+            }));
         }
 
         if return_by_value {
@@ -2743,7 +2827,7 @@ impl ObscuraJsRuntime {
             let result = self
                 .execute_runtime_script("<callFnByValue>", code)
                 .map_err(|e| format!("JS error: {}", e))?;
-            return self.v8_to_cdp_value(result);
+            return self.v8_to_cdp_value(result).map(CdpEvaluation::Complete);
         }
 
         let code = format!(
@@ -2771,7 +2855,97 @@ impl ObscuraJsRuntime {
         } else {
             meta_str
         };
-        self.finish_cdp_result(&meta_json, &oid)
+        self.finish_cdp_result(&meta_json, &oid).map(CdpEvaluation::Complete)
+    }
+
+    #[doc(hidden)]
+    pub fn cdp_evaluation_ready(&mut self, pending: &PendingCdpEvaluation) -> bool {
+        let Some(record) = self.pending_cdp_evaluations.get(&pending.object_id).cloned() else {
+            return false;
+        };
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        let Ok(record) = v8::Local::<v8::Object>::try_from(v8::Local::new(scope, record)) else {
+            return false;
+        };
+        let Some(key) = v8::String::new(scope, "done") else { return false; };
+        record.get(scope, key.into()).is_some_and(|value| value.is_true())
+    }
+
+    #[doc(hidden)]
+    pub fn finish_cdp_evaluation(
+        &mut self,
+        pending: PendingCdpEvaluation,
+        return_by_value: bool,
+    ) -> Result<RemoteObjectInfo, String> {
+        let oid = pending.object_id;
+        let record = self.pending_cdp_evaluations.remove(&oid)
+            .ok_or("Evaluation result unavailable")?;
+        let (value, rejected) = {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let record = v8::Local::<v8::Object>::try_from(v8::Local::new(scope, record))
+                .map_err(|_| "Invalid evaluation record")?;
+            let done_key = v8::String::new(scope, "done").ok_or("Cannot read evaluation result")?;
+            if !record.get(scope, done_key.into()).is_some_and(|value| value.is_true()) {
+                return Err("Evaluation result unavailable".into());
+            }
+            let rejected_key = v8::String::new(scope, "rejected").ok_or("Cannot read evaluation result")?;
+            let rejected = record.get(scope, rejected_key.into()).is_some_and(|value| value.is_true());
+            let value_key = v8::String::new(scope, "value").ok_or("Cannot read evaluation result")?;
+            let value = record.get(scope, value_key.into()).ok_or("Cannot read evaluation result")?;
+            if !return_by_value || rejected {
+                let objects_key = v8::String::new(scope, "__obscura_objects").ok_or("Cannot store evaluation result")?;
+                let global = scope.get_current_context().global(scope);
+                let objects = global.get(scope, objects_key.into())
+                    .and_then(|value| value.to_object(scope)).ok_or("Cannot store evaluation result")?;
+                let key = v8::String::new(scope, &oid).ok_or("Cannot store evaluation result")?;
+                if objects.set(scope, key.into(), value) != Some(true) {
+                    return Err("Cannot store evaluation result".into());
+                }
+            }
+            (v8::Global::new(scope, value), rejected)
+        };
+        if return_by_value && !rejected { return self.v8_to_cdp_value(value); }
+        let meta = self.execute_runtime_script(
+            "<readMeta>", Self::meta_extract_js(&format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid))),
+        ).map_err(|e| format!("JS error: {e}"))?;
+        let meta = self.v8_to_json(meta)?;
+        let meta = if let serde_json::Value::String(value) = &meta {
+            serde_json::from_str(value).unwrap_or(meta)
+        } else { meta };
+        let mut info = self.finish_cdp_result(&meta, &oid)?;
+        info.thrown = rejected;
+        if !rejected && info.object_id.is_some() {
+            if let Some(recipe) = pending.recipe { self.evaluation_recipes.insert(oid, recipe); }
+        }
+        Ok(info)
+    }
+
+    #[doc(hidden)]
+    pub fn cancel_cdp_evaluation(&mut self, pending: PendingCdpEvaluation) {
+        self.pending_cdp_evaluations.remove(&pending.object_id);
+    }
+
+    async fn await_cdp_evaluation(
+        &mut self,
+        evaluation: CdpEvaluation,
+        return_by_value: bool,
+        timeout_ms: u64,
+        method: &str,
+    ) -> Result<RemoteObjectInfo, String> {
+        let pending = match evaluation {
+            CdpEvaluation::Complete(info) => return Ok(info),
+            CdpEvaluation::Pending(pending) => pending,
+        };
+        if !self.resolve_promises_until(|rt| rt.cdp_evaluation_ready(&pending), timeout_ms).await {
+            self.cancel_cdp_evaluation(pending);
+            return Err(format!("{method} promise did not settle within {timeout_ms}ms"));
+        }
+        self.finish_cdp_evaluation(pending, return_by_value)
     }
     pub async fn call_function_on(
         &mut self,
@@ -3936,6 +4110,7 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
+            state.style_query_cache = None;
             state.pending_style_mutations.clear();
             let render_resources = crate::ops::fresh_render_resources(&state);
             state.render_resources = render_resources;
@@ -4003,6 +4178,17 @@ impl ObscuraJsRuntime {
     pub fn accessibility_styles(&self) -> HashMap<NodeId, AccessibilityStyle> {
         let mut state = self.state.borrow_mut();
         crate::ops::sample_live_document_animations(&mut state);
+        if state.animation_timeline.waapi_nodes().is_empty() {
+            if let Some(styles) = state.dom.as_ref().and_then(|dom| {
+                obscura_render::dom::accessibility_styles_without_layout(
+                    dom, state.viewport, state.render_media, &state.stylesheet_cache,
+                )
+            }) {
+                return styles.into_iter().map(|(id, (display_none, visibility_hidden))| {
+                    (id, AccessibilityStyle { display_none, visibility_hidden })
+                }).collect();
+            }
+        }
         let Some(prepared) = crate::ops::ensure_prepared_render(&mut state) else {
             return HashMap::new();
         };
@@ -4171,16 +4357,23 @@ impl ObscuraJsRuntime {
 
         for (i, arg) in arguments.iter().enumerate() {
             let arg_name = format!("__arg{}", i);
-            if let Some(value) = arg.get("value") {
-                let json_str =
-                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
-                setup_lines.push(format!("var {} = {};", arg_name, json_str));
-            } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
+            // objectId wins over value. go-rod marshals CallArgument through a
+            // struct, and Go's `omitempty` is a no-op on structs, so every
+            // object handle it sends arrives as `{"value":null,"objectId":...}`.
+            // Chromium reads objectId first and ignores the null; reading value
+            // first passed `null` as the argument and broke rod's JS helpers
+            // (`functions.selectable = ...` → "Cannot set properties of null").
+            if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
                 if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
                 }
+            } else if let Some(value) = arg.get("value") {
+                // No handle: a plain JSON argument, explicit null included.
+                let json_str =
+                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
+                setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
                 // CDP defines UnserializableValue as a closed set. Anything
                 // else is arbitrary source text arriving in a data field;
@@ -4534,6 +4727,28 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn static_accessibility_visibility_does_not_allocate_geometry() {
+        let rt = setup_runtime("<!doctype html><style>.gone{display:none}.hidden{visibility:hidden}.shown{visibility:visible}</style><div class=gone id=gone>hidden</div><div class=hidden id=hidden><span class=shown id=shown>visible</span></div>");
+        let styles = rt.accessibility_styles();
+        let ids = rt.with_dom(|dom| ["gone", "hidden", "shown"].map(|id| dom.get_element_by_id(id).unwrap())).unwrap();
+        assert!(styles[&ids[0]].display_none);
+        assert_eq!(styles[&ids[1]].visibility_hidden, Some(true));
+        assert_eq!(styles[&ids[2]].visibility_hidden, Some(false));
+        assert!(rt.state.borrow().prepared_render.is_none(), "a static visibility read must not retain layout/text geometry for an entire document");
+    }
+
+    #[test]
+    fn document_content_type_retains_url_fallback_without_response_metadata() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/document.xhtml");
+        rt.run_page_init();
+        assert_eq!(rt.evaluate("document.contentType").unwrap(),
+            serde_json::json!("application/xhtml+xml"));
     }
 
     #[test]
@@ -6720,6 +6935,112 @@ mod tests {
         assert_eq!(path, serde_json::json!("/dashboard"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_navigates_to_a_fragment_in_the_same_document() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#tab'>tab</a></body></html>");
+        rt.execute_script(
+            "fragment-navigation",
+            r#"
+                globalThis.__events = [];
+                addEventListener('hashchange', (e) => __events.push(e.oldURL + ' -> ' + e.newURL));
+                globalThis.__marker = 'same-document';
+                location.hash = 'one';
+                globalThis.__syncHash = location.hash;
+                location.hash = '#one';
+                location.href = '#two';
+                document.getElementById('tab').click();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(rt.take_pending_navigation(), None, "a fragment change must not load a new document");
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate("[__syncHash, location.href, history.length, __marker, __events]")
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "#one",
+                "http://example.com/test#tab",
+                4,
+                "same-document",
+                [
+                    "http://example.com/test -> http://example.com/test#one",
+                    "http://example.com/test#one -> http://example.com/test#two",
+                    "http://example.com/test#two -> http://example.com/test#tab",
+                ],
+            ])
+        );
+        rt.evaluate("history.back()").unwrap();
+        assert_eq!(rt.evaluate("location.hash").unwrap(), serde_json::json!("#two"));
+    }
+
+    #[test]
+    fn location_replace_with_a_fragment_replaces_the_history_entry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate("(function(){ location.replace('#r'); return [location.hash, history.length]; })()")
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["#r", 1]));
+        assert_eq!(rt.take_pending_navigation(), None);
+    }
+
+    #[test]
+    fn location_component_setters_load_the_new_url() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.search = 'q=1'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/test?q=1".into(), "GET".into(), String::new())),
+        );
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.pathname = '/other'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation().map(|(url, _, _)| url),
+            Some("http://example.com/other".into()),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_preserves_leading_hashes_and_ignores_an_unchanged_empty_fragment() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("hash-setter", r#"
+            globalThis.__hashEvents = [];
+            addEventListener('hashchange', e => __hashEvents.push([e.oldURL, e.newURL]));
+            location.hash = '';
+            location.hash = '#';
+            globalThis.__emptyHashResult = [location.href, history.length];
+            location.hash = '##panel';
+            location.hash = '##panel';
+        "#).unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[__emptyHashResult, location.href, location.hash, history.length, __hashEvents]").unwrap(),
+            serde_json::json!([
+                ["http://example.com/test", 1],
+                "http://example.com/test##panel", "##panel", 2,
+                [["http://example.com/test", "http://example.com/test##panel"]],
+            ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_fragment_navigation_preserves_history_state() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#panel'>tab</a></body></html>");
+        rt.execute_script("same-fragment", r#"
+            history.replaceState({saved: 1}, '', '#panel');
+            globalThis.__sameHashEvents = 0;
+            addEventListener('hashchange', () => __sameHashEvents++);
+            location.assign('#panel');
+            location.href = '#panel';
+            location.replace('#panel');
+            document.getElementById('tab').click();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(rt.evaluate("[history.state, history.length, location.hash, __sameHashEvents]").unwrap(),
+            serde_json::json!([{ "saved": 1 }, 1, "#panel", 0]));
+    }
+
     #[test]
     fn push_state_without_url_preserves_current_location() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -7477,6 +7798,523 @@ mod tests {
                     "HierarchyRequestError"
                 ]
             ])
+        );
+    }
+
+    #[test]
+    fn replacement_script_runs_after_the_old_child_is_removed_without_observers() {
+        let mut rt = setup_runtime("<!doctype html><body><span id=old>old</span></body>");
+        let result = rt.evaluate(r#"(() => {
+            const old = document.getElementById('old');
+            const script = document.createElement('script');
+            script.textContent = "globalThis.oldPresentDuringReplacement = document.getElementById('old') !== null";
+            const removed = document.body.replaceChild(script, old);
+            return [oldPresentDuringReplacement, removed === old, old.parentNode === null];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([false, true, true]));
+    }
+
+    #[test]
+    fn pre_insertion_validity_checks_arguments_and_order() {
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body><p id='log'></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const name = (fn) => {
+                    try { fn(); return "none"; }
+                    catch (error) { return error instanceof TypeError ? "TypeError" : error.name; }
+                };
+                const body = document.body;
+                const text = document.createTextNode("t");
+                const a = document.createElement("a");
+                const b = document.createElement("b");
+                const c = document.createElement("i");
+                a.appendChild(b);
+                const doc = document.implementation.createHTMLDocument("title");
+                const doctype = document.implementation.createDocumentType("html", "", "");
+                return [
+                    name(() => body.insertBefore(null, null)),
+                    name(() => body.insertBefore(text)),
+                    name(() => body.insertBefore(text, {})),
+                    name(() => body.appendChild({})),
+                    name(() => body.removeChild(null)),
+                    name(() => body.replaceChild(text, null)),
+                    name(() => text.insertBefore(document.createTextNode("x"), null)),
+                    name(() => text.appendChild(text)),
+                    name(() => b.insertBefore(a, c)),
+                    name(() => b.insertBefore(text, c)),
+                    name(() => a.insertBefore(doc, null)),
+                    name(() => a.insertBefore(doctype, null)),
+                    name(() => doc.insertBefore(doc.createTextNode("x"), doc.documentElement)),
+                    name(() => doc.appendChild(doc.createElement("x"))),
+                    name(() => doc.insertBefore(doctype, null)),
+                    Array.from(doc.childNodes, n => n.nodeType),
+                    doc.doctype === doc.firstChild,
+                    body.insertBefore(text, undefined) === text,
+                    body.lastChild === text,
+                    document.doctype === document.firstChild,
+                    Node.prototype.insertBefore.length,
+                    Node.prototype.appendChild.length
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "TypeError", "TypeError", "TypeError", "TypeError", "TypeError", "TypeError",
+                "HierarchyRequestError", "HierarchyRequestError", "HierarchyRequestError",
+                "NotFoundError", "HierarchyRequestError", "HierarchyRequestError",
+                "HierarchyRequestError", "HierarchyRequestError", "HierarchyRequestError",
+                [10, 1], true, true, true, true, 2, 1
+            ])
+        );
+    }
+
+    #[test]
+    fn document_child_constraints_follow_dom_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const name = (fn) => { try { fn(); return "none"; } catch (error) { return error.name; } };
+                const doc = document.implementation.createHTMLDocument("t");
+                const comment = doc.insertBefore(doc.createComment("c"), doc.firstChild);
+                const root = doc.documentElement;
+                doc.removeChild(root);
+                const afterRemove = Array.from(doc.childNodes, n => n.nodeType);
+                const fragment = doc.createDocumentFragment();
+                fragment.appendChild(doc.createElement("a"));
+                const beforeDoctype = name(() => doc.insertBefore(fragment, doc.doctype));
+                const beforeComment = name(() => doc.insertBefore(fragment, comment));
+                const appended = name(() => doc.appendChild(fragment));
+                const two = doc.createDocumentFragment();
+                two.append(doc.createElement("x"), doc.createElement("y"));
+                const replacedDoctype = name(() => doc.replaceChild(doc.createElement("z"), doc.doctype));
+                return [
+                    afterRemove, beforeDoctype, beforeComment, appended,
+                    doc.documentElement.localName, name(() => doc.appendChild(two)),
+                    replacedDoctype
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [8, 10], "HierarchyRequestError", "HierarchyRequestError", "none", "a",
+                "HierarchyRequestError", "HierarchyRequestError"
+            ])
+        );
+    }
+
+    #[test]
+    fn child_list_records_match_the_dom_mutation_algorithms() {
+        let mut rt = setup_runtime("<html><body><div id='p'><a></a><b></b><i></i></div><div id='q'><u></u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const p = document.getElementById("p");
+                const q = document.getElementById("q");
+                const [a, b, i] = Array.from(p.childNodes);
+                const u = q.firstChild;
+                const observer = new MutationObserver(() => {});
+                observer.observe(p, { childList: true, attributes: true, characterData: true, subtree: true });
+                const describe = (records) => records.map(r => [
+                    r.type,
+                    r.target.id || r.target.nodeName,
+                    Array.from(r.addedNodes, n => n.nodeName),
+                    Array.from(r.removedNodes, n => n.nodeName),
+                    r.previousSibling && r.previousSibling.nodeName,
+                    r.nextSibling && r.nextSibling.nodeName,
+                    r.attributeName,
+                    r.attributeNamespace,
+                    r.oldValue
+                ]);
+                const out = {};
+                p.insertBefore(b, a);
+                out.moveWithin = describe(observer.takeRecords());
+                const fragment = document.createDocumentFragment();
+                fragment.append(document.createElement("x"), document.createElement("y"));
+                p.appendChild(fragment);
+                out.fragment = describe(observer.takeRecords());
+                p.replaceChild(u, i);
+                out.replaceFromOtherParent = describe(observer.takeRecords());
+                p.replaceChild(a, a);
+                out.replaceSelf = describe(observer.takeRecords());
+                const e = document.createElement("em");
+                e.textContent = "";
+                p.appendChild(e);
+                observer.takeRecords();
+                e.textContent = "";
+                out.emptyTextContent = describe(observer.takeRecords());
+                e.append("one", "two");
+                out.appendTwo = describe(observer.takeRecords());
+                e.normalize();
+                out.normalize = describe(observer.takeRecords());
+                e.setAttribute("title", "x");
+                e.setAttribute("title", "y");
+                e.removeAttribute("title");
+                out.attributes = describe(observer.takeRecords());
+                out.recordType = [
+                    typeof MutationRecord,
+                    (() => { p.appendChild(document.createElement("s")); return observer.takeRecords()[0] instanceof MutationRecord; })(),
+                    Object.keys((() => { p.appendChild(document.createElement("s")); return observer.takeRecords()[0]; })()).length
+                ];
+                out.options = [
+                    (() => { try { observer.observe(p, {}); return "none"; } catch (error) { return error.constructor.name; } })(),
+                    (() => { try { observer.observe(p, { attributeOldValue: true, attributes: false }); return "none"; } catch (error) { return error.constructor.name; } })()
+                ];
+                return out;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "moveWithin": [
+                    ["childList", "p", [], ["B"], "A", "I", null, null, null],
+                    ["childList", "p", ["B"], [], null, "A", null, null, null]
+                ],
+                "fragment": [["childList", "p", ["X", "Y"], [], "I", null, null, null, null]],
+                "replaceFromOtherParent": [["childList", "p", ["U"], ["I"], "A", "X", null, null, null]],
+                "replaceSelf": [
+                    ["childList", "p", [], ["A"], "B", "U", null, null, null],
+                    ["childList", "p", ["A"], [], "B", "U", null, null, null]
+                ],
+                "emptyTextContent": [],
+                "appendTwo": [["childList", "EM", ["#text", "#text"], [], null, null, null, null, null]],
+                "normalize": [
+                    ["characterData", "#text", [], [], null, null, null, null, null],
+                    ["childList", "EM", [], ["#text"], "#text", null, null, null, null]
+                ],
+                "attributes": [
+                    ["attributes", "EM", [], [], null, null, "title", null, null],
+                    ["attributes", "EM", [], [], null, null, "title", null, null],
+                    ["attributes", "EM", [], [], null, null, "title", null, null]
+                ],
+                "recordType": ["function", true, 0],
+                "options": ["TypeError", "TypeError"]
+            })
+        );
+    }
+
+    #[test]
+    fn parent_node_insertion_of_several_nodes_is_one_mutation() {
+        let mut rt = setup_runtime("<html><body><div id='p'><i id='first'></i></div><div id='q'><u></u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const p = document.getElementById("p");
+                    const q = document.getElementById("q");
+                    const first = document.getElementById("first");
+                    const observer = new MutationObserver(() => {});
+                    observer.observe(document.body, { childList: true, subtree: true });
+                    const describe = (records) => records.map(r => [
+                        r.target.id, Array.from(r.addedNodes, n => n.nodeName), Array.from(r.removedNodes, n => n.nodeName),
+                        r.previousSibling && r.previousSibling.nodeName, r.nextSibling && r.nextSibling.nodeName
+                    ]);
+                    const a = document.createElement("a");
+                    p.append(a, "t", q.firstChild);
+                    const appended = describe(observer.takeRecords());
+                    const b = document.createElement("b");
+                    p.prepend(b, "s");
+                    const prepended = describe(observer.takeRecords());
+                    first.after(first, "x");
+                    const withSelf = describe(observer.takeRecords());
+                    const errors = [];
+                    try { p.append(document.createElement("em"), document.body); } catch (e) { errors.push(e.name); }
+                    return [appended, prepended, withSelf, errors, Array.from(p.childNodes, n => n.nodeName)];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [["q", [], ["U"], null, null], ["p", ["A", "#text", "U"], [], "I", null]],
+                [["p", ["B", "#text"], [], null, "I"]],
+                [["p", [], ["I"], "#text", "A"], ["p", ["I", "#text"], [], "#text", "A"]],
+                ["HierarchyRequestError"],
+                ["B", "#text", "I", "#text", "A", "#text", "U"]
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_observer_old_values_and_callback_this() {
+        let mut rt = setup_runtime("<html><body><p id='p' title='a'>text</p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const p = document.getElementById("p");
+                const observer = new MutationObserver(() => {});
+                observer.observe(p, { attributeOldValue: true, characterDataOldValue: true, subtree: true, attributeFilter: ["title"] });
+                p.setAttribute("title", "b");
+                p.setAttribute("lang", "en");
+                p.firstChild.data = "changed";
+                const records = observer.takeRecords().map(r => [r.type, r.attributeName, r.oldValue]);
+                let seenThis = null;
+                const callbackObserver = new MutationObserver(function (list, obs) {
+                    seenThis = [this === callbackObserver, obs === callbackObserver, arguments.length, Array.isArray(list)];
+                });
+                callbackObserver.observe(p, { childList: true });
+                p.appendChild(document.createElement("span"));
+                globalThis.__callbackThis = () => seenThis;
+                return records;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([["attributes", "title", "a"], ["characterData", null, "text"]])
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__callbackThis()").unwrap(),
+            serde_json::json!([true, true, 2, true])
+        );
+    }
+
+    #[test]
+    fn range_mutations_move_nodes_and_queue_records() {
+        let mut rt = setup_runtime("<html><body><div id='d'><b>bold</b><i>ital</i><u>under</u></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const d = document.getElementById("d");
+                const [b, i, u] = Array.from(d.children);
+                const observer = new MutationObserver(() => {});
+                observer.observe(d, { childList: true, characterData: true, subtree: true });
+                const range = document.createRange();
+                range.setStart(b.firstChild, 2);
+                range.setEnd(u.firstChild, 3);
+                const cloned = range.cloneContents();
+                const clonedText = Array.from(cloned.childNodes, n => n.textContent);
+                const unchanged = d.textContent;
+                observer.takeRecords();
+                const extracted = range.extractContents();
+                const extractedText = Array.from(extracted.childNodes, n => [n.nodeName, n.textContent]);
+                const afterExtract = [d.innerHTML, range.startContainer === d, range.startOffset, range.collapsed];
+                const extractRecords = observer.takeRecords().map(r => [r.type, Array.from(r.removedNodes, n => n.nodeName)]);
+                const insertRange = document.createRange();
+                insertRange.setStart(d, 1);
+                insertRange.collapse(true);
+                const marker = document.createElement("mark");
+                insertRange.insertNode(marker);
+                const afterInsert = [d.innerHTML, insertRange.endContainer === d, insertRange.endOffset];
+                const surround = document.createRange();
+                surround.selectNode(marker);
+                const wrapper = document.createElement("span");
+                surround.surroundContents(wrapper);
+                const deleteRange = document.createRange();
+                deleteRange.selectNodeContents(d);
+                deleteRange.deleteContents();
+                return [clonedText, unchanged, extractedText, afterExtract, extractRecords, afterInsert, marker.parentNode === wrapper, d.childNodes.length];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["ld", "ital", "und"],
+                "bolditalunder",
+                [["B", "ld"], ["I", "ital"], ["U", "und"]],
+                ["<b>bo</b><u>er</u>", true, 1, true],
+                [["characterData", []], ["childList", ["I"]], ["characterData", []]],
+                ["<b>bo</b><mark></mark><u>er</u>", true, 2],
+                true,
+                0
+            ])
+        );
+    }
+
+    #[test]
+    fn node_document_follows_the_creating_document_and_adoption() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const doc = document.implementation.createHTMLDocument();
+                const el = doc.createElement("p");
+                const text = doc.createTextNode("t");
+                const created = [el.ownerDocument === doc, text.ownerDocument === doc, doc.ownerDocument, doc.title, !!doc.body, doc.defaultView];
+                doc.body.appendChild(el);
+                el.innerHTML = "<span>parsed</span>";
+                const parsed = el.firstChild;
+                const inTree = [el.ownerDocument === doc, parsed.ownerDocument === doc, doc.querySelector("span") === parsed, document.querySelector("span")];
+                doc.body.removeChild(el);
+                const removed = [el.ownerDocument === doc, parsed.ownerDocument === doc];
+                document.body.appendChild(el);
+                const adopted = [el.ownerDocument === document, parsed.ownerDocument === document, el.isConnected];
+                document.body.removeChild(el);
+                const leftMain = el.ownerDocument === document;
+                const imported = doc.importNode(document.createElement("q"), true);
+                const adoptedNode = doc.adoptNode(el);
+                const xml = document.implementation.createDocument(null, "root", null);
+                const parser = new DOMParser().parseFromString("<p>x</p>", "text/html");
+                return [
+                    created, inTree, removed, adopted, leftMain,
+                    imported.ownerDocument === doc, adoptedNode.ownerDocument === doc,
+                    xml instanceof XMLDocument, xml.documentElement.localName, xml.contentType,
+                    xml.documentElement.ownerDocument === xml,
+                    parser.querySelector("p").ownerDocument === parser,
+                    document.createElement("div").ownerDocument === document,
+                    document.documentElement.ownerDocument === document
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true, null, "", true, null],
+                [true, true, true, null],
+                [true, true],
+                [true, true, true],
+                true,
+                true, true,
+                true, "root", "application/xml",
+                true, true, true, true
+            ])
+        );
+    }
+
+    #[test]
+    fn mutation_errors_use_the_dom_exception_of_the_node_frame() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const iframe = document.createElement("iframe");
+                    document.body.appendChild(iframe);
+                    const child = iframe.contentWindow;
+                    const doc = child.document;
+                    const caught = (fn) => { try { fn(); return null; } catch (error) { return error; } };
+                    const out = [];
+                    for (const make of [
+                        () => doc.createElement("a"),
+                        () => doc.createTextNode("t"),
+                        () => doc.createComment("c"),
+                    ]) {
+                        const node = make();
+                        doc.body.appendChild(node);
+                        const error = caught(() => node.removeChild(doc));
+                        out.push([
+                            node.ownerDocument === doc,
+                            error && error.name,
+                            error && error.constructor === child.DOMException,
+                            error && error.constructor === DOMException,
+                        ]);
+                    }
+                    const local = caught(() => document.body.removeChild(document.createElement("p")));
+                    out.push([local.name, local.constructor === DOMException, local.constructor === child.DOMException]);
+                    return [child.DOMException !== DOMException, out];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                [
+                    [true, "NotFoundError", true, false],
+                    [true, "NotFoundError", true, false],
+                    [true, "NotFoundError", true, false],
+                    ["NotFoundError", true, false]
+                ]
+            ])
+        );
+    }
+
+    #[test]
+    fn media_rules_expose_nested_rules_and_accept_insert_rule() {
+        let mut rt = setup_runtime("<html><head><style id='s'>#t { color: black; } @media all { #t { color: blue; } }</style></head><body><div id='t'></div></body></html>");
+        let result = rt
+            .evaluate(
+                r##"
+                const sheet = document.getElementById("s").sheet;
+                const media = sheet.cssRules[1];
+                const before = [media instanceof CSSMediaRule, media instanceof CSSGroupingRule, media.type, media.conditionText, media.cssRules.length];
+                const index = media.insertRule("#t { color: red; }", 1);
+                const inserted = [index, media.cssRules.length, media.cssRules[1].parentRule === media, media.cssRules[1].parentStyleSheet === sheet];
+                media.deleteRule(1);
+                return [before, inserted, media.cssRules.length, typeof CSSSupportsRule];
+                "##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[true, true, 4, "all", 1], [1, 2, true, true], 1, "function"])
+        );
+    }
+
+    #[test]
+    fn new_dom_interfaces_have_browser_shapes() {
+        let mut rt = setup_runtime("<html><head><style id='s'>@media all { p { color: red } }</style></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r##"(() => {
+                    const caught = (fn) => { try { fn(); return "none"; } catch (e) { return e.message; } };
+                    const observer = new MutationObserver(() => {});
+                    const div = document.createElement("div");
+                    observer.observe(div, { childList: true });
+                    div.appendChild(document.createElement("i"));
+                    const record = observer.takeRecords()[0];
+                    const media = document.getElementById("s").sheet.cssRules[0];
+                    return [
+                        Object.prototype.toString.call(record),
+                        Object.prototype.toString.call(media),
+                        caught(() => new MutationRecord()),
+                        caught(() => new IntersectionObserverEntry({})),
+                        [MutationRecord.length, IntersectionObserverEntry.length, CSSConditionRule.length, CSSMediaRule.length],
+                        ["MutationRecord", "IntersectionObserverEntry", "CSSMediaRule", "XMLDocument"]
+                            .map(name => Object.getOwnPropertyDescriptor(globalThis, name).enumerable),
+                        Object.getOwnPropertyNames(CSSConditionRule.prototype).sort(),
+                        media.cssText,
+                        Document.prototype.importNode.length
+                    ];
+                })()"##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object MutationRecord]",
+                "[object CSSMediaRule]",
+                "Failed to construct 'MutationRecord': Illegal constructor",
+                "Failed to construct 'IntersectionObserverEntry': Illegal constructor",
+                [0, 0, 0, 0],
+                [false, false, false, false],
+                ["conditionText", "constructor"],
+                "@media all {\n  p { color: red; }\n}",
+                1
+            ])
+        );
+    }
+
+    #[test]
+    fn computed_style_is_empty_outside_a_document() {
+        let mut rt = setup_runtime("<html><body><div id='c' style='color: red'></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const detached = document.createElement("div");
+                detached.style.color = "red";
+                const style = getComputedStyle(detached);
+                const empty = [style.length, style.color, style.getPropertyValue("color"), style.display];
+                document.body.appendChild(detached);
+                const live = style.color !== "";
+                const host = document.createElement("div");
+                const shadow = host.attachShadow({ mode: "open" });
+                shadow.innerHTML = "<p id='in'></p>";
+                const inDetachedShadow = getComputedStyle(shadow.getElementById("in")).display;
+                return [empty, live, inDetachedShadow, typeof getComputedStyle(document.getElementById("c")).color];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[0, "", "", ""], true, "", "string"])
         );
     }
 
@@ -8641,6 +9479,130 @@ mod tests {
     }
 
     #[test]
+    fn iframe_brand_does_not_match_other_elements() {
+        // style-loader resolves its insert target with
+        // `found instanceof HTMLIFrameElement ? found.contentDocument.head : found`;
+        // with the interface aliased to Element, <head> took the iframe branch.
+        let mut rt = setup_runtime(
+            r#"<html><head></head><body><iframe id="frame"></iframe><div id="plain"></div></body></html>"#,
+        );
+        let result = rt.evaluate(r#"
+            const frame = document.getElementById('frame');
+            const created = document.createElement('iframe');
+            const nodes = [document.head, document.documentElement, document.body,
+                document.getElementById('plain'), document.createElement('div'),
+                document.createElementNS('urn:test', 'IFRAME')];
+            return [frame instanceof HTMLIFrameElement, created instanceof HTMLIFrameElement,
+                frame.cloneNode() instanceof HTMLIFrameElement,
+                frame instanceof HTMLElement && frame instanceof Element,
+                nodes.map(node => node instanceof HTMLIFrameElement)];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            true, true, true, true,
+            [false, false, false, false, false, false]
+        ]));
+    }
+
+    #[test]
+    fn list_element_brands_survive_parsing_creation_and_cloning() {
+        let mut rt = setup_runtime("<html><body><ol><li>item</li></ol></body></html>");
+        let result = rt.evaluate(r#"
+            return [['ol', HTMLOListElement], ['li', HTMLLIElement]].map(([tag, C]) => {
+                const parsed = document.querySelector(tag);
+                const created = document.createElement(tag);
+                const nodes = [parsed, created, parsed.cloneNode(true), created.cloneNode(),
+                    document.importNode(parsed, true)];
+                return [nodes.map(node => node instanceof C && node instanceof HTMLElement
+                    && node.constructor === C), Object.prototype.toString.call(created),
+                    [document.createElement('div'), document.createElement('ul'),
+                        document.createElementNS('urn:test', tag),
+                        document.createElementNS('urn:test', tag.toUpperCase()).cloneNode(),
+                        document.createElementNS('http://www.w3.org/2000/svg', tag)]
+                        .map(node => node instanceof C)];
+            });
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[true, true, true, true, true], "[object HTMLOListElement]",
+                [false, false, false, false, false]],
+            [[true, true, true, true, true], "[object HTMLLIElement]",
+                [false, false, false, false, false]]
+        ]));
+    }
+
+    #[test]
+    fn list_element_properties_reflect_boolean_and_string_attributes() {
+        let mut rt = setup_runtime(
+            "<html><body><ol reversed start='-2' type='A'><li value='-4'>item</li></ol></body></html>",
+        );
+        let result = rt.evaluate(r#"
+            const parsed = document.querySelector('ol');
+            const list = document.createElement('ol');
+            const initial = [parsed.reversed, parsed.start, parsed.type,
+                document.querySelector('li').value, list.reversed, list.start, list.type];
+            const states = [];
+            list.reversed = true;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.reversed = false;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.setAttribute('reversed', 'false');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.removeAttribute('reversed');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.type = 'i';
+            const written = [list.type, list.getAttribute('type')];
+            list.setAttribute('type', 'invalid');
+            const changed = list.type;
+            list.removeAttribute('type');
+            const removed = list.type;
+            list.type = null;
+            return [initial, states, written, changed, removed, list.getAttribute('type'),
+                'reversed' in document.createElement('div'),
+                'start' in document.createElement('li'),
+                ['reversed', 'start', 'type'].every(name =>
+                    Object.getOwnPropertyDescriptor(HTMLOListElement.prototype, name)?.enumerable),
+                Object.getOwnPropertyDescriptor(HTMLLIElement.prototype, 'value')?.enumerable];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [true, -2, "A", -4, false, 1, ""],
+            [[true, ""], [false, null], [true, "false"], [false, null]],
+            ["i", "i"], "invalid", "", "null", false, false,
+            true, true
+        ]));
+    }
+
+    #[test]
+    fn list_element_integer_reflection_defaults_parses_and_wraps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const list = document.createElement('ol');
+            const item = document.createElement('li');
+            const attributes = [null, '', 'invalid', '  +12tail', '-3.8',
+                '2147483648', '-2147483649', '99999999999999999999', '0x10'].map(value => {
+                if (value === null) { list.removeAttribute('start'); item.removeAttribute('value'); }
+                else { list.setAttribute('start', value); item.setAttribute('value', value); }
+                return [list.start, item.value];
+            });
+            const setters = [4294967297, 2147483648, -2147483649, NaN, Infinity,
+                -0, 3.8, null].map(value => {
+                list.start = value;
+                item.value = value;
+                return [list.start, list.getAttribute('start'), item.value, item.getAttribute('value')];
+            });
+            const bigints = [[list, 'start'], [item, 'value'], [list, 'tabIndex']].map(([node, key]) => {
+                try { node[key] = 1n; return 'accepted'; } catch (error) { return error.name; }
+            });
+            return [attributes, setters, bigints];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[1, 0], [1, 0], [1, 0], [12, 12], [-3, -3], [1, 0], [1, 0], [1, 0], [0, 0]],
+            [[1, "1", 1, "1"], [-2147483648i64, "-2147483648", -2147483648i64, "-2147483648"],
+                [2147483647, "2147483647", 2147483647, "2147483647"], [0, "0", 0, "0"],
+                [0, "0", 0, "0"], [0, "0", 0, "0"], [3, "3", 3, "3"], [0, "0", 0, "0"]],
+            ["TypeError", "TypeError", "TypeError"]
+        ]));
+    }
+
+    #[test]
     fn meta_http_equiv_reflection_supports_snapshot_csp_filtering() {
         let mut rt = setup_runtime(
             r#"<html><head><meta id="plain" charset="utf-8">
@@ -8911,6 +9873,101 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             ["100px", "30px", "rgb(78, 90, 12)"],
             ["100px", "30px", "rgb(78, 90, 12)"]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_animation_only_reads_reuse_the_prepared_frame() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            @keyframes move { to { transform:translateX(20px) } }
+            #box { width:20px; height:20px; color:blue; animation:move 1s linear infinite }
+        </style><div id=box></div>"#);
+        rt.set_viewport(100.0, 100.0);
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(0.0)));
+        assert_eq!(rt.evaluate("document.getElementById('box').getBoundingClientRect().width").unwrap(),
+            serde_json::json!(20.0));
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(500);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const style = getComputedStyle(document.getElementById('box'));
+            return [style.display, style.color];
+        })()"#).unwrap(), serde_json::json!(["block", "rgb(0, 0, 255)"]));
+        let state = rt.state.borrow();
+        assert!(state.style_query_cache.is_none(),
+            "animation-only reads must not duplicate an existing retained style graph");
+        assert_eq!(state.prepared_render.as_ref().unwrap().animation_sample(), state.animation_sample);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_sibling_reads_do_not_repeat_the_ancestor_cascade() {
+        let variables = (0..2500).map(|i| format!("--token-{i}:{i}px;"))
+            .collect::<String>();
+        let mut rt = setup_runtime(&format!(r#"<!doctype html><style>
+            body {{ {variables} color:rgb(12,34,56) }}
+            .row {{ display:block; width:var(--token-80); height:1px }}
+            body[data-active=yes] {{ color:rgb(78,90,12) }}
+        </style><body><main><section>{}</section></main></body>"#,
+            "<div class=row></div>".repeat(1024)));
+        // Prime the compiled stylesheet, then leave layout damage pending.
+        rt.evaluate("document.body.getBoundingClientRect().width").unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(rt.evaluate(r#"(() => {
+            let matched = 0;
+            for (const row of document.querySelectorAll('.row')) {
+                const style = getComputedStyle(row);
+                matched += style.display === 'block' && style.color === 'rgb(12, 34, 56)';
+            }
+            return matched;
+        })()"#).unwrap(), serde_json::json!(1024.0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1),
+            "style-only reads serialized the full CSS variable environment: {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.body.setAttribute('data-active', 'yes');
+            let matched = 0;
+            for (const row of document.querySelectorAll('.row')) {
+                const style = getComputedStyle(row);
+                matched += style.display === 'block' && style.color === 'rgb(78, 90, 12)';
+            }
+            return matched;
+        })()"#).unwrap(), serde_json::json!(1024.0));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1),
+            "sibling style reads repeated their large inherited cascade: {:?}", started.elapsed());
+        assert!(!rt.state.borrow().pending_style_mutations.is_empty());
+        assert_eq!(rt.evaluate("getComputedStyle(document.querySelector('.row')).width").unwrap(),
+            serde_json::json!("80px"));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const style = getComputedStyle(document.querySelector('.row'));
+            return [style.getPropertyValue('--token-80'), style.length > 2500];
+        })()"#).unwrap(), serde_json::json!(["80px", true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_geometric_style_cache_observes_mutations_between_sibling_reads() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            body { --tone:blue; color:var(--tone) }
+            body[data-active=yes] { --tone:red }
+            section { display:flex }
+            .row { display:inline }
+        </style><body><section><span class=row id=first></span>
+            <span class=row id=second></span></section></body>"#);
+        rt.evaluate("document.body.getBoundingClientRect().width").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const first = document.getElementById('first');
+            const second = document.getElementById('second');
+            document.body.setAttribute('data-active', 'yes');
+            const before = getComputedStyle(second).color;
+            document.body.removeAttribute('data-active');
+            const after = getComputedStyle(first).color;
+            document.querySelector('section').style.display = 'block';
+            const display = getComputedStyle(second).display;
+            document.querySelector('style').sheet.insertRule('.row { color:green }', 0);
+            return [before, after, display, getComputedStyle(first).color];
+        })()"#).unwrap(), serde_json::json!([
+            "rgb(255, 0, 0)", "rgb(0, 0, 255)", "inline", "rgb(0, 128, 0)"
         ]));
     }
 
@@ -12690,6 +13747,34 @@ mod tests {
                 .as_f64(),
             Some(60.0)
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn same_parent_moves_keep_geometry_and_observer_records_consistent() {
+        let mut rt = setup_runtime(
+            "<style>body{margin:0}#parent{display:flex}.item{flex:0 0 40px;height:20px}</style>\
+             <div id=parent><div id=a class=item></div><div id=b class=item></div></div>",
+        );
+        rt.evaluate("document.getElementById('b').getBoundingClientRect().x").unwrap();
+        assert!(rt.state.borrow().prepared_render.is_some());
+        let records = rt.evaluate(
+            "(function(){ const parent=document.getElementById('parent'), b=document.getElementById('b'); \
+             globalThis.moveObserver=new MutationObserver(()=>{}); moveObserver.observe(parent,{childList:true}); \
+             parent.appendChild(b); return moveObserver.takeRecords().map(record=>[record.type, \
+               record.removedNodes[0]?.id || null, record.addedNodes[0]?.id || null]); })()"
+        ).unwrap();
+        assert_eq!(records, serde_json::json!([
+            ["childList", "b", null], ["childList", null, "b"],
+        ]));
+        assert!(rt.state.borrow().prepared_render.is_some(), "a last-child move must retain geometry");
+        let moved = rt.evaluate(
+            "(function(){ const parent=document.getElementById('parent'), a=document.getElementById('a'), \
+             b=document.getElementById('b'); parent.appendChild(a); const records=moveObserver.takeRecords(); \
+             moveObserver.disconnect(); return [a.getBoundingClientRect().x, b.getBoundingClientRect().x, \
+               records.length, records[0].removedNodes[0]===a, records[1].addedNodes[0]===a]; })()"
+        ).unwrap();
+        assert_eq!(moved, serde_json::json!([40, 0, 2, true, true]));
     }
 
     #[cfg(feature = "render")]
@@ -18590,10 +19675,70 @@ mod tests {
         assert_eq!(result.value.unwrap().as_str().unwrap(), "async-ok");
     }
 
-    // This test used to assert that a rejection came back as `Err`. It does
-    // not any more, and the old expectation was the defect: CDP answers the
-    // command and reports the rejected value through `exceptionDetails`, so
-    // failing the command loses the page error rather than delivering it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn releasing_remote_objects_keeps_inflight_evaluations_alive() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let first = rt.start_cdp_evaluation(
+            "new Promise(resolve=>{globalThis.finishFirst=resolve})", true, true,
+        ).unwrap();
+        let second = rt.start_cdp_call(
+            "()=>new Promise(resolve=>setTimeout(()=>{finishFirst(42);resolve({answer:7})},1))",
+            None, &[], false, true,
+        ).unwrap();
+        let CdpEvaluation::Pending(first) = first else { panic!("expected pending evaluation"); };
+        let CdpEvaluation::Pending(second) = second else { panic!("expected pending evaluation"); };
+        rt.release_object_group();
+        assert!(rt.resolve_promises_until(|rt| rt.cdp_evaluation_ready(&first) && rt.cdp_evaluation_ready(&second), 100).await,
+            "releasing client object handles must not discard an inflight evaluation");
+        let result = rt.finish_cdp_evaluation(second, false).unwrap();
+        let answer = rt.call_function_on_for_cdp("function(){return this.answer}", result.object_id.as_deref(), &[], true, false).await.unwrap();
+        assert_eq!(answer.value.as_ref().and_then(serde_json::Value::as_f64), Some(7.0));
+        rt.release_object_group();
+        let result = rt.finish_cdp_evaluation(first, true).unwrap();
+        assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+        assert!(rt.pending_cdp_evaluations.is_empty(), "completed commands must release their native roots");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_timed_out_rejection_cannot_poison_a_later_success() {
+        for call_function in [false, true] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            assert!(rt.evaluate_for_cdp_with_timeout(
+                "new Promise((resolve,reject)=>{globalThis.rejectOld=reject})", true, true, 10,
+            ).await.is_err());
+            assert!(rt.pending_cdp_evaluations.is_empty(), "timed-out commands must release their native roots");
+            rt.release_object_group();
+            let body = "Promise.resolve().then(()=>queueMicrotask(()=>rejectOld(new Error('old-rejection'))));return 42;";
+            let result = if call_function {
+                rt.call_function_on_for_cdp(&format!("function(){{{body}}}"), None, &[], true, true).await
+            } else {
+                rt.evaluate_for_cdp(&format!("(function(){{{body}}})()"), true, true).await
+            }.unwrap();
+            assert!(!result.thrown, "an older rejected callback contaminated this call: {}", result.description);
+            assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_timed_out_success_cannot_hide_a_later_rejection() {
+        for call_function in [false, true] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            assert!(rt.evaluate_for_cdp_with_timeout(
+                "new Promise(resolve=>{globalThis.resolveOld=resolve})", true, true, 10,
+            ).await.is_err());
+            rt.release_object_group();
+            let body = "Promise.resolve().then(()=>queueMicrotask(()=>resolveOld(99)));return Promise.reject(new Error('current-failure'));";
+            let result = if call_function {
+                rt.call_function_on_for_cdp(&format!("function(){{{body}}}"), None, &[], true, true).await
+            } else {
+                rt.evaluate_for_cdp(&format!("(function(){{{body}}})()"), true, true).await
+            }.unwrap();
+            assert!(result.thrown, "an older resolved callback hid this call's rejection: {:?}", result.value);
+            assert!(result.description.contains("current-failure"), "{}", result.description);
+        }
+    }
+
+    // CDP answers the command and reports rejections through exceptionDetails.
     #[tokio::test(flavor = "current_thread")]
     async fn test_evaluate_for_cdp_reports_promise_rejection() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -18763,9 +19908,7 @@ mod tests {
     
     #[tokio::test(flavor = "current_thread")]
     async fn a_rejection_does_not_leak_into_the_next_call() {
-        // `__obscura_await_rejected` is a global, so the success branch has to
-        // clear it. Without that the first rejection would mark every later
-        // call on the same runtime as thrown.
+        // Completed calls must not carry rejection state into either API entrypoint.
         let mut rt = setup_runtime("<html><body></body></html>");
         let rejected = rt
             .call_function_on_for_cdp(
@@ -19060,6 +20203,103 @@ mod tests {
                 true, true, true, "source", "changed", 1
             ])
         );
+    }
+
+    #[test]
+    fn document_clones_preserve_metadata_and_native_control_state() {
+        let mut rt = setup_runtime("<!doctype html><!--before--><html lang=en><head><base href='http://example.com/articles/'><title>Article</title></head><body><input id=field value=initial><template id=t><p>Template</p></template><p id=copy>Original</p></body></html><!--after-->");
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.getElementById('field').value='edited';
+            const shallow=document.cloneNode(false), clone=document.cloneNode(true);
+            if (!shallow || !clone) return 'missing document clone';
+            clone.getElementById('copy').textContent='Changed';
+            return [clone instanceof Document, clone.nodeType, clone.ownerDocument, clone.defaultView,
+                clone.URL, clone.documentURI, clone.baseURI, clone.contentType, clone.compatMode,
+                clone.characterSet, shallow.childNodes.length, shallow.URL, shallow.compatMode,
+                Array.from(clone.childNodes,n=>n.nodeType), clone.doctype.name,
+                clone.documentElement.ownerDocument===clone, clone.body.ownerDocument===clone,
+                clone.getElementById('field').value, clone.getElementById('field').getAttribute('value'),
+                clone.getElementById('t').content.textContent, document.getElementById('copy').textContent];
+        })()"#).unwrap(), serde_json::json!([true,9,null,null,"http://example.com/test","http://example.com/test","http://example.com/articles/","text/html","CSS1Compat","UTF-8",0,"http://example.com/test","CSS1Compat",[10,8,1,8],"html",true,true,"edited","initial","Template","Original"]));
+    }
+
+    #[test]
+    fn document_clones_preserve_xml_interfaces_namespaces_and_quirks_mode() {
+        let mut rt = setup_runtime("<p>Quirks</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const source=document.implementation.createDocument('urn:article','p:article',null);
+            source.documentElement.setAttributeNS('urn:meta','m:kind','article');
+            const clone=source.cloneNode(true), quirks=document.cloneNode(false);
+            if (!clone || !quirks) return 'missing document clone';
+            return [clone instanceof XMLDocument, clone.contentType, clone.documentElement.nodeName,
+                clone.documentElement.namespaceURI, clone.documentElement.getAttributeNS('urn:meta','kind'),
+                clone.documentElement.ownerDocument===clone, clone.defaultView, quirks.compatMode];
+        })()"#).unwrap(), serde_json::json!([true,"application/xml","p:article","urn:article","article",true,null,"BackCompat"]));
+    }
+
+    #[test]
+    fn attribute_clones_are_independent_nodes_with_the_original_namespace_and_owner() {
+        let mut rt = setup_runtime("<div id=source data-value=old></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const source=document.getElementById('source');
+            source.setAttributeNS('urn:meta','m:kind','article');
+            const attr=source.attributes.getNamedItem('m:kind');
+            if (typeof attr.cloneNode!=='function') return 'missing attribute clone';
+            const clone=attr.cloneNode(true);
+            clone.value='copy';
+            const foreign=document.implementation.createHTMLDocument('Foreign');
+            const detached=foreign.createAttributeNS('urn:meta','m:kind');
+            detached.value='detached';
+            const detachedClone=detached.cloneNode(false);
+            return [attr instanceof Attr, attr instanceof Node, Object.prototype.toString.call(attr),
+                clone.nodeType, clone.name, clone.localName, clone.namespaceURI, clone.prefix,
+                clone.ownerElement, clone.ownerDocument===document, clone.parentNode,
+                clone.childNodes.length, clone.getRootNode()===clone, clone.isConnected,
+                clone.value, clone.nodeValue, clone.textContent, source.getAttributeNS('urn:meta','kind'),
+                clone!==attr, !clone.isSameNode(attr), !clone.isEqualNode(attr),
+                detachedClone.ownerDocument===foreign, detachedClone.value, detachedClone.namespaceURI];
+        })()"#).unwrap(), serde_json::json!([true,true,"[object Attr]",2,"m:kind","kind","urn:meta","m",null,true,null,0,true,false,"copy","copy","copy","article",true,true,true,true,"detached","urn:meta"]));
+    }
+
+    #[test]
+    fn parsed_document_clones_keep_the_url_and_do_not_reparse_or_run_scripts() {
+        let mut rt = setup_runtime("<!doctype html><title>Live</title><p>Live body</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const parsed=new DOMParser().parseFromString('<title>Inert</title><script>window.executed=true</script><input id=field value=initial>','text/html');
+            parsed.getElementById('field').value='edited';
+            const clone=parsed.cloneNode(true), shallow=parsed.cloneNode(false);
+            return [parsed.URL, clone.URL, clone instanceof Document, clone.defaultView,
+                clone.getElementById('field').value, clone.getElementById('field').getAttribute('value'),
+                clone.getElementById('field').ownerDocument===clone, shallow.childNodes.length,
+                document.title, typeof window.executed];
+        })()"#).unwrap(), serde_json::json!(["http://example.com/test","http://example.com/test",true,null,"edited","initial",true,0,"Live","undefined"]));
+    }
+
+    #[test]
+    fn attribute_node_positions_do_not_alias_missing_arena_ids() {
+        let mut rt = setup_runtime("<div id=x a=1 b=2></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const el=document.getElementById('x'), a=el.attributes[1], b=el.attributes[2];
+            const clone=a.cloneNode(), forward=clone.compareDocumentPosition(a), reverse=a.compareDocumentPosition(clone);
+            return [a.compareDocumentPosition(el),el.compareDocumentPosition(a),
+                a.compareDocumentPosition(b),b.compareDocumentPosition(a),
+                (forward & 33)===33,(reverse & 33)===33,
+                (forward & 6)===(reverse & 4 ? 2 : 4),clone.compareDocumentPosition(clone)];
+        })()"#).unwrap(), serde_json::json!([10,20,36,34,true,true,true,0]));
+    }
+
+    #[test]
+    fn inert_html_parsing_preserves_document_root_attributes_and_structure() {
+        let mut rt = setup_runtime("<title>Live page</title><p>Live content</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const parsed=new DOMParser().parseFromString('<!doctype html><!--before--><html lang=fr dir=rtl data-root=article><head><title>Parsed</title></head><body><template id=t><p>Template</p></template><script>window.executed=true</script><noscript><img src=fallback.jpg></noscript><p id=content>Article</p></body></html><!--after-->','text/html');
+            return [parsed instanceof Document, parsed.URL, parsed.documentElement.lang,
+                parsed.documentElement.dir, parsed.documentElement.getAttribute('data-root'),
+                Array.from(parsed.childNodes,n=>n.nodeType), parsed.doctype?.name,
+                parsed.body.ownerDocument===parsed, parsed.getElementById('t').content.textContent,
+                parsed.title, parsed.compatMode, parsed.defaultView, document.title, typeof window.executed,
+                parsed.querySelector('noscript img')?.getAttribute('src')];
+        })()"#).unwrap(), serde_json::json!([true,"http://example.com/test","fr","rtl","article",[10,8,1,8],"html",true,"Template","Parsed","CSS1Compat",null,"Live page","undefined","fallback.jpg"]));
     }
 
     #[test]
@@ -21823,8 +23063,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_origin_follows_the_final_redirect_url() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
-        let result = rt
-            .call_function_on_for_cdp(
+        let evaluation = rt
+            .start_cdp_call(
                 r#"async () => {
                     const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     try {
@@ -21853,8 +23093,20 @@ mod tests {
                 true,
                 true,
             )
-            .await
             .unwrap();
+
+        // The embedder owns frame creation and fires the element's load after it.
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let frame = rt.take_pending_frames().remove(0);
+        let realm = crate::frame::FrameRealm::new(
+            &mut rt, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html,
+        ).unwrap();
+        realm.dispatch_load_events(&mut rt).unwrap();
+        rt.execute_script("frame-load", &format!(
+            "globalThis.__obscura_frameElements[{}].dispatchEvent(new Event('load'));", frame.frame_id,
+        )).unwrap();
+        let result = rt.await_cdp_evaluation(evaluation, true, 1_000, "Runtime.callFunctionOn")
+            .await.unwrap();
 
         assert_eq!(
             result.value.unwrap(),
@@ -22352,6 +23604,95 @@ mod tests {
     }
 
     #[test]
+    fn web_storage_preserves_undefined_values_and_rejects_symbol_arguments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"[localStorage, sessionStorage].map(store => {
+            store.setItem('undefined', undefined);
+            const errors = [() => store.setItem(Symbol('key'), 'value'),
+                () => store.setItem('symbol', Symbol('value')),
+                () => store.getItem(Symbol('key')), () => store.removeItem(Symbol('key'))]
+                .map(call => { try { call(); return null; } catch (error) { return error.name; } });
+            return [store.getItem('undefined'), ...errors];
+        })"#).unwrap(), serde_json::json!([
+            ["undefined", "TypeError", "TypeError", "TypeError", "TypeError"],
+            ["undefined", "TypeError", "TypeError", "TypeError", "TypeError"]
+        ]));
+    }
+
+    #[test]
+    fn web_storage_preserves_unpaired_utf16_and_transport_prefixes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"[localStorage, sessionStorage].map(store => {
+            store.setItem('\ud800', '\udfff');
+            store.setItem('\0"ordinary"', '\0"literal"');
+            return [store.key(0).charCodeAt(0), store.getItem('\ud800').charCodeAt(0),
+                Object.keys(store).map(key => key.charCodeAt(0)), store.getItem('\0"ordinary"')];
+        })"#).unwrap(), serde_json::json!([
+            [55296, 57343, [55296, 0], "\0\"literal\""],
+            [55296, 57343, [55296, 0], "\0\"literal\""]
+        ]));
+    }
+
+    #[test]
+    fn web_storage_initial_frame_inherits_the_parent_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            localStorage.setItem('local', 'shared');
+            sessionStorage.setItem('session', 'same-tab');
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            return [frame.contentWindow.localStorage.getItem('local'),
+                frame.contentWindow.sessionStorage.getItem('session')];
+        })()"#).unwrap(), serde_json::json!(["shared", "same-tab"]));
+    }
+
+    #[test]
+    fn web_storage_file_documents_share_the_file_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("file:///tmp/first.html");
+        rt.evaluate("localStorage.setItem('token', 'file-value')").unwrap();
+        rt.set_url("file:///tmp/second.html");
+        assert_eq!(rt.evaluate("localStorage.getItem('token')").unwrap(), serde_json::json!("file-value"));
+    }
+
+    #[test]
+    fn web_storage_access_tracks_url_and_inherited_origin_changes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let read = "[localStorage.getItem('token'), sessionStorage.getItem('token')]";
+        let denied = r#"['localStorage', 'sessionStorage'].map(name => {
+            try { globalThis[name]; return 'allowed'; }
+            catch (error) { return error.name; }
+        })"#;
+        rt.set_url("https://a.test/page");
+        rt.evaluate("[localStorage, sessionStorage].forEach(store => store.setItem('token', 'a'))").unwrap();
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.set_url("https://b.test/page");
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!([null, null]));
+        rt.evaluate("[localStorage, sessionStorage].forEach(store => store.setItem('token', 'b'))").unwrap();
+        rt.set_url("https://a.test/other#fragment");
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(denied).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+        rt.set_url("about:blank");
+        rt.state.borrow_mut().inherited_origin = Some("https://a.test".into());
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["a", "a"]));
+        rt.state.borrow_mut().inherited_origin = Some("https://b.test".into());
+        assert_eq!(rt.evaluate(read).unwrap(), serde_json::json!(["b", "b"]));
+        rt.state.borrow_mut().inherited_origin = None;
+        assert_eq!(rt.evaluate(denied).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+    }
+
+    #[test]
+    fn web_storage_getters_reject_opaque_origins() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(r#"['localStorage', 'sessionStorage'].map(name => {
+            try { return globalThis[name].getItem('token'); }
+            catch (error) { return error.name; }
+        })"#).unwrap(), serde_json::json!(["SecurityError", "SecurityError"]));
+    }
+
+    #[test]
     fn test_storage_event_constructor_and_legacy_factory() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
@@ -22740,6 +24081,64 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{}", address), requests_rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_module_transport_records_one_failure_without_a_response_body() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).unwrap();
+            // Close before sending headers, rather than returning an HTTP error.
+        });
+        let url = format!("http://{address}/entry.js");
+        let client = obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        );
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("http://{address}/"));
+        rt.set_http_client(std::sync::Arc::new(client));
+        let error = rt.load_module(&url, 1_000).await.unwrap_err();
+        assert!(error.contains("Failed to fetch module"), "{error}");
+        server.join().unwrap();
+
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1, "failed module request must remain observable");
+        let event = &events[0];
+        assert_eq!(event.url, url);
+        assert_eq!(event.resource_type, "Script");
+        assert_eq!(event.status, 0);
+        assert_eq!(event.error_text.as_deref(), Some("net::ERR_FAILED"));
+        assert!(rt.get_network_response_body(&event.request_id).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_module_transport_records_one_failure() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let url = format!("http://{address}/entry.js");
+        let client = obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        );
+        let mut rt = ObscuraJsRuntime::with_base_url(&format!("http://{address}/"));
+        rt.set_http_client(std::sync::Arc::new(client));
+        let error = rt.load_module(&url, 100).await.unwrap_err();
+        server.abort();
+        assert!(error.contains("timed out"), "{error}");
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1, "timed-out graph must not disappear from Network");
+        assert_eq!(events[0].url, url);
+        assert_eq!(events[0].error_text.as_deref(), Some("net::ERR_FAILED"));
+        assert!(rt.get_network_response_body(&events[0].request_id).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

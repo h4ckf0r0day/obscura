@@ -70,6 +70,10 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --worker-max-connections <N>  Recycle a worker after N CDP connections (--workers > 1)
+    --worker-max-rss <MB>    Recycle a worker above this resident size (Linux)
+    --worker-max-age <SECS>  Recycle a worker after this long
+    --worker-drain-timeout <SECS>  Let a replaced worker finish live connections (default 120)
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
@@ -112,6 +116,7 @@ Run obscura as an MCP server.
 
 ```
     --http                   HTTP transport instead of stdio
+    --font-dir <DIR>         Load additional fonts before rendering (repeatable; render build)
     --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
@@ -155,3 +160,25 @@ without a `result` object.
 
 The status field is additive. Navigation timing and the other worker commands
 are unchanged.
+
+## Worker navigation readiness
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and writes
+one response per command to stdout. Select a readiness mode per navigation:
+
+```json
+{"cmd":"navigate","url":"https://example.com","waitUntil":"domcontentloaded"}
+```
+
+`waitUntil` accepts `load`, `domcontentloaded`, `networkidle0`, or `networkidle2`.
+Omitting it preserves the existing `load` default. The option applies only to
+that request. Invalid values return an `ok: false` response without navigating;
+the worker remains available for subsequent commands.
+
+These modes use the existing `Page::navigate_with_wait` behavior. Parser scripts
+run in every mode. Network-idle modes additionally drive the event loop until
+active requests remain at or below zero or two, respectively, for 500 ms, with
+the engine's existing five-second idle deadline. `domcontentloaded` uses the
+engine's DOM readiness boundary; it does not change script execution or resource
+warmup semantics. Successful responses retain their existing `title`, `url`, and `status`
+fields.

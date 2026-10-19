@@ -1,4 +1,13 @@
 {
+  "inline-block-block-children": [
+    {"name": "first block keeps its authored width", "color": "#d02020", "x": 12, "y": 12, "width": 80, "height": 20},
+    {"name": "second block stacks without formatting whitespace", "color": "#2050d0", "x": 12, "y": 32, "width": 120, "height": 30},
+    {"name": "inline-block starts the next outer line", "color": "#087f5b", "x": 12, "y": 86, "width": 80, "height": 20},
+    {"name": "sibling block margins collapse within the flow root", "color": "#7048e8", "x": 12, "y": 121, "width": 120, "height": 30}
+  ],
+  "emulated-color-scheme": [
+    {"name": "default light preference keeps the green block", "color": "#00aa00", "x": 0, "y": 0, "width": 240, "height": 100}
+  ],
   "retained-cssom-raster": [
     {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
     {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},
