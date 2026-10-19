@@ -1,4 +1,7 @@
 {
+  "xml-data-consumer": [
+    {"name": "XML metadata and Atom content load", "color": "#087f5b", "x": 0, "y": 0, "width": 320, "height": 40}
+  ],
   "inline-block-block-children": [
     {"name": "first block keeps its authored width", "color": "#d02020", "x": 12, "y": 12, "width": 80, "height": 20},
     {"name": "second block stacks without formatting whitespace", "color": "#2050d0", "x": 12, "y": 32, "width": 120, "height": 30},
