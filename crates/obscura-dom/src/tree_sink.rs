@@ -362,6 +362,17 @@ pub fn parse_html(html: &str) -> DomTree {
         .one(html.as_bytes())
 }
 
+/// Parse an iframe srcdoc with its standards-mode and scripting rules.
+pub fn parse_srcdoc(html: &str, scripting_enabled: bool) -> DomTree {
+    use html5ever::tendril::TendrilSink;
+    let tree = DomTree::new();
+    tree.set_allow_declarative_shadow_roots(true);
+    let mut opts = html5ever::ParseOpts::default();
+    opts.tree_builder.iframe_srcdoc = true;
+    opts.tree_builder.scripting_enabled = scripting_enabled;
+    html5ever::parse_document(tree, opts).from_utf8().one(html.as_bytes())
+}
+
 pub fn parse_fragment(html: &str) -> DomTree {
     let context_name = QualName::new(None, ns!(html), local_name!("body"));
     parse_fragment_with_context(html, context_name)

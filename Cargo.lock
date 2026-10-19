@@ -60,6 +60,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-kw"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69fa2b352dcefb5f7f3a5fb840e02665d311d878955380515e4fd50095dd3d8c"
+dependencies = [
+ "aes",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1992,6 +2001,7 @@ dependencies = [
  "obscura-dom",
  "obscura-js",
  "obscura-net",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -2031,7 +2041,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "image",
+ "libc",
  "obscura-browser",
  "obscura-cdp",
  "obscura-dom",
@@ -2041,6 +2053,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -2066,6 +2079,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "aes-kw",
  "anyhow",
  "base64",
  "cbc",
@@ -2842,9 +2856,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",

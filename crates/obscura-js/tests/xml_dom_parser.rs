@@ -403,3 +403,24 @@ fn xml_dom_parser_serialization_matches_xml_control_whitespace_normalization() {
     })()"#).unwrap();
     assert_eq!(result, json!(["\t\n\r", "\r", "\t\n\r", "\n", null]));
 }
+
+#[test]
+fn xml_factory_mime_and_clone_keep_undeclared_attribute_namespaces() {
+    let mut rt = runtime();
+    assert_eq!(rt.evaluate(r#"(() => {
+        const svg = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg', null);
+        const xhtml = document.implementation.createDocument('http://www.w3.org/1999/xhtml', 'html', null);
+        const source = document.implementation.createDocument('urn:article', 'p:Root', null);
+        source.documentElement.setAttributeNS('urn:meta', 'm:kind', 'article');
+        source.documentElement.appendChild(source.createCDATASection('content'));
+        const clone = source.cloneNode(true), shallow = svg.cloneNode(false);
+        clone.documentElement.setAttributeNS('urn:meta', 'm:kind', 'copy');
+        return [svg.contentType, xhtml.contentType, clone.documentElement.nodeName,
+            clone.documentElement.getAttributeNS('urn:meta', 'kind'),
+            source.documentElement.getAttributeNS('urn:meta', 'kind'),
+            clone.documentElement.ownerDocument === clone,
+            clone.documentElement.firstChild.nodeType,
+            clone.documentElement.firstChild.ownerDocument === clone,
+            shallow instanceof XMLDocument, shallow.contentType, shallow.childNodes.length, shallow.defaultView];
+    })()"#).unwrap(), json!(["image/svg+xml", "application/xhtml+xml", "p:Root", "copy", "article", true, 4, true, true, "image/svg+xml", 0, null]));
+}

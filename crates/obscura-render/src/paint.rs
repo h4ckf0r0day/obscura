@@ -162,6 +162,8 @@ struct CachedRasterPaint {
 /// Successful bytes use `Arc` so consumers never clone an image/font body.
 pub struct RenderResourceCache {
     entries: HashMap<String, CachedResource>,
+    // Cancellation belongs to the document, not the retryable byte cache.
+    stopped: HashSet<String>,
     order: VecDeque<String>,
     retained_bytes: usize,
     raster_paints: VecDeque<CachedRasterPaint>,
@@ -209,6 +211,7 @@ impl RenderResourceCache {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            stopped: HashSet::new(),
             order: VecDeque::new(),
             retained_bytes: 0,
             raster_paints: VecDeque::new(),
@@ -285,7 +288,9 @@ impl RenderResourceCache {
     }
 
     pub fn has_live_outcome(&self, url: &str) -> bool {
-        match self.entries.get(&network_resource_url(url)) {
+        let key = network_resource_url(url);
+        if self.stopped.contains(&key) { return true; }
+        match self.entries.get(&key) {
             Some(CachedResource::Bytes { .. }) => true,
             Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
             None => false,
@@ -336,8 +341,20 @@ impl RenderResourceCache {
     /// Seed already-shared bytes without copying a complete response body.
     pub fn seed_shared(&mut self, url: String, bytes: Arc<[u8]>) {
         let url = network_resource_url(&url);
+        self.stopped.remove(&url);
         self.remove(&url);
         self.insert_bytes(url, bytes);
+    }
+
+    /// Keep a canceled request stopped until this document's cache is replaced.
+    pub fn stop_resource(&mut self, url: &str, profile: Option<ImageRequestProfile>) {
+        let key = match profile {
+            Some(profile) => image_resource_key(url, profile),
+            None => network_resource_url(url),
+        };
+        if self.has_cached_bytes(&key) { return; }
+        self.remove(&key);
+        self.stopped.insert(key);
     }
 
     /// Retain a page-transport failure so capture does not immediately repeat
@@ -385,7 +402,9 @@ impl RenderResourceCache {
                     .map(|(width, height)| (resolved_url, width, height)),
             );
         }
-        match self.entries.get(&network_resource_url(&resolved_url)) {
+        let key = network_resource_url(&resolved_url);
+        if self.stopped.contains(&key) { return Some(None); }
+        match self.entries.get(&key) {
             Some(entry @ CachedResource::Bytes { .. }) => Some(
                 entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
                     .map(|(width, height)| (resolved_url, width, height)),
@@ -408,6 +427,7 @@ impl RenderResourceCache {
             return self.cached_image_metadata(&resolved_url, None);
         }
         let key = image_resource_key(&resolved_url, profile);
+        if self.stopped.contains(&key) { return Some(None); }
         match self.entries.get(&key) {
             Some(entry @ CachedResource::Bytes { .. }) => Some(
                 entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
@@ -525,6 +545,7 @@ impl RenderResourceCache {
 
     fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
+        if self.stopped.contains(&url) { return None; }
         if let Some(entry) = self.entries.get(&url) {
             match entry {
                 CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
@@ -555,6 +576,7 @@ impl RenderResourceCache {
 
     fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
         let key = image_resource_key(url, profile);
+        if self.stopped.contains(&key) { return None; }
         if let Some(entry) = self.entries.get(&key) {
             match entry {
                 CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
@@ -1683,6 +1705,15 @@ impl PreparedRender {
         None
     }
 
+    /// Read common style-only properties without copying the full CSSOM and
+    /// inherited custom-property environment for each element.
+    pub fn computed_non_geometric_style(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<HashMap<&'static str, String>> {
+        Some(non_geometric_computed_style(self.layout.styles.get(&id)?))
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,
@@ -2264,7 +2295,7 @@ pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMa
     );
     out.insert(
         "visibility",
-        if style.visibility_hidden.unwrap_or(false) {
+        if style.visibility_hidden.unwrap_or(style.computed_visibility_hidden) {
             "hidden"
         } else {
             "visible"
@@ -4925,6 +4956,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 None,
                                 0.0,
+                                0.0,
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -5058,6 +5090,7 @@ fn paint_laid_dom_scrolled(
                     false,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -5097,6 +5130,7 @@ fn paint_laid_dom_scrolled(
                     is_bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -5123,6 +5157,7 @@ fn paint_laid_dom_scrolled(
                     crate::style::used_font_weight(style) >= 600,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     Some(visible_rect),
                     element_clip_mask,
                     raster_scale,
@@ -5303,6 +5338,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
+                                style.word_spacing.unwrap_or(0.0),
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -5337,6 +5373,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
+                                style.word_spacing.unwrap_or(0.0),
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -7288,6 +7325,7 @@ fn paint_text_node(
             is_bold,
             style.font_family.as_deref(),
             style.letter_spacing.unwrap_or(0.0),
+            style.word_spacing.unwrap_or(0.0),
             clip,
             clip_mask.as_ref(),
             raster_scale,
@@ -7373,6 +7411,7 @@ fn draw_text(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
     clip: Option<crate::Rect>,
     clip_mask: Option<&tiny_skia::Mask>,
     raster_scale: f32,
@@ -7479,11 +7518,13 @@ fn draw_text(
             // each word is its own independently-positioned box.
             caret.x += scaled_font.h_advance(id)
                 + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale;
+                + letter_spacing * raster_scale
+                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         } else {
             caret.x += scaled_font.h_advance(id)
                 + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale;
+                + letter_spacing * raster_scale
+                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         }
     }
 }
@@ -12565,7 +12606,10 @@ mod tests {
         for active in ["yes", "no"] {
             tree.with_node_mut(body, |node| node.set_attribute("data-active", active.into()));
             let full = prepare_dom(&tree, viewport, None, &mut resources).unwrap();
-            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child"] {
+            let mut shared = crate::dom::NonGeometricStyleCache::new(
+                &tree, viewport, crate::CssMediaType::Screen, &cache,
+            ).unwrap();
+            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child", "hidden"] {
                 let id = tree.get_element_by_id(name).unwrap();
                 let fast = crate::dom::computed_style_without_layout(
                     &tree, id, viewport, crate::CssMediaType::Screen, &cache, "color",
@@ -12575,7 +12619,17 @@ mod tests {
                     assert_eq!(value, expected[property], "{name}.{property} with {active}");
                 }
             }
-            for name in ["inherit", "hidden", "animated", "query"] {
+            // Reverse the usual traversal, crossing branches and then reading
+            // cached ancestors after their children.
+            for name in ["item", "contents", "flex", "suppressed-child", "suppressed", "float"] {
+                let id = tree.get_element_by_id(name).unwrap();
+                let fast = shared.resolve(&tree, id, "color").unwrap();
+                let expected = full.computed_style(id).unwrap();
+                for (property, value) in fast {
+                    assert_eq!(value, expected[property], "shared {name}.{property} with {active}");
+                }
+            }
+            for name in ["inherit", "animated", "query"] {
                 assert!(crate::dom::computed_style_without_layout(
                     &tree, tree.get_element_by_id(name).unwrap(), viewport,
                     crate::CssMediaType::Screen, &cache, "display",
@@ -13841,6 +13895,43 @@ mod tests {
         let mut encoded = std::io::Cursor::new(Vec::new());
         source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
         Arc::from(encoded.into_inner())
+    }
+
+    #[test]
+    fn stopped_resources_survive_cache_eviction_and_preserve_request_profiles() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut cache = RenderResourceCache::with_loader_and_limits(move |_url: &str| {
+            loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }, 1, 4096);
+        let url = "https://example.test/image.png";
+        cache.stop_resource(url, Some(ImageRequestProfile::CorsInclude));
+        assert!(cache.has_live_image_outcome(url, ImageRequestProfile::CorsInclude));
+        assert!(!cache.has_live_image_outcome(url, ImageRequestProfile::NoCorsInclude));
+        cache.seed_shared(url.to_owned(), raster_cache_fixture());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_some());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::CorsInclude).is_none());
+        cache.stop_resource(url, None);
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_some(),
+            "canceling a duplicate request must preserve already-loaded bytes");
+        cache.seed_shared("https://example.test/other.png".to_owned(), raster_cache_fixture());
+        cache.stop_resource(url, None);
+        assert!(cache.has_live_outcome(url));
+        assert_eq!(cache.cached_image_metadata(url, None), Some(None));
+        assert!(cache.get_or_load(url, true).is_none());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::CorsInclude).is_none());
+        cache.set_sync_loading_enabled(false);
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_none());
+        assert!(cache.take_sync_misses().is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let new_url = "https://example.test/new.png";
+        assert!(cache.get_or_load(new_url, false).is_none());
+        assert_eq!(cache.take_sync_misses(), vec![(new_url.to_owned(), None, false)]);
+        cache.seed_shared(url.to_owned(), raster_cache_fixture());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_some());
+        assert_eq!(cache.retained_entry_count(), 1);
+        assert!(!RenderResourceCache::default().has_live_outcome(url));
     }
 
     #[test]
@@ -16541,6 +16632,25 @@ mod tests {
         assert_eq!(computed["translate"], "7px 0px");
         assert_eq!(computed["rotate"], "30deg");
         assert_eq!(computed["scale"], "2 2");
+    }
+
+    #[test]
+    fn non_replaced_inline_ignores_transform_for_geometry() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <span id="inline" style="transform:translateX(50px)">abc</span>
+              <span id="atomic" style="display:inline-block;transform:translateX(50px)">abc</span>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (300.0, 100.0), None, &mut resources)
+            .expect("prepared inline transform geometry");
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let atomic = tree.get_element_by_id("atomic").unwrap();
+
+        assert!(prepared.layout().transforms.get(&inline).is_none());
+        assert!(prepared.layout().transforms.get(&atomic).is_some());
+        assert!(prepared.document_rect(atomic).unwrap().x >= 50.0);
     }
 
     #[test]

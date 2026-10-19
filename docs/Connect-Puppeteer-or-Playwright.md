@@ -99,6 +99,21 @@ Rendering is included in official binaries and requires `--features render`
 for source builds. The client-specific guides cover scrolling, raw CDP
 screencasting, and current output limits.
 
+## Raw CDP node queries
+
+`DOM.getAttributes`, `DOM.requestNode`, `DOM.requestChildNodes`, and
+`DOM.getNodeForLocation` support the top-level light DOM. Request the document
+with `DOM.getDocument` before publishing frontend node IDs. Ancestors and
+requested children arrive through session-scoped `DOM.setChildNodes` events;
+navigation clears the node cache and emits `DOM.documentUpdated`.
+
+Live mutation events are not implemented yet. Request the document again to
+publish newly inserted children of an already-published parent. `requestChildNodes` accepts
+`pierce: true` on plain light-DOM subtrees, but rejects requests that would
+require frame or shadow-tree traversal. Detached-node publication and
+`ignorePointerEventsNone: true` hit testing are not supported. The remaining work is tracked in
+[#1291](https://github.com/h4ckf0r0day/obscura/issues/1291).
+
 ## Current limits
 
 - Pages share one V8 isolate. CPU-bound JavaScript on one page can delay others.

@@ -7,6 +7,39 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 const OBSCURA: &str = env!("CARGO_BIN_EXE_obscura");
+
+#[test]
+fn mcp_font_directory_is_validated_before_either_transport_starts() {
+    let missing = std::env::temp_dir().join(format!("obscura-missing-fonts-{}", std::process::id()));
+    assert!(!missing.exists());
+    for http in [false, true] {
+        let mut command = Command::new(OBSCURA);
+        command.args(["mcp", "--font-dir"]).arg(&missing).stdin(Stdio::null());
+        if http {
+            command.args(["--http", "--port", "0"]);
+        }
+        let output = command.output().expect("start MCP with invalid font directory");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Font directory does not exist"));
+    }
+}
+
+#[test]
+fn mcp_font_directory_respects_render_feature() {
+    let output = Command::new(OBSCURA)
+        .args(["mcp", "--font-dir"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("start MCP with existing font directory");
+    if cfg!(feature = "render") {
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    } else {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--font-dir requires a render-enabled build"));
+    }
+}
+
 const TEST_PAGE: &str = r#"<!doctype html><html><head><title>Example Domain</title></head>
 <body><h1>Example Domain</h1><p>Deterministic local MCP fixture.</p>
 <a href="/more">More information...</a></body></html>"#;

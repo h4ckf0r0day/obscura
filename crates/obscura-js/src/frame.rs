@@ -91,7 +91,12 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
+        let (scripting_enabled, sandbox_opaque_origin) = realms.borrow().by_frame_id(parent_frame_id)
+            .map(|creator| {
+                let creator = creator.borrow();
+                (creator.scripting_enabled, creator.sandbox_opaque_origin)
+            }).unwrap_or((true, false));
+        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -102,6 +107,9 @@ impl FrameRealm {
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
+        state.scripting_enabled = scripting_enabled;
+        state.sandbox_opaque_origin = sandbox_opaque_origin;
+        if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
@@ -356,6 +364,14 @@ impl FrameRealm {
     /// Resolves a subresource URL against the frame's own document URL, not the
     /// parent's. A relative `src` in a frame is relative to the frame.
     fn resolve(&self, src: &str) -> String {
+        if self.url == "about:srcdoc" {
+            if let Some(base) = self.realms.borrow().by_frame_id(self.frame_id)
+                .and_then(|state| crate::ops::document_base_url(&state.borrow()))
+            {
+                return url::Url::parse(&base).and_then(|base| base.join(src))
+                    .map(|url| url.to_string()).unwrap_or_else(|_| src.to_string());
+            }
+        }
         url::Url::parse(&self.url)
             .and_then(|base| base.join(src))
             .map(|url| url.to_string())
@@ -367,6 +383,7 @@ impl FrameRealm {
         let state = self.realms.borrow().by_frame_id(self.frame_id)
             .ok_or_else(|| "could not list frame scripts: missing realm".to_string())?;
         let state = state.borrow();
+        if !state.scripting_enabled { return Ok(Vec::new()); }
         let dom = state.dom.as_ref()
             .ok_or_else(|| "could not list frame scripts: missing document".to_string())?;
         let nodes = dom.query_selector_all("script")?;
@@ -432,6 +449,23 @@ mod tests {
         runtime.set_url(url);
         runtime.run_page_init();
         runtime
+    }
+
+    #[test]
+    fn borrowed_content_type_getter_reads_the_frame_document() {
+        let mut parent = ObscuraJsRuntime::new();
+        parent.set_dom(parse_html("<html><body></body></html>"));
+        parent.set_url("https://parent.example/page");
+        parent.set_content_type("text/plain");
+        parent.run_page_init();
+        let _frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(parent.evaluate(r#"(function(){
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const get = Object.getOwnPropertyDescriptor(Document.prototype, 'contentType').get;
+            return [get.call(child), child.contentType, document.contentType];
+        })()"#).unwrap(), serde_json::json!(["text/html", "text/html", "text/plain"]));
     }
 
     #[test]
@@ -1571,5 +1605,71 @@ mod tests {
         assert_eq!(frame.origin(), "null");
         assert!(!frame.is_same_origin_as("null"));
         assert!(!frame.is_same_origin_as("https://parent.example"));
+    }
+
+    #[test]
+    fn file_list_global_exists_and_input_files_is_instance() {
+        // Issue #1232: `typeof FileList` was `undefined`, crashing apps that
+        // reference it while booting.
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate("typeof FileList").unwrap(),
+            serde_json::json!("function")
+        );
+        assert_eq!(
+            rt.evaluate("Object.prototype.toString.call(document.getElementById('f').files)")
+                .unwrap(),
+            serde_json::json!("[object FileList]")
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files instanceof FileList")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('f').files.length").unwrap(),
+            serde_json::json!(0.0)
+        );
+        assert_eq!(
+            rt.evaluate("(() => { try { new FileList(); return 'no-throw'; } catch (e) { return e.name + ': ' + e.message; } })()").unwrap(),
+            serde_json::json!("TypeError: Illegal constructor")
+        );
+    }
+
+    #[test]
+    fn file_list_iteration_preserves_uploaded_files() {
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f multiple></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const input = document.getElementById('f');
+            const empty = [...input.files].length;
+            __obscura_setInputFiles(input, [
+                {name: 'first.txt', type: 'text/plain', b64: 'YQ=='},
+                {name: 'second.txt', type: 'text/plain', b64: 'Yg=='}
+            ]);
+            const files = input.files;
+            const names = [];
+            for (const file of files) names.push(file.name);
+            const iterator = files[Symbol.iterator]();
+            return {
+                empty,
+                spread: [...files].map(file => file.name),
+                names,
+                sameFile: [...files][0] === files.item(0),
+                iterableIterator: iterator[Symbol.iterator]() === iterator
+            };
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "empty": 0,
+            "spread": ["first.txt", "second.txt"],
+            "names": ["first.txt", "second.txt"],
+            "sameFile": true,
+            "iterableIterator": true
+        }));
     }
 }
