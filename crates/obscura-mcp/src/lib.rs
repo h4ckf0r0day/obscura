@@ -70,6 +70,7 @@ pub struct BrowserState {
     tab_counter: u32,
     context: Arc<BrowserContext>,
     user_agent: Option<String>,
+    operator_network_hints: bool,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
@@ -77,18 +78,33 @@ pub struct BrowserState {
     /// table is wiped on every navigation / tab switch and refilled on
     /// the next snapshot call.
     interactive_refs: HashMap<String, NodeId>,
+    ref_generation: u64,
 }
 
 impl BrowserState {
     pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+        // `--storage-dir` is a global flag, so the profile arrives through the
+        // environment rather than through every constructor call. Without this
+        // the MCP path silently ignored the flag and persisted nothing, cookies
+        // included.
+        let storage_dir = std::env::var_os("OBSCURA_STORAGE_DIR").map(std::path::PathBuf::from);
+        let context = BrowserContext::with_storage_full(
+            "mcp".to_string(),
+            proxy,
+            stealth,
+            None,
+            storage_dir,
+        );
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
+            context: Arc::new(context),
             user_agent,
+            operator_network_hints: false,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
+            ref_generation: 0,
         }
     }
 
@@ -121,27 +137,14 @@ impl BrowserState {
         id
     }
 
-    /// Enforce the single-live-isolate invariant. rusty_v8 enters each V8
-    /// isolate on creation and requires isolates be dropped in reverse order of
-    /// creation, so keeping more than one tab's isolate live at once and then
-    /// dropping a non-newest one aborts the whole process (#258). Suspend every
-    /// other tab (drops its isolate, keeps its DOM in self.dom) and make the
-    /// active tab the only live isolate, mirroring the CDP server's
-    /// Dispatcher::get_session_page_mut.
+    /// Scoped isolate entries allow inactive tabs to keep their realms, as in CDP.
     fn activate(&mut self, tab_id: &str) {
-        for (id, page) in self.tabs.iter_mut() {
-            if id.as_str() != tab_id && page.has_js() {
-                page.suspend_js();
-            }
-        }
         if let Some(page) = self.tabs.get_mut(tab_id) {
-            page.resume_js();
+            if !page.has_js() { page.resume_js(); }
         }
     }
 
-    /// Close a tab without breaking the LIFO isolate-drop rule. suspend_js drops
-    /// this tab's isolate (if it is the live one) while it is still the only
-    /// entered isolate, so the following remove disposes no isolate (#258).
+    /// Retire frame handles before disposing their owning runtime.
     fn close_tab(&mut self, tab_id: &str) -> bool {
         if let Some(page) = self.tabs.get_mut(tab_id) {
             page.suspend_js();
@@ -161,9 +164,13 @@ impl BrowserState {
     /// so leaving either half for the next tool call strands timers, fetches,
     /// and location/form/click navigations while the transport waits on stdin.
     async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
-        let page = self.page_mut();
-        let reached_idle = page.run_autonomous_event_loop_turn().await?;
-        let navigated = page
+        let reached_idle = self.page_mut().run_autonomous_event_loop_turn().await?;
+        self.finish_active_page_turn(reached_idle).await
+    }
+
+    // Complete navigation outside the cancelable wait: it consumes pending state before I/O.
+    async fn finish_active_page_turn(&mut self, reached_idle: bool) -> Result<bool, String> {
+        let navigated = self.page_mut()
             .process_pending_navigation()
             .await
             .map_err(|error| error.to_string())?;
@@ -215,12 +222,20 @@ impl BrowserState {
     /// the page isn't re-rendered without it. Returns `Err` if the ref
     /// hasn't been registered (caller must call browser_snapshot first).
     fn ref_to_selector(&self, r: &str) -> Result<String, String> {
-        if !self.interactive_refs.contains_key(r) {
-            return Err(format!(
+        let node_id = *self.interactive_refs.get(r).ok_or_else(|| format!(
                 "unknown ref '{r}'; call browser_snapshot first to refresh the ref table"
-            ));
+            ))?;
+        let selector = format!("[data-obscura-ref=\"{r}\"]");
+        let same_node = self.active_tab.as_ref()
+            .and_then(|id| self.tabs.get(id))
+            .and_then(|page| page.with_dom(|dom| {
+                dom.query_selector(&selector).ok().flatten() == Some(node_id)
+            }))
+            .unwrap_or(false);
+        if !same_node {
+            return Err(format!("stale ref '{r}'; call browser_snapshot to refresh the ref table"));
         }
-        Ok(format!("[data-obscura-ref=\"{r}\"]"))
+        Ok(selector)
     }
 }
 
@@ -243,6 +258,9 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     let mut writer = stdout;
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
+    state.operator_network_hints = true;
+    // Cookies and Web Storage are written on every navigation; this covers the
+    // writes an agent makes after a page has settled, on the way out.
     let mut runtime_pump_armed = false;
 
     loop {
@@ -252,7 +270,11 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             tokio::select! {
                 biased;
                 read = reader.read_line(&mut line) => Some(read?),
-                pump_result = state.advance_active_page_tasks() => {
+                pump_result = state.page_mut().run_autonomous_event_loop_turn() => {
+                    let pump_result = match pump_result {
+                        Ok(reached_idle) => state.finish_active_page_turn(reached_idle).await,
+                        Err(error) => Err(error),
+                    };
                     match pump_result {
                         Ok(reached_idle) => runtime_pump_armed = !reached_idle,
                         Err(error) => {
@@ -270,6 +292,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             continue;
         };
         if n == 0 {
+            state.context.save_storage();
             return Ok(());
         }
 
@@ -336,11 +359,11 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_snapshot",
-                "description": "Get the current page content as text (title, URL, and readable body text)",
+                "description": "Get URL, title, actionable element references, control states, and visible body text",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "max_chars": { "type": "number", "minimum": 0, "description": "Truncate readable body text to this many characters (default: 4000)" }
+                        "max_chars": { "type": "number", "minimum": 0, "description": "Character budget shared by whole control descriptions and visible body text (default: 4000); URL and title are separately capped at 256 characters each" }
                     },
                     "additionalProperties": false
                 }
@@ -412,9 +435,23 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "expression": { "type": "string", "description": "JavaScript expression to evaluate" }
+                        "expression": { "type": "string", "description": "JavaScript expression to evaluate; a promise it returns is awaited" },
+                        "timeoutMs": { "type": "number", "description": "How long to wait for a returned promise, in milliseconds (default: 5000)" }
                     },
                     "required": ["expression"]
+                }
+            },
+            {
+                "name": "browser_wait_for_function",
+                "description": "Wait until a JavaScript expression returns true, polling the page",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "function": { "type": "string", "description": "JavaScript expression that must become truthy" },
+                        "timeout": { "type": "number", "description": "Timeout in milliseconds (default: 30000)" },
+                        "pollIntervalMs": { "type": "number", "description": "Poll interval in milliseconds (default: 100)" }
+                    },
+                    "required": ["function"]
                 }
             },
             {
@@ -768,6 +805,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_select_option" => tool_select_option(args, state),
         "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
+        "browser_wait_for_function" => tool_wait_for_function(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
         "browser_console_messages" => tool_console_messages(state),
         "browser_close" => tool_close(state),
@@ -784,7 +822,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_wait_for_text" => tool_wait_for_text(args, state).await,
         // Tier 2 agent-UX additions
         "browser_detect_forms" => tool_detect_forms(state),
-        "browser_fill_form" => tool_fill_form(args, state),
+        "browser_fill_form" => tool_fill_form(args, state).await,
         "browser_scroll" => tool_scroll(args, state),
         "browser_get_attribute" => tool_get_attribute(args, state),
         "browser_count" => tool_count(args, state),
@@ -922,6 +960,17 @@ fn resolve_target(args: &Value, state: &BrowserState) -> Result<String, String> 
     Err("Missing 'ref' or 'selector' parameter".to_string())
 }
 
+fn evaluate_tool_script(page: &mut Page, script: &str) -> Result<Value, String> {
+    // Keep the watchdog armed through result serialization, which can run page code.
+    let watchdog = page.js.as_mut().ok_or("Navigate before evaluating JavaScript")?
+        .arm_watchdog(std::time::Duration::from_secs(5));
+    let result = page.evaluate_script(script);
+    if page.js.as_mut().expect("evaluation runtime").disarm_watchdog(watchdog) {
+        return Err("JavaScript execution or serialization exceeded the 5000ms deadline".into());
+    }
+    result
+}
+
 /// Clamp text to `max_chars` and tack on a `...(truncated, N more chars)`
 /// marker so the agent can ask for more if needed. Default ceiling is
 /// 4 KiB to prevent a single tool call from consuming a window of context.
@@ -947,13 +996,22 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
     let ua = state.user_agent.clone();
+    let operator_hints = state.operator_network_hints;
     let page = state.page_mut();
     if let Some(ref ua) = ua {
         page.http_client.set_user_agent(ua).await;
     }
 
     page.navigate_with_wait(url, condition).await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let message = e.to_string();
+            if operator_hints {
+                if let Some(hint) = obscura_net::private_network_error_hint(&message) {
+                    return format!("{}\n{}", message, hint);
+                }
+            }
+            message
+        })?;
 
     let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
     // DOM changed — invalidate the ref table. Next snapshot will rebuild.
@@ -966,28 +1024,35 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
         .unwrap_or(DEFAULT_TEXT_LIMIT);
     rebuild_interactive_refs(state)?;
     let page = state.page_mut();
-    let url = page.url_string();
-    let title = page.title.clone();
-
+    let url = truncate(&page.url_string(), 256);
+    let title = truncate(&page.title, 256);
+    if max_chars == 0 { return Ok(format!("URL: {url}\nTitle: {title}")); }
+    let context = accessibility_context(page);
     let body_text = page.with_dom(|dom| {
         if let Ok(Some(body)) = dom.query_selector("body") {
-            extract_text(dom, body)
+            extract_text(dom, body, context.as_ref())
         } else {
             String::new()
         }
     }).unwrap_or_default();
 
-    let refs_summary = if state.interactive_refs.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\n{} interactive element(s) registered. Call browser_interactive_elements to list, or pass `ref` to browser_click/browser_fill/browser_type.",
-            state.interactive_refs.len(),
-        )
-    };
-
-    let body = truncate(body_text.trim(), max_chars);
-    Ok(format!("URL: {url}\nTitle: {title}\n\n{body}{refs_summary}"))
+    let lines = context.as_ref().map(|context| interactive_lines(state, context, usize::MAX)).unwrap_or_default();
+    let mut content = String::new();
+    let mut remaining = max_chars;
+    let mut shown = 0;
+    for line in &lines {
+        let cost = line.chars().count() + 1;
+        if cost > remaining { break; }
+        content.push_str(line);
+        content.push('\n');
+        remaining -= cost;
+        shown += 1;
+    }
+    if shown < lines.len() {
+        content.push_str(&format!("...({} controls omitted; use browser_interactive_elements)\n", lines.len() - shown));
+    }
+    content.push_str(&truncate(body_text.trim(), remaining));
+    Ok(format!("URL: {url}\nTitle: {title}\n\n{content}"))
 }
 
 async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
@@ -1003,7 +1068,7 @@ async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, St
         sel = serde_json::to_string(&selector).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
@@ -1033,7 +1098,7 @@ async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, Str
         val = serde_json::to_string(value).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
@@ -1059,7 +1124,7 @@ async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, Str
         txt = serde_json::to_string(text).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     if result.as_str() == Some("error:element not found") {
         Err(format!("Element not found: {selector}"))
     } else {
@@ -1090,7 +1155,10 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
         key = serde_json::to_string(key).unwrap()
     );
 
-    state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
+    if result.as_str() == Some("error:element not found") {
+        return Err("Element not found for key press".into());
+    }
     state.settle_synthetic_navigation().await?;
     Ok(format!("Pressed key '{key}'"))
 }
@@ -1116,7 +1184,7 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
         val = serde_json::to_string(value).unwrap()
     );
 
-    let result = state.page_mut().evaluate(&js);
+    let result = evaluate_tool_script(state.page_mut(), &js)?;
     match result.as_str() {
         Some("error:element not found") => Err(format!("Element not found: {selector}")),
         Some("error:option not found") => Err(format!("Option not found: {value}")),
@@ -1127,14 +1195,80 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
 async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let expression = args.get("expression").and_then(Value::as_str)
         .ok_or("Missing expression parameter")?;
-
-    let result = state.page_mut().evaluate(expression);
+    let timeout_ms = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(5_000).max(1);
+    let budget = std::time::Duration::from_millis(timeout_ms);
+    std::time::Instant::now().checked_add(budget).ok_or("timeoutMs is too large")?;
+    let page = state.page_mut();
+    let watchdog = page.js.as_mut().ok_or("Navigate before evaluating JavaScript")?.arm_watchdog(budget);
+    let result = page.evaluate_for_cdp_with_timeout(expression, true, true, timeout_ms).await;
+    // MCP never exposes remote handles. Release results, including exceptions.
+    page.release_object_group();
+    if page.js.as_mut().expect("evaluation runtime").disarm_watchdog(watchdog) {
+        // Termination can prevent the first cleanup; retry under a fresh bounded guard.
+        let cleanup = page.js.as_mut().expect("evaluation runtime").arm_watchdog(budget);
+        page.release_object_group();
+        page.js.as_mut().expect("evaluation runtime").disarm_watchdog(cleanup);
+        return Err(format!("JavaScript evaluation exceeded {timeout_ms}ms"));
+    }
+    let result = result?;
+    if result.thrown {
+        return Err(result.description);
+    }
+    let result = result.value.unwrap_or(Value::Null);
     state.settle_synthetic_navigation().await?;
     Ok(match &result {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         other => serde_json::to_string_pretty(other).unwrap_or_default(),
     })
+}
+
+/// Poll a JavaScript predicate until it returns something truthy.
+///
+/// Agents otherwise express "wait until the app finished loading" as a loop of
+/// `browser_evaluate` plus a sleep, which costs a round trip per iteration and
+/// is where flaky automation comes from.
+async fn tool_wait_for_function(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let expression = args.get("function").or_else(|| args.get("expression"))
+        .and_then(Value::as_str)
+        .ok_or("Missing function parameter")?;
+    let timeout_ms = args.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    let poll_ms = args.get("pollIntervalMs").and_then(Value::as_u64).unwrap_or(100).max(10);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    let mut attempts: u64 = 0;
+    loop {
+        attempts += 1;
+        let value = evaluate_tool_script(state.page_mut(), &format!("JSON.stringify((function(){{ try {{ return (function(){{ return !!({expression}); }})(); }} catch (e) {{ return false; }} }})())"))?;
+        let truthy = value
+            .as_str()
+            .map(|raw| raw == "true")
+            .unwrap_or(value.as_bool().unwrap_or(false));
+        if truthy {
+            return Ok(format!("condition met after {attempts} poll(s)"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "condition not met within {timeout_ms} ms after {attempts} poll(s): {expression}"
+            ));
+        }
+        let poll_deadline = (tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(poll_ms)).min(deadline);
+        while tokio::time::Instant::now() < poll_deadline {
+            match tokio::time::timeout_at(
+                poll_deadline, state.page_mut().run_autonomous_event_loop_turn(),
+            ).await {
+                Ok(result) => {
+                    // Navigation consumes pending state before I/O, so do not cancel it mid-turn.
+                    if state.finish_active_page_turn(result?).await? {
+                        tokio::time::sleep_until(poll_deadline).await;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String, String> {
@@ -1203,9 +1337,7 @@ fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
 }
 
 fn tool_close(state: &mut BrowserState) -> Result<String, String> {
-    // Drop the one live isolate (if any) via suspend_js before clearing, so the
-    // map drop disposes no isolate and the LIFO rule holds regardless of the
-    // BTreeMap's ascending drop order (#258).
+    // Retire each page's frame handles before clearing the tab map.
     for page in state.tabs.values_mut() {
         page.suspend_js();
     }
@@ -1225,7 +1357,7 @@ fn tool_markdown(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     let max_chars = args.get("max_chars").and_then(Value::as_u64).map(|n| n as usize)
         .unwrap_or(DEFAULT_TEXT_LIMIT);
     let page = state.page_mut();
-    let result = page.evaluate(obscura_browser::HTML_TO_MARKDOWN_JS);
+    let result = evaluate_tool_script(page, obscura_browser::HTML_TO_MARKDOWN_JS)?;
     let md = result.as_str().unwrap_or_default();
     Ok(truncate(md, max_chars))
 }
@@ -1256,7 +1388,7 @@ fn tool_links(args: &Value, state: &mut BrowserState) -> Result<String, String> 
         }
         return out;
     })()"#;
-    let val = page.evaluate(js);
+    let val = evaluate_tool_script(page, js)?;
     let arr = val.as_array().cloned().unwrap_or_default();
     let lines: Vec<String> = arr.into_iter()
         .filter(|item| {
@@ -1283,43 +1415,49 @@ fn tool_links(args: &Value, state: &mut BrowserState) -> Result<String, String> 
 fn tool_interactive_elements(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
     rebuild_interactive_refs(state)?;
-    if state.interactive_refs.is_empty() {
+    let context = accessibility_context(state.page_mut());
+    let lines = context.as_ref().map(|context| interactive_lines(state, context, limit)).unwrap_or_default();
+    if lines.is_empty() {
         return Ok("No interactive elements on this page.".to_string());
     }
-    let page = state.page_mut();
-    let js = format!(r#"(function(){{
-        var els = document.querySelectorAll('[data-obscura-ref]');
-        var out = [];
-        for (var i = 0; i < els.length && out.length < {limit}; i++) {{
-            var e = els[i];
-            var label = (e.innerText || e.textContent || e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('value') || e.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-            var role = e.getAttribute('role') || '';
-            var typeAttr = e.getAttribute('type') || '';
-            out.push({{
-                ref: e.getAttribute('data-obscura-ref'),
-                tag: e.tagName.toLowerCase(),
-                type: typeAttr,
-                role: role,
-                name: e.getAttribute('name') || '',
-                label: label,
-            }});
-        }}
-        return out;
-    }})()"#);
-    let val = page.evaluate(&js);
-    let arr = val.as_array().cloned().unwrap_or_default();
-    let lines: Vec<String> = arr.into_iter().map(|item| {
-        let r = item.get("ref").and_then(|v| v.as_str()).unwrap_or("?");
-        let tag = item.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
-        let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let label = item.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let kind = if !ty.is_empty() { format!("{tag}[{ty}]") } else if !role.is_empty() { format!("{tag}[role={role}]") } else { tag.to_string() };
-        let detail = if !name.is_empty() { format!(" name={name:?}") } else { String::new() };
-        format!("ref={r:<5} {kind:<22} {label:?}{detail}")
-    }).collect();
     Ok(lines.join("\n"))
+}
+
+fn accessibility_context(page: &Page) -> Option<obscura_browser::accessibility::AccessibilityContext> {
+    #[cfg(feature = "render")]
+    let styles = page.js.as_ref().map(|js| js.accessibility_styles()).unwrap_or_default();
+    #[cfg(not(feature = "render"))]
+    let styles = HashMap::new();
+    page.with_dom(|dom| obscura_browser::accessibility::AccessibilityContext::for_document(dom, &styles))
+}
+
+fn interactive_lines(state: &BrowserState, context: &obscura_browser::accessibility::AccessibilityContext, limit: usize) -> Vec<String> {
+    let Some(page) = state.active_tab.as_ref().and_then(|id| state.tabs.get(id)) else { return Vec::new(); };
+    let refs: HashMap<_, _> = state.interactive_refs.iter().map(|(reference, id)| (id.raw(), reference.as_str())).collect();
+    page.with_dom(|dom| dom.descendants(dom.document()).into_iter().filter_map(|id| {
+        let reference = refs.get(&id.raw())?;
+        let ax = context.describe_node(dom, id)?;
+        let node = dom.get_node(id)?;
+        let tag = node.as_element()?.local.as_ref();
+        let preview = |value: &str| value.chars().take(80).collect::<String>();
+        let label = ax["name"]["value"].as_str().map(str::to_owned)
+            .unwrap_or_else(|| extract_text(dom, id, Some(context)).trim().to_string());
+        let label = preview(&label);
+        let role = ax["role"]["value"].as_str().unwrap_or("generic");
+        let mut line = format!("ref={reference} {tag} {label:?} role={role}");
+        if let Some(kind) = node.get_attribute("type") { line.push_str(&format!(" type={:?}", preview(kind))); }
+        if let Some(name) = node.get_attribute("name") { line.push_str(&format!(" name={:?}", preview(name))); }
+        if let Some(value) = ax["value"]["value"].as_str() { line.push_str(&format!(" value={:?}", preview(value))); }
+        if let Some(properties) = ax["properties"].as_array() {
+            for property in properties {
+                let name = property["name"].as_str().unwrap_or("");
+                if matches!(name, "checked" | "disabled" | "required" | "expanded" | "selected" | "pressed") {
+                    line.push_str(&format!(" {name}={}", property["value"]["value"]));
+                }
+            }
+        }
+        Some(line)
+    }).take(limit).collect()).unwrap_or_default()
 }
 
 /// Rebuild the ref table: walk the DOM, find every interactable, assign
@@ -1328,20 +1466,24 @@ fn tool_interactive_elements(args: &Value, state: &mut BrowserState) -> Result<S
 /// agent always sees fresh refs.
 fn rebuild_interactive_refs(state: &mut BrowserState) -> Result<(), String> {
     state.interactive_refs.clear();
+    state.ref_generation = state.ref_generation.checked_add(1)
+        .ok_or("Element reference generation exhausted")?;
+    let prefix = format!("e{}-", state.ref_generation);
     let page = state.page_mut();
-    // Tag every interactable with data-obscura-ref="eN" in DOM order.
-    let tag_js = r#"(function(){
+    if !page.has_js() { return Ok(()); }
+    // Never reuse tokens: an old snapshot must not name a different action.
+    let tag_js = format!(r#"(function(){{
         var sel = 'a[href], button, input:not([type=hidden]), select, textarea, [role=button], [role=link], [role=checkbox], [role=tab], [role=menuitem], [role=option], [onclick], [tabindex]:not([tabindex="-1"])';
         var els = document.querySelectorAll(sel);
         var refs = [];
-        for (var i = 0; i < els.length; i++) {
-            var ref = 'e' + (i + 1);
+        for (var i = 0; i < els.length; i++) {{
+            var ref = '{prefix}' + (i + 1);
             els[i].setAttribute('data-obscura-ref', ref);
             refs.push(ref);
-        }
+        }}
         return refs;
-    })()"#;
-    let val = page.evaluate(tag_js);
+    }})()"#);
+    let val = evaluate_tool_script(page, &tag_js)?;
     let refs: Vec<String> = val.as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
@@ -1471,7 +1613,7 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
     // Exponential backoff like browser_wait_for (see comment there).
     let mut tick_ms: u64 = 5;
     loop {
-        let found = state.page_mut().evaluate(&js).as_bool().unwrap_or(false);
+        let found = evaluate_tool_script(state.page_mut(), &js)?.as_bool().unwrap_or(false);
         if found {
             return Ok(format!("Found text {needle:?}"));
         }
@@ -1547,7 +1689,7 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
         }
         return out;
     })()"#;
-    let val = page.evaluate(js);
+    let val = evaluate_tool_script(page, js)?;
     if val.is_null() {
         return Ok("No forms found.".to_string());
     }
@@ -1558,7 +1700,7 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
 /// type='text' (default) sets value, 'check'/'uncheck' toggles checkbox,
 /// 'select' picks an option by value or visible text. Optional
 /// `submit_ref`/`submit_selector` clicks after filling.
-fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+async fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let fields = args.get("fields").and_then(Value::as_array)
         .ok_or("Missing fields array")?
         .clone();
@@ -1615,12 +1757,16 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
                 return "ok";
             }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
         };
-        let res = state.page_mut().evaluate(&js);
+        let res = evaluate_tool_script(state.page_mut(), &js)?;
         match res.as_str() {
             Some("ok") => filled += 1,
             Some(e) => errors.push(format!("{selector}: {e}")),
             None => errors.push(format!("{selector}: unknown error")),
         }
+    }
+
+    if !errors.is_empty() {
+        return Err(format!("Filled {filled} fields; not submitted. Errors: {}", errors.join("; ")));
     }
 
     // Optional submit click
@@ -1629,7 +1775,7 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             "ref": args.get("submit_ref"),
             "selector": args.get("submit_selector"),
         });
-        resolve_target(&pseudo, state).ok()
+        Some(resolve_target(&pseudo, state)?)
     } else { None };
     if let Some(sel) = submit_target {
         let js = format!(r#"(function(){{
@@ -1638,15 +1784,15 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
             el.click();
             return "ok";
         }})()"#, sel = serde_json::to_string(&sel).unwrap());
-        let _ = state.page_mut().evaluate(&js);
+        let result = evaluate_tool_script(state.page_mut(), &js)?;
+        if result.as_str() != Some("ok") {
+            return Err(format!("Submit target not found: {sel}"));
+        }
         state.interactive_refs.clear();
     }
 
-    if errors.is_empty() {
-        Ok(format!("Filled {filled} fields."))
-    } else {
-        Ok(format!("Filled {filled} fields. Errors: {}", errors.join("; ")))
-    }
+    state.settle_synthetic_navigation().await?;
+    Ok(format!("Filled {filled} fields."))
 }
 
 /// Scroll the page (or an element) by direction + amount, or scroll an
@@ -1665,7 +1811,7 @@ fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String>
             el.scrollIntoView({{behavior:'instant', block:'center'}});
             return JSON.stringify({{x: window.scrollX, y: window.scrollY}});
         }})()"#, sel = serde_json::to_string(&selector).unwrap());
-        let res = state.page_mut().evaluate(&js);
+        let res = evaluate_tool_script(state.page_mut(), &js)?;
         if res.as_str() == Some("error:not found") {
             return Err(format!("Element not found: {selector}"));
         }
@@ -1694,7 +1840,7 @@ fn tool_scroll(args: &Value, state: &mut BrowserState) -> Result<String, String>
         dir = serde_json::to_string(direction).unwrap(),
         amt = amt,
     );
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     // A scroll can reveal new DOM (infinite scroll); invalidate refs.
     state.interactive_refs.clear();
     Ok(format!("Scrolled {direction}. {}", res.as_str().unwrap_or("")))
@@ -1714,7 +1860,7 @@ fn tool_get_attribute(args: &Value, state: &mut BrowserState) -> Result<String, 
         sel = serde_json::to_string(&selector).unwrap(),
         a = serde_json::to_string(attr).unwrap(),
     );
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     if res.is_null() {
         return Err(format!("Element not found: {selector}"));
     }
@@ -1728,7 +1874,7 @@ fn tool_count(args: &Value, state: &mut BrowserState) -> Result<String, String> 
         "document.querySelectorAll({sel}).length",
         sel = serde_json::to_string(selector).unwrap()
     );
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     // V8 numbers come back as f64 even when they are integer-valued; as_u64
     // returns None for f64 in serde_json, so coerce via f64.
     let n = res.as_u64()
@@ -1778,7 +1924,7 @@ fn tool_extract(args: &Value, state: &mut BrowserState) -> Result<String, String
         }}
         return out;
     }})()"#, schema = schema_json);
-    let res = state.page_mut().evaluate(&js);
+    let res = evaluate_tool_script(state.page_mut(), &js)?;
     serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
 }
 
@@ -1866,7 +2012,7 @@ fn append_text_segment(result: &mut String, pending_space: &mut bool, contents: 
     *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
 }
 
-fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> String {
+fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId, context: Option<&obscura_browser::accessibility::AccessibilityContext>) -> String {
     use obscura_dom::NodeData;
 
     enum Work {
@@ -1903,11 +2049,13 @@ fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> Str
 
         match &node.data {
             NodeData::Text { contents } => {
-                append_text_segment(&mut result, &mut pending_space, contents);
+                if context.is_none_or(|context| !context.is_hidden(id)) {
+                    append_text_segment(&mut result, &mut pending_space, contents);
+                }
             }
             NodeData::Element { name, .. } => {
                 let tag = name.local.as_ref();
-                if matches!(tag, "script" | "style" | "noscript") {
+                if matches!(tag, "script" | "style" | "noscript" | "template") {
                     continue;
                 }
 
@@ -1954,7 +2102,7 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
     let page = state.page_mut();
     let body = page.with_dom(|dom| {
         dom.query_selector("body").ok().flatten()
-            .map(|b| extract_text(dom, b))
+            .map(|b| extract_text(dom, b, None))
             .unwrap_or_default()
     }).unwrap_or_default();
 
@@ -2051,92 +2199,487 @@ fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
         "same_site": c.same_site,
         "expires": c.expires,
     })).collect();
-    // Pull localStorage + sessionStorage for the current page's origin.
-    let storage_js = r#"(function(){
-        var ls = [], ss = [];
-        try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); ls.push([k, localStorage.getItem(k)]); } } catch(e) {}
-        try { for (var j = 0; j < sessionStorage.length; j++) { var k2 = sessionStorage.key(j); ss.push([k2, sessionStorage.getItem(k2)]); } } catch(e) {}
-        return { origin: location.origin || '', localStorage: ls, sessionStorage: ss };
-    })()"#;
-    let storage = if state.active_tab.is_some() {
-        state.page_mut().evaluate(storage_js)
-    } else {
-        Value::Null
-    };
-    let origins = if storage.is_object() { vec![storage] } else { vec![] };
+    let mut origins = std::collections::BTreeMap::new();
+    for (origin, entries) in state.context.local_storage.entries() {
+        let entries: Vec<_> = entries.into_iter().map(|(k, v)| (decode_storage_string(k), decode_storage_string(v))).collect();
+        origins.insert(origin.clone(), json!({
+            "origin": origin, "localStorage": entries, "sessionStorage": []
+        }));
+    }
+    if let Some(page) = state.active_tab.as_ref().and_then(|id| state.tabs.get(id)) {
+        for (origin, entries) in page.session_storage().entries() {
+            let entries: Vec<_> = entries.into_iter().map(|(k, v)| (decode_storage_string(k), decode_storage_string(v))).collect();
+            let entry = origins.entry(origin.clone()).or_insert_with(|| json!({
+                "origin": origin, "localStorage": [], "sessionStorage": []
+            }));
+            entry["sessionStorage"] = json!(entries);
+        }
+    }
+    let origins: Vec<_> = origins.into_values().collect();
     let out = json!({ "cookies": cookies, "origins": origins });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
+#[derive(Deserialize)]
+struct StorageOrigin {
+    origin: String,
+    #[serde(default, rename = "localStorage")]
+    local_storage: Vec<(String, String)>,
+    #[serde(default, rename = "sessionStorage")]
+    session_storage: Vec<(String, String)>,
+}
+
+// Match the Web Storage bridge's escaping of strings that begin with NUL.
+fn encode_storage_string(value: String) -> String {
+    if value.starts_with('\0') { format!("\0{}", json!(value)) } else { value }
+}
+
+fn decode_storage_string(value: String) -> String {
+    value.strip_prefix('\0')
+        .and_then(|encoded| serde_json::from_str::<String>(encoded).ok())
+        .filter(|decoded| decoded.starts_with('\0'))
+        .unwrap_or(value)
+}
+
 fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<String, String> {
-    let s = args.get("state").ok_or("Missing state object")?;
-    let mut applied = 0u32;
-    // Cookies
-    if let Some(cookies) = s.get("cookies").and_then(Value::as_array) {
-        let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().filter_map(|c| {
-            Some(obscura_net::CookieInfo {
-                name: c.get("name")?.as_str()?.to_string(),
-                value: c.get("value")?.as_str()?.to_string(),
-                domain: c.get("domain")?.as_str()?.to_string(),
-                path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
-                secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
-                http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
-                same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
-                expires: c.get("expires").and_then(Value::as_i64),
-            })
-        }).collect();
-        applied += parsed.len() as u32;
-        state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    let s = args.get("state").and_then(Value::as_object).ok_or("Missing state object")?;
+    let origins: Vec<StorageOrigin> = serde_json::from_value(
+        s.get("origins").cloned().unwrap_or_else(|| json!([])),
+    ).map_err(|error| format!("Invalid storage origins: {error}"))?;
+    for entry in &origins {
+        if !url::Url::parse(&entry.origin).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == entry.origin
+        }) {
+            return Err("Storage origins must be canonical http(s) origins without paths or credentials".into());
+        }
     }
-    // Storage (per origin). Only applies if there's an active page; we
-    // restore on whatever origin is currently loaded, which usually
-    // matches because agents navigate before restoring state.
-    if state.active_tab.is_some() {
-        if let Some(origins) = s.get("origins").and_then(Value::as_array) {
-            for origin_entry in origins {
-                let mut snippets = Vec::new();
-                if let Some(arr) = origin_entry.get("localStorage").and_then(Value::as_array) {
-                    for pair in arr {
-                        if let (Some(k), Some(v)) = (
-                            pair.get(0).and_then(Value::as_str),
-                            pair.get(1).and_then(Value::as_str),
-                        ) {
-                            snippets.push(format!(
-                                "try {{ localStorage.setItem({k},{v}); }} catch(e) {{}};",
-                                k = serde_json::to_string(k).unwrap(),
-                                v = serde_json::to_string(v).unwrap(),
-                            ));
-                            applied += 1;
-                        }
-                    }
+    let cookies: &[Value] = match s.get("cookies") {
+        Some(value) => value.as_array().ok_or("cookies must be an array")?,
+        None => &[],
+    };
+    let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().map(|c| {
+        Some(obscura_net::CookieInfo {
+            name: c.get("name")?.as_str()?.to_string(),
+            value: c.get("value")?.as_str()?.to_string(),
+            domain: c.get("domain")?.as_str()?.to_string(),
+            path: c.get("path").and_then(Value::as_str).unwrap_or("/").to_string(),
+            secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+            http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
+            same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
+            expires: c.get("expires").and_then(Value::as_i64),
+        })
+    }).collect::<Option<Vec<_>>>()
+        .ok_or("Each cookie requires string name, value and domain fields")?;
+    let cookie_count = parsed.len();
+    let mut applied = 0usize;
+    for entry in origins {
+        for (key, value) in entry.local_storage {
+            if !state.context.local_storage.set(&entry.origin, encode_storage_string(key), encode_storage_string(value)) {
+                return Err(format!("localStorage quota exceeded after restoring {applied} web storage entries; restoration may be partial"));
+            }
+            applied += 1;
+        }
+        if !entry.session_storage.is_empty() {
+            let storage = state.page_mut().session_storage();
+            for (key, value) in entry.session_storage {
+                if !storage.set(&entry.origin, encode_storage_string(key), encode_storage_string(value)) {
+                    return Err(format!("sessionStorage quota exceeded after restoring {applied} web storage entries; restoration may be partial"));
                 }
-                if let Some(arr) = origin_entry.get("sessionStorage").and_then(Value::as_array) {
-                    for pair in arr {
-                        if let (Some(k), Some(v)) = (
-                            pair.get(0).and_then(Value::as_str),
-                            pair.get(1).and_then(Value::as_str),
-                        ) {
-                            snippets.push(format!(
-                                "try {{ sessionStorage.setItem({k},{v}); }} catch(e) {{}};",
-                                k = serde_json::to_string(k).unwrap(),
-                                v = serde_json::to_string(v).unwrap(),
-                            ));
-                            applied += 1;
-                        }
-                    }
-                }
-                if !snippets.is_empty() {
-                    let _ = state.page_mut().evaluate(&snippets.join("\n"));
-                }
+                applied += 1;
             }
         }
     }
-    Ok(format!("Restored {applied} state entries."))
+    state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    state.context.save_storage();
+    Ok(format!("Restored {applied} web storage entries; processed {cookie_count} cookie entries."))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tab_switch_preserves_globals_listeners_and_pending_promises() {
+        let mut state = BrowserState::new(None, None, false);
+        let mut tabs = Vec::new();
+        for index in 0..3 {
+            tool_tab_new(&json!({"url":"data:text/html,<button id=action>Increment</button>"}), &mut state).await.unwrap();
+            tabs.push(state.active_tab.clone().unwrap());
+            evaluate_tool_script(state.page_mut(), &format!(
+                "const tabToken={index}; window.counter=40; document.querySelector('button').addEventListener('click',()=>window.counter++); window.pending=new Promise(resolve=>{{window.finishPending=resolve}}); true"
+            )).unwrap();
+        }
+        for index in [1, 0, 2] {
+            tool_tab_switch(&json!({"tab_id":tabs[index]}), &mut state).unwrap();
+            assert_eq!(evaluate_tool_script(state.page_mut(), "typeof tabToken").unwrap(), json!("number"), "switching tabs must not replace a realm");
+            tool_click(&json!({"selector":"#action"}), &mut state).await.unwrap();
+            assert_eq!(evaluate_tool_script(state.page_mut(), "[tabToken,window.counter]").unwrap(), json!([index,41]));
+            let result = tool_evaluate(&json!({"expression":"(function(){window.finishPending('retained');return window.pending})()"}), &mut state).await.unwrap();
+            assert_eq!(result, "retained");
+        }
+        tool_close(&mut state).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_tabs_with_frames_can_close_in_any_order_and_reopen() {
+        let mut state = BrowserState::new(None, None, false);
+        let mut tabs = Vec::new();
+        for index in 0..3 {
+            tool_tab_new(&json!({"url":"data:text/html,<iframe srcdoc='<p>Child frame</p>'></iframe>"}), &mut state).await.unwrap();
+            tabs.push(state.active_tab.clone().unwrap());
+            evaluate_tool_script(state.page_mut(), &format!("document.querySelector('iframe').contentWindow.frameToken={index}")).unwrap();
+        }
+        tool_tab_switch(&json!({"tab_id":tabs[0]}), &mut state).unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "document.querySelector('iframe').contentWindow.frameToken").unwrap().as_f64(), Some(0.0));
+        for index in [1,0,2] {
+            tool_tab_close(&json!({"tab_id":tabs[index]}), &mut state).unwrap();
+        }
+        assert!(state.tabs.is_empty());
+        tool_tab_new(&json!({"url":"data:text/html,<p>New session</p>"}), &mut state).await.unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "6*7").unwrap().as_f64(), Some(42.0));
+        tool_close(&mut state).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_references_are_actionable_without_an_extra_listing() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<label for=q>Work email</label><input id=q><button aria-label='Save account' onclick='window.saved=true'>Unhelpful text</button>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        let action = snapshot.lines().find(|line| line.starts_with("ref=") && line.contains("Save account"))
+            .expect("snapshot must include an accessible name and usable reference");
+        let reference = action.split_whitespace().next().unwrap().strip_prefix("ref=").unwrap();
+        let reference = reference.to_string();
+        assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Work email")), "associated labels must name fields: {snapshot}");
+        tool_click(&json!({"ref":reference}), &mut state).await.unwrap();
+        assert_eq!(state.page_mut().evaluate("window.saved"), json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_exposes_live_states_without_password_values() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<input id=c type=checkbox checked aria-label=Consent><input id=f value=old aria-label=Account><input id=p type=password aria-label=Password><button disabled>Blocked</button><div role=tab aria-selected=true>Overview</div><button aria-expanded=false>Details</button>").await.unwrap();
+        state.page_mut().evaluate("(function(){document.getElementById('c').checked=false;document.getElementById('f').value='fresh';document.getElementById('p').value='private-password';return true;})()");
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        for (label, detail) in [("Consent", "checked=false"), ("Account", "value=\"fresh\""), ("Blocked", "disabled=true"), ("Overview", "selected=true"), ("Details", "expanded=false")] {
+            assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains(label) && line.contains(detail)), "missing {label} {detail}: {snapshot}");
+        }
+        assert!(!snapshot.contains("private-password"), "automatic snapshots must not echo password values");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_budget_bounds_metadata_and_never_splits_a_reference() {
+        let mut state = BrowserState::new(None, None, false);
+        let html = format!("<title>{}</title><button>Continue</button><p>{}</p>", "界".repeat(1000), "Body ".repeat(2000));
+        state.page_mut().navigate(&format!("data:text/html,{html}")).await.unwrap();
+        let snapshot = tool_snapshot(&json!({"max_chars":96}), &mut state).unwrap();
+        assert!(snapshot.chars().count() < 900, "metadata must not bypass the content budget: {} characters", snapshot.chars().count());
+        for line in snapshot.lines().filter(|line| line.starts_with("ref=")) {
+            let reference = line.split_whitespace().next().unwrap().strip_prefix("ref=").unwrap();
+            assert!(state.interactive_refs.contains_key(reference), "a truncated ref must never be advertised");
+            assert!(line.contains("Continue"), "whole descriptions must fit or be omitted");
+        }
+        assert!(snapshot.contains("truncated") || snapshot.contains("omitted"), "omission must be explicit");
+        let empty = tool_snapshot(&json!({"max_chars":0}), &mut state).unwrap();
+        assert!(!empty.lines().any(|line| line.starts_with("ref=")));
+        assert!(empty.chars().count() < 800);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_omits_hidden_content_and_controls() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Visible</p><div hidden><button>Hidden action</button><p>Hidden body</p></div><div aria-hidden=true>Private panel</div>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        let content = snapshot.split_once("\n\n").unwrap().1;
+        for hidden in ["Hidden action", "Hidden body", "Private panel"] {
+            assert!(!content.contains(hidden), "hidden content must not be exposed as visible context: {content}");
+        }
+        assert!(content.contains("Visible"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshots_preserve_generic_interactive_text_and_hidden_referenced_names() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<div tabindex=0 onclick='window.opened=true'>Open <b>folder</b></div><span id=label hidden>Accessible details</span><button aria-labelledby=label>Other text</button>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Open folder")), "unlabelled generic controls must keep their visible text: {snapshot}");
+        assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Accessible details")), "hidden referenced text still supplies the visible control's name: {snapshot}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshots_apply_css_visibility_without_hiding_visible_overrides() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<style>.gone{display:none}.invisible{visibility:hidden}.shown{visibility:visible}</style><div class=gone><button>CSS hidden action</button></div><div class=invisible>Hidden text<button class=shown>Visible override</button></div>").await.unwrap();
+        let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
+        let content = snapshot.split_once("\n\n").unwrap().1;
+        assert!(!content.contains("CSS hidden action") && !content.contains("Hidden text"), "{content}");
+        assert!(content.lines().any(|line| line.starts_with("ref=") && line.contains("Visible override")), "a visible descendant must remain actionable: {content}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_serialization_deadline_recovers_the_page() {
+        // A missing production watchdog must fail this nextest process, not hang CI.
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let backstop = std::thread::spawn(move || {
+            if matches!(stopped.recv_timeout(std::time::Duration::from_secs(10)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                eprintln!("tool serialization exceeded its execution deadline");
+                std::process::exit(1);
+            }
+        });
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Content</p>").await.unwrap();
+        assert_eq!(state.page_mut().evaluate("(function(){globalThis.savedStringify=JSON.stringify;JSON.stringify=function(){while(true){}};return true;})()"), json!(true));
+        let result = tool_extract(&json!({"schema":{"text":"p"}}), &mut state);
+        state.page_mut().evaluate("(function(){JSON.stringify=savedStringify;return true;})()");
+        assert_eq!(state.page_mut().evaluate("6 * 7").as_f64(), Some(42.0), "the terminated page must remain usable");
+        stop.send(()).unwrap();
+        backstop.join().unwrap();
+        assert!(result.is_err(), "serialization overrun must be a tool error");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_failures_are_mcp_tool_errors() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
+        let mut responses = Vec::new();
+        for expression in [
+            "(function(){throw new Error('agent-fixture');})()",
+            "Promise.reject(new Error('agent-fixture'))",
+            "function (",
+            "new Promise(function(){})",
+        ] {
+            let response = dispatch("tools/call", json!(1), &json!({
+                "name": "browser_evaluate", "arguments": {"expression": expression, "timeoutMs": 30}
+            }), &mut state).await;
+            responses.push((expression, response.result.unwrap()));
+        }
+        for (expression, result) in responses {
+            assert_eq!(result["isError"], json!(true), "failure must not be successful data: {expression}: {result}");
+        }
+        assert_eq!(tool_evaluate(&json!({"expression": "6 * 7"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 42.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_runs_scripts_once_and_preserves_null_results() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
+        for expression in ["null", "undefined", "Promise.resolve(null)"] {
+            assert_eq!(tool_evaluate(&json!({"expression": expression}), &mut state).await.unwrap(), "null");
+        }
+        assert_eq!(tool_evaluate(&json!({"expression": "var mcpAnswer = 21; mcpAnswer * 2", "timeoutMs": 30}), &mut state).await.unwrap().parse::<f64>().unwrap(), 42.0);
+        state.page_mut().evaluate("globalThis.evaluations = 0");
+        tool_evaluate(&json!({"expression": "globalThis.evaluations++; undefined", "timeoutMs": 30}), &mut state).await.unwrap();
+        assert_eq!(state.page_mut().evaluate("globalThis.evaluations").as_f64(), Some(1.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interaction_exceptions_are_mcp_tool_errors() {
+        let mut results = Vec::new();
+        for (tool, arguments, setup) in [
+            ("browser_click", json!({"selector":"#action"}), "document.getElementById('action').click = function(){throw new Error('action failed')};"),
+            ("browser_fill", json!({"selector":"#action", "value":"value"}), "globalThis.__obscura_setFieldValue = function(){throw new Error('action failed')};"),
+            ("browser_select_option", json!({"selector":"#action", "value":"a"}), "Object.defineProperty(document.getElementById('action'), 'options', {get:function(){throw new Error('action failed')}});"),
+            ("browser_press_key", json!({"selector":"#action", "key":"Enter"}), "document.getElementById('action').dispatchEvent = function(){throw new Error('action failed')};"),
+            ("browser_scroll", json!({"selector":"#action"}), "document.getElementById('action').scrollIntoView = function(){throw new Error('action failed')};"),
+        ] {
+            let mut state = BrowserState::new(None, None, false);
+            state.page_mut().navigate("data:text/html,<button id=action>Continue</button>").await.unwrap();
+            assert_eq!(state.page_mut().evaluate(&format!("(function(){{{setup} return true;}})()")), json!(true));
+            let response = dispatch("tools/call", json!(1), &json!({"name":tool,"arguments":arguments}), &mut state).await;
+            results.push((tool, response.result.unwrap()));
+        }
+        for (tool, result) in results {
+            assert_eq!(result["isError"], json!(true), "throwing action must not report success: {tool}: {result}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_errors_prevent_submission() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<input id=q><button id=go onclick='window.submits++'>Submit</button><script>window.submits=0</script>").await.unwrap();
+        let response = dispatch("tools/call", json!(1), &json!({"name":"browser_fill_form", "arguments":{
+            "fields":[{"selector":"#q","value":"kept"},{"selector":"#missing","value":"bad"}],
+            "submit_selector":"#go"
+        }}), &mut state).await;
+        assert_eq!(state.page_mut().evaluate("window.submits").as_f64(), Some(0.0), "a partial form must not be submitted");
+        assert_eq!(response.result.unwrap()["isError"], json!(true));
+        let response = dispatch("tools/call", json!(2), &json!({"name":"browser_fill_form", "arguments":{
+            "fields":[], "submit_ref":"unknown"
+        }}), &mut state).await;
+        assert_eq!(response.result.unwrap()["isError"], json!(true), "a missing submit target must not be ignored");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fill_form_submission_reaches_the_server_before_replying() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(&base).await.unwrap();
+        assert!(requests.recv_timeout(std::time::Duration::from_secs(2)).unwrap().starts_with("GET /"));
+        let response = dispatch("tools/call", json!(1), &json!({"name":"browser_fill_form", "arguments":{
+            "fields":[{"selector":"#q","value":"complete"}], "submit_selector":"#go"
+        }}), &mut state).await;
+        assert_ne!(response.result.unwrap()["isError"], json!(true));
+        let request = requests.recv_timeout(std::time::Duration::from_secs(1)).expect("submit must complete before the reply");
+        assert!(request.starts_with("POST /submitted"), "{request}");
+        assert!(request.contains("q=complete"), "{request}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_restore_is_origin_scoped_and_works_before_navigation() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (first, _) = spawn_form_recording_server();
+        let (second, _) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": {"origins": [
+            {"origin": first, "localStorage": [["token", "first"]], "sessionStorage": [["tab", "first-session"]]},
+            {"origin": second, "localStorage": [["token", "second"]], "sessionStorage": [["tab", "second-session"]]}
+        ]}}), &mut state).expect("restore before the first navigation");
+        for (origin, local, session) in [(&first, "first", "first-session"), (&second, "second", "second-session")] {
+            state.page_mut().navigate(origin).await.expect("fixture page");
+            assert_eq!(state.page_mut().evaluate("[localStorage.getItem('token'), sessionStorage.getItem('tab')]"),
+                json!([local, session]), "restored values must belong to {origin}");
+        }
+        tool_set_storage_state(&json!({"state": {"origins": [
+            {"origin": first, "localStorage": [["token", "updated-first"]]}
+        ]}}), &mut state).expect("restore an inactive origin");
+        assert_eq!(state.page_mut().evaluate("localStorage.getItem('token')"), json!("second"));
+        state.page_mut().navigate(&first).await.expect("return to first origin");
+        assert_eq!(state.page_mut().evaluate("localStorage.getItem('token')"), json!("updated-first"));
+        tool_tab_new(&json!({"url": first}), &mut state).await.expect("second tab");
+        assert_eq!(state.page_mut().evaluate("[localStorage.getItem('token'), sessionStorage.getItem('tab')]"),
+            json!(["updated-first", null]), "restoring a session must not share sessionStorage across tabs");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_export_retains_previously_visited_origins() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (first, _) = spawn_form_recording_server();
+        let (second, _) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        for (origin, value) in [(&first, "first"), (&second, "second")] {
+            state.page_mut().navigate(origin).await.expect("fixture page");
+            state.page_mut().evaluate(&format!("(function(){{localStorage.setItem('token', '{value}'); sessionStorage.setItem('tab', '{value}-session'); return true;}})()"));
+        }
+        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
+        let origins = exported["origins"].as_array().expect("origins");
+        assert_eq!(origins.len(), 2, "export must not omit the previous origin: {exported}");
+        for (origin, value) in [(&first, "first"), (&second, "second")] {
+            let entry = origins.iter().find(|entry| entry["origin"] == json!(origin)).expect("visited origin");
+            assert_eq!(entry["localStorage"], json!([["token", value]]));
+            assert_eq!(entry["sessionStorage"], json!([["tab", format!("{value}-session")]]));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_restore_rejects_invalid_input_before_mutation() {
+        for invalid in [
+            json!({"origin": "null", "localStorage": [["token", "bad"]]}),
+            json!({"origin": "https://other.test/path", "localStorage": [["token", "bad"]]}),
+            json!({"origin": "https://other.test", "localStorage": [["token", 12]]}),
+        ] {
+            let mut state = BrowserState::new(None, None, false);
+            let result = tool_set_storage_state(&json!({"state": {"origins": [
+                {"origin": "https://first.test", "localStorage": [["token", "partial"]]}, invalid
+            ]}}), &mut state);
+            assert!(result.is_err(), "invalid state must not report success: {result:?}");
+            assert!(state.context.local_storage.entries().is_empty(), "invalid input must be validated before writes");
+            assert!(state.tabs.is_empty(), "invalid input must not create a tab");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_restore_reports_rejected_quota_writes() {
+        let mut state = BrowserState::new(None, None, false);
+        let result = tool_set_storage_state(&json!({"state": {"origins": [
+            {"origin": "https://first.test", "localStorage": [["oversized", "x".repeat(5 * 1024 * 1024 + 1)]]}
+        ]}}), &mut state);
+        assert!(result.is_err(), "rejected native storage writes must not report success");
+        assert!(state.context.local_storage.entries().is_empty(), "rejected value must not be retained");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_state_round_trip_preserves_nul_prefixed_strings() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin, _) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(&origin).await.expect("fixture page");
+        state.page_mut().evaluate(r#"(function(){localStorage.setItem('\0key', '\0"value"'); sessionStorage.setItem('\0tab', '\0session'); return true;})()"#);
+        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
+        assert_eq!(exported["origins"][0]["localStorage"], json!([["\0key", "\0\"value\""]]));
+        assert_eq!(exported["origins"][0]["sessionStorage"], json!([["\0tab", "\0session"]]));
+        drop(state);
+        let mut restored = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": exported}), &mut restored).expect("restore");
+        restored.page_mut().navigate(&origin).await.expect("restored page");
+        assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
+            json!(["\0\"value\"", "\0session"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_reject_copied_attributes_before_clicking() {
+        for mutation in [
+            "button.replaceWith(copy)",
+            "button.before(copy)",
+        ] {
+            let mut state = BrowserState::new(None, None, false);
+            state.page_mut().navigate("data:text/html,<button id=target>Buy</button>")
+                .await.expect("test page");
+            tool_snapshot(&json!({}), &mut state).expect("snapshot");
+            let reference = state.interactive_refs.keys().next().expect("button ref").clone();
+            tool_evaluate(&json!({"expression": format!(
+                "(function(){{ window.clicks=0; document.body.addEventListener('click',function(){{window.clicks++}}); var button=document.getElementById('target'); var copy=button.cloneNode(true); {mutation}; return true; }})()"
+            )}), &mut state).await.expect("framework rerender");
+
+            let result = tool_click(&json!({"ref": reference}), &mut state).await;
+            let clicks = state.page_mut().evaluate("window.clicks");
+            assert_eq!(clicks.as_f64(), Some(0.0), "stale ref must not click a clone: {mutation}, {result:?}");
+            assert!(result.is_err(), "stale ref must request a fresh snapshot");
+
+            tool_snapshot(&json!({}), &mut state).expect("fresh snapshot");
+            let reference = state.interactive_refs.keys().next().expect("fresh ref").clone();
+            tool_click(&json!({"ref": reference}), &mut state).await.expect("fresh ref works");
+            assert_eq!(state.page_mut().evaluate("window.clicks").as_f64(), Some(1.0));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_from_old_snapshots_cannot_alias_new_targets() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<button id=target>Buy</button>")
+            .await.expect("test page");
+        tool_snapshot(&json!({}), &mut state).expect("snapshot");
+        let reference = state.interactive_refs.keys().next().expect("button ref").clone();
+        tool_evaluate(&json!({"expression":
+            "(function(){window.clicks=0; document.body.addEventListener('click',function(){window.clicks++}); var other=document.createElement('button'); other.textContent='Delete'; document.body.prepend(other); return true;})()"
+        }), &mut state).await.expect("insert another action");
+        tool_snapshot(&json!({}), &mut state).expect("new snapshot");
+        let result = tool_click(&json!({"ref": reference}), &mut state).await;
+        assert_eq!(state.page_mut().evaluate("window.clicks").as_f64(), Some(0.0), "old ref must not act on a new target: {result:?}");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_refs_follow_the_same_connected_node_after_reordering() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<button id=target>Buy</button><p>Details</p>")
+            .await.expect("test page");
+        tool_snapshot(&json!({}), &mut state).expect("snapshot");
+        let reference = state.interactive_refs.keys().next().expect("button ref").clone();
+        tool_evaluate(&json!({"expression":
+            "(function(){window.clicked=''; var button=document.getElementById('target'); button.addEventListener('click',function(){window.clicked=this.id}); document.body.appendChild(button); return true;})()"
+        }), &mut state).await.expect("reorder same node");
+        tool_click(&json!({"ref": reference}), &mut state).await.expect("same node ref");
+        assert_eq!(state.page_mut().evaluate("window.clicked"), json!("target"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_evaluation_and_promise_results_work_without_prior_state() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
+        assert_eq!(tool_evaluate(&json!({"expression":"1 + 1"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 2.0);
+        assert_eq!(tool_evaluate(&json!({"expression":"Promise.resolve(3)"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 3.0);
+    }
 
     // #1015: case-folding can change byte length (Turkish "İ" -> "i̇"), so a
     // match offset found in the lowercased haystack must be translated back to
@@ -2189,6 +2732,24 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    #[tokio::test]
+    async fn local_network_hint_is_limited_to_operator_stdio_state() {
+        std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
+        let mut state = BrowserState::new(None, None, false);
+        let args = json!({"url": "http://localhost:9/"});
+        let remote_error = tool_navigate(&args, &mut state).await.unwrap_err();
+        assert!(remote_error.contains("is not allowed"));
+        assert!(!remote_error.contains("--allow-private-network"));
+        state.operator_network_hints = true;
+        let local_error = tool_navigate(&args, &mut state).await.unwrap_err();
+        assert!(local_error.contains("is not allowed"));
+        assert!(local_error.contains("--allow-private-network"));
+        assert!(local_error.contains("OBSCURA_ALLOW_PRIVATE_NETWORK=1"));
+        let metadata_error = tool_navigate(&json!({"url":"http://169.254.169.254/latest/meta-data/"}), &mut state).await.unwrap_err();
+        assert!(metadata_error.contains("is not allowed"));
+        assert!(!metadata_error.contains("--allow-private-network"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2430,6 +2991,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn function_wait_advances_fetch_response_callbacks() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(&base).await.expect("fixture page");
+        requests.recv_timeout(std::time::Duration::from_secs(2)).expect("page request");
+        evaluate_tool_script(state.page_mut(),
+            "fetch('/wait-data').then(r => r.text()).then(text => window.fetchedText = text); true"
+        ).unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "typeof window.fetchedText").unwrap(), json!("undefined"));
+
+        tool_wait_for_function(&json!({
+            "function": "typeof window.fetchedText === 'string' && window.fetchedText.includes('Envoyer')",
+            "timeout": 1000, "pollIntervalMs": 20
+        }), &mut state).await.expect("fetch body callback must run while waiting");
+        assert!(requests.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("fetch request").starts_with("GET /wait-data"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn function_wait_finishes_task_navigation_between_polls() {
+        use tokio::io::AsyncReadExt;
+
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/landed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /landed "));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<p id=landed>done</p>").await.unwrap();
+        });
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>waiting</p>").await.unwrap();
+        evaluate_tool_script(state.page_mut(), &format!(
+            "setTimeout(() => location.href = {}, 0); true", serde_json::to_string(&url).unwrap()
+        )).unwrap();
+
+        tool_wait_for_function(&json!({
+            "function": "document.querySelector('#landed') !== null",
+            "timeout": 1000, "pollIntervalMs": 10
+        }), &mut state).await.expect("a navigation longer than one poll must finish");
+        assert_eq!(state.page_mut().url_string(), url);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn function_wait_preserves_idle_polling_and_caps_the_last_interval() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>idle</p>").await.unwrap();
+        evaluate_tool_script(state.page_mut(), "window.waitPolls = 0; true").unwrap();
+        let started = std::time::Instant::now();
+        let error = tool_wait_for_function(&json!({
+            "function": "(++window.waitPolls, false)", "timeout": 80, "pollIntervalMs": 1000
+        }), &mut state).await.expect_err("false predicate must time out");
+        assert!(error.contains("condition not met"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(800),
+            "the last interval must be bounded by the timeout");
+        assert_eq!(evaluate_tool_script(state.page_mut(), "window.waitPolls").unwrap().as_f64(), Some(2.0),
+            "an idle page must not busy-poll the predicate");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn network_tool_includes_completed_script_fetches() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
@@ -2524,6 +3150,7 @@ mod tests {
             }),
             &mut state,
         )
+        .await
         .expect("browser_fill_form should succeed");
 
         let actual = state.page_mut().evaluate(
@@ -2596,6 +3223,7 @@ mod tests {
             }),
             &mut state,
         )
+        .await
         .expect("browser_fill_form should succeed");
 
         let actual = state.page_mut().evaluate(

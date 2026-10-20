@@ -1,13 +1,46 @@
 #!/usr/bin/env python3
 
+import contextlib
+import io
+import json
+from pathlib import Path
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from check import pair_metrics
+from PIL import Image
+
+from check import main, pair_metrics
 
 
 class PairMetricsTests(unittest.TestCase):
+    def test_absent_color_check_rejects_an_unexpected_component(self):
+        for extra_component in (False, True):
+            with self.subTest(extra_component=extra_component), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                image = np.full((200, 500, 3), 255, dtype=np.uint8)
+                image[90:120, 20:220] = [8, 127, 91]
+                image[20:120, 260:460] = [112, 72, 232]
+                if extra_component:
+                    image[140:170, 20:60] = [232, 89, 12]
+                for engine in ("obscura", "chrome"):
+                    Image.fromarray(image).save(out / f"sparse-grid-scroll.{engine}.png")
+                with patch.object(sys, "argv", ["check.py", str(out)]), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    if extra_component:
+                        with self.assertRaises(SystemExit) as raised:
+                            main()
+                        self.assertEqual(raised.exception.code, 1)
+                    else:
+                        main()
+                report = json.loads((out / "analysis.json").read_text())
+                for engine in ("obscura", "chromium"):
+                    check = report["fixtures"]["sparse-grid-scroll"]["behavior"][engine][-1]
+                    self.assertEqual(check["passed"], not extra_component)
+
     def test_bidirectional_distance_catches_projection_preserving_rearrangement(self):
         diagonal = np.full((160, 160, 3), 255, dtype=np.uint8)
         anti_diagonal = diagonal.copy()

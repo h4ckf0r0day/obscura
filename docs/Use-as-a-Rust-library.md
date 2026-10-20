@@ -122,6 +122,8 @@ page.settle(2000).await;
 
 A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
 
+`Continue.body` takes raw bytes as `Option<Vec<u8>>`, not a base64 string. Migrate text overrides from `Some(text)` to `Some(text.into_bytes())`. `None` preserves the original request body; `Some(Vec::new())` replaces it with an empty body. CDP clients still send base64 `postData` as specified by the protocol; Obscura decodes it before sending the request.
+
 ### Preload scripts
 
 `add_preload_script` runs a script before any of the page's own `<script>` tags (the CDP `Page.addScriptToEvaluateOnNewDocument` contract), so it can install hooks before the page bootstraps. Call it before `goto`.

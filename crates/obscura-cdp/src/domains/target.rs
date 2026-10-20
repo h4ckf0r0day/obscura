@@ -218,32 +218,14 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let mut sessions = ctx.sessions.iter()
-                .filter(|(_, page_id)| page_id.as_str() == target_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect::<Vec<_>>();
-            sessions.sort_unstable();
-            for session_id in sessions {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.detachedFromTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetId": target_id,
-                    }),
-                ));
-            }
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.targetDestroyed",
-                json!({ "targetId": target_id }),
-            ));
-
-            ctx.remove_page(target_id);
+            close_target(ctx, target_id);
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => Ok(json!({})),
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 let page_id = ctx.sessions.remove(session_id);
+                ctx.dom_documents.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
@@ -335,6 +317,31 @@ pub async fn handle(
         }
         _ => Err(format!("Unknown Target method: {}", method)),
     }
+}
+
+/// Detach the target's sessions, announce destruction, and release its state.
+pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
+    let mut sessions = ctx.sessions
+        .iter()
+        .filter(|(_, page_id)| page_id.as_str() == target_id)
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    for session_id in sessions {
+        ctx.pending_events.push(CdpEvent::new(
+            "Target.detachedFromTarget",
+            json!({
+                "sessionId": session_id,
+                "targetId": target_id,
+            }),
+        ));
+    }
+    ctx.pending_events.push(CdpEvent::new(
+        "Target.targetDestroyed",
+        json!({ "targetId": target_id }),
+    ));
+
+    ctx.remove_page(target_id);
 }
 
 #[cfg(test)]

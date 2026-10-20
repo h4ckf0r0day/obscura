@@ -111,6 +111,9 @@ def main() -> None:
 
     if regressions:
         raise SystemExit("candidate introduces new obstacle-course failures")
+    if candidate_passed != EXPECTED_STAGE_COUNT:
+        failed = sorted(name for name, result in candidate.items() if not result["pass"])
+        raise SystemExit(f"candidate fails the release obstacle course: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

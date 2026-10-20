@@ -1,0 +1,35 @@
+<!doctype html><meta charset="utf-8"><title>Retained rendering after CSSOM and image updates</title>
+<style>
+body { margin:0; background:#fff }
+#marker { position:absolute; left:16px; top:16px; width:32px; height:32px; background:#d03020 }
+.tile { position:absolute; top:80px; width:80px; height:40px; background:#eee }
+img { display:block; width:80px; height:40px }
+#clip { position:absolute; left:16px; top:160px; width:56px; height:28px; overflow:hidden; border-radius:8px; background:#eee }
+#clip img { width:112px; height:56px }
+#done { position:absolute; left:16px; top:220px; width:32px; height:16px; background:#d03020 }
+</style>
+<div id="marker"></div>
+<div class="tile" style="left:16px"><img id="image0" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg=="></div>
+<div class="tile" style="left:112px"><img id="image1" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg=="></div>
+<div class="tile" style="left:208px"><img id="image2" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg=="></div>
+<div class="tile" style="left:304px"><img id="image3" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg=="></div>
+<div class="tile" style="left:400px"><img id="image4" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg=="></div>
+<div id="clip"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg=="></div><div id="done"></div>
+<script>
+addEventListener('load', () => {
+  document.getElementById('marker').getBoundingClientRect();
+  const sheet=document.styleSheets[0];
+  sheet.insertRule('#marker { width:128px; background:#246840 }',sheet.cssRules.length);
+  document.getElementById('marker').setAttribute('data-unreferenced','ready');
+  const changed=document.getElementById('image4');
+  changed.onload=() => {
+    requestAnimationFrame(() => {
+      const marker=document.getElementById('marker');
+      const valid=marker.getBoundingClientRect().width===128 && changed.naturalWidth===4;
+      document.getElementById('done').style.background=valid?'#246840':'#d03020';
+      document.documentElement.setAttribute('data-complete',String(valid));
+    });
+  };
+  changed.src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGNQCLjwH4QZoIAJxiBeAAAbQwSFDmsp4QAAAABJRU5ErkJggg==";
+});
+</script>

@@ -756,6 +756,37 @@ impl DomTree {
             .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
     }
 
+    /// Whether `ancestor` is an inclusive ancestor of `node` through ordinary
+    /// parent links only (a shadow root ends the walk), as MutationObserver
+    /// subtree matching requires. Bounded like the other ancestor walks.
+    pub fn is_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = Some(node);
+        for _ in 0..=inner.nodes.len() {
+            let Some(id) = current else { return false };
+            if id == ancestor {
+                return true;
+            }
+            current = inner
+                .nodes
+                .get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
+    }
+
+    /// Whether `ancestor` is a host-including inclusive ancestor of `node`, the
+    /// DOM pre-insertion check that stops a node from being inserted into its
+    /// own subtree. Uses the same bounded walk as the reparenting guards.
+    pub fn is_host_including_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        if ancestor == node {
+            return true;
+        }
+        let inner = self.inner.borrow();
+        Self::would_create_host_including_cycle(&inner, node, ancestor)
+    }
+
     /// DOM insertion rejects a node when it is a host-including inclusive
     /// ancestor of the destination parent. Ordinary parent links are not enough
     /// for this check because a ShadowRoot's parent is intentionally null.
@@ -1238,6 +1269,37 @@ impl DomTree {
     pub fn shadow_children(&self, host: NodeId) -> Option<Vec<NodeId>> {
         let root = self.shadow_root(host)?;
         Some(self.children(root))
+    }
+
+    /// Internal preorder traversal for synchronous reads such as selectors.
+    /// Unlike `descendants`, this does not allocate a snapshot of the subtree
+    /// before the first result. Only deferred siblings on the current ancestor
+    /// path are retained, and no RefCell borrow survives an iterator step.
+    pub(crate) fn descendants_iter(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let mut next = self.with_node(node_id, |node| node.first_child).flatten();
+        let mut siblings = Vec::new();
+        let mut remaining = self.node_slot_count();
+        std::iter::from_fn(move || {
+            let current = next.take()?;
+            if remaining == 0 {
+                eprintln!("obscura: descendants iterator cap hit at node {} - tree has a cycle", node_id.index());
+                siblings.clear();
+                return None;
+            }
+            remaining -= 1;
+            let (child, sibling) = self
+                .with_node(current, |node| (node.first_child, node.next_sibling))
+                .unwrap_or_default();
+            if let Some(child) = child {
+                if let Some(sibling) = sibling {
+                    siblings.push(sibling);
+                }
+                next = Some(child);
+            } else {
+                next = sibling.or_else(|| siblings.pop());
+            }
+            Some(current)
+        })
     }
 
     pub fn descendants(&self, node_id: NodeId) -> Vec<NodeId> {
@@ -1915,6 +1977,41 @@ mod tests {
         assert!(!sheet.origin_clean);
     }
 
+    #[test]
+    fn streaming_descendants_match_snapshots_and_keep_shadow_roots_separate() {
+        let tree = crate::parse_html("<!doctype html><main id='root'>text<!--gap--><div><i></i><b></b></div><p></p></main><aside id='host'></aside>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let shadow = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let child = element(&tree, "span");
+        tree.append_child(shadow, child);
+        let mut roots = tree.descendants(tree.document());
+        roots.extend([tree.document(), shadow, child]);
+        for root in roots {
+            assert_eq!(tree.descendants_iter(root).collect::<Vec<_>>(), tree.descendants(root));
+        }
+        assert!(!tree.descendants_iter(tree.document()).any(|node| node == child));
+        assert_eq!(tree.descendants_iter(shadow).collect::<Vec<_>>(), vec![child]);
+        tree.detach(child);
+        assert_eq!(tree.descendants_iter(shadow).count(), 0);
+        assert_eq!(tree.descendants_iter(child).count(), 0);
+    }
+
+    #[test]
+    fn streaming_descendants_bound_broken_child_and_sibling_cycles() {
+        for sibling_cycle in [false, true] {
+            let tree = DomTree::new();
+            let child = element(&tree, "div");
+            tree.append_child(tree.document(), child);
+            tree.with_node_mut(child, |node| {
+                if sibling_cycle { node.next_sibling = Some(child); }
+                else { node.first_child = Some(child); }
+            });
+            let mut walk = tree.descendants_iter(tree.document());
+            assert_eq!(walk.by_ref().count(), tree.node_slot_count());
+            assert_eq!(walk.next(), None);
+        }
+    }
+
     fn element(tree: &DomTree, local: &str) -> NodeId {
         tree.new_node(NodeData::Element {
             name: QualName::new(None, ns!(html), LocalName::from(local)),
@@ -2077,6 +2174,51 @@ mod tests {
     }
 
     #[test]
+    fn slot_assignment_tracks_renames_reordering_and_non_slottable_nodes() {
+        let tree = DomTree::new();
+        let host = element(&tree, "x-card");
+        tree.append_child(tree.document(), host);
+        let light = element(&tree, "span");
+        let text = tree.new_node(NodeData::Text { contents: "text ".repeat(32_768) });
+        let comment = tree.new_node(NodeData::Comment { contents: "comment".into() });
+        for child in [light, text, comment] {
+            tree.append_child(host, child);
+            assert_eq!(tree.assigned_slot(child), None);
+        }
+        let root = tree.attach_shadow_root(host, ShadowRootMode::Open).unwrap();
+        let first = element(&tree, "slot");
+        let second = element(&tree, "slot");
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(svg), LocalName::from("slot")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        for child in [foreign, first, second] { tree.append_child(root, child); }
+        assert!(!tree.is_html_slot_element(foreign));
+        assert_eq!(tree.assigned_nodes(foreign), None);
+        assert_eq!(tree.assigned_nodes(first), Some(vec![light, text]));
+        assert_eq!(tree.assigned_slot(comment), None);
+        assert_eq!(tree.assigned_slot(text), Some(first));
+
+        tree.with_node_mut(first, |node| node.set_attribute("name", "Title".into()));
+        tree.with_node_mut(light, |node| node.set_attribute("slot", "title".into()));
+        assert_eq!(tree.assigned_slot(light), None);
+        assert_eq!(tree.assigned_slot(text), Some(second));
+        tree.with_node_mut(first, |node| node.set_attribute("name", "title".into()));
+        assert_eq!(tree.assigned_nodes(first), Some(vec![light]));
+        tree.with_node_mut(second, |node| node.set_attribute("name", "title".into()));
+        tree.insert_before(first, second);
+        assert_eq!(tree.assigned_slot(light), Some(second));
+        assert_eq!(tree.assigned_nodes(first), Some(vec![]));
+        assert_eq!(tree.assigned_slot(text), None);
+        tree.remove(second);
+        assert_eq!(tree.assigned_slot(light), Some(first));
+        tree.append_child(tree.document(), light);
+        assert_eq!(tree.assigned_slot(light), None);
+        assert_eq!(tree.assigned_nodes(first), Some(vec![]));
+    }
+
+    #[test]
     fn document_id_lookup_never_exposes_a_shadow_descendant() {
         let tree = DomTree::new();
         let document = tree.document();
@@ -2128,6 +2270,52 @@ mod tests {
         tree.insert_before(shadow_child, host);
         assert_eq!(tree.get_node(host).unwrap().parent, Some(document));
         assert_eq!(tree.children(root), vec![shadow_child]);
+    }
+
+    #[test]
+    fn host_including_ancestor_query_follows_parents_and_hosts() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        let leaf = element(&tree, "i");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_host_including_inclusive_ancestor(shadow_child, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, host));
+        assert!(tree.is_host_including_inclusive_ancestor(host, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(document, shadow_child));
+        assert!(!tree.is_host_including_inclusive_ancestor(shadow_child, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(leaf, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(host, outer));
+    }
+
+    #[test]
+    fn inclusive_ancestor_query_stops_at_shadow_roots() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_inclusive_ancestor(outer, outer));
+        assert!(tree.is_inclusive_ancestor(document, host));
+        assert!(tree.is_inclusive_ancestor(root, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, outer));
     }
 
     #[test]

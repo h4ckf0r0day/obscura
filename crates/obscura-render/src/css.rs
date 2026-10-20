@@ -25,6 +25,50 @@ pub enum CssMediaType {
     #[default]
     Screen,
     Print,
+    ScreenReducedMotion,
+    PrintReducedMotion,
+    ScreenDark,
+    PrintDark,
+    ScreenDarkReducedMotion,
+    PrintDarkReducedMotion,
+}
+
+impl CssMediaType {
+    pub fn with_reduced_motion(self, reduce: bool) -> Self {
+        match (self.is_print(), reduce, self.dark_color_scheme()) {
+            (false, false, false) => Self::Screen,
+            (false, true, false) => Self::ScreenReducedMotion,
+            (true, false, false) => Self::Print,
+            (true, true, false) => Self::PrintReducedMotion,
+            (false, false, true) => Self::ScreenDark,
+            (false, true, true) => Self::ScreenDarkReducedMotion,
+            (true, false, true) => Self::PrintDark,
+            (true, true, true) => Self::PrintDarkReducedMotion,
+        }
+    }
+
+    pub fn with_dark_color_scheme(self, dark: bool) -> Self {
+        let medium = if self.is_print() { Self::Print } else { Self::Screen };
+        let medium = if dark {
+            if medium.is_print() { Self::PrintDark } else { Self::ScreenDark }
+        } else { medium };
+        medium.with_reduced_motion(self.reduced_motion())
+    }
+
+    pub fn reduced_motion(self) -> bool {
+        matches!(self, Self::ScreenReducedMotion | Self::PrintReducedMotion
+            | Self::ScreenDarkReducedMotion | Self::PrintDarkReducedMotion)
+    }
+
+    pub fn dark_color_scheme(self) -> bool {
+        matches!(self, Self::ScreenDark | Self::PrintDark
+            | Self::ScreenDarkReducedMotion | Self::PrintDarkReducedMotion)
+    }
+
+    pub fn is_print(self) -> bool {
+        matches!(self, Self::Print | Self::PrintReducedMotion
+            | Self::PrintDark | Self::PrintDarkReducedMotion)
+    }
 }
 
 /// The part of the tree whose selector match may change when a dependency on
@@ -616,17 +660,11 @@ fn invalidation_compounds(selector: &str) -> (Vec<(String, InvalidationReaches)>
     } else if compounds.is_empty() {
         malformed = true;
     }
-    let mut descendants_to_right = false;
-    for (_, reaches) in compounds.iter_mut().rev() {
-        if reaches.contains(InvalidationReaches::DESCENDANTS) {
-            descendants_to_right = true;
-        } else if descendants_to_right && reaches.contains(InvalidationReaches::SIBLINGS) {
-            // `.foo ~ .bar .child`: a change to `.foo` can affect descendants
-            // of following siblings. A flat Siblings reach is insufficient
-            // unless phase 2 also carries the remaining descendant path.
-            *reaches = reaches.union(InvalidationReaches::CONSERVATIVE);
-        }
-    }
+    // The renderer expands SIBLINGS into entire following-sibling subtrees.
+    // An ordinary chain such as `.foo ~ .bar .child` therefore remains within
+    // that scope: later combinators move only down or to later siblings.
+    // Nested selector-list composition still uses its separate conservative
+    // fallback when a flat reach cannot describe the outer continuation.
     (compounds, malformed)
 }
 
@@ -2528,6 +2566,16 @@ impl Stylesheet {
             .is_some_and(|evaluator| evaluator.condition_matches(self, subject, id, kind))
     }
 
+    pub(crate) fn animation_affects_non_geometric_style(&self, name: &str) -> bool {
+        // Only tracks exposed by the partial CSSOM snapshot require live sampling.
+        self.keyframes.get(name).is_some_and(|keyframes| {
+            keyframes.tracks.keys().any(|property| matches!(property,
+                AnimatedProperty::Opacity | AnimatedProperty::Color
+                    | AnimatedProperty::BackgroundColor | AnimatedProperty::Visibility
+            ))
+        })
+    }
+
     pub(crate) fn has_container_queries(&self) -> bool {
         self.rules
             .iter()
@@ -3461,6 +3509,7 @@ impl Stylesheet {
             None,
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3528,6 +3577,7 @@ impl Stylesheet {
             Some(evaluator),
             animation_sample,
             animation_timeline,
+            false,
         )
     }
 
@@ -3552,6 +3602,7 @@ impl Stylesheet {
         evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         self.apply_internal(
             tree,
@@ -3568,6 +3619,7 @@ impl Stylesheet {
             evaluator,
             animation_sample,
             animation_timeline,
+            ancestor_display_none,
         )
     }
 
@@ -3587,6 +3639,7 @@ impl Stylesheet {
         mut evaluator: Option<&mut ContainerQueryEvaluator<'_>>,
         animation_sample: crate::AnimationSample,
         animation_timeline: &mut crate::AnimationTimelineState,
+        ancestor_display_none: bool,
     ) -> Option<HashMap<String, String>> {
         let shadow_host_declarations = shadow_host_sheet
             .map(|sheet| {
@@ -4023,35 +4076,24 @@ impl Stylesheet {
         if !self.keyframes.is_empty() && (style.animation_name.is_some() || important_has_animation)
         {
             let mut animation_style = style.clone();
+            // The winning display declaration participates in animation
+            // eligibility, including !important and shadow-scope declarations.
             for &(_, _, i) in &important_matched {
                 let rule = &self.rules[i];
-                if !rule.important_flags.has_animation {
-                    continue;
-                }
                 let expanded = substitute_declarations(
-                    &rule.important_decls,
-                    props,
-                    rule.important_flags.has_var,
+                    &rule.important_decls, props, rule.important_flags.has_var,
                 );
                 crate::style::apply_animation_declarations(&mut animation_style, &expanded);
             }
-            if inline_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &inline_important,
-                    props,
-                    inline_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if shadow_important_flags.has_animation {
-                let expanded = substitute_declarations(
-                    &shadow_scope_declarations.important,
-                    props,
-                    shadow_important_flags.has_var,
-                );
-                crate::style::apply_animation_declarations(&mut animation_style, &expanded);
-            }
-            if let Some(name) = animation_style.animation_name.as_deref() {
+            let expanded = substitute_declarations(&inline_important, props, inline_important_flags.has_var);
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            let expanded = substitute_declarations(
+                &shadow_scope_declarations.important, props, shadow_important_flags.has_var,
+            );
+            crate::style::apply_animation_declarations(&mut animation_style, &expanded);
+            if ancestor_display_none || animation_style.display == crate::Display::None {
+                animation_timeline.suppress_css_animation(nid, animation_sample);
+            } else if let Some(name) = animation_style.animation_name.as_deref() {
                 if let Some(keyframes) = self.keyframes.get(name) {
                     style.animation_has_render_effect = !keyframes.tracks.is_empty();
                     style.animation_effect_impact = keyframes
@@ -6859,8 +6901,8 @@ fn single_media_query_applies_for_viewport(
     let medium = compact.split_once("and").map_or(compact, |(medium, _)| medium);
     let medium_matches = match medium {
         "all" => true,
-        "screen" => media_type == CssMediaType::Screen,
-        "print" => media_type == CssMediaType::Print,
+        "screen" => !media_type.is_print(),
+        "print" => media_type.is_print(),
         medium if medium.starts_with('(') => true,
         // Unknown named media such as `speech` do not match either visual
         // rendering mode.
@@ -6870,15 +6912,18 @@ fn single_media_query_applies_for_viewport(
         return false;
     }
 
-    // Color-scheme: we render the light (default) context. A site's
-    // `@media (prefers-color-scheme: dark)` block must NOT apply on top of its
-    // light defaults (that is what was leaking dark backgrounds, e.g. near
-    // black inline <code>); a `:light` block should apply.
-    if compact.contains("prefers-color-scheme:dark") {
-        return false;
+    for feature in compact.split('(') {
+        if let Some(value) = feature.strip_prefix("prefers-color-scheme:") {
+            let value = value.split(')').next().unwrap_or(value);
+            let expected = if media_type.dark_color_scheme() { "dark" } else { "light" };
+            if value != expected {
+                return false;
+            }
+        }
     }
     // Reduced-motion / high-contrast / inverted: default (no preference).
-    if compact.contains("prefers-reduced-motion:reduce")
+    if (compact.contains("prefers-reduced-motion:reduce") && !media_type.reduced_motion())
+        || (compact.contains("prefers-reduced-motion:no-preference") && media_type.reduced_motion())
         || compact.contains("prefers-contrast:more")
         || compact.contains("prefers-contrast:less")
         || compact.contains("inverted-colors:inverted")
@@ -7645,7 +7690,7 @@ mod tests {
             trigger,
             InvalidationReaches::SIBLINGS,
         ));
-        assert!(dependencies_reach(
+        assert!(!dependencies_reach(
             trigger,
             InvalidationReaches::CONSERVATIVE,
         ));
@@ -7711,7 +7756,10 @@ mod tests {
         assert!(!entries[2].text_side_effect);
         assert!(entries[3].structural_side_effect);
         assert!(entries[3].text_side_effect);
-        assert!(entries[4].unrepresentable_outer_path);
+        assert!(entries[4]
+            .anchor_reaches
+            .contains(InvalidationReaches::SIBLINGS));
+        assert!(!entries[4].unrepresentable_outer_path);
 
         let tree = obscura_dom::parse_html(
             "<section id=host class=host></section><section id=other class=other></section>",
@@ -10261,6 +10309,30 @@ mod tests {
             left_height_calc,
             (1280.0, 705.0)
         ));
+    }
+
+    #[test]
+    fn media_color_scheme_preserves_motion_and_medium() {
+        for medium in [CssMediaType::Screen, CssMediaType::Print] {
+            for reduce in [false, true] {
+                for dark in [false, true] {
+                    let media = medium.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+                    assert_eq!(media.reduced_motion(), reduce);
+                    assert_eq!(media.is_print(), medium.is_print());
+                    assert_eq!(media.dark_color_scheme(), dark);
+                    let applies = |q| media_query_applies_for_viewport_and_type(q, (800.0, 600.0), media);
+                    assert_eq!(applies("(prefers-color-scheme:dark)"), dark);
+                    assert_eq!(applies("(prefers-color-scheme:light)"), !dark);
+                    assert!(!applies("(prefers-color-scheme:no-preference)"));
+                    assert!(!applies("(prefers-color-scheme:invalid)"));
+                    assert!(applies("(prefers-color-scheme)"));
+                    assert_eq!(applies("not all and (prefers-color-scheme:dark)"), !dark);
+                    assert_eq!(applies("(prefers-color-scheme:dark) and (prefers-reduced-motion:reduce)"), dark && reduce);
+                    assert!(applies("(prefers-color-scheme:light), (prefers-color-scheme:dark)"));
+                    assert_eq!(media.with_dark_color_scheme(!dark).with_reduced_motion(!reduce).is_print(), medium.is_print());
+                }
+            }
+        }
     }
 
     #[test]

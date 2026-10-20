@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -109,6 +110,7 @@ fn ephemeral_servers_publish_distinct_usable_ports() {
         assert_eq!(ready.host, "127.0.0.1");
         assert_ne!(ready.port, 0);
         assert_eq!(ready.websocket_path, WS_PATH);
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(server.dir.join("ready.json"))
                 .unwrap()

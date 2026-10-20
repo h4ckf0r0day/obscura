@@ -5,6 +5,50 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+async fn with_live_peers<'a, F, Fut>(
+    ctx: &'a mut CdpContext,
+    session_id: &Option<String>,
+    command: F,
+) -> Result<RemoteObjectInfo, String>
+where
+    F: FnOnce(&'a mut obscura_browser::Page) -> Fut,
+    Fut: std::future::Future<Output = Result<RemoteObjectInfo, String>>,
+{
+    if ctx.pages.len() == 1 {
+        return command(ctx.get_session_page_mut(session_id).ok_or("No page")?).await;
+    }
+    let id = ctx.get_session_page_mut(session_id).ok_or("No page")?.id.clone();
+    let index = ctx.pages.iter().position(|page| page.id == id).ok_or("No page")?;
+    let (before, remaining) = ctx.pages.split_at_mut(index);
+    let (page, after) = remaining.split_first_mut().ok_or("No page")?;
+    let command = command(page);
+    let peers = async {
+        let mut idle = std::collections::HashSet::new();
+        loop {
+            let all_idle = match crate::server::pump_page_event_loops(before.iter_mut().chain(after.iter_mut()), &mut idle).await {
+                Ok(idle) => idle,
+                Err(error) => return error,
+            };
+            if all_idle {
+                // Foreground and peer futures share this task's waker. Park
+                // idle peers until it wakes again, without a polling timer.
+                let mut parked = false;
+                std::future::poll_fn(|_| {
+                    if parked { std::task::Poll::Ready(()) }
+                    else { parked = true; std::task::Poll::Pending }
+                }).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        result = command => result,
+        error = peers => Err(error),
+    }
+}
+
 pub(crate) fn execution_context_created_event(
     context: &crate::dispatch::ExecutionContextRecord,
     session_id: Option<String>,
@@ -176,17 +220,14 @@ pub async fn handle(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30_000);
 
-            let page = ctx
-                .get_session_page_mut(session_id)
-                .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.evaluate_for_cdp_with_timeout(
+                with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_with_timeout(
                     expression,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
+                )),
             )
             .await
             {
@@ -238,19 +279,16 @@ pub async fn handle(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30_000);
 
-            let page = ctx
-                .get_session_page_mut(session_id)
-                .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.call_function_on_for_cdp_with_timeout(
+                with_live_peers(ctx, session_id, |page| page.call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     &arguments,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
+                )),
             )
             .await
             {
@@ -588,6 +626,35 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexeddb_awaited_commands_deliver_peer_versionchange_and_delayed_close() {
+        for method in ["evaluate", "callFunctionOn"] {
+            let mut ctx = CdpContext::new();
+            let mut sessions = Vec::new();
+            for _ in 0..2 {
+                let id = ctx.create_page();
+                let session = Some(format!("{id}-session"));
+                ctx.sessions.insert(session.clone().unwrap(),id);
+                crate::domains::page::handle("navigate",&json!({"url":"data:text/html,<body>idb</body>"}),&mut ctx,&session).await.unwrap();
+                ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().set_url("https://idb.test/");
+                sessions.push(session);
+            }
+            let first = ctx.get_session_page_mut(&sessions[0]).unwrap();
+            first.evaluate(r#"(() => {
+                const r = indexedDB.open('awaited-peer',1);
+                r.onsuccess = () => {globalThis.peer = r.result;
+                    peer.onversionchange = () => setTimeout(() => peer.close(),10);};
+            })()"#);
+            first.js.as_mut().unwrap().run_event_loop_bounded(100).await.unwrap();
+            let body = "return new Promise((resolve,reject)=>{const r=indexedDB.open('awaited-peer',2);r.onsuccess=()=>{r.result.close();resolve(r.result.version)};r.onerror=()=>reject(r.error)})";
+            let mut params = json!({"awaitPromise":true,"returnByValue":true,"timeout":1000});
+            if method == "evaluate" { params["expression"] = json!(format!("(()=>{{{body}}})()")); }
+            else { params["functionDeclaration"] = json!(format!("function(){{{body}}}")); }
+            let result = handle(method,&params,&mut ctx,&sessions[1]).await.unwrap();
+            assert_eq!(result["result"]["value"].as_f64(),Some(2.0),"{method}: {result}");
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn heap_usage_reports_live_v8_allocations_without_running_page_tasks() {

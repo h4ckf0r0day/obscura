@@ -780,6 +780,9 @@ pub struct InlineItem {
     /// Empty for ordinary IFCs and for nested inlines that remain at their
     /// normal-flow position, so paint pays no provenance cost on that path.
     relative_owner_ranges: Vec<RelativeOwnerTextRange>,
+    /// Mixed-content IFCs own only this sibling range. Caret queries replay
+    /// the collector on demand rather than retaining a map for every glyph.
+    caret_run: Option<(NodeId, NodeId)>,
     /// Exact measurement results retained across repeated Taffy probes.
     measured: Vec<(Option<u32>, Wrap, (f32, f32))>,
 }
@@ -1074,6 +1077,7 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy)]
 struct ReplacedItem {
+    independent_axes: bool,
     intrinsic_width: Option<f32>,
     intrinsic_height: Option<f32>,
     preferred_width: Option<f32>,
@@ -1131,6 +1135,7 @@ impl ReplacedItem {
             })
             .unwrap_or(2.0);
         ReplacedItem {
+            independent_axes: false,
             intrinsic_width: intrinsic
                 .width
                 .filter(|width| width.is_finite() && *width > 0.0),
@@ -1210,6 +1215,12 @@ impl ReplacedItem {
     }
 
     fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
+        if self.independent_axes {
+            return taffy::Size {
+                width: known.width.or(self.intrinsic_width).unwrap_or(0.0),
+                height: known.height.or(self.intrinsic_height).unwrap_or(0.0),
+            };
+        }
         let (width, height) = match (known.width, known.height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (width, width / self.preferred_ratio),
@@ -1468,7 +1479,7 @@ impl TextEngine {
                 &self.loaded_families,
             );
         }
-        self.push_shaped_item(
+        let index = self.push_shaped_item(
             base,
             line_height,
             spans,
@@ -1476,7 +1487,9 @@ impl TextEngine {
             collector.owner_ranges,
             collector.owner_boxes,
             collector.boundary_events,
-        )
+        )?;
+        self.items[index].caret_run = Some((*run.first()?, *run.last()?));
+        Some(index)
     }
 
     /// Shape generated text that owns a positioned pseudo box.
@@ -1500,6 +1513,7 @@ impl TextEngine {
             font_size: context.font_size,
             line_height: context.line_height,
             letter_spacing: context.letter_spacing,
+            word_spacing: context.word_spacing,
             letter_spacing_non_normal: context.letter_spacing_non_normal,
             weight: context.weight,
             optical_sizing: context.optical_sizing,
@@ -1525,6 +1539,7 @@ impl TextEngine {
             &attrs,
             &mut spans,
             &mut collector,
+            None,
         );
         self.push_shaped_item(
             style,
@@ -1802,6 +1817,7 @@ impl TextEngine {
             owner_boxes,
             boundary_events,
             relative_owner_ranges: Vec::new(),
+            caret_run: None,
             measured: Vec::new(),
         });
         Some(idx)
@@ -1896,6 +1912,16 @@ impl TextEngine {
             crate::ReplacedIntrinsic::from_dimensions(width, height),
             style,
         )
+    }
+
+    pub(crate) fn register_native_control(
+        &mut self, width: f32, height: f32, style: &LayoutStyle,
+    ) -> usize {
+        let mut item = ReplacedItem::from_style(width, height, style);
+        item.independent_axes = true;
+        let index = self.replaced.len();
+        self.replaced.push(item);
+        REPLACED_CONTEXT_BIT | index
     }
 
     pub(crate) fn register_replaced_intrinsic(
@@ -2167,6 +2193,145 @@ impl TextEngine {
         }
         out
     }
+
+    fn caret_source(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+    ) -> Option<(String, Vec<CaretBoundary>)> {
+        let item = self.items.get(index)?;
+        let base = styles.get(&parent)?;
+        let mut collector = Collector::new();
+        collector.caret_boundaries = Some(Vec::new());
+        let font = resolve_loaded_font(base.font_family.as_deref(),
+            crate::style::used_font_weight(base), base.font_style_italic.unwrap_or(false),
+            &self.loaded_families);
+        let ctx = base_span_ctx(base, font, &mut collector);
+        let mut spans = Vec::new();
+        if let Some((first, last)) = item.caret_run {
+            let mut children = crate::dom::rendered_children(tree, parent);
+            if !children.contains(&first) || !children.contains(&last) {
+                let mut flattened = Vec::new();
+                crate::dom::flatten_boxless_inline_children(tree, &children, styles, &mut flattened);
+                children = flattened;
+            }
+            let start = children.iter().position(|id| *id == first)?;
+            let end = children.iter().position(|id| *id == last)?;
+            for &id in children.get(start..=end)? {
+                collect_node_spans(tree, id, styles, ctx.clone(), &mut spans,
+                    &mut collector, &self.loaded_families);
+            }
+        } else {
+            collect_spans(tree, parent, styles, ctx, &mut spans,
+                &mut collector, &self.loaded_families);
+        }
+        let mut source: String = spans.into_iter().map(|(text, _)| text).collect();
+        if matches!(base.white_space.unwrap_or_default(),
+            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
+            && source.ends_with(' ')
+        {
+            source.pop();
+        }
+        let mut boundaries = collector.caret_boundaries?;
+        boundaries.retain(|boundary| boundary.byte <= source.len());
+        Some((source, boundaries))
+    }
+
+    /// Use the retained glyph clusters for hit testing, then translate the
+    /// shaped byte cursor into the original DOM node's UTF-16 boundary.
+    pub(crate) fn caret_from_point(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+        x: f32,
+        y: f32,
+        hit: NodeId,
+    ) -> Option<(NodeId, usize, f32)> {
+        let item = self.items.get(index)?;
+        let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
+        if hit != parent && !boundaries.iter().any(|boundary|
+            boundary.node == hit || tree.ancestors(boundary.node).contains(&hit))
+        { return None; }
+        let starts = source_line_starts(&item.buffer, &source);
+        let mut best: Option<(f32, usize, cosmic_text::Affinity)> = None;
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = *starts.get(run.line_i)?;
+            let end = start + run.text.len();
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            for glyph in run.glyphs {
+                if glyph.w <= 0.0 || item.marker.is_some_and(|marker|
+                    marker.line_index == line_index && glyph.x + indent + glyph.w > marker.content_end)
+                { continue; }
+                let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                let dx = item.origin.0 + indent + relative.0
+                    + line_edge_alignment_shift(item, start, end)
+                    + line_advance_before_text(item, start + glyph.start, start, end);
+                let dy = item.origin.1 + relative.1;
+                let left = dx + glyph.x;
+                let top = dy + run.line_top;
+                let distance = (x - x.clamp(left, left + glyph.w)).powi(2)
+                    + (y - y.clamp(top, top + run.line_height)).powi(2);
+                if best.as_ref().is_some_and(|(old, _, _)| *old <= distance) { continue; }
+                // Buffer::hit already implements grapheme/ligature and bidi
+                // boundaries. Remove the extra offsets applied by paint.
+                let hit_x = (x - dx).clamp(glyph.x, glyph.x + glyph.w);
+                let cursor = item.buffer.hit(hit_x, run.line_top + run.line_height * 0.5)?;
+                best = Some((distance, start + cursor.index, cursor.affinity));
+            }
+        }
+        let (distance, byte, affinity) = best?;
+        let nearest = boundaries.iter().map(|boundary| boundary.byte.abs_diff(byte)).min()?;
+        let matches = |boundary: &&CaretBoundary| boundary.byte.abs_diff(byte) == nearest;
+        let boundary = if affinity == cosmic_text::Affinity::Before {
+            boundaries.iter().find(matches)
+        } else {
+            boundaries.iter().rev().find(matches)
+        }?;
+        Some((boundary.node, boundary.offset, distance))
+    }
+
+    pub(crate) fn caret_rect(
+        &self,
+        index: usize,
+        parent: NodeId,
+        tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>,
+        node: NodeId,
+        offset: usize,
+    ) -> Option<Rect> {
+        let item = self.items.get(index)?;
+        let (source, boundaries) = self.caret_source(index, parent, tree, styles)?;
+        let boundary = boundaries.iter().filter(|boundary| boundary.node == node)
+            .min_by_key(|boundary| boundary.offset.abs_diff(offset))?;
+        let starts = source_line_starts(&item.buffer, &source);
+        let style = tree.with_node(node, |node| node.parent)
+            .flatten().and_then(|id| styles.get(&id)).or_else(|| styles.get(&parent))?;
+        let (ascent, descent) = self.inline_font_box_metrics(style);
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let start = *starts.get(run.line_i)?;
+            let byte = boundary.byte.checked_sub(start)?;
+            let Some(glyph) = run.glyphs.iter().find(|glyph| glyph.start <= byte && byte <= glyph.end) else {
+                continue;
+            };
+            let relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            return Some(Rect {
+                x: item.origin.0 + run_cursor_x(&run, byte) + indent + relative.0
+                    + line_edge_alignment_shift(item, start, start + run.text.len())
+                    + line_advance_before_text(item, start + glyph.start, start, start + run.text.len()),
+                y: item.origin.1 + run.line_y + relative.1 - ascent,
+                width: 0.0,
+                height: ascent + descent,
+            });
+        }
+        None
+    }
 }
 
 /// A run of same-styled inline text.
@@ -2175,6 +2340,7 @@ struct SpanAttrs {
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    word_spacing: f32,
     letter_spacing_non_normal: bool,
     weight: u16,
     optical_sizing: crate::FontOpticalSizing,
@@ -2240,6 +2406,9 @@ impl SpanAttrs {
         if self.synthetic_italic {
             a = a.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
         }
+        if self.word_spacing.is_finite() && self.word_spacing != 0.0 {
+            a = a.word_spacing(self.word_spacing / self.font_size.max(1.0));
+        }
         if self.letter_spacing.is_finite() && self.letter_spacing != 0.0 {
             a = a.letter_spacing(self.letter_spacing / self.font_size.max(1.0));
         }
@@ -2302,6 +2471,7 @@ struct SpanCtx {
     font_size: f32,
     line_height: f32,
     letter_spacing: f32,
+    word_spacing: f32,
     letter_spacing_non_normal: bool,
     color: [u8; 4],
     weight: u16,
@@ -2330,6 +2500,14 @@ struct Collector {
     owner_boxes: Vec<InlineOwnerBox>,
     boundary_events: Vec<InlineBoundaryEvent>,
     text_len: usize,
+    caret_boundaries: Option<Vec<CaretBoundary>>,
+}
+
+#[derive(Clone, Copy)]
+struct CaretBoundary {
+    byte: usize,
+    node: NodeId,
+    offset: usize,
 }
 
 impl Collector {
@@ -2342,6 +2520,7 @@ impl Collector {
             owner_boxes: Vec::new(),
             boundary_events: Vec::new(),
             text_len: 0,
+            caret_boundaries: None,
         }
     }
 
@@ -2447,6 +2626,7 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         font_size: base.font_size.unwrap_or(16.0),
         line_height,
         letter_spacing: base.letter_spacing.unwrap_or(0.0),
+        word_spacing: base.word_spacing.unwrap_or(0.0),
         letter_spacing_non_normal: base.letter_spacing_non_normal.unwrap_or(false),
         color: base.color.unwrap_or([0, 0, 0, 255]),
         weight: crate::style::used_font_weight(base),
@@ -2504,6 +2684,7 @@ fn collect_node_spans(
                 font_size: ctx.font_size,
                 line_height: ctx.line_height,
                 letter_spacing: ctx.letter_spacing,
+                word_spacing: ctx.word_spacing,
                 letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                 weight: ctx.weight,
                 optical_sizing: ctx.optical_sizing,
@@ -2521,7 +2702,7 @@ fn collect_node_spans(
                 overflow_wrap: ctx.overflow_wrap,
                 word_break: ctx.word_break,
             };
-            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c);
+            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c, Some(cid));
         }
         _ => {
             let Some(elem) = node.as_element() else {
@@ -2538,6 +2719,7 @@ fn collect_node_spans(
                         font_size: ctx.font_size,
                         line_height: ctx.line_height,
                         letter_spacing: ctx.letter_spacing,
+                        word_spacing: ctx.word_spacing,
                         letter_spacing_non_normal: ctx.letter_spacing_non_normal,
                         weight: ctx.weight,
                         optical_sizing: ctx.optical_sizing,
@@ -2610,6 +2792,9 @@ fn collect_node_spans(
                 letter_spacing: style
                     .and_then(|style| style.letter_spacing)
                     .unwrap_or(ctx.letter_spacing),
+                word_spacing: style
+                    .and_then(|style| style.word_spacing)
+                    .unwrap_or(ctx.word_spacing),
                 letter_spacing_non_normal: style
                     .and_then(|style| style.letter_spacing_non_normal)
                     .unwrap_or(ctx.letter_spacing_non_normal),
@@ -2654,9 +2839,44 @@ fn push_text(
     attrs: &SpanAttrs,
     out: &mut Vec<(String, SpanAttrs)>,
     c: &mut Collector,
+    node: Option<NodeId>,
 ) {
+    let start = c.text_len;
+    let buf = if let (Some(boundaries), Some(node)) = (&mut c.caret_boundaries, node) {
+        normalize_text(raw, transform, white_space, &mut c.last_was_space, |byte, offset| {
+            // Pre-line normalization can remove the space before a newline.
+            while boundaries.last().is_some_and(|boundary| boundary.byte > start + byte) {
+                boundaries.pop();
+            }
+            boundaries.push(CaretBoundary { byte: start + byte, node, offset });
+        })
+    } else {
+        normalize_text(raw, transform, white_space, &mut c.last_was_space, |_, _| {})
+    };
+    if buf.is_empty() {
+        return;
+    }
+    c.record_text(buf.len());
+    if let Some((last_text, last_attrs)) = out.last_mut() {
+        if last_attrs == attrs {
+            last_text.push_str(&buf);
+            return;
+        }
+    }
+    out.push((buf, attrs.clone()));
+}
+
+fn normalize_text(
+    raw: &str,
+    transform: TextTransform,
+    white_space: crate::WhiteSpace,
+    last_was_space: &mut bool,
+    mut boundary: impl FnMut(usize, usize),
+) -> String {
     let mut buf = String::new();
-    let mut at_word_start = c.last_was_space;
+    let mut at_word_start = *last_was_space;
+    let mut offset = 0;
+    boundary(0, 0);
     for ch in raw.chars() {
         if ch.is_whitespace() {
             match white_space {
@@ -2669,10 +2889,10 @@ fn push_text(
                     }
                     buf.push('\n');
                 }
-                _ if !c.last_was_space => buf.push(' '),
+                _ if !*last_was_space => buf.push(' '),
                 _ => {}
             }
-            c.last_was_space = true;
+            *last_was_space = true;
             at_word_start = true;
         } else {
             match transform {
@@ -2681,21 +2901,13 @@ fn push_text(
                 TextTransform::Capitalize if at_word_start => buf.extend(ch.to_uppercase()),
                 _ => buf.push(ch),
             }
-            c.last_was_space = false;
+            *last_was_space = false;
             at_word_start = false;
         }
+        offset += ch.len_utf16();
+        boundary(buf.len(), offset);
     }
-    if buf.is_empty() {
-        return;
-    }
-    c.record_text(buf.len());
-    if let Some((last_text, last_attrs)) = out.last_mut() {
-        if last_attrs == attrs {
-            last_text.push_str(&buf);
-            return;
-        }
-    }
-    out.push((buf, attrs.clone()));
+    buf
 }
 
 fn boundary_event_on_line(
@@ -3182,7 +3394,7 @@ pub(crate) fn default_replaced_intrinsic_size(
 /// genuinely cannot fold are rejected: replaced/atomic elements, block-level
 /// children, floats, out-of-flow positioned boxes, and elements with generated
 /// content (which would be lost).
-fn inline_child_ok(
+pub(crate) fn inline_child_ok(
     tree: &DomTree,
     cid: NodeId,
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,
@@ -4588,6 +4800,7 @@ mod tests {
             font_size: 16.0,
             line_height: 18.0,
             letter_spacing: 0.0,
+            word_spacing: 0.0,
             letter_spacing_non_normal: false,
             weight: 400,
             optical_sizing: crate::FontOpticalSizing::Auto,
@@ -4670,6 +4883,7 @@ mod tests {
             font_size: 20.0,
             line_height: 24.0,
             letter_spacing: 2.0,
+            word_spacing: 0.0,
             letter_spacing_non_normal: true,
             weight: 400,
             optical_sizing: crate::FontOpticalSizing::Auto,

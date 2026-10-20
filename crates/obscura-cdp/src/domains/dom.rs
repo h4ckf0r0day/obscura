@@ -1,8 +1,83 @@
+use std::collections::HashMap;
+
 use obscura_browser::Page;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
+use crate::types::CdpEvent;
+
+pub(crate) struct DomDocument {
+    pub page_id: String,
+    children_sent: HashMap<NodeId, bool>,
+}
+
+impl DomDocument {
+    fn remember(&mut self, root: &Value) {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if let Some(id) = node["nodeId"].as_u64().and_then(|id| u32::try_from(id).ok()) {
+                self.children_sent.insert(NodeId::new(id),
+                    node["children"].is_array() || node["childNodeCount"] == 0);
+            }
+            if let Some(children) = node["children"].as_array() {
+                pending.extend(children);
+            }
+        }
+    }
+}
+
+fn node_id_param(params: &Value) -> Result<NodeId, String> {
+    params["nodeId"].as_u64().and_then(|id| u32::try_from(id).ok())
+        .map(NodeId::new).ok_or_else(|| "valid nodeId required".into())
+}
+
+fn push_children(dom: &DomTree, state: &mut DomDocument, node: NodeId, depth: u32,
+    session_id: &Option<String>, events: &mut Vec<CdpEvent>) {
+    let mut pending = vec![(node, depth.min(MAX_SERIALIZE_DEPTH))];
+    while let Some((parent, depth)) = pending.pop() {
+        let Some(sent) = state.children_sent.get(&parent).copied() else { continue };
+        let children = dom.children(parent);
+        if !sent {
+            let nodes: Vec<_> = children.iter()
+                .map(|child| serialize_node(dom, *child, depth - 1, 0)).collect();
+            for node in &nodes { state.remember(node); }
+            state.children_sent.insert(parent, true);
+            events.push(CdpEvent {
+                method: "DOM.setChildNodes".into(),
+                params: json!({"parentId":parent.index(), "nodes":nodes}),
+                session_id: session_id.clone(),
+            });
+        } else if depth > 1 {
+            pending.extend(children.into_iter().rev().map(|child| (child, depth - 1)));
+        }
+    }
+}
+
+fn push_node(ctx: &mut CdpContext, session_id: &Option<String>, node: NodeId) -> Result<u32, String> {
+    let Some(mut state) = ctx.dom_documents.remove(session_id) else { return Ok(0) };
+    let mut events = Vec::new();
+    let result = ctx.get_session_page(session_id).and_then(|page| page.with_dom(|dom| {
+        if dom.get_node(node).is_none() { return Err("No node with given id found".into()); }
+        if !state.children_sent.contains_key(&node) {
+            let path = dom.ancestors(node);
+            if path.last().copied() != Some(dom.document()) {
+                return Err("Node is outside the requested light-DOM document".into());
+            }
+            for parent in path.into_iter().rev() {
+                push_children(dom, &mut state, parent, 1, session_id, &mut events);
+            }
+            if !state.children_sent.contains_key(&node) {
+                // shortcut: refresh inserted children until live DOM mutation events publish them.
+                return Err("Node requires DOM mutation events; request the document again".into());
+            }
+        }
+        Ok(node.index() as u32)
+    })).unwrap_or_else(|| Err("No DOM loaded".into()));
+    ctx.dom_documents.insert(session_id.clone(), state);
+    ctx.pending_events.extend(events);
+    result
+}
 
 /// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
 /// and `objectId` in that order. Playwright commonly passes only `objectId`
@@ -95,13 +170,100 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => Ok(json!({})),
+        "disable" => {
+            ctx.dom_documents.remove(session_id);
+            Ok(json!({}))
+        }
         "getDocument" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(2);
-            page.with_dom(|dom| {
-                let node = serialize_node(dom, dom.document(), depth as u32, 0);
-                json!({ "root": node })
-            }).ok_or_else(|| "No DOM loaded".to_string())
+            let root = page.with_dom(|dom| serialize_node(dom, dom.document(), depth as u32, 0))
+                .ok_or("No DOM loaded")?;
+            let mut state = DomDocument { page_id: page.id.clone(), children_sent: HashMap::new() };
+            state.remember(&root);
+            ctx.dom_documents.insert(session_id.clone(), state);
+            Ok(json!({"root":root}))
+        }
+        "getAttributes" => {
+            let node_id = node_id_param(params)?;
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let attributes = page.with_dom(|dom| {
+                let node = dom.get_node(node_id).ok_or("No node with given id found")?;
+                let attrs = node.attrs().ok_or("Node is not an Element")?;
+                Ok::<_, &str>(attrs.iter().flat_map(|attr| [attr.qualified_name(), attr.value.clone()]).collect::<Vec<_>>())
+            }).ok_or("No DOM loaded")?.map_err(str::to_string)?;
+            Ok(json!({"attributes":attributes}))
+        }
+        "requestChildNodes" => {
+            let node = node_id_param(params)?;
+            let depth = match params.get("depth") {
+                None => 1,
+                Some(value) => match value.as_i64() {
+                    Some(-1) => u32::MAX,
+                    Some(value) if value > 0 => u32::try_from(value).unwrap_or(u32::MAX),
+                    _ => return Err("depth must be positive or -1".into()),
+                },
+            };
+            if params["pierce"].as_bool() == Some(true) {
+                let page = ctx.get_session_page(session_id).ok_or("No page")?;
+                let needs_piercing = page.with_dom(|dom| {
+                    let mut pending = vec![(node, depth.min(MAX_SERIALIZE_DEPTH))];
+                    while let Some((id, remaining)) = pending.pop() {
+                        if dom.shadow_root(id).is_some() || dom.get_node(id).is_some_and(|node|
+                            node.as_element().is_some_and(|name| name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                                && matches!(name.local.as_ref(), "iframe" | "frame"))) {
+                            return true;
+                        }
+                        if remaining > 0 {
+                            pending.extend(dom.children(id).into_iter().map(|child| (child, remaining - 1)));
+                        }
+                    }
+                    false
+                }).unwrap_or(false);
+                if needs_piercing {
+                    return Err("Piercing frame and shadow trees is not supported".into());
+                }
+            }
+            if let Some(mut state) = ctx.dom_documents.remove(session_id) {
+                let mut events = Vec::new();
+                if let Some(page) = ctx.get_session_page(session_id) {
+                    page.with_dom(|dom| push_children(dom, &mut state, node, depth, session_id, &mut events));
+                }
+                ctx.dom_documents.insert(session_id.clone(), state);
+                ctx.pending_events.extend(events);
+            }
+            Ok(json!({}))
+        }
+        "requestNode" => {
+            let oid = params["objectId"].as_str().ok_or("objectId required")?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let code = format!(
+                "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects[{}]; \
+                 return o instanceof Node && (o === document || o.ownerDocument === document) ? o._nid : -1; }})()",
+                crate::util::object_id_literal(oid)
+            );
+            let id = page.evaluate(&code).as_f64().filter(|id|
+                id.is_finite() && *id >= 0.0 && *id <= u32::MAX as f64 && id.fract() == 0.0)
+                .ok_or("Object id does not reference a Node in this document")? as u32;
+            Ok(json!({"nodeId":push_node(ctx, session_id, NodeId::new(id))?}))
+        }
+        "getNodeForLocation" => {
+            let x = params["x"].as_i64().ok_or("integer x required")?;
+            let y = params["y"].as_i64().ok_or("integer y required")?;
+            if params["ignorePointerEventsNone"].as_bool() == Some(true) {
+                return Err("Ignoring pointer-events in hit testing is not supported".into());
+            }
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let frame = page.frame_id.clone();
+            let id = page.evaluate(&format!(
+                "(function() {{ var node = document.elementFromPoint({x},{y}); return node ? node._nid : -1; }})()"
+            )).as_f64().filter(|id| *id >= 0.0 && *id <= u32::MAX as f64)
+                .ok_or("No node found at given location")? as u32;
+            let mut result = json!({"backendNodeId":id,"frameId":frame});
+            if ctx.dom_documents.contains_key(session_id) {
+                result["nodeId"] = json!(push_node(ctx, session_id, NodeId::new(id))?);
+            }
+            Ok(result)
         }
         "querySelector" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
@@ -122,10 +284,12 @@ pub async fn handle(
             Ok(json!({ "nodeIds": ids }))
         }
         "getOuterHTML" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-                .ok_or("nodeId required")?;
+            // go-rod asks for the HTML of an element handle it already holds and
+            // sends `objectId` only (rod/element.go DOMGetOuterHTML). Chromium
+            // accepts all three identifiers here; accepting nodeId alone made
+            // every rod page.HTML() fail with "nodeId required".
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
             let html = page.with_dom(|dom| {
                 dom.outer_html(NodeId::new(node_id as u32))
             }).unwrap_or_default();
@@ -422,7 +586,7 @@ fn node_value(dom: &DomTree, node_id: NodeId) -> Option<(Value, Vec<NodeId>)> {
             result["localName"] = json!(name.local.as_ref());
             result["nodeValue"] = json!("");
             let cdp_attrs: Vec<String> = attrs.iter()
-                .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()]).collect();
+                .flat_map(|a| [a.qualified_name(), a.value.clone()]).collect();
             result["attributes"] = json!(cdp_attrs);
         }
         NodeData::Text { contents } => {
@@ -524,6 +688,33 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dom_node_tracking_is_released_on_navigation_detach_and_close() {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let session = Some(format!("{page}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page.clone());
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<p>first</p>"}),
+            &mut ctx, &session).await.unwrap();
+        handle("getDocument", &json!({"depth":-1}), &mut ctx, &session).await.unwrap();
+        ctx.pending_events.clear();
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<p>second</p>"}),
+            &mut ctx, &session).await.unwrap();
+        assert!(ctx.dom_documents.is_empty(), "navigation must release the old node cache");
+        assert!(ctx.pending_events.iter().any(|event| event.method == "DOM.documentUpdated"
+            && event.session_id == session));
+        handle("getDocument", &json!({}), &mut ctx, &session).await.unwrap();
+        crate::domains::target::handle("detachFromTarget", &json!({"sessionId":session}),
+            &mut ctx, &None).await.unwrap();
+        assert!(ctx.dom_documents.is_empty(), "detach must release session-owned nodes");
+        let closing_session = Some("closing".to_string());
+        ctx.sessions.insert(closing_session.clone().unwrap(), page.clone());
+        handle("getDocument", &json!({}), &mut ctx, &closing_session).await.unwrap();
+        assert_eq!(ctx.dom_documents.len(), 1);
+        ctx.remove_page(&page);
+        assert!(ctx.dom_documents.is_empty(), "close must release the target's node cache");
+    }
 
     // The escaping this file used to own now lives in `util::object_id_literal`,
     // which is where its tests went with it: the three lookup sites here embed

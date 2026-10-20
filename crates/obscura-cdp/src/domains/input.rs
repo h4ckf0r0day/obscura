@@ -21,13 +21,20 @@ fn js_str(s: &str) -> String {
 // they left out: a newline inside a single-quoted literal is a syntax error,
 // so the whole snippet was dropped and nothing was inserted. obscura-mcp
 // already builds its typing snippet this way.
-fn insert_text_js(text: &str) -> String {
+fn insert_text_js(text: &str, ime_commit: bool) -> String {
     let literal = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            if (globalThis.__obscura_isDisabled(t)) return;\
+            if (!{ime_commit} && t.hasAttribute('readonly')) return;\
             var ins = {text};\
+            var commitStart = {ime_commit} ? t.selectionStart : null;\
+            if ({ime_commit} && commitStart == null) commitStart = (t.value || '').length;\
+            var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\
+            if (!t.dispatchEvent(before)) return;\
+            if (t.hasAttribute('readonly') || globalThis.__obscura_isDisabled(t)) return;\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
             if (s == null) {{\
@@ -37,10 +44,10 @@ fn insert_text_js(text: &str) -> String {
                 e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
                 var lo = Math.min(s, e), hi = Math.max(s, e);\
                 globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
-                var caret = lo + ins.length;\
+                var caret = Math.max(0, Math.min((commitStart == null ? lo : commitStart) + ins.length, t.value.length));\
                 t.setSelectionRange(caret, caret);\
             }}\
-            t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+            t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ins,inputType:'insertText'}})));\
         }})()",
         text = literal,
     )
@@ -53,6 +60,7 @@ fn insert_text_js(text: &str) -> String {
 const BACKSPACE_JS: &str = "(function() {\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.hasAttribute('readonly')) return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
     function backCount(str, p) {\
@@ -84,6 +92,7 @@ const BACKSPACE_JS: &str = "(function() {\
 const DELETE_JS: &str = "(function() {\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.hasAttribute('readonly')) return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
     if (s == null) return;\
@@ -251,8 +260,8 @@ pub async fn handle(
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
                             if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
-                            var oldChecked = checkable ? !!clickTarget.checked : false;\
-                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
+                            var oldChecked = checkable ? globalThis.__obscura_inputChecked(clickTarget) : false;\
+                            var oldIndeterminate = checkable ? globalThis.__obscura_inputIndeterminate(clickTarget) : false;\
                             var radioStates = null;\
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
@@ -262,28 +271,28 @@ pub async fn handle(
                                     for (var ri = 0; ri < candidates.length; ri++) {{\
                                         var radio = candidates[ri];\
                                         if ((radio.getAttribute('type') || '').toLowerCase() !== 'radio' || (radio.getAttribute('name') || '') !== radioName || radio.form !== clickTarget.form) continue;\
-                                        radioStates.push([radio, !!radio.checked]);\
-                                        if (radio !== clickTarget) globalThis.__obscura_setFieldValue(radio, 'checked', false);\
+                                        radioStates.push([radio, globalThis.__obscura_inputChecked(radio)]);\
+                                        if (radio !== clickTarget) globalThis.__obscura_setInputChecked(radio, false);\
                                     }}\
                                 }}\
-                                globalThis.__obscura_setFieldValue(clickTarget, 'checked', true);\
+                                globalThis.__obscura_setInputChecked(clickTarget, true);\
                             }} else if (checkable) {{\
-                                globalThis.__obscura_setFieldValue(clickTarget, 'checked', !oldChecked);\
-                                clickTarget.indeterminate = false;\
+                                globalThis.__obscura_setInputChecked(clickTarget, !oldChecked);\
+                                globalThis.__obscura_setInputIndeterminate(clickTarget, false);\
                             }}\
                             var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
-                                    for (var rr = 0; rr < radioStates.length; rr++) globalThis.__obscura_setFieldValue(radioStates[rr][0], 'checked', radioStates[rr][1]);\
-                                }} else if (checkable) {{ globalThis.__obscura_setFieldValue(clickTarget, 'checked', oldChecked); clickTarget.indeterminate = oldIndeterminate; }}\
+                                    for (var rr = 0; rr < radioStates.length; rr++) globalThis.__obscura_setInputChecked(radioStates[rr][0], radioStates[rr][1]);\
+                                }} else if (checkable) {{ globalThis.__obscura_setInputChecked(clickTarget, oldChecked); globalThis.__obscura_setInputIndeterminate(clickTarget, oldIndeterminate); }}\
                                 return;\
                             }}\
                             if ({click_count} === 2) {{\
                                 var doubleClick = globalThis.__obscura_markTrusted(new MouseEvent('dblclick', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:2,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 clickTarget.dispatchEvent(doubleClick);\
                             }}\
-                            if (checkable && clickTarget.checked !== oldChecked) {{\
+                            if (checkable && globalThis.__obscura_inputChecked(clickTarget) !== oldChecked) {{\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
@@ -397,7 +406,9 @@ pub async fn handle(
         "insertText" => {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.evaluate(&insert_text_js(text));
+                // IME commits snapshot the final caret before beforeinput.
+                // Keyboard insertion instead follows the handler's selection.
+                page.evaluate(&insert_text_js(text, true));
             }
             Ok(json!({}))
         }
@@ -420,7 +431,7 @@ pub async fn handle(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                target.dispatchEvent(evt);\
+                                return target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -430,10 +441,12 @@ pub async fn handle(
                             code = js_str(code),
                             virtual_key_code = virtual_key_code,
                         );
-                        page.evaluate(&js);
+                        if page.evaluate(&js).as_bool() == Some(false) {
+                            return Ok(json!({}));
+                        }
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
-                            page.evaluate(&insert_text_js(text));
+                            page.evaluate(&insert_text_js(text, false));
                         }
 
                         if key == "Enter" {
@@ -446,6 +459,7 @@ pub async fn handle(
                                 if (!target) return;\
                                 target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
                                 if (target.localName === 'textarea') {\
+                                    if (target.hasAttribute('readonly')) return;\
                                     var value = target.value || '';\
                                     var start = target.selectionStart, end = target.selectionEnd;\
                                     start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
@@ -486,7 +500,7 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
-                            page.evaluate(&insert_text_js(text));
+                            page.evaluate(&insert_text_js(text, false));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }

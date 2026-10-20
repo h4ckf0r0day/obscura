@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::max_live_frames;
+use obscura_js::ops::{CachedNetworkResponseBody, OriginStorage, max_live_frames, NavigationTiming, StoredNetworkResponseBody};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -186,6 +186,7 @@ pub struct NetworkEvent {
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub error_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +249,11 @@ pub struct Page {
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
+    /// `sessionStorage` backing store, keyed by origin. Owned by the Page rather
+    /// than by the realm: `init_js` runs on every navigation and on CDP target
+    /// switching, but a session entry must survive both while never leaving the
+    /// tab (issue #678).
+    session_storage: Arc<OriginStorage>,
     pub title: String,
     /// Source document URL for the current document. This is deliberately
     /// separate from `url`: direct automation navigations have no referrer,
@@ -265,6 +271,8 @@ pub struct Page {
     /// keeps this baseline across subsequent override calls and restores it
     /// only when the override is cleared.
     device_metrics_baseline: Option<DeviceMetricsBaseline>,
+    reduced_motion: bool,
+    dark_color_scheme: bool,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -277,10 +285,15 @@ pub struct Page {
     /// Exposed to JS as `document.characterSet` and used for the URL query
     /// encoding override on `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
+    /// MIME type of the current document's main resource, lowercased and
+    /// without parameters, or empty when no type was supplied.
+    /// Exposed to JS as `document.contentType`.
+    pub content_type: String,
     /// Monotonic origin for the current document's CSS animation timeline.
     /// It is reset once author styles are installed, so stylesheet download
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
+    navigation_timing: NavigationTiming,
     /// Optional page-scoped ceiling for an end-to-end navigation. Automation
     /// frontends set this from their request timeout so a caller asking for a
     /// 50-second navigation is not silently cut off by the process default.
@@ -301,7 +314,7 @@ pub struct Page {
     /// to the entry instead of appending a new one.
     pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
-    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
+    response_bodies: std::collections::HashMap<String, CachedNetworkResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -1099,6 +1112,7 @@ impl Page {
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
+            session_storage: Arc::new(OriginStorage::default()),
             title: String::new(),
             referrer: String::new(),
             viewport: (1280.0, 720.0),
@@ -1106,10 +1120,14 @@ impl Page {
             screen_metrics_emulated: false,
             locale_override: None,
             device_metrics_baseline: None,
+            reduced_motion: false,
+            dark_color_scheme: false,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
+            content_type: String::new(),
             document_timeline_origin: std::time::Instant::now(),
+            navigation_timing: NavigationTiming::default(),
             navigation_timeout: None,
             navigation_chain_limit: None,
             history: Vec::new(),
@@ -1312,6 +1330,7 @@ impl Page {
 
         let Some(PendingFrameWork::Attached {
             frame_id,
+            parent_frame_id,
             frame_url,
             sources,
             ..
@@ -1320,6 +1339,7 @@ impl Page {
             return false;
         };
         let frame_id = *frame_id;
+        let parent_frame_id = *parent_frame_id;
         let frame_url = frame_url.clone();
         let sources = std::mem::take(sources);
         let Some(index) = self
@@ -1341,6 +1361,11 @@ impl Page {
             }
         }
         self.pending_frame_work.pop_front();
+        self.execute_frame_owner_script(parent_frame_id, &format!(
+            "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
+             if (frame && frame.isConnected && frame._frameId === {frame_id}) \
+               frame.dispatchEvent(new Event('load')); }})()"
+        ));
         true
     }
 
@@ -1429,13 +1454,13 @@ impl Page {
         }
     }
 
-    /// Executes cleanup in the realm that owns the iframe element. Nested
+    /// Executes code in the realm that owns the iframe element. Nested
     /// iframe registries live in their parent frame, not in the page realm.
     fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
         if parent_frame_id == 0 {
             if let Some(js) = self.js.as_mut() {
-                if let Err(error) = js.execute_script("<frame-detach>", script) {
-                    tracing::debug!("releasing frame references failed: {error}");
+                if let Err(error) = js.execute_script("<frame-owner>", script) {
+                    tracing::debug!("frame owner script failed: {error}");
                 }
             }
             return;
@@ -1450,7 +1475,7 @@ impl Page {
         };
         let Some(js) = self.js.as_mut() else { return };
         if let Err(error) = self.frames[index].execute_script(js, script) {
-            tracing::debug!("releasing nested frame references failed: {error}");
+            tracing::debug!("nested frame owner script failed: {error}");
         }
     }
 
@@ -1500,6 +1525,13 @@ impl Page {
                     tracing::debug!("could not list a frame's live frames: {error}");
                     return;
                 }
+            }
+        }
+        // A synchronously initialized parent may not be in self.frames yet.
+        // Its children's native owner chain still proves they are connected.
+        if let Some(js) = &self.js {
+            for pending in &self.pending_frame_work {
+                if js.frame_is_active(pending.frame_id()) { live.push(pending.frame_id()); }
             }
         }
         let mut discarded_ids: std::collections::HashSet<u32> = self
@@ -1690,6 +1722,23 @@ impl Page {
         self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
+    /// Override reduced-motion and dark color-scheme preferences together.
+    /// The pair persists across navigation and is shared with child documents.
+    pub fn set_media_preferences(&mut self, reduce: bool, dark: bool) {
+        self.reduced_motion = reduce;
+        self.dark_color_scheme = dark;
+        if let Some(js) = &mut self.js {
+            js.set_media_preferences(reduce, dark);
+        }
+    }
+
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        self.reduced_motion = reduce;
+        if let Some(js) = &mut self.js {
+            js.set_reduced_motion(reduce);
+        }
+    }
+
     /// Set the screenshot surface density without changing CSS layout. CDP
     /// uses zero to disable its override, which restores the native 1x surface
     /// in Obscura's headless-only model.
@@ -1766,6 +1815,7 @@ impl Page {
         );
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
+        rt.set_content_type(&self.content_type);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
         let (session_history, session_index) = self.predicted_session_history();
@@ -1815,6 +1865,10 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        // Web Storage lives outside the realm so a navigation cannot drop it.
+        rt.set_local_storage(self.context.local_storage.clone());
+        rt.set_indexed_db(self.context.indexed_db.clone());
+        rt.set_session_storage(self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -1832,6 +1886,7 @@ impl Page {
         // runtime does not exist yet, so the new runtime would otherwise start
         // with interception disabled and op_fetch_url would never intercept.
         rt.set_intercept_enabled(self.intercept_enabled);
+        rt.set_intercept_url_patterns(self.intercept_block_patterns.clone());
         #[cfg(feature = "render")]
         rt.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         rt.set_runtime_events_enabled(self.runtime_events_enabled.get());
@@ -1841,7 +1896,9 @@ impl Page {
             rt.set_dom(dom);
         }
 
+        rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
+        rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
@@ -2818,14 +2875,6 @@ impl Page {
                             tracing::warn!("ES module evaluation error: {}", error);
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
-                            self.record_network_event(
-                                &url,
-                                "GET",
-                                "Script",
-                                200,
-                                &std::collections::HashMap::new(),
-                                0,
-                            );
                         }
                     } else {
                         post_parse.push(scheduled);
@@ -2838,6 +2887,7 @@ impl Page {
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
         if let Some(js) = &mut self.js {
+            js.record_navigation_timing("domInteractive");
             let _ = js.execute_script(
                 "<ready-state-interactive>",
                 "globalThis.__documentReadyState__ = 'interactive';",
@@ -2905,14 +2955,6 @@ impl Page {
                         tracing::warn!("ES module evaluation error: {}", error);
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
-                        self.record_network_event(
-                            &url,
-                            "GET",
-                            "Script",
-                            200,
-                            &std::collections::HashMap::new(),
-                            0,
-                        );
                     }
                 }
             }
@@ -2923,11 +2965,15 @@ impl Page {
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
-            let _ = js.execute_script(
+            js.record_navigation_timing("domContentLoadedEventStart");
+            let completed = js.execute_script(
                 "<dom-content-loaded>",
                 "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
+            if completed.is_ok() {
+                js.record_navigation_timing("domContentLoadedEventEnd");
+            }
 
             let load_blockers_finished =
                 Self::drive_load_delaying_scripts(js, script_deadline).await;
@@ -2940,7 +2986,9 @@ impl Page {
             // readyState becomes complete before the load event. A script
             // inserted by an onload handler is therefore post-load work and
             // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
+            js.record_navigation_timing("domComplete");
+            js.record_navigation_timing("loadEventStart");
+            let completed = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  try {\n\
@@ -2948,6 +2996,9 @@ impl Page {
                    try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
                  } catch(e) {}",
             );
+            if completed.is_ok() {
+                js.record_navigation_timing("loadEventEnd");
+            }
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -2960,6 +3011,7 @@ impl Page {
             budget_ms = script_deadline_ms,
             "script execution phase complete",
         );
+        self.sync_js_network_events();
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -3354,6 +3406,7 @@ impl Page {
         referrer: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        self.navigation_timing = NavigationTiming::default();
 
         // The previous document's background loads end with the document.
         self.retire_render_resources();
@@ -3415,6 +3468,7 @@ impl Page {
             return Ok(());
         }
 
+        self.navigation_timing.record("fetchStart");
         let response = if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
@@ -3445,9 +3499,9 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        self.navigation_timing.record("responseEnd");
 
-        // Apply Chromium's charset-aware DevTools body policy. This preserves
-        // both non-UTF-8 text and opaque binary bytes without lossy conversion.
+        // Keep original bytes for streams; DevTools text decoding happens on read.
         let request_id = self.record_network_event_inner(
             response.url.as_str(),
             "GET",
@@ -3459,7 +3513,7 @@ impl Page {
         let body = &response.body;
         let content_type = response.content_type();
         self.store_response_body_with(request_id, body.len(), || {
-            stored_devtools_document_response_body(body, content_type)
+            CachedNetworkResponseBody::raw(body, content_type)
         });
 
         if !response.redirected_from.is_empty() {
@@ -3473,7 +3527,18 @@ impl Page {
         let (body_text, encoding_name) =
             obscura_net::decode_response_with_name(&response.body, response.content_type());
         self.encoding = encoding_name.to_string();
-        let dom = parse_html(&body_text);
+        self.navigation_timing.record("domLoading");
+        // A non-HTML text response is a plain-text document, not an HTML one
+        // that happens to hold text: every `<word>` in a .txt or .md body
+        // would otherwise be parsed as an element and its contents dropped
+        // from textContent (#1231). Chrome wraps the decoded text in a
+        // single <pre> instead.
+        let (dom, document_content_type) = match plain_text_document_type(response.content_type())
+        {
+            Some(mime) => (parse_plain_text_document(&body_text), mime),
+            None => (parse_html(&body_text), base_content_type(response.content_type()).unwrap_or_default()),
+        };
+        self.content_type = document_content_type;
 
         self.title = dom
             .query_selector("title")
@@ -3563,6 +3628,9 @@ impl Page {
         // page.click() handlers were no-ops. Now scripts run regardless
         // of waitUntil and DCL means "DOM parsed AND scripts executed".
         self.execute_scripts().await;
+        // The document's own scripts are the common source of storage writes,
+        // so the profile is flushed once they have run, not before.
+        self.context.save_local_storage();
 
         #[cfg(feature = "render")]
         {
@@ -3612,61 +3680,77 @@ impl Page {
                 _ => 0,
             };
 
-            // Same hazard as the post-script settle: a synchronous poll can pin
-            // the thread past the 5s network-idle deadline, so arm a watchdog
-            // that terminates the isolate ~500ms past it.
-            let netidle_wd = self
-                .js
-                .as_mut()
-                .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-            let mut idle_since: Option<tokio::time::Instant> = None;
-
-            loop {
-                let active = self.http_client.active_requests();
-                let now = tokio::time::Instant::now();
-
-                if active <= threshold {
-                    if idle_since.is_none() {
-                        idle_since = Some(now);
-                    }
-                    if now.duration_since(idle_since.unwrap())
-                        >= tokio::time::Duration::from_millis(500)
-                    {
-                        break;
-                    }
-                } else {
-                    idle_since = None;
-                }
-
-                if now >= deadline {
-                    tracing::debug!(
-                        "Network idle timeout reached with {} active requests",
-                        active
-                    );
-                    break;
-                }
-
-                if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    )
-                    .await;
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            }
-
-            if let Some(token) = netidle_wd {
-                if let Some(js) = self.js.as_mut() {
-                    js.disarm_watchdog(token);
-                }
-            }
-            self.lifecycle = LifecycleState::NetworkIdle;
+            self.wait_for_network_idle(threshold).await;
         }
 
         Ok(())
+    }
+
+    async fn wait_for_network_idle(&mut self, threshold: u32) {
+        // Same hazard as the post-script settle: a synchronous poll can pin
+        // the thread past the 5s network-idle deadline, so arm a watchdog
+        // that terminates the isolate ~500ms past it.
+        let netidle_wd = self
+            .js
+            .as_mut()
+            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let mut idle_since: Option<tokio::time::Instant> = None;
+
+        loop {
+            let active = self.http_client.active_requests();
+            let now = tokio::time::Instant::now();
+
+            if active <= threshold {
+                if idle_since.is_none() {
+                    idle_since = Some(now);
+                }
+                if now.duration_since(idle_since.unwrap())
+                    >= tokio::time::Duration::from_millis(500)
+                {
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+
+            if now >= deadline {
+                tracing::debug!(
+                    "Network idle timeout reached with {} active requests",
+                    active
+                );
+                break;
+            }
+
+            // An idle runtime can stay parked. Wake at the existing quiet
+            // window or hard deadline instead of adding a final full slice.
+            let readiness_deadline = idle_since
+                .map_or(deadline, |since| since + tokio::time::Duration::from_millis(500))
+                .min(deadline);
+            if let Some(js) = &mut self.js {
+                let next_check = readiness_deadline.min(now + tokio::time::Duration::from_millis(50));
+                crate::idle_deadline::wait_for_activity(
+                    next_check,
+                    next_check == readiness_deadline,
+                    js.wait_for_event_loop_activity(),
+                )
+                .await;
+            } else {
+                let next_check = readiness_deadline.min(now + tokio::time::Duration::from_millis(100));
+                crate::idle_deadline::wait_for_activity(
+                    next_check,
+                    next_check == readiness_deadline,
+                    std::future::pending::<()>(),
+                ).await;
+            }
+        }
+
+        if let Some(token) = netidle_wd {
+            if let Some(js) = self.js.as_mut() {
+                js.disarm_watchdog(token);
+            }
+        }
+        self.lifecycle = LifecycleState::NetworkIdle;
     }
 
     /// Builds the child frames of the document that just loaded.
@@ -3707,15 +3791,17 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
         self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
-            "<!DOCTYPE html><html><head></head><body></body></html>",
+            "<html><head></head><body></body></html>",
         ));
         self.title = String::new();
+        self.content_type.clear();
         self.lifecycle = LifecycleState::Loaded;
         self.document_timeline_origin = std::time::Instant::now();
     }
@@ -4228,12 +4314,13 @@ impl Page {
                 intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
-                resource_type: "Fetch".to_string(),
+                resource_type: ev.resource_type,
                 status: ev.status,
                 headers: std::collections::HashMap::new(),
                 response_headers: Arc::new(ev.response_headers),
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
+                error_text: ev.error_text,
             });
         }
     }
@@ -4283,6 +4370,11 @@ impl Page {
         }
     }
 
+    /// Run a script and preserve JavaScript execution errors. The caller owns its deadline.
+    pub fn evaluate_script(&mut self, script: &str) -> Result<serde_json::Value, String> {
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?.evaluate_script(script)
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
         if let Some(js) = &mut self.js {
             match js.evaluate(expression) {
@@ -4313,9 +4405,10 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
+        if self.js.is_some() {
+            match self
+                .evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise,
+                    obscura_js::runtime::DEFAULT_CDP_AWAIT_TIMEOUT_MS)
                 .await
             {
                 Ok(info) => info,
@@ -4361,13 +4454,8 @@ impl Page {
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         if let Some(js) = &mut self.js {
-            js.evaluate_for_cdp_with_timeout(
-                expression,
-                return_by_value,
-                await_promise,
-                await_timeout_ms,
-            )
-            .await
+            let evaluation = js.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+            self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
@@ -4396,14 +4484,15 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
+        if self.js.is_some() {
+            match self
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     args,
                     return_by_value,
                     await_promise,
+                    obscura_js::runtime::DEFAULT_CDP_AWAIT_TIMEOUT_MS,
                 )
                 .await
             {
@@ -4446,15 +4535,50 @@ impl Page {
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        js.call_function_on_for_cdp_with_timeout(
+        let evaluation = js.start_cdp_call(
             function_declaration,
             object_id,
             args,
             return_by_value,
             await_promise,
-            await_timeout_ms,
-        )
-        .await
+        )?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.callFunctionOn").await
+    }
+
+    async fn await_cdp_evaluation(
+        &mut self,
+        evaluation: obscura_js::runtime::CdpEvaluation,
+        return_by_value: bool,
+        timeout_ms: u64,
+        method: &str,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        let pending = match evaluation {
+            obscura_js::runtime::CdpEvaluation::Complete(info) => return Ok(info),
+            obscura_js::runtime::CdpEvaluation::Pending(pending) => pending,
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let wait = async {
+            loop {
+                let queued = !self.pending_frame_work.is_empty();
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+                let mut ready = false;
+                let progressed = js.resolve_promises_until(|js| {
+                    ready = js.cdp_evaluation_ready(&pending);
+                    ready || queued || js.has_pending_frame_tasks()
+                }, duration_millis_u64(remaining)).await;
+                if ready { return Ok(()); }
+                if !progressed { return Err(format!("{method} promise did not settle within {timeout_ms}ms")); }
+                self.advance_frames().await;
+            }
+        };
+        let result = tokio::time::timeout_at(deadline, wait).await
+            .unwrap_or_else(|_| Err(format!("{method} promise did not settle within {timeout_ms}ms")));
+        let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+        match result {
+            Ok(()) => js.finish_cdp_evaluation(pending, return_by_value),
+            Err(error) => { js.cancel_cdp_evaluation(pending); Err(error) }
+        }
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -4468,25 +4592,6 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.release_object(object_id);
         }
-    }
-
-    fn record_network_event(
-        &mut self,
-        url: &str,
-        method: &str,
-        resource_type: &str,
-        status: u16,
-        response_headers: &std::collections::HashMap<String, String>,
-        body_size: usize,
-    ) {
-        self.record_network_event_inner(
-            url,
-            method,
-            resource_type,
-            status,
-            response_headers,
-            body_size,
-        );
     }
 
     fn record_network_event_with_body(
@@ -4536,19 +4641,20 @@ impl Page {
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
+            error_text: None,
         });
         request_id
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
-        self.store_response_body_with(request_id, body.len(), || StoredResponseBody {
+        self.store_response_body_with(request_id, body.len(), || CachedNetworkResponseBody::Encoded(StoredNetworkResponseBody {
             body: if base64_encoded {
                 BASE64.encode(body)
             } else {
                 String::from_utf8_lossy(body).to_string()
             },
             base64_encoded,
-        });
+        }));
     }
 
     fn store_response_body_with<F>(
@@ -4558,7 +4664,7 @@ impl Page {
         make_stored: F,
     )
     where
-        F: FnOnce() -> StoredResponseBody,
+        F: FnOnce() -> CachedNetworkResponseBody,
     {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
@@ -4576,14 +4682,13 @@ impl Page {
     }
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
-        self.response_bodies.get(request_id).cloned().or_else(|| {
+        self.response_bodies.get(request_id).map(CachedNetworkResponseBody::decoded).or_else(|| {
             self.js
                 .as_ref()?
                 .get_network_response_body(request_id)
-                .map(|body| StoredResponseBody {
-                    body: body.body,
-                    base64_encoded: body.base64_encoded,
-                })
+        }).map(|body| StoredResponseBody {
+            body: body.body,
+            base64_encoded: body.base64_encoded,
         })
     }
 
@@ -4591,27 +4696,18 @@ impl Page {
     /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
     /// transfers ownership to the caller, so a large body is held once and freed
     /// when the stream is closed rather than lingering in this long-running
-    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
-    /// bodies return their UTF-8 bytes. Returns None if the body was never
+    /// process (issue #360). Transport bodies preserve their original bytes,
+    /// including legacy-encoded text. Returns None if the body was never
     /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
     /// dropped) or the id is unknown.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
-        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
+        if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            body
+            body.into_bytes()
         } else {
             self.js
                 .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|b| StoredResponseBody {
-                    body: b.body,
-                    base64_encoded: b.base64_encoded,
-                })?
-        };
-        if stored.base64_encoded {
-            BASE64.decode(stored.body.as_bytes()).ok()
-        } else {
-            Some(stored.body.into_bytes())
+                .take_network_response_body_raw(request_id)
         }
     }
 
@@ -4652,6 +4748,18 @@ impl Page {
         if self.js.is_none() {
             return;
         }
+        // Completed module and JS requests must survive the realm's teardown.
+        self.sync_js_network_events();
+        let max_entries = response_body_entry_limit();
+        for (id, body) in self.js.as_ref().unwrap().take_cached_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), body);
+            self.response_body_order.push_back(id);
+        }
+        while self.response_body_order.len() > max_entries {
+            if let Some(oldest) = self.response_body_order.pop_front() {
+                self.response_bodies.remove(&oldest);
+            }
+        }
         // Suspension rebuilds the renderer cache on resume (`take_dom`), so
         // results for the suspended realm would have nowhere to go.
         self.retire_render_resources();
@@ -4659,6 +4767,7 @@ impl Page {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.navigation_timing = js.navigation_timing();
         // Preserve console messages logged before suspension: dropping the
         // runtime below would otherwise lose any not yet drained (#971).
         let pending_console = js.take_pending_console_messages();
@@ -4698,6 +4807,15 @@ impl Page {
         self.js.is_some()
     }
 
+    /// Origin-scoped sessionStorage for this tab, including inactive origins.
+    pub fn session_storage(&self) -> &OriginStorage {
+        &self.session_storage
+    }
+
+    pub fn has_pending_indexed_db_notifications(&self) -> bool {
+        self.context.indexed_db.has_pending_notifications()
+    }
+
     pub fn release_object_group(&mut self) {
         if let Some(js) = &mut self.js {
             js.release_object_group();
@@ -4717,6 +4835,14 @@ impl Page {
         self.js
             .as_ref()
             .is_some_and(|js| js.has_pending_navigation())
+    }
+
+    /// Discard a queued document navigation and cancel retained resource loads.
+    /// The CDP processor separately cancels its borrowed navigation future.
+    pub fn stop_loading(&mut self) {
+        self.take_pending_navigation();
+        #[cfg(feature = "render")]
+        if let Some(js) = &mut self.js { js.stop_render_resource_loading(); }
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
@@ -4910,6 +5036,7 @@ impl Page {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
+            js.set_intercept_url_patterns(self.intercept_block_patterns.clone());
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
@@ -4922,32 +5049,7 @@ fn script_response_is_executable(status: u16) -> bool {
     (200..=299).contains(&status)
 }
 
-fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let mut remainder = url;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() {
-            continue;
-        }
-
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-
-        if first && !pattern.starts_with('*') && index != 0 {
-            return false;
-        }
-
-        remainder = &remainder[index + part.len()..];
-        first = false;
-    }
-
-    pattern.ends_with('*') || remainder.is_empty()
-}
+pub use obscura_js::ops::url_matches_cdp_pattern;
 
 impl Drop for Page {
     fn drop(&mut self) {
@@ -4972,6 +5074,182 @@ mod tests {
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_navigation_has_no_doctype_and_starts_in_quirks_mode() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("blank-mode".into()));
+        let mut page = super::Page::new("blank-mode".into(), context);
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.evaluate(r#"(() => [
+            document.compatMode, document.doctype,
+            Array.from(document.childNodes, node => node.nodeType),
+            document.documentElement.nodeName, document.head.nodeName, document.body.nodeName
+        ])()"#), serde_json::json!(["BackCompat", null, [1], "HTML", "HEAD", "BODY"]));
+        assert!(page.with_dom(|dom| dom.is_quirks()).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_quiet_deadline_does_not_gain_an_extra_polling_slice() {
+        use std::future::Future as _;
+
+        // No JavaScript runtime is needed to test the lifecycle deadline.
+        // This also keeps unrelated V8 maintenance wakes out of the clock test.
+        let context = std::sync::Arc::new(crate::BrowserContext::new("idle-deadline".into()));
+        let mut page = super::Page::new("idle-deadline".into(), context);
+        assert!(page.js.is_none());
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut wait = Box::pin(page.wait_for_network_idle(0));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+
+        // Model a delayed executor poll just before the existing quiet window
+        // ends. The next wake belongs to that window, not a fresh full slice.
+        tokio::time::advance(std::time::Duration::from_millis(490)).await;
+        assert!(wait.as_mut().poll(&mut cx).is_pending(),
+            "network idle must not complete before the quiet window");
+        tokio::time::advance(std::time::Duration::from_millis(11)).await;
+        assert!(wait.as_mut().poll(&mut cx).is_ready(),
+            "quiet-window expiry must not wait for another polling slice");
+        drop(wait);
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(501));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
+    }
+
+    fn network_idle_test_page() -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "network-idle-regression".into(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("network-idle-regression".into(), context);
+        page.url = Some(url::Url::parse("http://example.test/").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_preserves_quiet_window_and_page_tasks() {
+        let mut page = network_idle_test_page();
+        page.js.as_mut().unwrap().execute_script("network-idle-interval", r#"
+            globalThis.__idleTicks = 0;
+            globalThis.__idleObserved = false;
+            new MutationObserver(() => { __idleObserved = true; })
+                .observe(document.body, { attributes: true });
+            const id = setInterval(() => {
+                if (++__idleTicks === 3) {
+                    clearInterval(id);
+                    Promise.resolve().then(() => document.body.setAttribute('data-ready', 'yes'));
+                }
+            }, 20);
+        "#).unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
+            .await.expect("quiet page must finish within its normal window");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
+        assert_eq!(page.js.as_mut().unwrap().evaluate("[__idleTicks, __idleObserved]").unwrap(),
+            serde_json::json!([3, true]));
+    }
+
+    async fn network_idle_held_request(
+        client: std::sync::Arc<obscura_net::ObscuraHttpClient>,
+    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() < 16384);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+        });
+        let fetch = tokio::spawn(async move {
+            assert_eq!(client.fetch(&url).await.unwrap().status, 200);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await.expect("request reached fixture").unwrap();
+        (release_tx, fetch)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_two_allows_two_active_requests() {
+        let mut page = network_idle_test_page();
+        let (release_a, fetch_a) = network_idle_held_request(page.http_client.clone()).await;
+        let (release_b, fetch_b) = network_idle_held_request(page.http_client.clone()).await;
+        assert_eq!(page.http_client.active_requests(), 2);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(2))
+            .await.expect("two active requests must not force the five-second deadline");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+        assert_eq!(page.http_client.active_requests(), 2, "threshold two must allow both held requests");
+        release_a.send(()).unwrap();
+        release_b.send(()).unwrap();
+        fetch_a.await.unwrap();
+        fetch_b.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_zero_starts_quiet_window_after_request_completion() {
+        let mut page = network_idle_test_page();
+        let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
+        let completed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = completed.clone();
+        let release_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+            release.send(()).unwrap();
+            fetch.await.unwrap();
+            *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
+            .await.expect("completed request must permit network idle");
+        release_task.await.unwrap();
+        assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
+            "an active request must prevent an earlier quiet-window start");
+        assert_eq!(page.http_client.active_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_restarts_quiet_window_when_request_begins() {
+        let mut page = network_idle_test_page();
+        let client = page.http_client.clone();
+        let completed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = completed.clone();
+        let request_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let (release, fetch) = network_idle_held_request(client).await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            release.send(()).unwrap();
+            fetch.await.unwrap();
+            *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
+            .await.expect("a completed late request must permit network idle");
+        request_task.await.unwrap();
+        assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
+            "new traffic must reset the original quiet window");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_keeps_five_second_deadline_for_stuck_request() {
+        let mut page = network_idle_test_page();
+        let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(7), page.wait_for_network_idle(0))
+            .await.expect("network-idle deadline must still finish");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert_eq!(page.http_client.active_requests(), 1);
+        release.send(()).unwrap();
+        fetch.await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+    }
     fn install_linked_stylesheet(
         runtime: &mut obscura_js::runtime::ObscuraJsRuntime,
         index: usize,
@@ -5127,67 +5405,6 @@ mod tests {
         assert_eq!(page.url_string(), web_url);
 
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn document_devtools_body_matches_fetch_store_decoding_boundaries() {
-        assert_eq!(
-            super::decode_devtools_document_response_body(b"", None),
-            Some(String::new()),
-        );
-        for (body, content_type, expected) in [
-            (
-                &[0x81, 0x8d][..],
-                None,
-                Some("\u{81}\u{8d}".to_string()),
-            ),
-            (b"ABC", Some("application/octet-stream"), None),
-            (&[0xff], Some("text/plain"), Some("ÿ".to_string())),
-            (&[0xff], Some("application/json"), None),
-            (
-                &[0x80],
-                Some("text/plain; CHARSET=\"windows-1252\""),
-                Some("€".to_string()),
-            ),
-            (
-                &[0xd6, 0xd0, 0xce, 0xc4],
-                Some("text/html; Charset='GBK'"),
-                Some("中文".to_string()),
-            ),
-            (&[0xff], Some("text/plain; charset=not-real"), None),
-        ] {
-            assert_eq!(
-                super::decode_devtools_document_response_body(body, content_type),
-                expected,
-                "unexpected DevTools body policy for {content_type:?}",
-            );
-        }
-        for content_type in [
-            "application/x-ecmascript",
-            "application/x-javascript",
-            "text/javascript1.5",
-            "text/json",
-        ] {
-            assert_eq!(
-                super::decode_devtools_document_response_body(&[0xff], Some(content_type)),
-                None,
-                "{content_type} must use Chromium's UTF-8 decoder",
-            );
-        }
-        assert_eq!(
-            super::decode_devtools_document_response_body(
-                b"<html/>",
-                Some("application/xhtml+xml"),
-            ),
-            Some("<html/>".to_string()),
-        );
-        for content_type in ["image/svg+xml", "text/xsl", "foo/bar+xml"] {
-            assert_eq!(
-                super::decode_devtools_document_response_body(b"<xml/>", Some(content_type)),
-                None,
-                "{content_type} has no Chromium raw-resource text decoder",
-            );
-        }
     }
 
     #[test]
@@ -5529,6 +5746,179 @@ mod tests {
         assert_eq!(
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
+        );
+    }
+
+    // #1231: a text/plain or text/markdown response is a plain-text document.
+    // Parsing it as HTML turned every <word> in the body into an element and
+    // dropped its text, and document.contentType reported text/html.
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_text_response_builds_a_pre_document() {
+        let body = "RFC 9110 <URI-reference>: see <https://example.com/>\n2nd line";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "plain-text".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("plain-text".to_string(), context);
+        page.navigate(&format!("http://{address}/rfc9110.txt")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){return [document.contentType, \
+                 document.body.firstElementChild.tagName, \
+                 document.body.childNodes.length, \
+                 document.body.textContent];})()",
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!(["text/plain", "PRE", 1, body])
+        );
+    }
+
+    #[test]
+    fn plain_text_document_preserves_leading_newlines_and_literal_markup() {
+        for (text, expected) in [
+            ("\nfirst\nlast", "\nfirst\nlast"),
+            ("\r\nfirst\rsecond", "\nfirst\nsecond"),
+            ("\n\n", "\n\n"),
+            ("<&amp;> </pre><script>bad()</script>", "<&amp;> </pre><script>bad()</script>"),
+        ] {
+            let dom = super::parse_plain_text_document(text);
+            let pre = dom.query_selector("pre").unwrap().unwrap();
+            assert_eq!(dom.text_content(pre), expected, "input {text:?}");
+            assert!(dom.query_selector("script").unwrap().is_none());
+        }
+        let empty = super::parse_plain_text_document("");
+        assert_eq!(empty.text_content(empty.document()), "");
+        assert!(empty.query_selector("pre").unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_text_navigation_resets_content_type_on_about_blank() {
+        let mut page = super::Page::new(
+            "plain-text-blank".to_string(),
+            std::sync::Arc::new(crate::BrowserContext::new("plain-text-blank".to_string())),
+        );
+        page.navigate("data:text/plain,first%0Alast").await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[document.contentType, document.body.textContent]"
+        ).unwrap(), serde_json::json!(["text/plain", "first\nlast"]));
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[document.contentType, document.body.textContent]"
+        ).unwrap(), serde_json::json!(["text/html", ""]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_markdown_response_keeps_markup_as_text() {
+        let body = "# Title\n\nSee <Component prop={1} /> and 3 < 4.";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "markdown-text".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("markdown-text".to_string(), context);
+        page.navigate(&format!("http://{address}/settings-reference")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){return [document.contentType, \
+                 document.body.textContent, \
+                 document.body.querySelectorAll('component').length];})()",
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!(["text/markdown", body, 0])
+        );
+    }
+
+    // The HTML parse path is unchanged, including the URL-derived contentType
+    // sniffing for documents served without a usable Content-Type.
+    #[tokio::test(flavor = "current_thread")]
+    async fn html_response_still_builds_an_html_document() {
+        let body = "<!doctype html><title>page</title><p>hello <b>world</b></p>";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "html-doc".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("html-doc".to_string(), context);
+        page.navigate(&format!("http://{address}/index")).await.unwrap();
+
+        let observed = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "(function(){return [document.contentType, \
+                 document.body.firstElementChild.tagName, \
+                 document.body.querySelectorAll('b').length, \
+                 document.body.textContent];})()",
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!(["text/html", "P", 1, "hello world"])
         );
     }
 
@@ -6345,6 +6735,220 @@ mod tests {
         assert!(!script_response_is_executable(500));
     }
 
+    /// Issue #678: `localStorage` belongs to the BrowserContext and
+    /// `sessionStorage` to the Page, so both survive the realm rebuild that
+    /// `init_js` performs on every navigation. The fixture serves one origin on
+    /// two paths plus a second origin, so a cross-origin hop is testable too.
+    async fn spawn_storage_server() -> (String, String) {
+        let first = "<html><body><script>window.__ran='YES';</script></body></html>";
+        async fn serve(listener: tokio::net::TcpListener, body: &'static str) {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.to_string();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        }
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        tokio::spawn(serve(listener_a, first));
+        tokio::spawn(serve(listener_b, first));
+        (format!("http://{addr_a}"), format!("http://{addr_b}"))
+    }
+
+    fn storage_page(name: &str, context: std::sync::Arc<crate::BrowserContext>) -> super::Page {
+        super::Page::new(name.to_string(), context)
+    }
+
+    #[tokio::test]
+    async fn web_storage_survives_navigation_and_is_scoped_per_origin() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin_a, origin_b) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "storage-regression".into(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = storage_page("storage-regression", context.clone());
+
+        page.navigate(&origin_a).await.unwrap();
+        page.evaluate(
+            r#"(() => {
+                localStorage.setItem('l1', 'local-value');
+                sessionStorage.setItem('s1', 'session-value');
+                return 'seeded';
+            })()"#,
+        );
+
+        // Same origin, different path: a new document, and therefore a new realm.
+        page.navigate(&format!("{origin_a}/second")).await.unwrap();
+        let after = page
+            .evaluate(
+                r#"({
+                    local: localStorage.getItem('l1'),
+                    session: sessionStorage.getItem('s1'),
+                    length: localStorage.length,
+                    viaProperty: localStorage.l1,
+                    has: 'l1' in localStorage,
+                    keys: Object.keys(localStorage),
+                })"#,
+            );
+        assert_eq!(
+            after.get("local").and_then(|v| v.as_str()),
+            Some("local-value"),
+            "localStorage must survive a same-origin navigation: {after:?}"
+        );
+        assert_eq!(
+            after.get("session").and_then(|v| v.as_str()),
+            Some("session-value"),
+            "sessionStorage must survive a same-origin navigation in the same tab: {after:?}"
+        );
+        // The Proxy surface has to agree with the methods now that the data
+        // lives in Rust: property access, `in`, key enumeration and length.
+        assert_eq!(after.get("viaProperty").and_then(|v| v.as_str()), Some("local-value"));
+        assert_eq!(after.get("has").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(after.get("length").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            after.get("keys").and_then(|v| v.as_array()).map(|k| k.len()),
+            Some(1)
+        );
+
+        // Another origin gets an empty store of its own: no cross-origin leak.
+        page.navigate(&origin_b).await.unwrap();
+        let other = page
+            .evaluate(
+                r#"({
+                    local: localStorage.getItem('l1'),
+                    session: sessionStorage.getItem('s1'),
+                })"#,
+            );
+        assert!(
+            other["local"].is_null() && other["session"].is_null(),
+            "a different origin must not see this origin's storage: {other:?}"
+        );
+
+        // Coming back, the original origin's data is still there.
+        page.navigate(&origin_a).await.unwrap();
+        let back = page.evaluate("localStorage.getItem('l1')");
+        assert_eq!(back.as_str(), Some("local-value"));
+        assert_eq!(page.evaluate("sessionStorage.getItem('s1')").as_str(), Some("session-value"));
+    }
+
+    #[tokio::test]
+    async fn indexeddb_records_survive_navigation_and_share_only_their_context_and_origin() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin_a, _) = spawn_storage_server().await;
+        let (origin_b, _) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::new("idb-shared".into()));
+        let mut first = storage_page("idb-first", context.clone());
+        first.navigate(&origin_a).await.unwrap();
+        first.evaluate(r#"(() => {
+            globalThis.idbSaved = false;
+            const r = indexedDB.open('shared',1);
+            r.onupgradeneeded = () => r.result.createObjectStore('items');
+            r.onsuccess = () => {
+                const tx = r.result.transaction('items','readwrite');
+                tx.objectStore('items').put({value:'kept'},1);
+                tx.oncomplete = () => idbSaved = true;
+            };
+        })()"#);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbSaved"), serde_json::json!(true));
+        let read = r#"(() => {
+            globalThis.idbRead = 'pending';
+            const r = indexedDB.open('shared',1);
+            r.onupgradeneeded = () => r.result.createObjectStore('items');
+            r.onsuccess = () => {
+                const q = r.result.transaction('items').objectStore('items').get(1);
+                q.onsuccess = () => idbRead = q.result?.value ?? null;
+            };
+        })()"#;
+        first.navigate(&origin_b).await.unwrap();
+        first.evaluate(read);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbRead"), serde_json::Value::Null);
+        first.navigate(&origin_a).await.unwrap();
+        first.evaluate(read);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbRead"), serde_json::json!("kept"));
+        let mut second = storage_page("idb-second", context);
+        second.navigate(&origin_a).await.unwrap();
+        second.evaluate(read);
+        second.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(second.evaluate("idbRead"), serde_json::json!("kept"));
+        let mut isolated = storage_page("idb-isolated", std::sync::Arc::new(crate::BrowserContext::new("idb-private".into())));
+        isolated.navigate(&origin_a).await.unwrap();
+        isolated.evaluate(read);
+        isolated.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(isolated.evaluate("idbRead"), serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn session_storage_stays_inside_the_tab_and_local_storage_is_shared() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin, _) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "storage-scope".into(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut first = storage_page("storage-scope-1", context.clone());
+        first.navigate(&origin).await.unwrap();
+        first.evaluate(
+            r#"(() => {
+                localStorage.setItem('shared', 'from-tab-one');
+                sessionStorage.setItem('tab', 'from-tab-one');
+                return 'ok';
+            })()"#,
+        );
+
+        // A second page of the same context shares localStorage but not
+        // sessionStorage, which is the split the storage bug got wrong.
+        let mut second = storage_page("storage-scope-2", context.clone());
+        second.navigate(&origin).await.unwrap();
+        let view = second
+            .evaluate(
+                r#"({
+                    local: localStorage.getItem('shared'),
+                    session: sessionStorage.getItem('tab'),
+                })"#,
+            );
+        assert_eq!(
+            view.get("local").and_then(|v| v.as_str()),
+            Some("from-tab-one"),
+            "localStorage is scoped to the BrowserContext: {view:?}"
+        );
+        assert!(
+            view.get("session") == Some(&serde_json::Value::Null),
+            "sessionStorage must not cross tabs: {view:?}"
+        );
+        assert_eq!(second.evaluate("(() => { localStorage.setItem('shared', 'from-tab-two'); sessionStorage.setItem('tab', 'from-tab-two'); return localStorage.getItem('shared'); })()"),
+            serde_json::json!("from-tab-two"));
+        second.suspend_js();
+        first.suspend_js();
+        first.resume_js();
+        assert_eq!(first.evaluate("[localStorage.getItem('shared'), sessionStorage.getItem('tab')]"),
+            serde_json::json!(["from-tab-two", "from-tab-one"]));
+        first.suspend_js();
+        second.resume_js();
+        assert_eq!(second.evaluate("sessionStorage.getItem('tab')").as_str(), Some("from-tab-two"));
+    }
+
     /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the
     /// same iframe straight in the document, and `/child.html` is the frame.
     async fn spawn_shadow_frame_server() -> String {
@@ -6503,6 +7107,266 @@ mod tests {
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    async fn pump_srcdoc_frames(page: &mut super::Page) {
+        for _ in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(2),
+                page.js.as_mut().unwrap().run_event_loop()).await.unwrap().unwrap();
+            if !page.advance_frames().await { break; }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_loads_parser_and_inserted_documents_in_their_own_realms() {
+        let mut page = import_map_test_page("srcdoc", "https://parent.test",
+            r#"<html><head><base href="https://assets.test/dir/"></head><body>
+            <iframe id="parsed" src="data:text/html,FALLBACK" srcdoc="&lt;p&gt;parsed&lt;/p&gt;"></iframe>
+            </body></html>"#);
+        page.evaluate_script(r#"(() => {
+            globalThis.loads = [];
+            localStorage.setItem('shared', 'parent');
+            const frame = document.createElement('iframe'); frame.id = 'inserted';
+            frame.srcdoc = '<p>inserted</p><script>globalThis.childOnly=42;document.body.dataset.ready="yes";</script>';
+            frame.onload = () => loads.push([frame.contentDocument.URL,
+                frame.contentDocument.body.dataset.ready, frame.contentWindow.childOnly]);
+            document.body.appendChild(frame);
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let value = page.evaluate_script(r#"(() => {
+            const parsed = document.getElementById('parsed').contentDocument;
+            const f = document.getElementById('inserted'), d = f.contentDocument;
+            const a = d.createElement('a'); a.href = 'next';
+            return [parsed.URL, parsed.body.textContent, d.URL, d.baseURI, a.href,
+                f.contentWindow.localStorage.getItem('shared'), typeof globalThis.childOnly,
+                loads, d.defaultView === f.contentWindow, parsed.compatMode];
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(["about:srcdoc", "parsed", "about:srcdoc",
+            "https://assets.test/dir/", "https://assets.test/dir/next", "parent", "undefined",
+            [["about:srcdoc", "yes", 42]], true, "CSS1Compat"]));
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_replacement_cancels_stale_documents() {
+        let mut page = import_map_test_page("srcdoc-replace", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.executed = []; globalThis.loaded = [];
+            const host = document.createElement('div');
+            host.innerHTML = '<iframe id="f" srcdoc="first"></iframe>';
+            document.body.appendChild(host);
+            const f = document.getElementById('f');
+            f.onload = () => loaded.push(f.contentDocument.body.textContent);
+            f.setAttributeNS(null, 'srcdoc', '<script>parent.executed.push("stale")</script>stale');
+            f.srcdoc = '<script>parent.executed.push("latest")</script><p>latest</p>';
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[executed, loaded.map(text => text.endsWith('latest')), document.getElementById('f').srcdoc.includes('<p>latest</p>')]").unwrap(),
+            serde_json::json!([["latest"], [true], true]));
+        page.evaluate_script("document.getElementById('f').removeAttribute('srcdoc'); 1").unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("document.getElementById('f').contentDocument.URL").unwrap(),
+            serde_json::json!("about:blank"));
+        assert!(page.frames.len() <= 1, "replaced srcdoc realms must be released");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_sandbox_blocks_scripts_and_opaque_document_access() {
+        let mut page = import_map_test_page("srcdoc-sandbox", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.escaped = false;
+            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN']]) {
+                const f = document.createElement('iframe'); f.id = id;
+                f.setAttribute('sandbox', policy);
+                f.srcdoc = '<button onclick="parent.escaped=true">hello</button><script>globalThis.ran=true;try{parent.escaped=true}catch(e){}</script><noscript><i>fallback</i></noscript>';
+                document.body.appendChild(f);
+            }
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const opaque = document.getElementById('opaque');
+            const inert = document.getElementById('inert');
+            inert.contentDocument.querySelector('button').click();
+            return [opaque.contentDocument === null, inert.contentDocument.URL,
+                inert.contentDocument.querySelector('button').textContent,
+                typeof inert.contentWindow.ran, escaped,
+                inert.contentDocument.querySelector('noscript i')?.textContent];
+        })()"#).unwrap(), serde_json::json!([true, "about:srcdoc", "hello", "undefined", false, "fallback"]));
+        assert_eq!(page.evaluate_in_frame(0, "[document.URL, globalThis.ran, location.origin]").unwrap(),
+            serde_json::json!(["about:srcdoc", true, "null"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_nested_and_empty_documents_keep_the_creator_base() {
+        let mut page = import_map_test_page("srcdoc-nested", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.id = 'outer';
+            f.srcdoc = '<base href="https://nested.test/path/"><iframe srcdoc=""></iframe>';
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const child = document.getElementById('outer').contentDocument.querySelector('iframe');
+            return [child.contentDocument.URL, child.contentDocument.baseURI,
+                child.contentDocument.body.textContent,
+                child.contentWindow.parent === document.getElementById('outer').contentWindow];
+        })()"#).unwrap(), serde_json::json!(["about:srcdoc", "https://nested.test/path/", "", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_from_connected_inner_html_survives_initial_document_reads() {
+        let mut page = import_map_test_page("srcdoc-connected", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            document.body.innerHTML = '<iframe id="f" srcdoc="hello"></iframe>';
+            globalThis.initial = document.getElementById('f').contentDocument.URL;
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[initial, document.getElementById('f').contentDocument.URL, document.getElementById('f').contentDocument.body.textContent]").unwrap(),
+            serde_json::json!(["about:blank", "about:srcdoc", "hello"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_external_scripts_resolve_against_the_creator() {
+        let (base, requests) = spawn_nested_pending_frame_server().await;
+        let mut page = import_map_test_page("srcdoc-script-base", &base,
+            r#"<body><iframe srcdoc="&lt;script src=child.js&gt;&lt;/script&gt;"></iframe></body>"#);
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(*requests.lock().unwrap(), vec!["/app/child.js"]);
+        assert_eq!(page.evaluate_script("document.querySelector('iframe').contentWindow.__mustNotRun").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_inherits_sandbox_restrictions_in_nested_documents() {
+        let mut page = import_map_test_page("srcdoc-inherited-sandbox", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            for (const policy of ['allow-scripts', 'allow-same-origin']) {
+                const f = document.createElement('iframe'); f.id = policy; f.setAttribute('sandbox', policy);
+                f.srcdoc = '<iframe srcdoc="&lt;script&gt;globalThis.ran=true&lt;/script&gt;"></iframe>';
+                document.body.appendChild(f);
+            }
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_in_frame(0, "document.querySelector('iframe').contentDocument === null").unwrap(),
+            serde_json::json!(true));
+        assert_eq!(page.evaluate_script("typeof document.getElementById('allow-same-origin').contentDocument.querySelector('iframe').contentWindow.ran").unwrap(),
+            serde_json::json!("undefined"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_ignores_absent_attributes_and_non_html_elements() {
+        let mut page = import_map_test_page("srcdoc-noop", "https://parent.test", "<body></body>");
+        let values = page.evaluate_script(r#"(() => {
+            globalThis.escaped = false;
+            const f = document.createElement('iframe'); document.body.appendChild(f);
+            f.contentWindow.kept = 73;
+            f.removeAttribute('srcdoc');
+            const first = f.contentWindow.kept;
+            f.removeAttributeNS(null, 'srcdoc');
+            const second = f.contentWindow.kept;
+            const plain = document.createElement('div'); plain.srcdoc = 'expando';
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'iframe');
+            svg.setAttribute('srcdoc', '<script>parent.escaped=true</script>');
+            const host = document.createElement('div'); host.appendChild(svg);
+            document.body.appendChild(host);
+            return [first, second, plain.hasAttribute('srcdoc')];
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(values, serde_json::json!([73, 73, false]));
+        assert_eq!(page.evaluate_script("escaped").unwrap(), serde_json::json!(false));
+        assert_eq!(page.frames.len(), 1, "SVG iframe is not a browsing context");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_navigation_waits_until_after_the_microtask_checkpoint() {
+        let mut page = import_map_test_page("srcdoc-task", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.srcdoc = 'hello';
+            document.body.appendChild(f);
+            Promise.resolve().then(() => { globalThis.beforeNavigation = f.contentDocument.URL; });
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[beforeNavigation, document.querySelector('iframe').contentDocument.URL]").unwrap(),
+            serde_json::json!(["about:blank", "about:srcdoc"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_is_ready_after_data_document_navigation() {
+        let mut page = import_map_test_page("srcdoc-data-navigation", "https://parent.test", "<body></body>");
+        page.navigate("data:text/html,%3Ciframe%20srcdoc%3D%22HELLO%22%3E%3C%2Fiframe%3E").await.unwrap();
+        assert_eq!(page.evaluate_script("[document.querySelector('iframe').contentDocument.URL, document.querySelector('iframe').contentDocument.body.textContent]").unwrap(),
+            serde_json::json!(["about:srcdoc", "HELLO"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_opaque_document_is_not_published_to_creator_objects() {
+        let mut page = import_map_test_page("srcdoc-private-realm", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.seenOpaqueSource = false;
+            const f = document.createElement('iframe'); f.id = 'opaque';
+            f.setAttribute('sandbox', 'allow-scripts');
+            f.srcdoc = '<p>private</p><script>parent.postMessage("loaded", "*")</script>';
+            window.addEventListener('message', event => {
+                seenOpaqueSource = event.data === 'loaded' && event.source === f.contentWindow;
+            });
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const f = document.getElementById('opaque');
+            const references = [
+                () => f._iframeDoc,
+                () => f._iframeWin?.document,
+                () => globalThis.__obscura_frameObjects[f._frameId]?.document,
+                () => globalThis.__obscura_frameObjects[f._frameId]?.window?.document,
+            ];
+            const readable = references.map(getDocument => {
+                try { return getDocument()?.body?.textContent ?? null; }
+                catch (_) { return null; }
+            });
+            return [f.contentDocument === null, readable, seenOpaqueSource];
+        })()"#).unwrap(), serde_json::json!([true, [null, null, null, null], true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_load_waits_for_the_real_document_and_author_scripts() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page("frame-load-ready", &base, "<html><body></body></html>");
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        page.js.as_mut().unwrap().evaluate(
+            "(function(){ globalThis.loads = []; const frame = document.createElement('iframe'); \
+             frame.onload = function(){ loads.push([typeof frame.contentDocument.appendChild, \
+               frame.contentWindow.__childReady === true, frame.contentDocument.readyState]); }; \
+             frame.src = '/child.html'; document.body.appendChild(frame); return 1; })()"
+        ).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2), page.js.as_mut().unwrap().run_event_loop(),
+        ).await.unwrap().unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads").unwrap(), serde_json::json!([]),
+            "the iframe fired load before its scripts could run");
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.advance_frames())
+            .await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads").unwrap(),
+            serde_json::json!([["function", true, "complete"]]));
+        page.advance_frames().await;
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads.length === 1").unwrap(), serde_json::json!(true));
+
+        let script = "new Promise(resolve => { const frame = document.createElement('iframe'); \
+            frame.onload = () => resolve([typeof frame.contentDocument.appendChild, \
+                frame.contentWindow.__childReady === true]); \
+            frame.src = '/child.html'; document.body.appendChild(frame); })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!(["function", true]));
+        let called = page.call_function_on_for_cdp_with_timeout(
+            &format!("() => {script}"), None, &[], true, true, 2_000,
+        ).await.unwrap();
+        assert_eq!(called.value.unwrap(), serde_json::json!(["function", true]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7451,6 +8315,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_records_lifecycle_boundaries_not_future_events() {
+        let mut page = import_map_test_page(
+            "navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        let html = r#"<!doctype html><script>
+            globalThis.__navigationSamples = [];
+            function sample() {
+                const timing = performance.timing;
+                __navigationSamples.push([
+                    timing.navigationStart, timing.responseEnd,
+                    timing.domContentLoadedEventStart, timing.domContentLoadedEventEnd,
+                    timing.loadEventStart, timing.loadEventEnd
+                ]);
+            }
+            sample();
+            document.addEventListener('DOMContentLoaded', sample);
+            window.addEventListener('load', sample);
+        </script><p>Real navigation timing</p>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+        page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+        let actual = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const [parser, dom, load] = __navigationSamples;
+            const final = performance.timing;
+            return [
+                parser[3] === 0 && parser[5] === 0,
+                Number.isFinite(parser[1]) && parser[1] >= parser[0],
+                dom[2] > 0 && dom[3] === 0,
+                load[4] > 0 && load[5] === 0,
+                final.domContentLoadedEventEnd >= dom[2],
+                final.loadEventStart >= final.domContentLoadedEventEnd,
+                final.loadEventEnd >= load[4],
+                performance.timeOrigin >= final.navigationStart
+                    && performance.timeOrigin < final.navigationStart + 1
+            ];
+        })()"#).unwrap();
+        assert_eq!(actual, serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_survives_suspension_but_resets_on_navigation() {
+        let mut page = import_map_test_page(
+            "navigation-timing-retention", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        page.navigate("data:text/html,<p>First</p>").await.unwrap();
+        let expression = "[performance.timeOrigin, performance.timing.navigationStart, performance.timing.loadEventEnd]";
+        let before = page.js.as_mut().unwrap().evaluate(expression).unwrap();
+        assert!(before[2].as_f64().unwrap() > before[1].as_f64().unwrap());
+        page.suspend_js();
+        page.resume_js();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(expression).unwrap(), before);
+        page.navigate("data:text/html,<p>Second</p>").await.unwrap();
+        let after = page.js.as_mut().unwrap().evaluate(expression).unwrap();
+        assert!(after[0].as_f64().unwrap() > before[0].as_f64().unwrap());
+        assert!(after[1].as_f64().unwrap() >= before[2].as_f64().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_terminated_handlers_do_not_record_completion() {
+        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "250");
+        let mut page = import_map_test_page(
+            "terminated-navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        for (event, field) in [
+            ("DOMContentLoaded", "domContentLoadedEventEnd"), ("load", "loadEventEnd"),
+        ] {
+            let html = format!("<script>window.addEventListener('{event}',()=>{{globalThis.entered=true;while(true){{}}}});</script>");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+            page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+            assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.entered === true").unwrap(),
+                serde_json::json!(true), "the {event} handler must actually have started");
+            assert_eq!(page.js.as_mut().unwrap().evaluate(&format!("performance.timing.{field}")).unwrap().as_f64(),
+                Some(0.0), "the terminated {event} handler never completed");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn preload_dynamic_script_delays_load_but_not_dom_content_loaded() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(150),
@@ -8131,9 +9071,20 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 2048];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let first = String::from_utf8_lossy(&request[..read])
+                        // Accepted sockets can inherit the listener's nonblocking
+                        // mode. Consume the complete request before responding,
+                        // including fragmented headers.
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let size = stream.read(&mut chunk).unwrap();
+                            assert_ne!(size, 0, "request closed before its headers completed");
+                            request.extend_from_slice(&chunk[..size]);
+                            assert!(request.len() <= 16_384, "fixture request headers too large");
+                        }
+                        let first = String::from_utf8_lossy(&request)
                             .lines()
                             .next()
                             .unwrap_or_default()
@@ -9068,10 +10019,22 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let served = served.clone();
                         std::thread::spawn(move || {
-                            let mut request = [0u8; 2048];
-                            let _ = stream.read(&mut request);
+                            // Accepted sockets can inherit the listener's nonblocking
+                            // mode. Consume the complete request before responding or
+                            // signalling A's readiness, including fragmented headers.
+                            stream.set_nonblocking(false).unwrap();
+                            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                            let mut request = Vec::new();
+                            let mut chunk = [0u8; 2048];
+                            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                                let size = stream.read(&mut chunk).unwrap();
+                                assert_ne!(size, 0, "request closed before its headers completed");
+                                request.extend_from_slice(&chunk[..size]);
+                                assert!(request.len() <= 16_384, "fixture request headers too large");
+                            }
+                            let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let width = if index == 0 {
                                 std::thread::sleep(std::time::Duration::from_millis(1_500));
                                 20
@@ -9938,102 +10901,58 @@ impl From<ObscuraNetError> for PageError {
     }
 }
 
-/// Apply Chromium's charset-aware CDP policy to Page-owned response bodies.
-/// The JS fetch store keeps the same small private policy in obscura-js; sharing
-/// it would expose an engine-internal DevTools detail as public Rust API.
-fn stored_devtools_document_response_body(
-    body: &[u8],
-    content_type: Option<&str>,
-) -> StoredResponseBody {
-    if let Some(body) = decode_devtools_document_response_body(body, content_type) {
-        StoredResponseBody {
-            body,
-            base64_encoded: false,
-        }
-    } else {
-        StoredResponseBody {
-            body: BASE64.encode(body),
-            base64_encoded: true,
-        }
-    }
+/// Lowercased MIME type of a Content-Type header, without parameters.
+fn base_content_type(content_type: Option<&str>) -> Option<String> {
+    let ct = content_type?.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if ct.is_empty() { None } else { Some(ct) }
 }
 
-fn decode_devtools_document_response_body(
-    body: &[u8],
-    content_type: Option<&str>,
-) -> Option<String> {
-    if body.is_empty() {
-        return Some(String::new());
-    }
-
-    let Some(content_type) = content_type else {
-        return obscura_net::decode_with_label("windows-1252", body, true, false);
-    };
-    let mime = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
-        .to_ascii_lowercase();
-    let decoder = document_devtools_text_decoder(&mime)?;
-    let explicit_charset = content_type.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case("charset") {
-            return None;
-        }
-        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-        (!value.is_empty()).then_some(value)
-    });
-    let encoding = if let Some(charset) = explicit_charset {
-        charset
-    } else if matches!(decoder, DocumentDevtoolsTextDecoder::Html) {
-        obscura_net::encoding::detect_encoding(body, Some(content_type)).0.name()
-    } else if matches!(decoder, DocumentDevtoolsTextDecoder::Utf8) {
-        "utf-8"
-    } else {
-        "windows-1252"
-    };
-    obscura_net::decode_with_label(encoding, body, true, false)
-}
-
-#[derive(Clone, Copy)]
-enum DocumentDevtoolsTextDecoder {
-    Html,
-    Utf8,
-    Plain,
-}
-
-fn document_devtools_text_decoder(mime: &str) -> Option<DocumentDevtoolsTextDecoder> {
-    if mime == "text/html" {
-        return Some(DocumentDevtoolsTextDecoder::Html);
-    }
-    if matches!(
-        mime,
-        "application/javascript"
-            | "application/ecmascript"
-            | "application/x-ecmascript"
-            | "application/x-javascript"
-            | "text/ecmascript"
-            | "text/javascript"
-            | "text/javascript1.0"
-            | "text/javascript1.1"
-            | "text/javascript1.2"
-            | "text/javascript1.3"
-            | "text/javascript1.4"
-            | "text/javascript1.5"
-            | "text/jscript"
-            | "text/livescript"
-            | "text/x-ecmascript"
-            | "text/x-javascript"
-    ) || matches!(mime, "application/json" | "text/json")
-        || mime.ends_with("+json")
-        || matches!(mime, "application/xml" | "text/xml")
-        || (mime.starts_with("application/") && mime.ends_with("+xml"))
+/// A response whose body is text but not markup gets a plain-text document
+/// rather than an HTML parse of its content (`text/plain`, `text/markdown`).
+/// Returns the MIME type to report as `document.contentType`.
+fn plain_text_document_type(content_type: Option<&str>) -> Option<String> {
+    let ct = base_content_type(content_type)?;
+    // XML and HTML families keep their existing parse path, including the
+    // `.xhtml`/`.xml` URL sniffing that `contentType` still applies.
+    if ct == "text/html"
+        || ct == "application/xhtml+xml"
+        || ct == "text/xml"
+        || ct == "application/xml"
+        || ct.ends_with("+xml")
     {
-        return Some(DocumentDevtoolsTextDecoder::Utf8);
+        return None;
     }
-    (mime.starts_with("text/") && mime != "text/xsl")
-        .then_some(DocumentDevtoolsTextDecoder::Plain)
+    matches!(ct.as_str(), "text/plain" | "text/markdown" | "text/x-markdown")
+        .then_some(ct)
+}
+
+/// Escape text for insertion as HTML character data, then build the document
+/// Chrome builds for a plain-text response: `<body>` holding one `<pre>` with
+/// the whole text. Serializing through the HTML parser keeps one code path for
+/// document construction instead of a second native tree builder.
+fn parse_plain_text_document(text: &str) -> DomTree {
+    if text.is_empty() {
+        return parse_html("<!DOCTYPE html>");
+    }
+    let mut html = String::with_capacity(text.len() + 64);
+    // The parser discards the synthetic newline, not the document's first one.
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title></title></head><body><pre>\n");
+    html.push_str(&escape_html_text(text));
+    html.push_str("</pre></body></html>");
+    parse_html(&html)
+}
+
+fn escape_html_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn response_body_entry_limit() -> usize {

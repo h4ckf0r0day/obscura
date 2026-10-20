@@ -745,7 +745,7 @@ impl DomTree {
             context.scope_element = Some(DomElement::new(self, root).opaque());
         }
 
-        for desc_id in self.descendants(root) {
+        for desc_id in self.descendants_iter(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -791,7 +791,7 @@ impl DomTree {
         }
         let mut results = Vec::new();
 
-        for desc_id in self.descendants(root) {
+        for desc_id in self.descendants_iter(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
             if is_element {
                 let element = DomElement::new(self, desc_id);
@@ -1277,6 +1277,26 @@ mod tests {
     use crate::tree_sink::parse_html;
 
     use super::{DomElement, SelectorKey};
+
+    #[test]
+    fn streaming_selectors_keep_scope_order_and_see_reparented_matches() {
+        let tree = parse_html("<!doctype html><i id='duplicate'></i><main id='root'><section id='duplicate' class='hit early'><b class='hit'></b></section>text<!--gap--><span class='hit late'></span></main><aside class='hit'></aside>");
+        let root = tree.get_element_by_id("root").unwrap();
+        let hits = tree.query_selector_all_from(root, ".hit").unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(tree.query_selector_from(root, ".late, .early").unwrap(), Some(hits[0]));
+        assert_eq!(tree.query_selector_from(root, "#duplicate").unwrap(), Some(hits[0]));
+        assert_eq!(tree.query_selector_all_from(root, ":scope > .hit").unwrap(), vec![hits[0], hits[2]]);
+        assert_eq!(tree.query_selector_from(root, ":scope").unwrap(), None);
+        assert_eq!(tree.query_selector_from(root, "aside").unwrap(), None);
+        tree.append_child(root, hits[0]);
+        assert_eq!(tree.query_selector_from(root, ".hit").unwrap(), Some(hits[2]));
+        assert_eq!(tree.query_selector_all_from(root, ".hit").unwrap(), vec![hits[2], hits[0], hits[1]]);
+        tree.remove(hits[2]);
+        assert_eq!(tree.query_selector_from(root, ".hit").unwrap(), Some(hits[0]));
+        assert!(tree.query_selector_from(root, "[").is_err());
+    }
+
 
     #[test]
     fn borrowed_selector_traversal_preserves_links_and_shadow_boundaries() {

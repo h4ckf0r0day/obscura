@@ -139,6 +139,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
+      - name: Test obstacle comparison gate
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
         with:
@@ -153,6 +156,14 @@ jobs:
           # release workflows do not consume this cache.
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
+      - name: Repair incomplete V8 cache
+        run: |
+          # rust-cache removes gn_out but can retain V8's build-script metadata.
+          if [[ ! -f target/release/gn_out/obj/librusty_v8.a || ! -s target/release/gn_out/obj/librusty_v8.a ]]; then
+            rm -f -- target/release/gn_out/obj/librusty_v8.a target/release/gn_out/obj/librusty_v8.sum
+            cargo clean --release -p v8
+          fi
+
       - name: Build render release
         run: cargo build --release -p obscura-cli --bins --features render
 
@@ -161,6 +172,29 @@ jobs:
 
       - name: Stage candidate binary for comparison
         run: install -D -m 0755 target/release/obscura "$RUNNER_TEMP/obscura-ci/obscura-pr"
+
+      - name: Checkout pinned obstacle course
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: h4ckf0r0day/obscura-benchmark
+          ref: 2d08d9a8e860e423b47209434a9fba9c75e6eee6
+          path: obscura-benchmark
+          persist-credentials: false
+
+      - name: Require all 33 obstacle stages
+        run: |
+          OBSCURA_BIN="$RUNNER_TEMP/obscura-ci/obscura-pr" \
+            python3 obscura-benchmark/obstacle-course/run.py \
+              --json --runs 1 --warmup 0 > "$RUNNER_TEMP/obscura-ci/obstacle-candidate.json"
+
+      - name: Upload obstacle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: core-obstacle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/obscura-ci/obstacle-candidate.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build render and stealth release
         run: cargo build --release -p obscura-cli --bins --features render,stealth
@@ -221,7 +255,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: h4ckf0r0day/obscura-benchmark
-          ref: 6ebac8293d7477f59e837768bfd4e74173f04f1c
+          ref: 2d08d9a8e860e423b47209434a9fba9c75e6eee6
           path: obscura-benchmark
           persist-credentials: false
 
@@ -245,6 +279,14 @@ jobs:
         with:
           shared-key: obscura-ci-dependencies
           save-if: false
+
+      - name: Repair incomplete V8 cache
+        run: |
+          # This checkout is the trusted base, so keep the repair self-contained.
+          if [[ ! -f target/release/gn_out/obj/librusty_v8.a || ! -s target/release/gn_out/obj/librusty_v8.a ]]; then
+            rm -f -- target/release/gn_out/obj/librusty_v8.a target/release/gn_out/obj/librusty_v8.sum
+            cargo clean --release -p v8
+          fi
 
       - name: Build base revision
         shell: bash
