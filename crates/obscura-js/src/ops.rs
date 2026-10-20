@@ -5414,6 +5414,127 @@ mod tests {
     // above its fixed maximum before allocating, and still work for ordinary
     // inputs. See #910.
     use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, aes_kw, hkdf_derive, oct_jwk_json, parse_jwk, random_bytes};
+    use super::{ec_export, ec_generate, ec_import, ec_jwk_json, ecdsa_sign, ecdsa_verify};
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // RFC 6979, appendix A.2.5: the P-256 key and its SHA-256 signature of "sample".
+    const RFC6979_D: &str = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721";
+    const RFC6979_X: &str = "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6";
+    const RFC6979_Y: &str = "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
+    const RFC6979_SIG: &str = "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716\
+                               f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8";
+
+    #[test]
+    fn ecdsa_p256_matches_rfc6979() {
+        let private = ec_import(
+            "P-256",
+            "jwk",
+            &unhex(&[RFC6979_D, RFC6979_X, RFC6979_Y].concat()),
+        )
+        .unwrap();
+        let public = ec_import("P-256", "jwk", &unhex(&[RFC6979_X, RFC6979_Y].concat())).unwrap();
+        assert_eq!(private.len(), 97);
+        assert_eq!(public, private[32..]);
+        let expected = unhex(&RFC6979_SIG.split_whitespace().collect::<String>());
+        assert_eq!(
+            ecdsa_sign("P-256", "SHA-256", &private, b"sample").unwrap(),
+            expected
+        );
+        assert!(ecdsa_verify("P-256", "SHA-256", &public, &expected, b"sample").unwrap());
+        assert!(!ecdsa_verify("P-256", "SHA-256", &public, &expected, b"samplf").unwrap());
+        assert!(!ecdsa_verify("P-256", "SHA-384", &public, &expected, b"sample").unwrap());
+        assert!(!ecdsa_verify("P-256", "SHA-256", &public, &expected[1..], b"sample").unwrap());
+        assert!(!ecdsa_verify("P-256", "SHA-256", &public, &[0; 64], b"sample").unwrap());
+        assert!(!ecdsa_verify("P-256", "SHA-256", &public, &[0xff; 64], b"sample").unwrap());
+        // The other hashes sign and verify too (SHA-1 is padded, SHA-512 truncated).
+        for hash in ["SHA-1", "SHA-384", "SHA-512"] {
+            let signature = ecdsa_sign("P-256", hash, &private, b"data").unwrap();
+            assert_eq!(signature.len(), 64);
+            assert!(ecdsa_verify("P-256", hash, &public, &signature, b"data").unwrap());
+        }
+        assert!(ecdsa_sign("P-256", "MD5", &private, b"data").is_err());
+        assert!(ecdsa_sign("P-384", "SHA-256", &private, b"data").is_err());
+    }
+
+    #[test]
+    fn ec_keys_round_trip_through_spki_pkcs8_and_raw() {
+        let private = ec_generate("P-256").unwrap();
+        let public = &private[32..];
+        assert_eq!(public[0], 0x04);
+        let spki = ec_export("P-256", "spki", public).unwrap();
+        assert_eq!(spki.len(), 91);
+        assert_eq!(ec_import("P-256", "spki", &spki).unwrap(), public);
+        let pkcs8 = ec_export("P-256", "pkcs8", &private).unwrap();
+        assert_eq!(
+            pkcs8.len(),
+            138,
+            "Chrome's size: the public key, no inner curve parameters"
+        );
+        assert_eq!(ec_import("P-256", "pkcs8", &pkcs8).unwrap(), private);
+        assert_eq!(ec_import("P-256", "raw", public).unwrap(), public);
+        // A compressed point decompresses to the same key.
+        let mut compressed = vec![0x02 | (public[64] & 1)];
+        compressed.extend_from_slice(&public[1..33]);
+        assert_eq!(ec_import("P-256", "raw", &compressed).unwrap(), public);
+    }
+
+    #[test]
+    fn ec_import_rejects_bad_keys() {
+        let point = unhex(&["04", RFC6979_X, RFC6979_Y].concat());
+        let mut off_curve = point.clone();
+        off_curve[64] ^= 1;
+        assert!(ec_import("P-256", "raw", &off_curve).is_err());
+        assert!(
+            ec_import("P-256", "raw", &[0]).is_err(),
+            "the point at infinity"
+        );
+        assert!(ec_import("P-256", "raw", &point[1..]).is_err());
+        let mut spki = ec_export("P-256", "spki", &point).unwrap();
+        spki.push(0);
+        assert!(ec_import("P-256", "spki", &spki).is_err(), "trailing data");
+        // d = 1...1 doesn't belong to the RFC 6979 point.
+        let wrong_d = [vec![1; 32], point[1..].to_vec()].concat();
+        assert!(ec_import("P-256", "jwk", &wrong_d).is_err());
+        assert!(ec_import("P-256", "jwk", &point[1..33]).is_err());
+        // PKCS#8 keys: no public key (derived), the same and another curve in
+        // the ECPrivateKey's parameters, and a public key that doesn't match.
+        let prefix = "020100301306072a8648ce3d020106082a8648ce3d030107";
+        let d = "01".repeat(32);
+        let no_public = unhex(&format!("3041{prefix}042730250201010420{d}"));
+        assert_eq!(ec_import("P-256", "pkcs8", &no_public).unwrap().len(), 97);
+        let same_curve = unhex(&format!(
+            "304d{prefix}043330310201010420{d}a00a06082a8648ce3d030107"
+        ));
+        assert!(ec_import("P-256", "pkcs8", &same_curve).is_ok());
+        let p384 = unhex(&format!(
+            "304a{prefix}0430302e0201010420{d}a00706052b81040022"
+        ));
+        assert!(ec_import("P-256", "pkcs8", &p384).is_err());
+        let mismatch = unhex(&format!(
+            "308187{prefix}046d306b0201010420{d}a14403420004{RFC6979_X}{RFC6979_Y}"
+        ));
+        assert!(ec_import("P-256", "pkcs8", &mismatch).is_err());
+        assert!(ec_import("P-256", "pkcs8", b"not der").is_err());
+    }
+
+    #[test]
+    fn ec_jwk_json_is_in_lexicographic_order() {
+        let ops = vec!["sign".to_string()];
+        assert_eq!(
+            String::from_utf8(ec_jwk_json("P-256", "AQ", true, &ops, "Ag", "Aw")).unwrap(),
+            r#"{"crv":"P-256","d":"AQ","ext":true,"key_ops":["sign"],"kty":"EC","x":"Ag","y":"Aw"}"#
+        );
+        assert_eq!(
+            String::from_utf8(ec_jwk_json("P-256", "", true, &[], "Ag", "Aw")).unwrap(),
+            r#"{"crv":"P-256","ext":true,"key_ops":[],"kty":"EC","x":"Ag","y":"Aw"}"#
+        );
+    }
 
     #[test]
     fn hkdf_rejects_excessive_output_length() {
@@ -6871,17 +6992,21 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
 #[op2]
 #[buffer]
 fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8> {
+    subtle_digest(&algorithm.to_ascii_uppercase(), data).unwrap_or_default()
+}
+
+/// The digest of `data` with a normalized hash name, or None for another name.
+fn subtle_digest(algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
     use sha1::Digest as _;
-    let alg = algorithm.to_ascii_uppercase();
-    match alg.as_str() {
+    Some(match algorithm {
         "SHA-1" => sha1::Sha1::digest(data).to_vec(),
         "SHA-256" => sha2::Sha256::digest(data).to_vec(),
         "SHA-384" => sha2::Sha384::digest(data).to_vec(),
         "SHA-512" => sha2::Sha512::digest(data).to_vec(),
         "SHA-512/224" => sha2::Sha512_224::digest(data).to_vec(),
         "SHA-512/256" => sha2::Sha512_256::digest(data).to_vec(),
-        _ => vec![],
-    }
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6889,10 +7014,11 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
 //
 // These ops are stateless. The JS shim in bootstrap.js owns the CryptoKey
 // objects and their raw key bytes; it hands the bytes plus normalized algorithm
-// parameters to these ops for each operation. Only secret-key algorithms live
-// here (HMAC, AES-GCM/CBC/CTR, PBKDF2, HKDF); public-key algorithms are rejected
-// in the shim. A fallible op returns a JsErrorBox that the shim turns into the
-// appropriate DOMException (OperationError for a bad tag or padding, etc.).
+// parameters to these ops for each operation. The secret-key algorithms (HMAC,
+// AES-GCM/CBC/CTR/KW, PBKDF2, HKDF) and ECDSA on P-256 live here; the other
+// public-key algorithms are rejected in the shim. A fallible op returns a
+// JsErrorBox that the shim turns into the appropriate DOMException
+// (OperationError for a bad tag or padding, DataError for a bad key, etc.).
 // ---------------------------------------------------------------------------
 
 fn crypto_err(msg: impl std::fmt::Display) -> deno_error::JsErrorBox {
@@ -7148,6 +7274,268 @@ fn parse_jwk(bytes: &[u8]) -> Result<serde_json::Value, deno_error::JsErrorBox> 
 #[serde]
 fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno_error::JsErrorBox> {
     parse_jwk(bytes)
+}
+
+// ECDSA, on P-256 only for now. Key material crosses into JS as bytes: a public
+// key is its uncompressed SEC1 point (0x04 || x || y, 65 bytes), and a private
+// key is its 32-byte scalar followed by that point, so the shim can export a
+// JWK without another op. The shim rejects any other curve before it gets here.
+
+const EC_P256_SCALAR_LEN: usize = 32;
+
+fn ec_curve(curve: &str) -> Result<(), deno_error::JsErrorBox> {
+    if curve == "P-256" {
+        Ok(())
+    } else {
+        Err(crypto_err(format!("unsupported curve {curve}")))
+    }
+}
+
+fn ec_public_material(public: &p256::PublicKey) -> Vec<u8> {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    public.to_encoded_point(false).as_bytes().to_vec()
+}
+
+fn ec_private_material(secret: &p256::SecretKey) -> Vec<u8> {
+    let mut material = secret.to_bytes().to_vec();
+    material.extend_from_slice(&ec_public_material(&secret.public_key()));
+    material
+}
+
+fn ec_secret(material: &[u8]) -> Result<p256::SecretKey, deno_error::JsErrorBox> {
+    let scalar = material
+        .get(..EC_P256_SCALAR_LEN)
+        .ok_or_else(|| crypto_err("not an EC private key"))?;
+    p256::SecretKey::from_bytes(scalar.into()).map_err(crypto_err)
+}
+
+fn ec_public(material: &[u8]) -> Result<p256::PublicKey, deno_error::JsErrorBox> {
+    p256::PublicKey::from_sec1_bytes(material).map_err(crypto_err)
+}
+
+/// A fresh key pair's private material. A random scalar that is zero or not
+/// below the group order (odds about 2^-32) is drawn again.
+fn ec_generate(curve: &str) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    ec_curve(curve)?;
+    loop {
+        let bytes = random_bytes(EC_P256_SCALAR_LEN as u32)?;
+        if let Ok(secret) = p256::SecretKey::from_slice(&bytes) {
+            return Ok(ec_private_material(&secret));
+        }
+    }
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_ec_generate(#[string] curve: &str) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    ec_generate(curve)
+}
+
+/// The key material for `importKey`: "spki", "raw" (an uncompressed or
+/// compressed SEC1 point) and "pkcs8" as given, and "jwk" as the decoded
+/// coordinates x || y of a public key, or d || x || y of a private one. Any
+/// failure (bad DER, another curve, a point off the curve or at infinity, a
+/// private key that doesn't match its public key) is the shim's DataError.
+fn ec_import(curve: &str, format: &str, data: &[u8]) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    use p256::pkcs8::DecodePublicKey;
+    ec_curve(curve)?;
+    match format {
+        "spki" => Ok(ec_public_material(
+            &p256::PublicKey::from_public_key_der(data).map_err(crypto_err)?,
+        )),
+        "raw" => Ok(ec_public_material(&ec_public(data)?)),
+        "pkcs8" => {
+            // The ECPrivateKey's own curve parameters, when present, must name
+            // the same curve as the PrivateKeyInfo's (which SecretKey::try_from checks).
+            use p256::pkcs8::AssociatedOid;
+            let info = p256::pkcs8::PrivateKeyInfo::try_from(data).map_err(crypto_err)?;
+            let ec_key = sec1::EcPrivateKey::try_from(info.private_key).map_err(crypto_err)?;
+            if let Some(parameters) = ec_key.parameters {
+                if parameters.named_curve() != Some(p256::NistP256::OID) {
+                    return Err(crypto_err("the ECPrivateKey names another curve"));
+                }
+            }
+            let secret = p256::SecretKey::try_from(info).map_err(crypto_err)?;
+            Ok(ec_private_material(&secret))
+        }
+        "jwk" => {
+            let (d, xy) = match data.len() {
+                64 => (None, data),
+                96 => (
+                    Some(&data[..EC_P256_SCALAR_LEN]),
+                    &data[EC_P256_SCALAR_LEN..],
+                ),
+                _ => return Err(crypto_err("bad JWK coordinates")),
+            };
+            let mut point = vec![0x04];
+            point.extend_from_slice(xy);
+            let public = ec_public(&point)?;
+            match d {
+                None => Ok(ec_public_material(&public)),
+                Some(d) => {
+                    let secret = ec_secret(d)?;
+                    if secret.public_key() != public {
+                        return Err(crypto_err("the JWK's d doesn't match its x and y"));
+                    }
+                    Ok(ec_private_material(&secret))
+                }
+            }
+        }
+        _ => Err(crypto_err(format!("unsupported EC key format {format}"))),
+    }
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_ec_import(
+    #[string] curve: &str,
+    #[string] format: &str,
+    #[buffer] data: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    ec_import(curve, format, data)
+}
+
+/// The DER of a public key's "spki" or a private key's "pkcs8" export. The
+/// PKCS#8 ECPrivateKey carries the public key and, as Chrome's does, leaves out
+/// the curve parameters the PrivateKeyInfo already gives.
+fn ec_export(
+    curve: &str,
+    format: &str,
+    material: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    ec_curve(curve)?;
+    match format {
+        "spki" => Ok(ec_public(material)?
+            .to_public_key_der()
+            .map_err(crypto_err)?
+            .into_vec()),
+        "pkcs8" => Ok(ec_secret(material)?
+            .to_pkcs8_der()
+            .map_err(crypto_err)?
+            .as_bytes()
+            .to_vec()),
+        _ => Err(crypto_err(format!("unsupported EC key format {format}"))),
+    }
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_ec_export(
+    #[string] curve: &str,
+    #[string] format: &str,
+    #[buffer] material: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    ec_export(curve, format, material)
+}
+
+/// The message digest ECDSA signs: the hash's output, which signing truncates
+/// to the curve's order (SHA-384 and SHA-512) or pads (SHA-1).
+fn ecdsa_prehash(hash: &str, data: &[u8]) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    match hash {
+        "SHA-1" | "SHA-256" | "SHA-384" | "SHA-512" => subtle_digest(hash, data),
+        _ => None,
+    }
+    .ok_or_else(|| crypto_err("unsupported ECDSA hash"))
+}
+
+/// An ECDSA signature as WebCrypto gives it: r || s, each 32 bytes. The nonce
+/// is RFC 6979's, so a signature is deterministic.
+fn ecdsa_sign(
+    curve: &str,
+    hash: &str,
+    material: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    ec_curve(curve)?;
+    let key = p256::ecdsa::SigningKey::from(ec_secret(material)?);
+    let signature: p256::ecdsa::Signature = key
+        .sign_prehash(&ecdsa_prehash(hash, data)?)
+        .map_err(crypto_err)?;
+    Ok(signature.to_bytes().to_vec())
+}
+
+/// Whether `signature` is a valid r || s signature of `data`. One of the wrong
+/// length, or with r or s zero or not below the order, is just invalid.
+fn ecdsa_verify(
+    curve: &str,
+    hash: &str,
+    material: &[u8],
+    signature: &[u8],
+    data: &[u8],
+) -> Result<bool, deno_error::JsErrorBox> {
+    use p256::ecdsa::signature::hazmat::PrehashVerifier;
+    ec_curve(curve)?;
+    let key = p256::ecdsa::VerifyingKey::from(ec_public(material)?);
+    let prehash = ecdsa_prehash(hash, data)?;
+    let Ok(signature) = p256::ecdsa::Signature::from_slice(signature) else {
+        return Ok(false);
+    };
+    Ok(key.verify_prehash(&prehash, &signature).is_ok())
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_ecdsa_sign(
+    #[string] curve: &str,
+    #[string] hash: &str,
+    #[buffer] material: &[u8],
+    #[buffer] data: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    ecdsa_sign(curve, hash, material, data)
+}
+
+#[op2(fast)]
+fn op_subtle_ecdsa_verify(
+    #[string] curve: &str,
+    #[string] hash: &str,
+    #[buffer] material: &[u8],
+    #[buffer] signature: &[u8],
+    #[buffer] data: &[u8],
+) -> Result<bool, deno_error::JsErrorBox> {
+    ecdsa_verify(curve, hash, material, signature, data)
+}
+
+/// An "EC" JWK's members in lexicographic order, as `OctJwk`.
+#[derive(serde::Serialize)]
+struct EcJwk<'a> {
+    crv: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d: Option<&'a str>,
+    ext: bool,
+    key_ops: &'a [String],
+    kty: &'static str,
+    x: &'a str,
+    y: &'a str,
+}
+
+/// The UTF-8 JSON text of an "EC" JWK, for `wrapKey`, for the reason given at
+/// `oct_jwk_json`. An empty `d` (a public key) is left out.
+fn ec_jwk_json(crv: &str, d: &str, ext: bool, key_ops: &[String], x: &str, y: &str) -> Vec<u8> {
+    let jwk = EcJwk {
+        crv,
+        d: (!d.is_empty()).then_some(d),
+        ext,
+        key_ops,
+        kty: "EC",
+        x,
+        y,
+    };
+    serde_json::to_vec(&jwk).unwrap_or_default()
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_ec_jwk_json(
+    #[string] crv: &str,
+    #[string] d: &str,
+    ext: bool,
+    #[serde] key_ops: Vec<String>,
+    #[string] x: &str,
+    #[string] y: &str,
+) -> Vec<u8> {
+    ec_jwk_json(crv, d, ext, &key_ops, x, y)
 }
 
 /// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
@@ -7770,6 +8158,12 @@ pub fn build_extension() -> Extension {
         op_subtle_aes_kw(),
         op_subtle_jwk_json(),
         op_subtle_jwk_parse(),
+        op_subtle_ec_generate(),
+        op_subtle_ec_import(),
+        op_subtle_ec_export(),
+        op_subtle_ecdsa_sign(),
+        op_subtle_ecdsa_verify(),
+        op_subtle_ec_jwk_json(),
         op_subtle_pbkdf2(),
         op_subtle_hkdf(),
         op_random_bytes(),

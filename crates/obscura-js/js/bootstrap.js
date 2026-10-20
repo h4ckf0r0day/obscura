@@ -16953,12 +16953,13 @@ if (typeof TextDecoderStream === 'undefined') {
 
 if (!globalThis.crypto) globalThis.crypto = {};
 if (!globalThis.crypto.subtle) {
-  // Real WebCrypto for the secret-key algorithms sites actually use: HMAC,
-  // AES-GCM/CBC/CTR, PBKDF2 and HKDF, plus raw/JWK-oct key handling. The crypto
-  // itself runs in Rust ops (RustCrypto); this shim only marshals bytes and
-  // normalizes algorithm parameters. Public-key algorithms (RSA*, ECDSA, ECDH)
-  // and non-symmetric key formats (pkcs8/spki) are not implemented and throw
-  // NotSupportedError rather than returning fake data.
+  // Real WebCrypto for the algorithms sites actually use: HMAC,
+  // AES-GCM/CBC/CTR/KW, PBKDF2 and HKDF, plus raw/JWK-oct key handling, and
+  // ECDSA on P-256 (raw, spki, pkcs8 and JWK keys). The crypto itself runs in
+  // Rust ops (RustCrypto); this shim only marshals bytes and normalizes
+  // algorithm parameters. The other public-key algorithms (RSA*, ECDH) and
+  // curves (P-384, P-521) are not implemented and throw NotSupportedError
+  // rather than returning fake data.
   const keyMaterial = new WeakMap();
 
   class CryptoKey {
@@ -17075,6 +17076,208 @@ if (!globalThis.crypto.subtle) {
     return undefined;
   }
 
+  // ECDSA. A key's material is what op_subtle_ec_import and
+  // op_subtle_ec_generate give: a public key's uncompressed point
+  // (0x04 || x || y), or a private key's scalar followed by that point.
+  const EC_SCALAR_LEN = 32;
+  // The KeyUsage enum, in its order, with the KEM usages of the Modern
+  // Algorithms draft (which Chrome recognizes too).
+  const KEY_USAGES = ["encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey",
+    "encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits"];
+  const EC_JWK_ALG_CURVES = { ES256: "P-256", ES384: "P-384", ES512: "P-521" };
+
+  // The namedCurve member, required by EcKeyGenParams and EcKeyImportParams.
+  function ecNamedCurve(alg) {
+    if (alg.namedCurve === undefined) throw new TypeError("namedCurve is required");
+    return String(alg.namedCurve);
+  }
+  function ecSupportCurve(curve) {
+    if (curve !== "P-256") {
+      throw new DOMException("Unsupported named curve: " + curve, "NotSupportedError");
+    }
+  }
+  // A sequence<KeyUsage>, as given (an unknown value is a TypeError).
+  function keyUsageList(keyUsages) {
+    const list = Array.from(keyUsages || [], String);
+    for (const usage of list) {
+      if (!KEY_USAGES.includes(usage)) throw new TypeError("Unknown key usage: " + usage);
+    }
+    return list;
+  }
+  // The usages of `list` that are among `allowed`, once each and in the spec's order.
+  const usageIntersection = (list, allowed) => KEY_USAGES.filter(u => allowed.includes(u) && list.includes(u));
+  function onlyUsages(list, allowed) {
+    for (const usage of list) {
+      if (!allowed.includes(usage)) throw new DOMException("Invalid key usage: " + usage, "SyntaxError");
+    }
+  }
+  function ecImportOp(curve, format, data) {
+    try {
+      return __obscuraCore.ops.op_subtle_ec_import(curve, format, data);
+    } catch (e) {
+      throw new DOMException("Invalid " + curve + " key data", "DataError");
+    }
+  }
+  // An unpadded base64url string, or null for anything else (padding, other
+  // characters, a length no base64 text has).
+  function strictB64urlToBytes(text) {
+    if (typeof text !== "string" || text.length % 4 === 1) return null;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      const ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45 || c === 95;
+      if (!ok) return null;
+    }
+    return b64urlToBytes(text);
+  }
+  function concatBytes(parts) {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let offset = 0;
+    for (const part of parts) { out.set(part, offset); offset += part.length; }
+    return out;
+  }
+  // A JsonWebKey dictionary's members that EC keys use, each read once, in
+  // order, as WebIDL converts a dictionary.
+  function ecJwkDictionary(keyData) {
+    if (keyData === null || (typeof keyData !== "object" && typeof keyData !== "function")) {
+      throw new TypeError("keyData is not a JsonWebKey");
+    }
+    const str = (v) => (v === undefined ? undefined : String(v));
+    const jwk = {};
+    jwk.alg = str(keyData.alg);
+    jwk.crv = str(keyData.crv);
+    jwk.d = str(keyData.d);
+    const ext = keyData.ext;
+    jwk.ext = ext === undefined ? undefined : !!ext;
+    const keyOps = keyData.key_ops;
+    jwk.key_ops = keyOps === undefined ? undefined : Array.from(keyOps, String);
+    jwk.kty = str(keyData.kty);
+    jwk.use = str(keyData.use);
+    jwk.x = str(keyData.x);
+    jwk.y = str(keyData.y);
+    return jwk;
+  }
+  // The coordinates of a key's JWK, base64url-encoded; d only for a private key.
+  function ecJwkMembers(key, bytes) {
+    const point = key.type === "private" ? bytes.subarray(EC_SCALAR_LEN) : bytes;
+    return {
+      crv: keyMaterial.get(key).algorithm.namedCurve,
+      d: key.type === "private" ? bytesToB64url(bytes.subarray(0, EC_SCALAR_LEN)) : undefined,
+      x: bytesToB64url(point.subarray(1, 1 + EC_SCALAR_LEN)),
+      y: bytesToB64url(point.subarray(1 + EC_SCALAR_LEN)),
+    };
+  }
+
+  function ecdsaGenerateKey(alg, extractable, keyUsages) {
+    const curve = ecNamedCurve(alg);
+    const usages = keyUsageList(keyUsages);
+    onlyUsages(usages, ["sign", "verify"]);
+    ecSupportCurve(curve);
+    const material = runOp(() => __obscuraCore.ops.op_subtle_ec_generate(curve));
+    const algorithm = { name: "ECDSA", namedCurve: curve };
+    const privateUsages = usageIntersection(usages, ["sign"]);
+    if (privateUsages.length === 0) {
+      throw new DOMException("A private key needs a usage", "SyntaxError");
+    }
+    return {
+      publicKey: makeKey("public", true, algorithm, usageIntersection(usages, ["verify"]), material.slice(EC_SCALAR_LEN)),
+      privateKey: makeKey("private", extractable, algorithm, privateUsages, material),
+    };
+  }
+
+  function ecdsaImportKey(format, keyData, alg, extractable, keyUsages) {
+    const curve = ecNamedCurve(alg);
+    const usages = keyUsageList(keyUsages);
+    ecSupportCurve(curve);
+    let type, material;
+    if (format === "spki" || format === "pkcs8" || format === "raw") {
+      if (!(keyData instanceof ArrayBuffer) && !ArrayBuffer.isView(keyData)) {
+        throw new TypeError("keyData is not a BufferSource");
+      }
+      type = format === "pkcs8" ? "private" : "public";
+      onlyUsages(usages, [type === "private" ? "sign" : "verify"]);
+      material = ecImportOp(curve, format, toBytes(keyData));
+    } else if (format === "jwk") {
+      const jwk = ecJwkDictionary(keyData);
+      type = jwk.d !== undefined ? "private" : "public";
+      onlyUsages(usages, [type === "private" ? "sign" : "verify"]);
+      if (jwk.kty !== "EC") throw new DOMException("The JWK's kty is not EC", "DataError");
+      if (usages.length > 0 && jwk.use !== undefined && jwk.use !== "sig") {
+        throw new DOMException("The JWK's use is not sig", "DataError");
+      }
+      if (jwk.key_ops !== undefined) {
+        const unique = jwk.key_ops.every((op, i) => jwk.key_ops.indexOf(op) === i);
+        if (!unique || !usages.every(u => jwk.key_ops.includes(u))) {
+          throw new DOMException("The JWK's key_ops don't allow these usages", "DataError");
+        }
+      }
+      if (jwk.ext === false && extractable) {
+        throw new DOMException("The JWK is not extractable", "DataError");
+      }
+      if (jwk.crv !== curve) throw new DOMException("The JWK's crv is not " + curve, "DataError");
+      if (jwk.alg !== undefined && EC_JWK_ALG_CURVES[jwk.alg] !== curve) {
+        throw new DOMException("The JWK's alg doesn't match its curve", "DataError");
+      }
+      const members = type === "private" ? ["d", "x", "y"] : ["x", "y"];
+      const parts = members.map((name) => {
+        const bytes = strictB64urlToBytes(jwk[name]);
+        if (!bytes || bytes.length !== EC_SCALAR_LEN) {
+          throw new DOMException("The JWK's " + name + " is not a " + curve + " value", "DataError");
+        }
+        return bytes;
+      });
+      material = ecImportOp(curve, "jwk", concatBytes(parts));
+    } else {
+      throw new DOMException("Unsupported ECDSA key format: " + format, "NotSupportedError");
+    }
+    if (type === "private" && usages.length === 0) {
+      throw new DOMException("A private key needs a usage", "SyntaxError");
+    }
+    const keyUsageOrder = usageIntersection(usages, KEY_USAGES);
+    return makeKey(type, extractable, { name: "ECDSA", namedCurve: curve }, keyUsageOrder, material);
+  }
+
+  function ecdsaExportKey(format, key, bytes) {
+    const curve = keyMaterial.get(key).algorithm.namedCurve;
+    if (format === "spki" || format === "raw") {
+      if (key.type !== "public") throw new DOMException("Only a public key exports as " + format, "InvalidAccessError");
+      return format === "raw"
+        ? bufferOf(bytes)
+        : bufferOf(runOp(() => __obscuraCore.ops.op_subtle_ec_export(curve, "spki", bytes)));
+    }
+    if (format === "pkcs8") {
+      if (key.type !== "private") throw new DOMException("Only a private key exports as pkcs8", "InvalidAccessError");
+      return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_ec_export(curve, "pkcs8", bytes)));
+    }
+    if (format === "jwk") {
+      // Members in lexicographic order, as for "oct" keys.
+      const { crv, d, x, y } = ecJwkMembers(key, bytes);
+      const jwk = { crv };
+      if (d !== undefined) jwk.d = d;
+      jwk.ext = key.extractable;
+      jwk.key_ops = key.usages.slice();
+      jwk.kty = "EC";
+      jwk.x = x;
+      jwk.y = y;
+      return jwk;
+    }
+    throw new DOMException("Unsupported ECDSA key format: " + format, "NotSupportedError");
+  }
+
+  // The hash of EcdsaParams (required), and the key's material if it may be
+  // used for `usage`, as `type`.
+  function ecdsaHash(alg) {
+    if (alg.hash === undefined) throw new TypeError("hash is required");
+    return normalizeHash(alg.hash);
+  }
+  function ecdsaKeyMaterial(key, usage, type) {
+    const material = keyMaterial.get(key);
+    if (material.algorithm.name !== "ECDSA" || !material.usages.includes(usage)) {
+      throw new DOMException("Key does not allow " + usage + " with ECDSA", "InvalidAccessError");
+    }
+    if (key.type !== type) throw new DOMException("ECDSA " + usage + " needs a " + type + " key", "InvalidAccessError");
+    return material;
+  }
+
   function keyAlgorithmFor(alg, bytes) {
     switch (alg.name) {
       case "HMAC":
@@ -17103,6 +17306,7 @@ if (!globalThis.crypto.subtle) {
 
     async importKey(format, keyData, algorithm, extractable, keyUsages) {
       const alg = normalizeAlgo(algorithm);
+      if (alg.name === "ECDSA") return ecdsaImportKey(format, keyData, alg, extractable, keyUsages);
       let bytes;
       if (format === "raw") {
         bytes = toBytes(keyData);
@@ -17120,6 +17324,7 @@ if (!globalThis.crypto.subtle) {
     async exportKey(format, key) {
       const bytes = keyBytes(key);
       if (!key.extractable) throw new DOMException("Key is not extractable", "InvalidAccessError");
+      if (keyMaterial.get(key).algorithm.name === "ECDSA") return ecdsaExportKey(format, key, bytes);
       if (format === "raw") return bufferOf(bytes);
       if (format === "jwk") {
         // Members in lexicographic order, as browsers return a JsonWebKey and
@@ -17150,6 +17355,7 @@ if (!globalThis.crypto.subtle) {
         const bytes = __obscuraCore.ops.op_random_bytes(alg.length / 8);
         return makeKey("secret", extractable, { name: alg.name, length: alg.length }, keyUsages, bytes);
       }
+      if (alg.name === "ECDSA") return ecdsaGenerateKey(alg, extractable, keyUsages);
       throw new DOMException("generateKey does not support " + alg.name, "NotSupportedError");
     },
 
@@ -17159,6 +17365,12 @@ if (!globalThis.crypto.subtle) {
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
         return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
+      }
+      if (alg.name === "ECDSA") {
+        const hash = ecdsaHash(alg);
+        const material = ecdsaKeyMaterial(key, "sign", "private");
+        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_ecdsa_sign(
+          material.algorithm.namedCurve, hash, bytes, toBytes(data))));
       }
       throw new DOMException("sign does not support " + alg.name, "NotSupportedError");
     },
@@ -17174,6 +17386,12 @@ if (!globalThis.crypto.subtle) {
         let diff = 0;
         for (let i = 0; i < mac.length; i++) diff |= mac[i] ^ sig[i];
         return diff === 0;
+      }
+      if (alg.name === "ECDSA") {
+        const hash = ecdsaHash(alg);
+        const material = ecdsaKeyMaterial(key, "verify", "public");
+        return runOp(() => __obscuraCore.ops.op_subtle_ecdsa_verify(
+          material.algorithm.namedCurve, hash, bytes, toBytes(signature), toBytes(data)));
       }
       throw new DOMException("verify does not support " + alg.name, "NotSupportedError");
     },
@@ -17224,7 +17442,11 @@ if (!globalThis.crypto.subtle) {
       // A JWK is serialized natively rather than with the page's JSON.stringify,
       // so a toJSON or another prototype override can't change the wrapped bytes.
       let bytes;
-      if (format === "jwk") {
+      if (format === "jwk" && keyMaterial.get(key).algorithm.name === "ECDSA") {
+        const { crv, d, x, y } = ecJwkMembers(key, keyBytes(key));
+        bytes = __obscuraCore.ops.op_subtle_ec_jwk_json(
+          crv, d || "", key.extractable, key.usages.map(String), x, y);
+      } else if (format === "jwk") {
         const material = keyBytes(key);
         bytes = __obscuraCore.ops.op_subtle_jwk_json(
           jwkAlg(key, material) || "", key.extractable, bytesToB64url(material), key.usages.map(String));
