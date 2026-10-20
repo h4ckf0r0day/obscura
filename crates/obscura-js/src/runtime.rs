@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, OriginStorage, RuntimeEvent, StoredNetworkResponseBody,
+    ObscuraState, OriginStorage, RuntimeEvent, CachedNetworkResponseBody, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -1443,16 +1443,30 @@ impl ObscuraJsRuntime {
             .borrow()
             .network_response_bodies
             .get(request_id)
-            .cloned()
+            .map(CachedNetworkResponseBody::decoded)
     }
 
     /// Move retained bodies in completion order before the runtime is suspended.
     pub fn take_network_response_bodies(&self) -> Vec<(String, StoredNetworkResponseBody)> {
+        self.take_cached_network_response_bodies().into_iter()
+            .map(|(id, body)| (id, body.decoded())).collect()
+    }
+
+    /// Transfer cached bytes without decoding when the page suspends its realm.
+    pub fn take_cached_network_response_bodies(&self) -> Vec<(String, CachedNetworkResponseBody)> {
         let mut state = self.state.borrow_mut();
         let order = std::mem::take(&mut state.network_response_body_order);
         order.into_iter().filter_map(|id| {
             state.network_response_bodies.remove(&id).map(|body| (id, body))
         }).collect()
+    }
+
+    /// Transfer one response to a CDP stream instead of cloning it in the cache.
+    pub fn take_network_response_body_raw(&self, request_id: &str) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let body = state.network_response_bodies.remove(request_id)?;
+        state.network_response_body_order.retain(|id| id != request_id);
+        body.into_bytes()
     }
 
     pub fn clear_network_response_bodies(&self) {

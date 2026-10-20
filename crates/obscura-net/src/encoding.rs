@@ -68,6 +68,64 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     }
 }
 
+/// Decode CDP response text without replacing invalid bytes. `None` means the
+/// caller must return the original bytes as Base64, not a lossy UTF-8 string.
+pub fn decode_devtools_response_body(bytes: &[u8], content_type: Option<&str>) -> Option<String> {
+    if bytes.is_empty() { return Some(String::new()); }
+    let header = content_type?;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut parts = header.split(|c| {
+        if escaped { escaped = false; return false; }
+        if quoted && c == '\\' { escaped = true; return false; }
+        if c == '"' { quoted = !quoted; }
+        c == ';' && !quoted
+    });
+    let mime = parts.next()?.trim().to_ascii_lowercase();
+    for part in parts {
+        let Some((name, value)) = part.trim_start().split_once('=') else { continue };
+        if !name.eq_ignore_ascii_case("charset") { continue; }
+        let value = value.trim();
+        if value.is_empty() { break; }
+        let mut label = String::new();
+        if let Some(value) = value.strip_prefix('"') {
+            let mut chars = value.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => if let Some(c) = chars.next() { label.push(c); },
+                    c => label.push(c),
+                }
+            }
+        } else {
+            label.push_str(value);
+        }
+        if label.is_empty() { break; }
+        // Blink uses its plain-text default for an unrecognized declared label.
+        let encoding = Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::WINDOWS_1252);
+        return decode_with_label(encoding.name(), bytes, true, false);
+    }
+    let encoding = if mime == "text/html" {
+        sniff_meta_charset(bytes).unwrap_or(UTF_8)
+    } else if matches!(mime.as_str(), "text/xml" | "application/xml")
+        || (mime.contains('/') && mime.ends_with("+xml"))
+        || mime == "application/json" || mime == "text/json" || mime.ends_with("+json")
+        || matches!(mime.as_str(),
+            "application/javascript" | "application/ecmascript" | "application/x-ecmascript"
+            | "application/x-javascript" | "text/ecmascript" | "text/javascript"
+            | "text/javascript1.0" | "text/javascript1.1" | "text/javascript1.2"
+            | "text/javascript1.3" | "text/javascript1.4" | "text/javascript1.5"
+            | "text/jscript" | "text/livescript" | "text/x-ecmascript" | "text/x-javascript")
+    {
+        UTF_8
+    } else if mime.starts_with("text/") && mime != "text/xsl" {
+        encoding_rs::WINDOWS_1252
+    } else {
+        return None;
+    };
+    decode_with_label(encoding.name(), bytes, true, false)
+}
+
 /// Decode an HTTP response body. `content_type_header` is the raw header
 /// value if present (e.g. `text/html; charset=gbk`). For HTML resources,
 /// the parser also sniffs `<meta charset>` in the first 1KB.
@@ -340,6 +398,41 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devtools_response_text_matches_chromium_mime_and_charset_boundaries() {
+        let cases: &[(&[u8], Option<&str>, Option<&str>)] = &[
+            (&[], None, Some("")),
+            (&[], Some("application/octet-stream"), Some("")),
+            (&[0x81, 0x8d], None, None),
+            (b"ABC", None, None),
+            (b"ABC", Some("application/octet-stream"), None),
+            (&[0xff], Some("application/json"), None),
+            (&[0xff], Some("text/plain"), Some("ÿ")),
+            (&[0xff], Some("text/css"), Some("ÿ")),
+            (&[0xff], Some("text/plain; charset=not-real"), Some("ÿ")),
+            (&[0xff], Some("application/json; charset=not-real"), Some("ÿ")),
+            ("\"€\"".as_bytes(), Some("application/json; charset=\"\""), Some("\"€\"")),
+            ("\"€\"".as_bytes(), Some("application/json; charset=\""), Some("\"€\"")),
+            (&[0x80], Some("application/json; charset=windows-1252"), Some("€")),
+            (&[0x80], Some("application/octet-stream; charset=windows-1252"), Some("€")),
+            (&[0xff], Some("application/octet-stream; charset=not-real"), Some("ÿ")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset=gbk"), Some("中文")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset=\"GBK\""), Some("中文")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset='GBK'"), Some("ÖÐÎÄ")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; CHARSET = \"GBK\""), Some("ÖÐÎÄ")),
+            (&[0xd6, 0xd0, 0xce, 0xc4], Some("text/plain; charset= GBK"), Some("中文")),
+            (b"<svg/>", Some("image/svg+xml"), Some("<svg/>")),
+            (b"<x/>", Some("foo/bar+xml"), Some("<x/>")),
+            (b"<html/>", Some("application/xhtml+xml"), Some("<html/>")),
+            (b"<x/>", Some("text/xsl"), None),
+            (&[0xff], Some("application/x-javascript"), None),
+        ];
+        for &(bytes, content_type, expected) in cases {
+            assert_eq!(decode_devtools_response_body(bytes, content_type).as_deref(), expected,
+                "{content_type:?}, bytes={bytes:?}");
+        }
+    }
 
     // Legacy single-byte encodings can expand one input byte into three UTF-8
     // bytes (windows-1252 0x80 is U+20AC). The decoder only writes into spare

@@ -86,6 +86,16 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 
 DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
 
+For documents and fetch/XHR responses, `Network.getResponseBody` returns decoded
+text for recognized text MIME types or declared charsets. Binary, untyped, and
+undecodable bodies use Base64 so clients can recover the original bytes. Ordinary
+and native-stealth fetches use the same policy. Page-side
+`fetch().arrayBuffer()` remains byte-preserving. Cached
+transport bytes are decoded only on lookup; `Fetch.takeResponseBodyAsStream`
+transfers the original bytes, including legacy-encoded text.
+Body retention still follows `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and
+`OBSCURA_NETWORK_BODY_BUFFER_BYTES`; discarded bodies are not encoded for CDP.
+
 ## Capture example
 
 ```js

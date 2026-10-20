@@ -79,6 +79,39 @@ pub struct StoredNetworkResponseBody {
     pub base64_encoded: bool,
 }
 
+/// Retain transport bytes once; text decoding is only a DevTools presentation.
+#[derive(Debug, Clone)]
+pub enum CachedNetworkResponseBody {
+    Raw { bytes: Vec<u8>, content_type: Option<String> },
+    Encoded(StoredNetworkResponseBody),
+}
+
+impl CachedNetworkResponseBody {
+    pub fn raw(bytes: &[u8], content_type: Option<&str>) -> Self {
+        Self::Raw { bytes: bytes.to_vec(), content_type: content_type.map(str::to_string) }
+    }
+
+    pub fn decoded(&self) -> StoredNetworkResponseBody {
+        match self {
+            Self::Encoded(body) => body.clone(),
+            Self::Raw { bytes, content_type } => {
+                match obscura_net::encoding::decode_devtools_response_body(bytes, content_type.as_deref()) {
+                    Some(body) => StoredNetworkResponseBody { body, base64_encoded: false },
+                    None => StoredNetworkResponseBody { body: BASE64.encode(bytes), base64_encoded: true },
+                }
+            }
+        }
+    }
+
+    pub fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Raw { bytes, .. } => Some(bytes),
+            Self::Encoded(body) if body.base64_encoded => BASE64.decode(body.body.as_bytes()).ok(),
+            Self::Encoded(body) => Some(body.body.into_bytes()),
+        }
+    }
+}
+
 /// A network request made from page JS (fetch()/XHR/dynamic resource) recorded
 /// so the CDP layer can emit Network.requestWillBeSent / responseReceived for
 /// it. Static navigation subresources go through Page::record_network_event;
@@ -399,7 +432,7 @@ pub struct ObscuraState {
     pub pending_console_messages: VecDeque<String>,
     pub console_messages_enabled: bool,
     pub runtime_exception_counter: u64,
-    pub network_response_bodies: HashMap<String, StoredNetworkResponseBody>,
+    pub network_response_bodies: HashMap<String, CachedNetworkResponseBody>,
     pub network_response_body_order: VecDeque<String>,
     // Absolute URLs requested via JS fetch() / XHR (op_fetch_url), in request
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
@@ -886,26 +919,23 @@ fn response_body_byte_limit() -> usize {
 fn record_js_network_completion(
     state: &RefCell<OpState>,
     event: JsNetworkEvent,
-    body: &str,
-    base64_encoded: bool,
+    body: impl FnOnce(&JsNetworkEvent) -> CachedNetworkResponseBody,
 ) {
     let state_borrow = state.borrow();
     let gs = state_borrow.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
-        body: body.to_string(), base64_encoded,
-    });
+    record_network_completion(&mut gs, event, body);
 }
 
 pub(crate) fn record_network_completion(
     gs: &mut ObscuraState,
     event: JsNetworkEvent,
-    body: impl FnOnce() -> StoredNetworkResponseBody,
+    body: impl FnOnce(&JsNetworkEvent) -> CachedNetworkResponseBody,
 ) {
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), body());
+        gs.network_response_bodies.insert(event.request_id.clone(), body(&event));
         gs.network_response_body_order.push_back(event.request_id.clone());
         while gs.network_response_body_order.len() > max_entries {
             if let Some(oldest) = gs.network_response_body_order.pop_front() {
@@ -4029,7 +4059,9 @@ async fn fetch_url_inner(
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
-                    }, if encoded { &bb } else { &b }, encoded);
+                    }, |_| CachedNetworkResponseBody::Encoded(StoredNetworkResponseBody {
+                        body: if encoded { bb.clone() } else { b.clone() }, base64_encoded: encoded,
+                    }));
                     let mut response = intercept_fulfill_response(
                         status,
                         h,
@@ -4542,7 +4574,9 @@ async fn fetch_url_inner(
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            }, |event| CachedNetworkResponseBody::raw(
+                &resp_bytes, event.response_headers.get("content-type").map(String::as_str),
+            ));
         }
         network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
@@ -4796,7 +4830,9 @@ async fn stealth_fetch_all(
             event.body_size = resp_bytes.len();
             event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs_f64();
-            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+            record_js_network_completion(&state, event, |event| CachedNetworkResponseBody::raw(
+                &resp_bytes, event.response_headers.get("content-type").map(String::as_str),
+            ));
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::{OriginStorage, max_live_frames, NavigationTiming};
+use obscura_js::ops::{CachedNetworkResponseBody, OriginStorage, max_live_frames, NavigationTiming, StoredNetworkResponseBody};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -314,7 +314,7 @@ pub struct Page {
     /// to the entry instead of appending a new one.
     pending_history_traversal: std::sync::Mutex<Option<usize>>,
     pub network_events: Vec<NetworkEvent>,
-    response_bodies: std::collections::HashMap<String, StoredResponseBody>,
+    response_bodies: std::collections::HashMap<String, CachedNetworkResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
     pub intercept_enabled: bool,
@@ -3501,19 +3501,20 @@ impl Page {
         })?;
         self.navigation_timing.record("responseEnd");
 
-        // Store binary main resources (images, PDFs, octet-stream) base64 so
-        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
-        // corrupts them (issue #340). Text-like types stay as text.
-        let main_is_binary = !is_text_like_content_type(response.content_type());
-        self.record_network_event_with_body(
+        // Keep original bytes for streams; DevTools text decoding happens on read.
+        let request_id = self.record_network_event_inner(
             response.url.as_str(),
             "GET",
             "Document",
             response.status,
             &response.headers,
-            &response.body,
-            main_is_binary,
+            response.body.len(),
         );
+        let body = &response.body;
+        let content_type = response.content_type();
+        self.store_response_body_with(request_id, body.len(), || {
+            CachedNetworkResponseBody::raw(body, content_type)
+        });
 
         if !response.redirected_from.is_empty() {
             self.url = Some(response.url.clone());
@@ -4646,23 +4647,32 @@ impl Page {
     }
 
     fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+        self.store_response_body_with(request_id, body.len(), || CachedNetworkResponseBody::Encoded(StoredNetworkResponseBody {
+            body: if base64_encoded {
+                BASE64.encode(body)
+            } else {
+                String::from_utf8_lossy(body).to_string()
+            },
+            base64_encoded,
+        }));
+    }
+
+    fn store_response_body_with<F>(
+        &mut self,
+        request_id: String,
+        source_len: usize,
+        make_stored: F,
+    )
+    where
+        F: FnOnce() -> CachedNetworkResponseBody,
+    {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+        if max_entries == 0 || max_bytes == 0 || source_len > max_bytes {
             return;
         }
-        let body = if base64_encoded {
-            BASE64.encode(body)
-        } else {
-            String::from_utf8_lossy(body).to_string()
-        };
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body,
-                base64_encoded,
-            },
-        );
+        let stored = make_stored();
+        self.response_bodies.insert(request_id.clone(), stored);
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -4672,14 +4682,13 @@ impl Page {
     }
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
-        self.response_bodies.get(request_id).cloned().or_else(|| {
+        self.response_bodies.get(request_id).map(CachedNetworkResponseBody::decoded).or_else(|| {
             self.js
                 .as_ref()?
                 .get_network_response_body(request_id)
-                .map(|body| StoredResponseBody {
-                    body: body.body,
-                    base64_encoded: body.base64_encoded,
-                })
+        }).map(|body| StoredResponseBody {
+            body: body.body,
+            base64_encoded: body.base64_encoded,
         })
     }
 
@@ -4687,27 +4696,18 @@ impl Page {
     /// (Fetch.takeResponseBodyAsStream). Removes it from the in-memory cache and
     /// transfers ownership to the caller, so a large body is held once and freed
     /// when the stream is closed rather than lingering in this long-running
-    /// process (issue #360). Binary bodies are stored base64 (byte-exact); text
-    /// bodies return their UTF-8 bytes. Returns None if the body was never
+    /// process (issue #360). Transport bodies preserve their original bytes,
+    /// including legacy-encoded text. Returns None if the body was never
     /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
     /// dropped) or the id is unknown.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
-        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
+        if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            body
+            body.into_bytes()
         } else {
             self.js
                 .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|b| StoredResponseBody {
-                    body: b.body,
-                    base64_encoded: b.base64_encoded,
-                })?
-        };
-        if stored.base64_encoded {
-            BASE64.decode(stored.body.as_bytes()).ok()
-        } else {
-            Some(stored.body.into_bytes())
+                .take_network_response_body_raw(request_id)
         }
     }
 
@@ -4751,11 +4751,8 @@ impl Page {
         // Completed module and JS requests must survive the realm's teardown.
         self.sync_js_network_events();
         let max_entries = response_body_entry_limit();
-        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
-            self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: body.body,
-                base64_encoded: body.base64_encoded,
-            });
+        for (id, body) in self.js.as_ref().unwrap().take_cached_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), body);
             self.response_body_order.push_back(id);
         }
         while self.response_body_order.len() > max_entries {
@@ -10902,29 +10899,6 @@ impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
     }
-}
-
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn is_text_like_content_type(content_type: Option<&str>) -> bool {
-    let ct = match content_type {
-        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
-        // No Content-Type: assume text (matches the HTML-parse default).
-        None => return true,
-    };
-    if ct.is_empty() {
-        return true;
-    }
-    ct.starts_with("text/")
-        || ct == "application/json"
-        || ct == "application/xml"
-        || ct == "application/xhtml+xml"
-        || ct == "application/javascript"
-        || ct == "application/ecmascript"
-        || ct == "image/svg+xml"
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
 }
 
 /// Lowercased MIME type of a Content-Type header, without parameters.
