@@ -308,6 +308,44 @@ fn exception_text(
     }
 }
 
+fn cdp_result_record<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    rejected: bool,
+    await_promise: bool,
+) -> Result<v8::Global<v8::Value>, String> {
+    let should_await = await_promise && !rejected;
+    let pending = v8::Object::new(scope);
+    let done = v8::Boolean::new(scope, !should_await);
+    let rejected = v8::Boolean::new(scope, rejected);
+    let initial_value = if should_await { v8::undefined(scope).into() } else { value };
+    for (name, value) in [
+        ("done", done.into()), ("rejected", rejected.into()), ("value", initial_value),
+    ] {
+        let key = v8::String::new(scope, name).ok_or("CDP result key allocation failed")?;
+        if pending.create_data_property(scope, key.into(), value) != Some(true) {
+            return Err("CDP result allocation failed".into());
+        }
+    }
+    if should_await {
+        // Await uses the intrinsic Promise and assimilates thenables.
+        let source = v8::String::new(scope, r#"(async function(value, pending) {
+            try { pending.value = await value; }
+            catch (error) { pending.value = error; pending.rejected = true; }
+            pending.done = true;
+        })"#).ok_or("CDP await allocation failed")?;
+        let function = v8::Script::compile(scope, source, None)
+            .and_then(|script| script.run(scope))
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or("Cannot initialize awaited CDP result")?;
+        let receiver = v8::undefined(scope).into();
+        function.call(scope, receiver, &[value, pending.into()])
+            .ok_or("Cannot await CDP result")?;
+    }
+    let pending: v8::Local<v8::Value> = pending.into();
+    Ok(v8::Global::new(scope, pending))
+}
+
 /// A fetched and instantiated module graph whose evaluation is intentionally
 /// delayed until the HTML script scheduler reaches its post-parse turn.
 pub struct PreparedModule {
@@ -2654,36 +2692,7 @@ impl ObscuraJsRuntime {
             let value = result.or_else(|| scope.exception())
                 .ok_or("CDP evaluation failed without an exception")?;
             scope.reset();
-            let should_await = await_promise && !rejected;
-            let pending = v8::Object::new(scope);
-            let done = v8::Boolean::new(scope, !should_await);
-            let rejected = v8::Boolean::new(scope, rejected);
-            let initial_value = if should_await { v8::undefined(scope).into() } else { value };
-            for (name, value) in [
-                ("done", done.into()), ("rejected", rejected.into()), ("value", initial_value),
-            ] {
-                let key = v8::String::new(scope, name).ok_or("CDP result key allocation failed")?;
-                if pending.create_data_property(scope, key.into(), value) != Some(true) {
-                    return Err("CDP result allocation failed".to_string());
-                }
-            }
-            if should_await {
-                // Await assimilates thenables without consulting the page's Promise constructor.
-                let source = v8::String::new(scope, r#"(async function(value, pending) {
-                    try { pending.value = await value; }
-                    catch (error) { pending.value = error; pending.rejected = true; }
-                    pending.done = true;
-                })"#).ok_or("CDP await allocation failed")?;
-                let function = v8::Script::compile(scope, source, None)
-                    .and_then(|script| script.run(scope))
-                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-                    .ok_or_else(|| exception_text(scope))?;
-                let receiver = v8::undefined(scope).into();
-                function.call(scope, receiver, &[value, pending.into()])
-                    .ok_or_else(|| exception_text(scope))?;
-            }
-            let pending: v8::Local<v8::Value> = pending.into();
-            Ok(v8::Global::new(scope, pending))
+            cdp_result_record(scope, value, rejected, await_promise)
         })();
         let record = self.finish_heap_checked(record)?;
         self.pending_cdp_evaluations.insert(oid.clone(), record);
@@ -2741,86 +2750,53 @@ impl ObscuraJsRuntime {
     ) -> Result<CdpEvaluation, String> {
         self.begin_javascript_task();
         let this_expr = self.resolve_this(object_id);
-        let (setup, args_list) = self.build_args(arguments);
-
+        let receiver = self.execute_runtime_script("<cdp-receiver>", this_expr)
+            .map_err(|error| format!("JS error: {error}"))?;
+        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument))
+            .collect::<Result<Vec<_>, _>>()?;
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
-
+        let record = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let receiver = v8::Local::new(scope, &receiver);
+            let arguments = arguments.iter().map(|argument| v8::Local::new(scope, argument))
+                .collect::<Vec<_>>();
+            let source = v8::String::new(scope, &format!("(\n{function_declaration}\n)"))
+                .ok_or("CDP function allocation failed")?;
+            let result = v8::Script::compile(scope, source, None)
+                .and_then(|script| script.run(scope))
+                .and_then(|value| {
+                    match v8::Local::<v8::Function>::try_from(value) {
+                        Ok(function) => function.call(scope, receiver, &arguments),
+                        Err(_) => {
+                            let message = v8::String::new(scope, "Given expression does not evaluate to a function")?;
+                            let error = v8::Exception::type_error(scope, message);
+                            scope.throw_exception(error);
+                            None
+                        }
+                    }
+                });
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".into());
+            }
+            let rejected = result.is_none();
+            let value = result.or_else(|| scope.exception())
+                .ok_or("CDP call failed without an exception")?;
+            scope.reset();
+            cdp_result_record(scope, value, rejected, await_promise)
+        })();
+        let record = self.finish_heap_checked(record)?;
+        self.pending_cdp_evaluations.insert(oid.clone(), record);
+        let pending = PendingCdpEvaluation { object_id: oid, recipe: None };
         if await_promise {
-            let code = format!(
-                "(function() {{\n\
-                    var pending = {{done:false,rejected:false,value:undefined}};\n\
-                    (async function() {{\n\
-                        try {{\n\
-                            {setup}\n\
-                            var __fn = ({fn_decl});\n\
-                            var __this = ({this_expr});\n\
-                            pending.value = await __fn.call(__this, {args});\n\
-                        }} catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
-                        pending.done = true;\n\
-                    }})();\n\
-                    return pending;\n\
-                }})()",
-                setup = setup,
-                fn_decl = function_declaration,
-                this_expr = this_expr,
-                args = args_list,
-            );
-
-            let record = self.execute_runtime_script("<callFnAsync>", code)
-                .map_err(|e| format!("JS error: {}", e))?;
-            self.pending_cdp_evaluations.insert(oid.clone(), record);
-
-            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid, recipe: None,
-            }));
-        }
-
-        if return_by_value {
-            let code = format!(
-                "(function() {{\n\
-                    {setup}\n\
-                    var __fn = ({fn_decl});\n\
-                    var __this = ({this_expr});\n\
-                    return __fn.call(__this, {args});\n\
-                }})()",
-                setup = setup,
-                fn_decl = function_declaration,
-                this_expr = this_expr,
-                args = args_list,
-            );
-            let result = self
-                .execute_runtime_script("<callFnByValue>", code)
-                .map_err(|e| format!("JS error: {}", e))?;
-            return self.v8_to_cdp_value(result).map(CdpEvaluation::Complete);
-        }
-
-        let code = format!(
-            "(function() {{\n\
-                {setup}\n\
-                var __fn = ({fn_decl});\n\
-                var __this = ({this_expr});\n\
-                var __result = __fn.call(__this, {args});\n\
-                globalThis.__obscura_objects[{oid}] = __result;\n\
-                return {meta_fn};\n\
-            }})()",
-            setup = setup,
-            fn_decl = function_declaration,
-            this_expr = this_expr,
-            args = args_list,
-            oid = js_string_literal(&oid),
-            meta_fn = Self::meta_extract_js("__result"),
-        );
-        let result = self
-            .execute_runtime_script("<callFnRemote>", code)
-            .map_err(|e| format!("JS error: {}", e))?;
-        let meta_str = self.v8_to_json(result)?;
-        let meta_json = if let serde_json::Value::String(s) = &meta_str {
-            serde_json::from_str(s).unwrap_or(meta_str.clone())
+            Ok(CdpEvaluation::Pending(pending))
         } else {
-            meta_str
-        };
-        self.finish_cdp_result(&meta_json, &oid).map(CdpEvaluation::Complete)
+            self.finish_cdp_evaluation(pending, return_by_value).map(CdpEvaluation::Complete)
+        }
     }
 
     #[doc(hidden)]
@@ -4340,45 +4316,37 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn build_args(&mut self, arguments: &[serde_json::Value]) -> (String, String) {
-        let mut setup_lines = Vec::new();
-        let mut arg_names = Vec::new();
-
-        for (i, arg) in arguments.iter().enumerate() {
-            let arg_name = format!("__arg{}", i);
-            // objectId wins over value. go-rod marshals CallArgument through a
-            // struct, and Go's `omitempty` is a no-op on structs, so every
-            // object handle it sends arrives as `{"value":null,"objectId":...}`.
-            // Chromium reads objectId first and ignores the null; reading value
-            // first passed `null` as the argument and broke rod's JS helpers
-            // (`functions.selectable = ...` → "Cannot set properties of null").
-            if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
-                if let Some(retrieval) = self.resolve_remote_object(oid) {
-                    setup_lines.push(format!("var {} = {};", arg_name, retrieval));
-                } else {
-                    setup_lines.push(format!("var {} = undefined;", arg_name));
-                }
-            } else if let Some(value) = arg.get("value") {
-                // No handle: a plain JSON argument, explicit null included.
-                let json_str =
-                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
-                setup_lines.push(format!("var {} = {};", arg_name, json_str));
-            } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
-                // CDP defines UnserializableValue as a closed set. Anything
-                // else is arbitrary source text arriving in a data field;
-                // treat it as undefined rather than evaluating it.
-                if is_cdp_unserializable_value(unser) {
-                    setup_lines.push(format!("var {} = {};", arg_name, unser));
-                } else {
-                    setup_lines.push(format!("var {} = undefined;", arg_name));
-                }
-            } else {
-                setup_lines.push(format!("var {} = undefined;", arg_name));
-            }
-            arg_names.push(arg_name);
+    fn cdp_call_argument(&mut self, argument: &serde_json::Value) -> Result<v8::Global<v8::Value>, String> {
+        // Remote handles take precedence over value, including rod's value:null.
+        if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
+            let expression = self.resolve_remote_object(id).unwrap_or_else(|| "undefined".into());
+            return self.execute_runtime_script("<cdp-argument>", expression)
+                .map_err(|error| format!("JS error: {error}"));
         }
-
-        (setup_lines.join("\n"), arg_names.join(", "))
+        if argument.get("value").is_none() {
+            if let Some(value) = argument.get("unserializableValue").and_then(|value| value.as_str()) {
+                if is_cdp_unserializable_value(value) {
+                    return self.execute_runtime_script("<cdp-argument>", value.to_string())
+                        .map_err(|error| format!("JS error: {error}"));
+                }
+            }
+        }
+        let result = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let value = if let Some(value) = argument.get("value") {
+                // JSON data is not an object literal: __proto__ must be an own property.
+                let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
+                let json = v8::String::new(scope, &json).ok_or("CDP argument allocation failed")?;
+                v8::json::parse(scope, json).ok_or_else(|| exception_text(scope))?
+            } else {
+                v8::undefined(scope).into()
+            };
+            Ok(v8::Global::new(scope, value))
+        })();
+        self.finish_heap_checked(result)
     }
 
     fn v8_to_json(
@@ -19526,6 +19494,51 @@ mod tests {
             0,
             "removing an ancestor must release the linked stylesheets below it"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_calls_do_not_use_a_page_overridden_function_call() {
+        for await_promise in [false, true] {
+            let mut rt = setup_runtime("<body></body>");
+            let receiver = rt.evaluate_for_cdp("({base:40})", false, false).await.unwrap();
+            rt.execute_script("<override-call>",
+                "Function.prototype.call=function(){throw new Error('page call override');};").unwrap();
+            for declaration in [
+                "function(value){return this.base+value;}",
+                "function(value){return this.base+value;}\n//# sourceURL=cdp-function.js",
+            ] {
+                let result = rt.call_function_on_for_cdp(
+                    declaration, receiver.object_id.as_deref(),
+                    &[serde_json::json!({"value":2})], true, await_promise,
+                ).await.unwrap();
+                assert!(!result.thrown);
+                assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+            }
+            let thrown = rt.call_function_on_for_cdp(
+                "function(){throw new Error('native call error');}", None, &[], true, await_promise,
+            ).await.unwrap();
+            assert!(thrown.thrown);
+            assert_eq!(thrown.subtype.as_deref(), Some("error"));
+            assert!(thrown.description.contains("native call error"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_call_json_arguments_preserve_proto_data_properties() {
+        for await_promise in [false, true] {
+            let mut rt = setup_runtime("<body></body>");
+            rt.execute_script("<override-json>",
+                "JSON.parse=function(){throw new Error('page JSON override');};").unwrap();
+            let argument = serde_json::from_str(r#"{"value":{"__proto__":{"sentinel":42},"marker":7,"nested":[{"__proto__":null}]}}"#).unwrap();
+            let result = rt.call_function_on_for_cdp(r#"function(value){
+                const child=value.nested[0];
+                return [Object.hasOwn(value,'__proto__'), Object.getPrototypeOf(value)===Object.prototype,
+                    value.__proto__.sentinel, value.marker, Object.hasOwn(child,'__proto__'),
+                    Object.getPrototypeOf(child)===Object.prototype, child.__proto__===null];
+            }"#, None, &[argument], true, await_promise).await.unwrap();
+            assert!(!result.thrown);
+            assert_eq!(result.value, Some(serde_json::json!([true,true,42,7,true,true,true])));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
