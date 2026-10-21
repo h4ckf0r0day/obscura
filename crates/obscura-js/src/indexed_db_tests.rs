@@ -325,6 +325,28 @@ async fn indexeddb_cloned_nonextractable_crypto_keys_keep_their_material_and_per
 }
 
 #[tokio::test]
+async fn indexeddb_cloned_ecdsa_key_pairs_still_sign_and_verify() {
+    // A DPoP client keeps its non-extractable key pair in IndexedDB.
+    let out = probe(r#"
+        const ES256 = {name:'ECDSA',hash:'SHA-256'}, data = new Uint8Array([4,5,6]);
+        const pair = await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},false,['sign','verify']);
+        const db = await opened('ecdsa-keys');
+        const tx = db.transaction('items','readwrite'), done = finished(tx);
+        tx.objectStore('items').put(pair,1); await done;
+        const copy = await requested(db.transaction('items').objectStore('items').get(1));
+        const signature = await crypto.subtle.sign(ES256,copy.privateKey,data);
+        const jwk = await crypto.subtle.exportKey('jwk',copy.publicKey);
+        const original = await crypto.subtle.exportKey('jwk',pair.publicKey);
+        return [copy.privateKey instanceof CryptoKey,copy.privateKey.type,copy.privateKey.extractable,
+            copy.publicKey.type,copy.publicKey.algorithm.namedCurve,
+            await crypto.subtle.verify(ES256,pair.publicKey,signature,data),
+            await crypto.subtle.verify(ES256,copy.publicKey,await crypto.subtle.sign(ES256,pair.privateKey,data),data),
+            jwk.x === original.x && jwk.y === original.y];
+    "#).await;
+    assert_eq!(out,json!([true,"private",false,"public","P-256",true,true,true]));
+}
+
+#[tokio::test]
 async fn indexeddb_empty_upgrade_completes_and_index_metadata_outlives_transactions() {
     let out = probe(r#"
         const empty = await new Promise((resolve,reject) => {
