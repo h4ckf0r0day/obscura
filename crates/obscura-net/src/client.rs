@@ -435,6 +435,50 @@ pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
     }
 }
 
+/// Fetch Metadata header values for script-owned requests (fetch()/XHR and
+/// the module/resource loads that share `op_fetch_url`). Navigation builds its
+/// own profile in `fetch_with_profile_uncached`; these mirror it so every
+/// browser-owned request carries the same metadata a real browser sends.
+/// Servers rely on `Sec-Fetch-Site: same-origin` for CSRF guards and
+/// same-origin API auth, so omitting it makes such apps reject the request.
+pub fn script_fetch_site(initiator_origin: &str, target: &str) -> &'static str {
+    if initiator_origin.is_empty() || initiator_origin == "null" {
+        return "none";
+    }
+    let target_origin = match Url::parse(target) {
+        Ok(parsed) => parsed.origin().ascii_serialization(),
+        Err(_) => return "none",
+    };
+    if initiator_origin == target_origin {
+        "same-origin"
+    } else {
+        // Same-site classification needs the public suffix list; cross-site
+        // is the conservative value and never overstates ambient trust.
+        "cross-site"
+    }
+}
+
+/// `Sec-Fetch-Mode` for a script request, from the fetch() mode string.
+pub fn script_fetch_mode(mode: &str) -> &'static str {
+    match mode {
+        "navigate" => "navigate",
+        "no-cors" => "no-cors",
+        _ => "cors",
+    }
+}
+
+/// `Sec-Fetch-Dest` for a script request, from its resource type.
+pub fn script_fetch_dest(resource_type: ResourceType) -> &'static str {
+    match resource_type {
+        ResourceType::Document => "document",
+        ResourceType::Script => "script",
+        ResourceType::Stylesheet => "style",
+        ResourceType::Image => "image",
+        ResourceType::Font => "font",
+        ResourceType::Xhr | ResourceType::Fetch | ResourceType::Other => "empty",
+    }
+}
+
 pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
@@ -1794,9 +1838,10 @@ mod resource_cache_tests {
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
-        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer,
+        script_fetch_dest, script_fetch_mode, script_fetch_site, validate_url, CallbackRegistry,
+        ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode, ResourceRequest,
+        ResourceType, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
@@ -2080,6 +2125,41 @@ mod ssrf_tests {
             Some("https://app.example/")
         );
         assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    #[test]
+    fn script_fetch_metadata_classifies_site_mode_and_dest() {
+        // Same origin: initiator serialization equals the target origin.
+        assert_eq!(
+            script_fetch_site("https://app.example", "https://app.example/api/risk"),
+            "same-origin"
+        );
+        // Different origin conservatively reports cross-site.
+        assert_eq!(
+            script_fetch_site("https://app.example", "https://cdn.example/x.js"),
+            "cross-site"
+        );
+        // A missing or opaque initiator carries no ambient trust.
+        assert_eq!(script_fetch_site("", "https://app.example/"), "none");
+        assert_eq!(script_fetch_site("null", "https://app.example/"), "none");
+        // An unparsable target cannot be classified.
+        assert_eq!(script_fetch_site("https://app.example", "not a url"), "none");
+
+        // Mode maps the fetch() mode string; same-origin resolves to cors per spec.
+        assert_eq!(script_fetch_mode("navigate"), "navigate");
+        assert_eq!(script_fetch_mode("no-cors"), "no-cors");
+        assert_eq!(script_fetch_mode("cors"), "cors");
+        assert_eq!(script_fetch_mode("same-origin"), "cors");
+
+        // Destination mirrors the navigation-path mapping.
+        assert_eq!(script_fetch_dest(ResourceType::Document), "document");
+        assert_eq!(script_fetch_dest(ResourceType::Script), "script");
+        assert_eq!(script_fetch_dest(ResourceType::Stylesheet), "style");
+        assert_eq!(script_fetch_dest(ResourceType::Image), "image");
+        assert_eq!(script_fetch_dest(ResourceType::Font), "font");
+        assert_eq!(script_fetch_dest(ResourceType::Xhr), "empty");
+        assert_eq!(script_fetch_dest(ResourceType::Fetch), "empty");
+        assert_eq!(script_fetch_dest(ResourceType::Other), "empty");
     }
 
     async fn http_fixture(
