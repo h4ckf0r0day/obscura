@@ -7782,6 +7782,8 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
         op_begin_render_task(),
+        op_set_focused(),
+        op_set_target_fragment(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
@@ -9137,6 +9139,57 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
         state.prepared_render = None;
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
+    }
+}
+
+/// Push the focused area into the DOM tree so `:focus`/`:focus-within` resolve.
+/// JS `focus()`/`blur()` and the removal-steps reset route the element here;
+/// `nid == 0` means the viewport (nothing focused). Registered unconditionally:
+/// selector matching lives in obscura-dom and works without the render feature
+/// (a `querySelector(':focus-within')` on a no-render build must see the same
+/// state as a render build), while the render-cached invalidations are gated.
+#[op2(fast)]
+fn op_set_focused(state: &OpState, nid: u32, frame_id: u32) {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let changed = state.dom.as_ref().is_some_and(|dom| {
+        dom.set_focused((nid != 0).then(|| NodeId::new(nid)))
+    });
+    if changed {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
+    }
+}
+
+/// Push the document URL's fragment into the DOM tree so `:target` resolves.
+/// The fragment lives in JS-visible state (`location`, `history.pushState`, and
+/// `<a>` activation all route through the virtual URL), so JS is the sync point
+/// on every URL change, including the initial document load.
+#[op2(fast)]
+fn op_set_target_fragment(
+    state: &OpState,
+    #[string] fragment: String,
+    frame_id: u32,
+) {
+    let shared = frame_state(state, frame_id);
+    let mut state = shared.borrow_mut();
+    let fragment = fragment.trim_start_matches('#');
+    let changed = state.dom.as_ref().is_some_and(|dom| {
+        dom.set_target_fragment((!fragment.is_empty()).then_some(fragment))
+    });
+    if changed {
+        state.activity_generation = state.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
     }
 }
 

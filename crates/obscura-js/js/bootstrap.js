@@ -197,7 +197,10 @@ const _dom = (cmd, a1, a2) => {
     // HTML removal steps reset the focused area to the viewport without
     // dispatching blur/change events. Cover native replacement paths too.
     const focused = globalThis.__obscura_focused;
-    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
+    if (focused && !focused.isConnected) {
+      globalThis.__obscura_focused = null;
+      globalThis.__obscura_setFocused?.(null);
+    }
   }
   return result;
 };
@@ -4613,12 +4616,15 @@ class Element extends Node {
     }
     globalThis.__obscura_focused = this;
     globalThis.__obscura_click_target = this;
+    // Keep the tree's focused-area slot current so :focus/:focus-within match.
+    globalThis.__obscura_setFocused?.(this);
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
   }
   blur() {
     if (globalThis.__obscura_focused !== this) return;
     globalThis.__obscura_focused = null;
+    globalThis.__obscura_setFocused?.(null);
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
   }
@@ -11553,6 +11559,26 @@ globalThis.__obscura_setHovered = function(el) {
     __obscuraCore.ops.op_set_hovered(el?._nid | 0, 0);
   }
 };
+// Mirror the focused area into the DOM tree (nid 0 = viewport / nothing
+// focused). The selector engine reads only tree state for :focus and
+// :focus-within, so every JS-side focus change must land here.
+globalThis.__obscura_setFocused = function(el) {
+  if (typeof __obscuraCore.ops.op_set_focused === 'function') {
+    __obscuraCore.ops.op_set_focused(el?._nid | 0, _realmFrameId);
+  }
+};
+// Mirror the document URL's fragment into the tree for :target. Callers pass
+// the full URL; extraction and `#` stripping happen here so every URL change
+// (load, location setters, pushState/replaceState, traverse) syncs the same way.
+globalThis.__obscura_syncTargetFragment = function(url) {
+  if (typeof __obscuraCore.ops.op_set_target_fragment !== 'function') return;
+  let fragment = '';
+  try { fragment = new URL(url).hash; } catch (e) {
+    const i = String(url || '').indexOf('#');
+    if (i >= 0) fragment = String(url).slice(i);
+  }
+  __obscuraCore.ops.op_set_target_fragment(fragment, _realmFrameId);
+};
 
 // Build a FileList: indexed File entries plus the DOM's length and `item(i)`
 // accessor. Real instances of the FileList global (issue #1232), not arrays,
@@ -13232,6 +13258,9 @@ globalThis.atob = globalThis.atob || ((s) => {
   const applyVirtual = () => {
     const entry = stack[idx];
     globalThis.__virtualUrl = entry.url ?? null;
+    // :target follows the document URL on every history-driven change:
+    // fragment navigation, pushState/replaceState, and session traverse.
+    globalThis.__obscura_syncTargetFragment?.(globalThis.__virtualUrl || '');
   };
   // Same-document fragment navigation, reached from the Location setters and
   // `<a href="#x">` activation. Per the HTML spec it adds a history entry
@@ -18371,6 +18400,13 @@ globalThis.__obscura_init = function() {
   // URL a location setter previewed synchronously and let document_url drive
   // location.href again, including any redirect target.
   globalThis.__virtualUrl = null;
+  // An initial document load can carry the fragment in the navigation URL
+  // (`page.html#section`), which no history operation applies. The tree is
+  // installed and the URL is committed here, so sync :target before any style
+  // pass runs. Every realm does this for its own document: `document_url`
+  // resolves against the realm's frame state, so a child frame keeps its own
+  // fragment (and its own :target) instead of the parent's.
+  globalThis.__obscura_syncTargetFragment(_domParse("document_url") || "about:blank");
   _installWasmStreamingFallback();
 
   const documentNid = +_dom("document_node_id");

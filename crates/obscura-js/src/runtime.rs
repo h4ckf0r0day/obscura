@@ -5046,6 +5046,35 @@ mod tests {
     }
 
     #[test]
+    fn js_focus_and_hash_navigation_drive_the_dynamic_pseudo_classes() {
+        // Covers the JS-to-tree sync path (focus()/blur() and the location.hash
+        // setter through the history machinery), not just the tree predicates:
+        // a selector engine that reads state nothing writes is the #1295 bug.
+        let mut rt = setup_runtime(
+            "<html><body><div id=w><input id=t2></div><div id=pane-x>x</div></body></html>",
+        );
+        let ids = |rt: &mut ObscuraJsRuntime, sel: &str| {
+            rt.evaluate(&format!(
+                "[...document.querySelectorAll({sel:?})].map((e) => e.id).join(',')"
+            ))
+            .unwrap()
+        };
+
+        rt.evaluate("document.getElementById('t2').focus()").unwrap();
+        assert_eq!(ids(&mut rt, ":focus"), serde_json::json!("t2"));
+        assert_eq!(ids(&mut rt, "#w:focus-within"), serde_json::json!("w"));
+        rt.evaluate("document.getElementById('t2').blur()").unwrap();
+        assert_eq!(ids(&mut rt, ":focus"), serde_json::json!(""));
+        assert_eq!(ids(&mut rt, "#w:focus-within"), serde_json::json!(""));
+
+        assert_eq!(ids(&mut rt, ":target"), serde_json::json!(""));
+        rt.evaluate("location.hash = 'pane-x'").unwrap();
+        assert_eq!(ids(&mut rt, ":target"), serde_json::json!("pane-x"));
+        rt.evaluate("location.hash = ''").unwrap();
+        assert_eq!(ids(&mut rt, ":target"), serde_json::json!(""));
+    }
+
+    #[test]
     fn cloned_controls_keep_current_value_and_checked_state() {
         let mut rt = setup_runtime(
             "<html><body><div id=group><input id=field value=default><input id=box type=checkbox></div></body></html>",
