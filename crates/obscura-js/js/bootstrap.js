@@ -16414,6 +16414,45 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
+const _storageQuotaBytes = 2 * 1024 * 1024 * 1024;
+if (!navigator.storage) {
+  navigator.storage = {
+    estimate() { return Promise.resolve({ usage: 0, quota: _storageQuotaBytes }); },
+    persist() { return Promise.resolve(false); },
+    persisted() { return Promise.resolve(false); },
+  };
+}
+_markNative(navigator.storage.estimate);
+_markNative(navigator.storage.persist);
+_markNative(navigator.storage.persisted);
+
+function _legacyStorageInfo() {
+  return {
+    queryUsageAndQuota(callback) {
+      if (typeof callback !== 'function') {
+        throw new TypeError('queryUsageAndQuota requires a callback');
+      }
+      queueMicrotask(() => callback(0, _storageQuotaBytes));
+    },
+    requestQuota(_type, requested, callback) {
+      if (typeof callback !== 'function') {
+        throw new TypeError('requestQuota requires a callback');
+      }
+      const amount = Number(requested);
+      const granted = Number.isFinite(amount)
+        ? Math.max(0, Math.min(amount, _storageQuotaBytes)) : 0;
+      queueMicrotask(() => callback(granted));
+    },
+  };
+}
+
+if (!navigator.webkitTemporaryStorage) navigator.webkitTemporaryStorage = _legacyStorageInfo();
+if (!navigator.webkitPersistentStorage) navigator.webkitPersistentStorage = _legacyStorageInfo();
+for (const storage of [navigator.webkitTemporaryStorage, navigator.webkitPersistentStorage]) {
+  _markNative(storage.queryUsageAndQuota);
+  _markNative(storage.requestQuota);
+}
+
 navigator.mediaCapabilities = {
   decodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
