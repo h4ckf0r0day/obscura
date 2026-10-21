@@ -20440,6 +20440,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn global_document_cannot_be_replaced_by_page_script() {
+        let mut rt = setup_runtime(r#"<html><body id="live"></body></html>"#);
+
+        let descriptor = rt
+            .evaluate(
+                "(() => { \
+                   const d = Object.getOwnPropertyDescriptor(globalThis, 'document'); \
+                   return [typeof d.get, d.set === undefined, d.configurable, d.enumerable]; \
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            descriptor,
+            serde_json::json!(["function", true, false, true])
+        );
+
+        rt.evaluate("document = { probe: true };").unwrap();
+        let after_assignment = rt
+            .evaluate(
+                "[ \
+                   document === globalThis.document, \
+                   document instanceof Document, \
+                   document.body.tagName, \
+                   typeof document.cookie \
+                 ]",
+            )
+            .unwrap();
+        assert_eq!(
+            after_assignment,
+            serde_json::json!([true, true, "BODY", "string"])
+        );
+
+        let strict_error = rt
+            .execute_script(
+                "strict-document-assignment",
+                "'use strict'; document = {};",
+            )
+            .unwrap_err();
+        assert!(strict_error.contains("TypeError"), "{strict_error}");
+    }
+
     // #940: op_navigate must not move the document's cookie context before the
     // navigation actually commits. A queued navigation to another origin must
     // not let document.cookie read that origin's cookies (SOP bypass).

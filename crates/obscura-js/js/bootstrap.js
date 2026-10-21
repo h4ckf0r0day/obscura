@@ -7693,7 +7693,15 @@ function _wrapEl(nid) {
 globalThis._wrap = _wrap;
 globalThis.self = globalThis;
 
-globalThis.document = null;
+// Match Window's read-only document attribute. Script assignment is ignored in
+// sloppy mode and throws in strict mode, while navigation updates the backing
+// value through __obscura_init below.
+let _document = null;
+Object.defineProperty(globalThis, "document", {
+  get() { return _document; },
+  enumerable: true,
+  configurable: false,
+});
 function _resolveUrl(url) {
   url = String(url);
   if (!url) return url;
@@ -18374,13 +18382,14 @@ globalThis.__obscura_init = function() {
   _installWasmStreamingFallback();
 
   const documentNid = +_dom("document_node_id");
-  globalThis.document = new Document(documentNid);
+  const document = new Document(documentNid);
+  _document = document;
   // parentNode on <html> reaches the backing document node. Keep that wrapper
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
-  _cache.set(documentNid, globalThis.document);
+  _cache.set(documentNid, document);
   const previousWindowNames = new Set(_windowNamedPropertyNames);
-  _registerWindowNamedTree(globalThis.document.documentElement);
+  _registerWindowNamedTree(document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
 
   const scr = _fp('screen');
