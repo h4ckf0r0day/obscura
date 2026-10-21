@@ -15390,6 +15390,7 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
     delete child.__obscura_core_handoff;
     delete child.Deno;
+    delete child.__bootstrap;
     for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
                        '__obscura_ua_platform_version', '__obscura_stealth',
                        '__obscura_geo_lat', '__obscura_geo_lon']) {

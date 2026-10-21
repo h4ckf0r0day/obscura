@@ -797,7 +797,7 @@ impl ObscuraJsRuntime {
     /// the global so page script can never reach `Deno.core.ops`.
     ///
     /// Bootstrap keeps the core reference in a private const. Once deno_core
-    /// has bound the ops, this removes both public globals before page code can
+    /// has bound the ops, this removes the public globals before page code can
     /// run, leaving the handoff as the host's only route to child realms.
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
@@ -811,6 +811,7 @@ impl ObscuraJsRuntime {
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
         let deno_key = v8::String::new(scope, "Deno")?;
+        let bootstrap_key = v8::String::new(scope, "__bootstrap")?;
         let ops_key = v8::String::new(scope, "ops")?;
         let global = context.global(scope);
 
@@ -823,6 +824,7 @@ impl ObscuraJsRuntime {
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
+        global.delete(scope, bootstrap_key.into());
         Some(ops)
     }
 
@@ -920,6 +922,9 @@ impl ObscuraJsRuntime {
         let Some(deno_key) = v8::String::new(scope, "Deno") else {
             return false;
         };
+        let Some(bootstrap_key) = v8::String::new(scope, "__bootstrap") else {
+            return false;
+        };
         let global = context.global(scope);
         let Some(core) = global.get(scope, handoff_key.into()) else {
             return false;
@@ -958,6 +963,7 @@ impl ObscuraJsRuntime {
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
+        global.delete(scope, bootstrap_key.into());
         copied > 0
     }
 
@@ -4791,9 +4797,9 @@ mod tests {
         rt.evaluate("delete globalThis.__obscura_test_ops").unwrap();
 
         assert_eq!(
-            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff]")
+            rt.evaluate("[typeof Deno, typeof __bootstrap, typeof __obscuraCore, typeof __obscura_core_handoff]")
                 .unwrap(),
-            serde_json::json!(["undefined", "undefined", "undefined"])
+            serde_json::json!(["undefined", "undefined", "undefined", "undefined"])
         );
         assert_eq!(
             rt.evaluate("document.getElementById('value').textContent")
@@ -4801,6 +4807,27 @@ mod tests {
             serde_json::json!("safe"),
             "DOM ops must continue to work through the private closure"
         );
+    }
+
+    #[test]
+    fn fetched_frame_script_cannot_reach_runtime_bootstrap() {
+        let mut rt = setup_runtime("<html><body>parent</body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "https://child.example/", "<html><body>child</body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"[
+            typeof Deno, typeof __bootstrap, typeof __obscura_core_handoff,
+            document.body.textContent
+        ]"#).unwrap(), serde_json::json!(["undefined", "undefined", "undefined", "child"]));
+    }
+
+    #[test]
+    fn initial_frame_script_cannot_reach_runtime_bootstrap() {
+        let mut rt = setup_runtime("<html><body>parent</body></html>");
+        assert_eq!(rt.evaluate_script(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            return frame.contentWindow.eval('[typeof Deno, typeof __bootstrap, typeof __obscura_core_handoff, document.body.nodeName]');
+        })()"#).unwrap(), serde_json::json!(["undefined", "undefined", "undefined", "BODY"]));
     }
 
     // #1013: removeAttribute('id') must update the id_index so getElementById no
