@@ -1283,7 +1283,7 @@ async fn cdp_processor(
                         }
                     }
                     service_live_page_render_resources(&mut ctx);
-                    sync_live_page_background_events(&mut ctx);
+                    sync_live_page_background_events(&mut ctx, true);
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
@@ -1484,13 +1484,16 @@ fn emit_routed_intercepted_request(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let request = json!({
+    let mut request = json!({
         "url": intercepted.url,
         "method": intercepted.method,
         "headers": intercepted.headers,
         "initialPriority": "High",
         "referrerPolicy": "strict-origin-when-cross-origin",
     });
+    crate::domains::page::add_request_post_data(
+        &mut request, intercepted.has_post_data, intercepted.post_data.as_deref(),
+    );
     let request_will_be_sent = json!({
         "method": "Network.requestWillBeSent",
         "params": {
@@ -1589,7 +1592,7 @@ fn service_live_page_render_resources(ctx: &mut CdpContext) {
     }
 }
 
-fn sync_live_page_background_events(ctx: &mut CdpContext) {
+fn sync_live_page_background_events(ctx: &mut CdpContext, history: bool) {
     // Emit script-initiated network/history events for every live page, attributed
     // to its own session/frame — not just the first live page (#872).
     let live_ids: Vec<String> = ctx
@@ -1615,7 +1618,9 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
             // Timer-driven history changes need the same notification as
             // Runtime.evaluate, even when the client is only waiting for an
             // event. Leave document navigations to the interception loop.
-            let same_document_navigation = !page.has_pending_navigation() && page.sync_virtual_url();
+            let same_document_navigation = history
+                && !page.has_pending_navigation()
+                && page.sync_virtual_url();
             (
                 page.frame_id.clone(),
                 page.url_string(),
@@ -2220,6 +2225,11 @@ async fn process_cdp_message(
     service_live_page_render_resources(ctx);
     let response = dispatch::dispatch(&req, ctx).await;
     service_live_page_render_resources(ctx);
+    // A fetch the command's event loop finished (an awaited Runtime.evaluate)
+    // is queued on the page. Publish it with this command; the next autonomous
+    // turn can be held back by an unrelated pending timer (#1246). History
+    // changes keep their post-response ordering.
+    sync_live_page_background_events(ctx, false);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from
@@ -2454,6 +2464,7 @@ mod tests {
         let intercepted = obscura_js::ops::InterceptedRequest {
             request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
             method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
+            has_post_data: false, post_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut paused = HashMap::new();
@@ -3294,6 +3305,135 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn awaited_fetch_network_events_precede_the_command_response() {
+        assert_fetch_network_events_before_response(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn intercepted_post_network_events_include_request_body() {
+        assert_fetch_network_events_before_response(true, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_awaited_fetch_network_events_precede_the_command_response() {
+        assert_fetch_network_events_before_response(false, true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_intercepted_post_network_events_include_request_body() {
+        assert_fetch_network_events_before_response(true, true).await;
+    }
+
+    async fn assert_fetch_network_events_before_response(intercept: bool, stealth: bool) {
+        // #1246: a fetch that finished inside an awaited Runtime.evaluate waited
+        // for the next autonomous turn, which the page's pending timer held back,
+        // so a client that stopped listening after the result never saw it.
+        use serde_json::Value;
+        use std::time::Duration;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", http.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in http.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        if read == 0 { break; }
+                        continue;
+                    };
+                    let length = text[..end].lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse().unwrap_or(0));
+                    if read == 0 || request.len() >= end + 4 + length { break; }
+                }
+                let body = if request.starts_with(b"POST") { "ok" } else { "<html><body></body></html>" };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        tokio::task::LocalSet::new().run_until(async {
+            let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let context = crate::dispatch::CdpContext::new_with_options(None, stealth).default_context;
+            let processor = tokio::task::spawn_local(super::cdp_processor(
+                server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+            ));
+            server_tx.send(super::ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
+            reply_rx.recv().await.unwrap();
+            let send = |value: Value| {
+                server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            async fn next(reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Value {
+                let text = tokio::time::timeout(Duration::from_secs(5), reply_rx.recv())
+                    .await.expect("CDP reply timeout").expect("CDP reply channel");
+                serde_json::from_str(&text).unwrap()
+            }
+            send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
+            let mut session = None;
+            loop {
+                let value = next(&mut reply_rx).await;
+                if let Some(id) = value["params"]["sessionId"].as_str() { session = Some(id.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+            let session = session.expect("attached session");
+            send(json!({"id": 2, "method": "Page.navigate", "sessionId": session, "params": {"url": base}}));
+            while next(&mut reply_rx).await["id"] != 2 {}
+            if intercept {
+                send(json!({"id": 4, "method": "Fetch.enable", "sessionId": session,
+                    "params": {"patterns": [{"urlPattern": "*/probe"}]}}));
+                while next(&mut reply_rx).await["id"] != 4 {}
+            }
+            send(json!({"id": 3, "method": "Runtime.evaluate", "sessionId": session, "params": {
+                "expression": "setTimeout(() => {}, 60000); fetch('/probe', {method: 'POST', headers: {'X-Probe': '1', 'Content-Type': 'text/plain'}, body: 'hello=world'}).then(r => r.text())",
+                "awaitPromise": true, "returnByValue": true,
+            }}));
+            let mut request = None;
+            loop {
+                let value = next(&mut reply_rx).await;
+                if value["method"] == "Fetch.requestPaused" {
+                    assert_eq!(value["params"]["request"]["postData"], "hello=world", "{value}");
+                    assert_eq!(value["params"]["request"]["hasPostData"], true, "{value}");
+                    assert_eq!(value["params"]["request"]["postDataEntries"][0]["bytes"], "aGVsbG89d29ybGQ=", "{value}");
+                    send(json!({"id": 5, "method": "Fetch.fulfillRequest", "sessionId": session,
+                        "params": {"requestId": value["params"]["requestId"],
+                            "responseCode": 200, "body": "b2s="}}));
+                }
+                if value["method"] == "Network.requestWillBeSent"
+                    && value["params"]["request"]["url"].as_str().is_some_and(|url| url.ends_with("/probe"))
+                {
+                    request = Some(value["params"]["request"].clone());
+                }
+                if value["id"] == 3 {
+                    assert_eq!(value["result"]["result"]["value"], "ok", "{value}");
+                    break;
+                }
+            }
+            let request = request.expect("the fetch must emit requestWillBeSent before the command response");
+            assert_eq!(request["method"], "POST");
+            assert_eq!(request["headers"]["X-Probe"], "1", "{request}");
+            assert_eq!(request["headers"]["Content-Type"], "text/plain", "{request}");
+            assert_eq!(request["hasPostData"], true, "{request}");
+            assert_eq!(request["postData"], "hello=world", "{request}");
+            assert_eq!(request["postDataEntries"][0]["bytes"], "aGVsbG89d29ybGQ=", "{request}");
+            drop(server_tx);
+            tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn intercepted_requests_keep_their_page_and_unique_identity() {
         use serde_json::Value;
         use std::time::Duration;
@@ -3489,6 +3629,7 @@ mod tests {
                 page_id: page_id.clone(),
                 request_id: "pending-test".into(), url: format!("http://{address}/pending"),
                 method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
+                has_post_data: false, post_data: None,
                 resolver: resolution_tx,
             }).unwrap();
             loop {

@@ -92,6 +92,11 @@ page.settle(2000).await;   // let in-page fetch() calls resolve
 
 `enable_interception()` returns a channel of every JS `fetch()`/XHR request. Resolve each through its `resolver` to pass, block, mock, or rewrite it.
 
+`InterceptedRequest.has_post_data` distinguishes absent and empty bodies.
+`post_data` contains the original upload bytes as `Option<Vec<u8>>`, bounded to
+64 KiB. Larger bodies keep the flag but omit the captured bytes. Consumers that
+construct `InterceptedRequest` literals must initialize both fields.
+
 ```rust
 use obscura::{Browser, InterceptResolution};
 
@@ -107,6 +112,7 @@ tokio::spawn(async move {
                 status: 200,
                 headers: Default::default(),
                 body: r#"{"newDashboard":true}"#.into(),
+                body_base64: String::new(),
             }
         } else {
             // Pass through, or rewrite by setting url/method/headers/body.
@@ -134,7 +140,7 @@ page.add_preload_script("window.__patched = true;");
 page.goto("https://example.com").await?;
 ```
 
-`resource_type` reports `Fetch` for JS-initiated requests and does not yet split `Xhr` from `Fetch`.
+`resource_type` reports `Fetch`, `XHR`, or the initiating dynamic-resource destination.
 
 ## When to use which interface
 

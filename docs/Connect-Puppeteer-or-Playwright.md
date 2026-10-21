@@ -77,6 +77,9 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 - `page.waitForSelector`, `page.waitForFunction`, `page.waitForNavigation`
 - `page.cookies`, `page.setCookie`, `context.cookies`
 - `page.setRequestInterception`, block / modify
+- fetch/XHR request headers and byte-exact upload data, including intercepted
+  requests. `postDataEntries` supports Playwright's `request.postDataBuffer()`.
+  Bodies over 64 KiB retain `hasPostData` but omit the upload bytes.
 - `page.exposeFunction`
 - `page.content`, `page.title`, `page.url`
 - `page.screenshot` for viewport, clipped, and full-page capture

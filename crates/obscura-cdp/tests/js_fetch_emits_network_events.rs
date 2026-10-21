@@ -197,6 +197,126 @@ async fn navigation_without_script_fetch_is_unaffected() {
     );
 }
 
+// Serves a page whose script POSTs a body with custom headers to /api/probe.
+// Each request is read in full so the server never resets the connection on
+// an unread POST body.
+async fn serve_post_probe() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        if read == 0 { break; }
+                        continue;
+                    };
+                    let length = text[..end].lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse().unwrap_or(0));
+                    if read == 0 || request.len() >= end + 4 + length { break; }
+                }
+                if request.starts_with(b"POST /redirect") {
+                    socket.write_all(b"HTTP/1.1 303 See Other\r\nLocation: /api/probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    return;
+                }
+                let (ct, body) = if request.starts_with(b"POST /api/probe")
+                    || request.starts_with(b"GET /api/probe") {
+                    ("application/json", r#"{"ok":true}"#)
+                } else {
+                    (
+                        "text/html",
+                        r#"<html><body><script>
+fetch("/api/probe", { method: "POST", headers: { "X-Probe": "1", "Content-Type": "text/plain" }, body: "hello=world" });
+</script></body></html>"#,
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_fetch_request_reports_headers_and_post_data() {
+    // Regression for #1246: requestWillBeSent for a script POST carried
+    // `headers: {}` and no hasPostData/postData, unlike Chrome.
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_post_probe().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": base, "waitUntil": "networkidle0"}),
+        session_id,
+    )
+    .await;
+
+    let request = ctx
+        .pending_events
+        .iter()
+        .filter(|e| e.method == "Network.requestWillBeSent")
+        .map(|e| &e.params["request"])
+        .find(|r| r["url"].as_str().is_some_and(|u| u.ends_with("/api/probe")))
+        .expect("script POST must emit Network.requestWillBeSent");
+    assert_eq!(request["method"], "POST");
+    assert_eq!(request["headers"]["X-Probe"], "1", "{request}");
+    assert_eq!(request["headers"]["Content-Type"], "text/plain", "{request}");
+    assert_eq!(request["hasPostData"], true, "{request}");
+    assert_eq!(request["postData"], "hello=world", "{request}");
+    assert_eq!(request["postDataEntries"][0]["bytes"], "aGVsbG89d29ybGQ=", "{request}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_redirect_drops_upload_metadata_with_the_body() {
+    check_redirect_upload_metadata(false).await;
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_post_redirect_drops_upload_metadata_with_the_body() {
+    check_redirect_upload_metadata(true).await;
+}
+
+async fn check_redirect_upload_metadata(stealth: bool) {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = serve_post_probe().await;
+    let mut ctx = CdpContext::new_with_options(None, stealth);
+    let page_id = ctx.create_page();
+    let session = "session-1";
+    ctx.sessions.insert(session.into(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": base, "waitUntil": "networkidle0"}), session).await;
+    let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression": "fetch('/redirect', {method:'POST',headers:{'X-Probe':'redirect','Content-Type':'text/plain'},body:'secret'}).then(r=>r.text())",
+        "awaitPromise": true, "returnByValue": true,
+    }), session).await;
+    assert_eq!(response["result"]["value"], r#"{"ok":true}"#);
+    let page = ctx.get_session_page_mut(&Some(session.into())).unwrap();
+    page.sync_js_network_events();
+    let event = page.network_events.last().unwrap();
+    assert_eq!(event.method, "GET");
+    assert!(!event.has_post_data);
+    assert!(event.post_data.is_none());
+    assert_eq!(event.headers.get("X-Probe").map(String::as_str), Some("redirect"));
+    assert!(!event.headers.keys().any(|header| header.eq_ignore_ascii_case("content-type")));
+}
+
 #[cfg(feature = "stealth")]
 async fn stealth_context() -> (CdpContext, String, String) {
     let mut ctx = CdpContext::new();

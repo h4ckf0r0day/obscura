@@ -69,6 +69,9 @@ pub struct InterceptedRequest {
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
+    pub has_post_data: bool,
+    /// Original upload bytes, omitted above the network-event capture limit.
+    pub post_data: Option<Vec<u8>>,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
 }
@@ -95,11 +98,29 @@ pub struct JsNetworkEvent {
     pub url: String,
     pub method: String,
     pub resource_type: String,
+    /// Headers the page asked to send, after any Fetch.continueRequest
+    /// override, reported on Network.requestWillBeSent (#1246).
+    pub request_headers: HashMap<String, String>,
+    pub has_post_data: bool,
+    /// The request body when it fits in `MAX_POST_DATA_BYTES`.
+    pub post_data: Option<Vec<u8>>,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
     pub error_text: Option<String>,
+}
+
+/// Larger request bodies set hasPostData without postData, which the protocol
+/// allows, so an upload is not copied into every queued network event.
+const MAX_POST_DATA_BYTES: usize = 64 * 1024;
+
+impl JsNetworkEvent {
+    fn record_request(&mut self, headers: HashMap<String, String>, body: &[u8], has_body: bool) {
+        self.request_headers = headers;
+        self.has_post_data = has_body;
+        self.post_data = (has_body && body.len() <= MAX_POST_DATA_BYTES).then(|| body.to_vec());
+    }
 }
 
 #[cfg(feature = "render")]
@@ -3847,15 +3868,15 @@ async fn op_fetch_url(
 ) -> Result<String, deno_error::JsErrorBox> {
     // Keep the existing op arity rather than exceeding deno_core's
     // async-op code-generation limit with another positional argument.
-    let (destination, cancel_rid) = match options {
-        FetchOptions::Destination(destination) => (destination, None),
-        FetchOptions::Cancelable { cancel_rid, destination } => (destination, Some(cancel_rid)),
+    let (destination, cancel_rid, has_body) = match options {
+        FetchOptions::Destination(destination) => (destination, None, false),
+        FetchOptions::Request { cancel_rid, destination, has_body } => (destination, cancel_rid, has_body),
     };
     let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
         .map(|resource| resource.0.clone())
         .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
     let future = fetch_url_inner(state, url, method, headers_json, body, origin, mode, credentials,
-        destination, cancel.clone());
+        destination, cancel.clone(), has_body);
     match cancel {
         Some(cancel) => future.or_cancel(cancel).await
             .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
@@ -3867,13 +3888,18 @@ async fn op_fetch_url(
 #[serde(untagged)]
 enum FetchOptions {
     Destination(String),
-    Cancelable { cancel_rid: u32, destination: String },
+    Request {
+        cancel_rid: Option<u32>,
+        destination: String,
+        #[serde(default)]
+        has_body: bool,
+    },
 }
 
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
-    destination: String, cancel: Option<Rc<CancelHandle>>,
+    destination: String, cancel: Option<Rc<CancelHandle>>, has_body: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let (resource_type, resource_type_name) = match destination.as_str() {
         "Script" => (ResourceType::Script, "Script"),
@@ -3885,6 +3911,7 @@ async fn fetch_url_inner(
     let internal_load = matches!(resource_type,
         ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document);
     let body = body.to_vec();
+    let has_body = has_body || !body.is_empty();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -3979,6 +4006,7 @@ async fn fetch_url_inner(
             request_id: request_id.clone(), intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
+            request_headers: HashMap::new(), has_post_data: false, post_data: None,
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
         cancel: cancel.clone(),
@@ -3992,10 +4020,11 @@ async fn fetch_url_inner(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    let mut was_intercepted = false;
     if let Some(tx) = intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
+        let event = network_guard.event.as_mut().unwrap();
+        event.record_request(custom_headers.clone(), &body, has_body);
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
@@ -4003,11 +4032,12 @@ async fn fetch_url_inner(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
+            has_post_data: event.has_post_data,
+            post_data: event.post_data.clone(),
             resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
-            was_intercepted = true;
             network_guard.event.as_mut().unwrap().intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
@@ -4016,20 +4046,17 @@ async fn fetch_url_inner(
                     body: b,
                     body_base64: bb,
                 }) => {
-                    network_guard.event = None;
+                    let mut event = network_guard.event.take().unwrap();
                     // Keep fulfilled responses visible to CDP just like transport
                     // responses, including exact binary bodies and bounded retention.
                     let encoded = !bb.is_empty();
                     let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
-                    record_js_network_completion(&state, JsNetworkEvent {
-                        request_id: request_id.clone(), intercepted: true,
-                        error_text: None,
-                        url: url.clone(), method: method.clone(), status,
-                        resource_type: resource_type_name.to_string(),
-                        response_headers: h.clone(), body_size,
-                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default().as_secs_f64(),
-                    }, if encoded { &bb } else { &b }, encoded);
+                    event.status = status;
+                    event.response_headers = h.clone();
+                    event.body_size = body_size;
+                    event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs_f64();
+                    record_js_network_completion(&state, event, if encoded { &bb } else { &b }, encoded);
                     let mut response = intercept_fulfill_response(
                         status,
                         h,
@@ -4117,6 +4144,7 @@ async fn fetch_url_inner(
         url
     };
     let method = override_method.unwrap_or(method);
+    let has_body = has_body || override_body.is_some();
     let body = override_body.unwrap_or(body);
 
     let client = match &http_client {
@@ -4138,6 +4166,9 @@ async fn fetch_url_inner(
 
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    if let Some(event) = network_guard.event.as_mut() {
+        event.record_request(custom_headers.clone(), &body, has_body);
+    }
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -4455,6 +4486,12 @@ async fn fetch_url_inner(
 
         redirected_from.push(base);
         current_url = next_url.to_string();
+        if let Some(event) = network_guard.event.as_mut() {
+            event.url = current_url.clone();
+            event.method = current_method.as_str().to_string();
+            event.request_headers = current_headers.clone();
+            if downgraded_to_get { event.has_post_data = false; event.post_data = None; }
+        }
     };
 
     let redirected = redirects_followed > 0;
@@ -4533,18 +4570,18 @@ async fn fetch_url_inner(
                 cbs.fire_response(&info, &resp).await;
             }
         }
-        if let Some(state) = body_state.upgrade() {
-            record_js_network_completion(&state, JsNetworkEvent {
-                request_id, intercepted: was_intercepted,
-                error_text: None,
-                url: current_url, method: current_method.as_str().to_string(), status,
-                resource_type: resource_type_name.to_string(),
-                response_headers: resp_headers, body_size: resp_bytes.len(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+        // Complete the guard's event so the request headers and body recorded
+        // before sending reach Network.requestWillBeSent (#1246).
+        if let (Some(state), Some(mut event)) = (body_state.upgrade(), network_guard.event.take()) {
+            event.url = current_url;
+            event.method = current_method.as_str().to_string();
+            event.status = status;
+            event.response_headers = resp_headers;
+            event.body_size = resp_bytes.len();
+            event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64();
+            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
         }
-        network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
         Ok(resp_bytes)
     });
@@ -4591,7 +4628,7 @@ async fn stealth_fetch_all(
     allow_private_network: bool,
     internal_load: bool,
     cancel: Option<Rc<CancelHandle>>,
-    network_guard: FetchNetworkGuard,
+    mut network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
@@ -4717,6 +4754,12 @@ async fn stealth_fetch_all(
         sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
+        if let Some(event) = network_guard.event.as_mut() {
+            event.url = current_url.clone();
+            event.method = current_method.clone();
+            event.request_headers = current_headers.clone();
+            if downgraded_to_get { event.has_post_data = false; event.post_data = None; }
+        }
     };
 
     let status = response.status;
@@ -5125,6 +5168,28 @@ mod tests {
     use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_derive, push_capped};
     use super::{intercept_fulfill_response, visible_response_headers};
     use base64::{Engine as _, engine::general_purpose::STANDARD as FULFILL_BASE64};
+
+    #[test]
+    fn request_post_data_retention_is_byte_exact_bounded_and_body_aware() {
+        let mut event = super::JsNetworkEvent {
+            request_id: "fetch-1".into(), intercepted: false,
+            url: "https://example.test/".into(), method: "POST".into(),
+            resource_type: "Fetch".into(), request_headers: Default::default(),
+            has_post_data: false, post_data: None, status: 0,
+            response_headers: Default::default(), body_size: 0, timestamp: 0.0, error_text: None,
+        };
+        for bytes in [Vec::new(), vec![0xff, 0, 0x80], vec![0xff; super::MAX_POST_DATA_BYTES]] {
+            event.record_request(Default::default(), &bytes, true);
+            assert!(event.has_post_data);
+            assert_eq!(event.post_data.as_deref(), Some(bytes.as_slice()));
+        }
+        event.record_request(Default::default(), &vec![0xff; super::MAX_POST_DATA_BYTES + 1], true);
+        assert!(event.has_post_data);
+        assert!(event.post_data.is_none(), "oversize uploads must not be copied into events");
+        event.record_request(Default::default(), &[], false);
+        assert!(!event.has_post_data);
+        assert!(event.post_data.is_none());
+    }
 
     // #1008: URL property setters must follow WHATWG — search/hash keep a bare
     // delimiter as an empty component, and port parses the leading digits.
