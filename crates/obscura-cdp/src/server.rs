@@ -523,7 +523,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         storage_dir,
         allow_private_network,
     );
-    bctx.allow_file_access = allow_file_access;
+    bctx.set_allow_file_access(allow_file_access);
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
     // Cookie deltas are merged here, but new connections always clone the
