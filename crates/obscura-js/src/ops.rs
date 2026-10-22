@@ -6694,7 +6694,10 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
