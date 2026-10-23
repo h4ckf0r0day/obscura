@@ -31,6 +31,12 @@ pub struct BrowserContext {
     /// itself from a web origin into file:// regardless of this flag.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
+    /// Where the shared robots.txt cache lives, independent of `storage_dir`.
+    /// Set via `--robots-cache-dir`: `--storage-dir` implies shared cookies
+    /// and localStorage, which is wrong for a multi-worker deployment where
+    /// every worker should keep its own session state while still fetching
+    /// each origin's robots.txt once per TTL for the whole pod.
+    pub robots_cache_dir: Option<PathBuf>,
     /// When true, the http client allows fetching localhost / RFC1918 /
     /// link-local addresses. Set via `--allow-private-network` (issue #33).
     /// Independent of `allow_file_access` because they cover different threat
@@ -213,6 +219,7 @@ impl BrowserContext {
             stealth,
             allow_file_access: false,
             storage_dir,
+            robots_cache_dir: None,
             allow_private_network,
         }
     }
@@ -280,6 +287,9 @@ impl BrowserContext {
             stealth: self.stealth,
             allow_file_access: self.allow_file_access,
             storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
+            // The robots cache dir does not carry session state, so even an
+            // incognito copy keeps sharing it with the rest of the pod.
+            robots_cache_dir: self.robots_cache_dir.clone(),
             allow_private_network: self.allow_private_network,
         }
     }

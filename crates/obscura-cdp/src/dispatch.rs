@@ -227,6 +227,14 @@ impl CdpContext {
             allow_private_network,
         );
         ctx.allow_file_access = allow_file_access;
+        // Shared robots.txt cache for serve deployments: the CLI mirrors
+        // --robots-cache-dir into OBSCURA_ROBOTS_CACHE_DIR, and load-balanced
+        // worker processes inherit it, so every worker of a pod shares one
+        // robots-cache.json without sharing cookies (--storage-dir).
+        ctx.robots_cache_dir = std::env::var("OBSCURA_ROBOTS_CACHE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|dir| !dir.as_os_str().is_empty());
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
