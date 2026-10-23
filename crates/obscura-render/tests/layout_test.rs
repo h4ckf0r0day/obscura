@@ -1937,6 +1937,7 @@ fn non_replaced_inline_ignores_used_width_height_and_min_max_sizes() {
             min-width:100%;min-height:100px;
             max-width:100%;max-height:100px;
             padding:0 5px;
+            font-family:inherit;
             background:red
           }
           #after{position:relative;background:blue}
