@@ -1314,6 +1314,7 @@ pub fn parse_wait_until(params: &Value) -> WaitUntil {
                         WaitUntil::Load => 1,
                         WaitUntil::NetworkIdle2 => 2,
                         WaitUntil::NetworkIdle0 => 3,
+                        WaitUntil::Settle => 4,
                     })
             } else {
                 None

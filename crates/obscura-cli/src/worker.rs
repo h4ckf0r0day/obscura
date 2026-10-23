@@ -38,6 +38,8 @@ enum NavigationWaitUntil {
     NetworkIdle0,
     #[serde(rename = "networkidle2")]
     NetworkIdle2,
+    #[serde(rename = "settle")]
+    Settle,
 }
 
 impl From<NavigationWaitUntil> for WaitUntil {
@@ -47,6 +49,7 @@ impl From<NavigationWaitUntil> for WaitUntil {
             NavigationWaitUntil::DomContentLoaded => Self::DomContentLoaded,
             NavigationWaitUntil::NetworkIdle0 => Self::NetworkIdle0,
             NavigationWaitUntil::NetworkIdle2 => Self::NetworkIdle2,
+            NavigationWaitUntil::Settle => Self::Settle,
         }
     }
 }

@@ -3682,7 +3682,60 @@ impl Page {
             self.wait_for_network_idle(threshold).await;
         }
 
+        if matches!(wait_until, crate::lifecycle::WaitUntil::Settle) {
+            self.wait_for_content_stability().await;
+        }
+
         Ok(())
+    }
+
+    /// `waitUntil: "settle"`: poll until the document stops changing. Late
+    /// scripts and challenge pages keep mutating after the load event, so a
+    /// load-gated navigate returns their shell. A document with real content
+    /// (a non-trivial node count and a title) settles after two consecutive
+    /// equal samples; a small or titleless document needs a longer quiet
+    /// stretch, because that is exactly the shape of a challenge interstitial
+    /// whose real page arrives later. A hard deadline keeps a page that never
+    /// settles within the caller's budget, leaving the retry decision to the
+    /// client.
+    async fn wait_for_content_stability(&mut self) {
+        const SAMPLE_MS: u64 = 300;
+        const DEADLINE_S: u64 = 15;
+        const CONTENT_NODES: usize = 50;
+        const SMALL_QUIET_SAMPLES: u32 = 8;
+        let probe = "JSON.stringify({n: document.getElementsByTagName(\"*\").length, t: document.title})";
+        let sample = |page: &mut Self| -> (usize, String) {
+            let raw = page.evaluate(probe);
+            let parsed = serde_json::from_value::<String>(raw).ok();
+            match parsed
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            {
+                Some(v) => (
+                    v.get("n").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                    v.get("t").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                ),
+                None => (0, String::new()),
+            }
+        };
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(DEADLINE_S);
+        let mut last: Option<(usize, String)> = None;
+        let mut quiet = 0u32;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(tokio::time::Duration::from_millis(SAMPLE_MS)).await;
+            let current = sample(self);
+            if last.as_ref() == Some(&current) {
+                quiet += 1;
+                let looks_complete = current.0 >= CONTENT_NODES && !current.1.is_empty();
+                if quiet >= 2 && looks_complete || quiet >= SMALL_QUIET_SAMPLES {
+                    break;
+                }
+            } else {
+                quiet = 0;
+                last = Some(current);
+            }
+        }
     }
 
     async fn wait_for_network_idle(&mut self, threshold: u32) {
