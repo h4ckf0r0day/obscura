@@ -2393,6 +2393,21 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             }
             serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
         }
+        // Count only, no name list serialized: the document-init path uses
+        // this to decide between eager window-named registration and the live
+        // interceptor without paying for a JSON array of every name.
+        "window_named_count" => {
+            let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let mut seen = HashSet::new();
+            for node in std::iter::once(root).chain(dom.descendants(root)) {
+                dom.with_node(node, |node| {
+                    for name in window_named_attributes(node).into_iter().flatten() {
+                        seen.insert(name.to_string());
+                    }
+                });
+            }
+            seen.len().to_string()
+        }
         "window_named_candidates" => {
             if arg1.is_empty() { return "[]".into(); }
             let mut matches = Vec::new();
