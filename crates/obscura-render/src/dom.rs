@@ -10389,7 +10389,15 @@ fn is_flattenable_inline(
         && !style.is_replaced_box
         && style.before_pseudo.is_none()
         && style.after_pseudo.is_none()
-        && style.background_color.is_none()
+        // A fully transparent background paints nothing, so it is not a
+        // decoration worth keeping a box for. normalize.css ships
+        // `a{background-color:transparent}`, which made every anchor on every
+        // site using it unflattenable: the anchor then became the percentage
+        // basis for its own children, and a `width:100%` replaced child inside
+        // one collapsed instead of filling the real containing block.
+        && style
+            .background_color
+            .is_none_or(|[_, _, _, alpha]| alpha == 0)
         && style.background_image.is_none()
         && style.mask_image.is_none()
         && style.border == crate::Edges::default()
