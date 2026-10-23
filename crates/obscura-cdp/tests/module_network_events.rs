@@ -261,7 +261,7 @@ async fn module_records_survive_page_runtime_suspension() {
     ].map(|(path, body)| {
         let id = page.network_events.iter().find(|e| e.url == format!("{base}{path}"))
             .unwrap().request_id.clone();
-        assert_eq!(page.get_response_body(&id).unwrap().body, body);
+        assert_eq!(page.get_response_body(&id).unwrap().cdp_body(), body);
         (id, body)
     });
     page.suspend_js();
@@ -269,13 +269,13 @@ async fn module_records_survive_page_runtime_suspension() {
         assert_eq!(page.network_events.iter().filter(|e| e.url == format!("{base}{path}") && e.body_size > 0).count(), 1);
     }
     for (id, body) in &bodies {
-        assert_eq!(page.get_response_body(id).map(|b| b.body), Some(body.to_string()),
+        assert_eq!(page.get_response_body(id).map(|b| b.cdp_body()), Some(body.to_string()),
             "retained body must survive runtime suspension: {id}");
     }
     page.resume_js();
     page.suspend_js();
     for (id, body) in &bodies {
-        assert_eq!(page.get_response_body(id).map(|b| b.body), Some(body.to_string()),
+        assert_eq!(page.get_response_body(id).map(|b| b.cdp_body()), Some(body.to_string()),
             "resuming must not discard retained bodies: {id}");
     }
 }
@@ -299,11 +299,11 @@ async fn suspension_enforces_combined_response_body_entry_limit() {
     let page = &mut ctx.pages[0];
     assert!(page.get_response_body(&document).is_some());
     assert!(page.get_response_body(&root).is_none());
-    assert_eq!(page.get_response_body(&child).unwrap().body, CHILD);
+    assert_eq!(page.get_response_body(&child).unwrap().cdp_body(), CHILD);
     page.suspend_js();
     assert!(page.get_response_body(&document).is_none(), "older page cache entry must be evicted");
     assert!(page.get_response_body(&root).is_none(), "evicted runtime entry must not reappear");
-    assert_eq!(page.get_response_body(&child).map(|b| b.body), Some(CHILD.to_string()));
+    assert_eq!(page.get_response_body(&child).map(|b| b.cdp_body()), Some(CHILD.to_string()));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -336,5 +336,7 @@ async fn module_body_buffer_preserves_non_utf8_bytes() {
     ctx.pages[0].suspend_js();
     let retained = ctx.pages[0].get_response_body(&id).unwrap();
     assert!(retained.base64_encoded);
-    assert_eq!(base64::engine::general_purpose::STANDARD.decode(retained.body).unwrap(), BODY);
+    // Raw bytes are stored lazily; the base64 form is produced on read.
+    assert_eq!(retained.body, BODY);
+    assert_eq!(base64::engine::general_purpose::STANDARD.encode(&retained.body), base64::engine::general_purpose::STANDARD.encode(BODY));
 }

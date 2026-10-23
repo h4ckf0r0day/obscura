@@ -191,8 +191,23 @@ pub struct NetworkEvent {
 
 #[derive(Debug, Clone)]
 pub struct StoredResponseBody {
-    pub body: String,
+    /// Raw response bytes. The CDP wire form (lossy text or base64, per
+    /// `base64_encoded`) is produced on read by `cdp_body`, so the common
+    /// case — a body that no CDP client ever asks for — pays no decode at
+    /// store time and holds one copy instead of two.
+    pub body: Vec<u8>,
     pub base64_encoded: bool,
+}
+
+impl StoredResponseBody {
+    /// The body as CDP `Network.getResponseBody` reports it.
+    pub fn cdp_body(&self) -> String {
+        if self.base64_encoded {
+            BASE64.encode(&self.body)
+        } else {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4651,15 +4666,10 @@ impl Page {
         if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
             return;
         }
-        let body = if base64_encoded {
-            BASE64.encode(body)
-        } else {
-            String::from_utf8_lossy(body).to_string()
-        };
         self.response_bodies.insert(
             request_id.clone(),
             StoredResponseBody {
-                body,
+                body: body.to_vec(),
                 base64_encoded,
             },
         );
@@ -4673,13 +4683,21 @@ impl Page {
 
     pub fn get_response_body(&self, request_id: &str) -> Option<StoredResponseBody> {
         self.response_bodies.get(request_id).cloned().or_else(|| {
-            self.js
+            let body = self
+                .js
                 .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|body| StoredResponseBody {
-                    body: body.body,
-                    base64_encoded: body.base64_encoded,
-                })
+                .get_network_response_body(request_id)?;
+            // The JS-side store holds the lossy/base64 text form; convert to
+            // raw bytes so the page-side store stays uniformly lazy.
+            let raw = if body.base64_encoded {
+                BASE64.decode(body.body.as_bytes()).ok()?
+            } else {
+                body.body.into_bytes()
+            };
+            Some(StoredResponseBody {
+                body: raw,
+                base64_encoded: body.base64_encoded,
+            })
         })
     }
 
@@ -4692,22 +4710,20 @@ impl Page {
     /// cached (e.g. it exceeded OBSCURA_NETWORK_BODY_BUFFER_BYTES and was
     /// dropped) or the id is unknown.
     pub fn take_response_body_raw(&mut self, request_id: &str) -> Option<Vec<u8>> {
-        let stored = if let Some(body) = self.response_bodies.remove(request_id) {
+        if let Some(body) = self.response_bodies.remove(request_id) {
             self.response_body_order.retain(|id| id != request_id);
-            body
+            // Raw bytes are what this returns; the base64 flag only says how
+            // CDP would report the body, not how it is stored.
+            return Some(body.body);
+        }
+        let b = self
+            .js
+            .as_ref()?
+            .get_network_response_body(request_id)?;
+        if b.base64_encoded {
+            BASE64.decode(b.body.as_bytes()).ok()
         } else {
-            self.js
-                .as_ref()?
-                .get_network_response_body(request_id)
-                .map(|b| StoredResponseBody {
-                    body: b.body,
-                    base64_encoded: b.base64_encoded,
-                })?
-        };
-        if stored.base64_encoded {
-            BASE64.decode(stored.body.as_bytes()).ok()
-        } else {
-            Some(stored.body.into_bytes())
+            Some(b.body.into_bytes())
         }
     }
 
@@ -4752,8 +4768,15 @@ impl Page {
         self.sync_js_network_events();
         let max_entries = response_body_entry_limit();
         for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
+            // The JS-side store holds the lossy/base64 text form; convert to
+            // raw bytes so the page-side store stays uniformly lazy.
+            let raw = if body.base64_encoded {
+                BASE64.decode(body.body.as_bytes()).unwrap_or_default()
+            } else {
+                body.body.into_bytes()
+            };
             self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: body.body,
+                body: raw,
                 base64_encoded: body.base64_encoded,
             });
             self.response_body_order.push_back(id);
