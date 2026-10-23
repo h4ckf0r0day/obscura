@@ -1,3 +1,4 @@
+pub(crate) mod aia;
 pub mod client;
 pub mod cookies;
 pub mod encoding;
@@ -7,6 +8,7 @@ pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 
+pub use aia::send_with_aia;
 pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
