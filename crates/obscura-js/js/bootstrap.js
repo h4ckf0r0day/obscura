@@ -146,7 +146,13 @@ globalThis.dispatchEvent = function(event) {
 };
 
 let _domMutationEpoch = 0;
+// Bumped on every native tree change; invalidates cached connectivity.
 let _treeMutationEpoch = 0;
+// Bumped on tree changes JS cannot attribute to one node (innerHTML, bulk
+// text replacement, ...); invalidates cached parents. appendChild, insertBefore
+// and removeChild change exactly one node's parent and seed it directly, so a
+// long run of them keeps every other node's cached parent valid.
+let _parentCacheEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
@@ -165,42 +171,98 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 // the caller's. Set by __obscura_init; 0 is the page.
 let _realmFrameId = 0;
 
+function _afterDomMutation() {
+  _domMutationEpoch++;
+  // Resize observation is tied to rendering-invalidating DOM work. The
+  // hook is installed later in bootstrap, before page script can run.
+  if (typeof globalThis.__obscura_recompute_resizes === "function") {
+    globalThis.__obscura_recompute_resizes();
+  }
+  // Intersection geometry is invalidated synchronously as well. Deferring
+  // this solely through MutationObserver misses the IO phase of the current
+  // rendering opportunity when an rAF callback changes layout.
+  if (typeof globalThis.__obscura_recompute_intersections === "function") {
+    globalThis.__obscura_recompute_intersections();
+  }
+}
+function _afterTreeMutation() {
+  _treeMutationEpoch++;
+  // HTML removal steps reset the focused area to the viewport without
+  // dispatching blur/change events. Cover native replacement paths too.
+  const focused = globalThis.__obscura_focused;
+  if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
+}
+
+// A mutation that retires live iframes wraps its native result; reset those
+// iframe identities and hand back the plain result.
+function _unwrapFrameRetirements(result) {
+  if (!result.startsWith('{"__obscuraFrameRetirements":')) return result;
+  const mutation = JSON.parse(result);
+  for (const [id, nid] of mutation.__obscuraFrameRetirements) {
+    const element = _cache.get(nid);
+    if (element && element._frameId === id) _resetIframeElement(element);
+  }
+  return mutation.result;
+}
+
 const _dom = (cmd, a1, a2) => {
-  let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
-  if (result.startsWith('{"__obscuraFrameRetirements":')) {
-    const mutation = JSON.parse(result);
-    result = mutation.result;
-    for (const [id, nid] of mutation.__obscuraFrameRetirements) {
-      const element = _cache.get(nid);
-      if (element && element._frameId === id) _resetIframeElement(element);
-    }
-  }
-  if (_DOM_MUTATION_COMMANDS.has(cmd)) {
-    _domMutationEpoch++;
-    // Resize observation is tied to rendering-invalidating DOM work. The
-    // hook is installed later in bootstrap, before page script can run.
-    if (typeof globalThis.__obscura_recompute_resizes === "function") {
-      globalThis.__obscura_recompute_resizes();
-    }
-    // Intersection geometry is invalidated synchronously as well. Deferring
-    // this solely through MutationObserver misses the IO phase of the current
-    // rendering opportunity when an rAF callback changes layout.
-    if (typeof globalThis.__obscura_recompute_intersections === "function") {
-      globalThis.__obscura_recompute_intersections();
-    }
-  }
+  const result = _unwrapFrameRetirements(__obscuraCore.ops.op_dom(
+    cmd,
+    typeof a1 === "string" ? a1 : String(a1 ?? ""),
+    typeof a2 === "string" ? a2 : String(a2 ?? ""),
+    _realmFrameId,
+  ));
+  if (_DOM_MUTATION_COMMANDS.has(cmd)) _afterDomMutation();
   // Native mutation ops report their verified postcondition. Only a real tree
   // change invalidates ancestry caches; rejected cycles and invalid roots must
   // not make JS believe a move happened.
   if (result === "true" && _DOM_TREE_MUTATION_COMMANDS.has(cmd)) {
-    _treeMutationEpoch++;
-    // HTML removal steps reset the focused area to the viewport without
-    // dispatching blur/change events. Cover native replacement paths too.
-    const focused = globalThis.__obscura_focused;
-    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
+    _parentCacheEpoch++;
+    _afterTreeMutation();
   }
   return result;
 };
+
+// Composite commands: one crossing for a whole mutation. The result's first
+// character is "0" (rejected) or "s"/"x" (declined, nothing changed); anything
+// else means the tree changed. `_domTreeOne` is for commands that change one
+// node's parent (the caller seeds that node), `_domTreeBulk` for the rest.
+function _domComposite(cmd, a1, a2) {
+  return _unwrapFrameRetirements(__obscuraCore.ops.op_dom(
+    cmd,
+    typeof a1 === "string" ? a1 : String(a1),
+    typeof a2 === "string" ? a2 : String(a2),
+    _realmFrameId,
+  ));
+}
+function _domTreeOne(cmd, a1, a2) {
+  const result = _domComposite(cmd, a1, a2);
+  const c = result.charCodeAt(0);
+  if (c !== 115 /* s */ && c !== 120 /* x */) {
+    _afterDomMutation();
+    if (c !== 48 /* 0 */) _afterTreeMutation();
+  }
+  return result;
+}
+function _domTreeBulk(cmd, a1, a2) {
+  const result = _domComposite(cmd, a1, a2);
+  const c = result.charCodeAt(0);
+  if (c !== 115 && c !== 120) {
+    _afterDomMutation();
+    _parentCacheEpoch++;
+    _afterTreeMutation();
+  }
+  return result;
+}
+// Numeric reads on the native fast path; see op_dom_nav. -1 means "none".
+// String reads without JSON; see node_text in ops.rs (0 tagName, 1 localName,
+// 2 namespaceURI, 3 textContent, 4 nodeName, 5 innerHTML, 6 outerHTML).
+function _text(code, nid) {
+  return __obscuraCore.ops.op_dom_text(code, nid >>> 0, _realmFrameId);
+}
+function _nav(code, nid) {
+  return __obscuraCore.ops.op_dom_nav(code, nid >>> 0, _realmFrameId);
+}
 
 const _nativeFns = new WeakSet();
 const _nativeFnHas = _nativeFns.has.bind(_nativeFns);
@@ -2349,6 +2411,9 @@ function __prepareInsertedSubtree(root) {
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
   if (!root || !root.isConnected) return;
+  // Only elements and fragments can contain scripts.
+  const type = root.nodeType;
+  if (type === 3 || type === 8) return;
   const scripts = [];
   const seen = new Set();
   if (root.nodeType === 1 && (root.tagName === 'SCRIPT'
@@ -2371,21 +2436,33 @@ function __prepareInsertedSubtree(root) {
   }
 }
 
+// Script-created elements track their null-namespace attributes as a flat
+// [name, value, ...] array: a Map per element cost about as much as the rest
+// of createElement. This shared empty marker stands for "provably none yet";
+// setAttribute swaps in a real array on the first write, so it is never
+// mutated.
+const _EMPTY_ATTRS = Object.freeze([]);
+
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
+  // Epoch -1 never expires: a node removed or created through the JS API has
+  // no parent until the JS API inserts it.
   node._treeParent = null;
-  node._treeParentEpoch = _treeMutationEpoch;
+  node._treeParentEpoch = -1;
   node._treeConnected = false;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  node._treeConnectedEpoch = -1;
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
   node._treeParent = parent;
-  node._treeParentEpoch = _treeMutationEpoch;
+  node._treeParentEpoch = _parentCacheEpoch;
   node._treeConnected = !!connected;
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
+
+// State string from append_child_x / insert_before_x; see
+// inserted_subtree_state in ops.rs. Character code 49/50/51 is digit
+// "1"/"2"/"3": detached, connected in a shadow tree, connected in the
+// document tree.
 
 function _seedUnchangedConnection(node, connected) {
   node._treeConnected = !!connected;
@@ -2662,6 +2739,20 @@ function _hasMutationObservers() {
 function _removeNode(parent, child, suppress, method = "removeChild") {
   const observed = !suppress && _hasMutationObservers();
   const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
+  // Composite quick path: one native call reports whether the subtree needs
+  // the full bookkeeping below (stylesheet owners or window named elements)
+  // and performs the removal when it does not. "s" declines, nothing changed.
+  const quick = _domTreeOne("remove_child_x", child._nid, "");
+  if (quick !== "s") {
+    if (quick === "0") {
+      throw _mutationError(method, "The node to be removed is not a child of this node.", "NotFoundError");
+    }
+    _seedUnchangedConnection(parent, parent.isConnected);
+    _seedDetachedTreeState(child);
+    if (_foreignDocumentCount) _stampNodeDocument(child, _nodeDocumentForInsertion(parent));
+    if (observed) _queueTreeMutationRecord(parent, [], [child], previousSibling, nextSibling);
+    return;
+  }
   const removedWindowNames = _windowNamedNamesInTree(child);
   if (child instanceof Element) _releaseLinkedStylesheetsIn(child);
   const parentConnected = parent.isConnected;
@@ -2694,17 +2785,22 @@ function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
     }
   }
   const parentConnected = parent.isConnected;
-  const inserted = child === null
-    ? _dom("append_child", parent._nid, node._nid) === "true"
-    : _dom("insert_before", node._nid, child._nid) === "true";
-  if (!inserted) {
+  // Composite op: the mutation, its verified postcondition, the child's new
+  // connectivity/scope and the post-insertion scan run in one crossing.
+  // "0" is the native cycle/validity rejection.
+  const state = child === null
+    ? _domTreeOne("append_child_x", parent._nid, node._nid)
+    : _domTreeOne("insert_before_x", node._nid, child._nid);
+  if (state === "0") {
     // The native guard rejects cycles, the case the skipped ancestor walk covers.
     throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError", parent);
   }
+  const kind = state.charCodeAt(0);
   _seedUnchangedConnection(parent, parentConnected);
-  _seedInsertedTreeState(node, parent, parentConnected);
+  _seedInsertedTreeState(node, parent, kind !== 49);
   if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
-  _registerWindowNamedTree(node);
+  // "3" is the document tree; other scopes cannot supply window properties.
+  _registerWindowNamedTree(node, kind === 51);
 }
 
 // "Insert": returns the inserted nodes. `suppress` skips parent's record.
@@ -2803,8 +2899,8 @@ class Node {
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
   constructor(nid) { this._nid = nid; }
-  get nodeType() { return +_dom("node_type", this._nid); }
-  get nodeName() { return _domParse("node_name", this._nid) || ""; }
+  get nodeType() { return _nav(5, this._nid); }
+  get nodeName() { return _text(4, this._nid); }
   get ownerDocument() { return _nodeDocumentOf(this); }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
@@ -2819,7 +2915,7 @@ class Node {
     }
     try { return _documentBase(); } catch (e) { return ""; }
   }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() { return _text(3, this._nid); }
   set textContent(v) {
     const type = this.nodeType;
     if (type === 9 || type === 10) return;
@@ -2828,8 +2924,27 @@ class Node {
       this.data = value;
       return;
     }
-    // "String replace all". Removal keeps the old cheap per-child steps; the
-    // record rules are the spec's: one record, and none when nothing changed.
+    // One native call replaces the children of an element that owns no
+    // stylesheets; anything else takes the general path below.
+    if (type === 1) {
+      const r = _domTreeBulk("set_text_el", this._nid, value);
+      if (r !== "x") {
+        // Real MutationObserver fires childList for the children swap (see
+        // below), and only when something actually changed (the same rule
+        // as the general path).
+        const sep = r.indexOf(";");
+        const created = +r.slice(0, sep);
+        const removed = sep + 1 < r.length ? r.slice(sep + 1).split(",").map(Number) : [];
+        if ((created >= 0 || removed.length) && globalThis.__mutationObservers?.length) {
+          globalThis.__notifyMutation(
+            'childList', this._nid,
+            created >= 0 ? [created] : [],
+            removed,
+          );
+        }
+        return;
+      }
+    }
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     const observed = _hasMutationObservers();
     const removedNodes = observed ? oldChildren.map(_wrap).filter(Boolean) : null;
@@ -2856,7 +2971,7 @@ class Node {
   }
   get nodeValue() {
     const t = this.nodeType;
-    if (t === 3 || t === 8) return _domParse("text_content", this._nid) ?? "";
+    if (t === 3 || t === 8) return _text(3, this._nid);
     return null;
   }
   set nodeValue(v) {
@@ -2867,11 +2982,11 @@ class Node {
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
-    if (this._treeDetachedExact) return null;
-    if (this._treeParentEpoch === _treeMutationEpoch) return this._treeParent;
-    const parent = _wrap(+_dom("parent_node", this._nid));
+    const cached = this._treeParentEpoch;
+    if (cached === _parentCacheEpoch || cached === -1) return this._treeParent;
+    const parent = _wrap(_nav(0, this._nid));
     this._treeParent = parent;
-    this._treeParentEpoch = _treeMutationEpoch;
+    this._treeParentEpoch = _parentCacheEpoch;
     return parent;
   }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
@@ -2879,15 +2994,15 @@ class Node {
     const ids = _domParse("child_nodes", this._nid) || [];
     return _nodeList(ids.map(_wrap).filter(Boolean));
   }
-  get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
-  get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
+  get firstChild() { return _wrap(_nav(1, this._nid)); }
+  get lastChild() { return _wrap(_nav(2, this._nid)); }
   get nextSibling() {
     if (this._shadowParent) {
       const children = this._shadowParent.childNodes;
       const index = children.indexOf(this);
       return index >= 0 ? (children[index + 1] || null) : null;
     }
-    return _wrap(+_dom("next_sibling", this._nid));
+    return _wrap(_nav(3, this._nid));
   }
   get previousSibling() {
     if (this._shadowParent) {
@@ -2895,7 +3010,7 @@ class Node {
       const index = children.indexOf(this);
       return index > 0 ? children[index - 1] : null;
     }
-    return _wrap(+_dom("prev_sibling", this._nid));
+    return _wrap(_nav(4, this._nid));
   }
   appendChild(node) {
     _requireNodeArgument(node, "appendChild", 1);
@@ -3018,9 +3133,10 @@ class Node {
     return root;
   }
   get isConnected() {
-    if (this._treeDetachedExact) return false;
-    if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
-    const connected = _dom("is_connected", this._nid) === "true";
+    const cached = this._treeConnectedEpoch;
+    if (cached === _treeMutationEpoch) return this._treeConnected;
+    if (cached === -1) return false;
+    const connected = _nav(6, this._nid) === 1;
     this._treeConnected = connected;
     this._treeConnectedEpoch = _treeMutationEpoch;
     return connected;
@@ -3088,12 +3204,13 @@ class Node {
 }
 class CharacterData extends Node {
   get data() {
-    return _domParse("text_content", this._nid) ?? "";
+    return _text(3, this._nid);
   }
   set data(v) {
-    const oldValue = _domParse("text_content", this._nid) ?? "";
+    const observed = globalThis.__mutationObservers?.length;
+    const oldValue = observed ? _text(3, this._nid) : "";
     _dom("set_text_content", this._nid, v === null ? "" : String(v));
-    if (globalThis.__mutationObservers?.length) {
+    if (observed) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
     }
   }
@@ -4081,7 +4198,7 @@ class Element extends Node {
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
     // for every comparison adds thousands of calls on modern component trees.
     if (this._tagName !== undefined) return this._tagName;
-    this._tagName = _domParse("tag_name", this._nid) || "";
+    this._tagName = _text(0, this._nid);
     return this._tagName;
   }
   get nodeName() { return this.tagName; }
@@ -4090,7 +4207,7 @@ class Element extends Node {
     // component directly preserves case-sensitive SVG/MathML names such as
     // `linearGradient`; deriving this from HTML's uppercased tagName loses it.
     if (this._lname !== undefined) return this._lname;
-    const ln = _domParse("local_name", this._nid)
+    const ln = _text(1, this._nid)
       || (this.tagName || "").toLowerCase();
     if (ln) this._lname = ln;
     return ln;
@@ -4119,7 +4236,7 @@ class Element extends Node {
     // instead of an SVGAnimatedString. An element's namespace never changes,
     // so cache it like _lname.
     if (this._nsCache !== undefined) return this._nsCache;
-    let ns = _domParse("namespace_uri", this._nid) || "";
+    let ns = _text(2, this._nid);
     // Nodes with no element name recorded fall back to the previous heuristic.
     if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
     this._nsCache = ns;
@@ -4127,11 +4244,24 @@ class Element extends Node {
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
   // side (issue #463), so this needs no template special case.
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _text(5, this._nid); }
   set innerHTML(v) {
     if (this.localName === 'template') {
       this.content.innerHTML = v;
       return;
+    }
+    // Without observers, one native call replaces the content when neither
+    // the old nor the new content needs stylesheet or window-name bookkeeping.
+    if (!globalThis.__mutationObservers?.length) {
+      const html = String(v ?? "");
+      const r = _domTreeBulk("set_inner_html_x", this._nid, html);
+      if (r !== "s") {
+        if (r === "2") _registerWindowNamedTree(this);
+        // The composite op parses and inserts natively, so the JS post-insert
+        // hooks (iframe srcdoc content in particular) never run for it.
+        _connectSrcdocFrames(this, html);
+        return;
+      }
     }
     // Capture the children that are about to be replaced so we can deliver
     // them as `removedNodes` in the MutationObserver record. Without this,
@@ -4163,7 +4293,7 @@ class Element extends Node {
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
     }
   }
-  get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
+  get outerHTML() { return _text(6, this._nid); }
   get innerText() {
     if (!this.isConnected
         || typeof __obscuraCore.ops.op_computed_style !== 'function'
@@ -4264,12 +4394,14 @@ class Element extends Node {
     // Script-created elements start with a provably empty attribute set. Keep
     // that small null-namespace map coherent through the ordinary mutation
     // APIs so React's write-then-read reflection does not cross the bridge.
-    if (this._nullNamespaceAttrs instanceof Map) {
-      return this._nullNamespaceAttrs.has(n)
-        ? this._nullNamespaceAttrs.get(n)
-        : null;
+    const tracked = this._nullNamespaceAttrs;
+    if (tracked) {
+      for (let i = 0; i < tracked.length; i += 2) {
+        if (tracked[i] === n) return tracked[i + 1];
+      }
+      return null;
     }
-    return _domParse("get_attribute", this._nid, n);
+    return __obscuraCore.ops.op_dom_attr(this._nid >>> 0, n, _realmFrameId);
   }
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
@@ -4284,12 +4416,20 @@ class Element extends Node {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
     }
-    if (this._nullNamespaceAttrs instanceof Map) {
-      this._nullNamespaceAttrs.set(n, value);
+    const tracked = this._nullNamespaceAttrs;
+    if (tracked === _EMPTY_ATTRS) {
+      this._nullNamespaceAttrs = [n, value];
+    } else if (tracked) {
+      let i = 0;
+      while (i < tracked.length && tracked[i] !== n) i += 2;
+      if (i < tracked.length) tracked[i + 1] = value;
+      else tracked.push(n, value);
     }
     if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
-      if (this.getRootNode() === globalThis.document) {
+      // Detached elements (the common construction order) cannot be in the
+      // document tree, so skip the native root lookup for them.
+      if (this.isConnected && this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
       }
       if (previousWindowName && previousWindowName !== value) {
@@ -4341,8 +4481,11 @@ class Element extends Node {
     const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     _dom("remove_attribute", this._nid, n);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
-    if (this._nullNamespaceAttrs instanceof Map) {
-      this._nullNamespaceAttrs.delete(n);
+    const tracked = this._nullNamespaceAttrs;
+    if (tracked && tracked !== _EMPTY_ATTRS) {
+      for (let i = 0; i < tracked.length; i += 2) {
+        if (tracked[i] === n) { tracked.splice(i, 2); break; }
+      }
     }
     if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (previousWindowName
@@ -6455,7 +6598,7 @@ class Document extends Node {
     el._tagName = localName.toUpperCase();
     el._lname = localName;
     el._ns = "http://www.w3.org/1999/xhtml";
-    el._nullNamespaceAttrs = new Map();
+    el._nullNamespaceAttrs = _EMPTY_ATTRS;
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
     _stampNodeDocument(el, this);
@@ -6489,7 +6632,7 @@ class Document extends Node {
     el._tagName = qualified;
     el._lname = localName;
     el._ns = effectiveNamespace;
-    el._nullNamespaceAttrs = new Map();
+    el._nullNamespaceAttrs = _EMPTY_ATTRS;
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
     return _stampNodeDocument(el, this);
@@ -7019,7 +7162,7 @@ class DocumentFragment extends Node {
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _text(5, this._nid); }
   set innerHTML(v) {
     const html = String(v ?? "");
     if (this._fragmentContext) {
@@ -7084,7 +7227,26 @@ class DocumentType extends Node {
   }
 }
 
-const _cache = new Map();
+// Node wrappers by node id. Ids are small dense integers, and a holey array
+// is several times cheaper than a Map for both insertion and lookup; ids past
+// the array limit fall back to a Map.
+const _CACHE_ARRAY_MAX = 1 << 23;
+const _cache = {
+  _a: [],
+  _m: null,
+  get(nid) { return nid < _CACHE_ARRAY_MAX ? this._a[nid] : this._m?.get(nid); },
+  set(nid, n) {
+    if (nid < _CACHE_ARRAY_MAX) {
+      const a = this._a;
+      if (nid >= a.length) a.length = Math.max(nid + 1, a.length * 2, 1024);
+      a[nid] = n;
+    } else {
+      (this._m ??= new Map()).set(nid, n);
+    }
+    return this;
+  },
+  has(nid) { return this.get(nid) !== undefined; },
+};
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -7620,49 +7782,44 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
-const _elementClassFor = (function _elementClassFor(nid) {
-  const tag = _domParse("tag_name", nid);
-  // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
-  // case, so keep the common HTML path fast and only inspect the native
-  // namespace for possible SVG wrappers.
-  if (tag && tag !== tag.toUpperCase()
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    const svgClass = _svgElementClasses[tag];
+// Wrapper class for a native element class code; see element_class_kind in
+// ops.rs. A class that is not installed falls back the way the old tag-name
+// chain did.
+function _classForKind(kind) {
+  switch (kind) {
+    case 0: return Element;
+    case 1: return globalThis.SVGElement || Element;
+    case 2: return globalThis.SVGPathElement || globalThis.SVGElement || Element;
+    case 3: return globalThis.SVGSVGElement || globalThis.SVGElement || Element;
+    case 4: return globalThis.HTMLFormElement || Element;
+    case 5: return globalThis.HTMLInputElement || Element;
+    case 6: return globalThis.HTMLTextAreaElement || Element;
+    case 7: return globalThis.HTMLMetaElement || Element;
+    case 8: return globalThis.HTMLSlotElement || Element;
+    case 9: return HTMLImageElement;
+    case 10: return globalThis.HTMLCanvasElement || Element;
+    case 11: return HTMLAudioElement;
+    case 12: return HTMLVideoElement;
+    case 13: return HTMLTrackElement;
+    case 14: return HTMLOListElement;
+    case 15: return HTMLLIElement;
+    case 16: return globalThis.HTMLIFrameElement || Element;
+    default: return Element;
+  }
+}
+// Kinds 1-3 are case-preserved SVG-namespace elements; their concrete
+// interface comes from the element's own name, like the native-name path.
+function _classForElement(kind, nid) {
+  if (kind >= 1 && kind <= 3) {
+    const svgClass = _svgElementClasses[_domParse("tag_name", nid)];
     if (svgClass) return svgClass;
-    if (globalThis.SVGElement) return globalThis.SVGElement;
   }
-  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-  if (tag === "INPUT" && globalThis.HTMLInputElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
-  if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
-  if (tag === "META" && globalThis.HTMLMetaElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
-  if ((tag === "OL" || tag === "LI")
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    const localName = _domParse("local_name", nid);
-    if (localName === "ol") return HTMLOListElement;
-    if (localName === "li") return HTMLLIElement;
-  }
-  // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
-  // (createElementNS + cloneNode lands here) stays a plain Element.
-  if (tag === "SLOT" && globalThis.HTMLSlotElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    return globalThis.HTMLSlotElement;
-  }
-  if (tag === "IFRAME" && globalThis.HTMLIFrameElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    return globalThis.HTMLIFrameElement;
-  }
-  if (tag === "IMG") return HTMLImageElement;
-  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
-  if (tag === "AUDIO") return HTMLAudioElement;
-  if (tag === "VIDEO") return HTMLVideoElement;
-  if (tag === "TRACK") return HTMLTrackElement;
-  return Element;
-});
-const _elementClassForKnownName = (function _elementClassForKnownName(namespace, qualifiedName) {
+  return _classForKind(kind);
+}
+function _elementClassFor(nid) {
+  return _classForElement(_nav(9, nid) >> 4, nid);
+}
+function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
@@ -7688,13 +7845,15 @@ const _elementClassForKnownName = (function _elementClassForKnownName(namespace,
     if (tag === "TRACK") return HTMLTrackElement;
   }
   return Element;
-});
+}
 const _wrap = (function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
-  const t = +_dom("node_type", nid);
+  const hit = _cache.get(nid);
+  if (hit !== undefined) return hit;
+  const info = _nav(9, nid);
+  const t = info & 15;
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) { const C = _classForElement(info >> 4, nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
@@ -7707,7 +7866,8 @@ const _wrap = (function _wrap(nid) {
 });
 const _wrapEl = (function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
+  const hit = _cache.get(nid);
+  if (hit !== undefined) return hit;
   const C = _elementClassFor(nid);
   const n = new C(nid);
   _cache.set(nid, n);
@@ -10506,12 +10666,15 @@ function _releaseLinkedStylesheet(link) {
 }
 function _releaseLinkedStylesheetsIn(root) {
   if (!root || root.nodeType !== 1 && root.nodeType !== 11) return;
+  // One cheap native walk instead of up to three selector queries.
+  if (_nav(7, root._nid) === 0) return;
   if (root.nodeType === 1 && root.localName === "link") _releaseLinkedStylesheet(root);
   if (!root.querySelectorAll) return;
   for (const link of root.querySelectorAll("link")) _releaseLinkedStylesheet(link);
 }
 function _detachStyleSheetsInSubtree(root) {
   if (!root) return;
+  if ((root.nodeType === 1 || root.nodeType === 11) && _nav(7, root._nid) === 0) return;
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
   if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
   _releaseLinkedStylesheetsIn(root);
@@ -14566,12 +14729,17 @@ function _windowNamedNamesInTree(root) {
   return new Set(root ? _domParse("window_named_names", root._nid) || [] : []);
 }
 
-function _registerWindowNamedTree(root) {
+function _registerWindowNamedTree(root, inDocumentTree) {
   // Window named access only considers the document tree. Detached nodes and
   // attached shadow trees must not manufacture own Window properties. Check
   // connectivity first: getRootNode() walks every ancestor, which made the
   // common framework pattern of building a deep detached subtree quadratic.
-  if (!root || !root.isConnected || root.getRootNode() !== globalThis.document) return;
+  if (!root) return;
+  if (inDocumentTree === undefined) {
+    if (!root.isConnected || root.getRootNode() !== globalThis.document) return;
+  } else if (!inDocumentTree) {
+    return;
+  }
   const names = _windowNamedNamesInTree(root);
   for (const name of names) _ensureWindowNamedProperty(name);
 }
@@ -16192,9 +16360,9 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   }
   const shadow = new ShadowRoot(rootNid, this, opts);
   _treeMutationEpoch++;
-  shadow._treeDetachedExact = false;
+  _parentCacheEpoch++;
   shadow._treeParent = null;
-  shadow._treeParentEpoch = _treeMutationEpoch;
+  shadow._treeParentEpoch = _parentCacheEpoch;
   shadow._treeConnected = this.isConnected;
   shadow._treeConnectedEpoch = _treeMutationEpoch;
   _cache.set(rootNid, shadow);
