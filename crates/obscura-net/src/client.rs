@@ -845,11 +845,27 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+}
+
+/// The sub-resource cache and the concurrent-fetch coalescer are shared by
+/// every client in the process. They were per `ObscuraHttpClient`, i.e. per
+/// browser context, so 50 serve workers each kept a private cache and a
+/// private coalescer: the same CDN asset was downloaded once per context
+/// instead of once per process. Contexts come and go per CDP session while
+/// the shared assets (jQuery, theme CSS, …) repeat, which is exactly what a
+/// shared cache should absorb. The key pins the request-shaping state
+/// (UA, headers, credentials policy, SSRF gate, proxy), so entries only
+/// flow between contexts that would send byte-identical requests anyway.
+static PROCESS_RESOURCE_LOADER: std::sync::OnceLock<
+    std::sync::Mutex<ResourceLoaderState>,
+> = std::sync::OnceLock::new();
+
+fn process_resource_loader() -> &'static std::sync::Mutex<ResourceLoaderState> {
+    PROCESS_RESOURCE_LOADER.get_or_init(|| std::sync::Mutex::new(ResourceLoaderState::default()))
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -866,12 +882,35 @@ struct ResourceCacheKey {
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
+    /// SSRF gate of the client that issued the fetch. The cache lookup runs
+    /// before `validate_url`, so a permissive client must never seed a hit
+    /// for a stricter one once the cache is process-wide.
+    allow_private_network: bool,
+    /// Egress path of the fetching client. A proxy can rewrite or regionalize
+    /// responses, so two clients with different proxies never share entries.
+    proxy_url: Option<String>,
 }
 
 #[derive(Clone)]
 struct ResourceCacheEntry {
     response: Response,
     expires_at: Instant,
+    /// `etag` and `last_modified` are the response validators, sent back as
+    /// `if-none-match` / `if-modified-since` when the entry expires so the
+    /// origin can answer 304 instead of resending the body.
+    etag: Option<String>,
+    last_modified: Option<String>,
+    /// The lifetime computed when the entry was stored, reused when a 304
+    /// revalidation carries no fresh `cache-control`.
+    lifetime: Duration,
+}
+
+/// What a cache lookup returns for an expired-but-revalidatable entry.
+enum CacheGet {
+    Fresh(Response),
+    /// The entry left the cache; the caller revalidates it and reinserts on
+    /// 304 or a cacheable 200.
+    Stale(Box<ResourceCacheEntry>),
 }
 
 #[derive(Default)]
@@ -921,15 +960,17 @@ impl Drop for SharedFetchLeader<'_> {
 }
 
 impl ResourceCache {
-    fn get(&mut self, key: &ResourceCacheKey) -> Option<Response> {
+    fn get(&mut self, key: &ResourceCacheKey) -> Option<CacheGet> {
         let entry = self.entries.get(key)?;
         if entry.expires_at <= Instant::now() {
-            let expired = self.entries.remove(key)?;
-            self.body_bytes = self.body_bytes.saturating_sub(expired.response.body.len());
+            let expired = Box::new(self.entries.remove(key)?);
+            self.body_bytes = self
+                .body_bytes
+                .saturating_sub(expired.response.body.len());
             self.insertion_order.retain(|queued| queued != key);
-            return None;
+            return Some(CacheGet::Stale(expired));
         }
-        Some(entry.response.clone())
+        Some(CacheGet::Fresh(entry.response.clone()))
     }
 
     fn insert(&mut self, key: ResourceCacheKey, response: Response, lifetime: Duration) {
@@ -938,7 +979,9 @@ impl ResourceCache {
             return;
         }
         if let Some(previous) = self.entries.remove(&key) {
-            self.body_bytes = self.body_bytes.saturating_sub(previous.response.body.len());
+            self.body_bytes = self
+                .body_bytes
+                .saturating_sub(previous.response.body.len());
             self.insertion_order.retain(|queued| queued != &key);
         }
         while self.entries.len() >= RESOURCE_CACHE_MAX_ENTRIES
@@ -948,7 +991,9 @@ impl ResourceCache {
                 break;
             };
             if let Some(entry) = self.entries.remove(&oldest) {
-                self.body_bytes = self.body_bytes.saturating_sub(entry.response.body.len());
+                self.body_bytes = self
+                    .body_bytes
+                    .saturating_sub(entry.response.body.len());
             }
         }
         self.body_bytes = self.body_bytes.saturating_add(response_bytes);
@@ -956,15 +1001,34 @@ impl ResourceCache {
         self.entries.insert(
             key,
             ResourceCacheEntry {
+                etag: response
+                    .header("etag")
+                    .map(|etag| etag.to_string()),
+                last_modified: response
+                    .header("last-modified")
+                    .map(|last_modified| last_modified.to_string()),
                 response,
                 expires_at: Instant::now() + lifetime,
+                lifetime,
             },
         );
     }
 }
 
+/// Validators for a conditional (revalidation) request, taken from a stale
+/// cache entry: `If-None-Match` for the etag, `If-Modified-Since` for
+/// last-modified. Browsers send whichever they have; the origin answers 304
+/// when the resource did not change, sparing the body.
+struct Conditional {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+/// Cacheability and freshness for a response. `304` is accepted so a
+/// revalidation answer can refresh an entry's lifetime when the origin
+/// sent a new `cache-control` alongside it.
 fn response_cache_lifetime(response: &Response) -> Option<Duration> {
-    if !(200..300).contains(&response.status)
+    if (!(200..300).contains(&response.status) && response.status != 304)
         || !response.redirected_from.is_empty()
         || response.header("set-cookie").is_some()
         || response
@@ -1060,7 +1124,6 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
         }
     }
@@ -1224,6 +1287,8 @@ impl ObscuraHttpClient {
             user_agent: self.user_agent.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
+            allow_private_network: self.allow_private_network,
+            proxy_url: self.proxy_url.clone(),
         })
     }
 
@@ -1240,12 +1305,22 @@ impl ObscuraHttpClient {
             .await
         else {
             return self
-                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .fetch_with_profile_uncached(
+                    initial_method,
+                    url,
+                    initial_body,
+                    callbacks,
+                    request,
+                    None,
+                )
                 .await;
         };
 
         enum Acquisition {
             Cached(Response),
+            /// The entry expired; hold its validators and revalidate before
+            /// refetching the body in full.
+            Stale(Box<ResourceCacheEntry>),
             Follower(watch::Receiver<Option<SharedFetchOutcome>>),
             Leader(SharedFetchSender),
         }
@@ -1254,17 +1329,21 @@ impl ObscuraHttpClient {
         // that atomicity a request can miss the cache, pause, and install a
         // second leader after the first request has already populated it.
         let acquisition = {
-            let mut loader = self.resource_loader.lock().unwrap();
-            if let Some(response) = loader.cache.get(&cache_key) {
-                Acquisition::Cached(response)
-            } else if let Some(sender) = loader.shared_fetches.get(&cache_key) {
-                Acquisition::Follower(sender.subscribe())
-            } else {
-                let (sender, _receiver) = watch::channel(None);
-                loader
-                    .shared_fetches
-                    .insert(cache_key.clone(), sender.clone());
-                Acquisition::Leader(sender)
+            let mut loader = process_resource_loader().lock().unwrap();
+            match loader.cache.get(&cache_key) {
+                Some(CacheGet::Fresh(response)) => Acquisition::Cached(response),
+                Some(CacheGet::Stale(entry)) => Acquisition::Stale(entry),
+                None => {
+                    if let Some(sender) = loader.shared_fetches.get(&cache_key) {
+                        Acquisition::Follower(sender.subscribe())
+                    } else {
+                        let (sender, _receiver) = watch::channel(None);
+                        loader
+                            .shared_fetches
+                            .insert(cache_key.clone(), sender.clone());
+                        Acquisition::Leader(sender)
+                    }
+                }
             }
         };
 
@@ -1273,6 +1352,91 @@ impl ObscuraHttpClient {
                 self.fire_logical_resource_callbacks(callbacks, url, &request, &response)
                     .await;
                 Ok(response)
+            }
+            // A stale entry with validators (etag / last-modified) is
+            // revalidated with a conditional request instead of dropped: the
+            // origin answers 304 and the body never crosses the wire again.
+            // Without validators an expired entry is just a miss, so this arm
+            // falls back to the uncached path below.
+            //
+            // Observer semantics stay uniform with a cache hit: the wire
+            // exchange fires nothing, and exactly one logical request/response
+            // pair fires for the resource the page sees (200), whether the
+            // origin answered 304 or sent a new body.
+            Acquisition::Stale(entry) => {
+                let (etag, last_modified) = match (entry.etag.clone(), entry.last_modified.clone())
+                {
+                    (None, None) => {
+                        return self
+                            .fetch_with_profile_uncached(
+                                initial_method,
+                                url,
+                                initial_body,
+                                callbacks,
+                                request,
+                                None,
+                            )
+                            .await;
+                    }
+                    (etag, last_modified) => (etag, last_modified),
+                };
+                let conditional = Conditional {
+                    etag,
+                    last_modified,
+                };
+                let result = self
+                    .fetch_with_profile_uncached(
+                        initial_method,
+                        url,
+                        initial_body,
+                        None,
+                        request.clone(),
+                        Some(&conditional),
+                    )
+                    .await;
+                let final_response = match result {
+                    Ok(revalidation) if revalidation.status == 304 => {
+                        let mut refreshed = entry.response.clone();
+                        // A 304's headers only refresh validators; the
+                        // reconstructed response keeps the original 200
+                        // headers the page first saw.
+                        if let Some(etag) = revalidation.header("etag") {
+                            refreshed
+                                .headers
+                                .insert("etag".to_string(), etag.to_string());
+                        }
+                        if let Some(last_modified) = revalidation.header("last-modified") {
+                            refreshed
+                                .headers
+                                .insert("last-modified".to_string(), last_modified.to_string());
+                        }
+                        // Honor a fresh max-age from the origin; otherwise
+                        // the entry keeps the lifetime it was stored with.
+                        let lifetime =
+                            response_cache_lifetime(&revalidation).unwrap_or(entry.lifetime);
+                        process_resource_loader().lock().unwrap().cache.insert(
+                            cache_key,
+                            refreshed.clone(),
+                            lifetime,
+                        );
+                        refreshed
+                    }
+                    // 200 (or any non-304): the origin replaced the body.
+                    Ok(response) => {
+                        if let Some(lifetime) = response_cache_lifetime(&response) {
+                            process_resource_loader()
+                                .lock()
+                                .unwrap()
+                                .cache
+                                .insert(cache_key, response.clone(), lifetime);
+                        }
+                        response
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.fire_logical_resource_callbacks(callbacks, url, &request, &final_response)
+                    .await;
+                Ok(final_response)
             }
             Acquisition::Follower(mut receiver) => loop {
                 let outcome = { receiver.borrow().clone() };
@@ -1292,6 +1456,7 @@ impl ObscuraHttpClient {
                                 initial_body,
                                 callbacks,
                                 request,
+                                None,
                             )
                             .await
                         }
@@ -1305,6 +1470,7 @@ impl ObscuraHttpClient {
                             initial_body,
                             callbacks,
                             request,
+                            None,
                         )
                         .await;
                 }
@@ -1314,7 +1480,7 @@ impl ObscuraHttpClient {
                 // the guard removes the stale leader and wakes followers so
                 // they can retry instead of waiting forever.
                 let leader = SharedFetchLeader {
-                    loader: &self.resource_loader,
+                    loader: process_resource_loader(),
                     key: cache_key.clone(),
                     sender,
                     finished: false,
@@ -1326,12 +1492,13 @@ impl ObscuraHttpClient {
                         initial_body,
                         callbacks,
                         request,
+                        None,
                     )
                     .await;
                 let shared_outcome = match &result {
                     Ok(response) => match response_cache_lifetime(response) {
                         Some(lifetime) => {
-                            self.resource_loader.lock().unwrap().cache.insert(
+                            process_resource_loader().lock().unwrap().cache.insert(
                                 cache_key,
                                 response.clone(),
                                 lifetime,
@@ -1378,6 +1545,7 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
+        conditional: Option<&Conditional>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -1420,7 +1588,7 @@ impl ObscuraHttpClient {
                 url: current_url.clone(),
                 method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(),
-                resource_type: request.resource_type.clone(),
+                resource_type: request.resource_type,
             };
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
@@ -1551,6 +1719,20 @@ impl ObscuraHttpClient {
                     headers.insert(name, val);
                 }
             }
+            // Revalidation validators from the stale cache entry. Chrome
+            // places them after its standard headers.
+            if let Some(conditional) = conditional {
+                if let Some(etag) = conditional.etag.as_deref() {
+                    if let Ok(val) = HeaderValue::from_str(etag) {
+                        headers.insert(HeaderName::from_static("if-none-match"), val);
+                    }
+                }
+                if let Some(last_modified) = conditional.last_modified.as_deref() {
+                    if let Ok(val) = HeaderValue::from_str(last_modified) {
+                        headers.insert(HeaderName::from_static("if-modified-since"), val);
+                    }
+                }
+            }
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
             if cors_required(&request, &current_url) {
@@ -1602,6 +1784,21 @@ impl ObscuraHttpClient {
                     k.as_str().to_lowercase(),
                     v.to_str().unwrap_or("").to_string(),
                 );
+            }
+
+            // A 304 from a conditional (revalidation) request never reaches
+            // the page: the caller reconstructs the cached 200. Only the
+            // revalidation path can produce one, and it always checks for it,
+            // so this cannot mask a server misbehaving toward a normal fetch.
+            if status == reqwest::StatusCode::NOT_MODIFIED && conditional.is_some() {
+                drop(in_flight);
+                return Ok(Response {
+                    url: current_url,
+                    status: 304,
+                    headers: response_headers,
+                    body: Vec::new(),
+                    redirected_from: redirects,
+                });
             }
 
             if status.is_redirection() {
@@ -1721,7 +1918,7 @@ pub enum ObscuraNetError {
 
 #[cfg(test)]
 mod resource_cache_tests {
-    use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
+    use super::{CacheGet, ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
         RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -1739,6 +1936,8 @@ mod resource_cache_tests {
             user_agent: "cache-test".into(),
             extra_headers: Vec::new(),
             max_response_bytes: 1024,
+            allow_private_network: false,
+            proxy_url: None,
         };
         let response = Response {
             url,
@@ -1757,13 +1956,15 @@ mod resource_cache_tests {
         for _ in 0..10_000 {
             cache.insert(key.clone(), response.clone(), Duration::from_secs(60));
             cache.entries.get_mut(&key).unwrap().expires_at = Instant::now();
-            assert!(cache.get(&key).is_none());
+            // An expired entry leaves the map but is handed to the caller for
+            // revalidation, not silently dropped.
+            assert!(matches!(cache.get(&key), Some(CacheGet::Stale(_))));
             assert!(cache.entries.is_empty());
             assert!(cache.insertion_order.is_empty());
             assert_eq!(cache.body_bytes, 0);
         }
         cache.insert(key.clone(), response, Duration::from_secs(60));
-        assert!(cache.get(&key).is_some());
+        assert!(matches!(cache.get(&key), Some(CacheGet::Fresh(_))));
         assert_eq!(cache.insertion_order.len(), 1);
         assert_eq!(cache.body_bytes, 1);
     }
@@ -1775,7 +1976,7 @@ mod resource_cache_tests {
         let mut cache = ResourceCache::default();
         cache.insert(reused.clone(), response.clone(), Duration::from_secs(60));
         cache.entries.get_mut(&reused).unwrap().expires_at = Instant::now();
-        assert!(cache.get(&reused).is_none());
+        assert!(matches!(cache.get(&reused), Some(CacheGet::Stale(_))));
         cache.insert(oldest.clone(), oldest_response, Duration::from_secs(60));
         cache.insert(reused.clone(), response, Duration::from_secs(60));
         for index in 0..RESOURCE_CACHE_MAX_ENTRIES - 1 {
@@ -1783,10 +1984,46 @@ mod resource_cache_tests {
             cache.insert(key, response, Duration::from_secs(60));
         }
         assert!(cache.get(&oldest).is_none(), "evict the oldest live entry");
-        assert!(cache.get(&reused).is_some(), "keep the refreshed entry");
+        assert!(
+            matches!(cache.get(&reused), Some(CacheGet::Fresh(_))),
+            "keep the refreshed entry"
+        );
         assert_eq!(cache.entries.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
+    }
+
+    // An expired entry is only useful if it carries the validators the
+    // revalidation request needs: the etag and last-modified of the stored
+    // response, and the lifetime to fall back to when the origin's 304 ships
+    // no fresh cache-control.
+    #[test]
+    fn stale_entries_carry_their_validators_for_revalidation() {
+        let (key, mut response) = cache_test_resource("validator");
+        response
+            .headers
+            .insert("etag".to_string(), "\"v42\"".to_string());
+        response
+            .headers
+            .insert("last-modified".to_string(), "Wed, 21 Oct 2026 07:28:00 GMT".to_string());
+        let mut cache = ResourceCache::default();
+        cache.insert(key.clone(), response, Duration::from_secs(60));
+        cache.entries.get_mut(&key).unwrap().expires_at = Instant::now();
+        match cache.get(&key) {
+            Some(CacheGet::Stale(entry)) => {
+                assert_eq!(entry.etag.as_deref(), Some("\"v42\""));
+                assert_eq!(
+                    entry.last_modified.as_deref(),
+                    Some("Wed, 21 Oct 2026 07:28:00 GMT")
+                );
+                assert_eq!(entry.response.body, vec![1]);
+                assert_eq!(entry.lifetime, Duration::from_secs(60));
+            }
+            _ => panic!("expired entry must be handed to the caller for revalidation"),
+        }
+        assert!(cache.entries.is_empty());
+        assert!(cache.insertion_order.is_empty());
+        assert_eq!(cache.body_bytes, 0);
     }
 
 }
@@ -2493,8 +2730,7 @@ mod ssrf_tests {
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let follower_is_waiting = client
-                    .resource_loader
+                let follower_is_waiting = super::process_resource_loader()
                     .lock()
                     .unwrap()
                     .shared_fetches
@@ -2609,6 +2845,96 @@ mod ssrf_tests {
             Url::parse(&format!("http://{address}/shared.js")).unwrap(),
             requests,
         )
+    }
+
+    // The cache is process-wide: a second client (its own cookie jar, its own
+    // profile state) reuses the first one's cacheable subresources instead of
+    // downloading them again. Each context used to keep a private copy, so
+    // N workers of a process fetched the same CDN asset N times.
+    #[tokio::test]
+    async fn subresource_cache_is_shared_between_clients() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Cache-Control: public, max-age=3600\r\n",
+        )
+        .await;
+        let initiator = url.join("/page.html").unwrap();
+        let first_client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let second_client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        let first = first_client
+            .fetch_resource_with_callbacks(&url, request.clone(), None)
+            .await
+            .unwrap();
+        let second = second_client
+            .fetch_resource_with_callbacks(&url, request, None)
+            .await
+            .unwrap();
+        assert_eq!(first.status, 200);
+        assert_eq!(second.status, 200);
+        assert_eq!(first.body, second.body);
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    // An expired entry with validators revalidates instead of refetching: the
+    // second request carries If-None-Match, the origin answers 304, and the
+    // page still sees the cached 200 with its body intact.
+    #[tokio::test]
+    async fn expired_etag_entries_revalidate_with_a_conditional_request() {
+        let body = "let revalidated = true;";
+        let first = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nETag: \"v1\"\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let revalidation =
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (target, mut requests) =
+            http_fixture(vec![first, revalidation.to_string()]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let initiator = target.join("/page.html").unwrap();
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        let fetched = client
+            .fetch_resource_with_callbacks(&target, request.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(fetched.status, 200);
+        assert_eq!(fetched.body, body.as_bytes());
+        let first_request = requests.recv().await.unwrap();
+        assert!(!first_request.to_ascii_lowercase().contains("if-none-match"));
+
+        // Expire the entry without waiting out max-age: the outcome on the
+        // wire is identical.
+        {
+            let mut loader = super::process_resource_loader().lock().unwrap();
+            for entry in loader.cache.entries.values_mut() {
+                entry.expires_at = std::time::Instant::now();
+            }
+        }
+        let revalidated = client
+            .fetch_resource_with_callbacks(&target, request, None)
+            .await
+            .unwrap();
+        assert_eq!(revalidated.status, 200, "the page never sees the 304");
+        assert_eq!(revalidated.body, body.as_bytes(), "the cached body survives");
+        let second_request = requests.recv().await.unwrap();
+        assert!(
+            second_request
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"v1\""),
+            "the revalidation must be conditional, got: {second_request}"
+        );
     }
 
     #[tokio::test]
