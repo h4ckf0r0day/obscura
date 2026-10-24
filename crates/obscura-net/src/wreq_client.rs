@@ -191,6 +191,7 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    user_agent: Option<String>,
 }
 
 /// Scripted fetch exposes these headers before consuming the bounded body.
@@ -286,7 +287,15 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            user_agent: None,
         }
+    }
+
+    /// Overrides the emulation's User-Agent for every request (`--user-agent`).
+    /// `None` keeps the Chrome145/Windows emulation UA untouched.
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -375,6 +384,9 @@ impl StealthHttpClient {
             };
             if !cookie_header.is_empty() {
                 req = req.header("Cookie", &cookie_header);
+            }
+            if let Some(ua) = &self.user_agent {
+                req = req.header("user-agent", ua.as_str());
             }
 
             for (k, v) in self.extra_headers.read().await.iter() {
@@ -543,6 +555,9 @@ impl StealthHttpClient {
             if !cookie_header.is_empty() {
                 req = req.header("cookie", &cookie_header);
             }
+        }
+        if let Some(ua) = &self.user_agent {
+            req = req.header("user-agent", ua.as_str());
         }
         for (k, v) in self.extra_headers.read().await.iter() {
             req = req.header(k.as_str(), v.as_str());
@@ -823,6 +838,7 @@ mod tests {
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            user_agent: None,
         };
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
         let error = client
