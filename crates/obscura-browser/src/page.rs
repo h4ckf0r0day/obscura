@@ -1097,7 +1097,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            )))
+            ).with_user_agent(context.user_agent_override.clone())))
         } else {
             None
         };
@@ -1824,7 +1824,12 @@ impl Page {
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(
+                self.context
+                    .user_agent_override
+                    .as_deref()
+                    .unwrap_or(obscura_net::STEALTH_USER_AGENT),
+            );
             rt.set_platform(
                 obscura_net::STEALTH_NAVIGATOR_PLATFORM,
                 obscura_net::STEALTH_UA_PLATFORM,
