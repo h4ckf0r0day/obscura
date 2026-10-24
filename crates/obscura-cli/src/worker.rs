@@ -93,6 +93,13 @@ async fn main() {
     let mut context =
         BrowserContext::with_full_options("worker".to_string(), proxy, stealth, user_agent);
     context.obey_robots = obey_robots;
+    // Shared robots.txt cache: the parent mirrors --robots-cache-dir into
+    // OBSCURA_ROBOTS_CACHE_DIR before spawning workers, so the whole batch
+    // fetches each origin's robots.txt once.
+    context.robots_cache_dir = std::env::var("OBSCURA_ROBOTS_CACHE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty());
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
 

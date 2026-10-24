@@ -50,6 +50,16 @@ struct Args {
     #[arg(long)]
     storage_dir: Option<std::path::PathBuf>,
 
+    /// Directory for the shared robots.txt cache ({dir}/robots-cache.json),
+    /// so parallel processes (serve workers, fleet invocations) fetch each
+    /// origin's robots.txt once per TTL instead of once per process.
+    /// Deliberately independent of --storage-dir, which also shares cookies
+    /// and localStorage. Global: applies to fetch, serve, and scrape.
+    /// Equivalent to `OBSCURA_ROBOTS_CACHE_DIR` and survives in command
+    /// pipelines.
+    #[arg(long, global = true)]
+    robots_cache_dir: Option<std::path::PathBuf>,
+
     /// Permit fetches to loopback, RFC1918, and link-local addresses.
     /// Default is to block them (SSRF fix from #4). Use this for local
     /// development against http://localhost:N or http://192.168.x.y.
@@ -446,6 +456,23 @@ async fn run_cli() -> anyhow::Result<()> {
         // threaded at this point.
         unsafe {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        }
+    }
+
+    // Mirror --robots-cache-dir into the env like --allow-private-network:
+    // the serve path (single worker, load-balanced children, and the CDP
+    // context constructors) reads OBSCURA_ROBOTS_CACHE_DIR, so the flag
+    // reaches every process this one spawns without threading a new
+    // parameter through each CDP start function.
+    if let Some(ref dir) = args.robots_cache_dir {
+        // SAFETY: set_var is unsafe in newer rustc; this runs before any
+        // spawned thread inspects the env, so it's effectively single
+        // threaded at this point.
+        unsafe {
+            std::env::set_var(
+                "OBSCURA_ROBOTS_CACHE_DIR",
+                std::ffi::OsStr::new(dir.as_os_str()),
+            );
         }
     }
 
@@ -1212,6 +1239,13 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    // Shared robots.txt cache: main() mirrors --robots-cache-dir into
+    // OBSCURA_ROBOTS_CACHE_DIR, which also covers serve workers spawned
+    // from this process.
+    context.robots_cache_dir = std::env::var("OBSCURA_ROBOTS_CACHE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty());
     // The browser layer refuses file:// unless the context opts in. A local
     // user running `obscura fetch file://...` on their own files is the
     // intended case; only network-facing servers (serve, mcp) keep it off.
