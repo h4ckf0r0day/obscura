@@ -2068,7 +2068,35 @@ function _eventTargetDispatch(target, event) {
   }
 }
 
+// HTML Standard "current event": `window.event` exposes the event being
+// dispatched, and is restored once the invocation returns so nested dispatches
+// and code outside dispatch see the right value. Legacy handlers rely on it,
+// e.g. `onclick="go()"` with `function go() { event.preventDefault(); }`.
+let _currentWindowEvent;
+Object.defineProperty(globalThis, "event", {
+  get() { return _currentWindowEvent; },
+  // [Replaceable]: assigning replaces the accessor with a plain data property.
+  set(value) {
+    Object.defineProperty(globalThis, "event", {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  },
+  enumerable: true,
+  configurable: true,
+});
+
 function _domEventInvoke(target, event, capture, phase) {
+  const previousEvent = _currentWindowEvent;
+  // The spec leaves the current event untouched for targets in a shadow tree.
+  if (!event._inShadowTree) _currentWindowEvent = event;
+  try {
+    _domEventInvokeHandlers(target, event, capture, phase);
+  } finally {
+    _currentWindowEvent = previousEvent;
+  }
+}
+
+function _domEventInvokeHandlers(target, event, capture, phase) {
   event.currentTarget = target;
   event.eventPhase = phase;
 
@@ -2130,6 +2158,10 @@ function _domEventDispatch(target, event) {
     path.push(ancestor);
     ancestor = ancestor.parentNode || null;
   }
+  // The parentNode-based path never crosses a shadow boundary, so the tree
+  // root (last path entry, or the target itself) tells which tree every node
+  // on the path belongs to.
+  event._inShadowTree = (path.length ? path[path.length - 1] : target) instanceof ShadowRoot;
   // Detached nodes have no event parent. Connected paths reach Window through
   // Document, except for load, whose Document parent is null by specification.
   const reachesDocument = target === document || path[path.length - 1] === document;
