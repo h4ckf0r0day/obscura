@@ -41,7 +41,10 @@ struct Args {
     #[arg(long, global = true)]
     obey_robots: bool,
 
-    #[arg(long)]
+    /// Override the User-Agent sent with every request.
+    /// Global: applies to fetch, serve, scrape, and mcp. A subcommand-level
+    /// --user-agent still wins where one exists.
+    #[arg(long, global = true)]
     user_agent: Option<String>,
 
     #[arg(long)]
@@ -326,6 +329,13 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+fn merge_user_agent(
+    global_user_agent: Option<String>,
+    command_user_agent: Option<String>,
+) -> Option<String> {
+    command_user_agent.or(global_user_agent)
+}
+
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
 /// Returns `None` when the user didn't pass the flag, passed an empty string,
 /// or passed only whitespace; in those cases V8 is left untouched.
@@ -440,6 +450,7 @@ async fn run_cli() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    let global_user_agent = args.user_agent.clone();
     let global_storage_dir = args.storage_dir.clone();
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
@@ -462,6 +473,7 @@ async fn run_cli() -> anyhow::Result<()> {
             font_dirs,
             quiet: _,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             let policy = pool::RecyclePolicy {
                 max_connections: worker_max_connections,
                 max_rss_mb: worker_max_rss,
@@ -556,6 +568,7 @@ async fn run_cli() -> anyhow::Result<()> {
             concurrency,
             screenshot,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -630,6 +643,7 @@ async fn run_cli() -> anyhow::Result<()> {
                 global_proxy,
                 stealth,
                 obey_robots,
+                global_user_agent.clone(),
             )
             .await?;
         }
@@ -641,6 +655,7 @@ async fn run_cli() -> anyhow::Result<()> {
             proxy,
             user_agent,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             configure_font_directories(&font_dirs)?;
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             // `obscura mcp` builds its BrowserContext from the environment, so
@@ -1200,7 +1215,7 @@ async fn run_fetch(
     // The browser layer refuses file:// unless the context opts in. A local
     // user running `obscura fetch file://...` on their own files is the
     // intended case; only network-facing servers (serve, mcp) keep it off.
-    context.allow_file_access = true;
+    context.set_allow_file_access(true);
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -1605,6 +1620,9 @@ async fn fetch_original_response(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
     );
+    // Same local-user opt-in as `fetch`: `--dump original file://...` reads
+    // the user's own file. The client refuses file:// unless told otherwise.
+    client.set_allow_file_access(true);
     if let Some(ua) = user_agent {
         client.set_user_agent(&ua).await;
     }
@@ -2022,6 +2040,7 @@ async fn run_parallel_scrape(
     proxy: Option<String>,
     stealth: bool,
     obey_robots: bool,
+    user_agent: Option<String>,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -2064,6 +2083,7 @@ async fn run_parallel_scrape(
         let eval = eval.clone();
         let worker_path = worker_path.clone();
         let proxy = proxy.clone();
+        let user_agent = user_agent.clone();
 
         async move {
             let task_start = Instant::now();
@@ -2075,6 +2095,7 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
+                .env("OBSCURA_USER_AGENT", user_agent.as_deref().unwrap_or(""))
                 .spawn()
             {
                 Ok(c) => c,
@@ -2414,8 +2435,9 @@ mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
-        write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        merge_proxy, merge_user_agent, normalize_v8_flags, read_urls_from_file, resolve_asset_url,
+        select_log_filter, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
+        DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -2487,6 +2509,79 @@ mod tests {
         let err =
             Args::try_parse_from(["obscura", "fetch", "--file", "u.txt", "--concurrency", "0"]);
         assert!(err.is_err());
+    }
+
+    // Issue #1278 — a top-level --user-agent is global, so it reaches the
+    // subcommand whether it appears before or after the subcommand, and a
+    // subcommand-level value still wins.
+    #[test]
+    fn user_agent_before_subcommand_reaches_fetch() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--user-agent",
+            "TestUA/1.0",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept a top-level --user-agent before the subcommand");
+        let global = args.user_agent.clone();
+        match args.command {
+            Some(Command::Fetch { user_agent, .. }) => {
+                assert_eq!(
+                    merge_user_agent(global, user_agent),
+                    Some("TestUA/1.0".to_string())
+                );
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn subcommand_user_agent_wins_over_global() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--user-agent",
+            "Global/1.0",
+            "fetch",
+            "--user-agent",
+            "Sub/2.0",
+            "https://example.com",
+        ])
+        .expect("clap should accept both a global and a subcommand --user-agent");
+        let global = args.user_agent.clone();
+        match args.command {
+            Some(Command::Fetch { user_agent, .. }) => {
+                assert_eq!(
+                    merge_user_agent(global, user_agent),
+                    Some("Sub/2.0".to_string())
+                );
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn scrape_accepts_global_user_agent() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "scrape",
+            "https://example.com",
+            "--user-agent",
+            "TestUA/1.0",
+        ])
+        .expect("scrape should accept --user-agent via the global flag");
+        assert_eq!(args.user_agent, Some("TestUA/1.0".to_string()));
+    }
+
+    #[test]
+    fn merge_user_agent_prefers_command_value() {
+        assert_eq!(
+            merge_user_agent(Some("G".to_string()), Some("C".to_string())),
+            Some("C".to_string())
+        );
+        assert_eq!(merge_user_agent(Some("G".to_string()), None), Some("G".to_string()));
+        assert_eq!(merge_user_agent(None, Some("C".to_string())), Some("C".to_string()));
+        assert_eq!(merge_user_agent(None, None), None);
     }
 
     #[test]

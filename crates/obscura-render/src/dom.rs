@@ -5336,6 +5336,7 @@ fn layout_dom_once(
             flow_root: bool,
             is_table_box: bool,
             is_table_cell_box: bool,
+            table_row_display: Option<crate::TableRowDisplay>,
             color: Option<[u8; 4]>,
             font_size: Option<f32>,
             font_weight: u16,
@@ -5399,6 +5400,7 @@ fn layout_dom_once(
                     flow_root: false,
                     is_table_box: false,
                     is_table_cell_box: false,
+                    table_row_display: None,
                     color: None,
                     font_size: None,
                     font_weight: 400,
@@ -5524,6 +5526,7 @@ fn layout_dom_once(
                     inh.flow_root = style.flow_root;
                     inh.is_table_box = style.is_table_box;
                     inh.is_table_cell_box = style.is_table_cell_box;
+                    inh.table_row_display = style.table_row_display;
                     inh.color = style.color.or(inh.color);
                     inh.font_size = style.font_size.or(inh.font_size);
                     inh.font_weight = crate::style::used_font_weight(style);
@@ -5704,6 +5707,7 @@ fn layout_dom_once(
                     style.flow_root = inh.flow_root;
                     style.is_table_box = inh.is_table_box;
                     style.is_table_cell_box = inh.is_table_cell_box;
+                    style.table_row_display = inh.table_row_display;
                     // Reconstruct the internal cell-content wrapper only when
                     // the inherited computed display is table-cell.
                     style.internal_flex_container = style.is_table_cell_box;
@@ -5724,6 +5728,7 @@ fn layout_dom_once(
                 inh.flow_root = style.flow_root;
                 inh.is_table_box = style.is_table_box;
                 inh.is_table_cell_box = style.is_table_cell_box;
+                inh.table_row_display = style.table_row_display;
                 match style.color {
                     Some(c) => inh.color = Some(c),
                     None => style.color = inh.color,
@@ -6195,6 +6200,7 @@ fn layout_dom_once(
                 let host_flow_root = style.flow_root;
                 let host_is_table_box = style.is_table_box;
                 let host_is_table_cell_box = style.is_table_cell_box;
+                let host_table_row_display = style.table_row_display;
                 let host_grid_auto_columns = style.grid_auto_columns.clone();
                 let host_grid_auto_rows = style.grid_auto_rows.clone();
                 let host_grid_auto_column_calcs = style.grid_calc_expressions[2].clone();
@@ -6223,6 +6229,7 @@ fn layout_dom_once(
                         pseudo.flow_root = host_flow_root;
                         pseudo.is_table_box = host_is_table_box;
                         pseudo.is_table_cell_box = host_is_table_cell_box;
+                        pseudo.table_row_display = host_table_row_display;
                         pseudo.internal_flex_container = pseudo.is_table_cell_box;
                         if pseudo.is_table_cell_box {
                             pseudo.flex_direction = Some(taffy::FlexDirection::Column);
@@ -7694,7 +7701,7 @@ fn layout_dom_once(
                 &mut generated_rects,
             );
             inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
-            synthesize_row_rects(tree, &mut rects);
+            synthesize_row_rects(tree, &styles, &mut rects);
         }
     }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
@@ -10760,28 +10767,22 @@ fn tokenize_with_spaces(text: &str) -> Vec<String> {
 /// extent must ignore the portion of a `rowspan` that continues through later
 /// rows. Nested-table cells must not participate at all. Sections are then the
 /// union of their already-synthesized direct rows.
-fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
+fn synthesize_row_rects(tree: &DomTree, styles: &HashMap<NodeId, crate::LayoutStyle>,
+    rects: &mut HashMap<NodeId, Rect>) {
     let mut rows = Vec::new();
     let mut sections = Vec::new();
     let mut table_inline: HashMap<NodeId, Rect> = HashMap::new();
+    let is_cell = |id| styles.get(&id).is_some_and(|style| style.is_table_cell_box)
+        || tree.with_node(id, |node| node.as_element().is_some_and(|name|
+            matches!(name.local.as_ref(), "td" | "th"))).unwrap_or(false);
     for id in rendered_descendants(tree, tree.document()) {
-        let local = match tree
-            .borrow_node(id)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()))
-        {
-            Some(l) => l,
-            None => continue,
-        };
-        match local.as_str() {
-            "tr" => rows.push(id),
-            "tbody" | "thead" | "tfoot" => sections.push(id),
-            "td" | "th" => {
+        match table_row_display(tree, id, styles) {
+            Some(crate::TableRowDisplay::Row) => rows.push(id),
+            Some(_) => sections.push(id),
+            None if is_cell(id) => {
                 let mut ancestor = rendered_parent(tree, id);
                 while let Some(parent) = ancestor {
-                    let is_table = tree.borrow_node(parent).map_or(false, |node| {
-                        node.as_element()
-                            .map_or(false, |element| element.local.as_ref() == "table")
-                    });
+                    let is_table = styles.get(&parent).is_some_and(|style| style.is_table_box);
                     if is_table {
                         if let Some(rect) = rects.get(&id) {
                             table_inline
@@ -10804,15 +10805,8 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
         }
         let mut inline: Option<Rect> = None;
         let mut block: Option<Rect> = None;
-        for cell in tree.children(id) {
-            let is_cell = tree
-                .borrow_node(cell)
-                .and_then(|n| {
-                    n.as_element()
-                        .map(|e| matches!(e.local.as_ref(), "td" | "th"))
-                })
-                .unwrap_or(false);
-            if !is_cell {
+        for cell in rendered_children(tree, id) {
+            if !is_cell(cell) {
                 continue;
             }
             let Some(r) = rects.get(&cell) else {
@@ -10864,11 +10858,8 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
             continue;
         }
         let mut section: Option<Rect> = None;
-        for row in tree.children(id) {
-            let is_row = tree.borrow_node(row).map_or(false, |node| {
-                node.as_element()
-                    .map_or(false, |element| element.local.as_ref() == "tr")
-            });
+        for row in rendered_children(tree, id) {
+            let is_row = table_row_display(tree, row, styles) == Some(crate::TableRowDisplay::Row);
             if !is_row {
                 continue;
             }
@@ -11314,21 +11305,44 @@ where
     changed
 }
 
-/// Collect rows together with the exclusive end of their originating row
-/// group. HTML rowspans never cross a thead/tbody/tfoot boundary; `rowspan=0`
-/// means the remainder of that group, not the remainder of the whole table.
-fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)>) {
+fn table_row_display(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>)
+    -> Option<crate::TableRowDisplay> {
+    styles.get(&id).and_then(|style| style.table_row_display).or_else(|| {
+        // shortcut: preserve native display-override fixup until anonymous table boxes exist.
+        tree.with_node(id, |node| match node.as_element()?.local.as_ref() {
+            "tr" => Some(crate::TableRowDisplay::Row),
+            "tbody" => Some(crate::TableRowDisplay::Group),
+            "thead" => Some(crate::TableRowDisplay::Header),
+            "tfoot" => Some(crate::TableRowDisplay::Footer),
+            _ => None,
+        }).flatten()
+    })
+}
+
+/// Collect rows with the exclusive end of their originating group. Rowspans
+/// never cross a group boundary; rowspan=0 means the rest of that group.
+fn collect_table_rows(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>,
+    rows: &mut Vec<(NodeId, usize)>) {
+    use crate::TableRowDisplay::{Row, Header, Footer};
     let mut direct_start: Option<usize> = None;
-    for cid in tree.children(id) {
-        let local = tree
-            .borrow_node(cid)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()));
-        match local.as_deref() {
-            Some("tr") => {
+    let children = rendered_children(tree, id);
+    let first_group = |role| children.iter().copied().find(|child| {
+        !styles.get(child).is_some_and(|style| style.display == crate::Display::None)
+            && table_row_display(tree, *child, styles) == Some(role)
+    });
+    let header = first_group(Header);
+    let footer = first_group(Footer);
+    for cid in header.into_iter().chain(children.iter().copied()
+        .filter(|child| Some(*child) != header && Some(*child) != footer)).chain(footer) {
+        if styles.get(&cid).is_some_and(|style| style.display == crate::Display::None) {
+            continue;
+        }
+        match table_row_display(tree, cid, styles) {
+            Some(Row) => {
                 direct_start.get_or_insert(rows.len());
                 rows.push((cid, 0));
             }
-            Some("thead") | Some("tbody") | Some("tfoot") => {
+            Some(_) => {
                 if let Some(start) = direct_start.take() {
                     let end = rows.len();
                     for entry in &mut rows[start..end] {
@@ -11336,11 +11350,9 @@ fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)
                     }
                 }
                 let start = rows.len();
-                for row in tree.children(cid) {
-                    if tree.borrow_node(row).is_some_and(|node| {
-                        node.as_element()
-                            .is_some_and(|element| element.local.as_ref() == "tr")
-                    }) {
+                for row in rendered_children(tree, cid) {
+                    if !styles.get(&row).is_some_and(|style| style.display == crate::Display::None)
+                        && table_row_display(tree, row, styles) == Some(Row) {
                         rows.push((row, 0));
                     }
                 }
@@ -11683,7 +11695,10 @@ fn build_table(
         node.as_element()
             .is_some_and(|element| element.local.as_ref() == "table")
     });
+    let mut rows: Vec<(NodeId, usize)> = Vec::new();
     let authored_row_children = if native_html_table {
+        collect_table_rows(tree, id, styles, &mut rows);
+        if rows.is_empty() { return None; }
         None
     } else {
         let children = rendered_children(tree, id);
@@ -11693,31 +11708,38 @@ fn build_table(
         // ordinary box construction preserves every child; partially taking
         // the dedicated path would silently discard direct text/non-cell
         // boxes once one real table cell made the build succeed.
-        let all_rendered_children_are_cells = flattened.iter().all(|child| {
-            let hidden = styles
-                .get(child)
-                .is_some_and(|child_style| child_style.display == crate::Display::None);
-            let ignorable_whitespace = tree.borrow_node(*child).is_some_and(|node| {
-                !node.is_element() && tree.text_content(*child).trim().is_empty()
+        let ignorable = |child: NodeId| {
+            styles.get(&child).is_some_and(|style| style.display == crate::Display::None)
+                || tree.with_node(child, |node| !node.is_element()
+                    && tree.text_content(child).trim().is_empty()).unwrap_or(false)
+        };
+        let all_rendered_children_are_cells = flattened.iter().all(|child|
+            ignorable(*child) || styles.get(child).is_some_and(|style| style.is_table_cell_box));
+        if all_rendered_children_are_cells {
+            Some(flattened)
+        } else {
+            let valid_row = |row| rendered_children(tree, row).into_iter().all(|child| {
+                ignorable(child) || styles.get(&child).is_some_and(|style| style.is_table_cell_box)
             });
-            hidden
-                || ignorable_whitespace
-                || styles
-                    .get(child)
-                    .is_some_and(|child_style| child_style.is_table_cell_box)
-        });
-        if !all_rendered_children_are_cells {
-            return None;
+            let valid = flattened.iter().copied().all(|child| {
+                if ignorable(child) { return true; }
+                match styles.get(&child).and_then(|style| style.table_row_display) {
+                    Some(crate::TableRowDisplay::Row) => valid_row(child),
+                    Some(_) => rendered_children(tree, child).into_iter().all(|row| {
+                        ignorable(row) || (styles.get(&row).is_some_and(|style|
+                            style.table_row_display == Some(crate::TableRowDisplay::Row)) && valid_row(row))
+                    }),
+                    None => false,
+                }
+            });
+            if !valid { return None; }
+            collect_table_rows(tree, id, styles, &mut rows);
+            if rows.is_empty() { return None; }
+            None
         }
-        Some(flattened)
     };
-    let mut rows: Vec<(NodeId, usize)> = Vec::new();
-    if native_html_table {
-        collect_table_rows(tree, id, &mut rows);
-        if rows.is_empty() {
-            return None;
-        }
-    } else {
+    let explicit_rows = authored_row_children.is_none();
+    if !explicit_rows {
         // CSS table fixup inserts an anonymous row around table-cell children
         // that are direct children of a table. The grid representation does
         // not need a material row node, but retaining one logical row gives
@@ -11753,8 +11775,8 @@ fn build_table(
     let mut ncols = 0usize;
     for (r, &(tr, group_end)) in rows.iter().enumerate() {
         let mut c = 0usize;
-        let row_children = if native_html_table {
-            tree.children(tr)
+        let row_children = if explicit_rows {
+            rendered_children(tree, tr)
         } else {
             authored_row_children.clone().unwrap_or_default()
         };
@@ -12026,7 +12048,7 @@ fn build_table(
     // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
     // (content can always grow a row), matching how tables treat heights.
     let mut row_min: Vec<Option<f32>> = vec![None; nrows];
-    if native_html_table {
+    if explicit_rows {
         for (r, &(tr, _)) in rows.iter().enumerate() {
             if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
                 if h > 0.0 {

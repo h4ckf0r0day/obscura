@@ -1252,7 +1252,22 @@ async fn tool_wait_for_function(args: &Value, state: &mut BrowserState) -> Resul
                 "condition not met within {timeout_ms} ms after {attempts} poll(s): {expression}"
             ));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+        let poll_deadline = (tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(poll_ms)).min(deadline);
+        while tokio::time::Instant::now() < poll_deadline {
+            match tokio::time::timeout_at(
+                poll_deadline, state.page_mut().run_autonomous_event_loop_turn(),
+            ).await {
+                Ok(result) => {
+                    // Navigation consumes pending state before I/O, so do not cancel it mid-turn.
+                    if state.finish_active_page_turn(result?).await? {
+                        tokio::time::sleep_until(poll_deadline).await;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -2973,6 +2988,71 @@ mod tests {
             submitted.contains("q=hello"),
             "the submitted body must carry the filled field, got {submitted}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn function_wait_advances_fetch_response_callbacks() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (base, requests) = spawn_form_recording_server();
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate(&base).await.expect("fixture page");
+        requests.recv_timeout(std::time::Duration::from_secs(2)).expect("page request");
+        evaluate_tool_script(state.page_mut(),
+            "fetch('/wait-data').then(r => r.text()).then(text => window.fetchedText = text); true"
+        ).unwrap();
+        assert_eq!(evaluate_tool_script(state.page_mut(), "typeof window.fetchedText").unwrap(), json!("undefined"));
+
+        tool_wait_for_function(&json!({
+            "function": "typeof window.fetchedText === 'string' && window.fetchedText.includes('Envoyer')",
+            "timeout": 1000, "pollIntervalMs": 20
+        }), &mut state).await.expect("fetch body callback must run while waiting");
+        assert!(requests.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("fetch request").starts_with("GET /wait-data"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn function_wait_finishes_task_navigation_between_polls() {
+        use tokio::io::AsyncReadExt;
+
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/landed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /landed "));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<p id=landed>done</p>").await.unwrap();
+        });
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>waiting</p>").await.unwrap();
+        evaluate_tool_script(state.page_mut(), &format!(
+            "setTimeout(() => location.href = {}, 0); true", serde_json::to_string(&url).unwrap()
+        )).unwrap();
+
+        tool_wait_for_function(&json!({
+            "function": "document.querySelector('#landed') !== null",
+            "timeout": 1000, "pollIntervalMs": 10
+        }), &mut state).await.expect("a navigation longer than one poll must finish");
+        assert_eq!(state.page_mut().url_string(), url);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn function_wait_preserves_idle_polling_and_caps_the_last_interval() {
+        let mut state = BrowserState::new(None, None, false);
+        state.page_mut().navigate("data:text/html,<p>idle</p>").await.unwrap();
+        evaluate_tool_script(state.page_mut(), "window.waitPolls = 0; true").unwrap();
+        let started = std::time::Instant::now();
+        let error = tool_wait_for_function(&json!({
+            "function": "(++window.waitPolls, false)", "timeout": 80, "pollIntervalMs": 1000
+        }), &mut state).await.expect_err("false predicate must time out");
+        assert!(error.contains("condition not met"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(800),
+            "the last interval must be bounded by the timeout");
+        assert_eq!(evaluate_tool_script(state.page_mut(), "window.waitPolls").unwrap().as_f64(), Some(2.0),
+            "an idle page must not busy-poll the predicate");
     }
 
     #[tokio::test(flavor = "current_thread")]

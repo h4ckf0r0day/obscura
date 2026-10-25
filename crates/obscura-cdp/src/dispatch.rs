@@ -64,6 +64,7 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) dom_documents: HashMap<Option<String>, domains::dom::DomDocument>,
     pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -179,6 +180,7 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
+            dom_documents: HashMap::new(),
             pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -224,7 +226,7 @@ impl CdpContext {
             storage_dir,
             allow_private_network,
         );
-        ctx.allow_file_access = allow_file_access;
+        ctx.set_allow_file_access(allow_file_access);
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
@@ -333,6 +335,7 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.dom_documents.retain(|_, document| document.page_id != id);
         self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
@@ -417,6 +420,13 @@ impl CdpContext {
         frame_id: &str,
         origin: &str,
     ) -> Vec<ExecutionContextRecord> {
+        self.dom_documents.retain(|session, document| {
+            if document.page_id != page_id { return true; }
+            self.pending_events.push(CdpEvent {
+                method: "DOM.documentUpdated".into(), params: json!({}), session_id: session.clone(),
+            });
+            false
+        });
         if let Some(previous) = self.page_contexts.remove(page_id) {
             for id in previous {
                 self.execution_contexts.remove(&id);
@@ -727,6 +737,14 @@ fn is_v8_free_method(method: &str) -> bool {
 }
 
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    dispatch_with_deferred(req, ctx, None).await
+}
+
+pub(crate) async fn dispatch_with_deferred(
+    req: &CdpRequest,
+    ctx: &mut CdpContext,
+    deferred: Option<&mut Option<domains::runtime::DeferredEvaluation>>,
+) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
     // per-connection V8 lock — the recursive dispatch will acquire it for the
@@ -805,6 +823,18 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
             domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await
+        }
+        "Runtime" if deferred.is_some() && matches!(method, "evaluate" | "callFunctionOn")
+            && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true) => {
+            match domains::runtime::start_awaited_evaluation(method, &req.params, ctx, &req.session_id, cmd_budget_ms).await {
+                Ok(Some(evaluation)) if evaluation.ready(ctx) => evaluation.finish(ctx, &req.session_id).await,
+                Ok(Some(evaluation)) => {
+                    *deferred.unwrap() = Some(evaluation);
+                    Ok(json!({}))
+                }
+                Ok(None) => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
+                Err(error) => Err(error),
+            }
         }
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,

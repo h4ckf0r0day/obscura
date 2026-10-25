@@ -452,6 +452,123 @@ mod tests {
     }
 
     #[test]
+    fn frame_shadow_root_append_uses_its_own_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'open' });
+            const child = document.createElement('span');
+            child.textContent = 'shadow child';
+            root.appendChild(child);
+            return [
+                host.shadowRoot === root,
+                root.host === host,
+                root.ownerDocument === document,
+                child.parentNode === root,
+                root.textContent
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result, serde_json::json!([true, true, true, true, "shadow child"]));
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn frame_shadow_root_lookup_does_not_read_parent() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        parent.execute_script("parent-shadow", r#"
+            document.getElementById('host').attachShadow({ mode: 'open' })
+                .innerHTML = '<span>parent shadow</span>';
+        "#).unwrap();
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent,
+            "document.getElementById('host').shadowRoot === null").unwrap();
+
+        assert_eq!(result, serde_json::json!(true));
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot.textContent").unwrap(),
+            serde_json::json!("parent shadow"));
+    }
+
+    #[test]
+    fn initial_frame_shadow_root_uses_its_own_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+
+        let result = parent.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            const childDocument = frame.contentDocument;
+            const host = childDocument.createElement('div');
+            childDocument.body.appendChild(host);
+            const root = host.attachShadow({ mode: 'open' });
+            const child = childDocument.createElement('span');
+            child.textContent = 'initial frame shadow';
+            root.appendChild(child);
+            return [
+                host.shadowRoot === root,
+                root.ownerDocument === childDocument,
+                child.parentNode === root,
+                root.textContent,
+                document.getElementById('host').shadowRoot === null
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result,
+            serde_json::json!([true, true, true, "initial frame shadow", true]));
+    }
+
+    #[test]
+    fn frame_closed_shadow_root_stays_private_and_rejects_duplicate_attach() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'closed' });
+            const child = document.createElement('span');
+            child.textContent = 'closed frame shadow';
+            root.appendChild(child);
+            return [host.shadowRoot === null, root.mode, root.textContent];
+        })()"#).unwrap();
+        let error = frame.evaluate(&mut parent,
+            "document.getElementById('host').attachShadow({ mode: 'open' })").unwrap_err();
+
+        assert_eq!(result, serde_json::json!([true, "closed", "closed frame shadow"]));
+        assert!(error.contains("NotSupportedError"), "{error}");
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn borrowed_style_getter_keeps_the_elements_declaration() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body style='color: red'>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(parent.evaluate(r#"(() => {
+            const element = globalThis.__obscura_frameObjects[1].document.body;
+            const getter = Object.getOwnPropertyDescriptor(Element.prototype, 'style').get;
+            const borrowed = getter.call(element);
+            const same = borrowed === element.style;
+            element.setAttribute('style', 'color: blue');
+            return [same, borrowed.color, element.style.color];
+        })()"#).unwrap(), serde_json::json!([true, "blue", "blue"]));
+    }
+
+    #[test]
     fn borrowed_content_type_getter_reads_the_frame_document() {
         let mut parent = ObscuraJsRuntime::new();
         parent.set_dom(parse_html("<html><body></body></html>"));

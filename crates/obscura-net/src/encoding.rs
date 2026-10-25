@@ -30,7 +30,7 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     let mut dec = if ignore_bom {
         enc.new_decoder_without_bom_handling()
     } else {
-        enc.new_decoder()
+        enc.new_decoder_with_bom_removal()
     };
     // Both decode calls write only into the string's spare capacity and stop
     // with OutputFull when it runs out. Legacy encodings can expand one byte into
@@ -340,6 +340,22 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_decoder_bom_does_not_override_the_selected_encoding() {
+        assert_eq!(decode_with_label("utf-8", &[0xff, 0xfe, 65, 0], false, false).as_deref(),
+            Some("\u{fffd}\u{fffd}A\0"));
+        assert_eq!(decode_with_label("utf-8", &[0xff, 0xfe, 65, 0], true, false), None);
+        assert_eq!(decode_with_label("windows-1252", &[0xef, 0xbb, 0xbf, 65], false, false).as_deref(),
+            Some("\u{ef}\u{bb}\u{bf}A"));
+        for fatal in [false, true] {
+            assert_eq!(decode_with_label("utf-8", &[0xef, 0xbb, 0xbf, 65], fatal, false).as_deref(), Some("A"));
+            assert_eq!(decode_with_label("utf-8", &[0xef, 0xbb, 0xbf, 65], fatal, true).as_deref(), Some("\u{feff}A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xff, 0xfe, 65, 0], fatal, false).as_deref(), Some("A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xff, 0xfe, 65, 0], fatal, true).as_deref(), Some("\u{feff}A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xfe, 0xff, 0, 65], fatal, false).as_deref(), Some("\u{fffe}\u{4100}"));
+        }
+    }
 
     // Legacy single-byte encodings can expand one input byte into three UTF-8
     // bytes (windows-1252 0x80 is U+20AC). The decoder only writes into spare

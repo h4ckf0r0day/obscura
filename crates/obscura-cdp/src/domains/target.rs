@@ -225,6 +225,7 @@ pub async fn handle(
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 let page_id = ctx.sessions.remove(session_id);
+                ctx.dom_documents.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {

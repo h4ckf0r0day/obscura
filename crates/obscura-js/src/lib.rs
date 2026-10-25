@@ -11,6 +11,8 @@ mod write_stream;
 
 #[cfg(test)]
 mod indexed_db_tests;
+#[cfg(test)]
+mod webcrypto_tests;
 
 pub use markdown::HTML_TO_MARKDOWN_JS;
 pub use v8_flags::set_v8_flags;

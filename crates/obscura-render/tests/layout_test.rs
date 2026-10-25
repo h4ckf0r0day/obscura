@@ -326,6 +326,167 @@ fn table_width_uses_local_space_and_keeps_width_hints_shrinkable() {
     );
 }
 
+#[cfg(feature = "paint")]
+#[test]
+fn hidden_table_rows_do_not_generate_cells_tracks_or_rowspan_slots() {
+    let tree = parse_html(r#"<style>
+        html,body{margin:0}table{border-spacing:0}td{width:30px;height:20px;padding:0}
+        .gone{display:none}.wide{width:500px;height:90px}
+        </style><table id="table"><tbody>
+        <tr><td id="span" rowspan="2"></td><td></td></tr>
+        <tr class="gone" id="gone"><td class="wide" id="gone-cell"></td></tr>
+        <tr><td id="next"></td></tr><tr><td id="last"></td></tr>
+        </tbody></table>"#);
+    let layout = layout_dom(&tree, (600.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["gone", "gone-cell"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()),
+            "hidden {id} generated a box");
+    }
+    assert_eq!((rect("table").width, rect("table").height), (60.0, 60.0));
+    assert_eq!(rect("span").height, 40.0);
+    assert_eq!((rect("next").x, rect("next").y), (30.0, 20.0));
+    assert_eq!((rect("last").x, rect("last").y), (0.0, 40.0));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn hidden_table_sections_do_not_contribute_rows_or_cell_widths() {
+    for section in ["thead", "tbody", "tfoot"] {
+        let tree = parse_html(&format!(r#"<style>
+            html,body{{margin:0}}table{{border-spacing:0}}td{{width:30px;height:20px;padding:0}}
+            </style><table id="table"><{section} id="gone" style="display:none">
+            <tr id="gone-row"><td id="gone-cell" style="width:500px;height:90px;visibility:visible"></td></tr>
+            </{section}><tbody><tr style="visibility:hidden"><td id="invisible"></td></tr>
+            <tr><td id="visible"></td></tr></tbody></table>"#));
+        let layout = layout_dom(&tree, (600.0, 400.0));
+        for id in ["gone", "gone-row", "gone-cell"] {
+            assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()),
+                "display:none {section} generated a box for {id}");
+        }
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert_eq!((rect("table").width, rect("table").height), (30.0, 40.0));
+        assert_eq!(rect("invisible").height, 20.0, "visibility:hidden must retain its track");
+        assert_eq!(rect("visible").y, 20.0);
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn table_display_keywords_restore_hidden_native_rows_and_groups() {
+    for (tag, display) in [("tr", "table-row"), ("tbody", "table-row-group"),
+        ("thead", "table-header-group"), ("tfoot", "table-footer-group")] {
+        let content = if tag == "tr" { "<td id='cell'></td>" }
+            else { "<tr><td id='cell'></td></tr>" };
+        let tree = parse_html(&format!(r#"<style>html,body{{margin:0}}
+            table{{border-spacing:0}}td{{width:40px;height:20px;padding:0}}</style>
+            <table id="table"><{tag} id="restored" style="display:none;display:{display}">
+            {content}</{tag}></table>"#));
+        let layout = layout_dom(&tree, (600.0, 400.0));
+        for id in ["table", "restored", "cell"] {
+            let rect = layout.rects.get(&tree.get_element_by_id(id).unwrap())
+                .unwrap_or_else(|| panic!("{display}: missing {id} box"));
+            assert_eq!((rect.width, rect.height), (40.0, 20.0), "{display}: {id}");
+        }
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn css_table_rows_share_tracks_and_generate_row_and_group_boxes() {
+    let tree = parse_html(r#"<style>html,body{margin:0}.table{display:table;border-spacing:0}
+        .group{display:table-row-group}.row{display:table-row}.cell{display:table-cell;height:20px}
+        .a{width:30px}.b{width:40px}</style><div id="table" class="table"><div id="group" class="group">
+        <div id="row1" class="row"><div id="a1" class="cell a"></div><div id="b1" class="cell b"></div></div>
+        <div id="row2" class="row"><div id="a2" class="cell a"></div><div id="b2" class="cell b"></div></div>
+        </div></div>"#);
+    let layout = layout_dom(&tree, (600.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["table", "group"] {
+        assert_eq!((rect(id).width, rect(id).height), (70.0, 40.0), "{id}");
+    }
+    for (id, x, y, width, height) in [("row1",0.0,0.0,70.0,20.0), ("row2",0.0,20.0,70.0,20.0),
+        ("a1",0.0,0.0,30.0,20.0), ("b1",30.0,0.0,40.0,20.0),
+        ("a2",0.0,20.0,30.0,20.0), ("b2",30.0,20.0,40.0,20.0)] {
+        let r = rect(id);
+        assert_eq!((r.x,r.y,r.width,r.height), (x,y,width,height), "{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn table_display_keywords_compute_inherit_reset_and_blockify() {
+    for display in ["table-row", "table-row-group", "table-header-group", "table-footer-group"] {
+        let tree = parse_html(&format!(r#"<div id="parent" style="display:{display}">
+            <span id="inherited" style="display:inherit"></span></div>
+            <div style="display:flex"><div id="item" style="display:{display}"></div></div>
+            <div id="reset" style="display:{display};display:block"></div>
+            <div id="invalid" style="display:{display};display:invalid"></div>"#));
+        let mut resources = obscura_render::RenderResourceCache::default();
+        let prepared = obscura_render::prepare_dom(&tree, (600.0,400.0), None, &mut resources).unwrap();
+        for (id, expected) in [("parent",display), ("inherited",display), ("item","block"),
+            ("reset","block"), ("invalid",display)] {
+            assert_eq!(prepared.computed_style(tree.get_element_by_id(id).unwrap()).unwrap()["display"],
+                expected, "{display}: {id}");
+        }
+        assert!(obscura_render::style::supports_declaration("display",display));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn css_table_header_and_footer_groups_use_visual_order() {
+    let tree = parse_html(r#"<style>html,body{margin:0}.table{display:table;border-spacing:0}
+        .row{display:table-row}.cell{display:table-cell;width:30px;height:20px}</style>
+        <div class="table"><div style="display:table-footer-group"><div class="row"><div id="footer" class="cell"></div></div></div>
+        <div class="row"><div id="body" class="cell"></div></div>
+        <div style="display:table-header-group"><div class="row"><div id="header" class="cell"></div></div></div></div>"#);
+    let layout = layout_dom(&tree, (600.0,400.0));
+    for (id,y) in [("header",0.0), ("body",20.0), ("footer",40.0)] {
+        assert_eq!(layout.rects[&tree.get_element_by_id(id).unwrap()].y,y,"{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn native_row_geometry_retains_cells_with_authored_block_display() {
+    let tree = parse_html(r#"<style>html,body{margin:0}table{border-spacing:0}
+        td{display:block;width:40px;height:20px;padding:0}</style><table><tr id="row"><td></td></tr></table>"#);
+    let layout = layout_dom(&tree,(600.0,400.0));
+    let row = layout.rects.get(&tree.get_element_by_id("row").unwrap()).expect("native row box");
+    assert_eq!((row.width,row.height),(40.0,20.0));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn table_row_display_does_not_unhide_native_hidden_inputs() {
+    let tree = parse_html(r#"<div style="display:flex">
+        <input id="flex" type="hidden" style="display:table-row;width:40px;height:20px"></div>
+        <input id="absolute" type="hidden" style="display:table-row-group;position:absolute;width:40px;height:20px">
+        <table style="display:flex"><tbody id="attribute" hidden><tr><td></td></tr></tbody></table>"#);
+    let layout = layout_dom(&tree,(600.0,400.0));
+    for id in ["flex","absolute","attribute"] {
+        assert!(!layout.rects.contains_key(&tree.get_element_by_id(id).unwrap()), "{id} became visible");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn css_table_mixed_children_are_not_discarded() {
+    for content in [
+        "<div class='row'><div class='cell'></div></div><div id='keep'></div>",
+        "<div class='group'><div class='row'><div class='cell'></div></div><div id='keep'></div></div>",
+        "<div class='row'><div class='cell'></div><div id='keep'></div></div>",
+    ] {
+        let tree = parse_html(&format!(r#"<style>.table{{display:table}}.group{{display:table-row-group}}
+            .row{{display:table-row}}.cell{{display:table-cell;width:30px;height:20px}}
+            #keep{{width:40px;height:17px}}</style><div class="table">{content}</div>"#));
+        let layout = layout_dom(&tree,(600.0,400.0));
+        let kept = layout.rects.get(&tree.get_element_by_id("keep").unwrap()).expect("mixed child box");
+        assert_eq!((kept.width,kept.height),(40.0,17.0));
+    }
+}
+
 #[test]
 fn table_rowspans_are_clipped_to_the_originating_row_group() {
     let tree = parse_html(

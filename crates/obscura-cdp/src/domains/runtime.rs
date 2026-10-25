@@ -5,6 +5,89 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+pub(crate) struct DeferredEvaluation {
+    pub(crate) page_id: String,
+    pending: obscura_js::runtime::PendingCdpEvaluation,
+    return_by_value: bool,
+    pub(crate) deadline: tokio::time::Instant,
+    command_deadline: Option<tokio::time::Instant>,
+    timeout_ms: u64,
+    method: String,
+}
+
+impl DeferredEvaluation {
+    pub(crate) fn ready(&self, ctx: &mut CdpContext) -> bool {
+        if tokio::time::Instant::now() >= self.deadline { return true; }
+        let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) else { return true; };
+        !js.has_cdp_evaluation(&self.pending) || js.cdp_evaluation_ready(&self.pending)
+    }
+
+    pub(crate) async fn finish(self, ctx: &mut CdpContext, session_id: &Option<String>) -> Result<Value, String> {
+        let js = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut())
+            .ok_or("Execution context was destroyed")?;
+        if !js.has_cdp_evaluation(&self.pending) {
+            return Err("Execution context was destroyed".into());
+        }
+        let remaining = self.command_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if remaining.is_some_and(|budget| budget.is_zero()) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err("Runtime evaluation exceeded its command budget".into());
+        }
+        if !js.cdp_evaluation_ready(&self.pending) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err(format!("Runtime.{} promise did not settle within {}ms", self.method, self.timeout_ms));
+        }
+        let watchdog = remaining.map(|budget| obscura_js::runtime::spawn_watchdog(js.isolate_handle(), budget));
+        let result = match js.finish_cdp_evaluation(self.pending, self.return_by_value) {
+            Ok(info) => emit_post_eval_nav(ctx, session_id).await.map(|_| evaluation_reply(&info)),
+            Err(error) => Err(error),
+        };
+        if watchdog.is_some_and(|watchdog| watchdog.stop()) {
+            if let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) {
+                js.cancel_termination();
+            }
+            return Err("Runtime result serialization exceeded its task budget".into());
+        }
+        result
+    }
+}
+
+pub(crate) async fn start_awaited_evaluation(
+    method: &str,
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    command_budget_ms: u64,
+) -> Result<Option<DeferredEvaluation>, String> {
+    let field = if method == "evaluate" { "contextId" } else { "executionContextId" };
+    validate_context(params, field, ctx, session_id, method)?;
+    let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
+    let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let command_deadline = (command_budget_ms != 0).then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(command_budget_ms));
+    let deadline = command_deadline.map_or(deadline, |command| deadline.min(command));
+    let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+    let Some(js) = page.js.as_mut() else { return Ok(None); };
+    let evaluation = if method == "evaluate" {
+        js.start_cdp_evaluation(params.get("expression").and_then(Value::as_str).ok_or("expression required")?, return_by_value, true)?
+    } else {
+        js.start_cdp_call(
+            params.get("functionDeclaration").and_then(Value::as_str).unwrap_or("() => undefined"),
+            params.get("objectId").and_then(Value::as_str),
+            params.get("arguments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+            return_by_value, true,
+        )?
+    };
+    let obscura_js::runtime::CdpEvaluation::Pending(pending) = evaluation else {
+        return Err("Awaited evaluation did not create a pending record".into());
+    };
+    // Finish this task's promise reactions before a script-initiated navigation.
+    js.resolve_promises_until(|js| js.cdp_evaluation_ready(&pending), 0).await;
+    Ok(Some(DeferredEvaluation {
+        page_id: page.id.clone(), pending, return_by_value, deadline, command_deadline, timeout_ms, method: method.into(),
+    }))
+}
+
 async fn with_live_peers<'a, F, Fut>(
     ctx: &'a mut CdpContext,
     session_id: &Option<String>,

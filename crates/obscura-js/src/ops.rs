@@ -1884,13 +1884,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1907,8 +1912,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -2077,6 +2082,14 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
         .collect::<Vec<_>>()
         .join("\n");
     serde_json::json!({ "originClean": true, "css": css }).to_string()
+}
+
+fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] {
+    let Some(tag) = node.as_element() else { return [None, None] };
+    let name = (tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+        && matches!(tag.local.as_ref(), "embed" | "form" | "iframe" | "img" | "object"))
+        .then(|| node.get_attribute_ns("", "name")).flatten();
+    [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
 }
 
 #[op2]
@@ -2371,6 +2384,34 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 _ => control.indeterminate = arg2 == "true",
             });
             "null".to_string()
+        }
+        "window_named_names" => {
+            let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let mut names = Vec::new();
+            let mut seen = HashSet::new();
+            for node in std::iter::once(root).chain(dom.descendants(root)) {
+                dom.with_node(node, |node| {
+                    for name in window_named_attributes(node).into_iter().flatten() {
+                        if seen.insert(name.to_string()) { names.push(name.to_string()); }
+                    }
+                });
+            }
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+        }
+        "window_named_candidates" => {
+            if arg1.is_empty() { return "[]".into(); }
+            let mut matches = Vec::new();
+            for node_id in dom.descendants(dom.document()) {
+                dom.with_node(node_id, |node| {
+                    let names = window_named_attributes(node);
+                    if names.contains(&Some(arg1.as_str())) {
+                        let named_frame = names[1] == Some(arg1.as_str())
+                            && node.as_element().is_some_and(|tag| tag.local.as_ref() == "iframe");
+                        matches.push((node_id.index(), named_frame));
+                    }
+                });
+            }
+            serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into())
         }
         "document_node_id" => dom.document().index().to_string(),
         "document_compat_mode" => if dom.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into(),
@@ -5413,7 +5454,7 @@ mod tests {
     // buffer straight from an untrusted u32 length. Each must reject a length
     // above its fixed maximum before allocating, and still work for ordinary
     // inputs. See #910.
-    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, hkdf_derive, random_bytes};
+    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, aes_kw, hkdf_derive, oct_jwk_json, parse_jwk, random_bytes};
 
     #[test]
     fn hkdf_rejects_excessive_output_length() {
@@ -5436,6 +5477,57 @@ mod tests {
         let okm = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(okm.len(), 32, "derived key must have the requested length");
+    }
+
+    // RFC 3394, section 4.1: 128 bits of key data with a 128-bit KEK.
+    #[test]
+    fn aes_kw_matches_rfc_3394() {
+        let kek: Vec<u8> = (0u8..16).collect();
+        let data: Vec<u8> = (0u8..16).map(|i| i * 0x11).collect();
+        let wrapped = aes_kw(true, &kek, &data).expect("a 128-bit key wraps");
+        assert_eq!(
+            wrapped,
+            [
+                0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+                0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5
+            ]
+        );
+        assert_eq!(aes_kw(false, &kek, &wrapped).expect("the wrap unwraps"), data);
+    }
+
+    #[test]
+    fn aes_kw_rejects_tampering_and_bad_sizes() {
+        let kek = [7u8; 32];
+        let mut wrapped = aes_kw(true, &kek, &[1u8; 24]).expect("a 192-bit key wraps");
+        wrapped[3] ^= 1;
+        assert!(aes_kw(false, &kek, &wrapped).is_err(), "a tampered wrap must not unwrap");
+        assert!(aes_kw(false, &[8u8; 32], &aes_kw(true, &kek, &[1u8; 16]).unwrap()).is_err(), "another key must not unwrap");
+        assert!(aes_kw(true, &kek, &[1u8; 20]).is_err(), "data not a multiple of 8 bytes must not wrap");
+        assert!(aes_kw(true, &kek, &[1u8; 8]).is_err(), "a single block must not wrap");
+        assert!(aes_kw(false, &kek, &[1u8; 16]).is_err(), "a single wrapped block must not unwrap");
+        assert!(aes_kw(false, &kek, &[]).is_err(), "nothing must not unwrap");
+        assert!(aes_kw(true, &[7u8; 20], &[1u8; 16]).is_err(), "a 160-bit KEK is not an AES key");
+    }
+
+    #[test]
+    fn oct_jwk_json_is_in_lexicographic_order() {
+        let ops = vec!["sign".to_string(), "verify".to_string()];
+        assert_eq!(
+            String::from_utf8(oct_jwk_json("HS256", true, "AQID", &ops)).unwrap(),
+            r#"{"alg":"HS256","ext":true,"k":"AQID","key_ops":["sign","verify"],"kty":"oct"}"#
+        );
+        assert_eq!(
+            String::from_utf8(oct_jwk_json("", false, "AQID", &[])).unwrap(),
+            r#"{"ext":false,"k":"AQID","key_ops":[],"kty":"oct"}"#
+        );
+    }
+
+    #[test]
+    fn parse_jwk_wants_a_json_object() {
+        assert!(parse_jwk(br#"{"kty":"oct","k":"AQID"}"#).unwrap().is_object());
+        assert!(parse_jwk(b"not json").is_err());
+        assert!(parse_jwk(b"[1, 2]").is_err());
+        assert!(parse_jwk(b"\"oct\"").is_err());
     }
 
     #[test]
@@ -6607,7 +6699,10 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
@@ -7006,6 +7101,97 @@ fn op_subtle_aes_ctr(
         }
     }
     Ok(buf)
+}
+
+/// AES-KW (RFC 3394) key wrap and unwrap, for `wrapKey` / `unwrapKey`. RFC 3394
+/// wraps at least two 64-bit blocks, so the data to wrap must be a multiple of
+/// 8 bytes and at least 16 (a wrap, at least 24); unwrapping checks the
+/// integrity value, so a wrong key or a tampered wrap is an error too (the
+/// shim's OperationError). Split out from the op so it is unit-testable.
+fn aes_kw(wrap: bool, key: &[u8], data: &[u8]) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    use aes_kw::{KekAes128, KekAes192, KekAes256};
+    // aes-kw itself accepts a single block.
+    if data.len() < if wrap { 16 } else { 24 } {
+        return Err(crypto_err("AES-KW wraps at least two 64-bit blocks"));
+    }
+    macro_rules! run {
+        ($kek:ty) => {{
+            let kek = <$kek>::try_from(key).map_err(crypto_err)?;
+            if wrap { kek.wrap_vec(data) } else { kek.unwrap_vec(data) }.map_err(crypto_err)?
+        }};
+    }
+    Ok(match key.len() {
+        16 => run!(KekAes128),
+        24 => run!(KekAes192),
+        32 => run!(KekAes256),
+        _ => return Err(crypto_err("AES-KW keys are 128, 192 or 256 bits")),
+    })
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_aes_kw(
+    wrap: bool,
+    #[buffer] key: &[u8],
+    #[buffer] data: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    aes_kw(wrap, key, data)
+}
+
+/// A symmetric ("oct") JWK as `wrapKey` serializes it. Members are declared in
+/// lexicographic order, the order `JSON.stringify` gives a JsonWebKey
+/// dictionary.
+#[derive(serde::Serialize)]
+struct OctJwk<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alg: Option<&'a str>,
+    ext: bool,
+    k: &'a str,
+    key_ops: &'a [String],
+    kty: &'static str,
+}
+
+/// The UTF-8 JSON text of an "oct" JWK, for `wrapKey`. Built here rather than
+/// with the page's `JSON.stringify`, so a `toJSON` or another override on the
+/// page's prototypes can't change the wrapped bytes: the spec serializes it in
+/// the context of a new global object. An empty `alg` is left out.
+fn oct_jwk_json(alg: &str, ext: bool, k: &str, key_ops: &[String]) -> Vec<u8> {
+    let jwk = OctJwk {
+        alg: (!alg.is_empty()).then_some(alg),
+        ext,
+        k,
+        key_ops,
+        kty: "oct",
+    };
+    serde_json::to_vec(&jwk).unwrap_or_default()
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_jwk_json(
+    #[string] alg: &str,
+    ext: bool,
+    #[string] k: &str,
+    #[serde] key_ops: Vec<String>,
+) -> Vec<u8> {
+    oct_jwk_json(alg, ext, k, &key_ops)
+}
+
+/// Parses the JSON text `unwrapKey` decrypted for a "jwk" import, for the same
+/// reason as `oct_jwk_json`: not with the page's `JSON.parse`. Text that isn't
+/// JSON, or isn't an object, is an error (the shim's DataError).
+fn parse_jwk(bytes: &[u8]) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(crypto_err)?;
+    if !value.is_object() {
+        return Err(crypto_err("the unwrapped key is not a JSON object"));
+    }
+    Ok(value)
+}
+
+#[op2]
+#[serde]
+fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    parse_jwk(bytes)
 }
 
 /// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
@@ -7625,6 +7811,9 @@ pub fn build_extension() -> Extension {
         op_subtle_aes_gcm(),
         op_subtle_aes_cbc(),
         op_subtle_aes_ctr(),
+        op_subtle_aes_kw(),
+        op_subtle_jwk_json(),
+        op_subtle_jwk_parse(),
         op_subtle_pbkdf2(),
         op_subtle_hkdf(),
         op_random_bytes(),
@@ -7655,6 +7844,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_check_visibility());
         ops.push(op_set_hovered());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
@@ -8992,6 +9182,35 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
+}
+
+/// `Element.checkVisibility()` in one native call. Walking ancestors through
+/// `getComputedStyle()` cost a JS proxy per ancestor, and Playwright calls
+/// this before every action.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_check_visibility(
+    state: &OpState,
+    nid: u32,
+    check_opacity: bool,
+    check_visibility_css: bool,
+    frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_prepared_render(&mut gs).is_none() {
+        return false;
+    }
+    let (Some(prepared), Some(dom)) = (gs.prepared_render.as_ref(), gs.dom.as_ref()) else {
+        return false;
+    };
+    prepared.check_visibility(
+        dom,
+        obscura_dom::tree::NodeId::new(nid),
+        check_opacity,
+        check_visibility_css,
+    )
 }
 
 /// Use the renderer's declaration parser as the single feature-query source
