@@ -11,17 +11,18 @@ default = []
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking, ab_glyph fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
+paint = ["dep:obscura-ssrf", "dep:tiny-skia", "dep:ab_glyph", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:url", "dep:wuff"]
 
 [dependencies]
 taffy = { workspace = true }
 obscura-dom = { workspace = true }
+obscura-ssrf = { workspace = true, optional = true }
 tiny-skia = { workspace = true, optional = true }
 ab_glyph = { workspace = true, optional = true }
 # Real inline text layout: HarfBuzz-class shaping (rustybuzz) + UAX#14 line
 # breaking, the same algorithms browsers use. Built with only our embedded
 # fonts (no system-font scan) so layout stays deterministic across hosts.
-cosmic-text = { version = "=0.14.2", default-features = false, features = ["std", "swash"], optional = true }
+cosmic-text = { version = "=0.14.2", default-features = false, features = ["std", "swash", "shape-run-cache"], optional = true }
 # Keep this exactly aligned with cosmic-text 0.14's raster backend. Cosmic
 # and the renderer consume the same canonical variation coordinates for
 # shaping and rasterization.

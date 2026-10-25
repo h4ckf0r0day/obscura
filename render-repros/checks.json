@@ -1,4 +1,40 @@
 {
+  "hidden-table-rows": [
+    {"name": "rowspan counts visible rows only", "color": "#1971c2", "x": 20, "y": 20, "width": 30, "height": 40},
+    {"name": "next visible row occupies the second column", "color": "#e8590c", "x": 50, "y": 40, "width": 30, "height": 20},
+    {"name": "last row starts after two visible rows", "color": "#7048e8", "x": 20, "y": 60, "width": 30, "height": 20},
+    {"name": "hidden groups do not reserve tracks or width", "color": "#0b7285", "x": 150, "y": 20, "width": 30, "height": 20}
+  ],
+  "inline-block-block-children": [
+    {"name": "first block keeps its authored width", "color": "#d02020", "x": 12, "y": 12, "width": 80, "height": 20},
+    {"name": "second block stacks without formatting whitespace", "color": "#2050d0", "x": 12, "y": 32, "width": 120, "height": 30},
+    {"name": "inline-block starts the next outer line", "color": "#087f5b", "x": 12, "y": 86, "width": 80, "height": 20},
+    {"name": "sibling block margins collapse within the flow root", "color": "#7048e8", "x": 12, "y": 121, "width": 120, "height": 30}
+  ],
+  "emulated-color-scheme": [
+    {"name": "default light preference keeps the green block", "color": "#00aa00", "x": 0, "y": 0, "width": 240, "height": 100}
+  ],
+  "retained-cssom-raster": [
+    {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
+    {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},
+    {"name": "four raster images preserve authored height", "color": "#d03020", "y": 80, "height": 40, "count": 4}
+  ],
+  "sparse-grid-scroll": [
+    {"name": "last contents-wrapped cell reaches scrollport bottom", "color": "#087f5b", "x": 20, "y": 90, "width": 200, "height": 30},
+    {"name": "empty tracks retain a full scroll viewport", "color": "#7048e8", "x": 260, "y": 20, "width": 200, "height": 100},
+    {"name": "first cells scroll out of view", "color": "#e8590c", "count": 0}
+  ],
+  "contained-flex-grid": [
+    {"name": "header retains its fixed height", "color": "#e8590c", "x": 1, "y": 1, "height": 40},
+    {"name": "grid viewport uses post-flex percentage height", "color": "#1971c2", "x": 9, "y": 41, "height": 550},
+    {"name": "following flow remains outside the panel", "color": "#7048e8", "x": 0, "y": 600, "width": 400, "height": 20}
+  ],
+  "cssom-rule-ownership": [
+    {"name": "inserted and edited rule applies", "color": "#166534", "x": 20, "y": 20, "width": 91, "height": 30},
+    {"name": "same-value source data resets cascade", "color": "#166534", "x": 20, "y": 60, "width": 17, "height": 30},
+    {"name": "shadow CSSOM rule applies", "color": "#166534", "x": 20, "y": 100, "width": 43, "height": 30},
+    {"name": "source ownership and geometry contract passes", "color": "#166534", "x": 20, "y": 140, "width": 120, "height": 30}
+  ],
   "abs-fill": [
     {"name": "blue fill", "color": "#0000ff", "width": 400, "height": 100},
     {"name": "teal fill", "color": "#008080", "width": 400, "height": 100},
@@ -347,6 +383,10 @@
     {"name": "cell vertical-align overrides the row default", "color": "#2b8a3e", "x": 200, "y": 240, "width": 20, "height": 20},
     {"name": "UA cell padding is one pixel on every edge", "color": "#1971c2", "x": 2, "y": 332, "width": 12, "height": 12}
   ],
+  "scroll-into-view": [
+    {"name": "nested scrollport brings the target inside its padding box", "color": "#087f5b", "x": 25, "y": 365, "width": 100, "height": 40},
+    {"name": "fixed scrollport scrolls both axes without moving the document", "color": "#7048e8", "x": 405, "y": 365, "width": 100, "height": 40}
+  ],
   "text-align-flex-items": [
     {"name": "text alignment does not shrink a flex item", "color": "#087f5b", "x": 20, "y": 20, "width": 360, "height": 80},
     {"name": "inherited text alignment centers inline content", "color": "#c2255c", "x": 150, "y": 100, "width": 100, "height": 20}
@@ -364,6 +404,14 @@
     {"name": "width media query uses the screenshot viewport", "color": "#087f5b", "x": 10, "y": 10, "width": 200, "height": 80},
     {"name": "height media query uses the screenshot viewport", "color": "#1971c2", "x": 10, "y": 110, "width": 200, "height": 80},
     {"name": "page JavaScript sees the screenshot viewport", "color": "#7048e8", "x": 10, "y": 210, "width": 200, "height": 80}
+  ],
+  "reduced-motion-emulation": [
+    {"name": "normal motion keeps the default width", "color": "#22aa66", "width": 100, "height": 30}
+  ],
+  "table-display-keywords": [
+    {"name": "explicit row and group display override display none", "color": "#1971c2", "x": 20, "y": 20, "width": 40, "height": 20},
+    {"name": "CSS rows share their first column", "color": "#087f5b", "x": 150, "y": 20, "width": 30, "height": 40},
+    {"name": "CSS rows share their second column", "color": "#7048e8", "x": 180, "y": 20, "width": 40, "height": 40}
   ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},

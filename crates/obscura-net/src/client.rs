@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -592,115 +592,7 @@ impl Default for CallbackRegistry {
     }
 }
 
-/// Process-wide opt-in via env var. Older flow that issue #4 introduced. The
-/// new `--allow-private-network` CLI flag (issue #33) sets a per-client field
-/// that is OR'd with this so existing scripts and Docker setups that pin the
-/// env var keep working unchanged.
-pub fn env_allows_private_network() -> bool {
-    matches!(
-        std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
-/// True when `ip` must never be the target of an outbound request from the
-/// engine: loopback, RFC1918 private, link-local (incl. the 169.254.169.254
-/// cloud-metadata endpoint), broadcast, documentation, the unspecified address
-/// (0.0.0.0 / ::, which the OS routes to localhost), IPv6 unique-local
-/// (fc00::/7), and any IPv4-mapped/compatible IPv6 form of the above.
-/// Centralizes the SSRF deny-set so the literal-host check and the
-/// DNS-resolution check (`SsrfGuardResolver`) can never disagree.
-pub fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                // std's is_private() covers only RFC1918, so add the IANA
-                // special-purpose ranges that also host internal services and
-                // are common SSRF targets:
-                //   100.64.0.0/10  CGNAT / RFC6598 — cloud metadata (e.g.
-                //                  Alibaba 100.100.100.200) lives here.
-                //   198.18.0.0/15  benchmarking / RFC2544.
-                //   192.88.99.0/24 6to4 relay anycast / RFC7526.
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-                // Most of 192.0.0.0/24 is special-purpose and not globally
-                // reachable. Keep the two globally reachable PCP anycast
-                // assignments usable rather than blocking the entire /24.
-                || (o[0] == 192
-                    && o[1] == 0
-                    && o[2] == 0
-                    && o[3] != 9
-                    && o[3] != 10)
-                // 240.0.0.0/4 is reserved (255.255.255.255 was already
-                // covered by is_broadcast()).
-                || o[0] >= 240
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast()
-            {
-                return true;
-            }
-            // Unwrap IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
-            // forms and re-check the embedded v4 so e.g. [::ffff:127.0.0.1] or
-            // [::ffff:169.254.169.254] cannot slip past the v6 arm.
-            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
-                return is_forbidden_ip(IpAddr::V4(v4));
-            }
-
-            let s = v6.segments();
-            // IPv4/IPv6 translation prefix (RFC 6052). Only /96 has a fixed
-            // embedded-address position; the local-use /48 is therefore
-            // blocked outright below.
-            if s[0] == 0x64
-                && s[1] == 0xff9b
-                && s[2] == 0
-                && s[3] == 0
-                && s[4] == 0
-                && s[5] == 0
-            {
-                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
-                    (s[6] >> 8) as u8,
-                    s[6] as u8,
-                    (s[7] >> 8) as u8,
-                    s[7] as u8,
-                )));
-            }
-            // 6to4 carries its IPv4 endpoint in bits 16..48.
-            if s[0] == 0x2002 {
-                return is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
-                    (s[1] >> 8) as u8,
-                    s[1] as u8,
-                    (s[2] >> 8) as u8,
-                    s[2] as u8,
-                )));
-            }
-
-            // Discard-only, local-use NAT64, and documentation prefixes.
-            (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
-                || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
-        }
-    }
-}
+pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
@@ -780,6 +672,11 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                     )));
                 }
             }
+            // Octal, hex, decimal and overlong IPv4 spellings ("0x7f000001",
+            // "0177.0.0.1", "2130706433") never reach this arm: for the http
+            // and https schemes the url crate normalizes them to Host::Ipv4,
+            // which is checked above. This arm is a belt-and-braces check on
+            // names, and the resolver re-checks whatever the name resolves to.
             url::Host::Domain(domain) => {
                 let lower_domain = domain.to_lowercase();
                 if lower_domain == "localhost"
@@ -799,10 +696,18 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+/// The only reader of local files in the net layer. It checks the opt-in
+/// itself so a new caller cannot read `file://` by forgetting the gate.
 pub(crate) async fn fetch_file_url(
     url: &Url,
     max_response_bytes: usize,
+    allow_file_access: bool,
 ) -> Result<Response, ObscuraNetError> {
+    if !allow_file_access {
+        return Err(ObscuraNetError::Network(format!(
+            "file:// access is disabled (requires --allow-file-access): {url}"
+        )));
+    }
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
@@ -927,7 +832,7 @@ async fn read_reqwest_body_limited(
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error))
+        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
@@ -953,6 +858,9 @@ pub struct ObscuraHttpClient {
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+    /// Lets `fetch_file_url` read local files. Off by default. Atomic because
+    /// `BrowserContext` flips it after the client is already shared.
+    allow_file_access: AtomicBool,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1029,6 +937,7 @@ impl ResourceCache {
         if entry.expires_at <= Instant::now() {
             let expired = self.entries.remove(key)?;
             self.body_bytes = self.body_bytes.saturating_sub(expired.response.body.len());
+            self.insertion_order.retain(|queued| queued != key);
             return None;
         }
         Some(entry.response.clone())
@@ -1164,7 +1073,16 @@ impl ObscuraHttpClient {
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
+            allow_file_access: AtomicBool::new(false),
         }
+    }
+
+    pub fn allow_file_access(&self) -> bool {
+        self.allow_file_access.load(Ordering::Relaxed)
+    }
+
+    pub fn set_allow_file_access(&self, allow: bool) {
+        self.allow_file_access.store(allow, Ordering::Relaxed);
     }
 
     async fn get_client(&self) -> &Client {
@@ -1173,6 +1091,9 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
+                // Read a folded header line (obs-fold) as browsers do instead of
+                // failing the response.
+                .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
@@ -1482,7 +1403,7 @@ impl ObscuraHttpClient {
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(url, request.max_response_bytes, self.allow_file_access()).await;
         }
 
         let mut method = initial_method;
@@ -1675,7 +1596,7 @@ impl ObscuraHttpClient {
 
             let in_flight = InFlightGuard::new(&self.in_flight);
             let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
             let status = resp.status();
@@ -1781,6 +1702,25 @@ impl Default for ObscuraHttpClient {
     }
 }
 
+/// `error` followed by the message of each error in its `source()` chain, joined
+/// with ": ". reqwest and wreq only say "error sending request" at the top level;
+/// the cause (expired certificate, handshake failure, refused connection, DNS)
+/// is further down the chain.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers already include their source's message in their own.
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObscuraNetError {
     #[error("Network error: {0}")]
@@ -1797,6 +1737,78 @@ pub enum ObscuraNetError {
 
     #[error("Response body exceeded {limit} byte limit: {url}")]
     ResponseTooLarge { url: String, limit: usize },
+}
+
+#[cfg(test)]
+mod resource_cache_tests {
+    use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
+        RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use url::Url;
+
+    fn cache_test_resource(name: &str) -> (ResourceCacheKey, Response) {
+        let url = Url::parse(&format!("https://example.test/{name}.js")).unwrap();
+        let key = ResourceCacheKey {
+            url: url.to_string(),
+            resource_type: ResourceType::Script,
+            mode: RequestMode::NoCors,
+            credentials: RequestCredentials::Omit,
+            initiator: None,
+            referrer: None,
+            user_agent: "cache-test".into(),
+            extra_headers: Vec::new(),
+            max_response_bytes: 1024,
+        };
+        let response = Response {
+            url,
+            status: 200,
+            headers: HashMap::new(),
+            body: vec![1],
+            redirected_from: Vec::new(),
+        };
+        (key, response)
+    }
+
+    #[test]
+    fn expired_resource_cache_keys_do_not_accumulate() {
+        let (key, response) = cache_test_resource("reused");
+        let mut cache = ResourceCache::default();
+        for _ in 0..10_000 {
+            cache.insert(key.clone(), response.clone(), Duration::from_secs(60));
+            cache.entries.get_mut(&key).unwrap().expires_at = Instant::now();
+            assert!(cache.get(&key).is_none());
+            assert!(cache.entries.is_empty());
+            assert!(cache.insertion_order.is_empty());
+            assert_eq!(cache.body_bytes, 0);
+        }
+        cache.insert(key.clone(), response, Duration::from_secs(60));
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.insertion_order.len(), 1);
+        assert_eq!(cache.body_bytes, 1);
+    }
+
+    #[test]
+    fn expired_then_reinserted_resource_keeps_its_new_eviction_position() {
+        let (reused, response) = cache_test_resource("reused");
+        let (oldest, oldest_response) = cache_test_resource("oldest");
+        let mut cache = ResourceCache::default();
+        cache.insert(reused.clone(), response.clone(), Duration::from_secs(60));
+        cache.entries.get_mut(&reused).unwrap().expires_at = Instant::now();
+        assert!(cache.get(&reused).is_none());
+        cache.insert(oldest.clone(), oldest_response, Duration::from_secs(60));
+        cache.insert(reused.clone(), response, Duration::from_secs(60));
+        for index in 0..RESOURCE_CACHE_MAX_ENTRIES - 1 {
+            let (key, response) = cache_test_resource(&format!("fill-{index}"));
+            cache.insert(key, response, Duration::from_secs(60));
+        }
+        assert!(cache.get(&oldest).is_none(), "evict the oldest live entry");
+        assert!(cache.get(&reused).is_some(), "keep the refreshed entry");
+        assert_eq!(cache.entries.len(), RESOURCE_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
+    }
+
 }
 
 #[cfg(test)]
@@ -1979,6 +1991,21 @@ mod ssrf_tests {
     }
 
     #[test]
+    fn teredo_cannot_hide_a_forbidden_ipv4() {
+        // RFC 4380: 2001:0::/32 embeds the Teredo server's IPv4 in bits
+        // 32..64 and the client's public IPv4, bit-inverted, in the last 32
+        // bits. Both are IPv4-in-IPv6 forms like NAT64 and 6to4.
+        // Client 127.1.1.1 (inverted 80fe:fefe) behind server 65.54.227.120.
+        assert!(is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:80fe:fefe")));
+        // Client 10.0.0.1 (inverted f5ff:fffe).
+        assert!(is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:f5ff:fffe")));
+        // Server 10.0.0.1 with a public client.
+        assert!(is_forbidden_ip(ip("2001:0:a00:1:8000:63bf:f7f7:f7f7")));
+        // Public server and public client 8.8.8.8 (inverted f7f7:f7f7).
+        assert!(!is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:f7f7:f7f7")));
+    }
+
+    #[test]
     fn native_non_global_ipv6_ranges_are_forbidden() {
         for s in [
             "100::1",       // discard-only
@@ -2123,6 +2150,23 @@ mod ssrf_tests {
     fn redirect_to_self() -> String {
         "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string()
+    }
+
+    // Browsers read a folded header line (obs-fold, RFC 9112 5.2) as part of
+    // the line above. Some origins still fold long values: promodirect.com
+    // sends its Content-Security-Policy over several lines, each continuation
+    // after a bare LF and two spaces. httparse rejects the whole response
+    // unless obs-fold is allowed.
+    #[tokio::test]
+    async fn navigation_accepts_a_folded_response_header() {
+        let folded = "Content-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\n";
+        let (target, _rx) = http_fixture(vec![ok_response(folded, "folded")]).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(response.body, b"folded");
     }
 
     // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
@@ -2894,7 +2938,38 @@ mod ssrf_tests {
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-        assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
+        let error = client.fetch(&url).await.expect_err("unknown CA must be rejected");
+        // The message must carry the TLS cause, not only "error sending request".
+        let message = error.to_string();
+        assert!(message.contains("invalid peer certificate"), "{message}");
+    }
+
+    #[test]
+    fn error_chain_appends_each_source_once() {
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl fmt::Display for Layer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+
+        let leaf = Layer("certificate expired", None);
+        // The middle layer already quotes the leaf, so the leaf is not repeated.
+        let middle = Layer("tls: certificate expired", Some(Box::new(leaf)));
+        let top = Layer("error sending request", Some(Box::new(middle)));
+        assert_eq!(
+            super::error_chain(&top),
+            "error sending request: tls: certificate expired"
+        );
+        assert_eq!(super::error_chain(&Layer("alone", None)), "alone");
     }
 }
 
@@ -2925,5 +3000,52 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod file_access_tests {
+    use super::{fetch_file_url, ObscuraHttpClient};
+    use crate::cookies::CookieJar;
+    use std::sync::Arc;
+    use url::Url;
+
+    fn fixture() -> (tempfile::TempDir, Url) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.html");
+        std::fs::write(&path, "local-secret").unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+        (dir, url)
+    }
+
+    // The gate lives in the loader, so a caller that never checks the flag
+    // still cannot read a local file.
+    #[tokio::test]
+    async fn loader_refuses_file_urls_without_the_opt_in() {
+        let (_dir, url) = fixture();
+        let error = fetch_file_url(&url, 1024, false)
+            .await
+            .expect_err("file:// must be refused without allow_file_access")
+            .to_string();
+        assert!(error.contains("allow-file-access"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn loader_reads_file_urls_with_the_opt_in() {
+        let (_dir, url) = fixture();
+        let response = fetch_file_url(&url, 1024, true).await.expect("opted in");
+        assert_eq!(response.body, b"local-secret");
+        assert_eq!(response.headers.get("content-type").unwrap(), "text/html");
+    }
+
+    #[tokio::test]
+    async fn client_fetch_follows_its_file_access_setting() {
+        let (_dir, url) = fixture();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, false);
+        assert!(client.fetch(&url).await.is_err());
+        client.set_allow_file_access(true);
+        assert_eq!(client.fetch(&url).await.unwrap().body, b"local-secret");
+        client.set_allow_file_access(false);
+        assert!(client.fetch(&url).await.is_err());
     }
 }

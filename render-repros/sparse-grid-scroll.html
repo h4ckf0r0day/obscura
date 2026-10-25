@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin:0; }
+  .grid { position:absolute;top:20px;left:20px;display:grid;width:200px;height:100px;
+    overflow:auto;grid-template-rows:repeat(10,30px);background:#1971c2; }
+  #empty { left:260px;background:#7048e8; }
+  .first { grid-row:1;background:#e8590c; }
+  .last { grid-row:10;background:#087f5b; }
+</style>
+<div id="wrapped" class="grid"><div style="display:contents">
+  <div class="first"></div><div class="last"></div>
+</div></div>
+<div id="empty" class="grid"><div class="first"></div></div>
+<script>
+  addEventListener('load', () => {
+    document.getElementById('wrapped').scrollTop = 9999;
+    document.getElementById('empty').scrollTop = 9999;
+  });
+</script>

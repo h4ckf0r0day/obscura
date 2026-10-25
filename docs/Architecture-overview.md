@@ -86,6 +86,26 @@ The dispatcher routes long-running operations (navigation, eval) through `proces
 
 This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
 
+## Child frames
+
+`iframe srcdoc` uses a native child realm and document, not a copy in the
+parent DOM. Its URL is `about:srcdoc`; relative URLs inherit the creator's
+document base, and unsandboxed Web Storage uses the creator's origin.
+`srcdoc` takes precedence over `src`, including an empty value. Parser input,
+connected `innerHTML`, property/attribute changes and removal use the same
+loading path. Replaced or detached documents are retired before stale loads
+can run. The iframe's `load` event follows classic author scripts.
+Navigation runs as a posted task, after microtasks. Parsing uses srcdoc
+standards mode without requiring a doctype and honors script-disabled
+`noscript` content.
+
+Sandboxed `srcdoc` enforces opaque document access and script disabling,
+including inherited restrictions on nested frames. This does not implement
+every HTML sandbox policy. Frame module scripts remain unsupported.
+Child-frame CDP evaluation routing and iframe content compositing remain
+separate compatibility gaps; loading a document does not establish support
+for Playwright frame locators or iframe screenshot fidelity.
+
 ## Robustness
 
 One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
@@ -137,7 +157,7 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 
 ## Storage
 
-`--storage-dir` persists cookies (`cookies.json`) and localStorage (`localStorage/<origin>.json`). Reads on process start, writes on every navigation and on graceful shutdown.
+`--storage-dir` persists cookies to `cookies.json` and `localStorage` to `localStorage/<origin>-<digest>.json`: read on process start, written after each navigation that changed something and on graceful shutdown. `sessionStorage` is origin-keyed in memory only, per tab.
 
 ## Stealth
 

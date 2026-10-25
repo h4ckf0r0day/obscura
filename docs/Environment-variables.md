@@ -185,10 +185,12 @@ OPENSSL_NO_VENDOR=1 cargo build --release --features render
 V8 flags are passed via `--v8-flags`, not environment variables:
 
 ```bash
-obscura serve --v8-flags "--max-old-space-size=2048 --expose-gc"
+obscura --v8-flags "--max-old-space-size=2048 --expose-gc" serve
 ```
 
-Defaults are `--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-size` on 64-bit systems (a 4 GB old-space ceiling, a capped young generation, and codegen tuned for a smaller footprint to cut RSS). Anything you pass with `--v8-flags` is appended after these, and V8 uses the last value for a repeated flag, so your value wins for that flag while the other defaults stay in effect.
+Defaults are `--max-old-space-size=4096 --max-semi-space-size=4 --optimize-for-size` on 64-bit systems. In the current V8, `--optimize-for-size` overrides the requested semi-space cap to **1 MiB**, not 4 MiB. The old-generation ceiling remains 4 GB.
+
+User flags are appended after the defaults, but V8 applies flag implications afterwards. To change the young-generation cap, also disable size optimization, for example `obscura --v8-flags "--no-optimize-for-size --max-semi-space-size=8" serve`. This can reduce GC CPU at the cost of more memory; measure the complete workload before adopting it. Use `--v8-flags "--print-flag-values"` to inspect the effective settings after V8 initialization.
 
 ## HTTP proxy environment
 
