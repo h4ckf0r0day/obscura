@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CSSOM rule ownership and synchronous rendering</title>
+<style>
+  body { margin: 20px; background: white; }
+  .box { height: 30px; margin-bottom: 10px; background: #166534; }
+  #status { width: 120px; height: 30px; background: #b91c1c; }
+</style>
+<style id="rules">#inserted, #reset { width: 11px }</style>
+<div class="box" id="inserted"></div>
+<div class="box" id="reset"></div>
+<div id="host"></div>
+<div id="status"></div>
+<script>
+  const owner = document.getElementById('rules');
+  const source = owner.textContent;
+  const sourceNode = owner.firstChild;
+  const sheet = owner.sheet;
+  for (let i = 0; i < 512; i++) sheet.insertRule(`.unused${i} { width: ${i}px }`, sheet.cssRules.length);
+  sheet.insertRule('#inserted { width: 73px }', sheet.cssRules.length);
+  sheet.cssRules[sheet.cssRules.length - 1].style.width = '91px';
+  const insertedWidth = document.getElementById('inserted').getBoundingClientRect().width;
+  const sourcePreserved = owner.textContent === source && owner.firstChild === sourceNode;
+  const resetStyle = document.createElement('style');
+  resetStyle.textContent = '#reset { width: 17px }';
+  document.head.append(resetStyle);
+  resetStyle.sheet.insertRule('#reset { width: 61px }', 1);
+  const changedWidth = document.getElementById('reset').getBoundingClientRect().width;
+  resetStyle.firstChild.data = resetStyle.firstChild.data;
+  const resetWidth = document.getElementById('reset').getBoundingClientRect().width;
+  const shadow = document.getElementById('host').attachShadow({mode: 'open'});
+  shadow.innerHTML = '<style>.box { width: 13px; height: 30px; margin-bottom: 10px; background: #166534 }</style><div class="box"></div>';
+  shadow.querySelector('style').sheet.insertRule('.box { width: 43px }', 1);
+  const shadowWidth = shadow.querySelector('.box').getBoundingClientRect().width;
+  const passed = sourcePreserved && insertedWidth === 91 && changedWidth === 61 && resetWidth === 17 && shadowWidth === 43;
+  document.getElementById('status').style.background = passed ? '#166534' : '#b91c1c';
+  document.documentElement.dataset.result = JSON.stringify({passed, sourcePreserved, insertedWidth, changedWidth, resetWidth, shadowWidth});
+</script>

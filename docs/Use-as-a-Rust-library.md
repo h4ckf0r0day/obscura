@@ -63,6 +63,11 @@ async fn main() -> anyhow::Result<()> {
 
 `CookieStore`: `set`, `get_all`, `get_for_url`, `save_to_file`, `load_from_file`.
 
+Low-level `obscura-browser` users must call `BrowserContext::set_allow_file_access(true)`
+before sharing the context to read local files. Assigning `allow_file_access` directly
+does not enable the transport. Standalone `obscura-net` clients refuse `file://` by
+default; use their file-access setting only for trusted local-file workflows.
+
 ## Intercept requests
 
 The interception API observes, blocks, mocks, and rewrites the requests a page makes, including JavaScript `fetch()` and XHR. Use it to capture API payloads while crawling, block trackers, or mock responses in tests.
@@ -121,6 +126,8 @@ page.settle(2000).await;
 ```
 
 A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
+
+`Continue.body` takes raw bytes as `Option<Vec<u8>>`, not a base64 string. Migrate text overrides from `Some(text)` to `Some(text.into_bytes())`. `None` preserves the original request body; `Some(Vec::new())` replaces it with an empty body. CDP clients still send base64 `postData` as specified by the protocol; Obscura decodes it before sending the request.
 
 ### Preload scripts
 

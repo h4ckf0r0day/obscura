@@ -20,7 +20,7 @@ impl RobotsServer {
         let paths = Arc::new(Mutex::new(Vec::new()));
         let server_paths = Arc::clone(&paths);
         thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(45);
             while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((stream, _)) => serve(stream, &server_paths),
@@ -107,13 +107,15 @@ fn obey_robots_is_global_and_blocks_fetch_before_target_request() {
 fn obey_robots_reaches_scrape_worker_and_blocks_target_request() {
     let server = RobotsServer::spawn();
     let url = server.url("/private/page");
+    // This checks policy propagation, not cold executable startup speed.
+    // Leave room for the OS loader before the worker can read its first command.
     let output = obscura(&[
         "--obey-robots",
         "--allow-private-network",
         "scrape",
         "--quiet",
         "--timeout",
-        "5",
+        "30",
         &url,
     ]);
 

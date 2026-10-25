@@ -1,6 +1,9 @@
 ## `obscura`
 
-Top-level flags apply to every subcommand.
+Most top-level flags apply to every subcommand. `--storage-dir` is the
+exception: it is declared on `serve` and `fetch`, and the top-level copy is read
+only by `mcp`, which exports it to `OBSCURA_STORAGE_DIR`. Pass it after the
+subcommand to use it with `serve` or `fetch`.
 
 ```
 -v, --verbose                Enable info logging
@@ -70,6 +73,10 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --worker-max-connections <N>  Recycle a worker after N CDP connections (--workers > 1)
+    --worker-max-rss <MB>    Recycle a worker above this resident size (Linux)
+    --worker-max-age <SECS>  Recycle a worker after this long
+    --worker-drain-timeout <SECS>  Let a replaced worker finish live connections (default 120)
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
@@ -112,6 +119,7 @@ Run obscura as an MCP server.
 
 ```
     --http                   HTTP transport instead of stdio
+    --font-dir <DIR>         Load additional fonts before rendering (repeatable; render build)
     --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
@@ -127,3 +135,53 @@ Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
 
 Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
 tool list. Streaming screencasts are available through CDP rather than MCP.
+
+## Worker navigation responses
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and emits one
+JSON response per command on stdout. For example:
+
+```json
+{"cmd":"navigate","url":"https://example.com/"}
+```
+
+A completed navigation includes the final document's HTTP status alongside the
+existing title and URL:
+
+```json
+{"ok":true,"result":{"title":"Example Domain","url":"https://example.com/","status":200}}
+```
+
+`status` is the main document's final HTTP response code after redirects, not a
+script, image, or child frame's response. HTTP errors such as 404 and 503 still
+return `ok: true`: the server responded and the error document can be inspected
+with `dump_html`, `dump_text`, or `evaluate`. Navigation without an HTTP response,
+such as `about:blank`, a `data:` URL, or a tracker blocked before the request,
+returns `status: null`. A transport or
+navigation failure retains the existing `{"ok":false,"error":"..."}` envelope
+without a `result` object.
+
+The status field is additive. Navigation timing and the other worker commands
+are unchanged.
+
+## Worker navigation readiness
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and writes
+one response per command to stdout. Select a readiness mode per navigation:
+
+```json
+{"cmd":"navigate","url":"https://example.com","waitUntil":"domcontentloaded"}
+```
+
+`waitUntil` accepts `load`, `domcontentloaded`, `networkidle0`, or `networkidle2`.
+Omitting it preserves the existing `load` default. The option applies only to
+that request. Invalid values return an `ok: false` response without navigating;
+the worker remains available for subsequent commands.
+
+These modes use the existing `Page::navigate_with_wait` behavior. Parser scripts
+run in every mode. Network-idle modes additionally drive the event loop until
+active requests remain at or below zero or two, respectively, for 500 ms, with
+the engine's existing five-second idle deadline. `domcontentloaded` uses the
+engine's DOM readiness boundary; it does not change script execution or resource
+warmup semantics. Successful responses retain their existing `title`, `url`, and `status`
+fields.

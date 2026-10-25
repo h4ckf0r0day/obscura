@@ -32,6 +32,18 @@ SCENARIOS = {
         "(function(){for(var i=0;i<2000;i++)localStorage.setItem('k'+i,'value-'+i);var n=0;for(var j=0;j<2000;j++)n+=localStorage.getItem('k'+j).length;return n;})()",
         18890,
     ),
+    "dom-lookup": (
+        "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<200000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
+        200000,
+    ),
+    "shadow-build": (
+        "(() => {let n=0;for(let i=0;i<1500;i++){let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let t=document.createElement('span');t.textContent='row';r.append(t);if(h.shadowRoot===r && r.textContent==='row')n++;}return n;})()",
+        1500,
+    ),
+    "shadow-lookup": (
+        "(() => {let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let n=0;for(let i=0;i<200000;i++)if(h.shadowRoot===r)n++;return n;})()",
+        200000,
+    ),
 }
 
 
@@ -55,6 +67,9 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
     with tempfile.NamedTemporaryFile(prefix="obscura-stderr-", delete=False) as stderr_file:
         stderr_path = Path(stderr_file.name)
     command = [
+        "timeout",
+        "--signal=KILL",
+        str(PROCESS_TIMEOUT_SECONDS),
         "prlimit",
         "--core=0",
         "--fsize=2097152",
@@ -87,11 +102,8 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
                 start_new_session=True,
             )
             try:
-                process.wait(timeout=PROCESS_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                # A Python timeout wait polls exits in steps up to 50 ms.
                 process.wait()
-                raise RuntimeError(f"{binary} timed out")
             finally:
                 # Remove background descendants left by an untrusted candidate binary.
                 try:
@@ -100,9 +112,9 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
                     pass
 
         elapsed_ms = (time.perf_counter() - started) * 1000
-        rss_kib = int(rss_path.read_text(encoding="ascii").strip())
         if process.returncode != 0:
             raise RuntimeError(f"{binary} exited with status {process.returncode}")
+        rss_kib = int(rss_path.read_text(encoding="ascii").strip())
         try:
             result = json.loads(stdout_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
