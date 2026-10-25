@@ -296,12 +296,18 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             style.border_spacing = Some((2.0, 2.0));
             style.border_collapse = Some(false);
         } else {
+            style.table_row_display = Some(match tag {
+                "thead" => crate::TableRowDisplay::Header,
+                "tfoot" => crate::TableRowDisplay::Footer,
+                _ => crate::TableRowDisplay::Group,
+            });
             style.width = crate::Dimension::Percent(1.0);
             // The row-group UA rule is the source of the effective default
             // middle alignment; rows and cells inherit it below.
             style.vertical_align = Some(crate::VerticalAlign::Middle);
         }
     } else if tag == "tr" {
+        style.table_row_display = Some(crate::TableRowDisplay::Row);
         style.internal_flex_container = true;
         // Rows fill the table width and can shrink below content min-content;
         // this is exactly why Wikipedia's own responsive CSS uses
@@ -854,6 +860,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "table"
                     | "inline-table"
                     | "table-cell"
+                    | "table-row"
+                    | "table-row-group"
+                    | "table-header-group"
+                    | "table-footer-group"
                     | "-webkit-box"
                     | "-webkit-inline-box"
                     | "contents"
@@ -868,6 +878,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.internal_flex_container = false;
                 style.is_table_box = false;
                 style.is_table_cell_box = false;
+                style.table_row_display = None;
                 style.is_inline_block = false;
                 style.flow_root = false;
                 style.display_contents = false;
@@ -910,6 +921,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.is_inline_block = true;
                     style.flow_root = true;
                     style.is_table_box = true;
+                }
+                "table-row" | "table-row-group" | "table-header-group" | "table-footer-group" => {
+                    style.table_row_display = Some(match value.as_str() {
+                        "table-row" => crate::TableRowDisplay::Row,
+                        "table-header-group" => crate::TableRowDisplay::Header,
+                        "table-footer-group" => crate::TableRowDisplay::Footer,
+                        _ => crate::TableRowDisplay::Group,
+                    });
+                    style.display = crate::Display::Block;
                 }
                 "table-cell" => {
                     // A table cell establishes an internal flow container. A
@@ -2313,6 +2333,10 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                 | "flow-root"
                 | "table"
                 | "inline-table"
+                | "table-row"
+                | "table-row-group"
+                | "table-header-group"
+                | "table-footer-group"
                 | "-webkit-box"
                 | "-webkit-inline-box"
                 | "contents"

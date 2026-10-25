@@ -1884,13 +1884,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1907,8 +1912,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -2077,6 +2082,14 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
         .collect::<Vec<_>>()
         .join("\n");
     serde_json::json!({ "originClean": true, "css": css }).to_string()
+}
+
+fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] {
+    let Some(tag) = node.as_element() else { return [None, None] };
+    let name = (tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+        && matches!(tag.local.as_ref(), "embed" | "form" | "iframe" | "img" | "object"))
+        .then(|| node.get_attribute_ns("", "name")).flatten();
+    [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
 }
 
 #[op2]
@@ -2371,6 +2384,34 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 _ => control.indeterminate = arg2 == "true",
             });
             "null".to_string()
+        }
+        "window_named_names" => {
+            let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let mut names = Vec::new();
+            let mut seen = HashSet::new();
+            for node in std::iter::once(root).chain(dom.descendants(root)) {
+                dom.with_node(node, |node| {
+                    for name in window_named_attributes(node).into_iter().flatten() {
+                        if seen.insert(name.to_string()) { names.push(name.to_string()); }
+                    }
+                });
+            }
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+        }
+        "window_named_candidates" => {
+            if arg1.is_empty() { return "[]".into(); }
+            let mut matches = Vec::new();
+            for node_id in dom.descendants(dom.document()) {
+                dom.with_node(node_id, |node| {
+                    let names = window_named_attributes(node);
+                    if names.contains(&Some(arg1.as_str())) {
+                        let named_frame = names[1] == Some(arg1.as_str())
+                            && node.as_element().is_some_and(|tag| tag.local.as_ref() == "iframe");
+                        matches.push((node_id.index(), named_frame));
+                    }
+                });
+            }
+            serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into())
         }
         "document_node_id" => dom.document().index().to_string(),
         "document_compat_mode" => if dom.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into(),
@@ -6664,7 +6705,10 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
@@ -7806,6 +7850,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_check_visibility());
         ops.push(op_set_hovered());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
@@ -9143,6 +9188,35 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
+}
+
+/// `Element.checkVisibility()` in one native call. Walking ancestors through
+/// `getComputedStyle()` cost a JS proxy per ancestor, and Playwright calls
+/// this before every action.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_check_visibility(
+    state: &OpState,
+    nid: u32,
+    check_opacity: bool,
+    check_visibility_css: bool,
+    frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_prepared_render(&mut gs).is_none() {
+        return false;
+    }
+    let (Some(prepared), Some(dom)) = (gs.prepared_render.as_ref(), gs.dom.as_ref()) else {
+        return false;
+    };
+    prepared.check_visibility(
+        dom,
+        obscura_dom::tree::NodeId::new(nid),
+        check_opacity,
+        check_visibility_css,
+    )
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

@@ -97,26 +97,12 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       99.9% uptime<br>
       IP filtering: all proxies have fraud score &lt;97%<br>
       No KYC required<br>
+      Check Nodemaven's new GitHub for more web scraping and automation solutions - https://github.com/nodemaven<br>
       Unique free tools: Proxy Bandwidth Checker, Meta Tag Checker, IP Lookup and others!<br><br>
       🎁 <b>Special codes for Obscura users:</b><br>
       <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
       <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies
     </td>
-    <tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://masklabs.io" target="_blank">
-        <img alt="Masklabs" src="assets/sponsors/Masklabs.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <b>Obscura + <a href="https://masklabs.io" target="_blank">Masklabs</a></b><br><br>
-      Obscura masks the browser. Masklabs masks the traffic.<br><br>
-      Mobile proxies for scrapers, bots, and AI agents that need to look human. Real carrier IPs across a rotating pool, zero shared-IP baggage.<br><br>
-      Pair Obscura's stealth rendering with Masklabs' mobile network and your requests blend into everyday traffic.<br><br>
-      💸 <b>Try it free for 30 days.</b><br><br>
-      🎁 Use code <b>OBSCURA25</b> for <b>25% off your first month</b>.
-    </td>
-  </tr>
 </table>
 
 ## Install

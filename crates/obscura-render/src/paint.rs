@@ -1506,6 +1506,48 @@ impl PreparedRender {
         Some((rect.width.max(0.0), rect.height.max(0.0)))
     }
 
+    /// CSSOM View `checkVisibility()` over the retained cascade. An element
+    /// without a generated box is hidden, including unslotted light children
+    /// and closed details content. Zero-size boxes still count. `content-visibility: hidden` is
+    /// not implemented by the renderer, which paints that content, so it is
+    /// not consulted here either.
+    pub fn check_visibility(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        check_opacity: bool,
+        check_visibility_css: bool,
+    ) -> bool {
+        let Some(style) = self.layout.styles.get(&id) else {
+            return false;
+        };
+        if style.display_contents || (check_visibility_css && style.computed_visibility_hidden) {
+            return false;
+        }
+        let document = tree.document();
+        let mut current = Some(id);
+        let mut box_known = self.layout.rects.contains_key(&id);
+        while let Some(node) = current.filter(|&node| node != document) {
+            let Some(style) = self.layout.styles.get(&node) else {
+                return false;
+            };
+            if style.display == crate::Display::None
+                || (check_opacity && style.opacity.is_some_and(|value| value <= 0.0))
+            {
+                return false;
+            }
+            let Some(parent) = crate::dom::rendered_parent(tree, node) else { return false; };
+            // Empty inline boxes may have no retained rect, but must still
+            // belong to the rendered child list (not closed details or slot fallback).
+            if !box_known {
+                if !crate::dom::rendered_children(tree, parent).contains(&node) { return false; }
+                box_known = self.layout.rects.contains_key(&parent);
+            }
+            current = Some(parent);
+        }
+        current == Some(document)
+    }
+
     /// Whether hit testing must ignore this element's generated box.
     pub fn pointer_events_none(&self, id: obscura_dom::tree::NodeId) -> bool {
         self.layout
@@ -2347,6 +2389,13 @@ fn computed_display(style: &crate::LayoutStyle) -> &'static str {
         "contents"
     } else if style.display == crate::Display::None {
         "none"
+    } else if let Some(display) = style.table_row_display {
+        match display {
+            crate::TableRowDisplay::Row => "table-row",
+            crate::TableRowDisplay::Group => "table-row-group",
+            crate::TableRowDisplay::Header => "table-header-group",
+            crate::TableRowDisplay::Footer => "table-footer-group",
+        }
     } else if active_webkit_clamp && style.webkit_box_display == Some(false) {
         "flow-root"
     } else if style.webkit_box_display == Some(false) && !active_webkit_clamp {
@@ -15032,6 +15081,57 @@ mod tests {
         assert_eq!((rect.width, rect.height), (40.0, 20.0));
         assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
         assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
+    }
+
+    #[test]
+    fn computed_visibility_reports_inherited_value() {
+        let tree = parse_html(
+            r#"<html><head><style>.h{visibility:hidden}</style></head><body>
+                <div class="h"><span id="inherited">a</span>
+                <span id="restored" style="visibility:visible">b</span></div>
+                <span id="plain">c</span></body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (80.0, 50.0), None, &mut resources).unwrap();
+        let visibility = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .unwrap()["visibility"]
+                .clone()
+        };
+        assert_eq!(visibility("inherited"), "hidden");
+        assert_eq!(visibility("restored"), "visible");
+        assert_eq!(visibility("plain"), "visible");
+    }
+
+    #[test]
+    fn check_visibility_uses_ancestor_display_opacity_and_computed_visibility() {
+        let tree = parse_html(
+            r#"<html><head><style>.n{display:none}.h{visibility:hidden}.o{opacity:0}
+                .c{display:contents}</style></head><body>
+                <div class="n"><span id="under-none">a</span></div>
+                <div class="h"><span id="under-hidden">b</span></div>
+                <div class="o"><span id="under-transparent">c</span></div>
+                <span id="contents" class="c">d</span>
+                <span id="plain">e</span></body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (80.0, 50.0), None, &mut resources).unwrap();
+        let check = |id, opacity, visibility| {
+            prepared.check_visibility(
+                &tree,
+                tree.get_element_by_id(id).unwrap(),
+                opacity,
+                visibility,
+            )
+        };
+        assert!(!check("under-none", false, false));
+        assert!(check("under-hidden", false, false));
+        assert!(!check("under-hidden", false, true));
+        assert!(check("under-transparent", false, false));
+        assert!(!check("under-transparent", true, false));
+        assert!(!check("contents", false, false));
+        assert!(check("plain", true, true));
     }
 
     #[test]

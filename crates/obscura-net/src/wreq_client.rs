@@ -187,6 +187,8 @@ async fn send_get_with_connection_reset_retry(
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
+    /// Lets `fetch_file_url` read local files. Off by default.
+    pub allow_file_access: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
@@ -280,6 +282,7 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             allow_private_network,
+            allow_file_access: false,
             block_trackers: tracker_blocking_enabled(
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
             ),
@@ -320,7 +323,7 @@ impl StealthHttpClient {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(url, request.max_response_bytes, self.allow_file_access).await;
         }
 
         let mut current_url = url.clone();
@@ -664,6 +667,21 @@ mod tests {
         }
     }
 
+    // The stealth transport delegates file:// to the shared loader, so it
+    // inherits the same opt-in instead of reading local files unconditionally.
+    #[tokio::test]
+    async fn stealth_client_reads_file_urls_only_when_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.html");
+        std::fs::write(&path, "local-secret").unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+
+        let mut client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        assert!(client.fetch(&url).await.is_err());
+        client.allow_file_access = true;
+        assert_eq!(client.fetch(&url).await.unwrap().body, b"local-secret");
+    }
+
     #[test]
     fn tracker_blocking_respects_host_and_setting() {
         let url = Url::parse("https://www.google-analytics.com/collect").unwrap();
@@ -819,6 +837,7 @@ mod tests {
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
             allow_private_network: true,
+            allow_file_access: false,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),

@@ -238,7 +238,7 @@ def main():
                     height_ok = "height" not in check or abs(component["height"] - check["height"]) <= 1
                     if x_ok and y_ok and width_ok and height_ok:
                         matches.append(component)
-                passed = len(matches) >= expected_count
+                passed = not matches if expected_count == 0 else len(matches) >= expected_count
                 fixture["behavior"][engine].append(
                     {
                         "name": check["name"],

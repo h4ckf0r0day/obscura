@@ -1,6 +1,9 @@
 ## `obscura`
 
-Top-level flags apply to every subcommand.
+Most top-level flags apply to every subcommand. `--storage-dir` is the
+exception: it is declared on `serve` and `fetch`, and the top-level copy is read
+only by `mcp`, which exports it to `OBSCURA_STORAGE_DIR`. Pass it after the
+subcommand to use it with `serve` or `fetch`.
 
 ```
 -v, --verbose                Enable info logging
