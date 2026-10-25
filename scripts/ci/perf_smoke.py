@@ -32,6 +32,18 @@ SCENARIOS = {
         "(function(){for(var i=0;i<2000;i++)localStorage.setItem('k'+i,'value-'+i);var n=0;for(var j=0;j<2000;j++)n+=localStorage.getItem('k'+j).length;return n;})()",
         18890,
     ),
+    "dom-lookup": (
+        "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<200000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
+        200000,
+    ),
+    "shadow-build": (
+        "(() => {let n=0;for(let i=0;i<1500;i++){let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let t=document.createElement('span');t.textContent='row';r.append(t);if(h.shadowRoot===r && r.textContent==='row')n++;}return n;})()",
+        1500,
+    ),
+    "shadow-lookup": (
+        "(() => {let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let n=0;for(let i=0;i<200000;i++)if(h.shadowRoot===r)n++;return n;})()",
+        200000,
+    ),
 }
 
 

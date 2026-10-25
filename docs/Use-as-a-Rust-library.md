@@ -63,6 +63,11 @@ async fn main() -> anyhow::Result<()> {
 
 `CookieStore`: `set`, `get_all`, `get_for_url`, `save_to_file`, `load_from_file`.
 
+Low-level `obscura-browser` users must call `BrowserContext::set_allow_file_access(true)`
+before sharing the context to read local files. Assigning `allow_file_access` directly
+does not enable the transport. Standalone `obscura-net` clients refuse `file://` by
+default; use their file-access setting only for trusted local-file workflows.
+
 ## Intercept requests
 
 The interception API observes, blocks, mocks, and rewrites the requests a page makes, including JavaScript `fetch()` and XHR. Use it to capture API payloads while crawling, block trackers, or mock responses in tests.

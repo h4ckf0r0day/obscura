@@ -45,17 +45,14 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
-/// Serializes V8 isolate construction across OS threads. The thread-per-
-/// connection server (issue #430) builds isolates on many threads. The main
-/// thread already warms up V8 once before any connection thread starts (see the
-/// `ObscuraJsRuntime::new` warmup in `obscura-cdp` server startup), which is
-/// what actually prevents the `InitializeBuiltinJSDispatchTable` segfault of a
-/// first isolate built off the main thread. This lock is defense-in-depth: it
-/// keeps two connections from running V8's isolate setup concurrently in case
-/// any residual first-time process init races. Construction is rare and fast, so
-/// serializing it costs nothing measurable; isolate *execution* stays fully
-/// parallel, each isolate on its own thread with no shared lock.
+/// Serialize first initialization (#430), then allow two snapshot restorations
+/// at a time. Unbounded construction increases CPU and peak memory contention.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ISOLATE_CREATE_SECOND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NEXT_ISOLATE_CREATE_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static ISOLATE_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static NEXT_CDP_OBJECT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 #[cfg(test)]
@@ -309,6 +306,44 @@ fn exception_text(
         Some(exception) => exception.to_rust_string_lossy(scope),
         None => "unknown error".to_string(),
     }
+}
+
+fn cdp_result_record<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    rejected: bool,
+    await_promise: bool,
+) -> Result<v8::Global<v8::Value>, String> {
+    let should_await = await_promise && !rejected;
+    let pending = v8::Object::new(scope);
+    let done = v8::Boolean::new(scope, !should_await);
+    let rejected = v8::Boolean::new(scope, rejected);
+    let initial_value = if should_await { v8::undefined(scope).into() } else { value };
+    for (name, value) in [
+        ("done", done.into()), ("rejected", rejected.into()), ("value", initial_value),
+    ] {
+        let key = v8::String::new(scope, name).ok_or("CDP result key allocation failed")?;
+        if pending.create_data_property(scope, key.into(), value) != Some(true) {
+            return Err("CDP result allocation failed".into());
+        }
+    }
+    if should_await {
+        // Await uses the intrinsic Promise and assimilates thenables.
+        let source = v8::String::new(scope, r#"(async function(value, pending) {
+            try { pending.value = await value; }
+            catch (error) { pending.value = error; pending.rejected = true; }
+            pending.done = true;
+        })"#).ok_or("CDP await allocation failed")?;
+        let function = v8::Script::compile(scope, source, None)
+            .and_then(|script| script.run(scope))
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or("Cannot initialize awaited CDP result")?;
+        let receiver = v8::undefined(scope).into();
+        function.call(scope, receiver, &[value, pending.into()])
+            .ok_or("Cannot await CDP result")?;
+    }
+    let pending: v8::Local<v8::Value> = pending.into();
+    Ok(v8::Global::new(scope, pending))
 }
 
 /// A fetched and instantiated module graph whose evaluation is intentionally
@@ -621,14 +656,18 @@ impl ObscuraJsRuntime {
         let loaded_module_specifiers = module_loader.loaded_specifiers();
         let module_loader = Rc::new(module_loader);
 
-        // Build the isolate under the process-wide creation lock so two
-        // connection threads never construct isolates concurrently (#430).
         let (runtime, isolate_handle, heap_limit_state) = {
             // Keep the guard alive for the whole construction: deno_core
             // captures the current tokio handle at `JsRuntime::new` time and
             // aborts if a V8 delayed task is posted without one.
             let _tokio_guard = enter_tokio_context();
-            let _create_guard = ISOLATE_CREATE_LOCK
+            let create_lock = if ISOLATE_INITIALIZED.load(std::sync::atomic::Ordering::Acquire)
+                && NEXT_ISOLATE_CREATE_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 != 0 {
+                &ISOLATE_CREATE_SECOND_LOCK
+            } else {
+                &ISOLATE_CREATE_LOCK
+            };
+            let _create_guard = create_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -636,13 +675,21 @@ impl ObscuraJsRuntime {
             // so Intl.* formats and resolvedOptions().locale leaked the
             // operator's real locale (an en-AU host showed en-AU) while
             // navigator.language and Accept-Language say en-US. Pin the one
-            // locale the other surfaces claim (#734). Process-global and
-            // idempotent; setting it under the create lock guarantees it
-            // lands before the first isolate exists.
-            deno_core::v8::icu::set_default_locale("en-US");
+            // locale the other surfaces claim (#734). This is process-global.
+            // Set it under the first-creation lock, before parallel restorations.
+            if !ISOLATE_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+                deno_core::v8::icu::set_default_locale("en-US");
+            }
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
-                extensions: vec![build_extension()],
+                extensions: if cfg!(obscura_external_bootstrap) {
+                    vec![deno_core::Extension {
+                        name: "obscura_bootstrap",
+                        ..Default::default()
+                    }, build_extension()]
+                } else {
+                    vec![build_extension()]
+                },
                 module_loader: Some(module_loader),
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
@@ -672,6 +719,7 @@ impl ObscuraJsRuntime {
                 )
                 .expect("init should not fail");
 
+            ISOLATE_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
             (runtime, isolate_handle, heap_limit_state)
         };
 
@@ -2620,117 +2668,43 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
-        // Every shape of this command now travels the same path. The
-        // by-value sync case used to short-circuit through `evaluate`,
-        // whose wrapper answers an exception with `null` — indistinguishable
-        // from an expression that really evaluated to null (#746).
         self.begin_javascript_task();
-
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
-
-        // The expression travels as a *string* into an indirect eval rather
-        // than being pasted into a wrapper. Pasting forced two workarounds
-        // that only half worked: a trailing `;` had to be trimmed or
-        // `(expr;)` failed to parse, and a trailing `//# sourceURL=` comment
-        // (Puppeteer and Playwright both append one) would swallow the
-        // closing paren unless it sat on its own line. Neither can happen to
-        // a string literal.
-        //
-        // It also makes statements legal. `Runtime.evaluate` is specified to
-        // take a script, not an expression, so `throw new Error('x')` and
-        // `var x = 1; x * 2` are both valid input; wrapped in parentheses the
-        // first was a parse-time SyntaxError, which is not catchable, and the
-        // second returned the wrapper's own `undefined` instead of the
-        // completion value Chrome reports (#746).
-        //
-        // `(0, eval)` rather than `eval` so the script runs at global scope,
-        // where `var` lands on `globalThis` the way it does in Chrome, and
-        // cannot see this wrapper's `__result`.
-        let source_literal = serde_json::Value::String(expression.to_string());
-        let meta_code = if await_promise {
-            format!(
-                "(function() {{\n\
-                    var pending = {{done:false,rejected:false,value:undefined}};\n\
-                    (async function() {{\n\
-                        try {{ pending.value = await (0, eval)({src}); }}\n\
-                        catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
-                        pending.done = true;\n\
-                    }})();\n\
-                    return pending;\n\
-                }})()",
-                src = source_literal,
-            )
-        } else {
-            // Before this, a throw here became `__result = undefined`: the
-            // command answered successfully with `undefined`, so a page error
-            // was indistinguishable from an expression with no value.
-            format!(
-                "(function() {{\n\
-                    var __result;\n\
-                    try {{\n\
-                        __result = (0, eval)({src});\n\
-                    }} catch(e) {{\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                        return globalThis.__obscura_await_meta;\n\
-                    }}\n\
-                    globalThis.__obscura_objects[{oid}] = __result;\n\
-                    globalThis.__obscura_await_rejected = false;\n\
-                    return {meta_fn};\n\
-                }})()",
-                src = source_literal,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = Self::meta_extract_js("e"),
-            )
+        // Compile the script itself, not a string passed through the page's eval.
+        let record = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let source = v8::String::new(scope, expression).ok_or("CDP source allocation failed")?;
+            let name = v8::String::new(scope, "<eval-remote>").ok_or("CDP origin allocation failed")?;
+            let origin = v8::ScriptOrigin::new(
+                scope, name.into(), 0, 0, false, 0, None, false, false, false, None,
+            );
+            let result = v8::Script::compile(scope, source, Some(&origin))
+                .and_then(|script| script.run(scope));
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
+            }
+            let rejected = result.is_none();
+            let value = result.or_else(|| scope.exception())
+                .ok_or("CDP evaluation failed without an exception")?;
+            scope.reset();
+            cdp_result_record(scope, value, rejected, await_promise)
+        })();
+        let record = self.finish_heap_checked(record)?;
+        self.pending_cdp_evaluations.insert(oid.clone(), record);
+        let pending = PendingCdpEvaluation {
+            object_id: oid,
+            recipe: if return_by_value { None } else { Some(expression.to_string()) },
         };
-
-        let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
-            .map_err(|e| format!("JS error: {}", e))?;
-
         if await_promise {
-            self.pending_cdp_evaluations.insert(oid.clone(), result);
-            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid,
-                recipe: if return_by_value { None } else { Some(expression.to_string()) },
-            }));
-        }
-        let meta_str = result;
-
-        // Neither a rejection nor a synchronous throw is a protocol failure.
-        // CDP answers the command and puts the value in `exceptionDetails`,
-        // which is what a client rebuilds the page error from, so it travels
-        // back as a remote object flagged `thrown`. It is reported by
-        // reference even when the caller asked for a value:
-        // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
-        // would throw the message away.
-        let thrown = self
-            .execute_runtime_script(
-                "<readRejected>",
-                "globalThis.__obscura_await_rejected".to_string(),
-            )
-            .map_err(|e| format!("JS error: {}", e))?;
-        if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
-            return self.thrown_info(&oid).map(CdpEvaluation::Complete);
-        }
-        if return_by_value {
-            return self.take_cdp_result_by_value(&oid).map(CdpEvaluation::Complete);
-        }
-        let meta_str = self.v8_to_json(meta_str)?;
-        let meta_json = if let serde_json::Value::String(s) = &meta_str {
-            serde_json::from_str(s).unwrap_or(meta_str)
+            Ok(CdpEvaluation::Pending(pending))
         } else {
-            meta_str
-        };
-        let info = self.finish_cdp_result(&meta_json, &oid)?;
-        // The eval-based wrapper parses the expression as statements.
-        if info.object_id.is_some() {
-            self.evaluation_recipes.insert(oid, expression.to_string());
+            self.finish_cdp_evaluation(pending, return_by_value).map(CdpEvaluation::Complete)
         }
-        Ok(CdpEvaluation::Complete(info))
     }
 
     pub async fn call_function_on_for_cdp(
@@ -2776,86 +2750,71 @@ impl ObscuraJsRuntime {
     ) -> Result<CdpEvaluation, String> {
         self.begin_javascript_task();
         let this_expr = self.resolve_this(object_id);
-        let (setup, args_list) = self.build_args(arguments);
-
+        let receiver = self.execute_runtime_script("<cdp-receiver>", this_expr)
+            .map_err(|error| format!("JS error: {error}"))?;
+        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument))
+            .collect::<Result<Vec<_>, _>>()?;
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
-
+        let record = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let receiver = v8::Local::new(scope, &receiver);
+            let arguments = arguments.iter().map(|argument| v8::Local::new(scope, argument))
+                .collect::<Vec<_>>();
+            let source = v8::String::new(scope, &format!("(\n{function_declaration}\n)"))
+                .ok_or("CDP function allocation failed")?;
+            let result = v8::Script::compile(scope, source, None)
+                .and_then(|script| script.run(scope))
+                .and_then(|value| {
+                    match v8::Local::<v8::Function>::try_from(value) {
+                        Ok(function) => function.call(scope, receiver, &arguments),
+                        Err(_) => {
+                            let message = v8::String::new(scope, "Given expression does not evaluate to a function")?;
+                            let error = v8::Exception::type_error(scope, message);
+                            scope.throw_exception(error);
+                            None
+                        }
+                    }
+                });
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".into());
+            }
+            let rejected = result.is_none();
+            let value = result.or_else(|| scope.exception())
+                .ok_or("CDP call failed without an exception")?;
+            scope.reset();
+            cdp_result_record(scope, value, rejected, await_promise)
+        })();
+        let record = self.finish_heap_checked(record)?;
+        self.pending_cdp_evaluations.insert(oid.clone(), record);
+        let pending = PendingCdpEvaluation { object_id: oid, recipe: None };
         if await_promise {
-            let code = format!(
-                "(function() {{\n\
-                    var pending = {{done:false,rejected:false,value:undefined}};\n\
-                    (async function() {{\n\
-                        try {{\n\
-                            {setup}\n\
-                            var __fn = ({fn_decl});\n\
-                            var __this = ({this_expr});\n\
-                            pending.value = await __fn.call(__this, {args});\n\
-                        }} catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
-                        pending.done = true;\n\
-                    }})();\n\
-                    return pending;\n\
-                }})()",
-                setup = setup,
-                fn_decl = function_declaration,
-                this_expr = this_expr,
-                args = args_list,
-            );
-
-            let record = self.execute_runtime_script("<callFnAsync>", code)
-                .map_err(|e| format!("JS error: {}", e))?;
-            self.pending_cdp_evaluations.insert(oid.clone(), record);
-
-            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid, recipe: None,
-            }));
-        }
-
-        if return_by_value {
-            let code = format!(
-                "(function() {{\n\
-                    {setup}\n\
-                    var __fn = ({fn_decl});\n\
-                    var __this = ({this_expr});\n\
-                    return __fn.call(__this, {args});\n\
-                }})()",
-                setup = setup,
-                fn_decl = function_declaration,
-                this_expr = this_expr,
-                args = args_list,
-            );
-            let result = self
-                .execute_runtime_script("<callFnByValue>", code)
-                .map_err(|e| format!("JS error: {}", e))?;
-            return self.v8_to_cdp_value(result).map(CdpEvaluation::Complete);
-        }
-
-        let code = format!(
-            "(function() {{\n\
-                {setup}\n\
-                var __fn = ({fn_decl});\n\
-                var __this = ({this_expr});\n\
-                var __result = __fn.call(__this, {args});\n\
-                globalThis.__obscura_objects[{oid}] = __result;\n\
-                return {meta_fn};\n\
-            }})()",
-            setup = setup,
-            fn_decl = function_declaration,
-            this_expr = this_expr,
-            args = args_list,
-            oid = js_string_literal(&oid),
-            meta_fn = Self::meta_extract_js("__result"),
-        );
-        let result = self
-            .execute_runtime_script("<callFnRemote>", code)
-            .map_err(|e| format!("JS error: {}", e))?;
-        let meta_str = self.v8_to_json(result)?;
-        let meta_json = if let serde_json::Value::String(s) = &meta_str {
-            serde_json::from_str(s).unwrap_or(meta_str.clone())
+            Ok(CdpEvaluation::Pending(pending))
         } else {
-            meta_str
-        };
-        self.finish_cdp_result(&meta_json, &oid).map(CdpEvaluation::Complete)
+            self.finish_cdp_evaluation(pending, return_by_value).map(CdpEvaluation::Complete)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn has_cdp_evaluation(&self, pending: &PendingCdpEvaluation) -> bool {
+        self.pending_cdp_evaluations.contains_key(&pending.object_id)
+    }
+
+    fn has_ready_cdp_evaluations(&mut self) -> bool {
+        if self.pending_cdp_evaluations.is_empty() { return false; }
+        let records: Vec<_> = self.pending_cdp_evaluations.values().cloned().collect();
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        let Some(key) = v8::String::new(scope, "done") else { return false; };
+        records.into_iter().any(|record| {
+            let Ok(record) = v8::Local::<v8::Object>::try_from(v8::Local::new(scope, record)) else { return false; };
+            record.get(scope, key.into()).is_some_and(|value| value.is_true())
+        })
     }
 
     #[doc(hidden)]
@@ -3807,6 +3766,9 @@ impl ObscuraJsRuntime {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
 
+        // Publish settled protocol replies before parking on unrelated page work.
+        if self.has_ready_cdp_evaluations() { return Ok(false); }
+
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
@@ -3824,6 +3786,9 @@ impl ObscuraJsRuntime {
                 return std::task::Poll::Ready(Err(
                     "autonomous browser task exceeded its task budget".into(),
                 ));
+            }
+            if self.has_ready_cdp_evaluations() {
+                return std::task::Poll::Ready(Ok(false));
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -4351,45 +4316,37 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn build_args(&mut self, arguments: &[serde_json::Value]) -> (String, String) {
-        let mut setup_lines = Vec::new();
-        let mut arg_names = Vec::new();
-
-        for (i, arg) in arguments.iter().enumerate() {
-            let arg_name = format!("__arg{}", i);
-            // objectId wins over value. go-rod marshals CallArgument through a
-            // struct, and Go's `omitempty` is a no-op on structs, so every
-            // object handle it sends arrives as `{"value":null,"objectId":...}`.
-            // Chromium reads objectId first and ignores the null; reading value
-            // first passed `null` as the argument and broke rod's JS helpers
-            // (`functions.selectable = ...` → "Cannot set properties of null").
-            if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
-                if let Some(retrieval) = self.resolve_remote_object(oid) {
-                    setup_lines.push(format!("var {} = {};", arg_name, retrieval));
-                } else {
-                    setup_lines.push(format!("var {} = undefined;", arg_name));
-                }
-            } else if let Some(value) = arg.get("value") {
-                // No handle: a plain JSON argument, explicit null included.
-                let json_str =
-                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
-                setup_lines.push(format!("var {} = {};", arg_name, json_str));
-            } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
-                // CDP defines UnserializableValue as a closed set. Anything
-                // else is arbitrary source text arriving in a data field;
-                // treat it as undefined rather than evaluating it.
-                if is_cdp_unserializable_value(unser) {
-                    setup_lines.push(format!("var {} = {};", arg_name, unser));
-                } else {
-                    setup_lines.push(format!("var {} = undefined;", arg_name));
-                }
-            } else {
-                setup_lines.push(format!("var {} = undefined;", arg_name));
-            }
-            arg_names.push(arg_name);
+    fn cdp_call_argument(&mut self, argument: &serde_json::Value) -> Result<v8::Global<v8::Value>, String> {
+        // Remote handles take precedence over value, including rod's value:null.
+        if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
+            let expression = self.resolve_remote_object(id).unwrap_or_else(|| "undefined".into());
+            return self.execute_runtime_script("<cdp-argument>", expression)
+                .map_err(|error| format!("JS error: {error}"));
         }
-
-        (setup_lines.join("\n"), arg_names.join(", "))
+        if argument.get("value").is_none() {
+            if let Some(value) = argument.get("unserializableValue").and_then(|value| value.as_str()) {
+                if is_cdp_unserializable_value(value) {
+                    return self.execute_runtime_script("<cdp-argument>", value.to_string())
+                        .map_err(|error| format!("JS error: {error}"));
+                }
+            }
+        }
+        let result = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let value = if let Some(value) = argument.get("value") {
+                // JSON data is not an object literal: __proto__ must be an own property.
+                let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
+                let json = v8::String::new(scope, &json).ok_or("CDP argument allocation failed")?;
+                v8::json::parse(scope, json).ok_or_else(|| exception_text(scope))?
+            } else {
+                v8::undefined(scope).into()
+            };
+            Ok(v8::Global::new(scope, value))
+        })();
+        self.finish_heap_checked(result)
     }
 
     fn v8_to_json(
@@ -4585,29 +4542,6 @@ impl ObscuraJsRuntime {
         }
     }
 
-    /// Build the remote object for a value that was thrown, or that a promise
-    /// rejected with.
-    ///
-    /// Both wrappers have already stored the value under `oid` and put its
-    /// metadata in `__obscura_await_meta`, so this reads them back and marks
-    /// the result. The mark is what lets the CDP layer answer the command with
-    /// `exceptionDetails` rather than fail it or, worse, present the value as
-    /// the evaluation result.
-    fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
-        let meta = self
-            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-            .map_err(|e| format!("JS error: {}", e))?;
-        let meta = self.v8_to_json(meta)?;
-        let meta_json = if let serde_json::Value::String(text) = &meta {
-            serde_json::from_str(text).unwrap_or_else(|_| meta.clone())
-        } else {
-            meta
-        };
-        let mut info = self.finish_cdp_result(&meta_json, oid)?;
-        info.thrown = true;
-        Ok(info)
-    }
-
     fn info_from_meta(meta: &serde_json::Value, object_id: Option<String>) -> RemoteObjectInfo {
         let js_type = meta
             .get("type")
@@ -4650,6 +4584,59 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(obscura_external_bootstrap)]
+    #[test]
+    fn snapshot_core_methods_have_bytecode_before_first_use() {
+        crate::v8_flags::set_v8_flags("--allow-natives-syntax");
+        let mut rt = super::ObscuraJsRuntime::new();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const methods = [Node, Element, Document, Response, Headers,
+                Node.prototype.appendChild, Document.prototype.createElement,
+                Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get,
+                Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').set];
+            // V8's kInterpreted bit identifies shared bytecode, including
+            // restored closures whose entry point is still CompileLazy.
+            return methods.filter(fn => !(%GetOptimizationStatus(fn) & (1 << 6)))
+                .map(fn => fn.name);
+        })()"#).unwrap(), serde_json::json!([]),
+            "common browser operations must not recompile in each fresh document");
+    }
+
+    #[test]
+    fn snapshot_compiler_is_not_available_in_page_or_frame_realms() {
+        let mut rt = setup_runtime("<html><body><iframe id='frame'></iframe></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const check = `(function() {
+                let denied = false;
+                try { Function('return %GetOptimizationStatus(function() {});')(); }
+                catch (error) { denied = error instanceof SyntaxError; }
+                return denied && !('__obscura_snapshot_compile' in globalThis);
+            })()`;
+            return [eval(check), document.getElementById('frame').contentWindow.eval(check)];
+        })()"#).unwrap(), serde_json::json!([true, true]));
+    }
+
+    #[test]
+    fn bootstrap_source_uses_ascii_snapshot_storage() {
+        let source = include_str!("../js/bootstrap.js")
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+        assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
+        if cfg!(obscura_external_bootstrap) {
+            assert_eq!(super::SNAPSHOT.windows(source.len())
+                .filter(|window| *window == source.as_bytes()).count(), 1,
+                "native snapshots must retain one shared source backing");
+        }
+    }
+
+    #[test]
+    fn custom_element_names_keep_unicode_characters() {
+        let mut rt = setup_runtime("<main></main>");
+        assert_eq!(rt.evaluate(r#"['widget-\u00e9','widget-\u00b7','widget-\u0100'].every(name => {
+            customElements.define(name, class extends HTMLElement {});
+            return typeof customElements.get(name) === 'function';
+        })"#).unwrap(), serde_json::json!(true));
+    }
+
     #[test]
     fn classic_code_cache_reuses_compilation_not_page_state() {
         use std::sync::atomic::Ordering;
@@ -4685,6 +4672,34 @@ mod tests {
 
     use super::*;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn one_busy_isolate_constructor_does_not_block_all_pages() {
+        let warmup = ObscuraJsRuntime::new();
+        let guard = ISOLATE_CREATE_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workers = (0..8).map(|id| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let mut rt = ObscuraJsRuntime::new();
+                    rt.set_dom(parse_html("<p id='value'>fresh</p>"));
+                    rt.run_page_init();
+                    assert_eq!(rt.evaluate("typeof globalThis.worker").unwrap(), serde_json::json!("undefined"));
+                    rt.execute_script("worker", &format!("globalThis.worker={id};")).unwrap();
+                    assert_eq!(rt.evaluate("[worker,document.getElementById('value').textContent]").unwrap(),
+                        serde_json::json!([id, "fresh"]));
+                    tx.send(()).unwrap();
+                }
+            })
+        }).collect::<Vec<_>>();
+        let independent = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(guard);
+        for worker in workers { worker.join().unwrap(); }
+        drop(warmup);
+        assert!(independent, "one busy isolate constructor blocked every page");
+        assert_eq!(rx.try_iter().count(), 31);
+    }
 
     #[test]
     fn completed_scripts_do_not_wait_for_watchdog_deadline() {
@@ -4818,6 +4833,60 @@ mod tests {
             serde_json::json!("safe"),
             "DOM ops must continue to work through the private closure"
         );
+    }
+
+    #[test]
+    fn native_metadata_does_not_retain_removed_methods() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.execute_runtime_script("<removed-native-method>", r#"(() => {
+            const fn = AudioBuffer.prototype.copyToChannel;
+            if (Function.prototype.toString.call(fn) !== 'function copyToChannel() { [native code] }') {
+                throw new Error('Live method lost its native source');
+            }
+            delete AudioBuffer.prototype.copyToChannel;
+            return fn;
+        })()"#.into()).unwrap();
+        let weak = deno_core::v8::Weak::new(rt.runtime().v8_isolate(), &value);
+        rt.collect_garbage();
+        assert!(!weak.is_empty(), "a caller-held method must remain live");
+        drop(value);
+        rt.collect_garbage();
+        assert!(weak.is_empty(), "native-source metadata must not own a removed method");
+    }
+
+    #[test]
+    fn native_metadata_does_not_retain_removed_accessors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt.execute_runtime_script("<removed-native-accessor>", r#"(() => {
+            const fn = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'x').get;
+            if (Function.prototype.toString.call(fn) !== 'function get x() { [native code] }') {
+                throw new Error('Live accessor lost its native source');
+            }
+            delete MouseEvent.prototype.x;
+            return fn;
+        })()"#.into()).unwrap();
+        let weak = deno_core::v8::Weak::new(rt.runtime().v8_isolate(), &value);
+        rt.collect_garbage();
+        assert!(!weak.is_empty(), "a caller-held accessor must remain live");
+        drop(value);
+        rt.collect_garbage();
+        assert!(weak.is_empty(), "native-source metadata must not own a removed accessor");
+    }
+
+    #[test]
+    fn native_source_survives_page_replacement_of_weak_collection_methods() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate_script(r#"(() => {
+            const method = AudioBuffer.prototype.copyToChannel;
+            const getter = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'x').get;
+            const fail = () => { throw new Error('Page collection method called'); };
+            WeakSet.prototype.has = WeakSet.prototype.add = fail;
+            WeakMap.prototype.has = WeakMap.prototype.get = WeakMap.prototype.set = fail;
+            return [method.toString(), getter.toString()];
+        })()"#).unwrap(), serde_json::json!([
+            "function copyToChannel() { [native code] }",
+            "function get x() { [native code] }",
+        ]));
     }
 
     // #1013: removeAttribute('id') must update the id_index so getElementById no
@@ -7131,6 +7200,63 @@ mod tests {
     }
 
     #[test]
+    fn element_style_is_not_replaced_by_a_page_expando() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="d" style="color: red">hi</div></body></html>"#,
+        );
+        assert_eq!(rt.evaluate(r#"(() => {
+            const element = document.getElementById('d');
+            element._style = { color: 'poisoned' };
+            const style = element.style;
+            return [style instanceof CSSStyleDeclaration, style.color, style === element.style];
+        })()"#).unwrap(), serde_json::json!([true, "red", true]));
+    }
+
+    #[test]
+    fn first_element_style_access_ignores_replaced_page_intrinsics() {
+        let mut rt = setup_runtime("<html><body>Style</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const element = document.body;
+            const original = [globalThis.Proxy, Object.defineProperty,
+                WeakMap.prototype.get, WeakMap.prototype.set, Reflect.apply];
+            const fail = () => { throw new Error('page intrinsic called'); };
+            let style;
+            try {
+                globalThis.Proxy = fail;
+                Object.defineProperty = fail;
+                WeakMap.prototype.get = fail;
+                WeakMap.prototype.set = fail;
+                Reflect.apply = fail;
+                style = element.style;
+            } finally {
+                [globalThis.Proxy, Object.defineProperty, WeakMap.prototype.get,
+                    WeakMap.prototype.set, Reflect.apply] = original;
+            }
+            return [style instanceof CSSStyleDeclaration, style === element.style];
+        })()"#).unwrap(), serde_json::json!([true, true]));
+    }
+
+    #[test]
+    fn element_style_first_read_observes_prior_attribute_mutations() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const element = document.createElement('div');
+            element.setAttribute('style', 'color: red');
+            element.removeAttributeNS(null, 'style');
+            element.setAttributeNS(null, 'style', 'color: blue');
+            const style = element.style;
+            const before = style.color;
+            element.style = 'color: green';
+            const assigned = style.color;
+            element.removeAttribute('style');
+            const removed = style.color;
+            style.color = 'purple';
+            return [before, assigned, removed, style === element.style,
+                element.getAttribute('style')];
+        })()"#).unwrap(), serde_json::json!(["blue", "green", "", true, "color: purple;"]));
+    }
+
+    #[test]
     fn style_attribute_parses_into_style_object() {
         // Inline styles present in the parsed HTML must be visible via el.style.*
         let mut rt = setup_runtime(
@@ -9034,6 +9160,37 @@ mod tests {
             result,
             serde_json::json!([true, "{\"ready\":true}", true, 2, true, true, "undefined"])
         );
+    }
+
+    #[test]
+    fn window_named_access_uses_native_attributes_not_page_overrides() {
+        let mut rt = setup_runtime("<html><body><div id='nativeName'></div></body></html>");
+        let result = rt.evaluate(r#"
+            const element = document.getElementById('nativeName');
+            let calls = 0;
+            element.getAttribute = () => { calls++; return null; };
+            const documentQuery = document.querySelectorAll;
+            document.querySelectorAll = function(selector) {
+                if (selector.includes('[id]')) { calls++; return []; }
+                return documentQuery.call(this,selector);
+            };
+            const existing = window.nativeName === element;
+            const subtree = document.createElement('section');
+            subtree.innerHTML = '<span id="insertedName"></span><img name="insertedImage">';
+            const span = subtree.firstElementChild;
+            const image = subtree.lastElementChild;
+            const elementQuery = subtree.querySelectorAll;
+            subtree.querySelectorAll = function(selector) {
+                if (selector.includes('[id]')) { calls++; return []; }
+                return elementQuery.call(this,selector);
+            };
+            span.getAttribute = image.getAttribute = () => { calls++; return null; };
+            document.body.appendChild(subtree);
+            const inserted = window.insertedName === span && window.insertedImage === image;
+            subtree.remove();
+            return [existing, inserted, 'insertedName' in window, 'insertedImage' in window, calls];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,false,false,0]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19116,6 +19273,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cdp_evaluation_does_not_call_the_pages_eval() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.evaluate_script("globalThis.eval = () => { throw new Error('page eval called'); };").unwrap();
+        for await_promise in [false, true] {
+            let result = rt.evaluate_for_cdp("6 * 7", true, await_promise).await.unwrap();
+            assert!(!result.thrown);
+            assert_eq!(result.value, Some(serde_json::json!(42.0)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_evaluation_preserves_global_lexical_bindings() {
+        let mut rt = ObscuraJsRuntime::new();
+        for (name, await_promise) in [("syncLexical", false), ("asyncLexical", true)] {
+            let declaration = format!("let {name} = 40; {name}");
+            let first = rt.evaluate_for_cdp(&declaration, true, await_promise).await.unwrap();
+            assert_eq!(first.value, Some(serde_json::json!(40.0)));
+            let second = rt.evaluate_for_cdp(&format!("{name} += 2; {name}"), true, await_promise).await.unwrap();
+            assert!(!second.thrown);
+            assert_eq!(second.value, Some(serde_json::json!(42.0)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cdp_by_value_results_do_not_retain_unreleasable_objects() {
         let mut rt = ObscuraJsRuntime::new();
         // A real remote handle must survive by-value calls until released.
@@ -19399,6 +19580,51 @@ mod tests {
             0,
             "removing an ancestor must release the linked stylesheets below it"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_calls_do_not_use_a_page_overridden_function_call() {
+        for await_promise in [false, true] {
+            let mut rt = setup_runtime("<body></body>");
+            let receiver = rt.evaluate_for_cdp("({base:40})", false, false).await.unwrap();
+            rt.execute_script("<override-call>",
+                "Function.prototype.call=function(){throw new Error('page call override');};").unwrap();
+            for declaration in [
+                "function(value){return this.base+value;}",
+                "function(value){return this.base+value;}\n//# sourceURL=cdp-function.js",
+            ] {
+                let result = rt.call_function_on_for_cdp(
+                    declaration, receiver.object_id.as_deref(),
+                    &[serde_json::json!({"value":2})], true, await_promise,
+                ).await.unwrap();
+                assert!(!result.thrown);
+                assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+            }
+            let thrown = rt.call_function_on_for_cdp(
+                "function(){throw new Error('native call error');}", None, &[], true, await_promise,
+            ).await.unwrap();
+            assert!(thrown.thrown);
+            assert_eq!(thrown.subtype.as_deref(), Some("error"));
+            assert!(thrown.description.contains("native call error"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_call_json_arguments_preserve_proto_data_properties() {
+        for await_promise in [false, true] {
+            let mut rt = setup_runtime("<body></body>");
+            rt.execute_script("<override-json>",
+                "JSON.parse=function(){throw new Error('page JSON override');};").unwrap();
+            let argument = serde_json::from_str(r#"{"value":{"__proto__":{"sentinel":42},"marker":7,"nested":[{"__proto__":null}]}}"#).unwrap();
+            let result = rt.call_function_on_for_cdp(r#"function(value){
+                const child=value.nested[0];
+                return [Object.hasOwn(value,'__proto__'), Object.getPrototypeOf(value)===Object.prototype,
+                    value.__proto__.sentinel, value.marker, Object.hasOwn(child,'__proto__'),
+                    Object.getPrototypeOf(child)===Object.prototype, child.__proto__===null];
+            }"#, None, &[argument], true, await_promise).await.unwrap();
+            assert!(!result.thrown);
+            assert_eq!(result.value, Some(serde_json::json!([true,true,42,7,true,true,true])));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -23373,6 +23599,40 @@ mod tests {
             .evaluate("new TextDecoder().decode(new Uint8Array([65, 66, 67]).subarray(1, 2))")
             .unwrap();
         assert_eq!(result.as_str().unwrap(), "B");
+    }
+
+    #[test]
+    fn text_decoder_replaces_malformed_utf8_and_preserves_bom_options() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const cases = [
+                [[0x80], '\ufffd'],
+                [[0xc0, 0xaf], '\ufffd\ufffd'],
+                [[0xe0, 0x80, 0xaf], '\ufffd\ufffd\ufffd'],
+                [[0xed, 0xa0, 0x80], '\ufffd\ufffd\ufffd'],
+                [[0xf4, 0x90, 0x80, 0x80], '\ufffd\ufffd\ufffd\ufffd'],
+                [[0xf5, 0x80, 0x80, 0x80], '\ufffd\ufffd\ufffd\ufffd'],
+                [[0xe2, 0x82], '\ufffd'],
+                [[0xf0, 0x9f, 0x92], '\ufffd'],
+                [[0xc2, 0x41], '\ufffdA'],
+                [[0xe2, 0x28, 0xa1], '\ufffd(\ufffd'],
+            ];
+            for (const [bytes, expected] of cases) {
+                const buffer = new Uint8Array([99, ...bytes, 99]);
+                const view = new DataView(buffer.buffer, 1, bytes.length);
+                const actual = new TextDecoder().decode(view);
+                if (actual !== expected) return {bytes, actual, expected};
+                try { new TextDecoder('utf-8', {fatal:true}).decode(view); return 'fatal accepted'; }
+                catch (error) { if (!(error instanceof TypeError)) return error.name; }
+            }
+            const bytes = new Uint8Array([0xef,0xbb,0xbf,65,0,34,92,10,0xc3,0xa9,0xf0,0x9f,0x98,0x80]);
+            const expected = 'A\0"\\\n\u00e9\ud83d\ude00';
+            const decoder = new TextDecoder('utf8', {fatal:true});
+            return [new TextDecoder().decode(bytes) === expected,
+                new TextDecoder('utf8', {ignoreBOM:true}).decode(bytes) === '\ufeff' + expected,
+                decoder.decode(bytes) === expected, decoder.decode(new Uint8Array()) === ''];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, true, true, true]));
     }
 
     #[test]

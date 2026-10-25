@@ -23,6 +23,13 @@ use crate::dispatch::{self, CdpContext};
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
 
+struct PendingRuntimeReply {
+    id: u64,
+    session_id: Option<String>,
+    reply_tx: mpsc::UnboundedSender<String>,
+    evaluation: crate::domains::runtime::DeferredEvaluation,
+}
+
 // The WS-stream forwarding channel must also be bounded: if the LocalSet
 // (CDP processor + nav tasks) stalls, the accept thread keeps pushing
 // `std::net::TcpStream`s into the queue. An unbounded channel would let
@@ -523,7 +530,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         storage_dir,
         allow_private_network,
     );
-    bctx.allow_file_access = allow_file_access;
+    bctx.set_allow_file_access(allow_file_access);
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
     // Cookie deltas are merged here, but new connections always clone the
@@ -1248,8 +1255,27 @@ async fn cdp_processor(
     let mut runtime_pump_armed = false;
     let mut runtime_pump_error_streak = 0_u8;
     let mut idle_pages = HashSet::new();
+    let mut pending_runtime = Vec::<PendingRuntimeReply>::new();
 
     loop {
+        let mut index = 0;
+        while index < pending_runtime.len() {
+            if !pending_runtime[index].evaluation.ready(&mut ctx) { index += 1; continue; }
+            let pending = pending_runtime.remove(index);
+            let _guard = ctx.v8_lock.clone().lock_owned().await;
+            let result = pending.evaluation.finish(&mut ctx, &pending.session_id).await;
+            idle_pages.clear();
+            runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+            dispatch::drain_runtime_events(&mut ctx);
+            dispatch::drain_binding_calls(&mut ctx);
+            dispatch::drain_frame_events(&mut ctx);
+            forward_pending_events(&mut ctx, Some(&pending.reply_tx));
+            let response = match result {
+                Ok(value) => crate::types::CdpResponse::success(pending.id, value, pending.session_id),
+                Err(error) => crate::types::CdpResponse::error(pending.id, -32000, error, pending.session_id),
+            };
+            if let Ok(json) = serde_json::to_string(&response) { let _ = pending.reply_tx.send(json); }
+        }
         // Drain any deferred messages from the previous interception window
         // before pulling new ones off the wire. Each is processed with no
         // nav-task spawn_local in flight, so this connection's only entered
@@ -1259,6 +1285,7 @@ async fn cdp_processor(
         } else {
             let screencast_active = has_active_screencast(&ctx);
             let has_intercept_rx = intercept_rx.is_some();
+            let evaluation_deadline = pending_runtime.iter().map(|pending| pending.evaluation.deadline).min();
             tokio::select! {
                 biased;
                 msg = rx.recv() => match msg {
@@ -1269,6 +1296,12 @@ async fn cdp_processor(
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
                 },
+                _ = async {
+                    match evaluation_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
                 pump_result = pump_live_page_event_loop(&mut ctx, &mut idle_pages), if runtime_pump_armed => {
                     match pump_result {
                         Ok(reached_idle) => {
@@ -1326,10 +1359,14 @@ async fn cdp_processor(
                     }
                 }, if has_intercept_rx => {
                     if let Some(reply_tx) = connection_reply_tx.as_ref() {
+                        let route = pending_runtime.iter()
+                            .find(|pending| pending.evaluation.page_id == intercepted.page_id)
+                            .and_then(|pending| ctx.pages.iter().find(|page| page.id == intercepted.page_id)
+                                .map(|page| (page.id.as_str(), page.frame_id.as_str(), pending.session_id.clone())));
                         emit_intercepted_request(
                             intercepted,
                             &ctx,
-                            None,
+                            route,
                             reply_tx,
                             &mut intercepted_paused,
                         );
@@ -1383,16 +1420,6 @@ async fn cdp_processor(
                         &mut intercept_rx, &mut intercepted_paused,
                         &mut deferred, true,
                     ).await;
-                } else if ctx.pages.iter().any(|page| page.intercept_enabled)
-                    && serde_json::from_str::<CdpRequest>(&cdp_msg.text).is_ok_and(|req| {
-                        matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn")
-                            && req.params.get("awaitPromise").and_then(|v| v.as_bool()) == Some(true)
-                    })
-                {
-                    process_awaited_with_interception(
-                        &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused, &mut deferred,
-                    ).await;
                 } else {
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
                         && handle_fetch_resolution(
@@ -1401,7 +1428,7 @@ async fn cdp_processor(
                             &mut intercepted_paused,
                         );
                     if !fetch_was_resolved {
-                        process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                        process_cdp_message_with_pending(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, Some(&mut pending_runtime)).await;
                     }
                 }
             }
@@ -2139,73 +2166,19 @@ async fn process_with_interception(
     }
 }
 
-async fn process_awaited_with_interception(
-    text: &str,
-    ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
-    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
-    intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
-    deferred: &mut std::collections::VecDeque<ServerMessage>,
-) {
-    // The evaluation owns ctx (and V8) until it completes. Snapshot only routing
-    // metadata so request replies can unblock it without entering another isolate.
-    let requesting_session = serde_json::from_str::<CdpRequest>(text).ok()
-        .and_then(|request| request.session_id);
-    let routes: HashMap<_, _> = ctx.pages.iter().filter_map(|page| {
-        let session_id = requesting_session.as_ref()
-            .filter(|session| ctx.sessions.get(*session) == Some(&page.id))
-            .or_else(|| ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)
-                .map(|(session, _)| session))?;
-        let observers = crate::domains::page::network_observer_sessions(
-            ctx, &page.id, &Some(session_id.clone()),
-        );
-        Some((page.id.clone(), (page.frame_id.clone(), session_id.clone(), observers)))
-    }).collect();
-    let command = process_cdp_message(text, ctx, reply_tx);
-    tokio::pin!(command);
-    loop {
-        tokio::select! {
-            () = &mut command => break,
-            Some(intercepted) = async {
-                match intercept_rx.as_mut() {
-                    Some(receiver) => receiver.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let (route, observers) = routes.get(&intercepted.page_id)
-                    .map(|(frame_id, session_id, observers)| (
-                        Some((frame_id.as_str(), Some(session_id.clone()))), observers.as_slice(),
-                    )).unwrap_or((None, &[]));
-                emit_routed_intercepted_request(intercepted, route, observers, reply_tx, intercepted_paused);
-            }
-            Some(message) = rx.recv() => {
-                if let ServerMessage::Cdp(msg) = &message {
-                    if handle_fetch_resolution(&msg.text, &msg.reply_tx, intercepted_paused) {
-                        continue;
-                    }
-                    if deferred.len() >= MAX_DEFERRED_MESSAGES {
-                        if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
-                            let response = crate::types::CdpResponse::error(
-                                req.id, -32000, "Server busy: evaluation in progress, try again later".into(), req.session_id,
-                            );
-                            if let Ok(json) = serde_json::to_string(&response) {
-                                let _ = msg.reply_tx.send(json);
-                            }
-                        }
-                        continue;
-                    }
-                }
-                deferred.push_back(message);
-            }
-        }
-    }
-}
-
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
+) {
+    process_cdp_message_with_pending(text, ctx, reply_tx, None).await;
+}
+
+async fn process_cdp_message_with_pending(
+    text: &str,
+    ctx: &mut CdpContext,
+    reply_tx: &mpsc::UnboundedSender<String>,
+    pending_runtime: Option<&mut Vec<PendingRuntimeReply>>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -2218,7 +2191,16 @@ async fn process_cdp_message(
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
     service_live_page_render_resources(ctx);
-    let response = dispatch::dispatch(&req, ctx).await;
+    let mut evaluation = None;
+    let is_awaited = matches!(req.method.as_str(), "Runtime.evaluate" | "Runtime.callFunctionOn")
+        && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true);
+    let response = if pending_runtime.as_ref().is_some_and(|pending| pending.len() >= MAX_DEFERRED_MESSAGES) && is_awaited {
+        crate::types::CdpResponse::error(req.id, -32000, "Too many pending evaluations".into(), req.session_id.clone())
+    } else if pending_runtime.is_some() {
+        dispatch::dispatch_with_deferred(&req, ctx, Some(&mut evaluation)).await
+    } else {
+        dispatch::dispatch(&req, ctx).await
+    };
     service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
@@ -2233,8 +2215,12 @@ async fn process_cdp_message(
         }
     }
 
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
+    if let (Some(evaluation), Some(pending)) = (evaluation, pending_runtime) {
+        pending.push(PendingRuntimeReply {
+            id: req.id, session_id: req.session_id, reply_tx: reply_tx.clone(), evaluation,
+        });
+    } else {
+        if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
     }
 
 }
@@ -3199,6 +3185,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pending_runtime_evaluations_do_not_block_their_resolver() {
+        use super::{cdp_processor, CdpContext, CdpMessage, ServerMessage};
+        use serde_json::Value;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        tokio::task::LocalSet::new().run_until(async {
+            let (server_tx, server_rx) = mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+            let processor = tokio::task::spawn_local(cdp_processor(
+                server_rx, CdpContext::new().default_context,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            ));
+            server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
+            reply_rx.recv().await.unwrap();
+            let send = |value: Value| {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: value.to_string(), reply_tx: reply_tx.clone(),
+                })).unwrap();
+            };
+            send(json!({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}));
+            let mut session = None;
+            loop {
+                let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if let Some(id) = value["params"]["sessionId"].as_str() { session = Some(id.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+            let session = session.expect("attached session");
+            for (id, method, params) in [
+                (2, "Runtime.evaluate", json!({"expression": "new Promise(resolve => globalThis.releasePending = resolve)", "awaitPromise": true, "returnByValue": true})),
+                (3, "Runtime.callFunctionOn", json!({"functionDeclaration": "function(){ return new Promise(resolve => globalThis.releasePending = resolve) }", "awaitPromise": true, "returnByValue": true})),
+            ] {
+                send(json!({"id": id, "method": method, "sessionId": session, "params": params}));
+                send(json!({"id": id + 10, "method": "Runtime.evaluate", "sessionId": session,
+                    "params": {"expression": "releasePending(42); 'released'", "returnByValue": true}}));
+                let mut resolved = false;
+                let mut released = false;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !resolved || !released {
+                        let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                        if value["id"] == id {
+                            assert!(value.get("error").is_none(), "{value}");
+                            assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
+                            resolved = true;
+                        } else if value["id"] == id + 10 {
+                            assert_eq!(value["result"]["result"]["value"], "released", "{value}");
+                            released = true;
+                        }
+                    }
+                }).await.expect("a pending promise must not block the command that resolves it");
+            }
+            send(json!({"id": 100, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "location.href='data:text/html,<title>next</title>'; 42", "awaitPromise": true, "returnByValue": true}}));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    if value["id"] == 100 {
+                        assert!(value.get("error").is_none(), "plain return must precede navigation: {value}");
+                        assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
+                        break;
+                    }
+                }
+            }).await.expect("script-initiated navigation must not discard a settled reply");
+            std::env::set_var("OBSCURA_CDP_COMMAND_TIMEOUT_MS", "50");
+            send(json!({"id": 200, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "new Promise(resolve => setTimeout(() => resolve({get trap(){while(true){}}}), 10))", "awaitPromise": true, "returnByValue": true}}));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    if value["id"] == 200 {
+                        assert!(value.get("error").is_some(), "a deferred result getter must remain watchdog-bounded: {value}");
+                        break;
+                    }
+                }
+            }).await.expect("deferred result serialization must not hang the worker");
+            send(json!({"id": 201, "method": "Runtime.evaluate", "sessionId": session,
+                "params": {"expression": "21*2", "returnByValue": true}}));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                    if value["id"] == 201 {
+                        assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0), "{value}");
+                        break;
+                    }
+                }
+            }).await.expect("the page must remain usable after a result getter is terminated");
+            drop(server_tx);
+            tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn awaited_runtime_requests_keep_servicing_route_replies() {
         use super::{cdp_processor, CdpContext, CdpMessage, ServerMessage};
         use serde_json::Value;
@@ -3278,7 +3355,6 @@ mod tests {
                         }
                         if value["method"] == "Network.loadingFinished" && value["sessionId"] == session { finished += 1; }
                         if value["id"] == 10 + id {
-                            assert!(completed, "unrelated V8 work must stay deferred");
                             assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
                             deferred_completed = true;
                         }

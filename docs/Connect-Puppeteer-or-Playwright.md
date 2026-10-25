@@ -86,6 +86,10 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 
 DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
 
+`Runtime.evaluate` runs scripts in the execution context's global scope, without
+calling the page's `eval`. Global lexical bindings survive subsequent evaluations
+in that context; navigation creates a fresh context.
+
 ## Capture example
 
 ```js

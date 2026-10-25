@@ -1215,7 +1215,7 @@ async fn run_fetch(
     // The browser layer refuses file:// unless the context opts in. A local
     // user running `obscura fetch file://...` on their own files is the
     // intended case; only network-facing servers (serve, mcp) keep it off.
-    context.allow_file_access = true;
+    context.set_allow_file_access(true);
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -1620,6 +1620,9 @@ async fn fetch_original_response(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
     );
+    // Same local-user opt-in as `fetch`: `--dump original file://...` reads
+    // the user's own file. The client refuses file:// unless told otherwise.
+    client.set_allow_file_access(true);
     if let Some(ua) = user_agent {
         client.set_user_agent(&ua).await;
     }
