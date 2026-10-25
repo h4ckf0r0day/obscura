@@ -1,5 +1,9 @@
+mod batch;
+
 use std::sync::Arc;
 use std::time::Instant;
+
+mod pool;
 
 use clap::{Parser, Subcommand};
 use obscura_browser::{BrowserContext, Page};
@@ -37,7 +41,10 @@ struct Args {
     #[arg(long, global = true)]
     obey_robots: bool,
 
-    #[arg(long)]
+    /// Override the User-Agent sent with every request.
+    /// Global: applies to fetch, serve, scrape, and mcp. A subcommand-level
+    /// --user-agent still wins where one exists.
+    #[arg(long, global = true)]
     user_agent: Option<String>,
 
     #[arg(long)]
@@ -83,9 +90,35 @@ enum Command {
         /// Maximum live CDP connections. Each connection runs on its own OS
         /// thread with its own V8 isolates, so this bounds the server's thread
         /// and memory footprint. Connections beyond the limit are refused with
-        /// a 503 rather than queued.
+        /// a 503 rather than queued. With --workers N the limit applies to each
+        /// worker process, so the server-wide maximum is N times this value.
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
+
+        /// Recycle a worker after it has served this many CDP connections
+        /// (/json discovery requests do not count). Needs --workers > 1. The
+        /// worker drains and a replacement takes its place; off by default.
+        #[arg(long, value_name = "N")]
+        worker_max_connections: Option<usize>,
+
+        /// Recycle a worker whose resident memory exceeds this many MB,
+        /// sampled every 2s from /proc (Linux only). Needs --workers > 1.
+        #[arg(long, value_name = "MB")]
+        worker_max_rss: Option<u64>,
+
+        /// Recycle a worker after it has run this many seconds. Needs
+        /// --workers > 1.
+        #[arg(long, value_name = "SECS")]
+        worker_max_age: Option<u64>,
+
+        /// Seconds a replaced worker may keep serving its live connections
+        /// before it is killed.
+        #[arg(long, value_name = "SECS", default_value_t = 120)]
+        worker_drain_timeout: u64,
+
+        /// Atomically publish the bound address after V8 initialization.
+        #[arg(long, value_name = "PATH")]
+        ready_file: Option<std::path::PathBuf>,
 
         /// Allow CDP clients to navigate to file:// URLs. Off by
         /// default so a CDP connection cannot read arbitrary local
@@ -96,6 +129,11 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Recursively load TTF, TTC, OTF, and OTC files from this directory.
+        /// Repeat for multiple directories. Requires a render-enabled build.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
 
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
@@ -183,6 +221,10 @@ enum Command {
     },
 
     Mcp {
+        /// Recursively load additional font files before the first render.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
+
         #[arg(long)]
         http: bool,
 
@@ -259,8 +301,39 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     )
 }
 
+fn configure_font_directories(font_dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    if font_dirs.is_empty() {
+        return Ok(());
+    }
+    for directory in font_dirs {
+        if !directory.is_dir() {
+            anyhow::bail!(
+                "Font directory does not exist or is not a directory: {}",
+                directory.display()
+            );
+        }
+    }
+
+    #[cfg(feature = "render")]
+    {
+        if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
+            anyhow::bail!("Font directories must be configured before the first render");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "render"))]
+    anyhow::bail!("--font-dir requires a render-enabled build")
+}
+
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
+}
+
+fn merge_user_agent(
+    global_user_agent: Option<String>,
+    command_user_agent: Option<String>,
+) -> Option<String> {
+    command_user_agent.or(global_user_agent)
 }
 
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
@@ -301,8 +374,31 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("obscura-main".to_string())
+        // V8 derives its stack guard from the current native thread. Deep but
+        // valid hostile documents can otherwise exhaust the platform's small
+        // default stack while the page realm is initialized. This reserves
+        // address space; pages are committed only as the stack is used.
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
+}
+
+fn operator_network_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    match obscura_net::private_network_error_hint(&message) {
+        Some(hint) => format!("{}\n{}", message, hint),
+        None => message,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
@@ -354,6 +450,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    let global_user_agent = args.user_agent.clone();
+    let global_storage_dir = args.storage_dir.clone();
     let stealth = args.stealth;
     let obey_robots = args.obey_robots;
 
@@ -365,10 +463,28 @@ async fn main() -> anyhow::Result<()> {
             user_agent,
             workers,
             max_connections,
+            worker_max_connections,
+            worker_max_rss,
+            worker_max_age,
+            worker_drain_timeout,
+            ready_file,
             allow_file_access,
             storage_dir,
+            font_dirs,
             quiet: _,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
+            let policy = pool::RecyclePolicy {
+                max_connections: worker_max_connections,
+                max_rss_mb: worker_max_rss,
+                max_age: worker_max_age.map(Duration::from_secs),
+            };
+            if policy.enabled() && workers <= 1 {
+                anyhow::bail!("--worker-max-* options require --workers > 1");
+            }
+            if policy.max_rss_mb.is_some() && !cfg!(target_os = "linux") {
+                tracing::warn!("--worker-max-rss is only supported on Linux and is ignored");
+            }
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
             // putting credentials on the command line. The multi-worker load
             // balancer passes the proxy to each worker this way (issue #366).
@@ -377,7 +493,13 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
-            print_banner(port);
+            configure_font_directories(&font_dirs)?;
+            if ready_file.is_some() && workers != 1 {
+                anyhow::bail!("--ready-file requires --workers 1");
+            }
+            if port != 0 {
+                print_banner(port);
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -386,6 +508,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
+            }
+            for directory in &font_dirs {
+                tracing::info!("Font dir: {}", directory.display());
             }
             if stealth {
                 #[cfg(feature = "stealth")]
@@ -398,9 +523,21 @@ async fn main() -> anyhow::Result<()> {
 
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
-                run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
+                run_multi_worker_serve(
+                    port,
+                    host,
+                    workers,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    font_dirs,
+                    max_connections,
+                    policy,
+                    Duration::from_secs(worker_drain_timeout),
+                )
+                .await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_serve_options_limit_and_ready_file(
                     port,
                     &host,
                     proxy,
@@ -410,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    ready_file.as_deref(),
                 )
                 .await?;
             }
@@ -430,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             screenshot,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -504,17 +643,29 @@ async fn main() -> anyhow::Result<()> {
                 global_proxy,
                 stealth,
                 obey_robots,
+                global_user_agent.clone(),
             )
             .await?;
         }
         Some(Command::Mcp {
+            font_dirs,
             http,
             host,
             port,
             proxy,
             user_agent,
         }) => {
+            let user_agent = merge_user_agent(global_user_agent.clone(), user_agent);
+            configure_font_directories(&font_dirs)?;
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
+            // `obscura mcp` builds its BrowserContext from the environment, so
+            // the global profile flag has to be handed over explicitly.
+            if let Some(ref dir) = global_storage_dir {
+                // SAFETY: single threaded here, before the MCP server starts.
+                unsafe {
+                    std::env::set_var("OBSCURA_STORAGE_DIR", dir);
+                }
+            }
             if http {
                 obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
             } else {
@@ -533,6 +684,183 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn wait_for_serve_worker(
+    child: &mut tokio::process::Child,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("worker on port {} exited during startup: {}", port, status);
+        }
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => return Ok(()),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// How often each supervisor re-checks its recycle policy (RSS and age have no
+/// event to wait on; the connection limit also wakes it directly).
+const RECYCLE_POLL: Duration = Duration::from_secs(2);
+
+fn free_port() -> std::io::Result<u16> {
+    Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+}
+
+type WorkerCommand = Arc<dyn Fn(u16) -> TokioCommand + Send + Sync>;
+
+/// Replace a dead worker, retrying until one starts. Always picks a fresh port.
+/// Returns `None` once the balancer is shutting down.
+async fn respawn_worker(
+    slot: &pool::Slot,
+    make_cmd: &WorkerCommand,
+    max_connections: Option<usize>,
+    stop: &tokio::sync::watch::Receiver<()>,
+) -> Option<tokio::process::Child> {
+    loop {
+        // ponytail: fixed retry bounds crash loops; add backoff if
+        // persistently failing worker configurations need it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if stop.has_changed().unwrap_or(true) {
+            return None;
+        }
+        let port = match free_port() {
+            Ok(port) => port,
+            Err(error) => {
+                tracing::warn!("worker port allocation failed: {}", error);
+                continue;
+            }
+        };
+        match make_cmd(port).spawn() {
+            Ok(mut replacement) => {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                match wait_for_serve_worker(&mut replacement, port, deadline).await {
+                    Ok(()) => {
+                        slot.replace(pool::Worker::new(port, max_connections, slot.wake.clone()));
+                        return Some(replacement);
+                    }
+                    Err(error) => tracing::warn!("worker {} restart failed: {}", port, error),
+                }
+            }
+            Err(error) => tracing::warn!("worker {} spawn failed: {}", port, error),
+        }
+    }
+}
+
+/// Let a replaced worker finish its live connections, then kill it. On
+/// shutdown it is stopped like the active workers.
+async fn drain_worker(
+    mut child: tokio::process::Child,
+    old: Arc<pool::Worker>,
+    timeout: Duration,
+    mut stop: tokio::sync::watch::Receiver<()>,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let outcome = loop {
+        if old.active() == 0 {
+            break "drained".to_string();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break format!("drain timeout, dropping {} live connections", old.active());
+        }
+        tokio::select! {
+            _ = child.wait() => break "exited while draining".to_string(),
+            _ = stop.changed() => {
+                stop_worker(&mut child).await;
+                break "stopped at shutdown".to_string();
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    };
+    let _ = child.kill().await;
+    tracing::info!("worker on port {} retired: {}", old.port, outcome);
+}
+
+async fn supervise_worker(
+    slot: Arc<pool::Slot>,
+    mut child: tokio::process::Child,
+    make_cmd: WorkerCommand,
+    policy: pool::RecyclePolicy,
+    drain_timeout: Duration,
+    recycles: Arc<tokio::sync::Semaphore>,
+    mut stop: tokio::sync::watch::Receiver<()>,
+) {
+    // Replaced workers still draining; awaited at shutdown so they are stopped
+    // gracefully too.
+    let mut drains = tokio::task::JoinSet::new();
+    let mut tick = tokio::time::interval(RECYCLE_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        while drains.try_join_next().is_some() {}
+        let worker = slot.current();
+        tokio::select! {
+            _ = stop.changed() => {
+                tokio::join!(stop_worker(&mut child), async {
+                    while drains.join_next().await.is_some() {}
+                });
+                return;
+            }
+            status = child.wait() => {
+                worker.set_ready(false);
+                tracing::warn!("worker on port {} exited: {:?}", worker.port, status);
+                let Some(replacement) =
+                    respawn_worker(&slot, &make_cmd, policy.max_connections, &stop).await
+                else {
+                    while drains.join_next().await.is_some() {}
+                    return;
+                };
+                child = replacement;
+                continue;
+            }
+            _ = slot.wake.notified() => {}
+            _ = tick.tick() => {}
+        }
+        if !policy.enabled() {
+            continue;
+        }
+        let rss = policy.max_rss_mb.and(child.id()).and_then(pool::rss_mb);
+        let Some(reason) = policy.reason(worker.served(), rss, worker.born.elapsed()) else {
+            continue;
+        };
+        // Bound concurrent replacement startups (not draining); if no permit
+        // is free, retry on the next tick and keep serving meanwhile.
+        let Ok(permit) = recycles.clone().try_acquire_owned() else { continue };
+        let started = Instant::now();
+        let spawned = free_port().and_then(|port| make_cmd(port).spawn().map(|c| (port, c)));
+        let (port, mut next) = match spawned {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                tracing::warn!("recycle of worker on port {} failed to spawn: {}", worker.port, error);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        if let Err(error) = wait_for_serve_worker(&mut next, port, deadline).await {
+            tracing::warn!(
+                "recycle of worker on port {} aborted, replacement failed: {}",
+                worker.port, error
+            );
+            let _ = next.kill().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        let old = slot.replace(pool::Worker::new(port, policy.max_connections, slot.wake.clone()));
+        tracing::info!(
+            "recycling worker on port {} (pid {:?}, served {}, live {}, age {}s): {}; replacement on port {} ready in {} ms",
+            old.port, child.id(), old.served(), old.active(), old.born.elapsed().as_secs(),
+            reason, port, started.elapsed().as_millis()
+        );
+        let retired = std::mem::replace(&mut child, next);
+        drop(permit);
+        drains.spawn(drain_worker(retired, old, drain_timeout, stop.clone()));
+    }
+}
+
 async fn run_multi_worker_serve(
     port: u16,
     host: String,
@@ -540,17 +868,44 @@ async fn run_multi_worker_serve(
     proxy: Option<String>,
     stealth: bool,
     user_agent: Option<String>,
+    font_dirs: Vec<std::path::PathBuf>,
+    max_connections: usize,
+    policy: pool::RecyclePolicy,
+    drain_timeout: Duration,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
 
     let exe = std::env::current_exe()?;
-    let mut children = Vec::new();
-
-    for i in 0..workers {
-        let worker_port = port + 1 + i;
-        let mut cmd = std::process::Command::new(&exe);
+    // Register before spawning workers so an early SIGTERM is not fatal to the
+    // balancer alone and leaves no orphans.
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
+    // Claim the public port before starting children so another process cannot
+    // take it during worker startup.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    // Internal worker ports are implementation details. Asking the OS for
+    // free ports avoids assuming that every port adjacent to the public one is
+    // available (or that `port + workers` cannot overflow).
+    let mut reservations = Vec::with_capacity(workers as usize);
+    for _ in 0..workers {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let worker_port = reservation.local_addr()?.port();
+        reservations.push((worker_port, reservation));
+    }
+    let host_for_workers = host.clone();
+    let make_cmd: WorkerCommand = Arc::new(move |worker_port: u16| {
+        let mut cmd = TokioCommand::new(&exe);
+        cmd.kill_on_drop(true);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Same limit per worker, not split: connections are not spread evenly,
+        // so a split would refuse clients while other workers have room.
+        cmd.arg("--max-connections").arg(max_connections.to_string());
+        // Workers receive the client-facing Host header through the TCP
+        // load balancer. Let their CDP security gate accept that public port
+        // while it continues to reject foreign hosts and browser origins.
+        cmd.env("OBSCURA_CDP_FORWARDED_HOST", &host_for_workers);
+        cmd.env("OBSCURA_CDP_FORWARDED_PORT", port.to_string());
         if let Some(ref p) = proxy {
             // Pass the proxy (which may embed credentials) via the environment,
             // not argv. A --proxy flag is visible in `ps`/`/proc/<pid>/cmdline`
@@ -561,49 +916,123 @@ async fn run_multi_worker_serve(
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
         }
+        for directory in &font_dirs {
+            cmd.arg("--font-dir").arg(directory);
+        }
         if stealth {
             cmd.arg("--stealth");
         }
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
+        cmd
+    });
+    let mut children = Vec::new();
 
-        let child = cmd.spawn()?;
-        tracing::info!("Worker {} on port {}", i + 1, worker_port);
-        children.push(child);
+    for (index, (worker_port, reservation)) in reservations.into_iter().enumerate() {
+        drop(reservation);
+        let child = make_cmd(worker_port).spawn()?;
+        tracing::info!("Worker {} on port {}", index + 1, worker_port);
+        children.push((child, worker_port));
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait only until every worker has bound its control port. The old fixed
+    // 500 ms sleep dominated multi-worker startup even when workers were ready
+    // in a few milliseconds.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    for (child, worker_port) in children.iter_mut() {
+        wait_for_serve_worker(child, *worker_port, deadline).await?;
+    }
 
-    // Bind the load balancer to the requested host, not hardcoded loopback.
+    // At most a tenth of the pool (minimum one) starts a replacement at a
+    // time, so a fleet that reaches its limit together does not stampede the
+    // CPU with simultaneous V8 startups.
+    let recycles = Arc::new(tokio::sync::Semaphore::new((workers as usize / 10).max(1)));
+    let mut slots = Vec::with_capacity(workers as usize);
+    let mut supervisors = tokio::task::JoinSet::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    for (child, worker_port) in children {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let first = pool::Worker::new(worker_port, policy.max_connections, wake.clone());
+        let slot = pool::Slot::new(first, wake);
+        slots.push(slot.clone());
+        supervisors.spawn(supervise_worker(
+            slot,
+            child,
+            make_cmd.clone(),
+            policy,
+            drain_timeout,
+            recycles.clone(),
+            stop_rx.clone(),
+        ));
+    }
+
+    // The load balancer is bound to the requested host, not hardcoded loopback.
     // With --host 0.0.0.0 (e.g. in Docker) the single-worker path already binds
     // all interfaces; the multi-worker balancer must too, or the mapped port is
     // refused from outside the container (issue #336). Workers stay on loopback
     // and are only reached by the balancer.
-    let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!("Load balancer on {}:{}, {} workers", host, port, workers);
+    if policy.enabled() {
+        tracing::info!("Worker recycling: {:?}, drain timeout {}s", policy, drain_timeout.as_secs());
+    }
 
-    let mut next_worker: u16 = 0;
+    let mut next_worker = 0usize;
 
     loop {
-        let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
-        next_worker = next_worker.wrapping_add(1);
+        let (client_stream, peer_addr) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = &mut shutdown => break,
+        };
+        if let Err(error) = client_stream.set_nodelay(true) {
+            tracing::warn!("client {} TCP_NODELAY failed: {}", peer_addr, error);
+        }
+        let Some(conn) = pool::pick(&slots, &mut next_worker) else {
+            tokio::spawn(async move {
+                let mut client = client_stream;
+                let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n").await;
+                let _ = client.shutdown().await;
+            });
+            continue;
+        };
 
+        let worker_port = conn.port();
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
 
         let mut peek_buf = [0u8; 4];
-        client_stream.peek(&mut peek_buf).await?;
+        match client_stream.peek(&mut peek_buf).await {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                continue;
+            }
+        }
 
         if &peek_buf == b"GET " {
             let mut full_peek = [0u8; 256];
-            let n = client_stream.peek(&mut full_peek).await?;
+            let n = match client_stream.peek(&mut full_peek).await {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::debug!("client {} closed before dispatch: {}", peer_addr, error);
+                    continue;
+                }
+            };
             let request_line = String::from_utf8_lossy(&full_peek[..n]);
 
             if request_line.contains("/json") {
                 let worker_addr = format!("127.0.0.1:{}", worker_port);
                 match tokio::net::TcpStream::connect(&worker_addr).await {
                     Ok(mut worker_stream) => {
+                        if let Err(error) = worker_stream.set_nodelay(true) {
+                            tracing::warn!(
+                                "worker {} TCP_NODELAY failed: {}",
+                                worker_addr,
+                                error
+                            );
+                        }
                         tokio::spawn(async move {
+                            // Held while proxying so a draining worker waits for it.
+                            let _conn = conn;
                             let std_stream = match client_stream.into_std() {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -644,9 +1073,15 @@ async fn run_multi_worker_serve(
         }
 
         let worker_addr = format!("127.0.0.1:{}", worker_port);
+        conn.count_session();
         tokio::spawn(async move {
+            let _conn = conn;
             match tokio::net::TcpStream::connect(&worker_addr).await {
                 Ok(mut worker_stream) => {
+                    if let Err(error) = worker_stream.set_nodelay(true) {
+                        tracing::warn!("worker {} TCP_NODELAY failed: {}", worker_addr, error);
+                        return;
+                    }
                     let mut client = client_stream;
                     let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                 }
@@ -661,6 +1096,56 @@ async fn run_multi_worker_serve(
             }
         });
     }
+
+    tracing::info!("Shutting down, stopping workers");
+    drop(stop_tx);
+    // Workers are stopped in parallel by their supervisors; anything left after
+    // the grace period is aborted, and kill_on_drop then kills the child.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while supervisors.join_next().await.is_some() {}
+    })
+    .await;
+    Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C elsewhere). Handlers are installed
+/// when this is called, not on first poll.
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+    }
+}
+
+/// Ask a worker to exit (SIGTERM lets it flush cookies), then kill it if it is
+/// still running after a short grace period.
+async fn stop_worker(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: plain signal send to a child we still own (not yet reaped).
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let _ = child.kill().await;
 }
 
 async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) {
@@ -727,6 +1212,10 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    // The browser layer refuses file:// unless the context opts in. A local
+    // user running `obscura fetch file://...` on their own files is the
+    // intended case; only network-facing servers (serve, mcp) keep it off.
+    context.set_allow_file_access(true);
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -825,7 +1314,7 @@ async fn run_fetch(
     .await
     {
         Ok(result) => {
-            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, operator_network_error(e)))?
         }
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
@@ -885,7 +1374,7 @@ async fn run_fetch(
                     other => other.to_string(),
                 };
                 write_or_print(rendered, output.as_ref()).await?;
-                context.save_cookies();
+                context.save_storage();
                 return Ok(());
             }
             if screenshot.is_some() {
@@ -1059,7 +1548,7 @@ async fn run_fetch(
                     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
                 );
             }
-            context.save_cookies();
+            context.save_storage();
             return Ok(());
         }
         #[cfg(not(feature = "render"))]
@@ -1084,7 +1573,7 @@ async fn run_fetch(
     write_or_print(rendered, output.as_ref()).await?;
 
     // Save cookies to disk if storage_dir is configured
-    context.save_cookies();
+    context.save_storage();
 
     Ok(())
 }
@@ -1121,7 +1610,7 @@ async fn fetch_original_response(
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
                 Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
             };
         }
@@ -1131,13 +1620,16 @@ async fn fetch_original_response(
         Arc::new(obscura_net::CookieJar::new()),
         proxy.as_deref(),
     );
+    // Same local-user opt-in as `fetch`: `--dump original file://...` reads
+    // the user's own file. The client refuses file:// unless told otherwise.
+    client.set_allow_file_access(true);
     if let Some(ua) = user_agent {
         client.set_user_agent(&ua).await;
     }
 
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
         Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
     }
 }
@@ -1207,18 +1699,14 @@ async fn run_batch_fetch(
     }
 
     let start = Instant::now();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let user_agent = Arc::new(user_agent);
     let proxy = Arc::new(proxy);
 
-    let mut handles = Vec::with_capacity(total);
-    for (i, url) in urls.into_iter().enumerate() {
-        let sem = semaphore.clone();
+    let completed = batch::run_bounded(urls.into_iter().enumerate(), concurrency, |(i, url)| {
         let user_agent = user_agent.clone();
         let proxy = proxy.clone();
 
-        handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+        async move {
             let task_start = Instant::now();
             let result = fetch_original_response(
                 &url,
@@ -1247,13 +1735,14 @@ async fn run_batch_fetch(
                 }),
             };
             (i, line)
-        }));
-    }
+        }
+    })
+    .await;
 
     let mut results: Vec<Option<serde_json::Value>> = vec![None; total];
     let mut failures = 0usize;
-    for handle in handles {
-        if let Ok((i, line)) = handle.await {
+    for result in completed {
+        if let Ok((i, line)) = result {
             if !line["ok"].as_bool().unwrap_or(false) {
                 failures += 1;
             }
@@ -1551,6 +2040,7 @@ async fn run_parallel_scrape(
     proxy: Option<String>,
     stealth: bool,
     obey_robots: bool,
+    user_agent: Option<String>,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -1583,23 +2073,19 @@ async fn run_parallel_scrape(
         );
     }
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let eval = Arc::new(eval);
     let worker_path = Arc::new(worker_path);
     let worker_timeout = Duration::from_secs(timeout_secs);
     let read_timeout = Duration::from_secs(timeout_secs.min(30));
     let shutdown_timeout = Duration::from_secs(5);
 
-    let mut handles = Vec::new();
-
-    for (i, url) in urls.into_iter().enumerate() {
-        let sem = semaphore.clone();
+    let completed = batch::run_bounded(urls.into_iter().enumerate(), concurrency, |(i, url)| {
         let eval = eval.clone();
         let worker_path = worker_path.clone();
         let proxy = proxy.clone();
+        let user_agent = user_agent.clone();
 
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+        async move {
             let task_start = Instant::now();
 
             let mut child = match TokioCommand::new(worker_path.as_ref())
@@ -1609,6 +2095,7 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
+                .env("OBSCURA_USER_AGENT", user_agent.as_deref().unwrap_or(""))
                 .spawn()
             {
                 Ok(c) => c,
@@ -1737,14 +2224,13 @@ async fn run_parallel_scrape(
                     })
                 }
             }
-        });
-
-        handles.push(handle);
-    }
+        }
+    })
+    .await;
 
     let mut results = Vec::new();
-    for handle in handles {
-        match handle.await {
+    for result in completed {
+        match result {
             Ok(result) => results.push(result),
             Err(e) => results.push(serde_json::json!({"error": e.to_string()})),
         }
@@ -1949,8 +2435,9 @@ mod tests {
     use super::{
         configure_fetch_navigation_timeout, effective_v8_flags, extract_assets,
         extract_readable_text, fetch_original_bytes, is_quiet_command, link_kind_from_rel,
-        merge_proxy, normalize_v8_flags, read_urls_from_file, resolve_asset_url, select_log_filter,
-        write_or_print, write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        merge_proxy, merge_user_agent, normalize_v8_flags, read_urls_from_file, resolve_asset_url,
+        select_log_filter, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
+        DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -2022,6 +2509,79 @@ mod tests {
         let err =
             Args::try_parse_from(["obscura", "fetch", "--file", "u.txt", "--concurrency", "0"]);
         assert!(err.is_err());
+    }
+
+    // Issue #1278 — a top-level --user-agent is global, so it reaches the
+    // subcommand whether it appears before or after the subcommand, and a
+    // subcommand-level value still wins.
+    #[test]
+    fn user_agent_before_subcommand_reaches_fetch() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--user-agent",
+            "TestUA/1.0",
+            "fetch",
+            "https://example.com",
+        ])
+        .expect("clap should accept a top-level --user-agent before the subcommand");
+        let global = args.user_agent.clone();
+        match args.command {
+            Some(Command::Fetch { user_agent, .. }) => {
+                assert_eq!(
+                    merge_user_agent(global, user_agent),
+                    Some("TestUA/1.0".to_string())
+                );
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn subcommand_user_agent_wins_over_global() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "--user-agent",
+            "Global/1.0",
+            "fetch",
+            "--user-agent",
+            "Sub/2.0",
+            "https://example.com",
+        ])
+        .expect("clap should accept both a global and a subcommand --user-agent");
+        let global = args.user_agent.clone();
+        match args.command {
+            Some(Command::Fetch { user_agent, .. }) => {
+                assert_eq!(
+                    merge_user_agent(global, user_agent),
+                    Some("Sub/2.0".to_string())
+                );
+            }
+            _ => panic!("expected Fetch command"),
+        }
+    }
+
+    #[test]
+    fn scrape_accepts_global_user_agent() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "scrape",
+            "https://example.com",
+            "--user-agent",
+            "TestUA/1.0",
+        ])
+        .expect("scrape should accept --user-agent via the global flag");
+        assert_eq!(args.user_agent, Some("TestUA/1.0".to_string()));
+    }
+
+    #[test]
+    fn merge_user_agent_prefers_command_value() {
+        assert_eq!(
+            merge_user_agent(Some("G".to_string()), Some("C".to_string())),
+            Some("C".to_string())
+        );
+        assert_eq!(merge_user_agent(Some("G".to_string()), None), Some("G".to_string()));
+        assert_eq!(merge_user_agent(None, Some("C".to_string())), Some("C".to_string()));
+        assert_eq!(merge_user_agent(None, None), None);
     }
 
     #[test]
@@ -2197,6 +2757,44 @@ mod tests {
     fn parsed_serve_command_is_not_quiet() {
         let args = Args::try_parse_from(["obscura", "serve"]).expect("clap should accept serve");
         assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn parsed_serve_accepts_repeated_font_directories() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--font-dir",
+            "/fonts/cjk",
+            "--font-dir",
+            "/fonts/brand",
+        ])
+        .expect("clap should accept repeatable --font-dir");
+        match args.command {
+            Some(Command::Serve { font_dirs, .. }) => assert_eq!(
+                font_dirs,
+                [
+                    std::path::PathBuf::from("/fonts/cjk"),
+                    std::path::PathBuf::from("/fonts/brand"),
+                ]
+            ),
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn parsed_mcp_accepts_repeated_font_directories() {
+        let args = Args::try_parse_from([
+            "obscura", "mcp", "--font-dir", "/fonts/cjk", "--font-dir", "/fonts/brand",
+        ])
+        .expect("clap should accept MCP font directories");
+        match args.command {
+            Some(Command::Mcp { font_dirs, .. }) => assert_eq!(
+                font_dirs,
+                [std::path::PathBuf::from("/fonts/cjk"), std::path::PathBuf::from("/fonts/brand")]
+            ),
+            _ => panic!("expected Mcp command"),
+        }
     }
 
     #[test]

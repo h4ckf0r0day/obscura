@@ -86,6 +86,10 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 
 DOM-agent frameworks such as browser-use also connect: obscura implements `DOMSnapshot.captureSnapshot` and `Target.targetInfoChanged` for perception, and `DOM.focus` so a focused field receives `Input.dispatchKeyEvent` keystrokes.
 
+`Runtime.evaluate` runs scripts in the execution context's global scope, without
+calling the page's `eval`. Global lexical bindings survive subsequent evaluations
+in that context; navigation creates a fresh context.
+
 ## Capture example
 
 ```js
@@ -98,6 +102,44 @@ await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 Rendering is included in official binaries and requires `--features render`
 for source builds. The client-specific guides cover scrolling, raw CDP
 screencasting, and current output limits.
+
+## Raw CDP node queries
+
+`DOM.getAttributes`, `DOM.requestNode`, `DOM.requestChildNodes`, and
+`DOM.getNodeForLocation` support the top-level light DOM. Request the document
+with `DOM.getDocument` before publishing frontend node IDs. Ancestors and
+requested children arrive through session-scoped `DOM.setChildNodes` events;
+navigation clears the node cache and emits `DOM.documentUpdated`.
+
+Live mutation events are not implemented yet. Request the document again to
+publish newly inserted children of an already-published parent. `requestChildNodes` accepts
+`pierce: true` on plain light-DOM subtrees, but rejects requests that would
+require frame or shadow-tree traversal. Detached-node publication and
+`ignorePointerEventsNone: true` hit testing are not supported. The remaining work is tracked in
+[#1291](https://github.com/h4ckf0r0day/obscura/issues/1291).
+
+## Element visibility queries
+
+Render builds implement `element.checkVisibility()` using the rendered flat tree.
+Disconnected elements, `display: none` subtrees, `display: contents` elements,
+closed-details content, and unassigned light-DOM children have no visible box.
+Zero-sized boxes are not automatically rejected. Queries use the element's owning
+document, including iframe documents.
+
+The `opacityProperty` / `checkOpacity` and `visibilityProperty` /
+`checkVisibilityCSS` options enable the corresponding CSS checks. Without
+rendering, only inline styles are checked. CSS `content-visibility: hidden` and
+`content-visibility: auto` skipping are not implemented, including the
+`contentVisibilityAuto` option.
+Listbox option/optgroup boxes are also not rendered, so their visibility queries
+currently return `false` even when Chromium returns `true`.
+
+Native table rows and sections can be revealed with explicit `display: table-row`,
+`table-row-group`, `table-header-group`, and `table-footer-group` declarations.
+CSS-created tables with explicit rows/groups share column tracks and expose row
+and group geometry. Full anonymous-table fixup for mixed content is not implemented;
+unsupported CSS table structures retain ordinary box layout rather than dropping
+their non-table children.
 
 ## Current limits
 

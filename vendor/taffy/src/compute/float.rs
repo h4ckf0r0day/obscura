@@ -93,16 +93,14 @@ impl Segment {
 struct FloatFitter {
     /// The overall width of the Block Formatting Context
     bfc_width: f32,
-    /// The total height of the set of segments currently being considered
-    slot_height: f64,
     /// The union of the insets of the set of segments currently being considered
     insets: [f32; 2],
 }
 
 impl FloatFitter {
     /// Create a new `FloatFitter`
-    fn new(bfc_width: f32, slot_height: f32, insets: [f32; 2]) -> Self {
-        Self { bfc_width, slot_height: slot_height as f64, insets }
+    fn new(bfc_width: f32, insets: [f32; 2]) -> Self {
+        Self { bfc_width, insets }
     }
 
     // Horizontal fitting
@@ -119,17 +117,6 @@ impl FloatFitter {
         self.insets == [0.0, 0.0] || self.bfc_width - self.insets[0] - self.insets[1] - width >= 0.0
     }
 
-    // Vertical fitting
-
-    /// Add the height of another segment.
-    fn add_height(&mut self, height: f32) {
-        self.slot_height += height as f64;
-    }
-
-    /// Given the currently accounted for height, check whether the box fits vertically
-    fn fits_vertically(&mut self, height: f32) -> bool {
-        self.slot_height >= height as f64
-    }
 }
 
 /// A context for placing floated boxes
@@ -307,8 +294,8 @@ impl FloatContext {
             }
 
             start_y = start_y.max(start_segment.y.start);
-            let available_height = start_segment.y.end - start_y;
-            let mut fitter = FloatFitter::new(self.available_width, available_height, containing_block_insets);
+            let float_end = start_y + floated_box.height;
+            let mut fitter = FloatFitter::new(self.available_width, containing_block_insets);
             fitter.union_insets(start_segment.insets);
 
             // Pinning the start segment, loop over segments starting with the start segment
@@ -341,10 +328,8 @@ impl FloatContext {
                 //
                 // If it does not (yet) fit vertically then continue the inner loop to add another
                 // segment to the range of segments we are placing the float in
-                if end_idx != start_idx {
-                    fitter.add_height(end_segment.y.end - end_segment.y.start);
-                }
-                if !fitter.fits_vertically(floated_box.height) {
+                // Compare endpoints directly: summing rounded segment heights can miss an exact boundary.
+                if float_end > end_segment.y.end {
                     end_idx += 1;
                     continue;
                 }

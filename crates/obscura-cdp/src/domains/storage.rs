@@ -36,7 +36,11 @@ pub async fn handle(
         "setCookies" => {
             if let Some(cookies) = params.get("cookies").and_then(|v| v.as_array()) {
                 let parsed: Vec<_> = cookies.iter().filter_map(parse_cdp_cookie).collect();
-                cookie_jar_for(ctx, params, session_id)?.set_cookies_from_cdp(parsed);
+                cookie_jar_for(ctx, params, session_id)?.set_cookies_from_cdp_with_scope(
+                    parsed
+                        .into_iter()
+                        .map(|cookie| (cookie.cookie, cookie.host_only)),
+                );
             }
             Ok(json!({}))
         }

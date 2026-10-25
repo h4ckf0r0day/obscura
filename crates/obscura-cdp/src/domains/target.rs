@@ -91,6 +91,9 @@ pub async fn handle(
             let committed_document = if let Some(page) = ctx.get_page_mut(&page_id) {
                 if url == "about:blank" || url.is_empty() {
                     page.navigate_blank();
+                    // Chrome keeps the new tab's about:blank as the first
+                    // session history entry, so history.back() can return to it.
+                    page.push_history(page.url_string());
                     None
                 } else {
                     page.navigate(url).await.ok().map(|_| {
@@ -148,7 +151,7 @@ pub async fn handle(
             // Playwright calls this on connect to obtain a session for the
             // implicit "browser" target. Returning Unknown method aborts
             // the connect handshake before any user code runs.
-            let session_id = "browser-session".to_string();
+            let session_id = format!("browser-{}", uuid::Uuid::new_v4());
             ctx.sessions
                 .insert(session_id.clone(), "browser".to_string());
 
@@ -215,38 +218,24 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let mut sessions = ctx.sessions.iter()
-                .filter(|(_, page_id)| page_id.as_str() == target_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect::<Vec<_>>();
-            sessions.sort_unstable();
-            for session_id in sessions {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.detachedFromTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetId": target_id,
-                    }),
-                ));
-            }
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.targetDestroyed",
-                json!({ "targetId": target_id }),
-            ));
-
-            ctx.remove_page(target_id);
+            close_target(ctx, target_id);
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => Ok(json!({})),
-        // No multi-target lifecycle to manage: obscura runs one page per session.
-        // Ack these so Chrome-shaped clients that call them do not warn (issue #340).
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                let page_id = ctx.sessions.get(session_id).cloned();
-                ctx.sessions.remove(session_id);
+                let page_id = ctx.sessions.remove(session_id);
+                ctx.dom_documents.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
+                ctx.lifecycle_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
+                    let params = json!({"sessionId": session_id, "targetId": page_id});
+                    let event = match parent_session_id {
+                        Some(parent) => CdpEvent::with_session("Target.detachedFromTarget", params, parent.clone()),
+                        None => CdpEvent::new("Target.detachedFromTarget", params),
+                    };
+                    ctx.pending_events.push(event);
                 }
                 #[cfg(feature = "render")]
                 ctx.screencasts.remove(session_id);
@@ -330,6 +319,31 @@ pub async fn handle(
     }
 }
 
+/// Detach the target's sessions, announce destruction, and release its state.
+pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
+    let mut sessions = ctx.sessions
+        .iter()
+        .filter(|(_, page_id)| page_id.as_str() == target_id)
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    for session_id in sessions {
+        ctx.pending_events.push(CdpEvent::new(
+            "Target.detachedFromTarget",
+            json!({
+                "sessionId": session_id,
+                "targetId": target_id,
+            }),
+        ));
+    }
+    ctx.pending_events.push(CdpEvent::new(
+        "Target.targetDestroyed",
+        json!({ "targetId": target_id }),
+    ));
+
+    ctx.remove_page(target_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,9 +403,9 @@ mod tests {
             .await
             .expect("attachToBrowserTarget should succeed");
 
-        assert_eq!(result["sessionId"], "browser-session");
+        let session_id = result["sessionId"].as_str().unwrap();
         assert_eq!(
-            ctx.sessions.get("browser-session").map(String::as_str),
+            ctx.sessions.get(session_id).map(String::as_str),
             Some("browser")
         );
 
@@ -403,8 +417,28 @@ mod tests {
             .iter()
             .find(|e| e.method == "Target.attachedToTarget")
             .expect("attachedToTarget event must be emitted");
-        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["sessionId"], session_id);
         assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+    }
+
+    #[tokio::test]
+    async fn browser_attachments_detach_independently() {
+        let mut ctx = CdpContext::new();
+        for detach_second in [false, true] {
+            let first = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
+                .await.unwrap();
+            let second = handle("attachToBrowserTarget", &json!({}), &mut ctx, &None)
+                .await.unwrap();
+            assert_ne!(first["sessionId"], second["sessionId"]);
+            let (removed, retained) = if detach_second { (&second, &first) } else { (&first, &second) };
+            handle("detachFromTarget", &json!({"sessionId": removed["sessionId"]}), &mut ctx, &None)
+                .await.unwrap();
+            assert!(!ctx.sessions.contains_key(removed["sessionId"].as_str().unwrap()));
+            assert_eq!(ctx.sessions.get(retained["sessionId"].as_str().unwrap()).map(String::as_str), Some("browser"));
+            handle("detachFromTarget", &json!({"sessionId": retained["sessionId"]}), &mut ctx, &None)
+                .await.unwrap();
+            assert!(ctx.sessions.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -461,6 +495,7 @@ mod tests {
         .await
         .unwrap();
         let session_id = attached["sessionId"].as_str().unwrap().to_string();
+        ctx.pending_events.clear();
 
         handle(
             "detachFromTarget",
@@ -471,6 +506,13 @@ mod tests {
         .await
         .expect("detach should succeed");
         assert!(!ctx.sessions.contains_key(&session_id));
+        assert!(ctx.get_page(&page_id).is_some(), "detach must not destroy the target");
+        assert_eq!(ctx.pending_events.len(), 1);
+        let event = &ctx.pending_events[0];
+        assert_eq!(event.method, "Target.detachedFromTarget");
+        assert_eq!(event.session_id, parent_session);
+        assert_eq!(event.params["sessionId"], session_id);
+        assert_eq!(event.params["targetId"], page_id);
     }
 
     #[tokio::test]

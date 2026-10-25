@@ -66,7 +66,7 @@ impl CookieStore {
     pub fn get_for_url(&self, url: &str) -> Result<Vec<Cookie>, crate::error::Error> {
         let parsed = url::Url::parse(url)
             .map_err(|e| crate::error::Error::Internal(e.into()))?;
-        let header = self.jar.get_cookie_header(&parsed);
+        let header = self.jar.get_cookie_header_same_site(&parsed);
         Ok(header
             .split("; ")
             .filter(|s| !s.is_empty())

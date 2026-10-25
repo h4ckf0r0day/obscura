@@ -77,12 +77,12 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build no-render release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features
 
       - name: Stage no-render release binary
         shell: bash
         run: |
-          BIN_DIR=target/${{ matrix.target }}/release
+          BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/no-render
           if [ -f "$BIN_DIR/obscura.exe" ]; then
             cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/no-render/
@@ -91,12 +91,12 @@ jobs:
           fi
 
       - name: Build no-render stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
 
       - name: Stage no-render stealth release binary
         shell: bash
         run: |
-          BIN_DIR=target/${{ matrix.target }}/release
+          BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/no-render-stealth
           if [ -f "$BIN_DIR/obscura.exe" ]; then
             cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/no-render-stealth/
@@ -105,12 +105,12 @@ jobs:
           fi
 
       - name: Build render-enabled release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render
 
       - name: Stage default release binary
         shell: bash
         run: |
-          BIN_DIR=target/${{ matrix.target }}/release
+          BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/default
           if [ -f "$BIN_DIR/obscura.exe" ]; then
             cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/default/
@@ -119,12 +119,12 @@ jobs:
           fi
 
       - name: Build render-enabled stealth release binary
-        run: cargo build --release --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
+        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
 
       - name: Stage stealth release binary
         shell: bash
         run: |
-          BIN_DIR=target/${{ matrix.target }}/release
+          BIN_DIR=target/${{ matrix.target }}/release-dist
           mkdir -p dist/stealth
           if [ -f "$BIN_DIR/obscura.exe" ]; then
             cp "$BIN_DIR/obscura.exe" "$BIN_DIR/obscura-worker.exe" dist/stealth/

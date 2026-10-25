@@ -21,13 +21,20 @@ fn js_str(s: &str) -> String {
 // they left out: a newline inside a single-quoted literal is a syntax error,
 // so the whole snippet was dropped and nothing was inserted. obscura-mcp
 // already builds its typing snippet this way.
-fn insert_text_js(text: &str) -> String {
+fn insert_text_js(text: &str, ime_commit: bool) -> String {
     let literal = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            if (globalThis.__obscura_isDisabled(t)) return;\
+            if (!{ime_commit} && t.hasAttribute('readonly')) return;\
             var ins = {text};\
+            var commitStart = {ime_commit} ? t.selectionStart : null;\
+            if ({ime_commit} && commitStart == null) commitStart = (t.value || '').length;\
+            var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\
+            if (!t.dispatchEvent(before)) return;\
+            if (t.hasAttribute('readonly') || globalThis.__obscura_isDisabled(t)) return;\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
             if (s == null) {{\
@@ -37,10 +44,10 @@ fn insert_text_js(text: &str) -> String {
                 e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
                 var lo = Math.min(s, e), hi = Math.max(s, e);\
                 globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
-                var caret = lo + ins.length;\
+                var caret = Math.max(0, Math.min((commitStart == null ? lo : commitStart) + ins.length, t.value.length));\
                 t.setSelectionRange(caret, caret);\
             }}\
-            t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+            t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ins,inputType:'insertText'}})));\
         }})()",
         text = literal,
     )
@@ -53,10 +60,19 @@ fn insert_text_js(text: &str) -> String {
 const BACKSPACE_JS: &str = "(function() {\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.hasAttribute('readonly')) return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
+    function backCount(str, p) {\
+        if (p >= 2) {\
+            var low = str.charCodeAt(p - 1), high = str.charCodeAt(p - 2);\
+            if (low >= 0xDC00 && low <= 0xDFFF && high >= 0xD800 && high <= 0xDBFF) return 2;\
+        }\
+        return 1;\
+    }\
     if (s == null) {\
-        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, -1));\
+        var n = backCount(v, v.length);\
+        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, v.length - n));\
     } else {\
         s = Math.max(0, Math.min(s, v.length));\
         e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
@@ -65,10 +81,28 @@ const BACKSPACE_JS: &str = "(function() {\
             globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + v.slice(hi));\
             t.setSelectionRange(lo, lo);\
         } else if (s > 0) {\
-            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, s - 1) + v.slice(s));\
-            t.setSelectionRange(s - 1, s - 1);\
+            var d = backCount(v, s);\
+            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, s - d) + v.slice(s));\
+            t.setSelectionRange(s - d, s - d);\
         }\
     }\
+    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
+})()";
+
+const DELETE_JS: &str = "(function() {\
+    var t = document.activeElement;\
+    if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.hasAttribute('readonly')) return;\
+    var v = t.value || '';\
+    var s = t.selectionStart, e = t.selectionEnd;\
+    if (s == null) return;\
+    s = Math.max(0, Math.min(s, v.length));\
+    e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
+    var lo = Math.min(s, e), hi = Math.max(s, e);\
+    if (lo === hi) hi = Math.min(v.length, hi + 1);\
+    if (lo === hi) return;\
+    globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + v.slice(hi));\
+    t.setSelectionRange(lo, lo);\
     t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
@@ -124,7 +158,35 @@ pub async fn handle(
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
 
-            if event_type == "mousePressed" {
+            if event_type == "mouseMoved" {
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                    let code = format!(
+                        "(function() {{\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
+                            if (!target) return;\
+                            var old = globalThis.__obscura_hover_target || null;\
+                            globalThis.__obscura_hover_target = target;\
+                            globalThis.__obscura_setHovered(target);\
+                            var init = {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
+                            if (old !== target) {{\
+                                if (old) old.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseout', Object.assign({{}}, init, {{relatedTarget:target}}))));\
+                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', Object.assign({{}}, init, {{relatedTarget:old}}))));\
+                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', Object.assign({{}}, init, {{bubbles:false,relatedTarget:old}}))));\
+                            }}\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', init)));\
+                        }})()",
+                        x = x,
+                        y = y,
+                        button_code = button_code,
+                        buttons = buttons,
+                        alt_key = alt_key,
+                        ctrl_key = ctrl_key,
+                        meta_key = meta_key,
+                        shift_key = shift_key,
+                    );
+                    page.evaluate(&code);
+                }
+            } else if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
@@ -132,8 +194,36 @@ pub async fn handle(
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var previousTarget = globalThis.__obscura_mouse_over_target || null;\
+                            if (previousTarget !== target) {{\
+                                function ancestry(node) {{ var path=[]; while (node) {{ path.push(node); node=node.parentNode || null; }} return path; }}\
+                                function pointerEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
+                                function mouseEvent(node,type,bubbles,related) {{ node.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent(type, {{bubbles:bubbles,cancelable:bubbles,composed:bubbles,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,relatedTarget:related,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}))); }}\
+                                var oldPath = previousTarget && previousTarget.isConnected ? ancestry(previousTarget) : [];\
+                                var newPath = ancestry(target);\
+                                var common = newPath.find(function(node) {{ return oldPath.includes(node); }}) || null;\
+                                var exited = common ? oldPath.slice(0, oldPath.indexOf(common)) : oldPath;\
+                                var entered = common ? newPath.slice(0, newPath.indexOf(common)) : newPath;\
+                                if (previousTarget && previousTarget.isConnected) pointerEvent(previousTarget,'pointerout',true,target);\
+                                for (var pi=0; pi<exited.length; pi++) pointerEvent(exited[pi],'pointerleave',false,target);\
+                                pointerEvent(target,'pointerover',true,previousTarget);\
+                                for (var pe=entered.length-1; pe>=0; pe--) pointerEvent(entered[pe],'pointerenter',false,previousTarget);\
+                                if (previousTarget && previousTarget.isConnected) mouseEvent(previousTarget,'mouseout',true,target);\
+                                for (var mi=0; mi<exited.length; mi++) mouseEvent(exited[mi],'mouseleave',false,target);\
+                                mouseEvent(target,'mouseover',true,previousTarget);\
+                                for (var me=entered.length-1; me>=0; me--) mouseEvent(entered[me],'mouseenter',false,previousTarget);\
+                                globalThis.__obscura_mouse_over_target = target;\
+                            }}\
+                            var focusTarget = target.closest && target.closest('input,select,textarea,button,a[href],[tabindex],[contenteditable]');\
+                            var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            target.dispatchEvent(pointer);\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
+                            if (!evt.defaultPrevented) {{\
+                                var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex]'));\
+                                if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
+                                else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();\
+                            }}\
                         }})()",
                         x = x,
                         y = y,
@@ -144,6 +234,7 @@ pub async fn handle(
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,
                         shift_key = shift_key,
+                        pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
                     );
                     page.evaluate(&code);
                 }
@@ -155,7 +246,9 @@ pub async fn handle(
                             if (!target) return;\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            target.dispatchEvent(pointer);\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
@@ -167,8 +260,8 @@ pub async fn handle(
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
                             if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
-                            var oldChecked = checkable ? !!clickTarget.checked : false;\
-                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
+                            var oldChecked = checkable ? globalThis.__obscura_inputChecked(clickTarget) : false;\
+                            var oldIndeterminate = checkable ? globalThis.__obscura_inputIndeterminate(clickTarget) : false;\
                             var radioStates = null;\
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
@@ -178,24 +271,28 @@ pub async fn handle(
                                     for (var ri = 0; ri < candidates.length; ri++) {{\
                                         var radio = candidates[ri];\
                                         if ((radio.getAttribute('type') || '').toLowerCase() !== 'radio' || (radio.getAttribute('name') || '') !== radioName || radio.form !== clickTarget.form) continue;\
-                                        radioStates.push([radio, !!radio.checked]);\
-                                        if (radio !== clickTarget) radio.checked = false;\
+                                        radioStates.push([radio, globalThis.__obscura_inputChecked(radio)]);\
+                                        if (radio !== clickTarget) globalThis.__obscura_setInputChecked(radio, false);\
                                     }}\
                                 }}\
-                                clickTarget.checked = true;\
+                                globalThis.__obscura_setInputChecked(clickTarget, true);\
                             }} else if (checkable) {{\
-                                clickTarget.checked = !oldChecked;\
-                                clickTarget.indeterminate = false;\
+                                globalThis.__obscura_setInputChecked(clickTarget, !oldChecked);\
+                                globalThis.__obscura_setInputIndeterminate(clickTarget, false);\
                             }}\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
-                                    for (var rr = 0; rr < radioStates.length; rr++) radioStates[rr][0].checked = radioStates[rr][1];\
-                                }} else if (checkable) {{ clickTarget.checked = oldChecked; clickTarget.indeterminate = oldIndeterminate; }}\
+                                    for (var rr = 0; rr < radioStates.length; rr++) globalThis.__obscura_setInputChecked(radioStates[rr][0], radioStates[rr][1]);\
+                                }} else if (checkable) {{ globalThis.__obscura_setInputChecked(clickTarget, oldChecked); globalThis.__obscura_setInputIndeterminate(clickTarget, oldIndeterminate); }}\
                                 return;\
                             }}\
-                            if (checkable && clickTarget.checked !== oldChecked) {{\
+                            if ({click_count} === 2) {{\
+                                var doubleClick = globalThis.__obscura_markTrusted(new MouseEvent('dblclick', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:2,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                clickTarget.dispatchEvent(doubleClick);\
+                            }}\
+                            if (checkable && globalThis.__obscura_inputChecked(clickTarget) !== oldChecked) {{\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
@@ -208,12 +305,17 @@ pub async fn handle(
                             }}\
                             var link = clickTarget.closest ? clickTarget.closest('a[href]') : null;\
                             if (!link && tag === 'A' && clickTarget.getAttribute('href')) link = clickTarget;\
+                            var submitButton = tag === 'BUTTON' ? clickTarget : (clickTarget.closest ? clickTarget.closest('button') : null);\
+                            var submitButtonType = submitButton ? ((submitButton.getAttribute('type') || '').toLowerCase()) : '';\
                             if (link) {{\
                                 var href = link.getAttribute('href');\
-                                if (href && !href.startsWith('#') && !href.startsWith('javascript:')) location.assign(href);\
-                            }} else if (tag === 'BUTTON' && type !== 'button' && type !== 'reset') {{\
-                                var form = clickTarget.closest ? clickTarget.closest('form') : null;\
-                                if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(clickTarget); }} else {{ form.submit(clickTarget); }} }} catch(e) {{}} }}\
+                                if (href && !href.startsWith('javascript:')) {{\
+                                    if (href.startsWith('#')) history.pushState(null, '', href);\
+                                    else location.assign(href);\
+                                }}\
+                            }} else if (submitButton && submitButtonType !== 'button' && submitButtonType !== 'reset' && !globalThis.__obscura_isDisabled(submitButton)) {{\
+                                var form = submitButton.closest ? submitButton.closest('form') : null;\
+                                if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(submitButton); }} else {{ form.submit(submitButton); }} }} catch(e) {{}} }}\
                             }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
                                 var form2 = clickTarget.closest ? clickTarget.closest('form') : null;\
                                 if (form2) {{ try {{ if (typeof form2.requestSubmit === 'function') {{ form2.requestSubmit(clickTarget); }} else {{ form2.submit(clickTarget); }} }} catch(e) {{}} }}\
@@ -233,43 +335,18 @@ pub async fn handle(
                         shift_key = shift_key,
                     );
                     page.evaluate(&code);
-                    let moved = page
-                        .process_pending_navigation()
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    // Fork: a single page app answers a click by routing itself,
-                    // with no document fetch. The client still has to be told the
-                    // frame moved, or the click looks like it did nothing.
-                    if moved {
-                        let url = page.url_string();
-                        let frame_id = page.frame_id.clone();
-                        Some((page.id.clone(), frame_id, url))
+                    // Document navigation runs after the input acknowledgement.
+                    // Same-document routing still needs a frame notification.
+                    if !page.has_pending_navigation() && page.sync_virtual_url() {
+                        Some((page.frame_id.clone(), page.url_string()))
                     } else {
                         None
                     }
                 } else {
                     None
                 };
-                if let Some((page_id, frame_id, url)) = moved_frame {
-                    let loader_id = ctx
-                        .current_loader_ids
-                        .get(&page_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                    ctx.pending_events.push(crate::types::CdpEvent {
-                        method: "Page.frameNavigated".into(),
-                        params: json!({
-                            "frame": crate::domains::page::frame_value(
-                                &frame_id,
-                                None,
-                                &loader_id,
-                                &url,
-                                "text/html",
-                            ),
-                            "type": "Navigation",
-                        }),
-                        session_id: Some(session_id.clone().unwrap_or_default()),
-                    });
+                if let Some((frame_id, url)) = moved_frame {
+                    crate::domains::page::emit_same_document_navigation(ctx, session_id, &frame_id, &url);
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -329,15 +406,23 @@ pub async fn handle(
         "insertText" => {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.evaluate(&insert_text_js(text));
+                // IME commits snapshot the final caret before beforeinput.
+                // Keyboard insertion instead follows the handler's selection.
+                page.evaluate(&insert_text_js(text, true));
             }
             Ok(json!({}))
         }
         "dispatchKeyEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let virtual_key_code = params
+                .get("windowsVirtualKeyCode")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
@@ -345,8 +430,8 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
-                                target.dispatchEvent(evt);\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                return target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -354,11 +439,14 @@ pub async fn handle(
                             // and produce a syntax error that drops the event.
                             key = js_str(key),
                             code = js_str(code),
+                            virtual_key_code = virtual_key_code,
                         );
-                        page.evaluate(&js);
+                        if page.evaluate(&js).as_bool() == Some(false) {
+                            return Ok(json!({}));
+                        }
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
-                            page.evaluate(&insert_text_js(text));
+                            page.evaluate(&insert_text_js(text, false));
                         }
 
                         if key == "Enter" {
@@ -369,37 +457,50 @@ pub async fn handle(
                             let js = "(function() {\
                                 var target = document.activeElement;\
                                 if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
+                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
                                 if (target.localName === 'textarea') {\
-                                    globalThis.__obscura_setFieldValue(target, 'value', (target.value || '') + '\\n');\
+                                    if (target.hasAttribute('readonly')) return;\
+                                    var value = target.value || '';\
+                                    var start = target.selectionStart, end = target.selectionEnd;\
+                                    start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
+                                    end = end == null ? start : Math.max(0, Math.min(end, value.length));\
+                                    var lower = Math.min(start, end), upper = Math.max(start, end);\
+                                    globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\\n' + value.slice(upper));\
+                                    target.setSelectionRange(lower + 1, lower + 1);\
                                     target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
                                     var form = target.form || (target.closest && target.closest('form'));\
                                     if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
                                 }\
-                            })()";
-                            page.evaluate(js);
+                            })()".replace("$VK", &virtual_key_code.to_string())
+                                .replace("$MODIFIERS", &format!("altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}"));
+                            page.evaluate(&js);
                         }
 
                         if key == "Backspace" {
                             page.evaluate(BACKSPACE_JS);
+                        }
+
+                        if key == "Delete" {
+                            page.evaluate(DELETE_JS);
                         }
                     }
                     "keyUp" => {
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             key = js_str(key),
                             code = js_str(code),
+                            virtual_key_code = virtual_key_code,
                         );
                         page.evaluate(&js);
                     }
                     "char" => {
                         if !text.is_empty() {
-                            page.evaluate(&insert_text_js(text));
+                            page.evaluate(&insert_text_js(text, false));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }

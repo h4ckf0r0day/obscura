@@ -1,8 +1,5 @@
-//! Regression test for issue #175: the MCP HTTP server's OPTIONS preflight
-//! response must list every header a browser MCP client may send, including
-//! `mcp-protocol-version` (from the MCP spec) and `Authorization` /
-//! `X-API-Key` (common in hosted deployments). Otherwise the browser blocks
-//! the actual request with a CORS error.
+//! Browser callers are denied unless the operator explicitly allowlists their
+//! Origin. Native MCP clients send no Origin and are unaffected.
 
 use std::net::TcpListener as StdListener;
 use std::time::Duration;
@@ -19,7 +16,7 @@ fn pick_free_port() -> u16 {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn options_preflight_lists_required_browser_headers() {
+async fn browser_preflight_is_denied_without_an_origin_allowlist() {
     let port = pick_free_port();
     let local = LocalSet::new();
 
@@ -60,27 +57,9 @@ async fn options_preflight_lists_required_browser_headers() {
 
         server.abort();
 
-        assert!(
-            response.starts_with("HTTP/1.1 204"),
-            "expected 204 No Content preflight, got:\n{response}"
-        );
+        assert!(response.starts_with("HTTP/1.1 403"), "expected 403, got:\n{response}");
         let lc = response.to_lowercase();
-        assert!(
-            lc.contains("access-control-allow-headers:"),
-            "preflight must include Access-Control-Allow-Headers; got:\n{response}"
-        );
-        assert!(
-            lc.contains("mcp-protocol-version"),
-            "ACAH must list mcp-protocol-version (per MCP spec); got:\n{response}"
-        );
-        assert!(
-            lc.contains("authorization"),
-            "ACAH must list Authorization for hosted deployments; got:\n{response}"
-        );
-        assert!(
-            lc.contains("x-api-key"),
-            "ACAH must list X-API-Key for hosted deployments; got:\n{response}"
-        );
+        assert!(!lc.contains("access-control-allow-origin: *"));
     })
     .await;
 }

@@ -3,16 +3,21 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
 use deno_core::error::ModuleLoaderError;
+use deno_core::ModuleLoadOptions;
+use deno_core::ModuleLoadReferrer;
 use deno_core::ModuleLoadResponse;
 use deno_core::ModuleLoader;
 use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
-use deno_core::RequestedModuleType;
+
+use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::ObscuraState;
+use crate::ops::{ObscuraState, JsNetworkEvent, StoredNetworkResponseBody, FetchNetworkGuard, record_network_completion};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -146,7 +151,7 @@ impl ObscuraModuleLoader {
 }
 
 fn io_err(msg: String) -> ModuleLoaderError {
-    std::io::Error::new(std::io::ErrorKind::Other, msg).into()
+    JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
 impl ModuleLoader for ObscuraModuleLoader {
@@ -162,7 +167,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         // must not remap that root URL.
         if referrer == "." {
             return deno_core::resolve_import(specifier, &self.base_url)
-                .map_err(|error| error.into());
+                .map_err(|error| io_err(error.to_string()));
         }
 
         let base = if referrer.is_empty()
@@ -186,9 +191,8 @@ impl ModuleLoader for ObscuraModuleLoader {
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
-        maybe_referrer: Option<&ModuleSpecifier>,
-        is_dyn_import: bool,
-        _requested_module_type: RequestedModuleType,
+        maybe_referrer: Option<&ModuleLoadReferrer>,
+        options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
         // Module-graph CORS and same-origin credentials are relative to the
@@ -199,7 +203,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         let document_url = ModuleSpecifier::parse(&self.base_url)
             .unwrap_or_else(|_| module_specifier.clone());
         let referrer = maybe_referrer
-            .cloned()
+            .map(|referrer| referrer.specifier.clone())
             .unwrap_or_else(|| document_url.clone());
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
@@ -211,7 +215,9 @@ impl ModuleLoader for ObscuraModuleLoader {
         // runtime between deno_core accepting the load and first polling it.
         // Keeping the guard inside the future makes cancellation/navigation
         // decrement the count through Drop as well as success and failure.
+        let is_dyn_import = options.is_dynamic_import;
         let activity_guard = is_dyn_import.then(|| activity.begin());
+        let page_state = self.page_state.clone();
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
                 let state = weak
@@ -250,7 +256,7 @@ impl ModuleLoader for ObscuraModuleLoader {
         };
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
-            // deno_core propagates `is_dyn_import` to every dependency edge in
+            // deno_core propagates `is_dynamic_import` to every dependency edge in
             // the recursive graph, so this excludes parser-discovered/static
             // graphs without losing descendant fetches of a lazy graph.
             let _activity_guard = activity_guard;
@@ -264,6 +270,23 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Ok((client, stealth, callbacks)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                    static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
+                        1, std::sync::atomic::Ordering::Relaxed,
+                    ));
+                    // Keep failed and cancelled graph fetches visible to the
+                    // same Network listeners as ordinary fetch/XHR failures.
+                    let mut network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
+                        state: state.clone(), cancel: None,
+                        event: Some(JsNetworkEvent {
+                            request_id: request_id.clone(), intercepted: false,
+                            url: url.clone(), method: "GET".to_string(),
+                            resource_type: "Script".to_string(), status: 0,
+                            response_headers: Default::default(), body_size: 0,
+                            timestamp: 0.0, error_text: None,
+                        }),
+                    });
                     let request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     #[cfg(feature = "stealth")]
@@ -298,6 +321,36 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .await
                             .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
                     };
+                    // A response (including the blocked-tracker sentinel) is
+                    // not a transport failure, even if evaluation later fails.
+                    if let Some(guard) = &mut network_guard { guard.event = None; }
+                    // A module response belongs to the owning page regardless
+                    // of whether graph preparation or evaluation later fails.
+                    // Status 0 is the transport's blocked-tracker sentinel.
+                    if resp.status != 0 {
+                        if let Some(state) = page_state.as_ref().and_then(Weak::upgrade) {
+                            let mut state = state.try_borrow_mut().map_err(|_| {
+                                io_err("Module loader page state is already borrowed".to_string())
+                            })?;
+                            record_network_completion(&mut state, JsNetworkEvent {
+                                request_id, intercepted: false,
+                                url: resp.url.to_string(), method: "GET".to_string(),
+                                resource_type: "Script".to_string(), status: resp.status,
+                                response_headers: resp.headers.clone(), body_size: resp.body.len(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_secs_f64(),
+                                error_text: None,
+                            }, || match std::str::from_utf8(&resp.body) {
+                                Ok(body) => StoredNetworkResponseBody {
+                                    body: body.to_string(), base64_encoded: false,
+                                },
+                                Err(_) => StoredNetworkResponseBody {
+                                    body: BASE64.encode(&resp.body), base64_encoded: true,
+                                },
+                            });
+                        }
+                    }
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",

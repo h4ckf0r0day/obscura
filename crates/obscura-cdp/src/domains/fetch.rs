@@ -18,7 +18,7 @@ pub enum FetchResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        post_data: Option<String>,
+        post_data: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
@@ -113,6 +113,10 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
+            let post_data = crate::server::decode_optional_binary(
+                params, "postData", "continueRequest postData",
+            )?;
+
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
                     url: params
@@ -123,11 +127,10 @@ pub async fn handle(
                         .get("method")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
-                    headers: None,
-                    post_data: params
-                        .get("postData")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    // Honor client header overrides (route.continue({ headers }))
+                    // — parity with server.rs handle_fetch_resolution (#919).
+                    headers: crate::server::parse_cdp_headers(params),
+                    post_data,
                 });
             }
             Ok(json!({}))
@@ -155,11 +158,11 @@ pub async fn handle(
                         .collect()
                 })
                 .unwrap_or_default();
-            let body = params
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            // The CDP fulfillRequest body is base64-encoded; decode it — parity
+            // with server.rs handle_fetch_resolution (#919). (Binary-safe body
+            // transport across the JS boundary remains tracked in #912.)
+            let body =
+                crate::server::decode_base64(params.get("body").and_then(|v| v.as_str()).unwrap_or(""));
 
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Fulfill {
@@ -220,5 +223,95 @@ pub async fn handle(
             Ok(json!({ "stream": handle }))
         }
         _ => Err(format!("Unknown Fetch method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::CdpContext;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn pause(ctx: &mut CdpContext, id: &str) -> tokio::sync::oneshot::Receiver<FetchResolution> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctx.fetch_intercept.paused.insert(
+            id.to_string(),
+            PausedRequest {
+                request_id: id.to_string(),
+                url: "https://example.test/".to_string(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                resource_type: "Fetch".to_string(),
+                resolver: tx,
+            },
+        );
+        rx
+    }
+
+    // Parity with server.rs handle_fetch_resolution: continueRequest must
+    // forward the client's header overrides (route.continue({ headers })), not
+    // drop them. See #919.
+    #[tokio::test]
+    async fn continue_request_forwards_header_overrides() {
+        let mut ctx = CdpContext::new();
+        let rx = pause(&mut ctx, "req-1");
+        handle(
+            "continueRequest",
+            &json!({ "requestId": "req-1", "headers": [{ "name": "X-Test", "value": "42" }] }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("continueRequest should succeed");
+
+        match rx.await.expect("resolver should fire") {
+            FetchResolution::Continue { headers, .. } => {
+                let mut expected = HashMap::new();
+                expected.insert("X-Test".to_string(), "42".to_string());
+                assert_eq!(headers, Some(expected), "continue must forward header overrides");
+            }
+            _ => panic!("expected FetchResolution::Continue"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_request_decodes_binary_post_data_and_preserves_invalid_pause() {
+        let mut ctx = CdpContext::new();
+        let mut rx = pause(&mut ctx, "binary");
+        assert!(handle("continueRequest", &json!({"requestId": "binary", "postData": 42}),
+            &mut ctx, &None).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        handle("continueRequest", &json!({"requestId": "binary", "postData": "AID/EMMo"}),
+            &mut ctx, &None).await.unwrap();
+        match rx.await.unwrap() {
+            FetchResolution::Continue { post_data: Some(body), .. } => {
+                assert_eq!(serde_json::to_value(body).unwrap(), json!([0, 128, 255, 16, 195, 40]));
+            }
+            _ => panic!("expected binary Continue"),
+        }
+    }
+
+    // Parity with server.rs: the fulfillRequest body is base64-encoded per CDP
+    // and must be decoded, not passed through as raw base64 text. See #919/#912.
+    #[tokio::test]
+    async fn fulfill_request_base64_decodes_body() {
+        let mut ctx = CdpContext::new();
+        let rx = pause(&mut ctx, "req-2");
+        handle(
+            "fulfillRequest",
+            &json!({ "requestId": "req-2", "responseCode": 200, "body": "SGVsbG8=" }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .expect("fulfillRequest should succeed");
+
+        match rx.await.expect("resolver should fire") {
+            FetchResolution::Fulfill { body, .. } => {
+                assert_eq!(body, "Hello", "fulfill body must be base64-decoded");
+            }
+            _ => panic!("expected FetchResolution::Fulfill"),
+        }
     }
 }

@@ -56,6 +56,21 @@ viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
 
+Page-owned layout and paint never fetch resources synchronously. Missing
+resources load through the page transport, with URL blocking checked both
+for navigation/screenshot warmup and for later renderer misses. The DOM-only
+`Page::screenshot` fallback (for example after `Page::suspend_js`) also performs
+no network requests: external images and fonts absent from its cache remain
+unavailable. Resume the page and prepare its resources before capture when
+those assets are required. Standalone `obscura-render` callers retain their
+existing synchronous-loader behavior.
+
+The relevant paths are `Page::screenshot_with_animation_sample` and
+`Page::render_resource_candidates` in `crates/obscura-browser/src/page.rs`,
+`ObscuraJsRuntime::take_render_resource_requests` in
+`crates/obscura-js/src/runtime.rs`, and `RenderResourceCache` in
+`crates/obscura-render/src/paint.rs`.
+
 ## Single V8 isolate
 
 All pages in a process share one V8 isolate. The isolate is single-threaded by design.
@@ -70,6 +85,26 @@ page.evaluate(expr).await
 The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
 
 This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
+
+## Child frames
+
+`iframe srcdoc` uses a native child realm and document, not a copy in the
+parent DOM. Its URL is `about:srcdoc`; relative URLs inherit the creator's
+document base, and unsandboxed Web Storage uses the creator's origin.
+`srcdoc` takes precedence over `src`, including an empty value. Parser input,
+connected `innerHTML`, property/attribute changes and removal use the same
+loading path. Replaced or detached documents are retired before stale loads
+can run. The iframe's `load` event follows classic author scripts.
+Navigation runs as a posted task, after microtasks. Parsing uses srcdoc
+standards mode without requiring a doctype and honors script-disabled
+`noscript` content.
+
+Sandboxed `srcdoc` enforces opaque document access and script disabling,
+including inherited restrictions on nested frames. This does not implement
+every HTML sandbox policy. Frame module scripts remain unsupported.
+Child-frame CDP evaluation routing and iframe content compositing remain
+separate compatibility gaps; loading a document does not establish support
+for Playwright frame locators or iframe screenshot fidelity.
 
 ## Robustness
 
@@ -93,6 +128,16 @@ Adding a Web API usually means:
 
 Worked example: [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md).
 
+## Classic Web Workers
+
+The JavaScript shim executes each classic Worker source once and retains its
+message handlers and lexical state. Bare `onmessage` assignments target the
+worker scope, and messages posted before the source loads are queued until
+initialization finishes. Terminating a worker discards pending messages.
+
+Workers remain emulated within the page runtime, not separate V8 isolates or
+OS threads. This is not a complete WorkerGlobalScope implementation.
+
 ## CDP session model
 
 Each CDP client connection gets attached to one or more targets.
@@ -112,7 +157,7 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 
 ## Storage
 
-`--storage-dir` persists cookies (`cookies.json`) and localStorage (`localStorage/<origin>.json`). Reads on process start, writes on every navigation and on graceful shutdown.
+`--storage-dir` persists cookies to `cookies.json` and `localStorage` to `localStorage/<origin>-<digest>.json`: read on process start, written after each navigation that changed something and on graceful shutdown. `sessionStorage` is origin-keyed in memory only, per tab.
 
 ## Stealth
 
