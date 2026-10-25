@@ -296,12 +296,18 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             style.border_spacing = Some((2.0, 2.0));
             style.border_collapse = Some(false);
         } else {
+            style.table_row_display = Some(match tag {
+                "thead" => crate::TableRowDisplay::Header,
+                "tfoot" => crate::TableRowDisplay::Footer,
+                _ => crate::TableRowDisplay::Group,
+            });
             style.width = crate::Dimension::Percent(1.0);
             // The row-group UA rule is the source of the effective default
             // middle alignment; rows and cells inherit it below.
             style.vertical_align = Some(crate::VerticalAlign::Middle);
         }
     } else if tag == "tr" {
+        style.table_row_display = Some(crate::TableRowDisplay::Row);
         style.internal_flex_container = true;
         // Rows fill the table width and can shrink below content min-content;
         // this is exactly why Wikipedia's own responsive CSS uses
@@ -424,7 +430,9 @@ pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
-        if name == "animation" || name.starts_with("animation-") {
+        // display:none determines whether a CSS animation can exist, even
+        // when an important declaration overrides the normal display value.
+        if name == "display" || name == "animation" || name.starts_with("animation-") {
             apply_value(style, &name, value.trim());
         }
     }
@@ -503,6 +511,73 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     }
     parts.push(&css[start..]);
     parts
+}
+
+/// Whether an inline-style edit can leave CSSOM View's untransformed box
+/// metrics intact. This is deliberately narrower than "paint only": callers
+/// use it only for `client*`/`offset*`, while transformed visual rectangles
+/// still force an exact render. Comparing every other declaration in source
+/// order keeps shorthands, custom properties, priorities, and duplicate
+/// declarations conservative without maintaining a second CSS cascade.
+pub fn inline_style_change_preserves_box_metrics(old: Option<&str>, new: Option<&str>) -> bool {
+    fn next_layout_declaration<'a>(
+        declarations: &mut impl Iterator<Item = &'a str>,
+    ) -> Option<(&'a str, &'a str)> {
+        loop {
+            let raw = declarations.next()?;
+            let Some((name, value)) = raw.trim().split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("transform")
+                || name.eq_ignore_ascii_case("-webkit-transform")
+            {
+                continue;
+            }
+            return Some((name, value.trim()));
+        }
+    }
+
+    let mut old = old.into_iter().flat_map(split_declarations);
+    let mut new = new.into_iter().flat_map(split_declarations);
+    loop {
+        match (
+            next_layout_declaration(&mut old),
+            next_layout_declaration(&mut new),
+        ) {
+            (Some((old_name, old_value)), Some((new_name, new_value)))
+                if old_name.eq_ignore_ascii_case(new_name) && old_value == new_value => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn parse_containment(value: &str) -> Option<u8> {
+    use crate::{CONTAIN_SIZE, CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_STYLE, CONTAIN_PAINT};
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "none" | "initial" | "unset" | "revert" | "revert-layer" => return Some(0),
+        "inherit" => return Some(crate::CONTAIN_INHERIT),
+        "strict" => return Some(CONTAIN_SIZE | CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        "content" => return Some(CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        _ => {}
+    }
+    let mut flags = 0;
+    for token in value.split_ascii_whitespace() {
+        let flag = match token {
+            "size" => CONTAIN_SIZE,
+            "inline-size" => CONTAIN_INLINE_SIZE,
+            "layout" => CONTAIN_LAYOUT,
+            "style" => CONTAIN_STYLE,
+            "paint" => CONTAIN_PAINT,
+            _ => return None,
+        };
+        if flags & flag != 0 { return None; }
+        flags |= flag;
+    }
+    (flags != 0 && flags & (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)
+        != (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)).then_some(flags)
 }
 
 fn parse_container_type(value: &str) -> Option<crate::ContainerType> {
@@ -785,6 +860,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "table"
                     | "inline-table"
                     | "table-cell"
+                    | "table-row"
+                    | "table-row-group"
+                    | "table-header-group"
+                    | "table-footer-group"
                     | "-webkit-box"
                     | "-webkit-inline-box"
                     | "contents"
@@ -799,6 +878,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.internal_flex_container = false;
                 style.is_table_box = false;
                 style.is_table_cell_box = false;
+                style.table_row_display = None;
                 style.is_inline_block = false;
                 style.flow_root = false;
                 style.display_contents = false;
@@ -841,6 +921,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.is_inline_block = true;
                     style.flow_root = true;
                     style.is_table_box = true;
+                }
+                "table-row" | "table-row-group" | "table-header-group" | "table-footer-group" => {
+                    style.table_row_display = Some(match value.as_str() {
+                        "table-row" => crate::TableRowDisplay::Row,
+                        "table-header-group" => crate::TableRowDisplay::Header,
+                        "table-footer-group" => crate::TableRowDisplay::Footer,
+                        _ => crate::TableRowDisplay::Group,
+                    });
+                    style.display = crate::Display::Block;
                 }
                 "table-cell" => {
                     // A table cell establishes an internal flow container. A
@@ -1184,6 +1273,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             apply_font_size(style, value);
         }
         "letter-spacing" => apply_letter_spacing(style, value),
+        "word-spacing" => apply_word_spacing(style, value),
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
             let lower = value.trim().to_ascii_lowercase();
@@ -1862,13 +1952,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             non_none_value(value),
         ),
         "contain" => {
-            let establishes = value.split_whitespace().any(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "layout" | "paint" | "strict" | "content"
-                )
-            });
-            set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN, establishes);
+            if let Some(flags) = parse_containment(value) {
+                style.containment = flags;
+                set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN,
+                    flags & (crate::CONTAIN_LAYOUT | crate::CONTAIN_PAINT) != 0);
+            }
         }
         "will-change" => {
             let establishes = value.split([',', ' ']).map(str::trim).any(|v| {
@@ -2085,6 +2173,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "color-scheme"
             | "font-size"
             | "letter-spacing"
+            | "word-spacing"
             | "font"
             | "font-weight"
             | "font-family"
@@ -2244,6 +2333,10 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                 | "flow-root"
                 | "table"
                 | "inline-table"
+                | "table-row"
+                | "table-row-group"
+                | "table-header-group"
+                | "table-footer-group"
                 | "-webkit-box"
                 | "-webkit-inline-box"
                 | "contents"
@@ -2929,6 +3022,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
     };
     match name {
         "width" | "inline-size" => lower == "fit-content" || dimension(value, true),
+        "word-spacing" => lower == "normal" || parse_word_spacing_length(value).is_some(),
         "height" | "block-size" | "min-width" | "min-inline-size" | "min-height"
         | "min-block-size" | "max-width" | "max-inline-size" | "max-height" | "max-block-size"
         | "flex-basis" => dimension(value, true),
@@ -6967,17 +7061,17 @@ fn valid_counter_name(name: &str) -> bool {
             .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '"' | '\''))
 }
 
-/// Absolute keyword font-sizes (the `medium`-anchored scale), for the handful
-/// of pages that still use them.
+/// Absolute keyword font-sizes using the default 16px medium scale.
 fn font_size_keyword(v: &str) -> Option<f32> {
     Some(match v.to_ascii_lowercase().as_str() {
-        "xx-small" => 9.6,
-        "x-small" => 12.0,
-        "small" => 13.3,
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
         "medium" => 16.0,
         "large" => 18.0,
         "x-large" => 24.0,
         "xx-large" => 32.0,
+        "xxx-large" => 48.0,
         _ => return None,
     })
 }
@@ -7028,6 +7122,50 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
             style.font_size = None;
             style.font_size_raw = Some(rel);
         }
+    }
+}
+
+fn apply_word_spacing(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "inherit" | "unset" | "revert" | "revert-layer") {
+        style.word_spacing = None;
+        style.word_spacing_raw = None;
+        return;
+    }
+    if matches!(lower.as_str(), "normal" | "initial") {
+        style.word_spacing = Some(0.0);
+        style.word_spacing_raw = None;
+        return;
+    }
+    // Invalid declarations must not replace an earlier cascade winner.
+    match parse_word_spacing_length(value) {
+        Some(crate::Dimension::Px(pixels)) => {
+            style.word_spacing = Some(pixels);
+            style.word_spacing_raw = None;
+        }
+        Some(relative) => {
+            style.word_spacing = None;
+            style.word_spacing_raw = Some(relative);
+        }
+        None => {}
+    }
+}
+
+fn parse_word_spacing_length(value: &str) -> Option<crate::Dimension> {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let length = match parser.next().ok()? {
+        cssparser::Token::Number { value, .. } if *value == 0.0 => crate::Dimension::Px(0.0),
+        cssparser::Token::Dimension { value, unit, .. } if value.is_finite() => {
+            dimension_value(&format!("{value}{unit}"))
+        }
+        _ => return None,
+    };
+    if !parser.is_exhausted() { return None; }
+    match length.resolve(16.0, 16.0, 1.0, 1.0) {
+        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(length),
+        _ => None,
     }
 }
 
@@ -7157,6 +7295,22 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
 /// the required size so modern design-system declarations reach the size,
 /// line-height, weight, style, and family fields that affect our layout.
 fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") {
+        // All modeled font longhands are inherited. Clear earlier declarations,
+        // including native-control UA defaults, before the top-down pass.
+        style.font_size = None;
+        style.font_size_raw = None;
+        style.font_size_expression = None;
+        style.font_family = None;
+        style.font_weight = None;
+        style.font_style_italic = None;
+        style.font_optical_sizing = None;
+        style.font_variation_settings = None;
+        style.line_height = None;
+        style.line_height_expression = None;
+        return;
+    }
     let tokens = split_ws_paren(value);
     let Some((size_index, size, attached_line_height)) =
         tokens.iter().enumerate().find_map(|(index, token)| {
