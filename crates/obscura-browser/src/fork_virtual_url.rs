@@ -36,8 +36,13 @@ impl Page {
         if self.url.as_ref() == Some(&parsed) {
             return false;
         }
+        // A web document must not become a file:// page without loading one:
+        // page.url keys the file:// sub-resource gate (#1069).
+        if crate::page::cross_scheme_to_file(&self.url_string(), virtual_url) {
+            return false;
+        }
         self.url = Some(parsed);
-        self.push_history(self.url_string());
+        self.push_same_document_history(self.url_string());
         true
     }
 }

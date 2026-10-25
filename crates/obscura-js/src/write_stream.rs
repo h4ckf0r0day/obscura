@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use html5ever::driver::{parse_fragment, ParseOpts, Parser};
+use html5ever::driver::{parse_document, parse_fragment, ParseOpts, Parser};
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::Tracer;
 use html5ever::{local_name, ns, QualName};
@@ -38,6 +38,7 @@ impl Tracer for RetainedNodes {
 pub(crate) struct Placement {
     pub(crate) parent: Option<NodeId>,
     pub(crate) node: NodeId,
+    pub(crate) before: Option<NodeId>,
 }
 
 /// A `<script>` runs as soon as it is inserted, so a half-written one must not.
@@ -52,6 +53,7 @@ fn needs_to_be_complete(source: &DomTree, node: NodeId) -> bool {
 
 pub(crate) struct DocumentWriteStream {
     parser: Parser<DomTree>,
+    document: bool,
     /// Maps a node of the parser tree to its copy in the document. A node missing here has
     /// not been handed over yet.
     handed_over: HashMap<NodeId, NodeId>,
@@ -60,11 +62,16 @@ pub(crate) struct DocumentWriteStream {
 }
 
 impl DocumentWriteStream {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(document: bool) -> Self {
         // Scripting enabled, as with the fragment parser behind innerHTML.
         let context = QualName::new(None, ns!(html), local_name!("body"));
         DocumentWriteStream {
-            parser: parse_fragment(DomTree::new(), ParseOpts::default(), context, vec![], true),
+            parser: if document {
+                parse_document(DomTree::new(), ParseOpts::default())
+            } else {
+                parse_fragment(DomTree::new(), ParseOpts::default(), context, vec![], true)
+            },
+            document,
             handed_over: HashMap::new(),
             staging: None,
         }
@@ -74,48 +81,75 @@ impl DocumentWriteStream {
     /// Returns the nodes to insert, parents before children.
     pub(crate) fn write(&mut self, html: &str, dom: &DomTree) -> Vec<Placement> {
         self.parser.process(html.into());
+        self.mirror(dom)
+    }
 
+    pub(crate) fn close(&mut self, dom: &DomTree) -> Vec<Placement> {
+        self.parser.tokenizer.end();
+        self.mirror(dom)
+    }
+
+    fn mirror(&mut self, dom: &DomTree) -> Vec<Placement> {
         let retained = RetainedNodes::default();
         self.parser.tokenizer.sink.trace_handles(&retained);
         let retained = retained.0.into_inner();
 
         // Separate fields: the parser tree is read, the mapping is written.
         let source = &self.parser.tokenizer.sink.sink;
+        if self.document {
+            dom.set_quirks(source.is_quirks());
+        }
         let handed_over = &mut self.handed_over;
         let staging = &mut self.staging;
 
-        let root = source.fragment_root();
+        let root = if self.document { source.document() } else { source.fragment_root() };
         let mut placements = Vec::new();
         // Only look at what is new. A walk over all children would cost as much per call as
         // the input stream written so far is long, so quadratic over a thousand calls. Measured at
         // 5000 calls: 852 ms versus 4130 ms.
-        let mut stack: Vec<NodeId> = fresh_children(source, root, handed_over);
+        let mut stack: Vec<(NodeId, Option<NodeId>)> = fresh_children(source, root, handed_over)
+            .into_iter().map(|id| (id, None)).collect();
 
-        while let Some(current) = stack.pop() {
+        while let Some((current, before)) = stack.pop() {
             let node = match source.get_node(current) {
                 Some(node) => node,
                 None => continue,
             };
 
             if let Some(&copy) = handed_over.get(&current) {
+                // Foster parenting inserts before an existing sibling. Carry that sibling
+                // as a stable anchor, and stop at the first already-copied predecessor.
+                let mut previous = node.prev_sibling;
+                while let Some(id) = previous {
+                    let Some(sibling) = source.get_node(id) else { break; };
+                    if handed_over.contains_key(&id) {
+                        if sibling.is_text() { stack.push((id, None)); }
+                        break;
+                    }
+                    stack.push((id, Some(copy)));
+                    previous = sibling.prev_sibling;
+                }
                 // A text node at the end of the input stream grows with every call and stays the
-                // same node. Elements no longer change after their creation.
+                // same node, including immediately before a foster-parenting anchor.
                 if node.is_text() {
                     let text = source.text_content(current);
-                    dom.with_node_mut(copy, |n| {
-                        if let NodeData::Text { contents } = &mut n.data {
-                            *contents = text;
-                        }
-                    });
+                    if dom.with_node(copy, |n| matches!(&n.data,
+                        NodeData::Text { contents } if contents == &text)) != Some(true) {
+                        dom.with_node_mut(copy, |n| {
+                            if let NodeData::Text { contents } = &mut n.data {
+                                *contents = text;
+                            }
+                        });
+                    }
                 }
                 for child in fresh_children(source, current, handed_over) {
-                    stack.push(child);
+                    stack.push((child, None));
                 }
                 continue;
             }
 
             let parent = match node.parent {
-                Some(p) if p == root => None,
+                Some(p) if p == root => self.document.then(|| dom.document()),
                 // If the parent is held back, this one waits along.
                 Some(p) => match handed_over.get(&p) {
                     Some(&copy) => Some(copy),
@@ -134,7 +168,7 @@ impl DocumentWriteStream {
                 };
                 dom.detach(copy);
                 map_subtree(source, current, dom, copy, handed_over);
-                placements.push(Placement { parent, node: copy });
+                placements.push(Placement { parent, node: copy, before });
                 continue;
             }
 
@@ -142,9 +176,9 @@ impl DocumentWriteStream {
             // never closed appear at once instead of never.
             let copy = dom.new_node(node.data.clone());
             handed_over.insert(current, copy);
-            placements.push(Placement { parent, node: copy });
+            placements.push(Placement { parent, node: copy, before });
             for child in fresh_children(source, current, handed_over) {
-                stack.push(child);
+                stack.push((child, None));
             }
         }
 
@@ -155,9 +189,9 @@ impl DocumentWriteStream {
 /// The children of `parent` still to do, as a stack: the top element is processed first.
 ///
 /// The walk goes backward from the last child and stops at the first one already handed over.
-/// The parser only appends at the back, so everything before it is done. This one already
-/// handed-over child comes back along, because a text node at the end of the input stream keeps
-/// growing and an open element still receives children.
+/// This already handed-over child comes back along, because a text node keeps growing, an
+/// open element receives children, and foster parenting can add preceding siblings. The mirror
+/// discovers those siblings at this boundary rather than rescanning all earlier children.
 fn fresh_children(
     source: &DomTree,
     parent: NodeId,

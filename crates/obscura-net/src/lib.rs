@@ -26,3 +26,6 @@ pub use wreq_client::{
     StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
     STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
 };
+
+mod operator_hint;
+pub use operator_hint::private_network_error_hint;

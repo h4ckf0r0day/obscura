@@ -13,19 +13,65 @@ cargo nextest run --release --features render -p obscura-cdp
 cargo nextest run --release --features render -p obscura-browser
 ```
 
-By name:
+By name, also selecting the crate and test target:
 
 ```bash
-cargo nextest run --release --features render runtime_click_submit_prevent_default
+rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-js --lib completed_scripts_do_not_wait_for_watchdog_deadline
 ```
 
 Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
 because the engine owns one V8 isolate per process. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
+### Fast edit/test loop
+
+For runtime unit tests, the `test-js` Cargo alias enables incremental compilation
+only for `obscura-js`, retaining release optimization and reusing dependencies:
+
+```bash
+rtk proxy env -u CARGO_INCREMENTAL CARGO_BUILD_JOBS=2 cargo test-js -E 'test(classic_script_url_is_dynamic_import_referrer)'
+```
+
+The first invocation warms an extra compiler cache. Later source edits reuse it.
+Unset `CARGO_INCREMENTAL`: an exported `0` overrides the alias's package setting.
+This is a local feedback command, not the production benchmark build. Cargo
+defaults to more code-generation units with incremental compilation, so do not
+use its timings as performance evidence. No global release setting changes.
+
+For other crates, select the affected binary before applying a test-name filter.
+CDP integration tests share one binary; select a module within it:
+
+```bash
+rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --features render -p obscura-cdp --test integration -E 'test(page_frame_contract::)'
+```
+
+`-p` selects packages; `--lib` or `--test NAME` selects binaries to compile.
+A bare test name or `-E` filters test execution, not the Cargo build target set.
+Keep the same package/features while iterating. Workspace tests and the CLI can
+resolve different dependency features, requiring distinct engine artifacts.
+Do not enable extra production features merely to unify those artifacts.
+
+Run the focused repro after each edit. At a stable candidate, run the full
+release nextest gate, exact CLI build and obstacle course from `AGENTS.md`, plus
+render/stealth verification when applicable. Do not repeat the whole gate at
+each red/green step, and do not omit it when declaring a candidate validated.
+
+For build attribution, append `--timings` to Cargo or nextest; inspect
+`target/cargo-timings/`. Preserve caches: avoid `cargo clean`, changing Rust flags,
+or switching profiles unless those changes are intentional. Incremental caches
+consume extra disk. See Cargo's [profile settings](https://doc.rust-lang.org/cargo/reference/profiles.html)
+and nextest's [target selection](https://nexte.st/docs/running/).
+
 ### CDP parity tests
 
-`crates/obscura-cdp/tests/cdp_*.rs` exercise CDP methods end-to-end with a real `dispatch` call and an in-process HTTP server.
+`crates/obscura-cdp/tests/*.rs` exercise CDP methods end-to-end with a real
+`dispatch` call and an in-process HTTP server. `integration.rs` registers these
+files as modules in one binary to avoid repeatedly linking the browser engine.
+Nextest still runs each test in its own process. Register new files in its
+`integration_tests!` list; a guard fails if a sibling Rust test file is omitted.
+Old `--test FILE` commands become `--test integration -E 'test(FILE::)'`.
+The tradeoff is that editing one CDP test file rebuilds the shared test binary;
+the consolidation targets engine-change rebuild fan-out and artifact duplication.
 
 Pattern:
 
@@ -77,6 +123,23 @@ wscat -c ws://127.0.0.1:9222
 Useful for reproducing what Puppeteer or Playwright is doing without their abstraction.
 
 ## Common failure modes
+
+### JavaScript behavior disagrees with the current bootstrap source
+
+The runtime embeds a generated V8 snapshot, not `bootstrap.js` directly.
+Restored build artifacts can contain an older snapshot even when the Rust ops
+are current. Confirm which `OBSCURA_SNAPSHOT.bin` the binary's dependency file
+under `target/release/deps/` references before changing engine behavior.
+To regenerate the snapshot while retaining dependency caches:
+
+```bash
+rtk proxy touch crates/obscura-js/js/bootstrap.js
+rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --features render
+```
+
+Then rerun the failing nextest command, which rebuilds its own feature-specific
+snapshot as needed. Do not copy generated snapshots between revisions or
+feature configurations.
 
 ### `Target.createTarget timed out`
 

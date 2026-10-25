@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Hidden table rows and sections</title>
+<style>
+  html, body { margin: 0; background: white; }
+  table { position: absolute; border-spacing: 0; }
+  td { width: 30px; height: 20px; padding: 0; }
+  .gone { display: none; }
+  .wide { width: 500px; height: 90px; background: #d02020; }
+  #rows { left: 20px; top: 20px; }
+  #span { background: #1971c2; }
+  #first { background: #087f5b; }
+  #next { background: #e8590c; }
+  #last { background: #7048e8; }
+  #groups { left: 150px; top: 20px; }
+  #group-cell { background: #0b7285; }
+</style>
+<table id="rows"><tbody>
+  <tr><td id="span" rowspan="2"></td><td id="first"></td></tr>
+  <tr id="gone-row" class="gone"><td id="gone-cell" class="wide"></td></tr>
+  <tr><td id="next"></td></tr>
+  <tr><td id="last"></td></tr>
+</tbody></table>
+<table id="groups">
+  <thead id="gone-head" class="gone"><tr><td class="wide"></td></tr></thead>
+  <tbody id="gone-body" class="gone"><tr><td class="wide"></td></tr></tbody>
+  <tfoot id="gone-foot" class="gone"><tr><td class="wide"></td></tr></tfoot>
+  <tbody><tr><td id="group-cell"></td></tr></tbody>
+</table>

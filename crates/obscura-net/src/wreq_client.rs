@@ -16,7 +16,7 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, fetch_file_url, is_forbidden_ip,
+    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
@@ -155,7 +155,7 @@ async fn read_wreq_body_limited(
     let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            ObscuraNetError::Network(format!("Failed to read body: {}", error))
+            ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
         })?;
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
@@ -187,10 +187,20 @@ async fn send_get_with_connection_reset_retry(
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
+    /// Lets `fetch_file_url` read local files. Off by default.
+    pub allow_file_access: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// Scripted fetch exposes these headers before consuming the bounded body.
+#[cfg(feature = "stealth")]
+pub struct StealthResponseHeaders {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: futures_util::future::BoxFuture<'static, Result<Vec<u8>, ObscuraNetError>>,
 }
 
 #[cfg(feature = "stealth")]
@@ -211,6 +221,14 @@ impl StealthHttpClient {
 
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
+            // Read a folded header line (obs-fold) as Chrome does instead of
+            // failing the response. Set after `emulation()`, which overwrites
+            // `http1_options`; the Chrome profile leaves them unset.
+            .http1_options(
+                wreq::http1::Http1Options::builder()
+                    .allow_obsolete_multiline_headers_in_responses(true)
+                    .build(),
+            )
             .timeout(Duration::from_secs(30))
             // SSRF guard: reject hostnames that resolve to a private/loopback
             // IP. Use the same opt-in as the `validate_url` calls below so
@@ -264,6 +282,7 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             allow_private_network,
+            allow_file_access: false,
             block_trackers: tracker_blocking_enabled(
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
             ),
@@ -304,7 +323,7 @@ impl StealthHttpClient {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
+            return fetch_file_url(url, request.max_response_bytes, self.allow_file_access).await;
         }
 
         let mut current_url = url.clone();
@@ -388,12 +407,7 @@ impl StealthHttpClient {
             let resp = send_get_with_connection_reset_retry(req, &current_url)
                 .await
                 .map_err(|e| {
-                    ObscuraNetError::Network(format!(
-                        "{}: {} (source: {:?})",
-                        current_url,
-                        e,
-                        e.source()
-                    ))
+                    ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
                 })?;
 
             let status = resp.status();
@@ -493,14 +507,32 @@ impl StealthHttpClient {
         cookie_context: Option<SameSiteContext>,
         store_cookies: bool,
     ) -> Result<Response, ObscuraNetError> {
+        let response = self.send_single_headers_with_context(
+            method, url, headers, body, cookie_context, store_cookies, 64 * 1024 * 1024,
+        ).await?;
+        Ok(Response {
+            url: url.clone(), status: response.status, headers: response.headers,
+            body: response.body.await?, redirected_from: Vec::new(),
+        })
+    }
+
+    /// Preserve request policy and cookie handling while deferring body reads.
+    pub async fn send_single_headers_with_context(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        cookie_context: Option<SameSiteContext>,
+        store_cookies: bool,
+        max_body_bytes: usize,
+    ) -> Result<StealthResponseHeaders, ObscuraNetError> {
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
-            return Ok(Response {
+            return Ok(StealthResponseHeaders {
                 status: 0,
-                url: url.clone(),
                 headers: HashMap::new(),
-                body: Vec::new(),
-                redirected_from: Vec::new(),
+                body: Box::pin(async { Ok(Vec::new()) }),
             });
         }
 
@@ -527,7 +559,7 @@ impl StealthHttpClient {
 
         let in_flight = InFlightGuard::new(&self.in_flight);
         let resp = req.send().await.map_err(|e| {
-            ObscuraNetError::Network(format!("{}: {}", url, e))
+            ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
         })?;
 
         let status = resp.status();
@@ -543,15 +575,14 @@ impl StealthHttpClient {
             .iter()
             .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let resp_body = read_wreq_body_limited(resp, url, 64 * 1024 * 1024).await?;
-        drop(in_flight);
-
-        Ok(Response {
-            url: url.clone(),
+        let body_url = url.clone();
+        Ok(StealthResponseHeaders {
             status: status.as_u16(),
             headers: response_headers,
-            body: resp_body,
-            redirected_from: Vec::new(),
+            body: Box::pin(async move {
+                let _in_flight = in_flight;
+                read_wreq_body_limited(resp, &body_url, max_body_bytes).await
+            }),
         })
     }
 
@@ -634,6 +665,21 @@ mod tests {
                 "{value:?} must disable tracker blocking"
             );
         }
+    }
+
+    // The stealth transport delegates file:// to the shared loader, so it
+    // inherits the same opt-in instead of reading local files unconditionally.
+    #[tokio::test]
+    async fn stealth_client_reads_file_urls_only_when_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.html");
+        std::fs::write(&path, "local-secret").unwrap();
+        let url = Url::from_file_path(&path).unwrap();
+
+        let mut client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        assert!(client.fetch(&url).await.is_err());
+        client.allow_file_access = true;
+        assert_eq!(client.fetch(&url).await.unwrap().body, b"local-secret");
     }
 
     #[test]
@@ -791,6 +837,7 @@ mod tests {
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
             allow_private_network: true,
+            allow_file_access: false,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
@@ -811,6 +858,48 @@ mod tests {
 
         assert!(matches!(error, ObscuraNetError::Network(_)));
         assert_eq!(server.join().unwrap(), 1);
+    }
+
+    // See `navigation_accepts_a_folded_response_header` in client.rs: the
+    // stealth transport must read a folded header as Chrome does.
+    #[tokio::test]
+    async fn stealth_client_accepts_a_folded_response_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\ncontent-length: 6\r\nconnection: close\r\n\r\nfolded";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let resp = client
+            .fetch(&url)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), "folded");
+    }
+
+    #[tokio::test]
+    async fn stealth_network_error_names_the_cause() {
+        // A port nobody listens on: the message must say the connection was
+        // refused instead of only "error sending request", and must not be a
+        // Debug dump of the error structs.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let message = client.fetch(&url).await.expect_err("nothing listens").to_string();
+        assert!(message.to_lowercase().contains("refused"), "{message}");
+        assert!(!message.contains("source: Some("), "{message}");
     }
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.

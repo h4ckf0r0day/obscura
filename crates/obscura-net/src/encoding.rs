@@ -13,7 +13,7 @@
 //!
 //! For non-HTML resources (JS, CSS, JSON), only steps 1 and 3 apply.
 
-use encoding_rs::{DecoderResult, EncoderResult, Encoding, UTF_8};
+use encoding_rs::{CoderResult, DecoderResult, EncoderResult, Encoding, UTF_8};
 
 /// WHATWG canonical (lowercased) name for an encoding label, or None if the
 /// label is not a known encoding. Backs `TextDecoder`'s label validation and
@@ -30,19 +30,41 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     let mut dec = if ignore_bom {
         enc.new_decoder_without_bom_handling()
     } else {
-        enc.new_decoder()
+        enc.new_decoder_with_bom_removal()
     };
+    // Both decode calls write only into the string's spare capacity and stop
+    // with OutputFull when it runs out. Legacy encodings can expand one byte into
+    // three UTF-8 bytes, so grow the buffer and continue until the input is
+    // consumed instead of truncating (or, in fatal mode, rejecting valid input).
+    let mut out = String::with_capacity(bytes.len() + 1);
+    let mut src = bytes;
     if fatal {
-        let mut out = String::with_capacity(bytes.len() + 1);
-        let (res, _) = dec.decode_to_string_without_replacement(bytes, &mut out, true);
-        match res {
-            DecoderResult::InputEmpty => Some(out),
-            _ => None,
+        loop {
+            let (res, read) = dec.decode_to_string_without_replacement(src, &mut out, true);
+            src = &src[read..];
+            match res {
+                DecoderResult::InputEmpty => return Some(out),
+                DecoderResult::OutputFull => out.reserve(
+                    dec.max_utf8_buffer_length_without_replacement(src.len())
+                        .unwrap_or(src.len().saturating_mul(3))
+                        .max(4),
+                ),
+                DecoderResult::Malformed(..) => return None,
+            }
         }
     } else {
-        let mut out = String::with_capacity(bytes.len() * 2 + 1);
-        let _ = dec.decode_to_string(bytes, &mut out, true);
-        Some(out)
+        loop {
+            let (res, read, _) = dec.decode_to_string(src, &mut out, true);
+            src = &src[read..];
+            match res {
+                CoderResult::InputEmpty => return Some(out),
+                CoderResult::OutputFull => out.reserve(
+                    dec.max_utf8_buffer_length(src.len())
+                        .unwrap_or(src.len().saturating_mul(3))
+                        .max(4),
+                ),
+            }
+        }
     }
 }
 
@@ -318,6 +340,50 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<&'static Encoding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_decoder_bom_does_not_override_the_selected_encoding() {
+        assert_eq!(decode_with_label("utf-8", &[0xff, 0xfe, 65, 0], false, false).as_deref(),
+            Some("\u{fffd}\u{fffd}A\0"));
+        assert_eq!(decode_with_label("utf-8", &[0xff, 0xfe, 65, 0], true, false), None);
+        assert_eq!(decode_with_label("windows-1252", &[0xef, 0xbb, 0xbf, 65], false, false).as_deref(),
+            Some("\u{ef}\u{bb}\u{bf}A"));
+        for fatal in [false, true] {
+            assert_eq!(decode_with_label("utf-8", &[0xef, 0xbb, 0xbf, 65], fatal, false).as_deref(), Some("A"));
+            assert_eq!(decode_with_label("utf-8", &[0xef, 0xbb, 0xbf, 65], fatal, true).as_deref(), Some("\u{feff}A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xff, 0xfe, 65, 0], fatal, false).as_deref(), Some("A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xff, 0xfe, 65, 0], fatal, true).as_deref(), Some("\u{feff}A"));
+            assert_eq!(decode_with_label("utf-16le", &[0xfe, 0xff, 0, 65], fatal, false).as_deref(), Some("\u{fffe}\u{4100}"));
+        }
+    }
+
+    // Legacy single-byte encodings can expand one input byte into three UTF-8
+    // bytes (windows-1252 0x80 is U+20AC). The decoder only writes into spare
+    // capacity, so an undersized buffer used to truncate the text or, in fatal
+    // mode, reject valid input.
+    #[test]
+    fn decode_with_label_does_not_truncate_expanding_input() {
+        let euros = [0x80u8; 12];
+        let expected = "€".repeat(12);
+        assert_eq!(
+            decode_with_label("windows-1252", &euros, false, false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decode_with_label("windows-1252", &euros, true, false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            decode_with_label("windows-1252", &[0xE9; 4], true, false).as_deref(),
+            Some("éééé")
+        );
+        // Malformed input is still rejected in fatal mode and replaced otherwise.
+        assert_eq!(decode_with_label("utf-8", &[0x61, 0xFF], true, false), None);
+        assert_eq!(
+            decode_with_label("utf-8", &[0x61, 0xFF], false, false).as_deref(),
+            Some("a\u{FFFD}")
+        );
+    }
 
     #[test]
     fn content_type_charset_wins() {
