@@ -50,7 +50,7 @@ const __obscuraCore = globalThis.Deno.core;
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
-    '_urlResolveOp', '_decodeBodyWithCharset', '_utf8DecodeBytes',
+    '_urlResolveOp', '_decodeBodyWithCharset',
     '_selectionFor', '_isConstructorCE', '_isValidCustomElementName', '_shadowRootForHost',
     '_blobPartToBytes', '_bytesToBinaryString', '_formEncode', '_hexv',
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
@@ -76,6 +76,8 @@ const __obscuraCore = globalThis.Deno.core;
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
+    'MutationRecord', 'CSSConditionRule', 'CSSMediaRule', 'CSSSupportsRule',
+    'IntersectionObserverEntry', 'XMLDocument',
     'SVGSVGElement', 'SVGGElement', 'SVGDefsElement', 'SVGSymbolElement',
     'SVGUseElement', 'SVGMarkerElement', 'SVGAElement', 'SVGSwitchElement',
     'SVGImageElement', 'SVGForeignObjectElement', 'SVGRectElement',
@@ -200,28 +202,33 @@ const _dom = (cmd, a1, a2) => {
   return result;
 };
 
-const _nativeFns = new Set();
+const _nativeFns = new WeakSet();
+const _nativeFnHas = _nativeFns.has.bind(_nativeFns);
+const _nativeFnAdd = _nativeFns.add.bind(_nativeFns);
 // Exact toString override for members whose native form is not just
 // `function <name>()`, e.g. accessors (`function get x() { [native code] }`)
 // or functions whose `.name` does not match the real builtin.
-const _nativeStr = new Map();
+const _nativeStr = new WeakMap();
+const _nativeStrHas = _nativeStr.has.bind(_nativeStr);
+const _nativeStrGet = _nativeStr.get.bind(_nativeStr);
+const _nativeStrSet = _nativeStr.set.bind(_nativeStr);
 const _origToString = Function.prototype.toString;
 // Method syntax matches the native function's non-constructible shape and
 // does not add an own `prototype` property.
 const _functionToString = {
   toString() {
-    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-    if (_nativeFns.has(this)) {
+    if (_nativeStrHas(this)) { return _nativeStrGet(this); }
+    if (_nativeFnHas(this)) {
       return `function ${this.name || ''}() { [native code] }`;
     }
     return _origToString.call(this);
   },
 }.toString;
 Function.prototype.toString = _functionToString;
-function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+function _markNative(fn) { if (typeof fn === 'function') _nativeFnAdd(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
-function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
-_nativeFns.add(_functionToString);
+function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStrSet(fn, str); return fn; }
+_nativeFnAdd(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from
@@ -609,7 +616,6 @@ function _rebaseCssUrls(css, baseUrl) {
 function _cssImportApplies(media) {
   const compact = media.replace(/\s+/g, "").toLowerCase();
   if (!compact) return true;
-  if (compact.includes("prefers-color-scheme:dark")) return false;
   if (compact.includes("print")
     && !compact.includes("screen")
     && !compact.includes("all")) return false;
@@ -712,7 +718,8 @@ function _fpNoise(x, y, channel) {
 }
 
 var _fpCache = null;
-function _getFp() {
+// Parenthesized helpers retain compiled bytecode in the startup snapshot.
+const _getFp = (function _getFp() {
   if (_fpCache) return _fpCache;
   const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
   const isMac = _uaPlat === 'macOS';
@@ -780,7 +787,7 @@ function _getFp() {
     canvasFingerprint: cfp,
   };
   return _fpCache;
-}
+});
 function _fp(key) { return _getFp()[key]; }
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
@@ -1051,7 +1058,7 @@ const _cancelScheduled = (nativeId) => {
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
 // `acw_sc__v2` challenge drives `setTimeout('reload(arg2)', 2)`). A string is
 // compiled and run in global scope, identical to a real browser; otherwise the
-// call silently no-ops and JS-triggered navigations (cookie → reload) never fire.
+// call silently no-ops and JS-triggered navigations (cookie -> reload) never fire.
 const _coerceTimerFn = (fn) => {
   if (typeof fn === "string") {
     // Per HTML, a string handler is compiled and run as a classic script in
@@ -1790,19 +1797,22 @@ function _serializeCss(props) {
   return e.length ? e.map(([k, v]) => `${k}: ${v}`).join("; ") + ";" : "";
 }
 
+const _styleDefineProperty = Object.defineProperty;
+const _styleProxyConstructor = Proxy;
+const _styleReflectApply = Reflect.apply;
 class CSSStyleDeclaration {
   constructor(owner, onChange) {
     // Non-enumerable so they never leak through the proxy's own-key traps.
-    Object.defineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_props", { value: {}, writable: true, enumerable: false, configurable: true });
     // The owner Element, if any. A live declaration reflects that element's
     // `style` content attribute in both directions; an owner-less declaration
     // (getComputedStyle fallback, stylesheet rules) is purely in-memory.
-    Object.defineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
-    Object.defineProperty(this, "_onChange", { value: onChange || null, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_owner", { value: owner || null, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_onChange", { value: onChange || null, writable: true, enumerable: false, configurable: true });
     // Load the content attribute only when style is first observed. Keeping
     // this as a primitive avoids allocating a separate sync object for every
     // wrapped element.
-    Object.defineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
+    _styleDefineProperty(this, "_loaded", { value: !owner, writable: true, enumerable: false, configurable: true });
   }
   // Pull the initial `style` attribute once. Later attribute mutations update
   // the declaration directly from Element.setAttribute/removeAttribute, so
@@ -1817,7 +1827,7 @@ class CSSStyleDeclaration {
     this._loaded = true;
   }
   // Serialize `_props` back onto the owner's `style` attribute after a mutation,
-  // so el.style.x = … and cssText reflect into getAttribute('style') and
+  // so el.style.x = ... and cssText reflect into getAttribute('style') and
   // serialization. No-op when owner-less.
   _push() {
     const o = this._owner;
@@ -1870,7 +1880,7 @@ class CSSStyleDeclaration {
   item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
 }
 
-const _styleProxy = (decl) => new Proxy(decl, {
+const _styleProxyHandler = {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
     if (/^\d+$/.test(p)) return t.item(+p);
@@ -1912,7 +1922,8 @@ const _styleProxy = (decl) => new Proxy(decl, {
     }
     return undefined;
   },
-});
+};
+const _styleProxy = (decl) => new _styleProxyConstructor(decl, _styleProxyHandler);
 
 // Clone a single node (no children), used by Node.cloneNode. Elements are built
 // with createElement/createElementNS and their content attributes copied, so no
@@ -2160,7 +2171,10 @@ function _domEventDispatch(target, event) {
 // browser custom-element implementations.
 const _customElementConstructionStack = [];
 
+let _scriptingEnabled = true;
+let _sandboxOpaqueOrigin = false;
 function __prepareInsertedScript(script) {
+  if (!_scriptingEnabled) return;
   if (!__obscuraCore.ops.op_script_try_start(script._nid)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
@@ -2298,6 +2312,38 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Post-connection steps run per inserted node, in tree order, after the whole
+// insertion. While a script among them runs, an iframe later in tree order
+// has not run its steps yet, so it has no content window.
+let _postConnection = null;
+function _runPostConnectionSteps(nodes) {
+  const outer = _postConnection;
+  const state = { roots: nodes, index: 0, cursor: null };
+  _postConnection = state;
+  try {
+    for (let i = 0; i < nodes.length; i++) {
+      state.index = i;
+      state.cursor = null;
+      const n = nodes[i];
+      __prepareInsertedSubtree(n);
+      if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+    }
+  } finally {
+    _postConnection = outer;
+  }
+}
+function _iframeConnectionPending(iframe) {
+  const state = _postConnection;
+  if (!state) return false;
+  for (let j = state.index; j < state.roots.length; j++) {
+    const root = state.roots[j];
+    if (root !== iframe && _dom("is_inclusive_ancestor", root._nid, iframe._nid) !== "true") continue;
+    if (j > state.index) return true;
+    return !!state.cursor && _rngOrder(state.cursor, iframe) < 0;
+  }
+  return false;
+}
+
 function __prepareInsertedSubtree(root) {
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
@@ -2305,11 +2351,12 @@ function __prepareInsertedSubtree(root) {
   if (!root || !root.isConnected) return;
   const scripts = [];
   const seen = new Set();
-  if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
+  if (root.nodeType === 1 && (root.tagName === 'SCRIPT'
+      || (root.tagName === 'IFRAME' && root.hasAttribute('srcdoc')))) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe[srcdoc]") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
     if (script && !seen.has(script._nid)) {
@@ -2317,7 +2364,11 @@ function __prepareInsertedSubtree(root) {
       seen.add(script._nid);
     }
   }
-  for (const script of scripts) __prepareInsertedScript(script);
+  for (const script of scripts) {
+    if (_postConnection) _postConnection.cursor = script;
+    if (script.localName === 'iframe') script._loadIframeSrcdoc();
+    else __prepareInsertedScript(script);
+  }
 }
 
 function _seedDetachedTreeState(node) {
@@ -2339,6 +2390,396 @@ function _seedInsertedTreeState(node, parent, connected) {
 function _seedUnchangedConnection(node, connected) {
   node._treeConnected = !!connected;
   node._treeConnectedEpoch = _treeMutationEpoch;
+}
+
+// Node documents. The main document owns a node unless its tree's root says
+// otherwise: a detached Document (createHTMLDocument, createDocument) is the
+// root of its own tree, and the root of a tree made by another document (its
+// create* methods, DOMParser, an iframe shim document) carries
+// `_nodeDocument`. All nodes of a tree share one node document, so only roots
+// are stamped: insertion clears the stamp (the node is no longer a root) and
+// removal stamps the new root with the document it left.
+let _foreignDocumentCount = 0;
+function _nodeDocumentOf(node) {
+  if (_foreignDocumentCount === 0 || node.isConnected) return globalThis.document;
+  let root = node;
+  for (let parent = root.parentNode; parent; parent = parent.parentNode) root = parent;
+  if (root.nodeType === 9 && root._detached) return root;
+  if (root instanceof ShadowRoot && root.host) return _nodeDocumentOf(root.host);
+  return root._nodeDocument || globalThis.document;
+}
+function _stampNodeDocument(node, doc) {
+  if (node && doc && doc !== globalThis.document) node._nodeDocument = doc;
+  return node;
+}
+function _registerForeignDocument() { _foreignDocumentCount++; }
+// A Document without a browsing context, backed by its own native tree root.
+function _createDetachedDocument(contentType, xml) {
+  const nid = +_dom("create_document_fragment");
+  const DocumentClass = xml ? (globalThis.XMLDocument || Document) : Document;
+  const doc = new DocumentClass(nid);
+  doc._detached = true;
+  doc._contentType = contentType;
+  _seedDetachedTreeState(doc);
+  _cache.set(nid, doc);
+  _registerForeignDocument();
+  return doc;
+}
+function _childNodeOfType(parent, type) {
+  for (let child = parent.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === type) return child;
+  }
+  return null;
+}
+
+// DOM mutation algorithms (https://dom.spec.whatwg.org/#mutation-algorithms).
+// appendChild, insertBefore, replaceChild, removeChild, the ChildNode and
+// ParentNode methods, textContent and Range all go through these, so they
+// validate in the spec's order and queue the same MutationObserver records.
+
+function _isDomNode(value) {
+  return value instanceof Node
+    || (typeof globalThis.Attr === "function" && value instanceof globalThis.Attr)
+    || (value !== null && typeof value === "object"
+      && (typeof value._nid === "number" || value._documentShim === true));
+}
+
+function _requireNodeArgument(value, method, position, iface = "Node") {
+  if (!_isDomNode(value)) {
+    throw new TypeError(
+      `Failed to execute '${method}' on '${iface}': parameter ${position} is not of type 'Node'.`,
+    );
+  }
+}
+
+// Objects a node's methods create come from that node's relevant global. An
+// iframe document's nodes live in this realm, so their exceptions and node
+// lists take the frame window's constructors explicitly.
+function _frameViewOf(context) {
+  if (!context || !_foreignDocumentCount) return null;
+  const doc = context.nodeType === 9 ? context : _nodeDocumentOf(context);
+  const view = doc && doc !== globalThis.document ? doc.defaultView : null;
+  return view && view !== globalThis ? view : null;
+}
+function _relevantNodeList(context, list) {
+  const view = _frameViewOf(context);
+  const FrameNodeList = view && view.NodeList;
+  if (typeof FrameNodeList === "function" && FrameNodeList.prototype !== NodeList.prototype) {
+    Object.setPrototypeOf(list, FrameNodeList.prototype);
+  }
+  return list;
+}
+function _mutationError(method, message, name, context) {
+  const view = _frameViewOf(context);
+  const Ctor = view && typeof view.DOMException === "function" ? view.DOMException : DOMException;
+  return new Ctor(`Failed to execute '${method}' on 'Node': ${message}`, name);
+}
+
+function _isHostIncludingInclusiveAncestor(node, parent) {
+  if (node === parent) return true;
+  const type = node.nodeType;
+  if (type !== 1 && type !== 9 && type !== 11) return false;
+  // The native walk goes up from parent and through shadow hosts; leaves
+  // that host no shadow root answer without walking.
+  return _dom("is_host_including_inclusive_ancestor", node._nid, parent._nid) === "true";
+}
+
+// "Ensure pre-insertion validity" and the validity checks of "replace"
+// (`replacing` true). Steps run in the spec's order because the order is
+// observable through which exception is thrown.
+function _ensureInsertionValidity(parent, node, child, method, replacing) {
+  const parentType = parent.nodeType;
+  if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
+    throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
+  }
+  // Appending a parentless non-fragment node has no side effect before the
+  // native insert, whose cycle guard rejects the same case with the same
+  // error, so the walk is only needed when ordering or side effects matter.
+  const needsAncestorCheck = child !== null || node.nodeType === 11
+    || node._shadowParent || node.parentNode !== null;
+  if (needsAncestorCheck ? _isHostIncludingInclusiveAncestor(node, parent) : node === parent) {
+    throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError", parent);
+  }
+  if (child !== null && child.parentNode !== parent) {
+    throw _mutationError(
+      method,
+      replacing
+        ? "The node to be replaced is not a child of this node."
+        : "The node before which the new node is to be inserted is not a child of this node.",
+      "NotFoundError",
+      parent,
+    );
+  }
+  const nodeType = node.nodeType;
+  if ((nodeType !== 1 && nodeType !== 3 && nodeType !== 4 && nodeType !== 7
+      && nodeType !== 8 && nodeType !== 10 && nodeType !== 11) || node instanceof ShadowRoot) {
+    throw _mutationError(
+      method,
+      `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
+      "HierarchyRequestError",
+      parent,
+    );
+  }
+  if (((nodeType === 3 || nodeType === 4) && parentType === 9)
+      || (nodeType === 10 && parentType !== 9)) {
+    throw _mutationError(
+      method,
+      `Nodes of type '${node.nodeName}' may not be inserted inside nodes of type '${parent.nodeName}'.`,
+      "HierarchyRequestError",
+      parent,
+    );
+  }
+  if (parentType === 9) _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing);
+}
+
+function _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing) {
+  const doc = parent;
+  const children = Array.from(doc.childNodes);
+  const childIndex = child === null ? children.length : children.indexOf(child);
+  const hasElementOtherThanChild = children.some(c => c.nodeType === 1 && !(replacing && c === child));
+  const doctypeFollowsChild = child !== null
+    && children.slice(childIndex + (replacing ? 1 : 0)).some(c => c.nodeType === 10);
+  const elementPrecedesChild = children.slice(0, childIndex).some(c => c.nodeType === 1);
+  const oneElement = () => {
+    if (hasElementOtherThanChild || (!replacing && child !== null && child.nodeType === 10) || doctypeFollowsChild) {
+      throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError", parent);
+    }
+  };
+  if (nodeType === 11) {
+    let elements = 0;
+    for (const c of Array.from(node.childNodes)) {
+      const t = c.nodeType;
+      if (t === 1) elements++;
+      else if (t === 3 || t === 4) {
+        throw _mutationError(method, "Nodes of type '#text' may not be inserted inside nodes of type '#document'.", "HierarchyRequestError", parent);
+      }
+    }
+    if (elements > 1) throw _mutationError(method, "Only one element on document allowed.", "HierarchyRequestError", parent);
+    if (elements === 1) oneElement();
+  } else if (nodeType === 1) {
+    oneElement();
+  } else if (nodeType === 10) {
+    const hasOtherDoctype = children.some(c => c.nodeType === 10 && !(replacing && c === child));
+    if (hasOtherDoctype) throw _mutationError(method, "Only one doctype on document allowed.", "HierarchyRequestError", parent);
+    if (child !== null ? elementPrecedesChild : children.some(c => c.nodeType === 1)) {
+      throw _mutationError(method, "Can't insert a doctype after the document element.", "HierarchyRequestError", parent);
+    }
+  }
+}
+
+// "Convert nodes into a node": strings become Text nodes; more than one
+// argument is collected into a DocumentFragment so the caller inserts once and
+// observers get a single record.
+function _convertNodesIntoNode(nodes, context) {
+  if (nodes.length === 1 && _isDomNode(nodes[0])) return nodes[0];
+  const owner = _nodeDocumentForInsertion(context);
+  const converted = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    converted.push(_isDomNode(n) ? n : owner.createTextNode(String(n)));
+  }
+  if (converted.length === 1) return converted[0];
+  const fragment = owner.createDocumentFragment();
+  for (const n of converted) fragment.appendChild(n);
+  return fragment;
+}
+
+// ParentNode/ChildNode insertion of several nodes. The spec collects them in
+// a DocumentFragment and inserts that; for the common shape (an element or
+// fragment parent and plain nodes that are not already under it, not
+// repeated and not its ancestors) inserting them in order is observably the
+// same, including the one childList record, without the fragment round trip.
+// Anything else takes the fragment path. `reference` is read after conversion.
+function _preInsertConverted(parent, args, context, reference, method) {
+  if (args.length === 1 && _isDomNode(args[0])) return _preInsertNode(parent, args[0], reference(), method);
+  const parentType = parent.nodeType;
+  if (args.length > 1 && (parentType === 1 || parentType === 11) && !(parent instanceof ShadowRoot)) {
+    const nodes = _plainInsertionNodes(parent, args, context);
+    const child = nodes && reference();
+    if (nodes && (child === null || (!nodes.includes(child) && child.parentNode === parent))) {
+      const observed = _hasMutationObservers();
+      const previousSibling = observed
+        ? (child === null ? parent.lastChild : _recordSiblings(child)[0])
+        : null;
+      for (const n of nodes) _insertOneNode(parent, n, child, method, true);
+      if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
+      _runPostConnectionSteps(nodes);
+      return;
+    }
+  }
+  _preInsertNode(parent, _convertNodesIntoNode(args, context), reference(), method);
+}
+function _plainInsertionNodes(parent, args, context) {
+  let owner = null;
+  const nodes = [];
+  const seen = new Set();
+  for (let i = 0; i < args.length; i++) {
+    let n = args[i];
+    if (!_isDomNode(n)) {
+      owner = owner || _nodeDocumentForInsertion(context);
+      n = owner.createTextNode(String(n));
+    } else {
+      const type = n.nodeType;
+      if (type !== 1 && type !== 3 && type !== 4 && type !== 7 && type !== 8) return null;
+      if (seen.has(n) || n.parentNode === parent || n._shadowParent) return null;
+      if (type === 1 && _isHostIncludingInclusiveAncestor(n, parent)) return null;
+      seen.add(n);
+    }
+    nodes.push(n);
+  }
+  return nodes;
+}
+
+function _nodeDocumentForInsertion(node) {
+  if (node.nodeType === 9) return node._detached ? node : globalThis.document;
+  return _nodeDocumentOf(node);
+}
+
+// Previous and next sibling of a node as record values: node ids resolved
+// lazily by MutationRecord, captured in one native call.
+function _recordSiblings(node) {
+  if (node._shadowParent) return [node.previousSibling, node.nextSibling];
+  const pair = _dom("sibling_nids", node._nid) || "-1,-1";
+  const comma = pair.indexOf(",");
+  return [+pair.slice(0, comma), +pair.slice(comma + 1)];
+}
+// Attribute records need the old value only when a registration asked for
+// it; removals still read it, since a removal of a missing attribute is none.
+function _attributeOldValuesWanted() {
+  const observers = globalThis.__mutationObservers;
+  if (!observers || !observers.length) return false;
+  for (const observer of observers) {
+    for (const registration of observer._targets) if (registration.options.attributeOldValue) return true;
+  }
+  return false;
+}
+function _hasMutationObservers() {
+  const observers = globalThis.__mutationObservers;
+  return !!(observers && observers.length);
+}
+
+// "Remove": `suppress` skips the record, as replace/replace-all queue their own.
+function _removeNode(parent, child, suppress, method = "removeChild") {
+  const observed = !suppress && _hasMutationObservers();
+  const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
+  const removedWindowNames = _windowNamedNamesInTree(child);
+  if (child instanceof Element) _releaseLinkedStylesheetsIn(child);
+  const parentConnected = parent.isConnected;
+  const removed = _dom("remove_child", child._nid) === "true";
+  if (!removed) {
+    throw _mutationError(method, "The node to be removed is not a child of this node.", "NotFoundError");
+  }
+  _seedUnchangedConnection(parent, parentConnected);
+  _seedDetachedTreeState(child);
+  if (_foreignDocumentCount) _stampNodeDocument(child, _nodeDocumentForInsertion(parent));
+  _detachStyleSheetsInSubtree(child);
+  _reconcileWindowNamedProperties(removedWindowNames);
+  if (observed) _queueTreeMutationRecord(parent, [], [child], previousSibling, nextSibling);
+}
+
+// Move one node under `parent` before `child` (append when null). A node
+// that still has a parent is removed from it first, which old-parent
+// observers see as a removal (adopt runs "remove" before inserting).
+function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  if (node._shadowParent) {
+    node._shadowParent.removeChild(node);
+  } else {
+    const oldParent = node.parentNode;
+    if (oldParent) {
+      if (queueOldParentRecord && _hasMutationObservers()) {
+        const [previousSibling, nextSibling] = _recordSiblings(node);
+        _queueTreeMutationRecord(oldParent, [], [node], previousSibling, nextSibling);
+      }
+      _detachStyleSheetsInSubtree(node);
+    }
+  }
+  const parentConnected = parent.isConnected;
+  const inserted = child === null
+    ? _dom("append_child", parent._nid, node._nid) === "true"
+    : _dom("insert_before", node._nid, child._nid) === "true";
+  if (!inserted) {
+    // The native guard rejects cycles, the case the skipped ancestor walk covers.
+    throw _mutationError(method, "The new child element contains the parent.", "HierarchyRequestError", parent);
+  }
+  _seedUnchangedConnection(parent, parentConnected);
+  _seedInsertedTreeState(node, parent, parentConnected);
+  if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
+  _registerWindowNamedTree(node);
+}
+
+// "Insert": returns the inserted nodes. `suppress` skips parent's record.
+function _insertNode(parent, node, child, suppress, method) {
+  const isFragment = node.nodeType === 11;
+  let nodes;
+  if (isFragment) {
+    nodes = Array.from(node.childNodes);
+    if (nodes.length === 0) return nodes;
+    // The children leave the fragment silently; the fragment's own
+    // observers get one record for all of them.
+    if (_hasMutationObservers()) _queueTreeMutationRecord(node, [], nodes, null, null);
+  } else {
+    nodes = [node];
+  }
+  const observed = !suppress && _hasMutationObservers();
+  const previousSibling = observed
+    ? (child === null ? parent.lastChild : _recordSiblings(child)[0])
+    : null;
+  for (const n of nodes) _insertOneNode(parent, n, child, method, !isFragment);
+  if (observed) _queueTreeMutationRecord(parent, nodes, [], previousSibling, child);
+  _runPostConnectionSteps(nodes);
+  return nodes;
+}
+
+function _preInsertNode(parent, node, child, method) {
+  _ensureInsertionValidity(parent, node, child, method, false);
+  let reference = child;
+  if (reference === node) reference = node.nextSibling;
+  _insertNode(parent, node, reference, false, method);
+  return node;
+}
+
+function _replaceChildNode(parent, node, child, method) {
+  _ensureInsertionValidity(parent, node, child, method, true);
+  let reference = child.nextSibling;
+  if (reference === node) reference = node.nextSibling;
+  let previousSibling = child.previousSibling;
+  if (previousSibling === node) previousSibling = node.previousSibling;
+
+  const observed = _hasMutationObservers();
+  const addedNodes = observed ? (node.nodeType === 11 ? Array.from(node.childNodes) : [node]) : null;
+  // Adopting node removes it from its parent before child is removed, so its
+  // old parent (possibly this one) sees that removal first.
+  if (node.nodeType !== 11) {
+    const oldParent = node._shadowParent || node.parentNode;
+    if (oldParent) oldParent.removeChild(node);
+  }
+  const removedNodes = [];
+  if (child.parentNode === parent) {
+    removedNodes.push(child);
+    _removeNode(parent, child, true, method);
+  }
+  _insertNode(parent, node, reference, true, method);
+  if (observed) _queueTreeMutationRecord(parent, addedNodes, removedNodes, previousSibling, reference);
+  return child;
+}
+
+// "Replace all" (replaceChildren, textContent). `node` may be null.
+function _replaceAllChildren(parent, node, method) {
+  const removedNodes = Array.from(parent.childNodes);
+  const observed = _hasMutationObservers();
+  const addedNodes = node === null ? [] : (node.nodeType === 11 ? Array.from(node.childNodes) : [node]);
+  for (const c of removedNodes) _removeNode(parent, c, true, method);
+  if (node !== null) _insertNode(parent, node, null, true, method);
+  if (observed && (addedNodes.length || removedNodes.length)) {
+    _queueTreeMutationRecord(parent, addedNodes, removedNodes, null, null);
+  }
+}
+
+const _attributePositionOrder = new WeakMap();
+let _nextAttributePositionOrder = 0;
+function _attributePositionKey(node) {
+  if (!_attributePositionOrder.has(node)) _attributePositionOrder.set(node, ++_nextAttributePositionOrder);
+  return _attributePositionOrder.get(node);
 }
 
 class Node {
@@ -2364,30 +2805,53 @@ class Node {
   constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
-  get ownerDocument() { return globalThis.document; }
+  get ownerDocument() { return _nodeDocumentOf(this); }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
+    if (_foreignDocumentCount) {
+      const doc = this.nodeType === 9 ? this : this.ownerDocument;
+      if (doc && doc !== globalThis.document) {
+        const url = doc.URL || "about:blank";
+        const base = doc.querySelector('base[href]');
+        try { return base ? new URL(base.getAttribute('href'), url).href : url; }
+        catch (e) { return url; }
+      }
+    }
     try { return _documentBase(); } catch (e) { return ""; }
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
+    const type = this.nodeType;
+    if (type === 9 || type === 10) return;
+    const value = v == null ? "" : String(v);
+    if (type !== 1 && type !== 11) {
+      this.data = value;
+      return;
+    }
+    // "String replace all". Removal keeps the old cheap per-child steps; the
+    // record rules are the spec's: one record, and none when nothing changed.
     const oldChildren = _domParse("child_nodes", this._nid) || [];
+    const observed = _hasMutationObservers();
+    const removedNodes = observed ? oldChildren.map(_wrap).filter(Boolean) : null;
+    const doc = _foreignDocumentCount ? _nodeDocumentForInsertion(this) : null;
     for (const c of oldChildren) {
       const child = _wrap(c);
       if (child) _detachStyleSheetsInSubtree(child);
       _dom("remove_child", c);
+      if (child) {
+        _seedDetachedTreeState(child);
+        _stampNodeDocument(child, doc);
+      }
     }
-    let added = [];
-    if (v != null && v !== "") {
-      const tn = +_dom("create_text_node", String(v));
-      _dom("append_child", this._nid, tn);
-      added = [tn];
+    let addedNodes = [];
+    if (value !== "") {
+      const text = _nodeDocumentForInsertion(this).createTextNode(value);
+      _dom("append_child", this._nid, text._nid);
+      _seedInsertedTreeState(text, this, this.isConnected);
+      addedNodes = [text];
     }
-    // Real MutationObserver fires childList for the children swap.
-    // Without this React 18+ hydration mismatch detection and many polling
-    // libs (intersection-driven lazy load, content sync) silently stall.
-    if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
+    if (observed && (addedNodes.length || removedNodes.length)) {
+      _queueTreeMutationRecord(this, addedNodes, removedNodes, null, null);
     }
   }
   get nodeValue() {
@@ -2397,7 +2861,9 @@ class Node {
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
+    if (t !== 3 && t !== 8) return;
+    if (this instanceof CharacterData) this.data = v ?? "";
+    else _dom("set_text_content", this._nid, String(v ?? ""));
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
@@ -2431,147 +2897,31 @@ class Node {
     }
     return _wrap(+_dom("prev_sibling", this._nid));
   }
-  appendChild(c) {
-    if (!c) return c;
-    if (this instanceof CharacterData) {
-      throw new DOMException(
-        "Failed to execute 'appendChild' on 'Node': This node type cannot have children.",
-        "HierarchyRequestError",
-      );
-    }
-    if (c instanceof DocumentFragment) {
-      const children = Array.from(c.childNodes);
-      for (const child of children) this.appendChild(child);
-      return c;
-    }
-    if (c._shadowParent) c._shadowParent.removeChild(c);
-    else if (c.parentNode) _detachStyleSheetsInSubtree(c);
-    const parentConnected = this.isConnected;
-    const inserted = _dom("append_child", this._nid, c._nid) === "true";
-    if (!inserted) {
-      throw new DOMException(
-        "Failed to execute 'appendChild' on 'Node': The new child would create an invalid tree.",
-        "HierarchyRequestError",
-      );
-    }
-    _seedUnchangedConnection(this, parentConnected);
-    _seedInsertedTreeState(c, this, parentConnected);
-    _registerWindowNamedTree(c);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
-    __prepareInsertedSubtree(c);
-    if (c instanceof Element && c.tagName === 'LINK') {
-      _loadLinkedStylesheet(c);
-    }
-    return c;
+  appendChild(node) {
+    _requireNodeArgument(node, "appendChild", 1);
+    return _preInsertNode(this, node, null, "appendChild");
   }
-  removeChild(c) {
-    if (!c || c.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
-        'NotFoundError'
-      );
+  removeChild(child) {
+    _requireNodeArgument(child, "removeChild", 1);
+    if (child.parentNode !== this) {
+      throw _mutationError("removeChild", "The node to be removed is not a child of this node.", "NotFoundError", this);
     }
-    const removedWindowNames = _windowNamedNamesInTree(c);
-    if (c instanceof Element) _releaseLinkedStylesheetsIn(c);
-    const parentConnected = this.isConnected;
-    const removed = _dom("remove_child", c._nid) === "true";
-    if (!removed) {
-      throw new DOMException(
-        "Failed to execute 'removeChild' on 'Node': The node is not a child of this node.",
-        "NotFoundError",
-      );
-    }
-    _seedUnchangedConnection(this, parentConnected);
-    _seedDetachedTreeState(c);
-    _detachStyleSheetsInSubtree(c);
-    _reconcileWindowNamedProperties(removedWindowNames);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
-    return c;
+    _removeNode(this, child, false);
+    return child;
   }
-  replaceChild(newChild, oldChild) {
-    if (!oldChild || !newChild) return oldChild;
-    if (oldChild.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
-        "NotFoundError",
-      );
-    }
-    if (newChild === oldChild) return oldChild;
-    if (newChild instanceof DocumentFragment) {
-      const children = Array.from(newChild.childNodes);
-      for (const child of children) this.insertBefore(child, oldChild);
-      this.removeChild(oldChild);
-      return oldChild;
-    }
-    if (newChild._shadowParent) newChild._shadowParent.removeChild(newChild);
-    else if (newChild.parentNode) _detachStyleSheetsInSubtree(newChild);
-    const parentConnected = this.isConnected;
-    const removedWindowNames = _windowNamedNamesInTree(oldChild);
-    const inserted = _dom("insert_before", newChild._nid, oldChild._nid) === "true";
-    if (!inserted) {
-      throw new DOMException(
-        "Failed to execute 'replaceChild' on 'Node': The new child would create an invalid tree.",
-        "HierarchyRequestError",
-      );
-    }
-    const removed = _dom("remove_child", oldChild._nid) === "true";
-    if (!removed) throw new DOMException("The node could not be replaced.", "NotFoundError");
-    _seedUnchangedConnection(this, parentConnected);
-    _seedInsertedTreeState(newChild, this, parentConnected);
-    _seedDetachedTreeState(oldChild);
-    _detachStyleSheetsInSubtree(oldChild);
-    _registerWindowNamedTree(newChild);
-    _reconcileWindowNamedProperties(removedWindowNames);
-    // As in appendChild and removeChild. A replacement is an insertion and a removal. An
-    // observer saw neither so far.
-    if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
-    }
-    __prepareInsertedSubtree(newChild);
-    if (newChild instanceof Element && newChild.tagName === 'LINK') {
-      _loadLinkedStylesheet(newChild);
-    }
-    return oldChild;
+  replaceChild(node, child) {
+    _requireNodeArgument(node, "replaceChild", 1);
+    _requireNodeArgument(child, "replaceChild", 2);
+    return _replaceChildNode(this, node, child, "replaceChild");
   }
-  insertBefore(n, ref) {
-    if (!n) return n;
-    if (!ref) { this.appendChild(n); return n; }
-    if (ref.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
-        "NotFoundError",
-      );
+  insertBefore(node, child) {
+    _requireNodeArgument(node, "insertBefore", 1);
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'insertBefore' on 'Node': 2 arguments required, but only 1 present.");
     }
-    if (n === ref) {
-      ref = n.nextSibling;
-      if (!ref) return this.appendChild(n);
-    }
-    if (n instanceof DocumentFragment) {
-      const children = Array.from(n.childNodes);
-      for (const child of children) this.insertBefore(child, ref);
-      return n;
-    }
-    if (n._shadowParent) n._shadowParent.removeChild(n);
-    else if (n.parentNode) _detachStyleSheetsInSubtree(n);
-    const parentConnected = this.isConnected;
-    const inserted = _dom("insert_before", n._nid, ref._nid) === "true";
-    if (!inserted) {
-      throw new DOMException(
-        "Failed to execute 'insertBefore' on 'Node': The new child would create an invalid tree.",
-        "HierarchyRequestError",
-      );
-    }
-    _seedUnchangedConnection(this, parentConnected);
-    _seedInsertedTreeState(n, this, parentConnected);
-    _registerWindowNamedTree(n);
-    // The same steps as in appendChild. Where a node is inserted does not decide whether an
-    // observer sees it and whether a <link> loads its stylesheet.
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
-    __prepareInsertedSubtree(n);
-    if (n instanceof Element && n.tagName === 'LINK') {
-      _loadLinkedStylesheet(n);
-    }
-    return n;
+    if (child === undefined) child = null;
+    if (child !== null) _requireNodeArgument(child, "insertBefore", 2);
+    return _preInsertNode(this, node, child, "insertBefore");
   }
   contains(o) {
     if (o === this) return true;
@@ -2580,12 +2930,23 @@ class Node {
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
     const t = this.nodeType;
+    if (t === 9) {
+      const xml = this instanceof XMLDocument || (this._documentShim && _isXMLDocument(this));
+      const clone = _createDetachedDocument(this.contentType, !!xml);
+      clone._documentURL = this.URL;
+      clone._documentEncoding = this.characterSet;
+      clone._documentCompatMode = this.compatMode;
+      if (deep) {
+        for (const child of this.childNodes) clone.appendChild(child.cloneNode(true));
+      }
+      return clone;
+    }
     if (t === 1) {
       return _wrap(+_dom("clone_node", this._nid, deep ? "true" : "false"));
     }
     // Clone structurally via real DOM nodes rather than round-tripping through a
     // throwaway <div>.innerHTML: the fragment parser discards elements that are
-    // not valid children of <div> (<tr>, <td>, <option>, …), so the old path
+    // not valid children of <div> (<tr>, <td>, <option>, ...), so the old path
     // returned null for them and lost JS-set inline styles. Building each node
     // directly with createElement(NS) + attribute copy avoids any parsing
     // context, and an explicit stack keeps a deep subtree from overflowing the
@@ -2618,6 +2979,25 @@ class Node {
   }
   compareDocumentPosition(other) {
     if (!other) return 0;
+    if (this === other) return 0;
+    if (this.nodeType === 2 || other.nodeType === 2) {
+      const ownAttr = this.nodeType === 2, otherAttr = other.nodeType === 2;
+      const own = ownAttr ? this.ownerElement : this;
+      const target = otherAttr ? other.ownerElement : other;
+      if (!own || !target) {
+        return 33 | (_attributePositionKey(this) < _attributePositionKey(other) ? 4 : 2);
+      }
+      if (own === target) {
+        if (ownAttr && otherAttr) {
+          const names = own.getAttributeNames();
+          const a = names.indexOf(this.name), b = names.indexOf(other.name);
+          return a === b ? 0 : 32 | (a < b ? 4 : 2);
+        }
+        return ownAttr ? 10 : 20;
+      }
+      const order = own.compareDocumentPosition(target);
+      return order & ~(ownAttr ? 16 : 0) & ~(otherAttr ? 8 : 0);
+    }
     if (this._nid === other._nid) return 0;
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
@@ -2646,21 +3026,31 @@ class Node {
     return connected;
   }
   normalize() {
-    // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
-    // removed nodes keep their own data (read from the backing node by nid).
+    // Spec order: drop an empty Text node; otherwise append the data of the
+    // following contiguous Text nodes (one characterData record), then remove
+    // those nodes one by one (one childList record each). Detached removed
+    // nodes keep their own data (read from the backing node by nid).
     let child = this.firstChild;
     while (child) {
-      const next = child.nextSibling;
       if (child.nodeType === 3) {
-        let data = child.data, sib = child.nextSibling;
-        while (sib && sib.nodeType === 3) { const after = sib.nextSibling; data += sib.data; this.removeChild(sib); sib = after; }
-        if (data.length === 0) { this.removeChild(child); child = sib; continue; }
-        if (data !== child.data) child.data = data;
-        child = sib; continue;
-      } else if (child.nodeType === 1 || child.nodeType === 11) {
-        child.normalize();
+        if (child.data.length === 0) {
+          const next = child.nextSibling;
+          this.removeChild(child);
+          child = next;
+          continue;
+        }
+        const following = [];
+        let sibling = child.nextSibling;
+        while (sibling && sibling.nodeType === 3) { following.push(sibling); sibling = sibling.nextSibling; }
+        if (following.length) {
+          child.data = child.data + following.map(t => t.data).join("");
+          for (const t of following) this.removeChild(t);
+        }
+        child = sibling;
+        continue;
       }
-      child = next;
+      if (child.nodeType === 1 || child.nodeType === 11) child.normalize();
+      child = child.nextSibling;
     }
   }
   isEqualNode(other) {
@@ -3061,8 +3451,8 @@ function _htmlAttrName(el, n) {
   return n;
 }
 
-// A submit button per the HTML spec: a <button> whose type is submit — the
-// default, including when the type attribute is missing or invalid — or an
+// A submit button per the HTML spec: a <button> whose type is submit (the
+// default, including when the type attribute is missing or invalid), or an
 // <input> of type submit/image. Used to validate requestSubmit's submitter.
 // The HTML "labeled control" of a <label>: the element referenced by its `for`
 // attribute, or the first labelable descendant. Labelable elements per spec are
@@ -3261,9 +3651,9 @@ class NamedNodeMap {
     return _domParse("attribute_names", this._element._nid) || [];
   }
   _attr(name) {
-    const value = this._element.getAttribute(name);
-    if (value === null) return null;
-    const attr = new Attr(name, value, null, null);
+    const info = _domParse("attribute_metadata", this._element._nid, name);
+    if (!info) return null;
+    const attr = new Attr(info.name, info.value, info.namespaceURI, info.prefix);
     attr.ownerElement = this._element;
     return attr;
   }
@@ -3277,7 +3667,13 @@ class NamedNodeMap {
     return this._names().includes(name) ? this._attr(name) : null;
   }
   getNamedItemNS(namespaceURI, localName) {
-    return this.getNamedItem(localName);
+    const ns = namespaceURI == null || namespaceURI === '' ? null : String(namespaceURI);
+    const local = String(localName);
+    for (const name of this._names()) {
+      const attr = this._attr(name);
+      if (attr && attr.namespaceURI === ns && attr.localName === local) return attr;
+    }
+    return null;
   }
   setNamedItem(attr) {
     if (!attr || typeof attr.name !== "string") return null;
@@ -3639,6 +4035,21 @@ function _renderedInnerText(element) {
     .replace(/^[ \n\t]+|[ \n\t]+$/g, '');
 }
 
+const _elementStyles = new WeakMap();
+const _elementStyleGet = _elementStyles.get.bind(_elementStyles);
+const _elementStyleSet = _elementStyles.set.bind(_elementStyles);
+function _elementStyle(element) {
+  let style = _elementStyleGet(element);
+  if (!style) {
+    // A borrowed getter must return the owning realm's same declaration.
+    const member = _documentRealmMember(element, 'elementStyle');
+    style = member ? _styleReflectApply(member, element, [])
+      : _styleProxy(new CSSStyleDeclaration(element));
+    _elementStyleSet(element, style);
+  }
+  return style;
+}
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -3656,7 +4067,6 @@ class Element extends Node {
       Object.setPrototypeOf(upgrading, new.target.prototype);
       return upgrading;
     }
-    this._style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -3740,12 +4150,14 @@ class Element extends Node {
     if (globalThis.__mutationObservers?.length) {
       oldChildren = _domParse("child_nodes", this._nid) || [];
     }
-    _dom("set_inner_html", this._nid, String(v ?? ""));
+    const html = String(v ?? "");
+    _dom("set_inner_html", this._nid, html);
     // HTML fragment parsing can introduce IDs without calling the JS
     // setAttribute path. Register those elements for Window named access
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
+    _connectSrcdocFrames(this, html);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -3778,7 +4190,7 @@ class Element extends Node {
       // `template_contents` allocates one on demand for created templates.
       const nid = +_dom("template_contents", this._nid);
       if (nid >= 0) {
-        // Cache by node id so `.content` keeps a stable identity across reads —
+        // Cache by node id so `.content` keeps a stable identity across reads;
         // frameworks stash the fragment and compare it later.
         if (!_cache.has(nid)) _cache.set(nid, new DocumentFragment(nid));
         const content = _cache.get(nid);
@@ -3845,8 +4257,8 @@ class Element extends Node {
       this.setAttribute("for", String(v));
     }
   }
-  get style() { return this._style; }
-  set style(v) { if (typeof v === "string") this._style.cssText = v; }
+  get style() { return _elementStyle(this); }
+  set style(v) { if (typeof v === "string") _elementStyle(this).cssText = v; }
   getAttribute(n) {
     n = _htmlAttrName(this, n);
     // Script-created elements start with a provably empty attribute set. Keep
@@ -3865,15 +4277,17 @@ class Element extends Node {
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    const observedOldValue = _attributeOldValuesWanted() ? this.getAttribute(n) : null;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
-    if (n === "src" && this.localName === "iframe") {
+    if (n === "src" && this.localName === "iframe" && !this.hasAttribute('srcdoc')) {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
       else this._resetIframeFrame();
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
     }
+    if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       if (this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
@@ -3882,14 +4296,14 @@ class Element extends Node {
         _reconcileWindowNamedProperty(previousWindowName);
       }
     }
-    if (n === "style") this._style._replaceFromAttribute(value);
+    if (n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
       if (this.__inlineHandlerCache) delete this.__inlineHandlerCache.onload;
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (_hasMutationObservers()) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -3906,28 +4320,36 @@ class Element extends Node {
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
+    const localName = n.includes(":") ? n.slice(n.indexOf(":") + 1) : n;
+    const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
+    if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
-    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
+    if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
+    if (n === 'srcdoc' && this.localName === 'iframe' && !this.hasAttribute(n)) return;
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     const previousWindowName = (n === "id" || n === "name")
       ? this.getAttribute(n)
       : null;
+    const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
     _dom("remove_attribute", this._nid, n);
+    if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
+    if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (previousWindowName
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
     }
-    if (n === "style") this._style._replaceFromAttribute("");
+    if (n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -3948,9 +4370,13 @@ class Element extends Node {
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
+    const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
+    if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
-    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
+    if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -3963,11 +4389,16 @@ class Element extends Node {
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
-    return _nodeList(ids.map(_wrapEl).filter(Boolean));
+    return _relevantNodeList(this, _nodeList(ids.map(_wrapEl).filter(Boolean)));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
+    if (arguments.length === 0) {
+      const view = _frameViewOf(this);
+      throw new ((view && view.TypeError) || TypeError)(
+        "Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
+    }
     // :popover-open is a JS-observable popover state, not understood by the
     // native selector engine. Handle it here (and strip it from compound
     // selectors so the rest can still be matched natively).
@@ -4077,6 +4508,7 @@ class Element extends Node {
     return _domEventDispatch(this, event);
   }
   _resolveInlineHandler(name) {
+    if (!_scriptingEnabled) return null;
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
     // as a function body on first read and cache it on the instance.
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
@@ -4175,7 +4607,7 @@ class Element extends Node {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
         const href = link.getAttribute('href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+        if (href && !href.startsWith('javascript:')) {
           location.assign(href);
           return;
         }
@@ -4686,6 +5118,8 @@ class Element extends Node {
     _resetIframeElement(this);
   }
   _loadIframeSrc(url) {
+    if (this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
+    if (url === 'about:blank' || !url) { this._resetIframeFrame(); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -4708,10 +5142,8 @@ class Element extends Node {
         const html = response.body || '';
         const loadedUrl = response.url || fullUrl;
         el._iframeLoadedUrl = loadedUrl;
-        // Hand the document to the host, which gives this frame a realm of its
-        // own and runs the scripts that came with it (issue #600). The shim
-        // document below stays: it is what the parent reads through
-        // contentDocument.
+        el._iframeOpaque = _sandboxOpaqueOrigin;
+        // The host fires load after creating the realm and running its scripts.
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
@@ -4726,6 +5158,7 @@ class Element extends Node {
           el._iframeWin._frameId = el._frameId;
           globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
           globalThis.__obscura_frameElements[el._frameId] = el;
+          return;
         }
       } else {
         el._iframeLoadedUrl = fullUrl;
@@ -4746,9 +5179,33 @@ class Element extends Node {
       el.dispatchEvent(new Event('load'));
     });
   }
+  _loadIframeSrcdoc(force = false) {
+    if (this.namespaceURI !== 'http://www.w3.org/1999/xhtml' || !this.isConnected) return;
+    const html = this.getAttribute('srcdoc');
+    if (html === null) return;
+    if (!force && this._iframeLoadingUrl === 'about:srcdoc' && this._iframeSrcdoc === html) return;
+    this._resetIframeFrame();
+    this._iframeLoadingUrl = 'about:srcdoc';
+    this._iframeSrcdoc = html;
+    // Coalesce attribute writes into one navigation task, after microtasks.
+    if (this._iframeSrcdocTaskPending) return;
+    this._iframeSrcdocTaskPending = true;
+    _browserPostedTaskEnqueue(() => {
+      this._iframeSrcdocTaskPending = false;
+      if (!this.isConnected || this._iframeLoadingUrl !== 'about:srcdoc' || !this.hasAttribute('srcdoc')) return;
+      if (this._frameId) globalThis.__obscura_forgetFrame(this._frameId);
+      this._frameId = 0;
+      _ensureInitialFrameRealm(this, this._iframeSrcdoc);
+      this._iframeLoadedUrl = 'about:srcdoc';
+    }, _schedulerPriorityRank['user-visible'] * 2, _browserPostedTaskGeneration(), () => {
+      this._iframeSrcdocTaskPending = false;
+    });
+  }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    if (_postConnection && _iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) return null;
+    if (this._iframeOpaque) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4770,7 +5227,9 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_postConnection && _iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) return null;
+    if (this._iframeOpaque && this._frameId) return _remoteWindow(this._frameId);
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -4870,7 +5329,7 @@ class Element extends Node {
     }
   }
   // Per the HTML spec, the submit() METHOD submits the form WITHOUT firing a
-  // cancelable `submit` event — a page's submit listener cannot veto it. Only
+  // cancelable `submit` event: a page's submit listener cannot veto it. Only
   // requestSubmit() and user-initiated submits fire the cancelable event.
   // Conflating the two broke sites whose submit listener preventDefault()s the
   // native submit and then calls form.submit() from a callback (e.g. an
@@ -5351,10 +5810,38 @@ class Element extends Node {
     }
     return new DOMRectList([this.getBoundingClientRect()]);
   }
-  // No layout engine: a stub that always returns true unblocks Playwright's
-  // actionability polling. With a real layout we'd check display, visibility,
-  // opacity and rect dimensions per spec.
-  checkVisibility(opts) { return true; }
+  // CSSOM View checkVisibility(). Box existence is judged from display along
+  // the flattened ancestor chain rather than from geometry, since some
+  // visible inline elements report 0x0 rects (#722). Playwright calls this
+  // before every action, so render builds answer from the retained cascade
+  // in one native call.
+  checkVisibility(opts) {
+    if (_cache.get(this._nid) !== this) {
+      const check = _documentRealmMember(this, 'checkVisibility');
+      if (check) return check.call(this, opts);
+    }
+    if (!this.isConnected) return false;
+    const options = opts && typeof opts === 'object' ? opts : {};
+    const checkOpacity = !!(options.opacityProperty || options.checkOpacity);
+    const checkVisibilityCSS = !!(options.visibilityProperty || options.checkVisibilityCSS);
+    if (typeof __obscuraCore.ops.op_check_visibility === 'function') {
+      return __obscuraCore.ops.op_check_visibility(this._nid | 0, checkOpacity, checkVisibilityCSS, _realmFrameId);
+    }
+    // Without the renderer, computed style only reflects inline declarations,
+    // so read them directly and resolve inheritance of `visibility` here.
+    let visibility = '';
+    for (let el = this; el; el = el.parentElement || (el.parentNode && el.parentNode.host) || null) {
+      const style = el.style;
+      if (!style) continue;
+      const display = style.display;
+      if (display === 'none' || (el === this && display === 'contents')) return false;
+      if (checkOpacity && style.opacity !== '' && parseFloat(style.opacity) <= 0) return false;
+      if (!visibility && style.visibility && style.visibility !== 'inherit') {
+        visibility = style.visibility;
+      }
+    }
+    return !(checkVisibilityCSS && visibility && visibility !== 'visible');
+  }
   // ARIA reflection properties. Without an accessibility tree we expose the
   // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
   // at least find elements that author them explicitly.
@@ -5511,18 +5998,17 @@ class Element extends Node {
   }
   getAnimations() { return _animationsForTarget(this); }
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-  append(...nodes) { for (const n of _convertNodes(nodes)) this.appendChild(n); }
+  append(...nodes) {
+    _preInsertConverted(this, nodes, this, () => null, "append");
+  }
   prepend(...nodes) {
-    const ref = this.firstChild;
-    for (const n of _convertNodes(nodes)) {
-      if (ref) this.insertBefore(n, ref); else this.appendChild(n);
-    }
+    _preInsertConverted(this, nodes, this, () => this.firstChild, "prepend");
   }
   replaceChildren(...nodes) {
-    const converted = _convertNodes(nodes);
-    let c;
-    while ((c = this.firstChild)) this.removeChild(c);
-    for (const n of converted) this.appendChild(n);
+    const node = _convertNodesIntoNode(nodes, this);
+    const empty = node.nodeType === 11 && !node.firstChild;
+    _ensureInsertionValidity(this, node, null, "replaceChildren", false);
+    _replaceAllChildren(this, empty ? null : node, "replaceChildren");
   }
 }
 
@@ -5541,13 +6027,19 @@ function _convertNodes(nodes) {
 }
 
 // ---- Reflected IDL attributes (WHATWG) ---------------------------------------
-// Installed ONCE on Element.prototype as shared getter/setter pairs. This is
+class HTMLOListElement extends Element {
+  get [Symbol.toStringTag]() { return "HTMLOListElement"; }
+}
+class HTMLLIElement extends Element {
+  get [Symbol.toStringTag]() { return "HTMLLIElement"; }
+}
+// Installed ONCE on shared prototypes as getter/setter pairs. This is
 // data-driven so there is no per-element defineProperty: element creation and
 // the querySelector/mutation hot paths are unaffected (each access is a normal
 // prototype getter that reads the backing attribute). Covers the global content
 // attributes reflected on every element plus the ARIAMixin (aria-* + ariaXxx).
 (function installElementReflectors() {
-  const P = Element.prototype;
+  let P = Element.prototype;
   const def = (name, get, set) => {
     if (Object.prototype.hasOwnProperty.call(P, name)) return; // never clobber an existing member
     Object.defineProperty(P, name, { get, set, enumerable: true, configurable: true });
@@ -5562,7 +6054,7 @@ function _convertNodes(nodes) {
   };
   // IDL `long` conversion (ToInt32): finite, truncated, wrapped to 32-bit signed.
   const toLong = (v) => {
-    let n = Number(v);
+    let n = +v;
     if (!Number.isFinite(n)) n = 0;
     n = Math.trunc(n) % 4294967296;
     if (n >= 2147483648) n -= 4294967296;
@@ -5637,6 +6129,13 @@ function _convertNodes(nodes) {
     ariaValueMin: "aria-valuemin", ariaValueNow: "aria-valuenow", ariaValueText: "aria-valuetext",
   };
   for (const prop in ARIA) reflectNullable(prop, ARIA[prop]);
+
+  P = HTMLOListElement.prototype;
+  reflectBool("reversed", "reversed");
+  reflectLong("start", "start", 1);
+  reflectStr("type", "type");
+  P = HTMLLIElement.prototype;
+  reflectLong("value", "value", 0);
 })();
 
 function _parseXPathPredicate(part) {
@@ -5764,7 +6263,10 @@ class Document extends Node {
     return Array.from(_waapiAnimations).filter(animation => animation.playState !== 'idle'
       && (animation.playState !== 'finished' || animation.effect?._timing.fill === 'forwards' || animation.effect?._timing.fill === 'both'));
   }
-  get documentElement() { return _wrapEl(+_dom("document_element")); }
+  get documentElement() {
+    if (this._detached) return _childNodeOfType(this, 1);
+    return _wrapEl(+_dom("document_element"));
+  }
   get children() {
     const root = this.documentElement;
     return HTMLCollection._from(root ? [root] : []);
@@ -5775,16 +6277,27 @@ class Document extends Node {
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
   get doctype() {
+    if (this._detached) return _childNodeOfType(this, 10);
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
     if (info && info.name) {
-      this._doctype = new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+      const cached = _cache.get(info.nodeId);
+      this._doctype = cached instanceof DocumentType
+        ? cached
+        : new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+      _cache.set(info.nodeId, this._doctype);
     } else {
       this._doctype = null;
     }
     return this._doctype;
   }
-  get title() { return _domParse("document_title") ?? ""; }
+  get title() {
+    if (this._detached) {
+      const title = this.querySelector("title");
+      return title ? title.textContent.replace(/[\t\n\f\r ]+/g, " ").trim() : "";
+    }
+    return _domParse("document_title") ?? "";
+  }
   set title(v) {
     const value = String(v);
     let title = this.querySelector("title");
@@ -5802,6 +6315,7 @@ class Document extends Node {
     title.textContent = value;
   }
   get URL() {
+    if (this._detached) return this._documentURL || "about:blank";
     const get = _documentRealmMember(this, 'URL');
     return get ? Reflect.apply(get, this, []) : (_domParse("document_url") ?? "");
   }
@@ -5828,10 +6342,14 @@ class Document extends Node {
     // grant cross-document access.
     this._effectiveDomain = candidate;
   }
-  get referrer() { return _domParse("document_referrer") ?? ""; }
-  get location() { return globalThis.location; }
-  set location(url) { __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  get referrer() { return this._detached ? "" : (_domParse("document_referrer") ?? ""); }
+  get location() { return this._detached ? null : globalThis.location; }
+  set location(url) {
+    if (this._detached) return;
+    __locationNavigate(String(url), false);
+  }
   get defaultView() {
+    if (this._detached) return null;
     const get = _documentRealmMember(this, 'defaultView');
     return get ? Reflect.apply(get, this, []) : globalThis;
   }
@@ -5839,6 +6357,7 @@ class Document extends Node {
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() {
+    if (this._detached) return this._documentCompatMode || "CSS1Compat";
     const get = _documentRealmMember(this, 'compatMode');
     return get ? Reflect.apply(get, this, [])
       : (this._nid == null ? "CSS1Compat" : _dom("document_compat_mode"));
@@ -5847,7 +6366,8 @@ class Document extends Node {
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
-  get characterSet() { return (this._nid === undefined || this._nid === null) ? "UTF-8" : _docEncoding(); }
+  get characterSet() { return this._documentEncoding || ((this._nid === undefined || this._nid === null || this._detached) ? "UTF-8" : _docEncoding()); }
+  get [Symbol.toStringTag]() { return this instanceof XMLDocument ? "XMLDocument" : (_isXMLDocument(this) ? "Document" : "HTMLDocument"); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -5878,6 +6398,7 @@ class Document extends Node {
     return "text/html";
   }
   get readyState() {
+    if (this._detached) return 'complete';
     const get = _documentRealmMember(this, 'readyState');
     return get ? Reflect.apply(get, this, []) : (globalThis.__documentReadyState__ || 'complete');
   }
@@ -5894,16 +6415,24 @@ class Document extends Node {
     const method = _documentRealmMember(this, 'getElementById');
     if (method) return Reflect.apply(method, this, [id]);
     const needle = String(id);
-    return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
+    if (needle === "") return null;
+    if (this._detached) {
+      return this.querySelector('[id="' + needle.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]');
+    }
+    return _wrapEl(+_dom("get_element_by_id", needle));
   }
   querySelector(s) {
     const method = _documentRealmMember(this, 'querySelector');
-    return method ? Reflect.apply(method, this, [s]) : _wrapEl(+_dom("query_selector", s));
+    if (method) return Reflect.apply(method, this, [s]);
+    if (this._detached) return _wrapEl(+_dom("query_selector_scoped", this._nid, s));
+    return _wrapEl(+_dom("query_selector", s));
   }
   querySelectorAll(s) {
     const method = _documentRealmMember(this, 'querySelectorAll');
     if (method) return Reflect.apply(method, this, [s]);
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = (this._detached
+      ? _domParse("query_selector_all_scoped", this._nid, s)
+      : _domParse("query_selector_all", s)) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
@@ -5929,6 +6458,7 @@ class Document extends Node {
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
+    _stampNodeDocument(el, this);
     if (el && localName === 'template') {
       el._templateContent = this.createDocumentFragment();
       el._templateContent._fragmentContext = 'template';
@@ -5962,21 +6492,21 @@ class Document extends Node {
     el._nullNamespaceAttrs = new Map();
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
-    return el;
+    return _stampNodeDocument(el, this);
   }
   createTextNode(t) {
     const nid = +_dom("create_text_node", String(t));
     const n = new Text(nid);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createCDATASection(data) {
     // Spec: throw NotSupportedError on an HTML document, reject data
@@ -5992,7 +6522,7 @@ class Document extends Node {
     const n = new CDATASection(nid);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createProcessingInstruction(target, data) {
     // Spec: not gated on document type. Reject targets that are not an XML
@@ -6009,19 +6539,19 @@ class Document extends Node {
     const n = new ProcessingInstruction(nid, tgt);
     _seedDetachedTreeState(n);
     _cache.set(nid, n);
-    return n;
+    return _stampNodeDocument(n, this);
   }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
     _seedDetachedTreeState(frag);
     _cache.set(nid, frag);
-    return frag;
+    return _stampNodeDocument(frag, this);
   }
   // Legacy DOM Level 2 event factory. Spec returns an event of the requested
   // class with an empty type until init*Event() is called. We previously
   // returned a generic Event for every type, which broke libraries that call
-  // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
+  // createEvent('CustomEvent').initCustomEvent(...), see issue #41.
   createEvent(type) {
     const eventType = String(type || '');
     const normalized = eventType.toLowerCase();
@@ -6054,7 +6584,11 @@ class Document extends Node {
     }
     return new Cls('');
   }
-  createRange() { return new Range(); }
+  createRange() {
+    const range = new Range();
+    if (this !== globalThis.document) { range._sc = this; range._ec = this; }
+    return range;
+  }
   addEventListener(type, fn, opts) {
     _eventTargetAdd(this, type, fn, opts);
   }
@@ -6101,8 +6635,8 @@ class Document extends Node {
         return null;
       },
       // DOM 6.1 "previousNode", implemented as specified (issue #462). The old
-      // version looked at exactly one candidate — the previous sibling's
-      // deepest last child — and returned null the moment it was filtered out,
+      // version looked at exactly one candidate (the previous sibling's
+      // deepest last child) and returned null the moment it was filtered out,
       // so a backward walk died mid-tree the way nextNode used to before #432.
       //
       // Unlike nextNode this stays in JS rather than using a DOM traversal op:
@@ -6117,7 +6651,7 @@ class Document extends Node {
             node = sibling;
             let verdict = this._filter(node);
             // Descend to the deepest last descendant, but never into a rejected
-            // subtree — that is what makes REJECT prune backwards as well.
+            // subtree: that is what makes REJECT prune backwards as well.
             while (verdict !== 2 && node.lastChild) {
               node = node.lastChild;
               verdict = this._filter(node);
@@ -6263,9 +6797,12 @@ class Document extends Node {
     };
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
-  get activeElement() { return globalThis.__obscura_focused || this.body; }
+  get activeElement() {
+    if (this._detached) return this.body;
+    return globalThis.__obscura_focused || this.body;
+  }
   // The element that scrolls the viewport, and where the page offset lives
-  // (issue #468). Standards mode, so documentElement — quirks mode would be
+  // (issue #468). Standards mode, so documentElement; quirks mode would be
   // body, but we never parse in quirks mode.
   get scrollingElement() { return this.documentElement; }
   get implementation() {
@@ -6273,35 +6810,35 @@ class Document extends Node {
     return {
       // Spec: createHTMLDocument returns a NEW detached Document. jQuery
       // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
-      // the result — when we returned `globalThis.document`, the real
+      // the result: when we returned `globalThis.document`, the real
       // `<body>` was wiped, taking every page on the open web that ships
       // jQuery 3.x with it. Reuse the DOMParser path to build a detached
       // document, then optionally set the title.
       createHTMLDocument(title) {
-        // Build head>title and body explicitly. Parsing a full skeleton string
-        // as innerHTML of <html> collapses through the fragment parser (it
-        // dropped head/body and kept only <title>), leaving doc.body null.
-        const doc = new DOMParser().parseFromString("", "text/html");
-        const root = doc.documentElement;
-        const head = document.createElement("head");
-        const titleEl = document.createElement("title");
-        if (title != null) titleEl.textContent = String(title);
-        head.appendChild(titleEl);
-        const body = document.createElement("body");
-        root.appendChild(head);
-        root.appendChild(body);
+        const doc = _createDetachedDocument("text/html", false);
+        doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
+        const html = doc.createElement("html");
+        doc.appendChild(html);
+        const head = doc.createElement("head");
+        html.appendChild(head);
+        if (title !== undefined) {
+          const titleEl = doc.createElement("title");
+          titleEl.appendChild(doc.createTextNode(String(title)));
+          head.appendChild(titleEl);
+        }
+        html.appendChild(doc.createElement("body"));
         return doc;
       },
-      // Real spec: createDocument(namespaceURI, qualifiedName, doctype) →
-      // an XML document with a root element of the given name. We don't
-      // have a separate XML stack, so return a minimal detached document
-      // with an element of the requested local name as documentElement.
-      createDocument(_ns, qualifiedName, _doctype) {
-        const name = (qualifiedName && String(qualifiedName)) || "root";
-        const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = new DOMParser().parseFromString(html, "application/xml");
-        if (_doctype) doc._docType = _doctype;
+      createDocument(namespace, qualifiedName, doctype) {
+        const ns = namespace == null ? null : String(namespace);
+        const contentType = ns === "http://www.w3.org/1999/xhtml"
+          ? "application/xhtml+xml"
+          : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
+        const doc = _createDetachedDocument(contentType, true);
+        const name = qualifiedName == null ? "" : String(qualifiedName);
+        const element = name === "" ? null : doc.createElementNS(ns, name);
+        if (doctype != null) doc.appendChild(doctype);
+        if (element) doc.appendChild(element);
         return doc;
       },
       // createDocumentType(qualifiedName, publicId, systemId): build a detached
@@ -6314,13 +6851,14 @@ class Document extends Node {
           throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
         }
         const dt = new DocumentType(
-          +_dom("create_comment_node", ""),
+          +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
           name,
           publicId === undefined ? "" : String(publicId),
           systemId === undefined ? "" : String(systemId)
         );
-        dt._ownerDocument = ownerDoc;
-        return dt;
+        _seedDetachedTreeState(dt);
+        _cache.set(dt._nid, dt);
+        return _stampNodeDocument(dt, ownerDoc);
       },
       hasFeature() { return true; },
     };
@@ -6334,10 +6872,12 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
+    // A document without a browsing context is cookie-averse.
+    if (this._detached) return "";
     return __obscuraCore.ops.op_get_cookies();
   }
   set cookie(v) {
-    if (!v) return;
+    if (!v || this._detached) return;
     __obscuraCore.ops.op_set_cookie(v);
   }
   // Inserts into the document's input stream, which the host keeps alive across calls.
@@ -6350,7 +6890,7 @@ class Document extends Node {
     if (method) return Reflect.apply(method, this, args);
     var html = args.join('');
     if (!html) return;
-    // The host parses into the input stream and returns [[parent, node], …], parents first. The
+    // The host parses into the input stream and returns [[parent, node], ...], parents first. The
     // insertion stays here, because appendChild does more than append: it reports the
     // mutation, registers window named access, and loads a written stylesheet.
     _insertWrittenNodes(this, _domParse("document_write", "", html) || []);
@@ -6410,7 +6950,7 @@ class Document extends Node {
     };
     setTimeout(finishParsing, 0);
   }
-  hasFocus() { return true; }
+  hasFocus() { return !this._detached; }
   queryCommandSupported(commandId) {
     const method = _documentRealmMember(this, 'queryCommandSupported');
     if (method) return Reflect.apply(method, this, arguments);
@@ -6487,11 +7027,12 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
+    _connectSrcdocFrames(this, html);
   }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
-    return _nodeList(ids.map(_wrapEl).filter(Boolean));
+    return _relevantNodeList(this, _nodeList(ids.map(_wrapEl).filter(Boolean)));
   }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -6533,7 +7074,14 @@ class DocumentType extends Node {
   get systemId() { return this._systemId; }
   get nodeValue() { return null; }
   set nodeValue(v) {}
-  get ownerDocument() { return this._ownerDocument || globalThis.document; }
+  cloneNode() {
+    const clone = new DocumentType(
+      +_dom("create_doctype", this._name, this._publicId), this._name, this._publicId, this._systemId,
+    );
+    _seedDetachedTreeState(clone);
+    _cache.set(clone._nid, clone);
+    return _stampNodeDocument(clone, this.ownerDocument);
+  }
 }
 
 const _cache = new Map();
@@ -7072,7 +7620,7 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
-function _elementClassFor(nid) {
+const _elementClassFor = (function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
@@ -7091,11 +7639,21 @@ function _elementClassFor(nid) {
   if (tag === "META" && globalThis.HTMLMetaElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
+  if ((tag === "OL" || tag === "LI")
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    const localName = _domParse("local_name", nid);
+    if (localName === "ol") return HTMLOListElement;
+    if (localName === "li") return HTMLLIElement;
+  }
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLSlotElement;
+  }
+  if (tag === "IFRAME" && globalThis.HTMLIFrameElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return globalThis.HTMLIFrameElement;
   }
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
@@ -7103,8 +7661,8 @@ function _elementClassFor(nid) {
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
   return Element;
-}
-function _elementClassForKnownName(namespace, qualifiedName) {
+});
+const _elementClassForKnownName = (function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
@@ -7119,7 +7677,10 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
+    if (localName === "ol") return HTMLOListElement;
+    if (localName === "li") return HTMLLIElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
+    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
@@ -7127,8 +7688,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "TRACK") return HTMLTrackElement;
   }
   return Element;
-}
-function _wrap(nid) {
+});
+const _wrap = (function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
@@ -7137,18 +7698,21 @@ function _wrap(nid) {
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) {
+    n = new DocumentType(nid, _domParse("doctype_name", nid) ?? "", _domParse("doctype_public_id", nid) ?? "", "");
+  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
-}
-function _wrapEl(nid) {
+});
+const _wrapEl = (function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
   const n = new C(nid);
   _cache.set(nid, n);
   return n;
-}
+});
 
 globalThis._wrap = _wrap;
 globalThis.self = globalThis;
@@ -7170,26 +7734,70 @@ globalThis.__virtualUrl = null;
 function __currentUrl() {
   return globalThis.__virtualUrl || _domParse("document_url") || "about:blank";
 }
+// HTML "navigate": a target that has a fragment and otherwise equals the
+// current URL is a same-document fragment navigation. It must not load a new
+// document; the history IIFE below adds (or replaces) a session-history entry
+// and queues hashchange. Hash routers (`location.hash = '#/route'`,
+// `<a href="#tab">`) depend on this.
+function __stripFragment(url) {
+  var i = url.indexOf('#');
+  return i < 0 ? url : url.slice(0, i);
+}
+function __locationNavigate(url, replace) {
+  var r = _resolveUrl(url);
+  var target = r;
+  try { target = new URL(r).href; } catch (e) {}
+  var current = __currentUrl();
+  if (target.indexOf('#') >= 0 && __stripFragment(target) === __stripFragment(current) &&
+      typeof globalThis.__obscuraNavigateToFragment === 'function') {
+    globalThis.__obscuraNavigateToFragment(target, replace);
+    return;
+  }
+  globalThis.__virtualUrl = r;
+  __obscuraCore.ops.op_navigate(r, 'GET', '');
+}
+// Location setters (HTML spec): change one component of a copy of the current
+// URL, then navigate to it. Only the fragment setter can stay in-document.
+function __locationSetPart(part, value) {
+  var u;
+  try { u = new URL(__currentUrl()); } catch (e) { return; }
+  if (part === 'hash') {
+    var previousHash = u.hash;
+    var input = String(value);
+    u.hash = input === '' ? '#' : input;
+    if (u.hash === previousHash) return;
+    __locationNavigate(u.href, false);
+    return;
+  }
+  u[part] = String(value);
+  __locationNavigate(u.href, false);
+}
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { __locationNavigate(url, false); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
+  set host(v) { __locationSetPart('host', v); },
   get hostname() { try { return new URL(this.href).hostname; } catch { return ""; } },
+  set hostname(v) { __locationSetPart('hostname', v); },
   get pathname() { try { return new URL(this.href).pathname; } catch { return "/"; } },
+  set pathname(v) { __locationSetPart('pathname', v); },
   get search() { try { return new URL(this.href).search; } catch { return ""; } },
+  set search(v) { __locationSetPart('search', v); },
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
+  set hash(v) { __locationSetPart('hash', v); },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
+  set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { __locationNavigate(url, false); },
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set(url) { __locationNavigate(String(url), false); },
   configurable: false,
   enumerable: true,
 });
@@ -7854,7 +8462,7 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
-async function _fetch(input, init = {}, resourceType = "Fetch") {
+const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -7956,7 +8564,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     });
   }
   return response;
-}
+});
 globalThis.fetch = (input, init = {}) => _fetch(input, init);
 
 if (typeof Headers === "undefined") {
@@ -7973,7 +8581,7 @@ if (typeof Headers === "undefined") {
   };
 }
 
-// XMLHttpRequestEventTarget — spec-required ancestor for XHR EventTarget methods.
+// XMLHttpRequestEventTarget: spec-required ancestor for XHR EventTarget methods.
 // zone.js prefers to walk XMLHttpRequestEventTarget.prototype for addEventListener/
 // removeEventListener/dispatchEvent descriptors before falling back to XHR.prototype.
 class XMLHttpRequestEventTarget {
@@ -8189,7 +8797,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     }
   }
 
-  // Per WHATWG DOM spec — required by zone.js which patches XHR via
+  // Per WHATWG DOM spec, required by zone.js which patches XHR via
   // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
   dispatchEvent(event) {
     if (!event || !event.type) return false;
@@ -8513,22 +9121,33 @@ if (typeof Response === 'undefined') {
 }
 
 if (!Element.prototype.replaceWith) {
-  // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
+  // _convertNodes turns any non-node argument (numbers, booleans, null, ...) into
   // a Text node via String(n), matching the spec and append()/prepend(); the
   // old `typeof n === 'string'` check corrupted insert_before for other types.
   Element.prototype.replaceWith = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
-    parent.removeChild(this);
+    const next = _viableSibling(this, nodes, "nextSibling");
+    const node = _convertNodesIntoNode(nodes, this);
+    if (this.parentNode === parent) _replaceChildNode(parent, node, this, "replaceWith");
+    else _preInsertNode(parent, node, next, "replaceWith");
   };
   _markNative(Element.prototype.replaceWith);
+}
+// ChildNode before/after/replaceWith anchor on the first sibling that is not
+// itself being inserted.
+function _viableSibling(node, nodes, direction) {
+  let sibling = node[direction];
+  while (sibling && nodes.includes(sibling)) sibling = sibling[direction];
+  return sibling;
 }
 if (!Element.prototype.before) {
   Element.prototype.before = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
+    const previous = _viableSibling(this, nodes, "previousSibling");
+    _preInsertConverted(parent, nodes, this,
+      () => (previous ? previous.nextSibling : parent.firstChild), "before");
   };
   _markNative(Element.prototype.before);
 }
@@ -8536,17 +9155,34 @@ if (!Element.prototype.after) {
   Element.prototype.after = function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
-    const ref = this.nextSibling;
-    for (const n of _convertNodes(nodes)) parent.insertBefore(n, ref);
+    const next = _viableSibling(this, nodes, "nextSibling");
+    _preInsertConverted(parent, nodes, this, () => next, "after");
   };
   _markNative(Element.prototype.after);
 }
 
 // ChildNode mixin: also mix before/after/replaceWith/remove into
 // CharacterData.prototype (covers Text, Comment, ProcessingInstruction).
-// These are the same implementations as Element.prototype — frameworks
+// These are the same implementations as Element.prototype; frameworks
 // (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
 if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
+// The legacy alias Chromium still ships.
+if (!Element.prototype.webkitMatchesSelector) {
+  Element.prototype.webkitMatchesSelector = function webkitMatchesSelector(selectors) {
+    if (arguments.length === 0) {
+      const view = _frameViewOf(this);
+      throw new ((view && view.TypeError) || TypeError)(
+        "Failed to execute 'webkitMatchesSelector' on 'Element': 1 argument required, but only 0 present.");
+    }
+    return this.matches(selectors);
+  };
+  _markNative(Element.prototype.webkitMatchesSelector);
+}
+for (const name of ["before", "after", "replaceWith", "remove"]) {
+  if (!Object.prototype.hasOwnProperty.call(DocumentType.prototype, name)) {
+    DocumentType.prototype[name] = Element.prototype[name];
+  }
+}
 if (!CharacterData.prototype.after) CharacterData.prototype.after = Element.prototype.after;
 if (!CharacterData.prototype.replaceWith) CharacterData.prototype.replaceWith = Element.prototype.replaceWith;
 if (!CharacterData.prototype.remove) CharacterData.prototype.remove = Element.prototype.remove;
@@ -8854,7 +9490,7 @@ globalThis.ResizeObserver = class ResizeObserver {
       return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
     this._active = [];
-    try { this._callback(entries, this); } catch (_error) {}
+    try { this._callback.call(this, entries, this); } catch (_error) {}
   }
   observe(target, options = {}) {
     if (!(target instanceof Element)) {
@@ -8901,20 +9537,6 @@ if (typeof TextEncoder === 'undefined') {
     encodeInto(str, dest) { const enc = this.encode(str); dest.set(enc.slice(0, dest.length)); return { read: str.length, written: Math.min(enc.length, dest.length) }; }
   };
 }
-// Fast pure-JS UTF-8 decode (the common case: Response/Blob .text(), most
-// pages). Avoids the op + JSON round trip for plain UTF-8.
-function _utf8DecodeBytes(bytes, start) {
-  let str = '', i = start | 0;
-  const n = bytes.length;
-  while (i < n) {
-    let c = bytes[i++];
-    if (c < 0x80) str += String.fromCharCode(c);
-    else if (c < 0xE0) str += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
-    else if (c < 0xF0) { const b1 = bytes[i++], b2 = bytes[i++]; str += String.fromCharCode(((c & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)); }
-    else { const b1 = bytes[i++], b2 = bytes[i++], b3 = bytes[i++]; const cp = ((c & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F); if (cp > 0xFFFF) { const s = cp - 0x10000; str += String.fromCharCode(0xD800 + (s >> 10), 0xDC00 + (s & 0x3FF)); } else str += String.fromCharCode(cp); }
-  }
-  return str;
-}
 if (typeof TextDecoder === 'undefined') {
   globalThis.TextDecoder = class TextDecoder {
     constructor(label, options) {
@@ -8937,11 +9559,9 @@ if (typeof TextDecoder === 'undefined') {
       const bytes = ArrayBuffer.isView(input)
         ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
         : new Uint8Array(input);
-      // Fast path: plain UTF-8, non-fatal (Response/Blob text, most pages).
-      if (this.encoding === 'utf-8' && !this.fatal) {
-        let off = 0;
-        if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) off = 3;
-        return _utf8DecodeBytes(bytes, off);
+      // The native UTF-8 decoder also replaces malformed sequences, without JSON or per-byte JS work.
+      if (this.encoding === 'utf-8' && !this.fatal && !this.ignoreBOM) {
+        return __obscuraCore.ops.op_decode(bytes);
       }
       // Legacy encodings / fatal mode: encoding_rs via the op.
       const r = JSON.parse(__obscuraCore.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
@@ -9066,6 +9686,9 @@ function _evaluateMediaDimension(feature) {
   return null;
 }
 
+let _prefersDark = false;
+let _prefersReducedMotion = false;
+
 function _evaluateMediaFeature(raw) {
   let feature = raw.trim().toLowerCase();
   if (feature[0] !== '(' || feature[feature.length - 1] !== ')') return false;
@@ -9081,10 +9704,11 @@ function _evaluateMediaFeature(raw) {
     return match[1] === 'portrait' ? height >= width : width > height;
   }
 
+  if (feature === 'prefers-color-scheme') return true;
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
-  if (match) return match[1] === 'light';
+  if (match) return match[1] === (_prefersDark ? 'dark' : 'light');
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
-  if (match) return match[1] === (globalThis.__obscura_reduced_motion ? 'reduce' : 'no-preference');
+  if (match) return match[1] === (_prefersReducedMotion ? 'reduce' : 'no-preference');
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
@@ -9147,6 +9771,11 @@ const _mediaQueries = new Set();
 // code does not retain the object returned from matchMedia().
 const _activeMediaQueries = new Set();
 const _mediaQueryState = new WeakMap();
+globalThis.__obscura_update_media_preferences = () => {
+  _prefersDark = !!_domParse("prefers_dark");
+  _prefersReducedMotion = !!_domParse("prefers_reduced_motion");
+  globalThis.__obscura_recompute_media_queries();
+};
 globalThis.__obscura_recompute_media_queries = () => {
   // Media/viewport changes also invalidate live computed-style snapshots.
   // Keep the epoch in this private scope, not in host-injected page script.
@@ -9294,16 +9923,21 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   };
 
   const target = style;
+  // An element outside any document has no computed style: every property
+  // reads "" and length is 0. Checked per read, as the declaration is live.
+  const detachedLookup = (name) => (_computedStyleHasNoDocument(el) ? '' : lookup(name));
   return new Proxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
-      if (prop === 'getPropertyValue') return (name) => lookup(name);
+      if (prop === 'getPropertyValue') return (name) => detachedLookup(name);
       if (prop === 'getPropertyPriority') return () => '';
       if (prop === 'item') return (i) => {
+        if (_computedStyleHasNoDocument(el)) return '';
         refreshRendered();
         return snapshot.names[i | 0] || '';
       };
       if (prop === 'length') {
+        if (_computedStyleHasNoDocument(el)) return 0;
         refreshRendered();
         return snapshot.names.length;
       }
@@ -9317,14 +9951,25 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
           && (_CSS_PROP_SET.has(prop)
               || _CSS_PROP_SET.has(_cssKebabToCamel(prop))
               || prop.includes('-'))) {
-        return lookup(prop);
+        return detachedLookup(prop);
       }
       if (prop in target) return target[prop];
-      if (typeof prop === 'string') return lookup(prop);
+      if (typeof prop === 'string') return detachedLookup(prop);
       return undefined;
     },
   });
 };
+// Chrome parity: only elements whose shadow-including root is not a document
+// lose their style. Iframe shim documents count as documents, and shadow
+// content of a connected host keeps its style even when it is not slotted.
+const _iframeDocumentRoots = new WeakSet();
+function _computedStyleHasNoDocument(el) {
+  if (!(el instanceof Node) || el.isConnected) return false;
+  const root = el.getRootNode({ composed: true });
+  if (!root) return true;
+  if (root.nodeType === 9) return root !== globalThis.document && !!root._detached;
+  return !_iframeDocumentRoots.has(root);
+}
 // Returns the one Selection instance for a document (cached on the document),
 // so window.getSelection() === document.getSelection(). The real Selection
 // class is defined below, after Range. _selectionFor is hoisted.
@@ -9337,6 +9982,9 @@ globalThis.getSelection = _markNative(function getSelection() {
   return _selectionFor(globalThis.document);
 });
 
+// Rules whose text is derived from their state serialize through this
+// symbol-keyed method, so cssText stays a single CSSRule.prototype accessor.
+const _cssRuleSerializer = Symbol("cssText");
 class CSSRule {
   static STYLE_RULE = 1;
   static CHARSET_RULE = 2;
@@ -9357,9 +10005,9 @@ class CSSRule {
     this._parentRule = null;
   }
   get type() { return this._type; }
-  get cssText() { return this._cssText; }
+  get cssText() { return this[_cssRuleSerializer] ? this[_cssRuleSerializer]() : this._cssText; }
   set cssText(_value) {}
-  get parentStyleSheet() { return this._parentStyleSheet; }
+  get parentStyleSheet() { return this._parentStyleSheet || this._parentRule?.parentStyleSheet || null; }
   get parentRule() { return this._parentRule; }
 }
 for (const name of [
@@ -9393,7 +10041,8 @@ class CSSStyleRule extends CSSRule {
   }
   set cssText(_value) {}
   _changed() {
-    if (this._parentStyleSheet) this._parentStyleSheet._ruleChanged();
+    const sheet = this.parentStyleSheet;
+    if (sheet) sheet._ruleChanged();
   }
 }
 
@@ -9458,7 +10107,7 @@ function _splitTopLevelCssRules(value) {
 function _cssRuleFromText(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
-  if (trimmed[0] === "@") return new CSSRule(trimmed, 0);
+  if (trimmed[0] === "@") return _cssConditionRuleFromText(trimmed) || new CSSRule(trimmed, 0);
   const open = trimmed.indexOf("{");
   if (open <= 0 || !trimmed.endsWith("}")) return null;
   const selector = trimmed.slice(0, open).trim();
@@ -9519,17 +10168,80 @@ class CSSGroupingRule extends CSSRule {
     if (!parsed.valid || parsed.rules.length !== 1) throw new DOMException("The rule could not be parsed", "SyntaxError");
     const child = _cssRuleFromText(parsed.rules[0]);
     if (!child) throw new DOMException("The rule could not be parsed", "SyntaxError");
-    child._parentStyleSheet = this.parentStyleSheet;
+    child._parentRule = this;
     this._rules.splice(idx, 0, child);
-    this.parentStyleSheet?._ruleChanged();
+    _groupingRuleChanged(this);
     return idx;
   }
   deleteRule(index) {
     const idx = Number(index) >>> 0;
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
-    this._rules.splice(idx, 1);
-    this.parentStyleSheet?._ruleChanged();
+    const [removed] = this._rules.splice(idx, 1);
+    if (removed) removed._parentRule = null;
+    _groupingRuleChanged(this);
   }
+}
+// A nested rule changes its top-level rule's text: replace that one rule in
+// the sheet, the same incremental path as CSSStyleSheet.insertRule.
+function _groupingRuleChanged(rule) {
+  let top = rule;
+  while (top._parentRule) top = top._parentRule;
+  const sheet = top.parentStyleSheet;
+  if (!sheet) return;
+  const index = sheet._rules.indexOf(top);
+  if (index < 0) sheet._ruleChanged();
+  else sheet._ruleChanged({ index, deleteCount: 1, rules: [top.cssText] });
+}
+
+// @media and @supports expose their nested rules; other at-rules stay opaque.
+class CSSConditionRule extends CSSGroupingRule {
+  constructor() {
+    super("", arguments[1]);
+    this._conditionText = arguments[0];
+  }
+  get conditionText() { return this._conditionText; }
+  [_cssRuleSerializer]() {
+    const keyword = this._type === CSSRule.MEDIA_RULE ? "@media" : "@supports";
+    const body = this._rules.map(rule => "\n  " + rule.cssText).join("");
+    return `${keyword} ${this._conditionText} {${body}\n}`;
+  }
+}
+class CSSMediaRule extends CSSConditionRule {
+  get media() {
+    const text = this._conditionText;
+    const items = text ? text.split(",").map(item => item.trim()).filter(Boolean) : [];
+    return {
+      mediaText: text,
+      length: items.length,
+      item(index) { return items[index >>> 0] ?? null; },
+      toString() { return text; },
+    };
+  }
+}
+class CSSSupportsRule extends CSSConditionRule {}
+for (const RuleClass of [CSSRule, CSSStyleRule, CSSGroupingRule, CSSConditionRule, CSSMediaRule, CSSSupportsRule]) {
+  Object.defineProperty(RuleClass.prototype, Symbol.toStringTag, { value: RuleClass.name, configurable: true });
+}
+
+function _cssConditionRuleFromText(text) {
+  const match = /^@(media|supports)\b/i.exec(text);
+  if (!match) return null;
+  const open = text.indexOf("{");
+  if (open < 0 || !text.endsWith("}")) return null;
+  const prelude = text.slice(match[0].length, open).trim().replace(/\s+/g, " ");
+  const parsed = _splitTopLevelCssRules(text.slice(open + 1, -1));
+  if (!parsed.valid) return null;
+  const isMedia = match[1].toLowerCase() === "media";
+  const rule = isMedia
+    ? new CSSMediaRule(prelude, CSSRule.MEDIA_RULE)
+    : new CSSSupportsRule(prelude, CSSRule.SUPPORTS_RULE);
+  for (const childText of parsed.rules) {
+    const child = _cssRuleFromText(childText);
+    if (!child) return null;
+    child._parentRule = rule;
+    rule._rules.push(child);
+  }
+  return rule;
 }
 
 class StyleSheet {
@@ -9607,7 +10319,7 @@ class CSSStyleSheet extends StyleSheet {
   _refreshFromOwner() {
     const state = _cssStyleSheetPrivate.get(this);
     if (!state || !(state.linked ? this._ownerNode : this._sourceNode)) return;
-    // Tracing iterates every rule. Copying the source for each item is O(n²).
+    // Tracing iterates every rule. Copying the source for each item is O(n^2).
     // The host generations include native imports and their origin-clean state.
     const generation = __obscuraCore.ops.op_stylesheet_generation(_realmFrameId, state.linked);
     if (state.generation === generation) return;
@@ -9648,6 +10360,9 @@ class CSSStyleSheet extends StyleSheet {
   }
   _serializeText() { return this._rules.map(rule => rule.cssText).join("\n"); }
   _ruleChanged(change) {
+    // A rule change restyles like a DOM mutation: computed-style snapshots
+    // taken before it must not be reused.
+    _domMutationEpoch++;
     const state = _cssStyleSheetPrivate.get(this);
     if (state?.linked && this._ownerNode) {
       // ponytail: linked imports retain the existing whole-sheet write path;
@@ -9862,6 +10577,9 @@ Object.defineProperty(Element.prototype, "sheet", {
 globalThis.CSSRule = CSSRule;
 globalThis.CSSStyleRule = CSSStyleRule;
 globalThis.CSSGroupingRule = CSSGroupingRule;
+globalThis.CSSConditionRule = CSSConditionRule;
+globalThis.CSSMediaRule = CSSMediaRule;
+globalThis.CSSSupportsRule = CSSSupportsRule;
 globalThis.CSSRuleList = CSSRuleList;
 globalThis.StyleSheet = StyleSheet;
 globalThis.CSSStyleSheet = CSSStyleSheet;
@@ -9965,92 +10683,207 @@ Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
 });
 
 globalThis.__mutationObservers = [];
+// MutationRecord fields are prototype getters over internal state, as in
+// browsers; records are only built while an observer exists. Node lists and
+// sibling wrappers are materialized on first read.
+const _mutationRecordToken = Symbol("MutationRecord");
+function _recordNode(value) {
+  if (typeof value !== "number") return value || null;
+  return value < 0 ? null : _wrap(value);
+}
+globalThis.MutationRecord = class MutationRecord {
+  #d;
+  constructor() {
+    if (arguments[0] !== _mutationRecordToken) {
+      throw new TypeError("Failed to construct 'MutationRecord': Illegal constructor");
+    }
+    this.#d = arguments[1];
+  }
+  get type() { return this.#d.type; }
+  get target() { return this.#d.target; }
+  get addedNodes() {
+    const d = this.#d;
+    if (!(d.addedNodes instanceof NodeList)) d.addedNodes = _nodeList(d.addedNodes || []);
+    return d.addedNodes;
+  }
+  get removedNodes() {
+    const d = this.#d;
+    if (!(d.removedNodes instanceof NodeList)) d.removedNodes = _nodeList(d.removedNodes || []);
+    return d.removedNodes;
+  }
+  get previousSibling() { return _recordNode(this.#d.previousSibling); }
+  get nextSibling() { return _recordNode(this.#d.nextSibling); }
+  get attributeName() { return this.#d.attributeName ?? null; }
+  get attributeNamespace() { return this.#d.attributeNamespace ?? null; }
+  get oldValue() { return this.#d.oldValue; }
+};
+Object.defineProperty(MutationRecord.prototype, Symbol.toStringTag, { value: "MutationRecord", configurable: true });
+function _makeMutationRecord(type, target, init, includeOldValue) {
+  return new MutationRecord(_mutationRecordToken, {
+    type,
+    target,
+    addedNodes: init.addedNodes,
+    removedNodes: init.removedNodes,
+    previousSibling: init.previousSibling,
+    nextSibling: init.nextSibling,
+    attributeName: init.attributeName,
+    attributeNamespace: init.attributeNamespace,
+    oldValue: includeOldValue ? (init.oldValue ?? null) : null,
+  });
+}
+
+let _mutationObserverMicrotaskQueued = false;
+function _notifyMutationObservers() {
+  _mutationObserverMicrotaskQueued = false;
+  // Observers are notified in creation order; one callback per observer
+  // with every record queued since the last delivery.
+  const observers = _mutationObserverRegistry.slice();
+  for (const observer of observers) {
+    if (observer._records.length === 0) continue;
+    const records = observer._records.splice(0);
+    try { observer._callback.call(observer, records, observer); }
+    catch (e) { _reportMutationObserverError(e); }
+  }
+}
+function _reportMutationObserverError(error) {
+  try {
+    if (typeof globalThis.reportError === "function") globalThis.reportError(error);
+    else console.error(error);
+  } catch (e) { /* reporting must not stop delivery */ }
+}
+// Every observing MutationObserver in creation order, which is delivery order.
+const _mutationObserverRegistry = [];
+
 globalThis.MutationObserver = class MutationObserver {
   constructor(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+    }
     this._callback = callback;
     this._targets = [];
     this._records = [];
   }
-  observe(target, options) {
-    this._targets.push({ target, options: options || {} });
+  observe(target, options = {}) {
+    if (!_isDomNode(target)) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+    }
+    const o = options == null ? {} : options;
+    const init = {
+      childList: !!o.childList,
+      subtree: !!o.subtree,
+      attributes: o.attributes === undefined ? undefined : !!o.attributes,
+      characterData: o.characterData === undefined ? undefined : !!o.characterData,
+      attributeOldValue: o.attributeOldValue === undefined ? undefined : !!o.attributeOldValue,
+      characterDataOldValue: o.characterDataOldValue === undefined ? undefined : !!o.characterDataOldValue,
+      attributeFilter: o.attributeFilter === undefined ? undefined : Array.from(o.attributeFilter, String),
+    };
+    if (init.attributes === undefined && (init.attributeOldValue !== undefined || init.attributeFilter !== undefined)) {
+      init.attributes = true;
+    }
+    if (init.characterData === undefined && init.characterDataOldValue !== undefined) init.characterData = true;
+    const fail = (message) => new TypeError("Failed to execute 'observe' on 'MutationObserver': " + message);
+    if (!init.childList && !init.attributes && !init.characterData) {
+      throw fail("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    }
+    if (init.attributeOldValue && !init.attributes) {
+      throw fail("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    }
+    if (init.attributeFilter !== undefined && !init.attributes) {
+      throw fail("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+    }
+    if (init.characterDataOldValue && !init.characterData) {
+      throw fail("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+    }
+    init.attributes = !!init.attributes;
+    init.characterData = !!init.characterData;
+    const existing = this._targets.find(registration => registration.target === target);
+    if (existing) existing.options = init;
+    else this._targets.push({ target, options: init });
     if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
+    if (!_mutationObserverRegistry.includes(this)) _mutationObserverRegistry.push(this);
   }
   disconnect() {
     this._targets = [];
+    this._records = [];
     const idx = globalThis.__mutationObservers.indexOf(this);
     if (idx >= 0) globalThis.__mutationObservers.splice(idx, 1);
+    const registered = _mutationObserverRegistry.indexOf(this);
+    if (registered >= 0) _mutationObserverRegistry.splice(registered, 1);
   }
   takeRecords() {
-    const r = this._records.slice();
-    this._records = [];
-    return r;
+    return this._records.splice(0);
   }
-  _notify(records) {
-    this._records.push(...records);
-    Promise.resolve().then(() => {
-      if (this._records.length > 0) {
-        const batch = this._records.splice(0);
-        try { this._callback(batch, this); } catch(e) { /* observer errors shouldn't propagate */ }
-      }
-    });
+  _enqueue(record) {
+    this._records.push(record);
+    if (!_mutationObserverMicrotaskQueued) {
+      _mutationObserverMicrotaskQueued = true;
+      queueMicrotask(_notifyMutationObservers);
+    }
   }
 };
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue) {
+
+// "Queue a mutation record": find every observer registered on the target or,
+// with subtree, on one of its inclusive ancestors, and apply its filters.
+function _queueMutationRecord(type, target, init) {
+  const observers = globalThis.__mutationObservers;
+  if (!observers.length || !target) return;
+  for (const observer of observers) {
+    let matched = false;
+    let wantsOldValue = false;
+    for (const registration of observer._targets) {
+      const root = registration.target;
+      const options = registration.options;
+      if (!root) continue;
+      // Filter by record type first: the ancestry check is the costly part.
+      let oldValue = false;
+      if (type === "attributes") {
+        if (!options.attributes) continue;
+        if (options.attributeFilter
+            && (init.attributeNamespace != null || !options.attributeFilter.includes(init.attributeName))) continue;
+        oldValue = !!options.attributeOldValue;
+      } else if (type === "characterData") {
+        if (!options.characterData) continue;
+        oldValue = !!options.characterDataOldValue;
+      } else if (!options.childList) {
+        continue;
+      }
+      if (root !== target && root._nid !== target._nid) {
+        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
+      }
+      if (oldValue) wantsOldValue = true;
+      matched = true;
+    }
+    if (matched) observer._enqueue(_makeMutationRecord(type, target, init, wantsOldValue));
+  }
+}
+// Subtree registrations match inclusive ancestors. One native bounded walk
+// replaces a JS parentNode walk per mutation; JS-only shadow parents keep it.
+function _isObservedAncestor(root, target) {
+  if (target._shadowParent || root._shadowParent) {
+    for (let cur = target.parentNode; cur; cur = cur.parentNode) if (cur === root) return true;
+    return false;
+  }
+  return _dom("is_inclusive_ancestor", root._nid, target._nid) === "true";
+}
+function _queueAttributeMutationRecord(target, localName, namespace, oldValue) {
+  _queueMutationRecord("attributes", target, { attributeName: localName, attributeNamespace: namespace, oldValue });
+}
+function _queueTreeMutationRecord(target, addedNodes, removedNodes, previousSibling, nextSibling) {
+  _queueMutationRecord("childList", target, { addedNodes, removedNodes, previousSibling, nextSibling });
+}
+// Node-id entry point kept for the native-backed callers (innerHTML,
+// attributes, character data).
+globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, oldValue, attributeNamespace) {
   if (!globalThis.__mutationObservers.length) return;
-  // Use `_wrap` (the canonical node-id → wrapper resolver) instead of a
-  // direct cache poke. The previous code referenced `globalThis._cache`,
-  // but `_cache` is a module-local Map — the lookup always returned
-  // undefined, so the function silently bailed every time. Result: no
-  // MutationObserver fired in obscura, ever, despite the call sites being
-  // wired up at appendChild / setAttribute. _wrap also lazily creates a
-  // wrapper for nodes that didn't have one yet (e.g. children parsed from
-  // `set innerHTML`), which we need for record.target/added/removed.
   const target = _wrap(target_nid);
   if (!target) return;
-  const record = {
-    type: type, // 'childList', 'attributes', 'characterData'
-    target: target,
+  _queueMutationRecord(type, target, {
     addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
-    attributeName: attributeName || null,
+    attributeName: attributeName ?? null,
+    attributeNamespace: attributeNamespace ?? null,
     oldValue: oldValue ?? null,
-    previousSibling: null,
-    nextSibling: null,
-  };
-  // Walk target → ancestors so a subtree-mode observer rooted at any
-  // ancestor matches. The previous implementation just checked that
-  // `target.contains` and `target.closest` were defined (always true on
-  // any Element), so subtree=true silently behaved like subtree=false and
-  // every nested mutation missed its subscriber.
-  for (const obs of globalThis.__mutationObservers) {
-    let matched = false;
-    for (const t of obs._targets) {
-      const root = t.target;
-      if (!root) continue;
-      // Filter by type per the observer options. Default behaviour matches
-      // real MutationObserver: attribute mutations need options.attributes,
-      // characterData mutations need options.characterData, childList
-      // needs options.childList.
-      const wantsType =
-        (type === 'attributes' && t.options.attributes) ||
-        (type === 'characterData' && t.options.characterData) ||
-        (type === 'childList' && t.options.childList);
-      if (!wantsType) continue;
-      if (type === 'attributes' && t.options.attributeFilter !== undefined
-          && !t.options.attributeFilter.includes(attributeName)) continue;
-      if (root._nid === target_nid) { matched = true; break; }
-      if (t.options.subtree) {
-        // Walk parents until we hit the observed root or run off the tree.
-        let cur = target.parentNode;
-        while (cur) {
-          if (cur._nid === root._nid) { matched = true; break; }
-          cur = cur.parentNode;
-        }
-        if (matched) break;
-      }
-    }
-    if (matched) obs._notify([record]);
-  }
+  });
 };
 
 globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
@@ -10081,37 +10914,17 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
     }
   }
   appendChild(child) {
+    _requireNodeArgument(child, "appendChild", 1);
     this._assertInsertable(child, 'appendChild');
     return super.appendChild(child);
   }
   insertBefore(node, reference) {
-    if (reference && reference.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'insertBefore' on 'Node': The reference node is not a child of this node.",
-        'NotFoundError'
-      );
-    }
-    if (node === reference) return node;
+    _requireNodeArgument(node, "insertBefore", 1);
     this._assertInsertable(node, 'insertBefore');
-    return super.insertBefore(node, reference);
-  }
-  removeChild(child) {
-    if (!child || child.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.",
-        'NotFoundError'
-      );
-    }
-    return super.removeChild(child);
+    return super.insertBefore(...arguments);
   }
   replaceChild(node, oldChild) {
-    if (!oldChild || oldChild.parentNode !== this) {
-      throw new DOMException(
-        "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.",
-        'NotFoundError'
-      );
-    }
-    if (node === oldChild) return oldChild;
+    _requireNodeArgument(node, "replaceChild", 1);
     this._assertInsertable(node, 'replaceChild');
     return super.replaceChild(node, oldChild);
   }
@@ -10147,7 +10960,7 @@ const _CE_RESERVED = new Set(['annotation-xml', 'color-profile', 'font-face', 'f
 function _isValidCustomElementName(name) {
   if (typeof name !== 'string' || _CE_RESERVED.has(name)) return false;
   // PotentialCustomElementName (approx): lowercase start, a hyphen, no uppercase.
-  return /^[a-z][a-z0-9._·À-￿-]*-[a-z0-9._·À-￿-]*$/.test(name);
+  return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(name);
 }
 class CustomElementRegistry {
   constructor() { this._registry = new Map(); this._byCtor = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
@@ -10308,7 +11121,7 @@ function _scheduleIntersectionObserverDelivery(observer) {
     for (const current of pending) {
       if (!current._connected || !current._records.length) continue;
       const records = current.takeRecords();
-      try { current._callback(records, current); } catch (e) {}
+      try { current._callback.call(current, records, current); } catch (e) {}
     }
   }, _schedulerPriorityRank["user-visible"] * 2, documentGeneration, () => {
     _intersectionDeliveryTaskPending = false;
@@ -10439,6 +11252,26 @@ function _ioElementPaddingBox(element, style, measurements) {
     : element.clientHeight;
   return _ioRect(rect.left + borderLeft, rect.top + borderTop, width, height);
 }
+// Entry fields are prototype getters over internal state, as in browsers.
+const _ioEntryToken = Symbol("IntersectionObserverEntry");
+globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {
+  #d;
+  constructor() {
+    if (arguments[0] !== _ioEntryToken) {
+      throw new TypeError("Failed to construct 'IntersectionObserverEntry': Illegal constructor");
+    }
+    this.#d = arguments[1];
+  }
+  get time() { return this.#d.time; }
+  get rootBounds() { return this.#d.rootBounds ?? null; }
+  get boundingClientRect() { return this.#d.boundingClientRect; }
+  get intersectionRect() { return this.#d.intersectionRect; }
+  get isIntersecting() { return !!this.#d.isIntersecting; }
+  get isVisible() { return !!this.#d.isVisible; }
+  get intersectionRatio() { return this.#d.intersectionRatio; }
+  get target() { return this.#d.target; }
+};
+Object.defineProperty(IntersectionObserverEntry.prototype, Symbol.toStringTag, { value: "IntersectionObserverEntry", configurable: true });
 globalThis.IntersectionObserver = class IntersectionObserver {
   constructor(callback, options) {
     if (typeof callback !== "function") {
@@ -10547,17 +11380,21 @@ globalThis.IntersectionObserver = class IntersectionObserver {
     const width = Math.max(0, right - left);
     const height = Math.max(0, bottom - top);
     const targetArea = Math.max(0, rect.width) * Math.max(0, rect.height);
-    const isIntersecting = edgesTouch;
-    const area = isIntersecting ? width * height : 0;
-    return {
+    const area = edgesTouch ? width * height : 0;
+    const intersectionRatio = targetArea > 0 ? area / targetArea : (edgesTouch ? 1 : 0);
+    // As in Chromium, an entry below the first threshold is reported as not
+    // intersecting even when the boxes overlap.
+    const isIntersecting = edgesTouch && this._thresholdIndex(intersectionRatio) > 0;
+    return new IntersectionObserverEntry(_ioEntryToken, {
       target,
       isIntersecting,
-      intersectionRatio: targetArea > 0 ? area / targetArea : (isIntersecting ? 1 : 0),
+      intersectionRatio,
       boundingClientRect: _ioRect(rect.x, rect.y, rect.width, rect.height),
-      intersectionRect: isIntersecting ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
-      rootBounds: root,
+      intersectionRect: edgesTouch ? _ioRect(left, top, width, height) : _ioRect(0, 0, 0, 0),
+      // A target outside the root's tree is not measured against the root.
+      rootBounds: inRootTree ? root : _ioRect(0, 0, 0, 0),
       time: performance.now(),
-    };
+    });
   }
   _thresholdIndex(ratio) {
     let index = 0;
@@ -10634,26 +11471,11 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   // rendering update and schedules both observer families.
   globalThis.__obscura_recompute_intersections = _scheduleIntersectionRenderCheckpoint;
   globalThis.addEventListener("resize", renderingUpdate);
-  const wireUp = () => {
-    if (!globalThis.document) return;
-    // DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
-    // MutationObserver is only needed for intersection geometry. Scheduling RO
-    // again here would escape its depth-bounded delivery cycle and allow a
-    // self-resizing callback to create an infinite chain of zero-delay tasks.
-    const observer = new MutationObserver(_scheduleIntersectionRenderCheckpoint);
-    try {
-      observer.observe(globalThis.document, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        characterData: true,
-      });
-    } catch {}
-  };
-  if (globalThis.document) wireUp();
-  else Promise.resolve().then(wireUp);
+  // DOM mutations need no MutationObserver here: every mutating `_dom`
+  // command already schedules the intersection checkpoint synchronously. A
+  // document-wide observer would make every page build spec mutation records
+  // (siblings, old values) for every DOM write without reading them.
 })();
-globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -11432,7 +12254,7 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
 // valid XML is never falsely flagged.
 const _checkXmlWellFormed = (html) => {
   // Strip comments, CDATA sections, processing instructions, and DOCTYPE
-  // declarations — they may contain angle brackets.
+  // declarations: they may contain angle brackets.
   const s = html
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
@@ -11486,13 +12308,11 @@ const _checkXmlWellFormed = (html) => {
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
 // then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
 // feature-detect writes `<form></form>` and wiped real bodies). We parse the
-// input into a detached `<html>` element and wrap it so the common Document
-// API surface (body / head / documentElement / querySelector* / getElementById /
-// getElementsByTagName / getElementsByClassName / title / cloneNode) works.
+// HTML uses an inert document parse; XML retains the limited HTML-backed shim.
 // Conservative XML well-formedness check. obscura has no XML parser, so this
 // only decides whether to surface a <parsererror> (it does not build an XML
-// tree). It flags clear structural errors — mismatched or unclosed tags,
-// multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
+// tree). It flags clear structural errors (mismatched or unclosed tags,
+// multiple/no root elements, unterminated comment/CDATA/PI) and defaults to
 // "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
 // flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
 // skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
@@ -11547,7 +12367,14 @@ const _escapeXmlErrorText = (text) =>
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
+    const parserURL = document.URL;
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
+    if (!isXml) {
+      const doc = _createDetachedDocument("text/html", false);
+      doc._documentURL = parserURL;
+      doc._documentCompatMode = _dom("parse_html_document", doc._nid, html);
+      return doc;
+    }
     const root = document.createElement("html");
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
@@ -11603,7 +12430,7 @@ globalThis.DOMParser = class DOMParser {
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
       get documentElement() {
         // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper — matches Chrome's behavior.
+        // <html> wrapper, matching Chrome's behavior.
         if (isParserError) return root.firstElementChild;
         return root;
       },
@@ -11630,14 +12457,13 @@ globalThis.DOMParser = class DOMParser {
       get lastChild() { return root; },
       get children() { return [root]; },
       get childNodes() { return [root]; },
-      // Document metadata the WHATWG interface exposes; DOMParser documents have
-      // URL about:blank, are already fully parsed, and carry no stylesheets.
-      get URL() { return "about:blank"; },
-      get documentURI() { return "about:blank"; },
+      // Inert documents inherit the parser realm's URL, not its browsing context.
+      get URL() { return parserURL; },
+      get documentURI() { return parserURL; },
       get domain() { return _incumbentDocumentDomain(); },
       set domain(value) { String(value); _throwDocumentDomainSecurityError(); },
       get referrer() { return ""; },
-      get baseURI() { return "about:blank"; },
+      get baseURI() { return Node.prototype.__lookupGetter__('baseURI').call(this); },
       get compatMode() { return "CSS1Compat"; },
       get characterSet() { return "UTF-8"; },
       get charset() { return "UTF-8"; },
@@ -11649,7 +12475,7 @@ globalThis.DOMParser = class DOMParser {
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
       querySelector(s) {
-        // For XML parsererror docs, check the root element as well —
+        // For XML parsererror docs, check the root element as well;
         // the <parsererror> is the documentElement, not a descendant.
         return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
       },
@@ -11666,24 +12492,24 @@ globalThis.DOMParser = class DOMParser {
       getElementsByName(n) {
         return root.querySelectorAll(`[name="${n}"]`);
       },
-      createElement: (t) => document.createElement(t),
-      createElementNS: (ns, t) => document.createElement(t),
-      createTextNode: (t) => document.createTextNode(t),
-      createComment: (t) => document.createComment(t),
-      createDocumentFragment: () => document.createDocumentFragment(),
+      createElement: (t) => _stampNodeDocument(document.createElement(t), docNode),
+      createElementNS: (ns, t) => _stampNodeDocument(document.createElement(t), docNode),
+      createTextNode: (t) => _stampNodeDocument(document.createTextNode(t), docNode),
+      createComment: (t) => _stampNodeDocument(document.createComment(t), docNode),
+      createDocumentFragment: () => _stampNodeDocument(document.createDocumentFragment(), docNode),
       createRange: () => new Range(),
       createEvent: (type) => document.createEvent(type),
       createCDATASection: (data) => {
         if (mimeType === "text/html") throw new DOMException("createCDATASection is not supported in HTML documents", "NotSupportedError");
         const s = String(data);
         if (s.indexOf("]]>") !== -1) throw new DOMException("CDATA section data must not contain ']]>'", "InvalidCharacterError");
-        return new CDATASection(+_dom("create_text_node", s));
+        return _stampNodeDocument(new CDATASection(+_dom("create_text_node", s)), docNode);
       },
       createProcessingInstruction: (target, data) => {
         const t = String(target), s = String(data);
         if (!_isValidPITarget(t)) throw new DOMException("Invalid processing instruction target", "InvalidCharacterError");
         if (s.indexOf("?>") !== -1) throw new DOMException("Processing instruction data must not contain '?>'", "InvalidCharacterError");
-        return new ProcessingInstruction(+_dom("create_text_node", s), t);
+        return _stampNodeDocument(new ProcessingInstruction(+_dom("create_text_node", s), t), docNode);
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
@@ -11694,13 +12520,17 @@ globalThis.DOMParser = class DOMParser {
       removeChild: function (n) { try { root.removeChild(n); } catch (e) {} return n; },
       insertBefore: function (n, ref) { try { root.insertBefore(n, ref); } catch (e) {} return n; },
       _docType: null,
+      _documentShim: true,
       get doctype() { return this._docType; },
       cloneNode: function (deep) {
-        return new DOMParser().parseFromString(root.outerHTML, mimeType);
+        return Node.prototype.cloneNode.call(this, deep);
       },
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
+    // The parsed tree belongs to this document, not the main one.
+    _registerForeignDocument();
+    _stampNodeDocument(root, docNode);
     _documentInstances.add(docNode);
     return docNode;
   }
@@ -12187,7 +13017,7 @@ function _structuredClone(value, seen) {
   }
   // Plain objects clone onto Object.prototype (like Chrome), not the source's
   // prototype. Define each property instead of assigning it: a source with an
-  // own enumerable `__proto__` data prop (what JSON.parse('{"__proto__":…}')
+  // own enumerable `__proto__` data prop (what JSON.parse('{"__proto__":...}')
   // yields) would otherwise hit the inherited __proto__ setter and reparent
   // the clone instead of copying the property.
   const out = Array.isArray(value) ? [] : {};
@@ -12355,7 +13185,7 @@ globalThis.atob = globalThis.atob || ((s) => {
 // Internally we keep a tiny in-memory stack of {state, url} entries. push/
 // replace mutate the stack and set globalThis.__virtualUrl so location.href
 // reads the new URL. Real Chrome doesn't fire popstate on push/replace,
-// only on user-driven back/forward — we match that exactly.
+// only on user-driven back/forward; we match that exactly.
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
@@ -12377,7 +13207,7 @@ globalThis.atob = globalThis.atob || ((s) => {
   const historyToken = Symbol("History");
   const resolveHistoryUrl = (url, method) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
-    // current document URL per the HTML spec — capture it so the entry does not
+    // current document URL per the HTML spec; capture it so the entry does not
     // reset location back to the original document URL.
     if (url === null || url === undefined) return __currentUrl();
     const base = __currentUrl();
@@ -12411,6 +13241,31 @@ globalThis.atob = globalThis.atob || ((s) => {
     const entry = stack[idx];
     globalThis.__virtualUrl = entry.url ?? null;
   };
+  // Same-document fragment navigation, reached from the Location setters and
+  // `<a href="#x">` activation. Per the HTML spec it adds a history entry
+  // (or replaces the current one), keeps the document, and queues a
+  // hashchange task when the fragment changed. No popstate fires here.
+  Object.defineProperty(globalThis, "__obscuraNavigateToFragment", {
+    value: (url, replace) => {
+      const prevUrl = __currentUrl();
+      if (prevUrl === url) return;
+      if (replace) {
+        stack[idx] = {state: null, url};
+      } else {
+        stack.length = idx + 1;
+        stack.push({state: null, url});
+        idx = stack.length - 1;
+        forwardCleared = true;
+      }
+      applyVirtual();
+      setTimeout(() => {
+        const ev = new HashChangeEvent('hashchange');
+        ev.oldURL = prevUrl; ev.newURL = url;
+        try { globalThis.dispatchEvent(ev); } catch {}
+      }, 0);
+    },
+    configurable: true,
+  });
   const fireHashChangeIfNeeded = (prevUrl) => {
     try {
       const next = __currentUrl();
@@ -13225,7 +14080,14 @@ for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype])
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
 }
 globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
+// <iframe> needs its own brand: with `HTMLIFrameElement = Element` every
+// element passed `instanceof HTMLIFrameElement`, so style-loader's
+// "insert target is an iframe" branch took `contentDocument.head` of <head>
+// itself and failed with "Couldn't find a style target".
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {
+  get srcdoc() { return this.getAttribute('srcdoc') || ''; }
+  set srcdoc(value) { this.setAttribute('srcdoc', value); }
+};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;
@@ -13241,8 +14103,8 @@ globalThis.HTMLHtmlElement = Element;
 globalThis.HTMLBRElement = Element;
 globalThis.HTMLHRElement = Element;
 globalThis.HTMLUListElement = Element;
-globalThis.HTMLOListElement = Element;
-globalThis.HTMLLIElement = Element;
+globalThis.HTMLOListElement = HTMLOListElement;
+globalThis.HTMLLIElement = HTMLLIElement;
 globalThis.HTMLPreElement = Element;
 globalThis.HTMLHeadingElement = Element;
 globalThis.HTMLTemplateElement = Element;
@@ -13647,48 +14509,23 @@ function _windowNameEligibleElement(element) {
     && _windowNamedNameTags.has(element.localName);
 }
 
-function _windowNamedSupportedNames(element) {
-  const names = [];
-  if (!element || element.nodeType !== 1) return names;
-  const id = element.getAttribute("id");
-  if (id) names.push(id);
-  if (_windowNameEligibleElement(element)) {
-    const name = element.getAttribute("name");
-    if (name && name !== id) names.push(name);
-  }
-  return names;
-}
-
 function _windowNamedCandidates(name) {
   const doc = globalThis.document;
   if (!doc || !name) return [];
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-  );
-  const matches = [];
-  for (let i = 0; i < elements.length; i++) {
-    const element = elements[i];
-    if (element.getAttribute("id") === name
-        || (_windowNameEligibleElement(element)
-          && element.getAttribute("name") === name)) {
-      matches.push(element);
-    }
-  }
-  return matches;
+  return _domParse("window_named_candidates", name) || [];
 }
 
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
-  for (const element of matches) {
-    if (element.localName === "iframe" && _windowNameEligibleElement(element)
-        && element.getAttribute("name") === name) {
-      const window = element.contentWindow;
+  for (const [nid, namedFrame] of matches) {
+    if (namedFrame) {
+      const window = _wrapEl(nid).contentWindow;
       if (window) return window;
     }
   }
-  if (matches.length > 1) return HTMLCollection._from(matches);
-  return matches[0];
+  if (matches.length > 1) return HTMLCollection._from(matches.map(([nid]) => _wrapEl(nid)));
+  return _wrapEl(matches[0][0]);
 }
 
 function _ensureWindowNamedProperty(name) {
@@ -13726,20 +14563,7 @@ function _reconcileWindowNamedProperty(name) {
 }
 
 function _windowNamedNamesInTree(root) {
-  const names = new Set();
-  if (!root) return names;
-  if (root.nodeType === 1) {
-    for (const name of _windowNamedSupportedNames(root)) names.add(name);
-  }
-  if (typeof root.querySelectorAll === "function") {
-    const elements = root.querySelectorAll(
-      "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-    );
-    for (let i = 0; i < elements.length; i++) {
-      for (const name of _windowNamedSupportedNames(elements[i])) names.add(name);
-    }
-  }
-  return names;
+  return new Set(root ? _domParse("window_named_names", root._nid) || [] : []);
 }
 
 function _registerWindowNamedTree(root) {
@@ -13756,15 +14580,7 @@ function _reconcileWindowNamedProperties(names) {
   if (!names || names.size === 0) return;
   const doc = globalThis.document;
   if (!doc) return;
-  const present = new Set();
-  const elements = doc.querySelectorAll(
-    "[id],embed[name],form[name],iframe[name],img[name],object[name]"
-  );
-  for (let i = 0; i < elements.length; i++) {
-    for (const name of _windowNamedSupportedNames(elements[i])) {
-      if (names.has(name)) present.add(name);
-    }
-  }
+  const present = _windowNamedNamesInTree(doc);
   for (const name of names) {
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
       try { delete globalThis[name]; } catch (_error) {}
@@ -13826,13 +14642,86 @@ function _rngOrder(a, b) {
 function _rngCmp(nA, oA, nB, oB) {
   if (_rngSame(nA, nB)) return oA < oB ? -1 : (oA > oB ? 1 : 0);
   if (_rngOrder(nA, nB) > 0) return -_rngCmp(nB, oB, nA, oA);
-  if (nA.contains && nA.contains(nB)) { // nA is a strict ancestor of nB
+  if (_dom("is_inclusive_ancestor", nA._nid, nB._nid) === "true") { // nA is a strict ancestor of nB
     let child = nB;
     while (child && child.parentNode && child.parentNode._nid !== nA._nid) child = child.parentNode;
     if (child && child.parentNode && child.parentNode._nid === nA._nid && _rngNodeIndex(child) < oA) return 1;
     return -1;
   }
   return -1;
+}
+function _rngIsCharacterData(n) {
+  const t = n.nodeType;
+  return t === 3 || t === 4 || t === 7 || t === 8;
+}
+// One native walk up from n; Node.contains enumerates a's whole subtree.
+function _rngIsInclusiveAncestor(a, n) {
+  return _rngSame(a, n) || _dom("is_inclusive_ancestor", a._nid, n._nid) === "true";
+}
+// A node is contained when all of it lies between the boundary points, and
+// partially contained when it is an inclusive ancestor of just one of them.
+function _rngContains(range, node) {
+  return _rngCmp(node, 0, range._sc, range._so) > 0
+    && _rngCmp(node, _rngNodeLength(node), range._ec, range._eo) < 0;
+}
+function _rngPartiallyContains(range, node) {
+  return _rngIsInclusiveAncestor(node, range._sc) !== _rngIsInclusiveAncestor(node, range._ec);
+}
+// Where extract/delete collapse the range: the start, or just after the
+// start's highest ancestor that does not contain the end.
+function _rngCollapsePoint(sc, so, ec) {
+  if (_rngIsInclusiveAncestor(sc, ec)) return [sc, so];
+  let reference = sc;
+  while (reference.parentNode && !_rngIsInclusiveAncestor(reference.parentNode, ec)) reference = reference.parentNode;
+  return [reference.parentNode, _rngNodeIndex(reference) + 1];
+}
+// The shared body of cloneContents (extract false) and extractContents.
+function _rngCopyContents(range, extract) {
+  const sc = range._sc, so = range._so, ec = range._ec, eo = range._eo;
+  const doc = sc.nodeType === 9 ? sc : (sc.ownerDocument || globalThis.document);
+  const fragment = doc.createDocumentFragment();
+  if (range.collapsed) return fragment;
+  if (_rngSame(sc, ec) && _rngIsCharacterData(sc)) {
+    const clone = sc.cloneNode(false);
+    clone.data = sc.data.substring(so, eo);
+    fragment.appendChild(clone);
+    if (extract) sc.replaceData(so, eo - so, "");
+    return fragment;
+  }
+  let common = sc;
+  while (!_rngIsInclusiveAncestor(common, ec)) common = common.parentNode;
+  const children = Array.from(common.childNodes);
+  const firstPartial = _rngIsInclusiveAncestor(sc, ec)
+    ? null : (children.find(c => _rngPartiallyContains(range, c)) || null);
+  const lastPartial = _rngIsInclusiveAncestor(ec, sc)
+    ? null : ([...children].reverse().find(c => _rngPartiallyContains(range, c)) || null);
+  const contained = children.filter(c => _rngContains(range, c));
+  if (contained.some(c => c.nodeType === 10)) {
+    throw new DOMException("The Range contains a DocumentType node.", "HierarchyRequestError");
+  }
+  const [newNode, newOffset] = extract ? _rngCollapsePoint(sc, so, ec) : [null, 0];
+  const copyPartial = (child, start, end) => {
+    if (_rngIsCharacterData(child)) {
+      const clone = child.cloneNode(false);
+      const from = start ? so : 0;
+      const to = start ? _rngNodeLength(child) : eo;
+      clone.data = child.data.substring(from, to);
+      fragment.appendChild(clone);
+      if (extract) child.replaceData(from, to - from, "");
+      return;
+    }
+    const clone = child.cloneNode(false);
+    fragment.appendChild(clone);
+    const sub = new Range();
+    if (start) { sub._sc = sc; sub._so = so; sub._ec = child; sub._eo = _rngNodeLength(child); }
+    else { sub._sc = child; sub._so = 0; sub._ec = ec; sub._eo = eo; }
+    clone.appendChild(_rngCopyContents(sub, extract));
+  };
+  if (firstPartial) copyPartial(firstPartial, true);
+  for (const child of contained) fragment.appendChild(extract ? child : child.cloneNode(true));
+  if (lastPartial) copyPartial(lastPartial, false);
+  if (extract) { range._sc = newNode; range._so = newOffset; range._ec = newNode; range._eo = newOffset; }
+  return fragment;
 }
 function _rngCheckOffset(n, o) {
   if (n && n.nodeType === 10) throw new DOMException("Range boundary cannot be a DocumentType", "InvalidNodeTypeError");
@@ -13948,11 +14837,93 @@ globalThis.Range = class Range {
     if (!_rngSame(sc, ec) && (ec.nodeType === 3 || ec.nodeType === 4)) s += (ec.data || "").slice(0, this._eo);
     return s;
   }
-  cloneContents() { return (globalThis.document || document).createDocumentFragment(); }
-  extractContents() { return (globalThis.document || document).createDocumentFragment(); }
-  deleteContents() {}
-  insertNode(node) { if (node && this._sc && this._sc.insertBefore) { const kids = this._sc.childNodes; this._sc.insertBefore(node, kids[this._so] || null); } }
-  surroundContents(node) { this.insertNode(node); }
+  cloneContents() { return _rngCopyContents(this, false); }
+  extractContents() { return _rngCopyContents(this, true); }
+  deleteContents() {
+    if (this.collapsed) return;
+    const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
+    if (_rngSame(sc, ec) && _rngIsCharacterData(sc)) {
+      sc.replaceData(so, eo - so, "");
+      return;
+    }
+    // The contained nodes whose parent is not contained, in tree order, read
+    // off the two boundary paths instead of testing every node in the range.
+    const common = this.commonAncestorContainer;
+    const toRemove = [];
+    const childrenOf = (node) => Array.from(node.childNodes);
+    let startIndex = so;
+    if (!_rngSame(sc, common)) {
+      if (!_rngIsCharacterData(sc)) toRemove.push(...childrenOf(sc).slice(so));
+      let node = sc;
+      while (!_rngSame(node.parentNode, common)) {
+        for (let sibling = node.nextSibling; sibling; sibling = sibling.nextSibling) toRemove.push(sibling);
+        node = node.parentNode;
+      }
+      startIndex = _rngNodeIndex(node) + 1;
+    }
+    const endSide = [];
+    let endIndex = eo;
+    if (!_rngSame(ec, common)) {
+      if (!_rngIsCharacterData(ec)) endSide.push(childrenOf(ec).slice(0, eo));
+      let node = ec;
+      while (!_rngSame(node.parentNode, common)) {
+        const preceding = [];
+        for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) preceding.unshift(sibling);
+        endSide.push(preceding);
+        node = node.parentNode;
+      }
+      endIndex = _rngNodeIndex(node);
+    }
+    toRemove.push(...childrenOf(common).slice(startIndex, Math.max(startIndex, endIndex)));
+    for (let i = endSide.length - 1; i >= 0; i--) toRemove.push(...endSide[i]);
+    const [newNode, newOffset] = _rngCollapsePoint(sc, so, ec);
+    if (_rngIsCharacterData(sc)) sc.replaceData(so, _rngNodeLength(sc) - so, "");
+    for (const node of toRemove) {
+      const parent = node.parentNode;
+      if (parent) parent.removeChild(node);
+    }
+    if (_rngIsCharacterData(ec)) ec.replaceData(0, eo, "");
+    this._sc = newNode; this._so = newOffset; this._ec = newNode; this._eo = newOffset;
+  }
+  insertNode(node) {
+    _requireNodeArgument(node, "insertNode", 1, "Range");
+    const sc = this._sc;
+    const st = sc.nodeType;
+    if (st === 7 || st === 8 || ((st === 3 || st === 4) && !sc.parentNode) || _rngSame(sc, node)) {
+      throw new DOMException("Failed to execute 'insertNode' on 'Range': The node provided cannot be inserted here.", "HierarchyRequestError");
+    }
+    const startIsText = st === 3 || st === 4;
+    let reference = startIsText ? sc : (sc.childNodes[this._so] || null);
+    const parent = reference === null ? sc : reference.parentNode;
+    _ensureInsertionValidity(parent, node, reference, "insertNode", false);
+    if (startIsText) reference = sc.splitText(this._so);
+    if (reference === node) reference = node.nextSibling;
+    if (node.parentNode) node.parentNode.removeChild(node);
+    let newOffset = reference === null ? _rngNodeLength(parent) : _rngNodeIndex(reference);
+    newOffset += node.nodeType === 11 ? node.childNodes.length : 1;
+    const wasCollapsed = this.collapsed;
+    _preInsertNode(parent, node, reference, "insertNode");
+    if (wasCollapsed) { this._ec = parent; this._eo = newOffset; }
+  }
+  surroundContents(newParent) {
+    _requireNodeArgument(newParent, "surroundContents", 1, "Range");
+    const partial = (node) => node.nodeType !== 3 && _rngPartiallyContains(this, node);
+    for (let n = this._sc; n; n = n.parentNode) {
+      if (partial(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", "InvalidStateError");
+    }
+    for (let n = this._ec; n; n = n.parentNode) {
+      if (partial(n)) throw new DOMException("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", "InvalidStateError");
+    }
+    const t = newParent.nodeType;
+    if (t === 9 || t === 10 || t === 11) {
+      throw new DOMException("Failed to execute 'surroundContents' on 'Range': The node provided is of an invalid type.", "InvalidNodeTypeError");
+    }
+    const fragment = this.extractContents();
+    if (newParent.firstChild) _replaceAllChildren(newParent, null, "surroundContents");
+    this.insertNode(newParent);
+    newParent.appendChild(fragment);
+    this.selectNode(newParent);
+  }
   detach() {}
   getBoundingClientRect() {
     if (this.collapsed) return new DOMRect();
@@ -14075,11 +15046,12 @@ _markNative(globalThis.Selection);
   Storage.prototype.removeItem, Storage.prototype.clear, Storage.prototype.key,
   Notification, Notification.requestPermission,
   window.chrome?.csi, window.chrome?.loadTimes,
-  MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver,
+  MutationObserver, MutationRecord, ResizeObserver, IntersectionObserver, PerformanceObserver,
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
 class _IframeDocument {
+  get _documentShim() { return true; }
   constructor(html, url, iframeEl) {
     this._url = url;
     this._iframeEl = iframeEl;
@@ -14094,6 +15066,9 @@ class _IframeDocument {
     this._root = document.createElement('html');
     this._head = document.createElement('head');
     this._body = document.createElement('body');
+    _iframeDocumentRoots.add(this._root);
+    _registerForeignDocument();
+    _stampNodeDocument(this._root, this);
     this._root.appendChild(this._head);
     this._root.appendChild(this._body);
     var bodyContent = html
@@ -14141,11 +15116,11 @@ class _IframeDocument {
   getElementsByClassName(cls) {
     return _getElementsByClassName(this._root, cls);
   }
-  createElement(tag) { return document.createElement(tag); }
-  createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
-  createTextNode(text) { return document.createTextNode(text); }
-  createComment(text) { return document.createComment(text); }
-  createDocumentFragment() { return document.createDocumentFragment(); }
+  createElement(tag) { return _stampNodeDocument(document.createElement(tag), this); }
+  createElementNS(ns, tag) { return _stampNodeDocument(document.createElementNS(ns, tag), this); }
+  createTextNode(text) { return _stampNodeDocument(document.createTextNode(text), this); }
+  createComment(text) { return _stampNodeDocument(document.createComment(text), this); }
+  createDocumentFragment() { return _stampNodeDocument(document.createDocumentFragment(), this); }
   createEvent(type) { return document.createEvent(type); }
   createRange() { return new Range(); }
   hasFocus() { return false; }
@@ -14315,8 +15290,8 @@ globalThis.__obscura_frameObjects = Object.create(null);
 // The frames of this realm whose element is still in the document.
 //
 // Liveness is asked of the element, not of a document query: an iframe inside
-// a shadow root is absent from `document.querySelectorAll('iframe')` — the
-// shape a challenge widget uses — while `isConnected` reports it correctly.
+// a shadow root is absent from `document.querySelectorAll('iframe')` (the
+// shape a challenge widget uses), while `isConnected` reports it correctly.
 // Treating it as gone would tear down a frame that is still in the page.
 globalThis.__obscura_liveFrameIds = function () {
   const live = [];
@@ -14402,12 +15377,20 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
-function _ensureInitialFrameRealm(element) {
+function _connectSrcdocFrames(root, html) {
+  if (root.isConnected && /<iframe[\s/>]/i.test(html)) {
+    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe[srcdoc]')));
+  }
+}
+
+function _ensureInitialFrameRealm(element, srcdoc) {
   if (element._frameId || !element.isConnected) return;
   // An opaque sandbox must never receive the creator's security token.
-  if (element.hasAttribute('sandbox') &&
-      !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
-  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
+  let opaque = element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin');
+  if (opaque && srcdoc === undefined) return false;
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, sandboxOpaque) => {
+    opaque = sandboxOpaque;
     const core = child.__obscura_core_handoff;
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
     delete child.__obscura_core_handoff;
@@ -14420,21 +15403,26 @@ function _ensureInitialFrameRealm(element) {
     child.__obscura_frameId = id;
     child.__obscura_parentFrameId = _realmFrameId;
     child.__obscura_init();
-    Object.defineProperties(child, {
-      parent: { value: globalThis, configurable: true },
-      top: { value: globalThis.top, configurable: true },
-      frameElement: { value: element, configurable: true },
-    });
+    if (!opaque) {
+      Object.defineProperties(child, {
+        parent: { value: globalThis, configurable: true },
+        top: { value: globalThis.top, configurable: true },
+        frameElement: { value: element, configurable: true },
+      });
+      globalThis.__obscura_frameObjects[id] = {
+        window: child, document: child.document, initial: true,
+      };
+    }
     child.innerWidth = 300;
     child.innerHeight = 150;
-    globalThis.__obscura_frameObjects[id] = {
-      window: child, document: child.document, initial: true,
-    };
-  }, element._nid);
+  }, element._nid, srcdoc);
   if (frameId) {
     element._frameId = frameId;
-    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
-    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    element._iframeOpaque = opaque;
+    element._iframeWin = opaque ? _remoteWindow(frameId)
+      : globalThis.__obscura_frameObjects[frameId].window;
+    element._iframeDoc = opaque ? null
+      : globalThis.__obscura_frameObjects[frameId].document;
     globalThis.__obscura_frameElements[frameId] = element;
   }
   return frameId !== 0;
@@ -14443,6 +15431,7 @@ function _ensureInitialFrameRealm(element) {
 function _resetIframeElement(element) {
   if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
   element._frameId = 0;
+  element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
   element._iframeLoadedUrl = 'about:blank';
   element._iframeDoc = new _IframeDocument(
@@ -14461,7 +15450,7 @@ function _frameWindowFor(frameId) {
   if (!frameId) return null;
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || null;
+  if (!real) return existing || _remoteWindows.get(frameId) || null;
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
@@ -14582,8 +15571,14 @@ class _IframeWindow {
     this.outerWidth = 300;
     this.outerHeight = 150;
     this.devicePixelRatio = globalThis.devicePixelRatio;
-    this.localStorage = globalThis.localStorage;
-    this.sessionStorage = globalThis.sessionStorage;
+    // Storage can throw for an opaque creator. Constructing its initial
+    // window must still succeed; enforce access restrictions on reads.
+    for (const name of ['localStorage', 'sessionStorage']) {
+      Object.defineProperty(this, name, {
+        configurable: true, enumerable: true,
+        get() { return globalThis[name]; },
+      });
+    }
     this.performance = globalThis.performance;
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
@@ -15188,10 +16183,10 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
-  if (__obscuraCore.ops.op_shadow_root_info(this._nid)) {
+  if (__obscuraCore.ops.op_shadow_root_info(this._nid, _realmFrameId)) {
     throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
   }
-  const rootNid = __obscuraCore.ops.op_shadow_attach(this._nid, _mode);
+  const rootNid = __obscuraCore.ops.op_shadow_attach(this._nid, _mode, _realmFrameId);
   if (rootNid < 0) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
@@ -15210,7 +16205,7 @@ _markNative(Element.prototype.attachShadow);
 
 function _shadowRootForHost(host, includeClosed) {
   if (!host) return null;
-  const info = __obscuraCore.ops.op_shadow_root_info(host._nid);
+  const info = __obscuraCore.ops.op_shadow_root_info(host._nid, _realmFrameId);
   if (!info) return null;
   const parts = info.split('\0');
   if (!includeClosed && parts[1] !== 'open') return null;
@@ -15356,126 +16351,7 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-// Minimal but spec-shape-correct IndexedDB shim. We don't persist anything,
-// but authentication libraries (Firebase, Supabase, dexie) hang forever on
-// the first `get` because their request's `onsuccess` is never called. Fire
-// `onsuccess` asynchronously with `null` so reads complete-but-empty, which
-// most libraries treat as a cache miss and fall back to the network.
-function _idbRequest(produceResult) {
-  const req = {
-    result: undefined,
-    error: null,
-    source: null,
-    transaction: null,
-    readyState: 'pending',
-    onsuccess: null,
-    onerror: null,
-    addEventListener(type, fn) { req['on' + type] = fn; },
-    removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
-  };
-  Promise.resolve().then(() => {
-    try {
-      req.result = produceResult();
-      req.readyState = 'done';
-      if (typeof req.onsuccess === 'function') {
-        try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
-      }
-    } catch (e) {
-      req.error = e; req.readyState = 'done';
-      if (typeof req.onerror === 'function') {
-        try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
-      }
-    }
-  });
-  return req;
-}
-
-function _idbObjectStore(name) {
-  const data = new Map();
-  return {
-    name,
-    keyPath: null,
-    autoIncrement: false,
-    indexNames: { contains() { return false; }, length: 0, item() { return null; } },
-    transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
-    openCursor() { return _idbRequest(() => null); },
-    openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
-    deleteIndex() {},
-  };
-}
-
-function _idbTransaction(storeNames) {
-  const stores = new Map();
-  const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
-  const tx = {
-    db: null,
-    mode: 'readonly',
-    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
-    onabort: null, oncomplete: null, onerror: null,
-    error: null,
-    objectStore(name) {
-      let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
-      s.transaction = tx;
-      return s;
-    },
-    abort() {},
-    commit() {},
-    addEventListener(type, fn) { tx['on' + type] = fn; },
-    removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
-  };
-  Promise.resolve().then(() => {
-    if (typeof tx.oncomplete === 'function') {
-      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
-    }
-  });
-  return tx;
-}
-
-function _idbDatabase(name, version) {
-  return {
-    name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
-    transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
-      tx.mode = mode || 'readonly';
-      return tx;
-    },
-    close() {},
-    onversionchange: null, onabort: null, onerror: null, onclose: null,
-    addEventListener() {}, removeEventListener() {},
-  };
-}
-
-globalThis.indexedDB = {
-  open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
-  },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
-  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
-};
-globalThis.IDBKeyRange = {
-  only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
-  lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },
-  upperBound(v, open) { return { lower: null, upper: v, lowerOpen: false, upperOpen: !!open, includes(x) { return open ? x < v : x <= v; } }; },
-  bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
-};
+/* INDEXED_DB */
 
 // Do not advertise CacheStorage until it can retain responses. A successful
 // no-op cache selects broken persistence paths instead of normal fetch fallbacks.
@@ -15654,13 +16530,13 @@ globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
   // Chrome mints blob:<document-origin>/<v4-uuid> (blob:null/<uuid> on an opaque
   // origin) and throws a TypeError on missing/non-Blob input. The old code named
-  // the engine ("blob:obscura/") — a one-line anti-bot tell — used a base36 token
+  // the engine ("blob:obscura/"), a one-line anti-bot tell, used a base36 token
   // no UUID parser accepts, and handed back a well-formed-looking string for
   // invalid input so the caller only failed later at the fetch (issue #751).
   if (arguments.length === 0) {
     throw new TypeError("Failed to execute 'createObjectURL' on 'URL': 1 argument required, but only 0 present.");
   }
-  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid —
+  // Only a real Blob/File (or obscura's Blob, which carries _bytes) is valid;
   // Chrome throws for anything else. Duck-typing on `.text()` used to accept
   // Response and other unrelated objects.
   const isBlob = blob != null && typeof blob === 'object' &&
@@ -15675,7 +16551,7 @@ URL.createObjectURL = function(blob) {
     const uuid = (globalThis.crypto && typeof crypto.randomUUID === 'function')
       ? crypto.randomUUID()
       : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-          // CSPRNG, not Math.random() — blob IDs must not be predictable.
+          // CSPRNG, not Math.random(): blob IDs must not be predictable.
           const b = new Uint8Array(1);
           crypto.getRandomValues(b);
           const r = b[0] & 0x0f;
@@ -16053,19 +16929,33 @@ if (!globalThis.crypto.subtle) {
   }
   function makeKey(type, extractable, algorithm, usages, bytes) {
     const k = Object.create(CryptoKey.prototype);
+    const publicAlgorithm = Object.assign({}, algorithm);
+    if (algorithm.hash) publicAlgorithm.hash = Object.assign({}, algorithm.hash);
     Object.defineProperty(k, "type", { value: type, enumerable: true });
     Object.defineProperty(k, "extractable", { value: !!extractable, enumerable: true });
-    Object.defineProperty(k, "algorithm", { value: algorithm, enumerable: true });
+    Object.defineProperty(k, "algorithm", { value: publicAlgorithm, enumerable: true });
     Object.defineProperty(k, "usages", { value: Object.freeze((usages || []).slice()), enumerable: true });
-    keyMaterial.set(k, bytes);
+    keyMaterial.set(k, {bytes, algorithm, usages: k.usages});
     return k;
   }
-  function keyBytes(key) {
+  function keyBytes(key, algorithm, usage) {
     if (!(key instanceof CryptoKey) || !keyMaterial.has(key)) {
       throw new DOMException("Argument is not a valid CryptoKey", "InvalidAccessError");
     }
-    return keyMaterial.get(key);
+    const material = keyMaterial.get(key);
+    if (usage && algorithm !== "AES-KW" && algorithm !== "AES-GCM" && algorithm !== "AES-CBC" && algorithm !== "AES-CTR") {
+      throw new DOMException("Unsupported key wrapping algorithm: " + algorithm, "NotSupportedError");
+    }
+    if (usage && (material.algorithm.name !== algorithm || !material.usages.includes(usage))) {
+      throw new DOMException("Key does not allow " + usage + " with " + algorithm, "InvalidAccessError");
+    }
+    return material.bytes;
   }
+  _idbPlatformCodecs.push({
+    name:"CryptoKey", test:key => keyMaterial.has(key),
+    encode:key => ({type:key.type,extractable:key.extractable,...keyMaterial.get(key)}),
+    decode:data => makeKey(data.type,data.extractable,data.algorithm,data.usages,data.bytes),
+  });
   // A CryptoKey cloned via structuredClone or postMessage is a different
   // object, so the WeakMap lookup above misses and crypto.subtle throws
   // "Argument is not a valid CryptoKey". Re-register the (cloned) key's
@@ -16078,7 +16968,9 @@ if (!globalThis.crypto.subtle) {
   // material is registered once), matching structuredClone's identity rules.
   globalThis.__obscura_clone_hooks["CryptoKey"] = function (src, seen) {
     if (seen && seen.has(src)) return seen.get(src);
-    const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    const bytes = keyBytes(src);
+    const material = keyMaterial.get(src);
+    const copy = makeKey(src.type, src.extractable, material.algorithm, material.usages, bytes);
     if (seen) seen.set(src, copy);
     return copy;
   };
@@ -16135,6 +17027,16 @@ if (!globalThis.crypto.subtle) {
     }
   }
 
+  // The JWK `alg` of an AES or HMAC key, or undefined for the others.
+  function jwkAlg(key, bytes) {
+    const algorithm = keyMaterial.get(key).algorithm;
+    if (algorithm.name && algorithm.name.indexOf("AES-") === 0) {
+      return "A" + (bytes.length * 8) + algorithm.name.slice(4);
+    }
+    if (algorithm.name === "HMAC") return "HS" + algorithm.hash.name.slice(4);
+    return undefined;
+  }
+
   function keyAlgorithmFor(alg, bytes) {
     switch (alg.name) {
       case "HMAC":
@@ -16182,12 +17084,14 @@ if (!globalThis.crypto.subtle) {
       if (!key.extractable) throw new DOMException("Key is not extractable", "InvalidAccessError");
       if (format === "raw") return bufferOf(bytes);
       if (format === "jwk") {
-        const jwk = { kty: "oct", k: bytesToB64url(bytes), ext: key.extractable, key_ops: key.usages.slice() };
-        if (key.algorithm.name && key.algorithm.name.indexOf("AES-") === 0) {
-          jwk.alg = "A" + (bytes.length * 8) + key.algorithm.name.slice(4);
-        } else if (key.algorithm.name === "HMAC") {
-          jwk.alg = "HS" + key.algorithm.hash.name.slice(4);
-        }
+        // Members in lexicographic order, as browsers return a JsonWebKey and
+        // as wrapKey serializes it.
+        const alg = jwkAlg(key, bytes);
+        const jwk = alg ? { alg } : {};
+        jwk.ext = key.extractable;
+        jwk.k = bytesToB64url(bytes);
+        jwk.key_ops = key.usages.slice();
+        jwk.kty = "oct";
         return jwk;
       }
       throw new DOMException("Only 'raw' and 'jwk' export is supported", "NotSupportedError");
@@ -16276,18 +17180,43 @@ if (!globalThis.crypto.subtle) {
     },
 
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+      const alg = normalizeAlgo(wrapAlgorithm);
+      const wrappingBytes = keyBytes(wrappingKey, alg.name, "wrapKey");
       const exported = await this.exportKey(format, key);
-      const bytes = format === "jwk"
-        ? new TextEncoder().encode(JSON.stringify(exported))
-        : new Uint8Array(exported);
+      // A JWK is serialized natively rather than with the page's JSON.stringify,
+      // so a toJSON or another prototype override can't change the wrapped bytes.
+      let bytes;
+      if (format === "jwk") {
+        const material = keyBytes(key);
+        bytes = __obscuraCore.ops.op_subtle_jwk_json(
+          jwkAlg(key, material) || "", key.extractable, bytesToB64url(material), key.usages.map(String));
+      } else {
+        bytes = new Uint8Array(exported);
+      }
+      // AES-KW has no encrypt, only its key wrap.
+      if (alg.name === "AES-KW") {
+        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_aes_kw(true, wrappingBytes, bytes)));
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, bytes);
     },
 
     async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
-      const decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
-      const keyData = format === "jwk"
-        ? JSON.parse(new TextDecoder().decode(new Uint8Array(decrypted)))
-        : decrypted;
+      const alg = normalizeAlgo(unwrapAlgorithm);
+      const unwrappingBytes = keyBytes(unwrappingKey, alg.name, "unwrapKey");
+      const decrypted = alg.name === "AES-KW"
+        ? runOp(() => __obscuraCore.ops.op_subtle_aes_kw(false, unwrappingBytes, toBytes(wrappedKey)))
+        : new Uint8Array(await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey));
+      let keyData;
+      if (format === "jwk") {
+        // Parsed natively too, not with the page's JSON.parse.
+        try {
+          keyData = __obscuraCore.ops.op_subtle_jwk_parse(decrypted);
+        } catch (e) {
+          throw new DOMException("The unwrapped key is not a JSON Web Key", "DataError");
+        }
+      } else {
+        keyData = bufferOf(decrypted);
+      }
       return this.importKey(format, keyData, unwrappedKeyAlgorithm, extractable, keyUsages);
     },
   };
@@ -16516,7 +17445,7 @@ if (typeof EventSource === 'undefined') {
 if (typeof WebSocket === 'undefined') {
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
-      // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
+      // Validate URL scheme per spec: Chrome throws SyntaxError for non-ws/wss URLs
       if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
         throw new DOMException(
           "Failed to construct 'WebSocket': The URL '" + url + "' is invalid.",
@@ -17116,7 +18045,15 @@ if (typeof URLPattern === 'undefined') {
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
-  Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
+  Document.prototype.importNode = function(node) {
+    const deep = arguments[1];
+    _requireNodeArgument(node, "importNode", 1, "Document");
+    if (node.nodeType === 9 || node instanceof ShadowRoot) {
+      throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
+    }
+    const clone = node.cloneNode(!!deep);
+    return _stampNodeDocument(clone, this);
+  };
 }
 
 // Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
@@ -17125,7 +18062,19 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // transfer ownership from, the node is already ours, so return it as-is,
 // matching the observable effect of adoption into this document.
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
-  Document.prototype.adoptNode = function(node) { return node || null; };
+  Document.prototype.adoptNode = function(node) {
+    _requireNodeArgument(node, "adoptNode", 1, "Document");
+    if (node.nodeType === 9) {
+      throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", "NotSupportedError");
+    }
+    if (node instanceof ShadowRoot) {
+      throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a shadow root, which may not be adopted.", "HierarchyRequestError");
+    }
+    const parent = node.parentNode;
+    if (parent) parent.removeChild(node);
+    if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
+    return _stampNodeDocument(node, this);
+  };
 }
 
 // Element.toggleAttribute: standard DOM. Lit/Stencil and several ad SDKs call
@@ -17188,7 +18137,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           (!('__obscuraPointerEventsNone' in r) && el.style?.pointerEvents === 'none')) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
         // A descendant's layout rect can extend beyond an overflow clip. It
-        // must not win hit testing where its scrolling ancestor hides it —
+        // must not win hit testing where its scrolling ancestor hides it;
         // otherwise a wheel well outside a small pane scrolls that pane
         // instead of the page behind it.
         var visible = true;
@@ -17250,7 +18199,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
 // Ops are bound after snapshot restoration, so probe the renderer at realm
 // initialization, not while building the snapshot with an empty op table.
-function _installCaretGeometry() {
+const _installCaretGeometry = (function _installCaretGeometry() {
   if (typeof __obscuraCore.ops.op_layout_caret !== 'function') return {};
   const positions = new WeakMap();
   function positionState(receiver) {
@@ -17351,7 +18300,7 @@ function _installCaretGeometry() {
     caretRangeFromPoint: Document.prototype.caretRangeFromPoint,
     caretPositionFromPoint: Document.prototype.caretPositionFromPoint,
   };
-}
+});
 
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
@@ -17363,11 +18312,16 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['activateElement', function(trusted) {
     return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
   }],
+  ['checkVisibility', Element.prototype.checkVisibility],
+  ['elementStyle', function() { return _elementStyle(this); }],
 ]));
 
-globalThis.__obscura_init = function() {
+globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _scriptingEnabled = _domParse('scripting_enabled') !== false;
+  _sandboxOpaqueOrigin = _domParse('sandbox_opaque_origin') === true;
+  globalThis.__obscura_update_media_preferences();
   const caretMembers = _installCaretGeometry();
   __obscuraCore.ops.op_register_document_realm(
     Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
@@ -17455,7 +18409,8 @@ globalThis.__obscura_init = function() {
   // its parent.
   for (const frame of globalThis.document.querySelectorAll('iframe')) {
     const src = frame.getAttribute('src');
-    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
+    else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
   }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
@@ -17468,7 +18423,7 @@ globalThis.__obscura_init = function() {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
   delete globalThis.__obscura_init;
-};
+});
 
 // Snapshot-time pre-computation of the hide list. Bootstrap.js runs once
 // during the V8 snapshot build (build.rs); this line captures the set of
@@ -17480,7 +18435,8 @@ globalThis.__obscura_init = function() {
 // and leave them out of the hide list (and thus visible to the reflection-API
 // filter and to fingerprinting scripts). getOwnPropertyNames captures them.
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
-  k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
+  k !== '__obscura_snapshot_compile' &&
+  (k.startsWith('_') || k.includes('obscura') || k.includes('Obscura'))
 );
 
 /* ===== WPT conformance shims: batch 2 ===== */
@@ -17592,20 +18548,63 @@ if (!Document.prototype.getElementsByTagNameNS) {
 // ---- Attr nodes and createAttribute ----
 // Attr class: represents attribute nodes (nodeType 2)
 if (!globalThis.Attr) {
-  globalThis.Attr = class Attr {
+  globalThis.Attr = class Attr extends Node {
     constructor(name, value = '', namespaceURI = null, prefix = null) {
+      super(undefined);
       this.name = name;
-      this.localName = name;
-      this.value = value;
+      this.localName = prefix ? name.slice(prefix.length + 1) : name;
+      this._value = String(value);
       this.namespaceURI = namespaceURI;
       this.prefix = prefix;
       this.ownerElement = null;
       this.specified = true;
     }
+    get [Symbol.toStringTag]() { return 'Attr'; }
+    get ownerDocument() { return this.ownerElement?.ownerDocument || this._nodeDocument || document; }
+    get value() {
+      if (this.ownerElement) {
+        const value = this.namespaceURI
+          ? this.ownerElement.getAttributeNS(this.namespaceURI, this.localName)
+          : this.ownerElement.getAttribute(this.name);
+        if (value !== null) return value;
+      }
+      return this._value;
+    }
+    set value(value) {
+      this._value = String(value);
+      if (this.ownerElement) {
+        if (this.namespaceURI) this.ownerElement.setAttributeNS(this.namespaceURI, this.name, this._value);
+        else this.ownerElement.setAttribute(this.name, this._value);
+      }
+    }
     get nodeName() { return this.name; }
     get nodeValue() { return this.value; }
     set nodeValue(v) { this.value = v; }
     get nodeType() { return 2; }
+    get textContent() { return this.value; }
+    set textContent(value) { this.value = value == null ? '' : value; }
+    // Attributes have no arena node or tree children.
+    get parentNode() { return null; }
+    get parentElement() { return null; }
+    get childNodes() { return _nodeList([]); }
+    get firstChild() { return null; }
+    get lastChild() { return null; }
+    get nextSibling() { return null; }
+    get previousSibling() { return null; }
+    get isConnected() { return false; }
+    hasChildNodes() { return false; }
+    getRootNode() { return this; }
+    contains(other) { return other === this; }
+    isSameNode(other) { return other === this; }
+    isEqualNode(other) {
+      return other?.nodeType === 2 && this.namespaceURI === other.namespaceURI
+        && this.prefix === other.prefix && this.localName === other.localName && this.value === other.value;
+    }
+    cloneNode() {
+      const clone = new Attr(this.name, this.value, this.namespaceURI, this.prefix);
+      clone._nodeDocument = this.ownerDocument;
+      return clone;
+    }
   };
 }
 
@@ -17638,7 +18637,9 @@ if (!Document.prototype.createAttribute) {
     if (!_ns_isValidXmlName(name)) {
       throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
     }
-    return new Attr(name, '', null, null);
+    const attr = new Attr(name, '', null, null);
+    attr._nodeDocument = this;
+    return attr;
   };
   _markNative(Document.prototype.createAttribute);
 }
@@ -17665,7 +18666,9 @@ if (!Document.prototype.createAttributeNS) {
         throw new DOMException('Invalid attribute name', 'InvalidCharacterError');
       }
     }
-    return new Attr(qn, '', ns, prefix);
+    const attr = new Attr(qn, '', ns, prefix);
+    attr._nodeDocument = this;
+    return attr;
   };
   _markNative(Document.prototype.createAttributeNS);
 }
@@ -17673,11 +18676,7 @@ if (!Document.prototype.createAttributeNS) {
 // Element.prototype.getAttributeNode: return an Attr node or null
 if (!Element.prototype.getAttributeNode) {
   Element.prototype.getAttributeNode = function(name) {
-    const val = this.getAttribute(name);
-    if (val === null) return null;
-    const attr = new Attr(name, val, null, null);
-    attr.ownerElement = this;
-    return attr;
+    return this.attributes.getNamedItem(_htmlAttrName(this, String(name)));
   };
   _markNative(Element.prototype.getAttributeNode);
 }
@@ -17685,12 +18684,7 @@ if (!Element.prototype.getAttributeNode) {
 // Element.prototype.getAttributeNodeNS: return a namespaced Attr node or null
 if (!Element.prototype.getAttributeNodeNS) {
   Element.prototype.getAttributeNodeNS = function(namespaceURI, localName) {
-    const val = this.getAttributeNS(namespaceURI, localName);
-    if (val === null) return null;
-    const name = String(localName || '');
-    const attr = new Attr(name, val, namespaceURI ? String(namespaceURI) : null, null);
-    attr.ownerElement = this;
-    return attr;
+    return this.attributes.getNamedItemNS(namespaceURI, localName);
   };
   _markNative(Element.prototype.getAttributeNodeNS);
 }
@@ -18002,7 +18996,7 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // enumerable: false, so every interface written as a `class` here disagrees with
 // the platform on that one descriptor bit.
 //
-// zone.js — which Angular installs on every page — discovers methods by walking
+// zone.js (which Angular installs on every page) discovers methods by walking
 // `for (prop in instance)` in patchClass(), applied to MutationObserver,
 // WebKitMutationObserver, IntersectionObserver and FileReader. With
 // enumerable: false it finds no methods at all and builds its proxy prototype
@@ -18075,5 +19069,21 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     if (typeof val === 'function') { walk(val); }
   }
 })();
+
+// Compile common bodies at snapshot build time without invoking them.
+if (typeof globalThis.__obscura_snapshot_compile === 'function') {
+  const compile = globalThis.__obscura_snapshot_compile;
+  delete globalThis.__obscura_snapshot_compile;
+  compile([
+    _fpRand, _browserPostedTaskDiscardQueue, _eventTargetDispatch, _domEventDispatch,
+    _runPostConnectionSteps, __prepareInsertedSubtree, _relevantNodeList,
+    _ensureInsertionValidity, _preInsertConverted, _attributeOldValuesWanted,
+    _insertOneNode, _resolveUrl, _applyScreenSize, _bodyToUint8Array, _serializeBody,
+    _releaseLinkedStylesheetsIn, _detachStyleSheetsInSubtree,
+    _scheduleIntersectionRenderCheckpoint, _attachResponseAbort, _nodeList,
+    _ensureWindowNamedProperty, _windowNamedNamesInTree, _registerWindowNamedTree,
+    _reconcileWindowNamedProperties, _installFramingRelationships,
+  ]);
+}
 
 })();

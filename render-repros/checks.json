@@ -1,4 +1,19 @@
 {
+  "hidden-table-rows": [
+    {"name": "rowspan counts visible rows only", "color": "#1971c2", "x": 20, "y": 20, "width": 30, "height": 40},
+    {"name": "next visible row occupies the second column", "color": "#e8590c", "x": 50, "y": 40, "width": 30, "height": 20},
+    {"name": "last row starts after two visible rows", "color": "#7048e8", "x": 20, "y": 60, "width": 30, "height": 20},
+    {"name": "hidden groups do not reserve tracks or width", "color": "#0b7285", "x": 150, "y": 20, "width": 30, "height": 20}
+  ],
+  "inline-block-block-children": [
+    {"name": "first block keeps its authored width", "color": "#d02020", "x": 12, "y": 12, "width": 80, "height": 20},
+    {"name": "second block stacks without formatting whitespace", "color": "#2050d0", "x": 12, "y": 32, "width": 120, "height": 30},
+    {"name": "inline-block starts the next outer line", "color": "#087f5b", "x": 12, "y": 86, "width": 80, "height": 20},
+    {"name": "sibling block margins collapse within the flow root", "color": "#7048e8", "x": 12, "y": 121, "width": 120, "height": 30}
+  ],
+  "emulated-color-scheme": [
+    {"name": "default light preference keeps the green block", "color": "#00aa00", "x": 0, "y": 0, "width": 240, "height": 100}
+  ],
   "retained-cssom-raster": [
     {"name": "CSSOM width and fill survive metadata update", "color": "#246840", "x": 16, "y": 16, "width": 128, "height": 32},
     {"name": "updated image and animation callback complete", "color": "#246840", "x": 16, "y": 220, "width": 32, "height": 16},
@@ -392,6 +407,11 @@
   ],
   "reduced-motion-emulation": [
     {"name": "normal motion keeps the default width", "color": "#22aa66", "width": 100, "height": 30}
+  ],
+  "table-display-keywords": [
+    {"name": "explicit row and group display override display none", "color": "#1971c2", "x": 20, "y": 20, "width": 40, "height": 20},
+    {"name": "CSS rows share their first column", "color": "#087f5b", "x": 150, "y": 20, "width": 30, "height": 40},
+    {"name": "CSS rows share their second column", "color": "#7048e8", "x": 180, "y": 20, "width": 40, "height": 40}
   ],
   "z-index": [
     {"name": "positive layer", "color": "#008000", "width": 200, "height": 100},

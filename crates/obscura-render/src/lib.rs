@@ -948,6 +948,14 @@ pub(crate) enum RadialGradientSize {
     Explicit(Dimension, Dimension),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableRowDisplay {
+    Row,
+    Group,
+    Header,
+    Footer,
+}
+
 /// One computed CSS counter operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterDirective {
@@ -1051,6 +1059,8 @@ pub struct LayoutStyle {
     /// `<td>`/`<th>` elements even though Taffy represents their cell-content
     /// wrapper as an internal column flexbox.
     pub(crate) is_table_cell_box: bool,
+    /// Table row/group provenance, independent of the internal layout stand-in.
+    pub(crate) table_row_display: Option<TableRowDisplay>,
     /// The HTML UA sheet's vendor `text-align` behavior for `<center>`.
     /// Unlike ordinary `text-align:center`, it also centers fixed-width block
     /// descendants while leaving auto-width blocks fill-available.
@@ -1455,6 +1465,9 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    // Preserve the own value above for retained inheritance updates while
+    // exposing the resolved inherited value through CSSOM snapshots.
+    pub(crate) computed_visibility_hidden: bool,
     /// Computed `pointer-events: none|auto`. The property is inherited, so
     /// `None` means the top-down style pass still needs the parent's value.
     pub pointer_events_none: Option<bool>,
@@ -1732,6 +1745,10 @@ pub(crate) fn is_inline_level_box(style: &LayoutStyle) -> bool {
 /// Thus inline-flex becomes flex and inline-grid becomes grid, while
 /// inline-block/plain inline become block.
 pub(crate) fn blockify_outer_display(style: &mut LayoutStyle) {
+    if style.display != Display::None && style.table_row_display.take().is_some() {
+        style.display = Display::Block;
+        style.internal_flex_container = false;
+    }
     if !is_inline_level_box(style) {
         return;
     }

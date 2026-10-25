@@ -66,16 +66,35 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "setEmulatedMedia" => {
-            let features = params.get("features").and_then(Value::as_array);
-            if let Some(features) = features {
-                let value = features.iter().find(|feature| feature["name"] == "prefers-reduced-motion")
-                    .and_then(|feature| feature["value"].as_str()).unwrap_or("");
-                if !matches!(value, "" | "reduce" | "no-preference") {
-                    return Err("Invalid prefers-reduced-motion value".into());
+            let features = match params.get("features") {
+                Some(features) => features.as_array().ok_or("Emulation.setEmulatedMedia features must be an array")?.as_slice(),
+                None => &[],
+            };
+            let mut reduce = false;
+            let mut dark = false;
+            for feature in features {
+                let name = feature.get("name").and_then(Value::as_str)
+                    .ok_or("Media feature requires a string name")?;
+                let value = feature.get("value").and_then(Value::as_str)
+                    .ok_or("Media feature requires a string value")?;
+                match name {
+                    "prefers-reduced-motion" => {
+                        if !matches!(value, "" | "reduce" | "no-preference") {
+                            return Err("Invalid prefers-reduced-motion value".into());
+                        }
+                        reduce = value == "reduce";
+                    }
+                    "prefers-color-scheme" => {
+                        if !matches!(value, "" | "dark" | "light" | "no-preference") {
+                            return Err("Invalid prefers-color-scheme value".into());
+                        }
+                        dark = value == "dark";
+                    }
+                    _ => {}
                 }
-                ctx.get_session_page_mut(session_id).ok_or("No page for session")?
-                    .set_reduced_motion(value == "reduce");
             }
+            ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                .set_media_preferences(reduce, dark);
             Ok(json!({}))
         }
         "setDeviceMetricsOverride" => {
@@ -180,6 +199,45 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn color_scheme_override_persists_and_resets_without_partial_invalid_updates() {
+        let mut ctx = CdpContext::new();
+        let id = ctx.create_page();
+        let session = Some("media-session".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), id);
+        let both = json!({"features": [
+            {"name": "prefers-color-scheme", "value": "dark"},
+            {"name": "prefers-reduced-motion", "value": "reduce"}
+        ]});
+        handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
+        let script = "return [matchMedia('(prefers-color-scheme:dark)').matches, matchMedia('(prefers-reduced-motion:reduce)').matches];";
+        for _ in 0..2 {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.navigate("data:text/html,<body>probe</body>").await.unwrap();
+            assert_eq!(page.evaluate(script), json!([true, true]));
+        }
+        for invalid in [
+            json!({"features": null}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":false}]}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":"light"}, {"name":"prefers-reduced-motion", "value":"invalid"}]}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":"invalid"}]}),
+        ] {
+            assert!(handle("setEmulatedMedia", &invalid, &mut ctx, &session).await.is_err());
+            assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([true, true]));
+        }
+        handle("setEmulatedMedia", &json!({}), &mut ctx, &session).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([false, false]));
+        handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
+        for value in ["light", "no-preference", ""] {
+            handle("setEmulatedMedia", &json!({"features":[{"name":"prefers-color-scheme", "value":value}]}), &mut ctx, &session).await.unwrap();
+            assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([false, false]));
+            handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
+        }
+        handle("setEmulatedMedia", &json!({"features":[]}), &mut ctx, &session).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([false, false]));
+    }
+
 
     #[tokio::test]
     async fn device_metrics_override_updates_page_and_window_viewport() {

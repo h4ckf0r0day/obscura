@@ -72,6 +72,31 @@ database. Opaque-origin documents cannot access either store.
 
 Automatic cross-document `storage` events are not implemented by this change.
 
+## IndexedDB
+
+IndexedDB data lives in memory, shared by pages in the same browser context and
+origin. It survives navigation, but not process restart. Incognito contexts do
+not share it. `--storage-dir` does not persist IndexedDB.
+
+Transactions stage record changes and publish them atomically on completion;
+aborting also rolls back schema changes and generated keys. Values use structured
+serialization, including typed keys, cyclic graphs, files and symmetric crypto
+keys. Readonly writes and uncloneable values fail instead of reporting success.
+Upgrades notify existing connections and wait for them to close.
+
+The context has a 64 MiB budget for committed records, schema and pending writes,
+including serialized-value and record overhead. Individual serialized values
+are limited to 16 MiB and encoded keys to 64 KiB. Quota failures abort an
+unhandled write transaction, leaving its committed records unchanged.
+
+This is not full IndexedDB conformance. Transactions currently serialize per
+database, including readonly transactions; index queries and cursor steps scan
+records rather than using a native index. Store/index renaming,
+`continuePrimaryKey()`, the newer bulk-read options dictionaries, and on-disk
+durability are not implemented. Database and schema names containing unpaired
+UTF-16 units are not supported. These limits do not change the behavior of
+cookies or Web Storage.
+
 ## Login once, scrape many
 
 ```bash

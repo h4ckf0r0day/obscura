@@ -5,6 +5,133 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+pub(crate) struct DeferredEvaluation {
+    pub(crate) page_id: String,
+    pending: obscura_js::runtime::PendingCdpEvaluation,
+    return_by_value: bool,
+    pub(crate) deadline: tokio::time::Instant,
+    command_deadline: Option<tokio::time::Instant>,
+    timeout_ms: u64,
+    method: String,
+}
+
+impl DeferredEvaluation {
+    pub(crate) fn ready(&self, ctx: &mut CdpContext) -> bool {
+        if tokio::time::Instant::now() >= self.deadline { return true; }
+        let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) else { return true; };
+        !js.has_cdp_evaluation(&self.pending) || js.cdp_evaluation_ready(&self.pending)
+    }
+
+    pub(crate) async fn finish(self, ctx: &mut CdpContext, session_id: &Option<String>) -> Result<Value, String> {
+        let js = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut())
+            .ok_or("Execution context was destroyed")?;
+        if !js.has_cdp_evaluation(&self.pending) {
+            return Err("Execution context was destroyed".into());
+        }
+        let remaining = self.command_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if remaining.is_some_and(|budget| budget.is_zero()) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err("Runtime evaluation exceeded its command budget".into());
+        }
+        if !js.cdp_evaluation_ready(&self.pending) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err(format!("Runtime.{} promise did not settle within {}ms", self.method, self.timeout_ms));
+        }
+        let watchdog = remaining.map(|budget| obscura_js::runtime::spawn_watchdog(js.isolate_handle(), budget));
+        let result = match js.finish_cdp_evaluation(self.pending, self.return_by_value) {
+            Ok(info) => emit_post_eval_nav(ctx, session_id).await.map(|_| evaluation_reply(&info)),
+            Err(error) => Err(error),
+        };
+        if watchdog.is_some_and(|watchdog| watchdog.stop()) {
+            if let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) {
+                js.cancel_termination();
+            }
+            return Err("Runtime result serialization exceeded its task budget".into());
+        }
+        result
+    }
+}
+
+pub(crate) async fn start_awaited_evaluation(
+    method: &str,
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    command_budget_ms: u64,
+) -> Result<Option<DeferredEvaluation>, String> {
+    let field = if method == "evaluate" { "contextId" } else { "executionContextId" };
+    validate_context(params, field, ctx, session_id, method)?;
+    let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
+    let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let command_deadline = (command_budget_ms != 0).then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(command_budget_ms));
+    let deadline = command_deadline.map_or(deadline, |command| deadline.min(command));
+    let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+    let Some(js) = page.js.as_mut() else { return Ok(None); };
+    let evaluation = if method == "evaluate" {
+        js.start_cdp_evaluation(params.get("expression").and_then(Value::as_str).ok_or("expression required")?, return_by_value, true)?
+    } else {
+        js.start_cdp_call(
+            params.get("functionDeclaration").and_then(Value::as_str).unwrap_or("() => undefined"),
+            params.get("objectId").and_then(Value::as_str),
+            params.get("arguments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
+            return_by_value, true,
+        )?
+    };
+    let obscura_js::runtime::CdpEvaluation::Pending(pending) = evaluation else {
+        return Err("Awaited evaluation did not create a pending record".into());
+    };
+    // Finish this task's promise reactions before a script-initiated navigation.
+    js.resolve_promises_until(|js| js.cdp_evaluation_ready(&pending), 0).await;
+    Ok(Some(DeferredEvaluation {
+        page_id: page.id.clone(), pending, return_by_value, deadline, command_deadline, timeout_ms, method: method.into(),
+    }))
+}
+
+async fn with_live_peers<'a, F, Fut>(
+    ctx: &'a mut CdpContext,
+    session_id: &Option<String>,
+    command: F,
+) -> Result<RemoteObjectInfo, String>
+where
+    F: FnOnce(&'a mut obscura_browser::Page) -> Fut,
+    Fut: std::future::Future<Output = Result<RemoteObjectInfo, String>>,
+{
+    if ctx.pages.len() == 1 {
+        return command(ctx.get_session_page_mut(session_id).ok_or("No page")?).await;
+    }
+    let id = ctx.get_session_page_mut(session_id).ok_or("No page")?.id.clone();
+    let index = ctx.pages.iter().position(|page| page.id == id).ok_or("No page")?;
+    let (before, remaining) = ctx.pages.split_at_mut(index);
+    let (page, after) = remaining.split_first_mut().ok_or("No page")?;
+    let command = command(page);
+    let peers = async {
+        let mut idle = std::collections::HashSet::new();
+        loop {
+            let all_idle = match crate::server::pump_page_event_loops(before.iter_mut().chain(after.iter_mut()), &mut idle).await {
+                Ok(idle) => idle,
+                Err(error) => return error,
+            };
+            if all_idle {
+                // Foreground and peer futures share this task's waker. Park
+                // idle peers until it wakes again, without a polling timer.
+                let mut parked = false;
+                std::future::poll_fn(|_| {
+                    if parked { std::task::Poll::Ready(()) }
+                    else { parked = true; std::task::Poll::Pending }
+                }).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        result = command => result,
+        error = peers => Err(error),
+    }
+}
+
 pub(crate) fn execution_context_created_event(
     context: &crate::dispatch::ExecutionContextRecord,
     session_id: Option<String>,
@@ -176,17 +303,14 @@ pub async fn handle(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30_000);
 
-            let page = ctx
-                .get_session_page_mut(session_id)
-                .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.evaluate_for_cdp_with_timeout(
+                with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_with_timeout(
                     expression,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
+                )),
             )
             .await
             {
@@ -238,19 +362,16 @@ pub async fn handle(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30_000);
 
-            let page = ctx
-                .get_session_page_mut(session_id)
-                .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.call_function_on_for_cdp_with_timeout(
+                with_live_peers(ctx, session_id, |page| page.call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     &arguments,
                     return_by_value,
                     await_promise,
                     timeout_ms,
-                ),
+                )),
             )
             .await
             {
@@ -588,6 +709,35 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexeddb_awaited_commands_deliver_peer_versionchange_and_delayed_close() {
+        for method in ["evaluate", "callFunctionOn"] {
+            let mut ctx = CdpContext::new();
+            let mut sessions = Vec::new();
+            for _ in 0..2 {
+                let id = ctx.create_page();
+                let session = Some(format!("{id}-session"));
+                ctx.sessions.insert(session.clone().unwrap(),id);
+                crate::domains::page::handle("navigate",&json!({"url":"data:text/html,<body>idb</body>"}),&mut ctx,&session).await.unwrap();
+                ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().set_url("https://idb.test/");
+                sessions.push(session);
+            }
+            let first = ctx.get_session_page_mut(&sessions[0]).unwrap();
+            first.evaluate(r#"(() => {
+                const r = indexedDB.open('awaited-peer',1);
+                r.onsuccess = () => {globalThis.peer = r.result;
+                    peer.onversionchange = () => setTimeout(() => peer.close(),10);};
+            })()"#);
+            first.js.as_mut().unwrap().run_event_loop_bounded(100).await.unwrap();
+            let body = "return new Promise((resolve,reject)=>{const r=indexedDB.open('awaited-peer',2);r.onsuccess=()=>{r.result.close();resolve(r.result.version)};r.onerror=()=>reject(r.error)})";
+            let mut params = json!({"awaitPromise":true,"returnByValue":true,"timeout":1000});
+            if method == "evaluate" { params["expression"] = json!(format!("(()=>{{{body}}})()")); }
+            else { params["functionDeclaration"] = json!(format!("function(){{{body}}}")); }
+            let result = handle(method,&params,&mut ctx,&sessions[1]).await.unwrap();
+            assert_eq!(result["result"]["value"].as_f64(),Some(2.0),"{method}: {result}");
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn heap_usage_reports_live_v8_allocations_without_running_page_tasks() {

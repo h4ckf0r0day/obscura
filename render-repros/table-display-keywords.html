@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CSS table row and group display</title>
+<style>
+  html, body { margin: 0; background: white; }
+  table, .table { border-spacing: 0; position: absolute; top: 20px; }
+  table { left: 20px; }
+  td { width: 40px; height: 20px; padding: 0; }
+  .hidden { display: none; }
+  #native-group { display: table-row-group; }
+  #native-row { display: table-row; }
+  #native-cell { background: #1971c2; }
+  .table { display: table; left: 150px; }
+  .group { display: table-row-group; }
+  .row { display: table-row; }
+  .cell { display: table-cell; height: 20px; }
+  .a { width: 30px; background: #087f5b; }
+  .b { width: 40px; background: #7048e8; }
+</style>
+<table><tbody id="native-group" class="hidden"><tr id="native-row" class="hidden">
+  <td id="native-cell"></td>
+</tr></tbody></table>
+<div class="table"><div class="group">
+  <div class="row"><div class="cell a"></div><div class="cell b"></div></div>
+  <div class="row"><div class="cell a"></div><div class="cell b"></div></div>
+</div></div>

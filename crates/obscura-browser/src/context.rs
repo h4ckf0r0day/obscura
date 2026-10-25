@@ -11,6 +11,7 @@ pub struct BrowserContext {
     /// rather than by a V8 realm, so an entry written in one document is still
     /// there in the next (issue #678).
     pub local_storage: Arc<OriginStorage>,
+    pub indexed_db: Arc<obscura_js::indexed_db::IndexedDbStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -28,6 +29,7 @@ pub struct BrowserContext {
     /// so every CDP and MCP route is covered; the CLI's own `obscura fetch
     /// file://...` opts its local context in. A page can never drive
     /// itself from a web origin into file:// regardless of this flag.
+    /// Use `set_allow_file_access` to keep the transport permission in sync.
     pub allow_file_access: bool,
     pub storage_dir: Option<PathBuf>,
     /// When true, the http client allows fetching localhost / RFC1918 /
@@ -200,6 +202,7 @@ impl BrowserContext {
             id,
             cookie_jar,
             local_storage,
+            indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -213,6 +216,14 @@ impl BrowserContext {
             storage_dir,
             allow_private_network,
         }
+    }
+
+    /// Sets the file:// opt-in on the context and on its http client, whose
+    /// loader enforces it for every fetch, not only for navigation. Assigning
+    /// the field directly leaves the client refusing file://.
+    pub fn set_allow_file_access(&mut self, allow: bool) {
+        self.allow_file_access = allow;
+        self.http_client.set_allow_file_access(allow);
     }
 
     pub fn with_options(id: String, proxy_url: Option<String>, stealth: bool) -> Self {
@@ -250,6 +261,7 @@ impl BrowserContext {
         if self.stealth {
             client.block_trackers = true;
         }
+        client.set_allow_file_access(self.allow_file_access);
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = self.user_agent.clone();
         }
@@ -265,6 +277,8 @@ impl BrowserContext {
             } else {
                 Arc::new(OriginStorage::default())
             },
+            indexed_db: if persistent { self.indexed_db.clone() }
+                else { Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()) },
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),

@@ -56,16 +56,32 @@ OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
 
 The server keeps a live browser session, so tools operate on the current page rather than taking a URL each call. Navigate first, then read or act.
 
+The active page continues running timers and network callbacks between tool
+calls over both stdio and HTTP. Task driving is wake-driven and parks when
+the page is idle; a future timer does not block incoming MCP requests.
+
 Navigation and lifecycle:
 
 - `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`, `browser_close`
 
 Read the page:
 
-- `browser_snapshot`: current URL, title, readable body text, and interactive
-  element references. Optional `max_chars` limits the returned text.
+- `browser_snapshot`: current URL, title, actionable element references, control
+  states, and visible body text. References can be passed directly to interaction
+  tools without a separate listing call. Names use the same native accessibility
+  logic as CDP, including associated labels and ARIA name precedence.
+  `max_chars` defaults to 4000 and is shared by whole control descriptions first,
+  then body text. Omission markers are added outside that budget. URL and title
+  are separately capped at 256 characters each; `max_chars: 0` returns only that
+  metadata. Descriptions preview at most 80 characters per name or value and
+  do not include password control values.
 - `browser_markdown`, `browser_links`, `browser_extract`: page as markdown, link list, or structured content.
 - `browser_interactive_elements`, `browser_detect_forms`: actionable elements and form fields.
+
+Snapshots and interactive-element listings exclude HTML/ARIA-hidden content;
+render builds also apply computed CSS visibility. Hidden text explicitly
+referenced by a visible control can still supply its accessible name. These are
+compact browsing context, not a claim of complete accessibility conformance.
 - `browser_get_attribute`, `browser_count`, `browser_search`: read an attribute, count matches, find text.
 
 Interact:
@@ -75,6 +91,19 @@ Interact:
 Wait and run JS:
 
 - `browser_wait_for`, `browser_wait_for_text`, `browser_evaluate`
+
+`browser_evaluate` accepts JavaScript scripts, executes them once, and waits for
+returned promises. `timeoutMs` defaults to 5000 ms and bounds synchronous
+execution as well as promise settlement. Exceptions, rejected promises, and
+timeouts return MCP tool errors (`isError: true`); a successful JavaScript
+`null` or `undefined` result is still returned as `null` text.
+
+Interaction tools also report execution failures as tool errors.
+Internal interaction and extraction scripts have a five-second execution and
+serialization deadline.
+`browser_fill_form` does not submit if any field fails, and completes a queued
+submit navigation before replying. A failed interaction can have partial side
+effects; take a fresh snapshot before deciding whether to retry.
 
 Diagnostics:
 
@@ -94,13 +123,33 @@ Cookies and storage:
 
 - `browser_get_cookies`, `browser_set_cookie`, `browser_clear_cookies`, `browser_storage_state`, `browser_set_storage_state`
 
+Storage-state export includes localStorage for all stored origins and
+sessionStorage for all stored origins in the active tab. Restoration merges
+the supplied keys into their declared origins and can run before navigation.
+Restored sessionStorage belongs only to the active tab, creating a default
+tab if needed; localStorage and cookies belong to the browser context.
+Origins must be canonical HTTP(S) origins, and storage entries are `[key, value]`
+string pairs. Invalid input is rejected before mutation. A quota failure returns
+a tool error and reports that preceding writes may already have been applied.
+Cookie entries pass through the browser's existing cookie validation.
+
 Tabs:
 
 - `browser_tab_new`, `browser_tab_list`, `browser_tab_switch`, `browser_tab_close`
 
+Switching tabs retains JavaScript globals, event listeners, frame state and
+pending promises. Each open tab keeps its runtime in memory until closed.
+Autonomous task progress currently belongs to the active tab; retaining a tab
+does not promise that background work runs while another tab is active.
+
 Element references describe the current rendered page state and can become
 stale after navigation, interaction, scrolling, or a framework rerender. Take
 a fresh snapshot or interactive-element listing before acting again.
+
+Treat references as opaque tokens. Each new snapshot or interactive-element
+listing invalidates the previous tokens. A reference targets the original
+native element, not a replacement or clone that copies its attributes; stale
+references return a tool error instead of acting on a different element.
 
 MCP exposes still-image and PDF output. It does not stream video frames; use
 CDP `Page.startScreencast` for activity-driven screencasting.

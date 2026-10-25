@@ -91,7 +91,12 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
+        let (scripting_enabled, sandbox_opaque_origin) = realms.borrow().by_frame_id(parent_frame_id)
+            .map(|creator| {
+                let creator = creator.borrow();
+                (creator.scripting_enabled, creator.sandbox_opaque_origin)
+            }).unwrap_or((true, false));
+        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -102,6 +107,9 @@ impl FrameRealm {
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
+        state.scripting_enabled = scripting_enabled;
+        state.sandbox_opaque_origin = sandbox_opaque_origin;
+        if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
@@ -356,6 +364,14 @@ impl FrameRealm {
     /// Resolves a subresource URL against the frame's own document URL, not the
     /// parent's. A relative `src` in a frame is relative to the frame.
     fn resolve(&self, src: &str) -> String {
+        if self.url == "about:srcdoc" {
+            if let Some(base) = self.realms.borrow().by_frame_id(self.frame_id)
+                .and_then(|state| crate::ops::document_base_url(&state.borrow()))
+            {
+                return url::Url::parse(&base).and_then(|base| base.join(src))
+                    .map(|url| url.to_string()).unwrap_or_else(|_| src.to_string());
+            }
+        }
         url::Url::parse(&self.url)
             .and_then(|base| base.join(src))
             .map(|url| url.to_string())
@@ -367,6 +383,7 @@ impl FrameRealm {
         let state = self.realms.borrow().by_frame_id(self.frame_id)
             .ok_or_else(|| "could not list frame scripts: missing realm".to_string())?;
         let state = state.borrow();
+        if !state.scripting_enabled { return Ok(Vec::new()); }
         let dom = state.dom.as_ref()
             .ok_or_else(|| "could not list frame scripts: missing document".to_string())?;
         let nodes = dom.query_selector_all("script")?;
@@ -432,6 +449,123 @@ mod tests {
         runtime.set_url(url);
         runtime.run_page_init();
         runtime
+    }
+
+    #[test]
+    fn frame_shadow_root_append_uses_its_own_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'open' });
+            const child = document.createElement('span');
+            child.textContent = 'shadow child';
+            root.appendChild(child);
+            return [
+                host.shadowRoot === root,
+                root.host === host,
+                root.ownerDocument === document,
+                child.parentNode === root,
+                root.textContent
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result, serde_json::json!([true, true, true, true, "shadow child"]));
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn frame_shadow_root_lookup_does_not_read_parent() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        parent.execute_script("parent-shadow", r#"
+            document.getElementById('host').attachShadow({ mode: 'open' })
+                .innerHTML = '<span>parent shadow</span>';
+        "#).unwrap();
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent,
+            "document.getElementById('host').shadowRoot === null").unwrap();
+
+        assert_eq!(result, serde_json::json!(true));
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot.textContent").unwrap(),
+            serde_json::json!("parent shadow"));
+    }
+
+    #[test]
+    fn initial_frame_shadow_root_uses_its_own_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+
+        let result = parent.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            const childDocument = frame.contentDocument;
+            const host = childDocument.createElement('div');
+            childDocument.body.appendChild(host);
+            const root = host.attachShadow({ mode: 'open' });
+            const child = childDocument.createElement('span');
+            child.textContent = 'initial frame shadow';
+            root.appendChild(child);
+            return [
+                host.shadowRoot === root,
+                root.ownerDocument === childDocument,
+                child.parentNode === root,
+                root.textContent,
+                document.getElementById('host').shadowRoot === null
+            ];
+        })()"#).unwrap();
+
+        assert_eq!(result,
+            serde_json::json!([true, true, true, "initial frame shadow", true]));
+    }
+
+    #[test]
+    fn frame_closed_shadow_root_stays_private_and_rejects_duplicate_attach() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='host'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://child.example/",
+            "<html><body><div id='host'>Child</div></body></html>").unwrap();
+
+        let result = frame.evaluate(&mut parent, r#"(() => {
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'closed' });
+            const child = document.createElement('span');
+            child.textContent = 'closed frame shadow';
+            root.appendChild(child);
+            return [host.shadowRoot === null, root.mode, root.textContent];
+        })()"#).unwrap();
+        let error = frame.evaluate(&mut parent,
+            "document.getElementById('host').attachShadow({ mode: 'open' })").unwrap_err();
+
+        assert_eq!(result, serde_json::json!([true, "closed", "closed frame shadow"]));
+        assert!(error.contains("NotSupportedError"), "{error}");
+        assert_eq!(parent.evaluate(
+            "document.getElementById('host').shadowRoot === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn borrowed_style_getter_keeps_the_elements_declaration() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body style='color: red'>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(parent.evaluate(r#"(() => {
+            const element = globalThis.__obscura_frameObjects[1].document.body;
+            const getter = Object.getOwnPropertyDescriptor(Element.prototype, 'style').get;
+            const borrowed = getter.call(element);
+            const same = borrowed === element.style;
+            element.setAttribute('style', 'color: blue');
+            return [same, borrowed.color, element.style.color];
+        })()"#).unwrap(), serde_json::json!([true, "blue", "blue"]));
     }
 
     #[test]

@@ -35,6 +35,7 @@ integration_tests!(
     control_plane_unblocked,
     document_write_lifecycle,
     dom_get_outer_html_object_id,
+    dom_node_queries,
     dynamic_script_onload_fires,
     dynamic_stylesheet_onload_fires,
     execution_context_ownership,

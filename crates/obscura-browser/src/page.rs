@@ -272,6 +272,7 @@ pub struct Page {
     /// only when the override is cleared.
     device_metrics_baseline: Option<DeviceMetricsBaseline>,
     reduced_motion: bool,
+    dark_color_scheme: bool,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -1092,11 +1093,13 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            let mut client = StealthHttpClient::with_proxy(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            )))
+            );
+            client.allow_file_access = context.allow_file_access;
+            Some(Arc::new(client))
         } else {
             None
         };
@@ -1120,6 +1123,7 @@ impl Page {
             locale_override: None,
             device_metrics_baseline: None,
             reduced_motion: false,
+            dark_color_scheme: false,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
@@ -1328,6 +1332,7 @@ impl Page {
 
         let Some(PendingFrameWork::Attached {
             frame_id,
+            parent_frame_id,
             frame_url,
             sources,
             ..
@@ -1336,6 +1341,7 @@ impl Page {
             return false;
         };
         let frame_id = *frame_id;
+        let parent_frame_id = *parent_frame_id;
         let frame_url = frame_url.clone();
         let sources = std::mem::take(sources);
         let Some(index) = self
@@ -1357,6 +1363,11 @@ impl Page {
             }
         }
         self.pending_frame_work.pop_front();
+        self.execute_frame_owner_script(parent_frame_id, &format!(
+            "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
+             if (frame && frame.isConnected && frame._frameId === {frame_id}) \
+               frame.dispatchEvent(new Event('load')); }})()"
+        ));
         true
     }
 
@@ -1445,13 +1456,13 @@ impl Page {
         }
     }
 
-    /// Executes cleanup in the realm that owns the iframe element. Nested
+    /// Executes code in the realm that owns the iframe element. Nested
     /// iframe registries live in their parent frame, not in the page realm.
     fn execute_frame_owner_script(&mut self, parent_frame_id: u32, script: &str) {
         if parent_frame_id == 0 {
             if let Some(js) = self.js.as_mut() {
-                if let Err(error) = js.execute_script("<frame-detach>", script) {
-                    tracing::debug!("releasing frame references failed: {error}");
+                if let Err(error) = js.execute_script("<frame-owner>", script) {
+                    tracing::debug!("frame owner script failed: {error}");
                 }
             }
             return;
@@ -1466,7 +1477,7 @@ impl Page {
         };
         let Some(js) = self.js.as_mut() else { return };
         if let Err(error) = self.frames[index].execute_script(js, script) {
-            tracing::debug!("releasing nested frame references failed: {error}");
+            tracing::debug!("nested frame owner script failed: {error}");
         }
     }
 
@@ -1516,6 +1527,13 @@ impl Page {
                     tracing::debug!("could not list a frame's live frames: {error}");
                     return;
                 }
+            }
+        }
+        // A synchronously initialized parent may not be in self.frames yet.
+        // Its children's native owner chain still proves they are connected.
+        if let Some(js) = &self.js {
+            for pending in &self.pending_frame_work {
+                if js.frame_is_active(pending.frame_id()) { live.push(pending.frame_id()); }
             }
         }
         let mut discarded_ids: std::collections::HashSet<u32> = self
@@ -1706,6 +1724,16 @@ impl Page {
         self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
+    /// Override reduced-motion and dark color-scheme preferences together.
+    /// The pair persists across navigation and is shared with child documents.
+    pub fn set_media_preferences(&mut self, reduce: bool, dark: bool) {
+        self.reduced_motion = reduce;
+        self.dark_color_scheme = dark;
+        if let Some(js) = &mut self.js {
+            js.set_media_preferences(reduce, dark);
+        }
+    }
+
     pub fn set_reduced_motion(&mut self, reduce: bool) {
         self.reduced_motion = reduce;
         if let Some(js) = &mut self.js {
@@ -1841,6 +1869,7 @@ impl Page {
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         // Web Storage lives outside the realm so a navigation cannot drop it.
         rt.set_local_storage(self.context.local_storage.clone());
+        rt.set_indexed_db(self.context.indexed_db.clone());
         rt.set_session_storage(self.session_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
@@ -1871,7 +1900,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
-        rt.set_reduced_motion(self.reduced_motion);
+        rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
@@ -4342,6 +4371,11 @@ impl Page {
         }
     }
 
+    /// Run a script and preserve JavaScript execution errors. The caller owns its deadline.
+    pub fn evaluate_script(&mut self, script: &str) -> Result<serde_json::Value, String> {
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?.evaluate_script(script)
+    }
+
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
         if let Some(js) = &mut self.js {
             match js.evaluate(expression) {
@@ -4372,9 +4406,10 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
+        if self.js.is_some() {
+            match self
+                .evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise,
+                    obscura_js::runtime::DEFAULT_CDP_AWAIT_TIMEOUT_MS)
                 .await
             {
                 Ok(info) => info,
@@ -4420,13 +4455,8 @@ impl Page {
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         if let Some(js) = &mut self.js {
-            js.evaluate_for_cdp_with_timeout(
-                expression,
-                return_by_value,
-                await_promise,
-                await_timeout_ms,
-            )
-            .await
+            let evaluation = js.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+            self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
@@ -4455,14 +4485,15 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
+        if self.js.is_some() {
+            match self
+                .call_function_on_for_cdp_with_timeout(
                     function_declaration,
                     object_id,
                     args,
                     return_by_value,
                     await_promise,
+                    obscura_js::runtime::DEFAULT_CDP_AWAIT_TIMEOUT_MS,
                 )
                 .await
             {
@@ -4505,15 +4536,50 @@ impl Page {
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        js.call_function_on_for_cdp_with_timeout(
+        let evaluation = js.start_cdp_call(
             function_declaration,
             object_id,
             args,
             return_by_value,
             await_promise,
-            await_timeout_ms,
-        )
-        .await
+        )?;
+        self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.callFunctionOn").await
+    }
+
+    async fn await_cdp_evaluation(
+        &mut self,
+        evaluation: obscura_js::runtime::CdpEvaluation,
+        return_by_value: bool,
+        timeout_ms: u64,
+        method: &str,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        let pending = match evaluation {
+            obscura_js::runtime::CdpEvaluation::Complete(info) => return Ok(info),
+            obscura_js::runtime::CdpEvaluation::Pending(pending) => pending,
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let wait = async {
+            loop {
+                let queued = !self.pending_frame_work.is_empty();
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+                let mut ready = false;
+                let progressed = js.resolve_promises_until(|js| {
+                    ready = js.cdp_evaluation_ready(&pending);
+                    ready || queued || js.has_pending_frame_tasks()
+                }, duration_millis_u64(remaining)).await;
+                if ready { return Ok(()); }
+                if !progressed { return Err(format!("{method} promise did not settle within {timeout_ms}ms")); }
+                self.advance_frames().await;
+            }
+        };
+        let result = tokio::time::timeout_at(deadline, wait).await
+            .unwrap_or_else(|_| Err(format!("{method} promise did not settle within {timeout_ms}ms")));
+        let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+        match result {
+            Ok(()) => js.finish_cdp_evaluation(pending, return_by_value),
+            Err(error) => { js.cancel_cdp_evaluation(pending); Err(error) }
+        }
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -4744,6 +4810,15 @@ impl Page {
 
     pub fn has_js(&self) -> bool {
         self.js.is_some()
+    }
+
+    /// Origin-scoped sessionStorage for this tab, including inactive origins.
+    pub fn session_storage(&self) -> &OriginStorage {
+        &self.session_storage
+    }
+
+    pub fn has_pending_indexed_db_notifications(&self) -> bool {
+        self.context.indexed_db.has_pending_notifications()
     }
 
     pub fn release_object_group(&mut self) {
@@ -5273,7 +5348,7 @@ mod tests {
             None,
             true,
         );
-        context.allow_file_access = allow_file_access;
+        context.set_allow_file_access(allow_file_access);
         std::sync::Arc::new(context)
     }
 
@@ -5297,6 +5372,27 @@ mod tests {
         let mut open = super::Page::new("file-gate-open".to_string(), file_gate_context("file-gate-open", true));
         open.navigate(&file_url).await.expect("an opted-in context reads local files");
         assert_eq!(open.url_string(), file_url);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Server connections navigate through an isolated copy of the startup
+    // context, so the copy's own http client must carry the opt-in too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_context_copy_keeps_the_file_access_setting() {
+        let (path, file_url) = local_html_fixture("copy");
+
+        let open_copy = std::sync::Arc::new(
+            file_gate_context("file-gate-copy", true).isolated_copy("copy-open".to_string(), false),
+        );
+        let mut open = super::Page::new("file-gate-copy-open".to_string(), open_copy);
+        open.navigate(&file_url).await.expect("the copy keeps the opt-in");
+
+        let locked_copy = std::sync::Arc::new(
+            file_gate_context("file-gate-copy-locked", false)
+                .isolated_copy("copy-locked".to_string(), false),
+        );
+        assert!(locked_copy.http_client.fetch(&url::Url::parse(&file_url).unwrap()).await.is_err());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -6777,6 +6873,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexeddb_records_survive_navigation_and_share_only_their_context_and_origin() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let (origin_a, _) = spawn_storage_server().await;
+        let (origin_b, _) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::new("idb-shared".into()));
+        let mut first = storage_page("idb-first", context.clone());
+        first.navigate(&origin_a).await.unwrap();
+        first.evaluate(r#"(() => {
+            globalThis.idbSaved = false;
+            const r = indexedDB.open('shared',1);
+            r.onupgradeneeded = () => r.result.createObjectStore('items');
+            r.onsuccess = () => {
+                const tx = r.result.transaction('items','readwrite');
+                tx.objectStore('items').put({value:'kept'},1);
+                tx.oncomplete = () => idbSaved = true;
+            };
+        })()"#);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbSaved"), serde_json::json!(true));
+        let read = r#"(() => {
+            globalThis.idbRead = 'pending';
+            const r = indexedDB.open('shared',1);
+            r.onupgradeneeded = () => r.result.createObjectStore('items');
+            r.onsuccess = () => {
+                const q = r.result.transaction('items').objectStore('items').get(1);
+                q.onsuccess = () => idbRead = q.result?.value ?? null;
+            };
+        })()"#;
+        first.navigate(&origin_b).await.unwrap();
+        first.evaluate(read);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbRead"), serde_json::Value::Null);
+        first.navigate(&origin_a).await.unwrap();
+        first.evaluate(read);
+        first.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(first.evaluate("idbRead"), serde_json::json!("kept"));
+        let mut second = storage_page("idb-second", context);
+        second.navigate(&origin_a).await.unwrap();
+        second.evaluate(read);
+        second.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(second.evaluate("idbRead"), serde_json::json!("kept"));
+        let mut isolated = storage_page("idb-isolated", std::sync::Arc::new(crate::BrowserContext::new("idb-private".into())));
+        isolated.navigate(&origin_a).await.unwrap();
+        isolated.evaluate(read);
+        isolated.js.as_mut().unwrap().run_event_loop_bounded(500).await.unwrap();
+        assert_eq!(isolated.evaluate("idbRead"), serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn session_storage_stays_inside_the_tab_and_local_storage_is_shared() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (origin, _) = spawn_storage_server().await;
@@ -6988,6 +7133,266 @@ mod tests {
             }
         });
         (format!("http://{addr}"), requests)
+    }
+
+    async fn pump_srcdoc_frames(page: &mut super::Page) {
+        for _ in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(2),
+                page.js.as_mut().unwrap().run_event_loop()).await.unwrap().unwrap();
+            if !page.advance_frames().await { break; }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_loads_parser_and_inserted_documents_in_their_own_realms() {
+        let mut page = import_map_test_page("srcdoc", "https://parent.test",
+            r#"<html><head><base href="https://assets.test/dir/"></head><body>
+            <iframe id="parsed" src="data:text/html,FALLBACK" srcdoc="&lt;p&gt;parsed&lt;/p&gt;"></iframe>
+            </body></html>"#);
+        page.evaluate_script(r#"(() => {
+            globalThis.loads = [];
+            localStorage.setItem('shared', 'parent');
+            const frame = document.createElement('iframe'); frame.id = 'inserted';
+            frame.srcdoc = '<p>inserted</p><script>globalThis.childOnly=42;document.body.dataset.ready="yes";</script>';
+            frame.onload = () => loads.push([frame.contentDocument.URL,
+                frame.contentDocument.body.dataset.ready, frame.contentWindow.childOnly]);
+            document.body.appendChild(frame);
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let value = page.evaluate_script(r#"(() => {
+            const parsed = document.getElementById('parsed').contentDocument;
+            const f = document.getElementById('inserted'), d = f.contentDocument;
+            const a = d.createElement('a'); a.href = 'next';
+            return [parsed.URL, parsed.body.textContent, d.URL, d.baseURI, a.href,
+                f.contentWindow.localStorage.getItem('shared'), typeof globalThis.childOnly,
+                loads, d.defaultView === f.contentWindow, parsed.compatMode];
+        })()"#).unwrap();
+        assert_eq!(value, serde_json::json!(["about:srcdoc", "parsed", "about:srcdoc",
+            "https://assets.test/dir/", "https://assets.test/dir/next", "parent", "undefined",
+            [["about:srcdoc", "yes", 42]], true, "CSS1Compat"]));
+        assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_replacement_cancels_stale_documents() {
+        let mut page = import_map_test_page("srcdoc-replace", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.executed = []; globalThis.loaded = [];
+            const host = document.createElement('div');
+            host.innerHTML = '<iframe id="f" srcdoc="first"></iframe>';
+            document.body.appendChild(host);
+            const f = document.getElementById('f');
+            f.onload = () => loaded.push(f.contentDocument.body.textContent);
+            f.setAttributeNS(null, 'srcdoc', '<script>parent.executed.push("stale")</script>stale');
+            f.srcdoc = '<script>parent.executed.push("latest")</script><p>latest</p>';
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[executed, loaded.map(text => text.endsWith('latest')), document.getElementById('f').srcdoc.includes('<p>latest</p>')]").unwrap(),
+            serde_json::json!([["latest"], [true], true]));
+        page.evaluate_script("document.getElementById('f').removeAttribute('srcdoc'); 1").unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("document.getElementById('f').contentDocument.URL").unwrap(),
+            serde_json::json!("about:blank"));
+        assert!(page.frames.len() <= 1, "replaced srcdoc realms must be released");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_sandbox_blocks_scripts_and_opaque_document_access() {
+        let mut page = import_map_test_page("srcdoc-sandbox", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.escaped = false;
+            for (const [id, policy] of [['opaque', 'ALLOW-SCRIPTS'], ['inert', 'ALLOW-SAME-ORIGIN']]) {
+                const f = document.createElement('iframe'); f.id = id;
+                f.setAttribute('sandbox', policy);
+                f.srcdoc = '<button onclick="parent.escaped=true">hello</button><script>globalThis.ran=true;try{parent.escaped=true}catch(e){}</script><noscript><i>fallback</i></noscript>';
+                document.body.appendChild(f);
+            }
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const opaque = document.getElementById('opaque');
+            const inert = document.getElementById('inert');
+            inert.contentDocument.querySelector('button').click();
+            return [opaque.contentDocument === null, inert.contentDocument.URL,
+                inert.contentDocument.querySelector('button').textContent,
+                typeof inert.contentWindow.ran, escaped,
+                inert.contentDocument.querySelector('noscript i')?.textContent];
+        })()"#).unwrap(), serde_json::json!([true, "about:srcdoc", "hello", "undefined", false, "fallback"]));
+        assert_eq!(page.evaluate_in_frame(0, "[document.URL, globalThis.ran, location.origin]").unwrap(),
+            serde_json::json!(["about:srcdoc", true, "null"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_nested_and_empty_documents_keep_the_creator_base() {
+        let mut page = import_map_test_page("srcdoc-nested", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.id = 'outer';
+            f.srcdoc = '<base href="https://nested.test/path/"><iframe srcdoc=""></iframe>';
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const child = document.getElementById('outer').contentDocument.querySelector('iframe');
+            return [child.contentDocument.URL, child.contentDocument.baseURI,
+                child.contentDocument.body.textContent,
+                child.contentWindow.parent === document.getElementById('outer').contentWindow];
+        })()"#).unwrap(), serde_json::json!(["about:srcdoc", "https://nested.test/path/", "", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_from_connected_inner_html_survives_initial_document_reads() {
+        let mut page = import_map_test_page("srcdoc-connected", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            document.body.innerHTML = '<iframe id="f" srcdoc="hello"></iframe>';
+            globalThis.initial = document.getElementById('f').contentDocument.URL;
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[initial, document.getElementById('f').contentDocument.URL, document.getElementById('f').contentDocument.body.textContent]").unwrap(),
+            serde_json::json!(["about:blank", "about:srcdoc", "hello"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_external_scripts_resolve_against_the_creator() {
+        let (base, requests) = spawn_nested_pending_frame_server().await;
+        let mut page = import_map_test_page("srcdoc-script-base", &base,
+            r#"<body><iframe srcdoc="&lt;script src=child.js&gt;&lt;/script&gt;"></iframe></body>"#);
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(*requests.lock().unwrap(), vec!["/app/child.js"]);
+        assert_eq!(page.evaluate_script("document.querySelector('iframe').contentWindow.__mustNotRun").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_inherits_sandbox_restrictions_in_nested_documents() {
+        let mut page = import_map_test_page("srcdoc-inherited-sandbox", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            for (const policy of ['allow-scripts', 'allow-same-origin']) {
+                const f = document.createElement('iframe'); f.id = policy; f.setAttribute('sandbox', policy);
+                f.srcdoc = '<iframe srcdoc="&lt;script&gt;globalThis.ran=true&lt;/script&gt;"></iframe>';
+                document.body.appendChild(f);
+            }
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_in_frame(0, "document.querySelector('iframe').contentDocument === null").unwrap(),
+            serde_json::json!(true));
+        assert_eq!(page.evaluate_script("typeof document.getElementById('allow-same-origin').contentDocument.querySelector('iframe').contentWindow.ran").unwrap(),
+            serde_json::json!("undefined"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_ignores_absent_attributes_and_non_html_elements() {
+        let mut page = import_map_test_page("srcdoc-noop", "https://parent.test", "<body></body>");
+        let values = page.evaluate_script(r#"(() => {
+            globalThis.escaped = false;
+            const f = document.createElement('iframe'); document.body.appendChild(f);
+            f.contentWindow.kept = 73;
+            f.removeAttribute('srcdoc');
+            const first = f.contentWindow.kept;
+            f.removeAttributeNS(null, 'srcdoc');
+            const second = f.contentWindow.kept;
+            const plain = document.createElement('div'); plain.srcdoc = 'expando';
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'iframe');
+            svg.setAttribute('srcdoc', '<script>parent.escaped=true</script>');
+            const host = document.createElement('div'); host.appendChild(svg);
+            document.body.appendChild(host);
+            return [first, second, plain.hasAttribute('srcdoc')];
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(values, serde_json::json!([73, 73, false]));
+        assert_eq!(page.evaluate_script("escaped").unwrap(), serde_json::json!(false));
+        assert_eq!(page.frames.len(), 1, "SVG iframe is not a browsing context");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_navigation_waits_until_after_the_microtask_checkpoint() {
+        let mut page = import_map_test_page("srcdoc-task", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.srcdoc = 'hello';
+            document.body.appendChild(f);
+            Promise.resolve().then(() => { globalThis.beforeNavigation = f.contentDocument.URL; });
+            return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script("[beforeNavigation, document.querySelector('iframe').contentDocument.URL]").unwrap(),
+            serde_json::json!(["about:blank", "about:srcdoc"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_is_ready_after_data_document_navigation() {
+        let mut page = import_map_test_page("srcdoc-data-navigation", "https://parent.test", "<body></body>");
+        page.navigate("data:text/html,%3Ciframe%20srcdoc%3D%22HELLO%22%3E%3C%2Fiframe%3E").await.unwrap();
+        assert_eq!(page.evaluate_script("[document.querySelector('iframe').contentDocument.URL, document.querySelector('iframe').contentDocument.body.textContent]").unwrap(),
+            serde_json::json!(["about:srcdoc", "HELLO"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_opaque_document_is_not_published_to_creator_objects() {
+        let mut page = import_map_test_page("srcdoc-private-realm", "https://parent.test", "<body></body>");
+        page.evaluate_script(r#"(() => {
+            globalThis.seenOpaqueSource = false;
+            const f = document.createElement('iframe'); f.id = 'opaque';
+            f.setAttribute('sandbox', 'allow-scripts');
+            f.srcdoc = '<p>private</p><script>parent.postMessage("loaded", "*")</script>';
+            window.addEventListener('message', event => {
+                seenOpaqueSource = event.data === 'loaded' && event.source === f.contentWindow;
+            });
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const f = document.getElementById('opaque');
+            const references = [
+                () => f._iframeDoc,
+                () => f._iframeWin?.document,
+                () => globalThis.__obscura_frameObjects[f._frameId]?.document,
+                () => globalThis.__obscura_frameObjects[f._frameId]?.window?.document,
+            ];
+            const readable = references.map(getDocument => {
+                try { return getDocument()?.body?.textContent ?? null; }
+                catch (_) { return null; }
+            });
+            return [f.contentDocument === null, readable, seenOpaqueSource];
+        })()"#).unwrap(), serde_json::json!([true, [null, null, null, null], true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_load_waits_for_the_real_document_and_author_scripts() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page("frame-load-ready", &base, "<html><body></body></html>");
+        page.add_preload_script("globalThis.__order = ['preload'];");
+        page.js.as_mut().unwrap().evaluate(
+            "(function(){ globalThis.loads = []; const frame = document.createElement('iframe'); \
+             frame.onload = function(){ loads.push([typeof frame.contentDocument.appendChild, \
+               frame.contentWindow.__childReady === true, frame.contentDocument.readyState]); }; \
+             frame.src = '/child.html'; document.body.appendChild(frame); return 1; })()"
+        ).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2), page.js.as_mut().unwrap().run_event_loop(),
+        ).await.unwrap().unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads").unwrap(), serde_json::json!([]),
+            "the iframe fired load before its scripts could run");
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.advance_frames())
+            .await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads").unwrap(),
+            serde_json::json!([["function", true, "complete"]]));
+        page.advance_frames().await;
+        assert_eq!(page.js.as_mut().unwrap().evaluate("loads.length === 1").unwrap(), serde_json::json!(true));
+
+        let script = "new Promise(resolve => { const frame = document.createElement('iframe'); \
+            frame.onload = () => resolve([typeof frame.contentDocument.appendChild, \
+                frame.contentWindow.__childReady === true]); \
+            frame.src = '/child.html'; document.body.appendChild(frame); })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!(["function", true]));
+        let called = page.call_function_on_for_cdp_with_timeout(
+            &format!("() => {script}"), None, &[], true, true, 2_000,
+        ).await.unwrap();
+        assert_eq!(called.value.unwrap(), serde_json::json!(["function", true]));
     }
 
     #[tokio::test(flavor = "current_thread")]

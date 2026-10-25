@@ -1,6 +1,9 @@
 ## `obscura`
 
-Top-level flags apply to every subcommand.
+Most top-level flags apply to every subcommand. `--storage-dir` is the
+exception: it is declared on `serve` and `fetch`, and the top-level copy is read
+only by `mcp`, which exports it to `OBSCURA_STORAGE_DIR`. Pass it after the
+subcommand to use it with `serve` or `fetch`.
 
 ```
 -v, --verbose                Enable info logging
@@ -70,6 +73,10 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --user-agent <UA>        Override the User-Agent
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --workers <N>            Worker processes (default 1)
+    --worker-max-connections <N>  Recycle a worker after N CDP connections (--workers > 1)
+    --worker-max-rss <MB>    Recycle a worker above this resident size (Linux)
+    --worker-max-age <SECS>  Recycle a worker after this long
+    --worker-drain-timeout <SECS>  Let a replaced worker finish live connections (default 120)
     --font-dir <DIR>         Recursively load fonts once per worker (repeatable; render build)
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage

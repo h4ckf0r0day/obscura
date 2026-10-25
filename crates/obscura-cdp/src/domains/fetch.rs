@@ -18,7 +18,7 @@ pub enum FetchResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        post_data: Option<String>,
+        post_data: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
@@ -113,6 +113,10 @@ pub async fn handle(
                 .and_then(|v| v.as_str())
                 .ok_or("requestId required")?;
 
+            let post_data = crate::server::decode_optional_binary(
+                params, "postData", "continueRequest postData",
+            )?;
+
             if let Some(paused) = ctx.fetch_intercept.paused.remove(request_id) {
                 let _ = paused.resolver.send(FetchResolution::Continue {
                     url: params
@@ -126,10 +130,7 @@ pub async fn handle(
                     // Honor client header overrides (route.continue({ headers }))
                     // — parity with server.rs handle_fetch_resolution (#919).
                     headers: crate::server::parse_cdp_headers(params),
-                    post_data: params
-                        .get("postData")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
+                    post_data,
                 });
             }
             Ok(json!({}))
@@ -271,6 +272,23 @@ mod tests {
                 assert_eq!(headers, Some(expected), "continue must forward header overrides");
             }
             _ => panic!("expected FetchResolution::Continue"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_request_decodes_binary_post_data_and_preserves_invalid_pause() {
+        let mut ctx = CdpContext::new();
+        let mut rx = pause(&mut ctx, "binary");
+        assert!(handle("continueRequest", &json!({"requestId": "binary", "postData": 42}),
+            &mut ctx, &None).await.is_err());
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        handle("continueRequest", &json!({"requestId": "binary", "postData": "AID/EMMo"}),
+            &mut ctx, &None).await.unwrap();
+        match rx.await.unwrap() {
+            FetchResolution::Continue { post_data: Some(body), .. } => {
+                assert_eq!(serde_json::to_value(body).unwrap(), json!([0, 128, 255, 16, 195, 40]));
+            }
+            _ => panic!("expected binary Continue"),
         }
     }
 
