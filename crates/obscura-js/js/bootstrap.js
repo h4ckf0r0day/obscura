@@ -31,7 +31,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
-    '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
+    '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost', '__obscura_focusNext',
     '__obscura_inputChecked', '__obscura_setInputChecked',
     '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
@@ -197,7 +197,10 @@ const _dom = (cmd, a1, a2) => {
     // HTML removal steps reset the focused area to the viewport without
     // dispatching blur/change events. Cover native replacement paths too.
     const focused = globalThis.__obscura_focused;
-    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
+    if (focused && !focused.isConnected) {
+      globalThis.__obscura_focused = null;
+      _pendingControlValues.delete(focused);
+    }
   }
   return result;
 };
@@ -1956,6 +1959,85 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+const _pendingControlValues = new WeakMap();
+const _textEntryTypes = new Set(['text', 'search', 'tel', 'url', 'email', 'password', 'number']);
+
+function _unfocusControl(element, relatedTarget) {
+  if (globalThis.__obscura_focused !== element) return;
+  globalThis.__obscura_focused = null;
+  const initial = _pendingControlValues.get(element);
+  _pendingControlValues.delete(element);
+  if (initial !== undefined && element.value !== initial) {
+    element.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', { bubbles: true })));
+  }
+  // A change handler can rebuild the form before the focus transition finishes.
+  if (!element.isConnected) return;
+  element.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget })));
+  element.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget })));
+}
+
+function _firstSummaryChild(details) {
+  for (const child of details.children) {
+    if (child.localName === 'summary') return child;
+  }
+  return null;
+}
+
+globalThis.__obscura_focusNext = function(backward) {
+  const current = document.activeElement;
+  const styles = new Map();
+  const style = element => {
+    if (!styles.has(element)) styles.set(element, getComputedStyle(element));
+    return styles.get(element);
+  };
+  const candidates = [];
+  for (const element of document.querySelectorAll('input,button,select,textarea,a[href],area[href],iframe,summary,[tabindex],[contenteditable],audio[controls],video[controls]')) {
+    if (_isActuallyDisabled(element) || (element.localName === 'input' && element._inputType() === 'hidden')) continue;
+    let index = element.tabIndex;
+    if (!element.hasAttribute('tabindex') && (
+        (element.isContentEditable && !element.parentElement?.isContentEditable)
+        || (element.localName === 'summary' && element.parentElement?.localName === 'details'
+          && _firstSummaryChild(element.parentElement) === element)
+        || ((element.localName === 'audio' || element.localName === 'video') && element.hasAttribute('controls')))) index = 0;
+    if (index < 0 || style(element).display === 'contents'
+        || style(element).visibility === 'hidden' || style(element).visibility === 'collapse') continue;
+    let unavailable = false;
+    for (let node = element; node; node = node.parentElement) {
+      if (node.hasAttribute('inert') || style(node).display === 'none') { unavailable = true; break; }
+      if (node !== element && node.localName === 'details' && !node.hasAttribute('open')) {
+        const summary = _firstSummaryChild(node);
+        if (!summary || !summary.contains(element)) { unavailable = true; break; }
+      }
+    }
+    if (!unavailable) candidates.push({ element, index });
+  }
+  // A named radio group has one sequential stop, or its entry-end radio if none is checked.
+  const owners = new Map();
+  const radioStops = new Map();
+  for (const { element } of candidates) {
+    if (element.localName !== 'input' || element._inputType() !== 'radio' || !element.name) continue;
+    const owner = element.form || document;
+    if (!owners.has(owner)) owners.set(owner, new Map());
+    const groups = owners.get(owner);
+    let group = groups.get(element.name);
+    if (!group) { group = { stop: element }; groups.set(element.name, group); }
+    if (element.checked || (!group.stop.checked && backward)) group.stop = element;
+    radioStops.set(element, group);
+  }
+  const stops = candidates.filter(({ element }) => !radioStops.has(element) || radioStops.get(element).stop === element);
+  const direction = backward ? -1 : 1;
+  let next;
+  if (current !== document.body && !stops.some(item => item.element === current)) {
+    const ordered = backward ? stops.slice().reverse() : stops;
+    next = ordered.find(item => current.compareDocumentPosition(item.element) & (backward ? 2 : 4));
+  } else {
+    stops.sort((a, b) => (a.index > 0 ? a.index : Infinity) - (b.index > 0 ? b.index : Infinity));
+    const position = globalThis.__obscura_focused ? stops.findIndex(item => item.element === current) : -1;
+    next = stops[position < 0 ? (backward ? stops.length - 1 : 0) : position + direction];
+  }
+  if (next) next.element.focus();
+  else current?.blur();
+};
 const _eventTargetListenerChanged = new WeakMap();
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
@@ -2121,6 +2203,7 @@ function _domEventDispatch(target, event) {
   }
 
   event._dispatching = true;
+  if (event.type === 'change' && _trustedEvents.has(event)) _pendingControlValues.delete(target);
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
   event.target = target;
@@ -4629,22 +4712,18 @@ class Element extends Node {
     }
   }
   focus() {
+    if (!this.isConnected) return;
     const previous = globalThis.__obscura_focused || null;
     if (previous === this) return;
-    if (previous) {
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
-    }
+    if (previous) _unfocusControl(previous, this);
+    if (!this.isConnected || globalThis.__obscura_focused) return;
     globalThis.__obscura_focused = this;
     globalThis.__obscura_click_target = this;
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
     this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
   }
   blur() {
-    if (globalThis.__obscura_focused !== this) return;
-    globalThis.__obscura_focused = null;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
+    _unfocusControl(this, null);
   }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -11546,6 +11625,11 @@ globalThis.__obscura_markTrusted = function(ev) {
 // user change. When no framework wrapper is present this is identical to a
 // direct assignment.
 globalThis.__obscura_setFieldValue = function(el, field, value) {
+  if (field === 'value' && globalThis.__obscura_focused === el && !_pendingControlValues.has(el)
+      && (el.localName === 'textarea' || (el.localName === 'input'
+        && _textEntryTypes.has(el._inputType())))) {
+    _pendingControlValues.set(el, el.value);
+  }
   try {
     let proto = Object.getPrototypeOf(el);
     let desc;

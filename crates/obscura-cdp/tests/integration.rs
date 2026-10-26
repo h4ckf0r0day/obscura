@@ -47,6 +47,7 @@ integration_tests!(
     input_key_event_escaping,
     input_mouse_event_parity,
     input_mouse_label_activation,
+    input_tab_commit,
     js_fetch_emits_network_events,
     max_connections_cap,
     module_network_events,

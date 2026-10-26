@@ -445,6 +445,13 @@ pub async fn handle(
                             return Ok(json!({}));
                         }
 
+                        if key == "Tab" {
+                            if !alt_key && !ctrl_key && !meta_key {
+                                page.evaluate(&format!("globalThis.__obscura_focusNext({shift_key})"));
+                            }
+                            return Ok(json!({}));
+                        }
+
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text, false));
                         }
