@@ -275,6 +275,14 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    /// Window named properties (window access to element ids and `name=` on
+    /// embed/form/iframe/img/object), maintained like `id_index` so lookups
+    /// do not walk the whole document tree. Key: the name; value: one entry
+    /// per element carrying it (duplicates resolve to a collection). Slot 0
+    /// marks the id attribute, slot 1 the name attribute — the same value
+    /// can arrive through both on one element, and updates must only touch
+    /// their own slot.
+    pub(crate) window_named_index: HashMap<String, Vec<(NodeId, u8)>>,
     form_controls: HashMap<NodeId, FormControlState>,
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
@@ -310,6 +318,7 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                window_named_index: HashMap::new(),
                 form_controls: HashMap::new(),
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
@@ -641,6 +650,65 @@ impl DomTree {
         self.inner.borrow().shadow_roots.get(&root).copied()
     }
 
+    /// One allocation-free pass over `root` and its descendants. Bit 0: a
+    /// `style` or `link` element (stylesheet owners). Bit 1: an element that
+    /// can supply a window named property (`id`, or `name` on
+    /// embed/form/iframe/img/object). Callers use a zero result to skip
+    /// per-subtree bookkeeping that would otherwise cost several selector
+    /// queries; the bits are a superset, never a proof of a match.
+    pub fn subtree_flags(&self, root: NodeId) -> u8 {
+        let inner = self.inner.borrow();
+        let mut flags = 0u8;
+        let mut current = root;
+        let mut budget = inner.nodes.len() + 1;
+        loop {
+            let Some(Some(node)) = inner.nodes.get(current.index()) else {
+                return flags;
+            };
+            if let NodeData::Element { name, .. } = &node.data {
+                let local = name.local.as_ref();
+                if local.eq_ignore_ascii_case("style") || local.eq_ignore_ascii_case("link") {
+                    flags |= 1;
+                }
+                if node.get_attribute("id").is_some()
+                    || (["embed", "form", "iframe", "img", "object"]
+                        .iter()
+                        .any(|tag| local.eq_ignore_ascii_case(tag))
+                        && node.get_attribute("name").is_some())
+                {
+                    flags |= 2;
+                }
+                if flags == 3 {
+                    return flags;
+                }
+            }
+            if let Some(child) = node.first_child {
+                current = child;
+            } else {
+                // Climb to the next unvisited sibling without leaving `root`.
+                let mut at = node;
+                loop {
+                    if at.id == root {
+                        return flags;
+                    }
+                    if let Some(next) = at.next_sibling {
+                        current = next;
+                        break;
+                    }
+                    let Some(parent) = at.parent else { return flags };
+                    let Some(Some(parent_node)) = inner.nodes.get(parent.index()) else {
+                        return flags;
+                    };
+                    at = parent_node;
+                }
+            }
+            budget -= 1;
+            if budget == 0 {
+                return flags;
+            }
+        }
+    }
+
     pub fn is_shadow_root(&self, node: NodeId) -> bool {
         self.inner.borrow().shadow_roots.contains_key(&node)
     }
@@ -713,11 +781,14 @@ impl DomTree {
         }
 
         let mut stack = vec![root];
-        let mut seen = HashSet::new();
+        // A valid tree visits each node once; the budget replaces a per-call
+        // HashSet as the guard against a corrupt (cyclic) sibling chain.
+        let mut budget = inner.nodes.len();
         while let Some(node_id) = stack.pop() {
-            if !seen.insert(node_id) {
-                continue;
+            if budget == 0 {
+                break;
             }
+            budget -= 1;
             if !connected { Self::clear_cssom_stylesheet_inner(inner, node_id); }
             let (mut child, shadow_root) = match inner
                 .nodes
@@ -839,6 +910,7 @@ impl DomTree {
                 // the first-in-tree-order element on duplicate ids, per spec.
                 inner.id_index.entry(id_attr.value.clone()).or_insert(id);
             }
+            Self::window_named_index_node(&mut inner, id, &data);
         }
 
         inner.nodes[id.index()] = Some(Node {
@@ -1153,16 +1225,38 @@ impl DomTree {
         let mut inner = self.inner.borrow_mut();
 
         let mut ids_to_remove = Vec::new();
+        let mut named_to_remove: Vec<(String, NodeId, u8)> = Vec::new();
         for &id in &nodes_to_remove {
             if let Some(Some(node)) = inner.nodes.get(id.index()) {
                 if let Some(id_val) = node.get_attribute("id") {
                     ids_to_remove.push(id_val.to_string());
+                }
+                // Window-named index entries die with the node: freed arena
+                // slots hand their NodeId to future nodes, so a stale entry
+                // would alias to whatever is created next.
+                if let Some(id_val) = node.get_attribute_ns("", "id") {
+                    if !id_val.is_empty() {
+                        named_to_remove.push((id_val.to_string(), id, 0));
+                    }
+                }
+                if let Some(name_val) = node.get_attribute_ns("", "name") {
+                    if !name_val.is_empty() {
+                        named_to_remove.push((name_val.to_string(), id, 1));
+                    }
                 }
             }
         }
 
         for id_str in ids_to_remove {
             inner.id_index.remove(&id_str);
+        }
+        for (name, node_id, slot) in named_to_remove {
+            if let Some(entries) = inner.window_named_index.get_mut(&name) {
+                entries.retain(|(nid, s)| !(*nid == node_id && *s == slot));
+                if entries.is_empty() {
+                    inner.window_named_index.remove(&name);
+                }
+            }
         }
 
         // Remove both directions before freeing any arena slot. Otherwise a
@@ -1875,6 +1969,53 @@ impl DomTree {
         self.len() <= 1
     }
 
+    /// Candidates for one window name, from the index: elements carrying the
+    /// name that live in the document tree (connected, not shadow-attached).
+    /// Returns `(matches, needs_walk)`. `needs_walk` is true only when several
+    /// elements carry the name, because document order then matters for the
+    /// HTMLCollection; every other case — including a name the index has never
+    /// seen, the interceptor's common unknown-global miss — resolves without
+    /// touching the tree.
+    pub fn window_named_candidates(&self, name: &str) -> (Vec<(NodeId, bool)>, bool) {
+        let inner = self.inner.borrow();
+        let Some(entries) = inner.window_named_index.get(name) else {
+            return (Vec::new(), false);
+        };
+        if entries.len() > 1 {
+            return (Vec::new(), true);
+        }
+        let mut matches = Vec::with_capacity(entries.len());
+        for &(nid, slot) in entries {
+            if self.is_connected(nid) && self.containing_shadow_root(nid).is_none() {
+                let named_frame = slot == 1
+                    && inner
+                        .nodes
+                        .get(nid.index())
+                        .and_then(|n| n.as_ref())
+                        .is_some_and(|node| {
+                            matches!(&node.data, NodeData::Element { name, .. } if name.local.as_ref() == "iframe")
+                        });
+                matches.push((nid, named_frame));
+            }
+        }
+        (matches, false)
+    }
+
+    /// Every window name with at least one live document-tree candidate.
+    pub fn window_named_names(&self) -> Vec<String> {
+        let inner = self.inner.borrow();
+        inner
+            .window_named_index
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|&(nid, _)| {
+                    self.is_connected(nid) && self.containing_shadow_root(nid).is_none()
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn update_id_index(&self, node_id: NodeId, old_id: Option<&str>, new_id: Option<&str>) {
         let mut inner = self.inner.borrow_mut();
         if let Some(old) = old_id {
@@ -1882,6 +2023,88 @@ impl DomTree {
         }
         if let Some(new) = new_id {
             inner.id_index.insert(new.to_string(), node_id);
+        }
+    }
+
+    /// Index the window-named attributes (`id` everywhere, `name` on the
+    /// eligible tags) an element carries. Mirrors `window_named_attributes`
+    /// in ops.rs: null-namespace attributes, empty values ignored, `name`
+    /// only in the HTML namespace on embed/form/iframe/img/object.
+    fn window_named_index_node(inner: &mut DomTreeInner, node_id: NodeId, data: &NodeData) {
+        let NodeData::Element { name: tag, attrs, .. } = data else { return };
+        let id_value = attrs.iter().find(|a| a.name.local.as_ref() == "id").map(|a| a.value.as_str());
+        let name_value = attrs.iter().find(|a| a.name.local.as_ref() == "name").map(|a| a.value.as_str());
+        if let Some(id_value) = id_value.filter(|v| !v.is_empty()) {
+            inner
+                .window_named_index
+                .entry(id_value.to_string())
+                .or_default()
+                .push((node_id, 0));
+        }
+        let eligible = tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            && matches!(
+                tag.local.as_ref(),
+                "embed" | "form" | "iframe" | "img" | "object"
+            );
+        if eligible {
+            if let Some(name_value) = name_value.filter(|v| !v.is_empty()) {
+                inner
+                    .window_named_index
+                    .entry(name_value.to_string())
+                    .or_default()
+                    .push((node_id, 1));
+            }
+        }
+    }
+
+    /// Update the window-named index after an `id` or `name` attribute of one
+    /// element changed. `old`/`new` are the previous and current attribute
+    /// values; empty and missing values mean "no entry".
+    pub fn update_window_named_index(
+        &self,
+        node_id: NodeId,
+        attr_local: &str,
+        old: Option<&str>,
+        new: Option<&str>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        let slot: u8 = if attr_local == "name" { 1 } else { 0 };
+        if let Some(old) = old.filter(|v| !v.is_empty()) {
+            if let Some(entries) = inner.window_named_index.get_mut(old) {
+                // Only this attribute's entry goes: the same value may also
+                // arrive through the other attribute of the same element.
+                entries.retain(|(nid, s)| !(*nid == node_id && *s == slot));
+                if entries.is_empty() {
+                    inner.window_named_index.remove(old);
+                }
+            }
+        }
+        // The `name` attribute only contributes entries on the eligible tags.
+        if attr_local == "name" {
+            let eligible = inner
+                .nodes
+                .get(node_id.index())
+                .and_then(|n| n.as_ref())
+                .is_some_and(|node| match &node.data {
+                    NodeData::Element { name, .. } => {
+                        name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                            && matches!(
+                                name.local.as_ref(),
+                                "embed" | "form" | "iframe" | "img" | "object"
+                            )
+                    }
+                    _ => false,
+                });
+            if !eligible {
+                return;
+            }
+        }
+        if let Some(new) = new.filter(|v| !v.is_empty()) {
+            inner
+                .window_named_index
+                .entry(new.to_string())
+                .or_default()
+                .push((node_id, slot));
         }
     }
 }
