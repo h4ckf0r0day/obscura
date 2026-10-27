@@ -14529,6 +14529,7 @@ function _windowNamedValue(name) {
 }
 
 function _ensureWindowNamedProperty(name) {
+  if (_windowNamedInterceptorInstalled) return;
   name = String(name || "");
   if (!name || _windowNamedPropertyNames.has(name)) return;
   // Existing own Window properties win over named elements.
@@ -14556,6 +14557,7 @@ function _ensureWindowNamedProperty(name) {
 }
 
 function _reconcileWindowNamedProperty(name) {
+  if (_windowNamedInterceptorInstalled) return;
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
   try { delete globalThis[name]; } catch (_error) {}
@@ -14566,7 +14568,86 @@ function _windowNamedNamesInTree(root) {
   return new Set(root ? _domParse("window_named_names", root._nid) || [] : []);
 }
 
+// Documents with more named elements than this resolve window named access
+// through the live interceptor below instead of one eagerly defined accessor
+// pair per name. Object.defineProperty on the global proxy costs roughly
+// 1-1.5 us per name (plus two closures and a property descriptor retained
+// per name), so a page with thousands of ids spent milliseconds at every
+// document init and re-registration work on every insertion. Small documents
+// keep the eager path, which preserves exact own-property semantics
+// (Object.keys(window) and window.hasOwnProperty) for the common case.
+const _WINDOW_NAMED_INTERCEPTOR_THRESHOLD = 1000;
+let _windowNamedInterceptorInstalled = false;
+
+function _installWindowNamedInterceptor() {
+  if (_windowNamedInterceptorInstalled) return;
+  _windowNamedInterceptorInstalled = true;
+  // Drop accessors a previous (small) document defined eagerly; the live
+  // interceptor resolves those names from now on.
+  for (const name of _windowNamedPropertyNames) {
+    try { delete globalThis[name]; } catch (_error) {}
+  }
+  _windowNamedPropertyNames.clear();
+  // The WebIDL "named properties object" sits between Window and its
+  // prototype. Resolution is live: it consults the native id/name index on
+  // each access, so insertions and removals need no registration work.
+  const target = Object.getPrototypeOf(globalThis);
+  const interceptor = new Proxy(target, {
+    get(t, key, receiver) {
+      if (typeof key === "string" && !(key in t)
+          && _windowNamedCandidates(key).length > 0) {
+        return _windowNamedValue(key);
+      }
+      return Reflect.get(t, key, receiver);
+    },
+    has(t, key) {
+      if (typeof key === "string" && !Reflect.has(t, key)
+          && _windowNamedCandidates(key).length > 0) return true;
+      return Reflect.has(t, key);
+    },
+    set(t, key, value, receiver) {
+      if (typeof key === "string" && !Reflect.has(t, key)
+          && _windowNamedCandidates(key).length > 0) {
+        // A named element is a legacy platform property, not a read-only
+        // Window attribute. An ordinary assignment shadows it with an own
+        // data property, including in strict-mode bootstrap scripts.
+        Object.defineProperty(globalThis, key, {
+          value, writable: true, configurable: true, enumerable: true,
+        });
+        return true;
+      }
+      return Reflect.set(t, key, value, receiver);
+    },
+    getOwnPropertyDescriptor(t, key) {
+      if (typeof key === "string" && !Reflect.getOwnPropertyDescriptor(t, key)
+          && _windowNamedCandidates(key).length > 0) {
+        return {
+          configurable: true,
+          enumerable: true,
+          get() { return _windowNamedValue(String(key)); },
+          set(value) {
+            Object.defineProperty(globalThis, String(key), {
+              value, writable: true, configurable: true, enumerable: true,
+            });
+          },
+        };
+      }
+      return Reflect.getOwnPropertyDescriptor(t, key);
+    },
+    ownKeys(t) {
+      const keys = Reflect.ownKeys(t);
+      const seen = new Set(keys);
+      for (const name of _domParse("window_named_names") || []) {
+        if (!seen.has(name)) { seen.add(name); keys.push(name); }
+      }
+      return keys;
+    },
+  });
+  try { Object.setPrototypeOf(globalThis, interceptor); } catch (_error) {}
+}
+
 function _registerWindowNamedTree(root) {
+  if (_windowNamedInterceptorInstalled) return;
   // Window named access only considers the document tree. Detached nodes and
   // attached shadow trees must not manufacture own Window properties. Check
   // connectivity first: getRootNode() walks every ancestor, which made the
@@ -14577,6 +14658,7 @@ function _registerWindowNamedTree(root) {
 }
 
 function _reconcileWindowNamedProperties(names) {
+  if (_windowNamedInterceptorInstalled) return;
   if (!names || names.size === 0) return;
   const doc = globalThis.document;
   if (!doc) return;
@@ -18343,8 +18425,21 @@ globalThis.__obscura_init = (function() {
   // the same Document object exposed as globalThis.document.
   _cache.set(documentNid, globalThis.document);
   const previousWindowNames = new Set(_windowNamedPropertyNames);
-  _registerWindowNamedTree(globalThis.document.documentElement);
-  _reconcileWindowNamedProperties(previousWindowNames);
+  const namedRoot = globalThis.document.documentElement;
+  if (+(_dom("window_named_count", namedRoot._nid) || "0")
+      > _WINDOW_NAMED_INTERCEPTOR_THRESHOLD) {
+    _installWindowNamedInterceptor();
+  } else {
+    const documentWindowNames = _domParse("window_named_names", namedRoot._nid) || [];
+    const present = new Set(documentWindowNames);
+    for (const name of previousWindowNames) {
+      if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
+        try { delete globalThis[name]; } catch (_error) {}
+        _windowNamedPropertyNames.delete(name);
+      }
+    }
+    for (const name of documentWindowNames) _ensureWindowNamedProperty(name);
+  }
 
   const scr = _fp('screen');
   const sw = Number.isFinite(globalThis.__obscura_screen_w) && globalThis.__obscura_screen_w > 0
