@@ -6126,6 +6126,34 @@ mod tests {
         );
     }
 
+    // Regression for issue #1247: built-ins must be reachable through the
+    // worker's global object, not only as bare identifiers, and writes to it
+    // must stay in the worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_self_exposes_page_builtins() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-self-builtins", r#"
+            globalThis.__workerBuiltins = null;
+            const source = "self.__workerOnly = 1; postMessage([typeof Object, typeof self.Object, 'Object' in self, typeof self.Uint8Array, typeof globalThis.Object, typeof this.Object, self === globalThis, self.__workerOnly]);";
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerBuiltins = event.data;
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerBuiltins").unwrap(),
+            serde_json::json!(["function", "function", true, "function", "function", "function", true, 1])
+        );
+        assert_eq!(
+            rt.evaluate("typeof __workerOnly").unwrap(),
+            serde_json::json!("undefined")
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn worker_initializes_once_and_retains_message_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
