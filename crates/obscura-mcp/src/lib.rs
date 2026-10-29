@@ -767,6 +767,21 @@ fn handle_tools_list(id: Value) -> RpcResponse {
         ]);
     }
 
+    if web_search_enabled() {
+        tools.push(json!({
+            "name": "web_search",
+            "description": "Search the web and return matching pages, one JSON object per line with title, url, and a short snippet. Use it to find pages to open with browser_navigate. Queries are sent to the Keenable search API.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "number", "description": "Max results to return (default 5, max 50)" }
+                },
+                "required": ["query"]
+            }
+        }));
+    }
+
     RpcResponse::ok(id, json!({ "tools": tools }))
 }
 
@@ -834,6 +849,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_search" => tool_search(args, state),
         "browser_storage_state" => tool_storage_state(state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
+        "web_search" if web_search_enabled() => tool_web_search(args, state).await,
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -2185,6 +2201,107 @@ fn search_body(
     out
 }
 
+const KEENABLE_SEARCH_URL: &str = "https://api.keenable.ai/v1/search";
+const KEENABLE_PUBLIC_SEARCH_URL: &str = "https://api.keenable.ai/v1/search/public";
+const WEB_SEARCH_SNIPPET_CHARS: usize = 500;
+
+/// `web_search` sends the agent's queries to a third-party API, so it is
+/// listed and callable only when the operator opts in.
+fn web_search_enabled() -> bool {
+    std::env::var("OBSCURA_WEB_SEARCH")
+        .is_ok_and(|provider| provider.trim().eq_ignore_ascii_case("keenable"))
+}
+
+struct WebSearchRequest {
+    url: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+}
+
+/// The public endpoint needs no account. A key only raises the rate limit.
+fn web_search_request(query: &str, limit: u64, api_key: Option<&str>) -> WebSearchRequest {
+    let mut headers = vec![
+        ("content-type", "application/json".to_string()),
+        ("x-keenable-title", "Obscura".to_string()),
+    ];
+    let url = match api_key {
+        Some(key) => {
+            headers.push(("x-api-key", key.to_string()));
+            KEENABLE_SEARCH_URL
+        }
+        None => KEENABLE_PUBLIC_SEARCH_URL,
+    };
+    WebSearchRequest {
+        url,
+        headers,
+        body: json!({ "query": query, "max_results": limit }).to_string(),
+    }
+}
+
+async fn tool_web_search(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let query = args.get("query").and_then(Value::as_str).map(str::trim)
+        .filter(|query| !query.is_empty())
+        .ok_or("Missing query parameter")?;
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 50);
+    let api_key = std::env::var("KEENABLE_API_KEY").ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let request = web_search_request(query, limit, api_key.as_deref());
+
+    // The context's client carries the configured proxy, CA roots and SSRF guard.
+    let client = state.context.http_client.request_client().await;
+    let mut builder = client.post(request.url).body(request.body);
+    for (name, value) in request.headers {
+        builder = builder.header(name, value);
+    }
+    let response = builder.send().await
+        .map_err(|error| format!("web search request failed: {error}"))?;
+    let status = response.status();
+    let body = response.bytes().await
+        .map_err(|error| format!("web search response failed: {error}"))?;
+    if !status.is_success() {
+        let hint = if status.as_u16() == 429 && api_key.is_none() {
+            " (set KEENABLE_API_KEY for higher rate limits)"
+        } else {
+            ""
+        };
+        return Err(format!("web search returned HTTP {}{hint}", status.as_u16()));
+    }
+    let body: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("web search returned invalid JSON: {error}"))?;
+    Ok(format_web_results(query, &body))
+}
+
+/// One JSON object per line, like `browser_links`. Keenable returns the page
+/// text in `snippet` (`description` is empty), often several KB of it.
+fn format_web_results(query: &str, body: &Value) -> String {
+    let compact = |text: &str, max_chars: usize| {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.chars().count() <= max_chars {
+            return text;
+        }
+        let mut cut: String = text.chars().take(max_chars).collect();
+        cut.push_str("...");
+        cut
+    };
+    let lines: Vec<String> = body.get("results").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|result| {
+            let url = result.get("url").and_then(Value::as_str)?;
+            let field = |name: &str| result.get(name).and_then(Value::as_str).unwrap_or("");
+            Some(json!({
+                "title": compact(field("title"), 200),
+                "url": url,
+                "snippet": compact(field("snippet"), WEB_SEARCH_SNIPPET_CHARS),
+            }).to_string())
+        })
+        .collect();
+    if lines.is_empty() {
+        format!("No results for {query:?}.")
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Export full session state: cookies + localStorage + sessionStorage
 /// for every origin the page knows about. Agents stash this between
 /// runs to skip a login flow.
@@ -2732,6 +2849,66 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_is_hidden_and_rejected_without_opt_in() {
+        std::env::remove_var("OBSCURA_WEB_SEARCH");
+        assert!(listed_tools().iter().all(|tool| tool["name"] != "web_search"));
+        let mut state = BrowserState::new(None, None, false);
+        let response = handle_tool_call(
+            json!(1),
+            &json!({"name": "web_search", "arguments": {"query": "obscura"}}),
+            &mut state,
+        ).await.result.expect("tool response");
+        assert_eq!(response["isError"], true);
+        assert!(response.to_string().contains("Unknown tool: web_search"), "{response}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_is_advertised_when_enabled_and_requires_a_query() {
+        std::env::set_var("OBSCURA_WEB_SEARCH", "keenable");
+        let tools = listed_tools();
+        let tool = tools.iter().find(|tool| tool["name"] == "web_search").expect("web_search tool");
+        assert_eq!(tool["inputSchema"]["required"], json!(["query"]));
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_web_search(&json!({"query": "  "}), &mut state).await.unwrap_err();
+        assert!(error.contains("Missing query"), "{error}");
+    }
+
+    #[test]
+    fn web_search_request_is_keyless_unless_a_key_is_set() {
+        let public = web_search_request("rust headless browser", 5, None);
+        assert_eq!(public.url, "https://api.keenable.ai/v1/search/public");
+        assert!(public.headers.contains(&("x-keenable-title", "Obscura".to_string())));
+        assert!(public.headers.iter().all(|(name, _)| *name != "x-api-key"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&public.body).unwrap(),
+            json!({"query": "rust headless browser", "max_results": 5})
+        );
+
+        let keyed = web_search_request("rust", 3, Some("test-key"));
+        assert_eq!(keyed.url, "https://api.keenable.ai/v1/search");
+        assert!(keyed.headers.contains(&("x-api-key", "test-key".to_string())));
+    }
+
+    #[test]
+    fn web_search_results_use_snippet_and_stay_compact() {
+        let long = "word ".repeat(400);
+        let body = json!({"results": [
+            {"title": "  Obscura\n docs ", "url": "https://docs.obscura.sh/", "description": "", "snippet": format!("Line one\n\n{long}")},
+            {"title": "no url", "snippet": "dropped"}
+        ]});
+        let out = format_web_results("obscura", &body);
+        let lines: Vec<Value> = out.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(lines.len(), 1, "{out}");
+        assert_eq!(lines[0]["title"], "Obscura docs");
+        assert_eq!(lines[0]["url"], "https://docs.obscura.sh/");
+        let snippet = lines[0]["snippet"].as_str().unwrap();
+        assert!(snippet.starts_with("Line one word word"), "{snippet}");
+        assert!(snippet.ends_with("..."));
+        assert_eq!(snippet.chars().count(), WEB_SEARCH_SNIPPET_CHARS + 3);
+        assert_eq!(format_web_results("nothing", &json!({"results": []})), "No results for \"nothing\".");
     }
 
     #[tokio::test]
