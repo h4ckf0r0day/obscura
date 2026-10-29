@@ -28,6 +28,12 @@ pub enum WaitUntil {
     DomContentLoaded,
     NetworkIdle0,
     NetworkIdle2,
+    /// Load plus a content-stability poll: scrape-oriented pages and challenge
+    /// interstitials keep mutating after the load event (late scripts rewrite
+    /// the DOM, bot walls swap in the real page after their checks). A client
+    /// asking for `settle` gets the page once it has stopped changing, instead
+    /// of a snapshot of the challenge shell.
+    Settle,
 }
 
 impl WaitUntil {
@@ -36,6 +42,7 @@ impl WaitUntil {
             "domcontentloaded" => WaitUntil::DomContentLoaded,
             "networkidle0" | "networkIdle" | "networkidle" => WaitUntil::NetworkIdle0,
             "networkidle2" => WaitUntil::NetworkIdle2,
+            "settle" => WaitUntil::Settle,
             _ => WaitUntil::Load,
         }
     }
