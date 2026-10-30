@@ -1353,6 +1353,22 @@ fn note_compound_dependencies(
                         );
                         map.mark_conservative(rule_order);
                     }
+                    "host" => {
+                        // The argument matches the shadow host from inside
+                        // its shadow tree, so key its dependencies but always
+                        // take the full fallback.
+                        map.push_state(name, rule_order, reaches);
+                        map.mark_conservative(rule_order);
+                        for alternative in split_selector_list(&arguments) {
+                            note_selector_dependencies(
+                                map,
+                                alternative.trim(),
+                                InvalidationReaches::CONSERVATIVE,
+                                rule_order,
+                                !inside_relational,
+                            );
+                        }
+                    }
                     _ => {
                         // A compiled functional pseudo outside the explicitly
                         // modeled set may hide selector or document state.
