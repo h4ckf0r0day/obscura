@@ -19666,6 +19666,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn navigator_storage_exposes_modern_and_legacy_quota_interfaces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const estimate = await navigator.storage.estimate();
+                    const quota = await new Promise(resolve =>
+                        navigator.webkitTemporaryStorage.queryUsageAndQuota(
+                            (usage, available) => resolve({ usage, available }),
+                        ));
+                    return {
+                        estimate,
+                        quota,
+                        persistent: typeof navigator.webkitPersistentStorage.requestQuota,
+                    };
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+
+        assert!(result["estimate"]["usage"].is_number());
+        assert!(result["estimate"]["quota"].as_f64().unwrap() > 0.0);
+        assert_eq!(result["quota"]["usage"], serde_json::json!(0));
+        assert!(result["quota"]["available"].as_f64().unwrap() > 0.0);
+        assert_eq!(result["persistent"], serde_json::json!("function"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unserializable_value_arguments_are_limited_to_the_cdp_set() {
         // CDP's UnserializableValue is a closed set. Anything else is source
         // text that must not be evaluated just because it arrived in that field.
