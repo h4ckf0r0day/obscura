@@ -18,9 +18,9 @@ use url::Url;
 use crate::client::{
     cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
-    same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
-    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
-    ResourceRequest, Response, SsrfGuardResolver,
+    same_site_context, serialized_request_origin, validate_cors_response, validate_proxied_host,
+    validate_request_mode, validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError,
+    RequestInfo, RequestMode, ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
@@ -187,6 +187,8 @@ async fn send_get_with_connection_reset_retry(
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
+    /// A proxy is configured, so targets need `validate_proxied_host`.
+    proxied: bool,
     /// Lets `fetch_file_url` read local files. Off by default.
     pub allow_file_access: bool,
     pub block_trackers: bool,
@@ -283,6 +285,7 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             allow_private_network,
+            proxied: proxy_url.is_some(),
             allow_file_access: false,
             block_trackers: tracker_blocking_enabled(
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
@@ -299,6 +302,12 @@ impl StealthHttpClient {
     pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
         self
+    }
+
+    /// True when requests leave through a proxy, so callers that validate
+    /// URLs themselves must also run `validate_proxied_host`.
+    pub fn is_proxied(&self) -> bool {
+        self.proxied
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -347,6 +356,9 @@ impl StealthHttpClient {
         let mut method = wreq::Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         validate_url(url, self.allow_private_network)?;
+        if self.proxied {
+            validate_proxied_host(url, self.allow_private_network).await.map_err(ObscuraNetError::Network)?;
+        }
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes, self.allow_file_access).await;
@@ -487,6 +499,11 @@ impl StealthHttpClient {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
+                    if self.proxied {
+                        validate_proxied_host(&next_url, self.allow_private_network)
+                            .await
+                            .map_err(ObscuraNetError::Network)?;
+                    }
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -930,6 +947,7 @@ mod tests {
         let client = StealthHttpClient {
             client: wreq::Client::builder().no_proxy().build().unwrap(),
             allow_private_network: true,
+            proxied: false,
             allow_file_access: false,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),

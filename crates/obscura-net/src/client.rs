@@ -640,6 +640,50 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
+/// The DNS half of the SSRF gate for a request that goes through a proxy.
+///
+/// With a proxy configured, reqwest and wreq resolve only the proxy's own host
+/// and hand the target name to the proxy unresolved, so `SsrfGuardResolver`
+/// never sees it and a name that resolves to 127.0.0.1 or 169.254.169.254 would
+/// be fetched by the proxy. This resolves the target locally and applies the
+/// same deny-set. A name that does not resolve locally is refused as well:
+/// otherwise a name only the proxy's network knows (an internal zone,
+/// metadata.google.internal) would pass unchecked. Literal IP hosts are left to
+/// `validate_url`, which already checks them. Every transport calls this at the
+/// same points as `validate_url`, for the first request and for each redirect.
+pub async fn validate_proxied_host(url: &Url, allow_private_network: bool) -> Result<(), String> {
+    if allow_private_network || env_allows_private_network() {
+        return Ok(());
+    }
+    let Some(url::Host::Domain(domain)) = url.host() else {
+        return Ok(());
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
+        .await
+        .map_err(|e| {
+            format!(
+                "SSRF blocked: '{}' could not be resolved locally to check it before sending it to the proxy ({})",
+                domain, e
+            )
+        })?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!(
+            "SSRF blocked: '{}' could not be resolved locally to check it before sending it to the proxy",
+            domain
+        ));
+    }
+    if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
+        return Err(format!(
+            "SSRF blocked: '{}' resolves to forbidden address {}",
+            domain,
+            bad.ip()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
@@ -1418,6 +1462,9 @@ impl ObscuraHttpClient {
         mut request_headers: Option<HashMap<String, String>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
+        if self.proxy_url.is_some() {
+            validate_proxied_host(url, self.allow_private_network).await.map_err(ObscuraNetError::Network)?;
+        }
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
@@ -1655,6 +1702,11 @@ impl ObscuraHttpClient {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
+                    if self.proxy_url.is_some() {
+                        validate_proxied_host(&next_url, self.allow_private_network)
+                            .await
+                            .map_err(ObscuraNetError::Network)?;
+                    }
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -1844,9 +1896,9 @@ mod resource_cache_tests {
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
-        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer,
+        validate_proxied_host, validate_url, CallbackRegistry, ObscuraHttpClient, ObscuraNetError,
+        RequestCredentials, RequestMode, ResourceRequest, ResourceType, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
@@ -2046,6 +2098,21 @@ mod ssrf_tests {
         ] {
             assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
         }
+    }
+
+    #[tokio::test]
+    async fn validate_proxied_host_checks_what_the_proxy_would_resolve() {
+        let check = |u: &str, allow| {
+            let url = Url::parse(u).unwrap();
+            async move { validate_proxied_host(&url, allow).await }
+        };
+        let err = check("http://localhost:8080/", false).await.unwrap_err();
+        assert!(err.contains("forbidden address"), "{err}");
+        let err = check("http://name-that-does-not-exist.invalid/", false).await.unwrap_err();
+        assert!(err.contains("could not be resolved locally"), "{err}");
+        // Literal IPs are validate_url's job; the opt-in lifts the check.
+        assert!(check("http://127.0.0.1/", false).await.is_ok());
+        assert!(check("http://localhost/", true).await.is_ok());
     }
 
     #[test]

@@ -4023,7 +4023,7 @@ async fn fetch_url_inner(
     // Same rule as the rewrite below: a URL the gate cannot parse is one it
     // cannot check, so it never reaches the transport.
     let gate_error = match url::Url::parse(&url) {
-        Ok(parsed_url) => validate_fetch_url(&parsed_url, allow_private_network).err(),
+        Ok(parsed_url) => gate_fetch_url(&parsed_url, allow_private_network, proxy_url.is_some()).await.err(),
         Err(err) => Some(format!("Unparsable URL blocked: {}", err)),
     };
     if let Some(e) = gate_error {
@@ -4168,7 +4168,7 @@ async fn fetch_url_inner(
                 .to_string());
             }
         };
-        if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+        if let Err(reason) = gate_fetch_url(&parsed, allow_private_network, proxy_url.is_some()).await {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -4480,7 +4480,7 @@ async fn fetch_url_inner(
         };
 
         // Re-validate every redirect target against the SSRF policy.
-        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
+        if let Err(reason) = gate_fetch_url(&next_url, allow_private_network, proxy_url.is_some()).await {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -4755,7 +4755,7 @@ async fn stealth_fetch_all(
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
-        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
+        if let Err(reason) = gate_fetch_url(&next_url, allow_private_network, stealth.is_proxied()).await {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
                 "blocked": true,
@@ -6246,6 +6246,16 @@ mod tests {
         let width = geometry.document_rect(box_node).unwrap().width;
         assert!((width - 60.0).abs() < 0.1, "sampled width was {width}");
     }
+}
+
+/// `validate_fetch_url` plus, when the request leaves through a proxy, the DNS
+/// check the proxy would otherwise skip (`obscura_net::validate_proxied_host`).
+async fn gate_fetch_url(url: &url::Url, allow_private_network: bool, proxied: bool) -> Result<(), String> {
+    validate_fetch_url(url, allow_private_network)?;
+    if proxied {
+        obscura_net::validate_proxied_host(url, allow_private_network).await?;
+    }
+    Ok(())
 }
 
 fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
