@@ -46,7 +46,7 @@ tokio-tungstenite = "0.26"
 # (obscura-net/src/cookies.rs) and never uses reqwest's cookie store. Pulling
 # it in only added the cookie/cookie_store crates, and cookie 0.18.1's blanket
 # From impl fails to compile under coherence on some toolchains (issue #295).
-reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks"], default-features = false }
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "socks", "http2"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
