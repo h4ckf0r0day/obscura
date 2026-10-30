@@ -5453,6 +5453,16 @@ mod tests {
     }
 
     #[test]
+    fn pbkdf2_bounds_iterations_times_blocks() {
+        // Each cap alone allows this: 10M iterations over 1 MiB of SHA-1 output.
+        let err = pbkdf2_derive("SHA-1", b"pw", b"salt", PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES)
+            .expect_err("iterations x blocks above the work cap must be rejected");
+        assert!(err.to_string().contains("work"), "error should name the work cap: {err}");
+        // Large iteration counts with a normal key length stay allowed.
+        assert!(pbkdf2_derive("SHA-256", b"pw", b"salt", 1_000_000, 32).is_ok());
+    }
+
+    #[test]
     fn pbkdf2_rejects_excessive_output_length() {
         let err = pbkdf2_derive(
             "SHA-256",
@@ -7235,6 +7245,11 @@ fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno
 /// ~600k iterations and derived keys are tens of bytes.
 const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
 const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+/// PBKDF2 runs the whole iteration count once per hash-sized output block, so
+/// the work is iterations x blocks, not iterations. The two caps above still
+/// allow 10M x 52,429 SHA-1 blocks, about 16 hours of one core. This bounds the
+/// product at 1e9 block iterations (about two minutes).
+const PBKDF2_MAX_WORK: u64 = 1_000_000_000;
 
 /// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
 /// are unit-testable without the `#[op2]` wrapper.
@@ -7255,6 +7270,19 @@ fn pbkdf2_derive(
             "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
         )));
     }
+    let block_len: u64 = match hash {
+        "SHA-1" => 20,
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
+        _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    let work = u64::from(iterations) * u64::from(length).div_ceil(block_len);
+    if work > PBKDF2_MAX_WORK {
+        return Err(crypto_err(format!(
+            "PBKDF2 work of {iterations} iterations over {length} bytes exceeds the supported maximum"
+        )));
+    }
     use pbkdf2::pbkdf2_hmac;
     let mut dk = vec![0u8; length as usize];
     match hash {
@@ -7268,16 +7296,21 @@ fn pbkdf2_derive(
 }
 
 /// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+/// Runs on the blocking pool: the V8 watchdog cannot interrupt native code, so
+/// a derivation on the page thread froze every page on the connection for its
+/// whole duration. A panic surfaces as a JoinError instead of unwinding into V8.
 #[op2]
 #[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+async fn op_subtle_pbkdf2(
+    #[string] hash: String,
+    #[buffer(copy)] password: Vec<u8>,
+    #[buffer(copy)] salt: Vec<u8>,
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    pbkdf2_derive(hash, password, salt, iterations, length)
+    tokio::task::spawn_blocking(move || pbkdf2_derive(&hash, &password, &salt, iterations, length))
+        .await
+        .map_err(|e| crypto_err(format!("PBKDF2 task failed: {e}")))?
 }
 
 /// Generous DoS backstop on HKDF output length. HKDF itself rejects output
