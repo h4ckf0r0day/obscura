@@ -14271,6 +14271,21 @@ globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
+// The rest of the HTML element interfaces. Site scripts reference these as bare
+// globals (costco.com reads HTMLBaseElement), which threw a ReferenceError and
+// aborted the script while the name was undefined.
+for (const name of [
+  'HTMLAreaElement', 'HTMLBaseElement', 'HTMLDListElement', 'HTMLDataElement',
+  'HTMLDirectoryElement', 'HTMLEmbedElement', 'HTMLFontElement', 'HTMLFrameElement',
+  'HTMLFrameSetElement', 'HTMLMapElement', 'HTMLMarqueeElement', 'HTMLMenuElement',
+  'HTMLMeterElement', 'HTMLModElement', 'HTMLObjectElement', 'HTMLOptGroupElement',
+  'HTMLOutputElement', 'HTMLParamElement', 'HTMLPictureElement', 'HTMLQuoteElement',
+  'HTMLSourceElement', 'HTMLTableCaptionElement', 'HTMLTableCellElement',
+  'HTMLTableColElement', 'HTMLTableRowElement', 'HTMLTableSectionElement',
+  'HTMLTimeElement', 'HTMLTitleElement',
+]) {
+  if (globalThis[name] === undefined) globalThis[name] = Element;
+}
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.

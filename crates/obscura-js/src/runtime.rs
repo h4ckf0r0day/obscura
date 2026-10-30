@@ -8929,6 +8929,35 @@ mod tests {
     }
 
     #[test]
+    fn remaining_html_element_interfaces_are_defined() {
+        // Site scripts read these as bare globals; an undefined name threw a
+        // ReferenceError and aborted the whole script.
+        let mut rt = setup_runtime("<html><head><base href=\"/\"></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const names = ["HTMLAreaElement", "HTMLBaseElement", "HTMLDListElement",
+                    "HTMLDataElement", "HTMLDirectoryElement", "HTMLEmbedElement",
+                    "HTMLFontElement", "HTMLFrameElement", "HTMLFrameSetElement",
+                    "HTMLMapElement", "HTMLMarqueeElement", "HTMLMenuElement",
+                    "HTMLMeterElement", "HTMLModElement", "HTMLObjectElement",
+                    "HTMLOptGroupElement", "HTMLOutputElement", "HTMLParamElement",
+                    "HTMLPictureElement", "HTMLQuoteElement", "HTMLSourceElement",
+                    "HTMLTableCaptionElement", "HTMLTableCellElement",
+                    "HTMLTableColElement", "HTMLTableRowElement",
+                    "HTMLTableSectionElement", "HTMLTimeElement", "HTMLTitleElement"];
+                return [
+                    names.filter((n) => typeof globalThis[n] !== "function"),
+                    document.querySelector("base") instanceof HTMLBaseElement,
+                    typeof HTMLBaseElement.prototype.getAttribute,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([[], true, "function"]));
+    }
+
+    #[test]
     fn foreign_inner_html_and_contextual_fragments_keep_svg_namespace() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let v = rt
