@@ -8979,6 +8979,137 @@ mod tests {
     }
 
     #[test]
+    fn custom_elements_connect_and_upgrade_on_insertion() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class XEl extends HTMLElement {
+                    constructor() { super(); log.push('ctor'); }
+                    connectedCallback() {
+                        log.push('connected');
+                        if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+                    }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('x-el', XEl);
+                const created = document.createElement('x-el');
+                log.push('created');
+                document.body.appendChild(created);
+                log.push('appended:' + (created.shadowRoot !== null));
+                const holder = document.createElement('div');
+                holder.innerHTML = '<x-el></x-el>';
+                log.push('parsed:' + (holder.firstChild instanceof XEl));
+                document.body.appendChild(holder);
+                log.push('inner:' + (holder.firstChild.shadowRoot !== null));
+                document.body.innerHTML = '<x-el></x-el>';
+                log.push('set:' + (document.body.firstChild instanceof XEl));
+                document.body.firstChild.remove();
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "ctor", "created", "connected", "appended:true",
+                "parsed:false", "ctor", "connected", "inner:true",
+                "disconnected", "disconnected", "ctor", "connected", "set:true",
+                "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_get_reactions_for_moves_and_observed_attributes() {
+        let mut rt = setup_runtime(r#"<html><body><a-el id="a" mode="x" other="y"></a-el><p id="p"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class AEl extends HTMLElement {
+                    static get observedAttributes() { return ['mode']; }
+                    attributeChangedCallback(name, oldValue, newValue) {
+                        log.push(name + ':' + oldValue + '>' + newValue);
+                    }
+                    connectedCallback() { log.push('connected'); }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('a-el', AEl);
+                const a = document.getElementById('a');
+                a.setAttribute('mode', 'y');
+                a.setAttribute('other', 'z');
+                a.removeAttribute('mode');
+                a.removeAttribute('mode');
+                document.getElementById('p').appendChild(a);
+                const detached = document.createElement('div');
+                detached.appendChild(a);
+                detached.removeChild(a);
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "mode:null>x", "connected", "mode:x>y", "mode:y>null",
+                "disconnected", "connected", "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_in_a_connected_shadow_tree_connect() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class InEl extends HTMLElement {
+                    connectedCallback() { log.push('inner'); }
+                }
+                class OutEl extends HTMLElement {
+                    connectedCallback() {
+                        const root = this.attachShadow({ mode: 'open' });
+                        root.innerHTML = '<in-el></in-el>';
+                        log.push('outer');
+                    }
+                }
+                customElements.define('in-el', InEl);
+                customElements.define('out-el', OutEl);
+                const host = document.createElement('out-el');
+                document.body.appendChild(host);
+                host.shadowRoot.appendChild(document.createElement('in-el'));
+                return [log, host.shadowRoot.firstChild instanceof InEl];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([["inner", "outer", "inner"], true]));
+    }
+
+    #[test]
+    fn throwing_connected_callback_is_reported_not_thrown() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const reported = [];
+                globalThis.reportError = (e) => reported.push(e.message);
+                class BadEl extends HTMLElement {
+                    connectedCallback() { throw new Error('connect failed'); }
+                }
+                customElements.define('bad-el', BadEl);
+                const el = document.createElement('bad-el');
+                document.body.appendChild(el);
+                return [el.isConnected, reported];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, ["connect failed"]]));
+    }
+
+    #[test]
     fn editing_command_detection_reports_unsupported_commands_without_mutation() {
         let mut rt = setup_runtime("<body><p>unchanged</p><iframe></iframe></body>");
         assert_eq!(rt.evaluate(r#"(() => {
