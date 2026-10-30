@@ -834,7 +834,7 @@ fn run_connection(
         .spawn(move || {
             let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
-                context_template.isolated_copy("default".to_string(), true),
+                context_template.connection_copy("default".to_string()),
             );
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
             let persisted_context = default_context.clone();
@@ -930,6 +930,7 @@ fn run_connection(
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
+                persisted_context.local_storage.merge_changed_into(&persistence_context.local_storage);
                 persistence_context.save_storage();
             }
 

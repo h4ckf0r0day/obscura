@@ -310,6 +310,28 @@ impl OriginStorage {
 
     pub fn is_dirty(&self) -> bool { !self.lock().changed.is_empty() }
 
+    /// An independent copy of every origin, with nothing marked changed. Each
+    /// CDP connection works on one of these so a client never sees another
+    /// live client's storage.
+    pub fn deep_copy(&self) -> OriginStorage {
+        let copy = OriginStorage::default();
+        for (origin, items) in self.entries() {
+            copy.load(&origin, items);
+        }
+        copy
+    }
+
+    /// Write the origins this store changed into `target` and mark them changed
+    /// there, so the target's next flush persists them. Origins this store did
+    /// not touch keep the target's value.
+    pub fn merge_changed_into(&self, target: &OriginStorage) {
+        for origin in self.changed_origins() {
+            if target.load(&origin, self.snapshot(&origin)) {
+                target.lock().changed.insert(origin);
+            }
+        }
+    }
+
     pub fn clear(&self, origin: &str) {
         let mut inner = self.lock();
         if let Some(entries) = inner.origins.remove(origin) {
