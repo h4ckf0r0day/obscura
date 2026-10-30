@@ -115,7 +115,7 @@ OBSCURA_TIMEZONE=America/New_York obscura serve
 
 ### `OBSCURA_GEOLOCATION`
 
-Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`. Without it the shim reports a fixed default. Keep it consistent with `OBSCURA_TIMEZONE` and the proxy region.
+Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`. Setting it also grants the geolocation permission, so `getCurrentPosition` resolves and `navigator.permissions.query({name: 'geolocation'})` reports `granted`. Without it the permission stays `prompt` and `getCurrentPosition` fails with `PERMISSION_DENIED`. Keep it consistent with `OBSCURA_TIMEZONE` and the proxy region.
 
 ```bash
 OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
