@@ -15720,6 +15720,12 @@ function _frameWindowFor(frameId) {
     get(target, prop) {
       if (prop === 'postMessage') return post;
       if (prop === '__obscura_wrapsRealm') return true;
+      // The frame realm only holds stand-ins for the windows above it, and a
+      // stand-in is its own parent. Seen from here, the frame's parent is this
+      // window, so `contentWindow.parent === window` holds and a walk up the
+      // parent chain ends.
+      if (prop === 'parent') return globalThis;
+      if (prop === 'top') return globalThis.top;
       // Not `receiver`: an accessor on a real global must run with the global
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
