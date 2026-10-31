@@ -2720,6 +2720,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
         }
+        "svg_total_length" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            crate::svg_geometry::total_length(dom, nid)
+                .map(|length| length.to_string())
+                .unwrap_or_else(|| "null".into())
+        }
         "parse_html_document" => {
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
             if root == dom.document() || !dom.with_node(root, |node| matches!(node.data, NodeData::Document)).unwrap_or(false)
