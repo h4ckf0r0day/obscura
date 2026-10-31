@@ -36,10 +36,17 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // becoming its own block box (which forces the flex word-promotion
         // fallback and its fragile one-word-per-line wrapping). Author CSS
         // (e.g. `code{display:block}`) still overrides this in the cascade.
+        // `picture` is a transparent wrapper around its `img`, not a box of
+        // its own: the HTML rendering section gives it no `display`, so it
+        // inherits the inline initial value as Chromium and Gecko both do.
+        // Defaulting it to block put a block box inside the inline `<a>` that
+        // usually wraps it, whose width then resolved against the inline and
+        // collapsed to zero -- taking the `img`'s `max-width:100%` with it, so
+        // a loaded image with a correct intrinsic size painted nothing.
         "span" | "a" | "b" | "i" | "strong" | "em" | "font" | "code" | "small" | "sub" | "sup"
         | "mark" | "abbr" | "cite" | "var" | "dfn" | "kbd" | "samp" | "q" | "time" | "s" | "u"
         | "del" | "ins" | "tt" | "big" | "bdi" | "bdo" | "br" | "wbr" | "data" | "output"
-        | "label" | "ruby" | "rt" | "rp" => Display::Inline,
+        | "label" | "ruby" | "rt" | "rp" | "picture" => Display::Inline,
         "tr" => Display::Flex,
         _ => Display::Block,
     };
@@ -8823,6 +8830,39 @@ fn split_ws_paren(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `<picture>` is a transparent wrapper around its `img`, so the UA sheet
+    /// must leave it inline. Defaulting it to block put a block box inside the
+    /// inline `<a>` that commonly wraps it; that block's width resolved
+    /// against the inline and came out zero, so the `img` -- loaded, with a
+    /// correct intrinsic size -- was laid out at 0x0 and painted nothing.
+    /// readymembership.com lost every article thumbnail to this.
+    /// normalize.css ships `a{background-color:transparent}`. A fully
+    /// transparent background paints nothing, so it must not make the anchor
+    /// an unflattenable inline box -- once it is one, it becomes the
+    /// percentage basis for its own children and a `width:100%` replaced
+    /// child collapses instead of filling the real containing block.
+    #[test]
+    fn a_transparent_background_is_not_an_inline_decoration() {
+        let transparent = compute_style("a", Some("background-color:transparent"));
+        assert_eq!(transparent.background_color, Some([0, 0, 0, 0]));
+        // An opaque one still is a decoration, and keeps its box.
+        let opaque = compute_style("a", Some("background-color:red"));
+        assert_eq!(opaque.background_color.map(|c| c[3]), Some(255));
+    }
+
+    #[test]
+    fn picture_is_an_inline_wrapper_not_a_block_box() {
+        assert_eq!(ua_style("picture").display, Display::Inline);
+        // The elements it sits among stay as they were.
+        assert_eq!(ua_style("a").display, Display::Inline);
+        assert_eq!(ua_style("div").display, Display::Block);
+        // Author CSS still wins over the UA default.
+        assert_eq!(
+            compute_style("picture", Some("display:block")).display,
+            Display::Block
+        );
+    }
 
     #[test]
     fn direction_parses_inherited_state_and_supports_only_real_values() {
