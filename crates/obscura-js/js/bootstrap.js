@@ -8707,7 +8707,9 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   let raw;
   try {
     raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
-      signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType);
+      signal || initBody != null
+        ? { cancel_rid: cancelRid, destination: resourceType, has_body: initBody != null }
+        : resourceType);
   } catch (error) {
     cleanup();
     throw signalState && signalState.aborted ? signalState.reason : error;
@@ -8892,7 +8894,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     _fetch(url, {
       method: this._method,
       headers: this._headers,
-      body: body || undefined,
+      body: body ?? undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
     }, 'XHR').then(async (resp) => {
