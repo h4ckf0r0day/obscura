@@ -96,9 +96,14 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+mod print;
+#[cfg(feature = "paint")]
+pub use print::{PrintFont, PrintGlyph, PrintCluster, PrintOp, PrintPage};
+#[cfg(feature = "paint")]
 pub use tiny_skia::Pixmap;
 #[cfg(feature = "paint")]
 pub use paint::{
+    print_prepared_region_with_scroll,
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,

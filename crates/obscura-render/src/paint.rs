@@ -3352,6 +3352,7 @@ fn paint_prepared_with_surface_color(
         1.0,
         false,
         canvas_background,
+        None,
     )
 }
 
@@ -3441,6 +3442,7 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         1.0,
         false,
         canvas_background,
+        None,
     )
 }
 
@@ -3502,6 +3504,7 @@ pub fn paint_prepared_region_with_scroll_and_surface_color_and_canvas_surfaces(
         false,
         surface_color,
         canvas_surfaces,
+        None,
     )
 }
 
@@ -3522,6 +3525,7 @@ fn paint_prepared_region_with_scroll_with_print_economy(
         true,
         [255, 255, 255, 255],
         canvas_surfaces,
+        None,
     )
 }
 
@@ -3534,6 +3538,7 @@ fn paint_prepared_region_with_scroll_policy(
     print_economy: bool,
     surface_color: [u8; 4],
     canvas_surfaces: &dyn CanvasSurfaceSource,
+    print_capture: Option<&mut crate::print::PrintCapture>,
 ) -> Result<Pixmap, CaptureError> {
     let (native_width, native_height, output_width, output_height) =
         checked_capture_dimensions(region, false)?;
@@ -3596,6 +3601,7 @@ fn paint_prepared_region_with_scroll_policy(
         raster_scale,
         print_economy,
         canvas_background,
+        print_capture,
     )
     .ok_or(CaptureError::PaintFailed)?;
 
@@ -4015,6 +4021,7 @@ fn paint_laid_dom_scrolled(
     raster_scale: f32,
     print_economy: bool,
     canvas_background: Option<CanvasBackground>,
+    mut print_capture: Option<&mut crate::print::PrintCapture>,
 ) -> Option<Pixmap> {
     let scroll_state = match resolved_scroll {
         Some(resolved) => ScrollPaintState::from_resolved(
@@ -4286,6 +4293,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                None,
             )?;
             continue;
         }
@@ -4323,6 +4331,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                None,
             )?;
             continue;
         }
@@ -4427,6 +4436,7 @@ fn paint_laid_dom_scrolled(
                     raster_scale,
                     print_economy,
                     canvas_background,
+                    None,
                 )?;
                 continue;
             }
@@ -4520,6 +4530,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                None,
             )?;
             let transform =
                 display_transform.then(crate::Affine2::translate(-layer_delta.0, -layer_delta.1));
@@ -4594,6 +4605,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                None,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -5528,16 +5540,24 @@ fn paint_laid_dom_scrolled(
         let clip = overflow_clip
             .as_ref()
             .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
-        let clip_mask = overflow_clip.as_ref().and_then(|clip| {
-            cached_overflow_clip_mask(
-                &mut overflow_mask_cache,
-                pixmap.width(),
-                pixmap.height(),
-                clip,
-                scroll_state.surface_extent.unwrap_or(viewport),
-            )
-        });
-        if let Some(idx) = whole {
+        let rectangular = overflow_clip.as_ref().is_none_or(|clip| clip.rounded_chain().is_none());
+        for idx in whole.into_iter().chain(run_items.into_iter().flatten()) {
+            if rectangular && raster_scale == 1.0 {
+                if let Some(capture) = print_capture.as_deref_mut() {
+                    if let Some((clusters, clip)) = laid.text_engine.print_item(
+                        idx, off, clip, pixmap.width(), pixmap.height(), print_economy,
+                    ) {
+                        capture.text(&mut pixmap, clusters, clip);
+                        continue;
+                    }
+                }
+            }
+            let clip_mask = overflow_clip.as_ref().and_then(|clip| {
+                cached_overflow_clip_mask(
+                    &mut overflow_mask_cache, pixmap.width(), pixmap.height(), clip,
+                    scroll_state.surface_extent.unwrap_or(viewport),
+                )
+            });
             laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
                 idx,
                 &mut pixmap,
@@ -5547,20 +5567,8 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
             );
-        }
-        // Anonymous inline-run leaves of a mixed block (see
-        // `build_mixed_block`), pinned to their own boxes at finalize.
-        if let Some(items) = run_items {
-            for idx in items {
-                laid.text_engine.paint_item_with_clip_mask_scaled_for_print(
-                    idx,
-                    &mut pixmap,
-                    off,
-                    clip,
-                    clip_mask.as_deref(),
-                    raster_scale,
-                    print_economy,
-                );
+            if let Some(capture) = print_capture.as_deref_mut() {
+                capture.raster_painted();
             }
         }
     }
@@ -7242,6 +7250,52 @@ pub fn screenshot_prepared_region_with_scroll_and_backgrounds_and_canvas_surface
         if let Some(style) = prepared.layout.styles.get_mut(&node) {
             snapshot.restore(style);
         }
+    }
+    result
+}
+
+/// Capture PDF paint in source-over order. Atomic compositing layers and
+/// unsupported text effects retain their established raster implementation.
+pub fn print_prepared_region_with_scroll(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    paint_backgrounds: bool,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Result<crate::PrintPage, CaptureError> {
+    if region.scale != 1.0 || region.output_size.is_some() {
+        return Err(CaptureError::InvalidRegion);
+    }
+    let snapshots = if paint_backgrounds { Vec::new() } else {
+        prepared.layout.styles.iter_mut()
+            .map(|(&node, style)| (node, PrintEconomyStyleSnapshot::apply(style)))
+            .collect::<Vec<_>>()
+    };
+    let mut capture = crate::print::PrintCapture::new();
+    let result = paint_prepared_region_with_scroll_policy(
+        tree, prepared, resources, scroll, region, !paint_backgrounds,
+        [255, 255, 255, 255], canvas_surfaces, Some(&mut capture),
+    ).and_then(|mut pixmap| {
+        capture.flush(&mut pixmap);
+        if capture.failed {
+            // An effect-heavy page may alternate many raster/vector segments.
+            // Keep the previous output behavior when capture would exceed its
+            // additional work/memory budget, rather than rejecting the page.
+            drop(pixmap);
+            capture.page.ops.clear();
+            let pixels = paint_prepared_region_with_scroll_policy(
+                tree, prepared, resources, scroll, region, !paint_backgrounds,
+                [255, 255, 255, 255], canvas_surfaces, None,
+            )?;
+            Ok(crate::PrintPage { ops: vec![crate::PrintOp::Raster { pixels, x: 0, y: 0 }] })
+        } else {
+            Ok(capture.page)
+        }
+    });
+    for (node, snapshot) in snapshots {
+        if let Some(style) = prepared.layout.styles.get_mut(&node) { snapshot.restore(style); }
     }
     result
 }

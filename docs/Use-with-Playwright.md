@@ -161,7 +161,9 @@ await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
 A normal screenshot captures the live viewport and scroll position;
-`fullPage: true` captures document space. PDF output is raster-backed.
+`fullPage: true` captures document space. PDF output includes selectable text
+with embedded fonts for supported text. See [PDF output](PDF-output.md) for
+raster fallbacks and current limits.
 
 ## Screencasting
 
@@ -239,4 +241,4 @@ early parent abort listener, before dependent abort steps run.
   [Persist cookies and storage](Persist-cookies-and-storage.md).
 - Service workers, native media, some Web APIs, long-tail CSS, and compositor
   behavior remain incomplete relative to Chromium.
-- PDF text is not selectable/searchable and tagged PDF is not yet available.
+- Some PDF text effects retain raster output. Tagged PDF is not yet available.

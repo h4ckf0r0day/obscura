@@ -28,4 +28,5 @@ pub use obscura_render::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
     CaptureError, CaptureRegion, CssMediaType, ImageRequestProfile, RenderResourceCache,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
+    PrintFont, PrintGlyph, PrintCluster, PrintOp, PrintPage,
 };

@@ -49,7 +49,7 @@ provides the flex/grid foundation; Obscura adds browser formatting behavior,
 text shaping, intrinsic replaced-element sizing, retained geometry, scrolling,
 and CPU-backed paint. `obscura-js` exposes renderer-owned geometry to DOM APIs,
 `obscura-browser` prepares resources and owns capture, and `obscura-cdp` maps
-screenshots, screencast frames, and raster PDF output onto CDP.
+screenshots, screencast frames, and hybrid text/raster PDF output onto CDP.
 
 Layout is retained between captures and invalidated by relevant DOM, style,
 viewport, scroll, animation, font, and resource changes. The same geometry
