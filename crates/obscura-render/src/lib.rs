@@ -272,6 +272,15 @@ pub mod inline {
             None
         }
 
+        pub(crate) fn push_generated_text_with_white_space(
+            &mut self,
+            _text: &str,
+            _style: &crate::LayoutStyle,
+            _white_space: Option<crate::WhiteSpace>,
+        ) -> Option<usize> {
+            None
+        }
+
         pub(crate) fn measure_word(&mut self, _idx: usize) -> (f32, f32) {
             (0.0, 0.0)
         }
