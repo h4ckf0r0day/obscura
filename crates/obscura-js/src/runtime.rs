@@ -21884,6 +21884,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fetch_and_xhr_send_sec_fetch_metadata_headers() {
+        // A std::thread blocking listener (the pattern the image-lifecycle tests
+        // use) records the Sec-Fetch headers of every request it receives. A
+        // no-cors response is opaque, so its headers cannot be read from JS; the
+        // server side is the only place all three requests can be inspected
+        // uniformly.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_captured = captured.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+                let hdr = |name: &str| {
+                    request
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                server_captured.lock().unwrap().push((
+                    hdr("sec-fetch-site: "),
+                    hdr("sec-fetch-mode: "),
+                    hdr("sec-fetch-dest: "),
+                ));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        // The document shares the listener origin, so every request is
+        // same-origin; a no-cors fetch() must still report its mode.
+        rt.set_url(&format!("http://{addr}/page"));
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
+        rt.call_function_on_for_cdp(
+            &format!(
+                r#"async () => {{
+                    await fetch("http://{addr}/get");
+                    await fetch("http://{addr}/nocors", {{ mode: "no-cors" }});
+                    await new Promise((resolve, reject) => {{
+                        const x = new XMLHttpRequest();
+                        x.open("GET", "http://{addr}/xhr");
+                        x.onload = resolve;
+                        x.onerror = reject;
+                        x.send();
+                    }});
+                    return true;
+                }}"#
+            ),
+            None,
+            &[],
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Let the server thread finish recording the last request before reading.
+        let mut observed = Vec::new();
+        for _ in 0..200 {
+            observed = captured.lock().unwrap().clone();
+            if observed.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(observed.len(), 3, "expected three script requests: {observed:?}");
+        // Same-origin fetch() and XHR: site same-origin, mode cors, dest empty.
+        let cors = ("same-origin".into(), "cors".into(), "empty".into());
+        let cors_count = observed.iter().filter(|entry| **entry == cors).count();
+        assert_eq!(cors_count, 2, "fetch() and XHR must both send cors metadata: {observed:?}");
+        // The explicit no-cors fetch() reports its mode while staying same-origin.
+        assert!(
+            observed.contains(&("same-origin".into(), "no-cors".into(), "empty".into())),
+            "an explicit no-cors fetch() must report mode no-cors: {observed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fetch_abort_prevents_pre_aborted_requests_from_reaching_transport() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

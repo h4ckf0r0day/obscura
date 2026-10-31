@@ -4367,6 +4367,17 @@ async fn fetch_url_inner(
         if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
             req = req.header("Origin", &page_origin);
         }
+        if current_url.starts_with("http://") || current_url.starts_with("https://") {
+            req = req.header(
+                "Sec-Fetch-Site",
+                obscura_net::script_fetch_site(&page_origin, &current_url),
+            );
+            req = req.header("Sec-Fetch-Mode", obscura_net::script_fetch_mode(&mode));
+            req = req.header(
+                "Sec-Fetch-Dest",
+                obscura_net::script_fetch_dest(resource_type),
+            );
+        }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         if credentials_allowed {
@@ -4689,6 +4700,20 @@ async fn stealth_fetch_all(
         crossed_origin |= current_is_cross_origin;
         if sends_origin_header(&current_method, current_is_cross_origin) {
             req_headers.insert("origin".to_string(), page_origin.clone());
+        }
+        if matches!(parsed_current.scheme(), "http" | "https") {
+            req_headers.insert(
+                "sec-fetch-site".to_string(),
+                obscura_net::script_fetch_site(&page_origin, &current_url).to_string(),
+            );
+            req_headers.insert(
+                "sec-fetch-mode".to_string(),
+                obscura_net::script_fetch_mode(&mode).to_string(),
+            );
+            req_headers.insert(
+                "sec-fetch-dest".to_string(),
+                obscura_net::script_fetch_dest(resource_type).to_string(),
+            );
         }
         for (k, v) in &current_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
