@@ -270,6 +270,33 @@ pub struct FormControlState {
     pub indeterminate: bool,
 }
 
+/// Percent-decode a URL fragment for `:target` id matching (the fragment is
+/// UTF-8 percent-encoded; malformed escapes pass through byte-wise as `%XX`).
+fn decode_fragment(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap();
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap();
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // A broken escape sequence (e.g. `%E0%A4%`) decodes through
+    // from_utf8_lossy to U+FFFD, which cannot name a real element id, so the
+    // fragment simply matches nothing instead of erroring.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
@@ -279,6 +306,16 @@ pub(crate) struct DomTreeInner {
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
     hovered: Option<NodeId>,
+    /// The element whose `:focus` applies (the focused area per the HTML spec).
+    /// Mirrors `hovered`: JS `.focus()`/`.blur()` push it here so the selector
+    /// engine, which reads only tree state, can resolve `:focus` and
+    /// `:focus-within`. Shadow hosts count via the flat-tree parent chain in
+    /// `is_focused_within`, same as hover's ancestor walk in `is_hovered`.
+    focused: Option<NodeId>,
+    /// The fragment identifier of the document URL (without `#`), kept here so
+    /// `:target` matching resolves against the DOM tree the same way `:focus`
+    /// does. Updated on navigation and on same-document fragment changes.
+    target_fragment: Option<String>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -314,6 +351,8 @@ impl DomTree {
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
                 hovered: None,
+                focused: None,
+                target_fragment: None,
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -511,6 +550,66 @@ impl DomTree {
                 .and_then(|entry| entry.parent);
         }
         false
+    }
+
+    /// Record the focused area so `:focus`/`:focus-within` can resolve. Returns
+    /// whether the state actually changed.
+    pub fn set_focused(&self, node: Option<NodeId>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.focused == node {
+            return false;
+        }
+        inner.focused = node;
+        true
+    }
+
+    pub fn is_focused(&self, node: NodeId) -> bool {
+        self.inner.borrow().focused == Some(node)
+    }
+
+    /// Whether the focused area is `node` or a flat-tree descendant of it. The
+    /// walk crosses a shadow boundary up (from a shadow root to its host) so a
+    /// host matches when focus is inside its shadow tree, per Selectors-4
+    /// `:focus-within`.
+    pub fn is_focused_within(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = inner.focused;
+        while let Some(id) = current {
+            if id == node {
+                return true;
+            }
+            let entry = inner.nodes.get(id.index()).and_then(|entry| entry.as_ref());
+            current = match entry.and_then(|entry| entry.parent) {
+                Some(parent) => Some(parent),
+                // A top-level shadow-tree node's parent is the shadow root,
+                // which lives outside the ordinary parent links; hop to its
+                // host and continue in the light tree.
+                None => inner.shadow_roots.get(&id).map(|root| root.host),
+            };
+        }
+        false
+    }
+
+    /// Set the document's target fragment (the URL fragment, `#` optional,
+    /// percent-decoded on entry). Returns whether the state changed.
+    pub fn set_target_fragment(&self, fragment: Option<&str>) -> bool {
+        let decoded = fragment.map(decode_fragment);
+        let decoded = decoded.filter(|f| !f.is_empty());
+        let mut inner = self.inner.borrow_mut();
+        if inner.target_fragment == decoded {
+            return false;
+        }
+        inner.target_fragment = decoded;
+        true
+    }
+
+    /// Whether `node` is the element `:target` applies to: the light-tree
+    /// element whose id is the document URL's decoded fragment (the same
+    /// element `getElementById` resolves, including its skip-shadow rule).
+    pub fn is_target(&self, node: NodeId) -> bool {
+        let fragment = self.inner.borrow().target_fragment.clone();
+        let Some(fragment) = fragment else { return false };
+        self.get_element_by_id(&fragment) == Some(node)
     }
 
     pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
