@@ -11,6 +11,8 @@ use obscura_js::CaptureRegion;
 
 use crate::Page;
 
+mod text;
+
 const POINTS_PER_INCH: f32 = 72.0;
 const MAX_PAPER_INCHES: f32 = 200.0;
 const MAX_PDF_PAGES: usize = 250;
@@ -86,6 +88,8 @@ pub enum RasterPdfError {
     ImageEncode(String),
     #[error("encoded PDF would exceed the 64 MiB safety limit")]
     OutputLimitExceeded,
+    #[error("PDF font work would exceed the bounded font or glyph budget")]
+    FontWorkLimitExceeded,
 }
 
 #[derive(Debug)]
@@ -301,6 +305,25 @@ impl Page {
         options: RasterPdfOptions,
         animation_sample: obscura_js::AnimationSample,
     ) -> Result<Vec<u8>, RasterPdfError> {
+        self.export_pdf_with_animation_sample(options, animation_sample, false)
+    }
+
+    /// Export supported shaped text as embedded-font PDF text. Unsupported
+    /// fonts and compositing effects retain their existing raster painting.
+    pub fn print_pdf_with_animation_sample(
+        &self,
+        options: RasterPdfOptions,
+        animation_sample: obscura_js::AnimationSample,
+    ) -> Result<Vec<u8>, RasterPdfError> {
+        self.export_pdf_with_animation_sample(options, animation_sample, true)
+    }
+
+    fn export_pdf_with_animation_sample(
+        &self,
+        options: RasterPdfOptions,
+        animation_sample: obscura_js::AnimationSample,
+        vector_text: bool,
+    ) -> Result<Vec<u8>, RasterPdfError> {
         let (page_width, page_height, printable_width, printable_height, left, bottom) =
             options.page_geometry()?;
         let js = self
@@ -335,6 +358,22 @@ impl Page {
             )?;
             let selected_pages = selected_page_indices(plan.page_count, &options.page_ranges)?;
             validate_selected_raster_work(content_width, content_height, plan, &selected_pages)?;
+
+            if vector_text {
+                return text::encode_pages(
+                    selected_pages.len(), (page_width, page_height),
+                    (left, bottom + printable_height), plan.points_per_css_pixel,
+                    |output_page_index| {
+                        let y = selected_pages[output_page_index] as f32 * plan.css_page_height;
+                        let height = (content_height - y).min(plan.css_page_height);
+                        let paint = js.print_prepared_region_at_scroll(
+                            CaptureRegion::new(0.0, y, content_width, height, 1.0),
+                            (0.0, y), options.print_background,
+                        ).map_err(|error| RasterPdfError::CaptureFailed(format!("{error:?}")))?;
+                        Ok((paint, content_width, height))
+                    },
+                );
+            }
 
             encode_pdf_pages(
                 selected_pages.len(),
@@ -441,6 +480,43 @@ struct PdfWriter {
 }
 
 impl PdfWriter {
+    fn allocate_object(&mut self) -> Result<usize, RasterPdfError> {
+        if self.offsets.len() >= 100_000 { return Err(RasterPdfError::OutputLimitExceeded); }
+        let id = self.offsets.len();
+        self.offsets.push(0);
+        Ok(id)
+    }
+
+    fn begin_stream(&mut self, id: usize, dictionary: &str) -> Result<(usize, usize), RasterPdfError> {
+        self.offsets[id] = self.output.len();
+        self.append(format!("{id} 0 obj\n<< {dictionary} /Length ").as_bytes())?;
+        let length_offset = self.output.len();
+        self.append(b"00000000000000000000 >>\nstream\n")?;
+        Ok((length_offset, self.output.len()))
+    }
+
+    fn end_stream(&mut self, offsets: (usize, usize)) -> Result<(), RasterPdfError> {
+        let length = format!("{:020}", self.output.len() - offsets.1);
+        self.output[offsets.0..offsets.0 + 20].copy_from_slice(length.as_bytes());
+        self.append(b"\nendstream\nendobj\n")
+    }
+
+    fn deflated_stream(
+        &mut self,
+        id: usize,
+        dictionary: &str,
+        source: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+    ) -> Result<(), RasterPdfError> {
+        let offsets = self.begin_stream(id, &format!("{dictionary} /Filter /FlateDecode"))?;
+        let mut encoder = flate2::write::ZlibEncoder::new(&mut *self, flate2::Compression::fast());
+        let result = source(&mut encoder).and_then(|()| encoder.finish().map(|_| ()));
+        if let Err(error) = result {
+            return Err(if self.limit_exceeded { RasterPdfError::OutputLimitExceeded }
+                else { RasterPdfError::ImageEncode(error.to_string()) });
+        }
+        self.end_stream(offsets)
+    }
+
     fn new(object_count: usize, limit: usize) -> Result<Self, RasterPdfError> {
         let mut writer = Self {
             output: Vec::new(),
@@ -548,6 +624,28 @@ mod tests {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    fn pdf_page_commands(pdf: &[u8]) -> String {
+        use std::io::Read as _;
+        let mut commands = String::new();
+        let mut cursor = 0;
+        while let Some(relative) = find_bytes(&pdf[cursor..], b"stream\n") {
+            let start = cursor + relative + b"stream\n".len();
+            let dictionary = String::from_utf8_lossy(&pdf[cursor..start]);
+            let length = dictionary.rsplit("/Length ").next().unwrap()
+                .split_whitespace().next().unwrap().parse::<usize>().unwrap();
+            let end = start + length;
+            if dictionary.contains("/Filter /FlateDecode") && !dictionary.contains("/Subtype /Image") {
+                let mut decoded = Vec::new();
+                flate2::read::ZlibDecoder::new(&pdf[start..end]).read_to_end(&mut decoded).unwrap();
+                if decoded.starts_with(b"q\n") {
+                    commands.push_str(std::str::from_utf8(&decoded).unwrap());
+                }
+            }
+            cursor = end + b"\nendstream\n".len();
+        }
+        commands
     }
 
     /// Decode the actual JPEG XObjects emitted into the PDF, rather than
@@ -771,6 +869,58 @@ mod tests {
             ),
             Err(RasterPdfError::EmptyPageRange)
         );
+    }
+
+    #[test]
+    fn print_pdf_preserves_pagination_ranges_scale_and_shared_fonts() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("pdf-text".into()));
+        let mut page = crate::Page::new("pdf-text-page".into(), context);
+        page.set_viewport((200.0, 80.0));
+        let dom = obscura_dom::parse_html(
+            "<html style='margin:0'><body style='margin:0;width:200px;height:280px;font:16px Arial'>\
+            <div style='height:100px'>FIRST RM 10.00</div>\
+            <div style='height:100px'>SECOND RM 20.00</div>\
+            <div style='height:80px'>THIRD RM 30.00</div></body></html>",
+        );
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(dom);
+        runtime.set_url("https://example.test/pdf-text");
+        runtime.set_viewport(200.0, 80.0);
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        let options = RasterPdfOptions {
+            paper_width_in: 200.0 / POINTS_PER_INCH,
+            paper_height_in: 100.0 / POINTS_PER_INCH,
+            margin_top_in: 0.0, margin_bottom_in: 0.0,
+            margin_left_in: 0.0, margin_right_in: 0.0,
+            ..RasterPdfOptions::default()
+        };
+        let extract = |bytes: &[u8]| {
+            pdf_page_commands(bytes).split("/ActualText <FEFF").skip(1)
+                .map(|tail| {
+                    let hex = tail.split('>').next().unwrap();
+                    let units = hex.as_bytes().chunks_exact(4).map(|chunk|
+                        u16::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap()
+                    ).collect::<Vec<_>>();
+                    String::from_utf16(&units).unwrap()
+                }).collect::<String>()
+        };
+        let export = |options| page.print_pdf_with_animation_sample(options, page.live_animation_sample()).unwrap();
+        let pdf = export(options.clone());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Count 3"));
+        assert!(source.contains("/MediaBox [0 0 200.000 100.000]"));
+        assert_eq!(source.matches("/FontFile2 ").count(), 1, "fonts are shared across pages");
+        let compact = |s: String| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert_eq!(compact(extract(&pdf)), "FIRSTRM10.00SECONDRM20.00THIRDRM30.00");
+        let mut selected = options.clone();
+        selected.page_ranges = vec![RasterPdfPageRange { start: Some(2), end: Some(2) }];
+        assert_eq!(compact(extract(&export(selected))), "SECONDRM20.00");
+        let mut scaled = options;
+        scaled.scale = 2.0;
+        let scaled = export(scaled);
+        assert!(String::from_utf8_lossy(&scaled).contains("/Count 6"));
+        assert_eq!(compact(extract(&scaled)), compact(extract(&pdf)));
     }
 
     #[test]

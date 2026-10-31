@@ -251,7 +251,9 @@ full allow/deny rules (DNS-resolution-time checks included).
 Official release archives and the Docker image include the rendering engine.
 It provides CSS layout and paint, viewport and full-page screenshots,
 scroll-aware fixed and sticky geometry, activity-driven CDP screencasting, and
-raster PDF export without starting Chromium.
+PDF export without starting Chromium. CDP PDF output includes selectable text
+with embedded fonts for supported text, with [raster fallbacks](docs/PDF-output.md)
+for unsupported effects.
 
 ```javascript
 await page.setViewport({ width: 1440, height: 1000 });

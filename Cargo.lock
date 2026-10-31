@@ -1996,6 +1996,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "flate2",
  "futures",
  "image",
  "obscura-dom",
@@ -2003,6 +2004,7 @@ dependencies = [
  "obscura-net",
  "serde",
  "serde_json",
+ "subsetter",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3249,6 +3251,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "subsetter"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38803281d1c23166c5ebcb455439a5d2afe711cc909cf88af72448c297756ad6"
+dependencies = [
+ "rustc-hash 2.1.2",
 ]
 
 [[package]]

@@ -2042,6 +2042,32 @@ impl ObscuraJsRuntime {
         })
     }
 
+    /// Capture ordered PDF paint using the same page-local scroll geometry as
+    /// raster PDF capture, without changing the live page's scroll position.
+    #[cfg(feature = "render")]
+    pub fn print_prepared_region_at_scroll(
+        &self,
+        region: obscura_render::CaptureRegion,
+        root_scroll: (f32, f32),
+        paint_backgrounds: bool,
+    ) -> Result<obscura_render::PrintPage, obscura_render::CaptureError> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let ObscuraState { dom, prepared_render, render_resources,
+                element_scroll_offsets, canvas_surfaces, .. } = state;
+            let dom = dom.as_ref().ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let prepared = prepared_render.as_mut().ok_or(obscura_render::CaptureError::PaintFailed)?;
+            let scroll = prepared.resolve_scroll_state_for_viewport(
+                dom, root_scroll, element_scroll_offsets, (region.width, region.height),
+            );
+            obscura_render::print_prepared_region_with_scroll(
+                dom, prepared, render_resources, &scroll, region, paint_backgrounds,
+                &RuntimeCanvasSurfaceSource(canvas_surfaces),
+            )
+        })
+    }
+
     /// Return the retained layout's scrollable document size without changing
     /// the live viewport or scroll position. PDF/full-document consumers use
     /// this to paginate document-space captures from the same geometry.

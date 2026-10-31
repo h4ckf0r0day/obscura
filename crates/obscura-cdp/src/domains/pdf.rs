@@ -228,10 +228,10 @@ pub async fn print_to_pdf(
         crate::domains::page::prepare_capture_resources_if_requested(page).await;
         let animation_sample = page.live_animation_sample();
         let pdf = page
-            .raster_pdf_with_animation_sample(options.raster, animation_sample)
+            .print_pdf_with_animation_sample(options.raster, animation_sample)
             .map_err(|error| error.to_string())?;
         let mut response = json!({
-            "obscuraPrintMode": "print-media-raster",
+            "obscuraPrintMode": "print-media-hybrid",
             "obscuraPrintBackground": options.requested_print_background,
             "obscuraRequestedPrintBackground": options.requested_print_background,
             "obscuraTaggedPDF": false,
@@ -244,6 +244,8 @@ pub async fn print_to_pdf(
                 "pageRanges": true,
                 "printColorAdjustExact": false,
                 "taggedPdf": false,
+                "vectorText": true,
+                "rasterTextFallback": true,
             },
         });
         let mut ignored_options = Vec::new();
@@ -394,6 +396,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn print_to_pdf_embeds_fonts_and_text_for_the_heading_and_currency_repro() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id);
+        page::handle("navigate", &json!({
+            "url": "data:text/html,<html><body style='font-family:Arial'><h1>Hello</h1><p>RM 6,000.00</p></body></html>",
+            "waitUntil": "load",
+        }), &mut ctx, &session).await.unwrap();
+        let response = print_to_pdf(&json!({"printBackground": true}), &mut ctx, &session).await.unwrap();
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(response["data"].as_str().unwrap()).unwrap();
+        let pdf = String::from_utf8_lossy(&bytes);
+        assert_eq!(pdf.matches("/FontFile2 ").count(), 2);
+        assert_eq!(pdf.matches("/ToUnicode ").count(), 2);
+        assert!(!pdf.contains("/Subtype /Image"));
+        assert_eq!(response["obscuraCapabilities"]["vectorText"], true);
+        assert_eq!(response["obscuraTaggedPDF"], false);
+    }
+
+    #[tokio::test]
     async fn print_to_pdf_returns_paginated_pdf_with_requested_media_box() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
@@ -424,7 +449,7 @@ mod tests {
         )
         .await
         .expect("raster PDF");
-        assert_eq!(response["obscuraPrintMode"], "print-media-raster");
+        assert_eq!(response["obscuraPrintMode"], "print-media-hybrid");
         assert_eq!(response["obscuraPrintBackground"], true);
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -530,6 +555,7 @@ mod tests {
             .unwrap();
         let ranged_text = String::from_utf8_lossy(&ranged_bytes);
         assert!(ranged_text.contains("/Count 1"));
-        assert_eq!(ranged_text.matches("/Subtype /Image").count(), 1);
+        assert_eq!(ranged_text.matches("/Subtype /Image").count(), 0,
+            "a white page needs no raster XObject when print backgrounds are disabled");
     }
 }
