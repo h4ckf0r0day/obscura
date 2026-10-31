@@ -154,3 +154,34 @@ fn tls_certificate_codecs_preserve_bytes_and_reject_corrupt_streams() {
         assert_eq!(decode(&decoder, &encoded).unwrap(), expected);
     }
 }
+
+#[cfg(feature = "stealth")]
+#[test]
+fn zstd_certificate_decoder_preserves_framing_and_output_limits() {
+    use std::io::{self, Write};
+    use wreq::tls::compress::{CertificateCompressor, Codec};
+    use wreq_util::emulate::compress::ZstdCompressor;
+    fn decode(input: &[u8], output: &mut dyn Write) -> io::Result<()> {
+        match ZstdCompressor.decompress() {
+            Codec::Pointer(call) => call(input, output),
+            Codec::Dynamic(call) => call(input, output),
+        }
+    }
+    let expected: Vec<u8> = (0..4).flat_map(|_| 0..=255u8).collect();
+    let mut output = Vec::new();
+    assert!(decode(&ZSTD[..ZSTD.len()-1], &mut output).is_err());
+    let mut trailing = ZSTD.to_vec();
+    trailing.extend_from_slice(b"invalid trailing frame");
+    assert!(decode(&trailing, &mut Vec::new()).is_err());
+    let mut frames = ZSTD.to_vec();
+    frames.extend_from_slice(ZSTD);
+    let mut output = Vec::new();
+    decode(&frames, &mut output).unwrap();
+    assert_eq!(output, expected.repeat(2));
+    // The TLS caller supplies a writer limited to the declared output size.
+    let mut limited = vec![0; expected.len()-1];
+    assert!(decode(ZSTD, &mut limited.as_mut_slice()).is_err());
+    let mut output = Vec::new();
+    decode(ZSTD, &mut output).unwrap();
+    assert_eq!(output, expected);
+}

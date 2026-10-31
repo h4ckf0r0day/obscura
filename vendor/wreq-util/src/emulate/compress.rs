@@ -73,7 +73,7 @@ impl CertificateCompressor for ZstdCompressor {
 
     fn decompress(&self) -> Codec {
         Codec::Pointer(|input, output| {
-            let mut reader = ZstdDecoder::new(input)?;
+            let mut reader = ZstdDecoder::with_buffer(input)?;
             io::copy(&mut reader, output)?;
             Ok(())
         })
