@@ -3652,6 +3652,21 @@ impl Page {
             self.url = Some(response.url.clone());
         }
 
+        // An HTTP error status with no body at all (a bare 429/403/503 from a
+        // rate limiter or WAF) is not a document. Chrome fails that navigation
+        // with net::ERR_HTTP_RESPONSE_CODE_FAILURE and shows its own error
+        // page, so Page.navigate / page.goto reject. Parsing the empty body
+        // instead commits `<html><head></head><body></body></html>` as a
+        // successful load and the block looks like an empty site. An error
+        // status that carries a body (a real 404 page) still renders.
+        if response.status >= 400 && response.body.is_empty() {
+            self.lifecycle = LifecycleState::Failed;
+            return Err(PageError::NetworkError(format!(
+                "net::ERR_HTTP_RESPONSE_CODE_FAILURE: HTTP {} with an empty body for {}",
+                response.status, response.url
+            )));
+        }
+
         // Honor the response charset: HTTP Content-Type → <meta charset> sniff
         // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
         // page (GBK, Big5, Shift-JIS, Windows-125x, EUC-KR, ISO-8859-x)
@@ -6082,6 +6097,55 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+    }
+
+    // A bare HTTP error (rate limiter, WAF) with no body must fail the
+    // navigation like Chrome's net::ERR_HTTP_RESPONSE_CODE_FAILURE instead of
+    // committing an empty document; an error status with a body still renders.
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_body_http_error_fails_navigation_but_error_page_renders() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let response = if request.starts_with("GET /blocked ") {
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = "<html><body><h1>Not here</h1></body></html>";
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "empty-http-error".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("empty-http-error".to_string(), context);
+        let error = page
+            .navigate(&format!("http://{address}/blocked"))
+            .await
+            .expect_err("an empty 429 must not become an empty document");
+        assert!(error.to_string().contains("ERR_HTTP_RESPONSE_CODE_FAILURE"), "{error}");
+        assert!(error.to_string().contains("429"), "{error}");
+        assert_eq!(page.lifecycle, crate::LifecycleState::Failed);
+
+        page.navigate(&format!("http://{address}/missing")).await.unwrap();
+        let heading = page.evaluate("document.querySelector('h1').textContent");
+        assert_eq!(heading.as_str(), Some("Not here"));
     }
 
     // #1231: a text/plain or text/markdown response is a plain-text document.
