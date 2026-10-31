@@ -5994,8 +5994,9 @@ fn layout_dom_once(
                 );
                 style.font_weight = Some(computed_weight.to_string());
                 inh.font_weight = computed_weight;
-                match &style.font_family {
-                    Some(f) => inh.font_family = Some(f.clone()),
+                match style.font_family.as_deref() {
+                    Some("inherit") => style.font_family = inh.font_family.clone(),
+                    Some(family) => inh.font_family = Some(family.to_string()),
                     None => style.font_family = inh.font_family.clone(),
                 }
                 match style.font_optical_sizing {
@@ -21295,6 +21296,34 @@ mod tests {
             assert_eq!(style.margin.bottom, 0.0, "{id} must lose nested UA margins");
             assert_eq!(style.list_style, Some(marker), "{id} marker depth");
         }
+    }
+
+    #[test]
+    fn ua_code_elements_use_monospace_font_family() {
+        let tree = parse_html(
+            r#"<style>body { font-family: serif }</style>
+            <code id="code">code</code><kbd id="kbd">key</kbd>
+            <samp id="samp">output</samp><tt id="tt">type</tt>
+            <pre id="pre">text</pre>
+            <code id="override" style="font-family:serif">override</code>
+            <span style="font-family:serif">
+                <code id="inherit" style="font-family:inherit">inherit</code>
+            </span>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 400.0));
+
+        for id in ["code", "kbd", "samp", "tt", "pre"] {
+            let style = &laid.styles[&tree.get_element_by_id(id).unwrap()];
+            assert_eq!(
+                style.font_family.as_deref(),
+                Some("monospace"),
+                "{id} must use the monospace UA font family"
+            );
+        }
+        let override_style = &laid.styles[&tree.get_element_by_id("override").unwrap()];
+        assert_eq!(override_style.font_family.as_deref(), Some("serif"));
+        let inherited_style = &laid.styles[&tree.get_element_by_id("inherit").unwrap()];
+        assert_eq!(inherited_style.font_family.as_deref(), Some("serif"));
     }
 
     #[test]
