@@ -9,7 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    name: Audit release dependencies
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          arguments: --all-features --config deny.toml
+          command: check advisories bans licenses sources
+
   build:
+    needs: audit
     strategy:
       fail-fast: false
       matrix:
