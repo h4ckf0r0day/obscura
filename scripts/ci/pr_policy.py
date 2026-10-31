@@ -35,7 +35,7 @@ UNTRUSTED_CONTEXT_RE = re.compile(
 BLOCKED_SUFFIXES = {".dll", ".dylib", ".exe", ".o", ".obj", ".pyc", ".so"}
 # Maintainer-reviewed compression backport; other snapshots still require review.
 APPROVED_VENDOR_SNAPSHOTS = {
-    "vendor/wreq-util": "d75ef4ce62e7c324175e27cc668bd5cc393da170",
+    "vendor/wreq-util": "a72b11d7aca7750af2e30f09791e239ca6585536",
 }
 
 
