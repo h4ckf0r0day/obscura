@@ -4183,10 +4183,6 @@ pub(crate) fn can_retain_layout_for_metadata(
         return false;
     }
 
-    let nodes = tree.descendants(tree.document());
-    if nodes.iter().any(|node| tree.shadow_root(*node).is_some()) {
-        return false;
-    }
     let sources = document_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen);
     let (sheet, cache_hit) =
         cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
@@ -4198,6 +4194,31 @@ pub(crate) fn can_retain_layout_for_metadata(
                 has_animation_damage: false,
             } if dirty.is_empty()
         )
+        && shadow_stylesheets_ignore_attributes(
+            tree,
+            viewport,
+            mutations.iter().filter_map(|mutation| match mutation {
+                RetainedStyleMutation::Attribute(attribute) => Some(attribute.name.as_str()),
+                _ => None,
+            }),
+        )
+}
+
+/// Shadow trees compile their own stylesheets, and `:host` or `::slotted`
+/// rules there can match light-DOM nodes. An attribute write is invisible to
+/// every shadow tree only when no shadow sheet depends on that attribute.
+fn shadow_stylesheets_ignore_attributes<'a>(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    names: impl Iterator<Item = &'a str> + Clone,
+) -> bool {
+    collect_shadow_stylesheets(tree, viewport, crate::CssMediaType::Screen)
+        .values()
+        .all(|sheet| {
+            names
+                .clone()
+                .all(|name| sheet.invalidation_map().attribute_dependencies(name).is_empty())
+        })
 }
 
 fn image_source_attribute(name: &str) -> bool {
@@ -4235,14 +4256,14 @@ pub(crate) fn image_source_updates_without_style_damage(
         }
         names.push(name);
     }
-    if images.is_empty()
-        || tree.descendants(tree.document()).iter().any(|node| tree.shadow_root(*node).is_some())
-    {
+    if images.is_empty() {
         return None;
     }
     let sources = document_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen);
     let (sheet, cache_hit) = cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
-    if !cache_hit || names.iter().any(|name| !sheet.invalidation_map().attribute_dependencies(name).is_empty()) {
+    if !cache_hit || names.iter().any(|name| !sheet.invalidation_map().attribute_dependencies(name).is_empty())
+        || !shadow_stylesheets_ignore_attributes(tree, viewport, names.iter().map(String::as_str))
+    {
         return None;
     }
     images.sort_unstable_by_key(|node| node.index());
@@ -18263,6 +18284,32 @@ mod tests {
             let mut resource = changes.to_vec();
             resource.push(RetainedStyleMutation::Resource);
             assert!(image_source_updates_without_style_damage(&tree, viewport, &mut cache, &resource).is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_retain_checks_shadow_stylesheets() {
+        for (css, reusable) in [
+            ("span { width: 80px }", true),
+            (":host([data-state]) { width: 160px }", false),
+            ("::slotted([data-state]) { width: 160px }", false),
+            ("span::before { content: attr(data-state) }", false),
+        ] {
+            let tree = parse_html(&format!(
+                "<x-host><template shadowrootmode=open><style>{css}</style>\
+                 <span>shadow</span><slot></slot></template><p id=target>text</p></x-host>"
+            ));
+            let target = tree.get_element_by_id("target").unwrap();
+            let viewport = (500.0, 300.0);
+            let mut cache = crate::css::StylesheetCache::default();
+            let _ = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree, viewport, &HashMap::new(), &[], &mut cache,
+            );
+            let mutation = RetainedStyleMutation::Attribute(AttributeStyleMutation {
+                node: target, name: "data-state".into(), old_value: None, new_value: Some("1".into()),
+            });
+            assert_eq!(can_retain_layout_for_metadata(&tree, viewport, &mut cache, &[mutation]),
+                reusable, "{css}");
         }
     }
 
