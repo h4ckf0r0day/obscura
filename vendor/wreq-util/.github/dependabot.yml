@@ -1,0 +1,22 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://help.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    # Workflow files stored in the
+    # default location of `.github/workflows`
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # todo: if only this worked, see https://github.com/dependabot/dependabot-core/issues/4009
+    # only tell us if there's a new 'breaking' change we could upgrade to
+    # versioning-strategy: increase-if-necessary
+    # disable regular version updates, security updates are unaffected
+    open-pull-requests-limit: 0
