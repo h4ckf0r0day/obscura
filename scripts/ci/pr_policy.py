@@ -33,6 +33,10 @@ UNTRUSTED_CONTEXT_RE = re.compile(
     r"issue\.(?:title|body)|comment\.body|head_commit\.message)"
 )
 BLOCKED_SUFFIXES = {".dll", ".dylib", ".exe", ".o", ".obj", ".pyc", ".so"}
+# Maintainer-reviewed compression backport; other snapshots still require review.
+APPROVED_VENDOR_SNAPSHOTS = {
+    "vendor/wreq-util": "d75ef4ce62e7c324175e27cc668bd5cc393da170",
+}
 
 
 def git(*args: str, text: bool = False) -> bytes | str:
@@ -81,7 +85,7 @@ def check_control_symlinks(files: list[str], errors: list[str]) -> None:
             return
 
 
-def check_new_vendor(base: str, files: list[str], errors: list[str]) -> None:
+def check_new_vendor(base: str, head: str, files: list[str], errors: list[str]) -> None:
     roots = sorted(
         {"/".join(PurePosixPath(name).parts[:2]) for name in files if name.startswith("vendor/")}
     )
@@ -93,6 +97,9 @@ def check_new_vendor(base: str, files: list[str], errors: list[str]) -> None:
             check=False,
         )
         if exists.returncode != 0:
+            approved = APPROVED_VENDOR_SNAPSHOTS.get(root)
+            if approved and git("rev-parse", f"{head}:{root}", text=True).strip() == approved:
+                continue
             errors.append(f"new vendored dependency requires explicit maintainer handling: {root}")
 
 
@@ -207,7 +214,7 @@ def main() -> None:
     warnings: list[str] = []
     check_artifacts(files, errors, warnings)
     check_control_symlinks(files, errors)
-    check_new_vendor(args.base, files, errors)
+    check_new_vendor(args.base, args.head, files, errors)
     check_workflows(args.base, args.head, files, errors, warnings)
     check_scope(args.base, args.head, files, warnings)
 
