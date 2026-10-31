@@ -5228,12 +5228,17 @@ class Element extends Node {
     const method = submission?.method || 'GET';
     const headers = method === 'POST' ? '{"Content-Type":"application/x-www-form-urlencoded"}' : '{}';
     const body = submission?.body ? new TextEncoder().encode(submission.body) : new Uint8Array(0);
-    __obscuraCore.ops.op_fetch_url(
-      fullUrl, method, headers, body, pageOrigin,
-      'no-cors', submission ? 'include' : 'same-origin', 'Document'
-    ).then(raw => {
+    // A blob: URL lives in this realm's blob store, not on the network, so the
+    // native fetch can't load it and the frame used to stay empty.
+    const blobText = fullUrl.startsWith('blob:') ? globalThis.__blobStore[fullUrl] : undefined;
+    const loaded = blobText !== undefined
+      ? Promise.resolve({ status: 200, body: blobText, url: fullUrl })
+      : __obscuraCore.ops.op_fetch_url(
+          fullUrl, method, headers, body, pageOrigin,
+          'no-cors', submission ? 'include' : 'same-origin', 'Document'
+        ).then(raw => JSON.parse(raw));
+    loaded.then(response => {
       if (el._iframeRequest !== request) return;
-      const response = JSON.parse(raw);
       if (!response.blocked && response.status > 0 && response.status < 400) {
         const html = response.body || '';
         const loadedUrl = response.url || fullUrl;
