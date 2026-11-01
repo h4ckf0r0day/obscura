@@ -19219,32 +19219,51 @@ if (!Element.prototype.setSelectionRange) {
   _markNative(Element.prototype.setSelectionRange);
 }
 
-// Element.prototype.setRangeText - replace selection with text
+// Element.prototype.setRangeText - replace selected text, preserving the
+// selection around edits as HTMLInputElement/HTMLTextAreaElement do.
 if (!Element.prototype.setRangeText) {
   Element.prototype.setRangeText = function setRangeText(replacement, start, end, selectMode) {
-    const val = this.value;
-    if (!val) return;
-    const strVal = String(val);
-    start = start === undefined ? (this.selectionStart ?? 0) : Math.max(0, parseInt(start, 10) || 0);
-    end = end === undefined ? (this.selectionEnd ?? 0) : Math.max(0, parseInt(end, 10) || 0);
-    const newValue = strVal.slice(0, start) + String(replacement) + strVal.slice(end);
-    this.value = newValue;
-    selectMode = selectMode || 'preserve';
-    if (selectMode === 'select') {
-      const replLen = String(replacement).length;
-      _ns_selectionStart.set(this, start);
-      _ns_selectionEnd.set(this, start + replLen);
-      _ns_selectionDir.set(this, 'none');
-    } else if (selectMode === 'start') {
-      _ns_selectionStart.set(this, start);
-      _ns_selectionEnd.set(this, start);
-      _ns_selectionDir.set(this, 'none');
-    } else if (selectMode === 'end') {
-      const replLen = String(replacement).length;
-      _ns_selectionStart.set(this, start + replLen);
-      _ns_selectionEnd.set(this, start + replLen);
-      _ns_selectionDir.set(this, 'none');
+    const tag = this.localName;
+    const inputType = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
+    if (tag !== 'textarea' && !(tag === 'input' &&
+        ['text', 'search', 'tel', 'url', 'password'].includes(inputType))) {
+      throw new DOMException('This input element does not support text selection.', 'InvalidStateError');
     }
+    if (arguments.length < 1 || arguments.length === 2)
+      throw new TypeError("Failed to execute 'setRangeText': invalid number of arguments");
+    const mode = arguments.length >= 4 ? String(selectMode) : 'preserve';
+    if (!['select', 'start', 'end', 'preserve'].includes(mode))
+      throw new TypeError("Failed to execute 'setRangeText': invalid selection mode");
+    const value = String(this.value ?? '');
+    const text = String(replacement);
+    let lo = arguments.length < 3 ? (this.selectionStart ?? 0) : Math.max(0, Math.trunc(Number(start)) || 0);
+    let hi = arguments.length < 3 ? (this.selectionEnd ?? 0) : Math.max(0, Math.trunc(Number(end)) || 0);
+    if (lo > hi) throw new DOMException('Start is greater than end.', 'IndexSizeError');
+    lo = Math.min(lo, value.length);
+    hi = Math.min(hi, value.length);
+    const beforeStart = Math.min(this.selectionStart ?? 0, value.length);
+    const beforeEnd = Math.min(this.selectionEnd ?? 0, value.length);
+    this.value = value.slice(0, lo) + text + value.slice(hi);
+    const afterEnd = lo + text.length;
+    const delta = text.length - (hi - lo);
+    let selectionStart = beforeStart;
+    let selectionEnd = beforeEnd;
+    if (mode === 'select') {
+      selectionStart = lo;
+      selectionEnd = afterEnd;
+    } else if (mode === 'start') {
+      selectionStart = selectionEnd = lo;
+    } else if (mode === 'end') {
+      selectionStart = selectionEnd = afterEnd;
+    } else {
+      // Preserve offsets before the replaced range, shift offsets after it,
+      // and collapse selection endpoints that intersect the replaced text.
+      if (selectionStart > hi) selectionStart += delta;
+      else if (selectionStart > lo) selectionStart = lo;
+      if (selectionEnd > hi) selectionEnd += delta;
+      else if (selectionEnd > lo) selectionEnd = afterEnd;
+    }
+    this.setSelectionRange(selectionStart, selectionEnd, 'forward');
   };
   _markNative(Element.prototype.setRangeText);
 }
