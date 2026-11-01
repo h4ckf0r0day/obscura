@@ -61,19 +61,24 @@ impl RobotsCache {
             None => return true,
         };
 
+        // RFC 9309 2.2.2: the most specific (longest) match wins; Allow only
+        // wins when both rules have the same length.
+        let mut best: Option<(usize, bool)> = None;
         for pattern in &rules.allowed {
-            if path_matches(path, pattern) {
-                return true;
+            if path_matches(path, pattern)
+                && best.is_none_or(|(length, _)| pattern.len() >= length)
+            {
+                best = Some((pattern.len(), true));
             }
         }
-
         for pattern in &rules.disallowed {
-            if path_matches(path, pattern) {
-                return false;
+            if path_matches(path, pattern)
+                && best.is_none_or(|(length, allow)| pattern.len() > length || (pattern.len() == length && !allow))
+            {
+                best = Some((pattern.len(), false));
             }
         }
-
-        true
+        best.is_none_or(|(_, allow)| allow)
     }
 }
 
@@ -98,76 +103,82 @@ fn truncate_body(body: &str) -> &str {
 }
 
 fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
-    // RFC 9309 2.2.1: a group applies when its product token equals one of
-    // ours, case-insensitively. Our identification string is a full
-    // User-Agent, so split it into its product tokens. Substring matching in
-    // either direction let "User-agent: Moz" govern a Mozilla/5.0 UA and
-    // "User-agent: ObscuraBot" govern a UA of "Obscura".
+    // RFC 9309 2.2.1: a group applies when any of its user-agent lines names
+    // us, or when it names "*". Consecutive user-agent lines belong to the
+    // same group; the first rule ends the agent list, and a later user-agent
+    // line starts a new group.
     let our_tokens: Vec<String> = our_agent
         .split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ';' | ','))
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect();
-    let mut disallowed = Vec::new();
-    let mut allowed = Vec::new();
-    let mut in_matching_section = false;
-    let mut found_specific = false;
 
+    struct Group {
+        agents: Vec<String>,
+        disallowed: Vec<String>,
+        allowed: Vec<String>,
+        rules_started: bool,
+    }
+
+    let mut groups: Vec<Group> = Vec::new();
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_lowercase();
-            let value = value.trim();
-
-            match key.as_str() {
-                "user-agent" => {
-                    let agent = value.to_lowercase();
-                    in_matching_section =
-                        agent == "*" || our_tokens.iter().any(|token| *token == agent);
-                    if agent != "*" && in_matching_section {
-                        found_specific = true;
-                    }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        let value = value.trim();
+        match key.as_str() {
+            "user-agent" => {
+                if groups.last().is_none_or(|group| group.rules_started) {
+                    groups.push(Group {
+                        agents: Vec::new(),
+                        disallowed: Vec::new(),
+                        allowed: Vec::new(),
+                        rules_started: false,
+                    });
                 }
-                "disallow" if in_matching_section && !value.is_empty() => {
-                    disallowed.push(value.to_string());
+                if let Some(group) = groups.last_mut() {
+                    group.agents.push(value.to_lowercase());
                 }
-                "allow" if in_matching_section && !value.is_empty() => {
-                    allowed.push(value.to_string());
-                }
-                _ => {}
             }
+            "allow" | "disallow" => {
+                let Some(group) = groups.last_mut() else {
+                    continue;
+                };
+                group.rules_started = true;
+                if value.is_empty() {
+                    continue;
+                }
+                if key == "allow" {
+                    group.allowed.push(value.to_string());
+                } else {
+                    group.disallowed.push(value.to_string());
+                }
+            }
+            _ => {}
         }
     }
 
-    if !found_specific {
-        disallowed.clear();
-        allowed.clear();
-        in_matching_section = false;
-
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            if let Some((key, value)) = line.split_once(':') {
-                let key = key.trim().to_lowercase();
-                let value = value.trim();
-                match key.as_str() {
-                    "user-agent" => {
-                        in_matching_section = value.trim() == "*";
-                    }
-                    "disallow" if in_matching_section && !value.is_empty() => {
-                        disallowed.push(value.to_string());
-                    }
-                    "allow" if in_matching_section && !value.is_empty() => {
-                        allowed.push(value.to_string());
-                    }
-                    _ => {}
-                }
-            }
-        }
+    let matches = |group: &Group| {
+        group
+            .agents
+            .iter()
+            .any(|agent| agent != "*" && our_tokens.iter().any(|token| token == agent))
+    };
+    let specific = groups
+        .iter()
+        .any(&matches);
+    let mut disallowed = Vec::new();
+    let mut allowed = Vec::new();
+    for group in groups.iter().filter(|group| {
+        if specific { matches(group) } else { group.agents.iter().any(|agent| agent == "*") }
+    }) {
+        disallowed.extend(group.disallowed.iter().cloned());
+        allowed.extend(group.allowed.iter().cloned());
     }
 
     RobotsRules { disallowed, allowed }
@@ -214,6 +225,50 @@ mod tests {
         assert!(cache.is_allowed("c.test", "/page"), "our token being a substring of theirs is not a match");
         cache.parse_and_store("d.test", "User-agent: Obscura\nDisallow: /\n", "Obscura/1.0 (+https://example.test)");
         assert!(!cache.is_allowed("d.test", "/page"), "a product token followed by a version matches");
+    }
+
+    #[test]
+    fn consecutive_user_agent_lines_share_one_group() {
+        // RFC 9309 2.1: a group's user-agent lines are consecutive, and the
+        // first rule ends that list. Google's robots.txt relies on this.
+        let body = "User-agent: *\nUser-agent: Yandex\nDisallow: /search\nAllow: /search/about\n";
+        let cache = RobotsCache::new();
+        cache.parse_and_store("google.test", body, "Obscura");
+        assert!(!cache.is_allowed("google.test", "/search?q=test"));
+        assert!(cache.is_allowed("google.test", "/search/about"));
+    }
+
+    #[test]
+    fn longest_matching_rule_wins_and_allow_wins_a_tie() {
+        // RFC 9309 2.2.2: the most specific match decides. Allow only wins
+        // when both patterns are the same length.
+        let body = "User-agent: *\nAllow: /p\nDisallow: /p/private\nDisallow: /tie\nAllow: /tie\n";
+        let cache = RobotsCache::new();
+        cache.parse_and_store("paths.test", body, "Obscura");
+        assert!(cache.is_allowed("paths.test", "/p"));
+        assert!(!cache.is_allowed("paths.test", "/p/private/x"));
+        assert!(cache.is_allowed("paths.test", "/tie"));
+    }
+
+    #[test]
+    fn a_matching_specific_group_overrides_the_star_group() {
+        let body = "User-agent: *\nDisallow: /\n\nUser-agent: Obscura\nDisallow: /only\n";
+        let cache = RobotsCache::new();
+        cache.parse_and_store("specific.test", body, "Obscura");
+        assert!(cache.is_allowed("specific.test", "/elsewhere"));
+        assert!(!cache.is_allowed("specific.test", "/only"));
+    }
+
+    #[test]
+    fn unrelated_agents_in_wildcard_groups_do_not_select_specific_rules() {
+        let cache = RobotsCache::new();
+        let mixed = "User-agent: *\nUser-agent: OtherBot\nDisallow: /mixed\n\n";
+        cache.parse_and_store("wildcard.test", &format!("{mixed}User-agent: *\nDisallow: /fallback\n"), "Obscura");
+        assert!(!cache.is_allowed("wildcard.test", "/mixed"));
+        assert!(!cache.is_allowed("wildcard.test", "/fallback"));
+        cache.parse_and_store("specific.test", &format!("{mixed}User-agent: Obscura\nDisallow: /own\n"), "Obscura");
+        assert!(cache.is_allowed("specific.test", "/mixed"));
+        assert!(!cache.is_allowed("specific.test", "/own"));
     }
 
     #[test]

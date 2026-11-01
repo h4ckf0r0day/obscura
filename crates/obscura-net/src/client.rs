@@ -1399,6 +1399,24 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request_uncached(initial_method, url, initial_body, callbacks, request, None).await
+    }
+
+    /// A navigation continued by an interceptor uses request-local overrides.
+    pub async fn fetch_navigation_request(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
+        self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
+    }
+
+    async fn fetch_request_uncached(
+        &self, initial_method: Method, url: &Url, initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>, request: ResourceRequest,
+        mut request_headers: Option<HashMap<String, String>>,
+    ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
 
@@ -1439,7 +1457,7 @@ impl ObscuraHttpClient {
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: match request_headers.as_ref() { Some(headers) => headers.clone(), None => self.extra_headers.read().await.clone() },
                 resource_type: request.resource_type.clone(),
             };
 
@@ -1563,7 +1581,9 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            let extra_headers = self.extra_headers.read().await;
+            let supplied = request_headers.as_ref();
+            for (k, v) in supplied.unwrap_or(&extra_headers).iter() {
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -1581,11 +1601,13 @@ impl ObscuraHttpClient {
                 headers.remove(reqwest::header::ORIGIN);
             }
 
+            drop(extra_headers);
+            let default_form_type = method == Method::POST && !headers.contains_key(reqwest::header::CONTENT_TYPE);
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
 
             if let Some(ref b) = body {
-                if method == Method::POST {
+                if default_form_type {
                     req_builder = req_builder.header(
                         reqwest::header::CONTENT_TYPE,
                         "application/x-www-form-urlencoded",
@@ -1636,14 +1658,22 @@ impl ObscuraHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    if next_url.origin() != current_url.origin() {
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        }
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
-                    if status == reqwest::StatusCode::MOVED_PERMANENTLY
-                        || status == reqwest::StatusCode::FOUND
-                        || status == reqwest::StatusCode::SEE_OTHER
+                    if ((status == reqwest::StatusCode::MOVED_PERMANENTLY || status == reqwest::StatusCode::FOUND) && method == Method::POST)
+                        || (status == reqwest::StatusCode::SEE_OTHER && method != Method::GET && method != Method::HEAD)
                     {
                         method = Method::GET;
                         body = None;
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
+                                "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                        }
                     }
                     continue;
                 }

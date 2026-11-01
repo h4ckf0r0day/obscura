@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Interleaved latency, peak-RSS, and result-correctness comparison."""
+"""Interleaved latency, CPU, peak-RSS, and result-correctness comparison."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import statistics
@@ -18,7 +19,9 @@ from threading import Thread
 
 ROUNDS = 5
 PROCESS_TIMEOUT_SECONDS = 45
-LATENCY_FAILURE_RATIO = 1.20
+LATENCY_FAILURE_RATIO = 1.10
+CPU_FAILURE_RATIO = 1.10
+CPU_FAILURE_DELTA_SECONDS = 0.02
 LATENCY_FAILURE_DELTA_MS = 10.0
 RSS_FAILURE_RATIO = 1.15
 RSS_FAILURE_DELTA_KIB = 8 * 1024
@@ -33,8 +36,8 @@ SCENARIOS = {
         18890,
     ),
     "dom-lookup": (
-        "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<200000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
-        200000,
+        "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<2000000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
+        2000000,
     ),
     "shadow-build": (
         "(() => {let n=0;for(let i=0;i<1500;i++){let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let t=document.createElement('span');t.textContent='row';r.append(t);if(h.shadowRoot===r && r.textContent==='row')n++;}return n;})()",
@@ -59,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[float, int]:
+def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[float, int, float]:
     with tempfile.NamedTemporaryFile(prefix="obscura-rss-", delete=False) as rss_file:
         rss_path = Path(rss_file.name)
     with tempfile.NamedTemporaryFile(prefix="obscura-stdout-", delete=False) as stdout_file:
@@ -77,7 +80,7 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         "--",
         "/usr/bin/time",
         "-f",
-        "%M",
+        "%U %S %M",
         "-o",
         str(rss_path),
         str(binary),
@@ -114,7 +117,10 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         elapsed_ms = (time.perf_counter() - started) * 1000
         if process.returncode != 0:
             raise RuntimeError(f"{binary} exited with status {process.returncode}")
-        rss_kib = int(rss_path.read_text(encoding="ascii").strip())
+        user, system, peak = rss_path.read_text(encoding="ascii").split()
+        cpu_seconds, rss_kib = float(user) + float(system), int(peak)
+        if not math.isfinite(cpu_seconds) or float(user) < 0 or float(system) < 0 or rss_kib <= 0:
+            raise RuntimeError(f"{binary} produced an invalid CPU/RSS measurement")
         try:
             result = json.loads(stdout_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -123,7 +129,7 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
             raise RuntimeError(
                 f"{binary} returned {result!r}; expected {expected!r}"
             )
-        return elapsed_ms, rss_kib
+        return elapsed_ms, rss_kib, cpu_seconds
     finally:
         rss_path.unlink(missing_ok=True)
         stdout_path.unlink(missing_ok=True)
@@ -161,8 +167,8 @@ def main() -> None:
     try:
         for scenario, (expression, expected) in SCENARIOS.items():
             samples[scenario] = {
-                "base": {"latency_ms": [], "rss_kib": []},
-                "candidate": {"latency_ms": [], "rss_kib": []},
+                "base": {"latency_ms": [], "rss_kib": [], "cpu_seconds": []},
+                "candidate": {"latency_ms": [], "rss_kib": [], "cpu_seconds": []},
             }
             for round_number in range(ROUNDS):
                 order = (
@@ -171,9 +177,10 @@ def main() -> None:
                     else (("candidate", args.candidate), ("base", args.base))
                 )
                 for label, binary in order:
-                    latency_ms, rss_kib = run_once(binary, url, expression, expected)
+                    latency_ms, rss_kib, cpu_seconds = run_once(binary, url, expression, expected)
                     samples[scenario][label]["latency_ms"].append(latency_ms)
                     samples[scenario][label]["rss_kib"].append(rss_kib)
+                    samples[scenario][label]["cpu_seconds"].append(cpu_seconds)
     finally:
         server.shutdown()
         server.server_close()
@@ -181,9 +188,9 @@ def main() -> None:
     report: dict[str, object] = {"rounds": ROUNDS, "scenarios": {}}
     lines = [
         "## Performance smoke comparison\n\n",
-        "Fails above 20% and 10 ms for latency, or above 15% and 8 MiB for RSS.\n\n",
-        "| Scenario | Base latency | PR latency | Change | Base RSS | PR RSS | Change |\n",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Fails above 10% and 10 ms for latency, 10% and 20 ms for CPU, or 15% and 8 MiB for RSS.\n\n",
+        "| Scenario | Base latency | PR latency | Change | Base CPU | PR CPU | Base RSS | PR RSS | Change |\n",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     ]
     failures = []
     for scenario in SCENARIOS:
@@ -193,7 +200,11 @@ def main() -> None:
         pr_rss = median(samples[scenario]["candidate"]["rss_kib"])
         latency_ratio = pr_latency / base_latency
         rss_ratio = pr_rss / base_rss
+        base_cpu = median(samples[scenario]["base"]["cpu_seconds"])
+        pr_cpu = median(samples[scenario]["candidate"]["cpu_seconds"])
         report["scenarios"][scenario] = {
+            "base_cpu_seconds": base_cpu,
+            "candidate_cpu_seconds": pr_cpu,
             "base_latency_ms": base_latency,
             "candidate_latency_ms": pr_latency,
             "latency_ratio": latency_ratio,
@@ -204,7 +215,7 @@ def main() -> None:
         }
         lines.append(
             f"| {scenario} | {base_latency:.1f} ms | {pr_latency:.1f} ms | "
-            f"{(latency_ratio - 1) * 100:+.1f}% | {base_rss / 1024:.1f} MiB | "
+            f"{(latency_ratio - 1) * 100:+.1f}% | {base_cpu:.2f} s | {pr_cpu:.2f} s | {base_rss / 1024:.1f} MiB | "
             f"{pr_rss / 1024:.1f} MiB | {(rss_ratio - 1) * 100:+.1f}% |\n"
         )
         latency_delta = pr_latency - base_latency
@@ -214,6 +225,8 @@ def main() -> None:
             and latency_delta > LATENCY_FAILURE_DELTA_MS
         ):
             failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
+        if pr_cpu > base_cpu * CPU_FAILURE_RATIO and pr_cpu - base_cpu > CPU_FAILURE_DELTA_SECONDS + 1e-9:
+            failures.append(f"{scenario} CPU increased from {base_cpu:.2f} s to {pr_cpu:.2f} s")
         if rss_ratio > RSS_FAILURE_RATIO and rss_delta > RSS_FAILURE_DELTA_KIB:
             failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
 

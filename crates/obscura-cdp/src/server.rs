@@ -1224,7 +1224,7 @@ async fn cdp_processor(
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
+    let mut intercepted_paused: HashMap<String, PausedIntercept> = HashMap::new();
 
     // Issue #19 follow-up: messages deferred from inside
     // `process_with_interception` because routing them through
@@ -1463,18 +1463,30 @@ async fn cdp_processor(
     let _ = &ctx;
 }
 
+struct PausedIntercept {
+    resolver: tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
+    main_document: bool,
+}
+
+// Native document requests use Page's page-id.counter namespace. Frame documents
+// fetched by JavaScript use fetch-N and must not become the top-level loader.
+fn is_main_document_intercept(request: &obscura_js::ops::InterceptedRequest, page_id: &str) -> bool {
+    request.page_id == page_id && request.resource_type == "Document"
+        && request.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.'))
+}
+
 fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     ctx: &CdpContext,
     navigating_page: Option<(&str, &str, Option<String>)>,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<
-        String,
-        tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
-    >,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
 ) {
     // Navigation temporarily removes its Page from ctx. Other pages can still
     // have requests queued on the same channel, so never infer their owner.
+    let loader = navigating_page.as_ref()
+        .filter(|(page_id, _, _)| is_main_document_intercept(&intercepted, page_id))
+        .map(|_| intercepted.request_id.clone());
     let route = navigating_page
         .filter(|(page_id, _, _)| *page_id == intercepted.page_id)
         .map(|(_, frame_id, session_id)| (frame_id, session_id))
@@ -1486,15 +1498,16 @@ fn emit_intercepted_request(
     let observers = route.as_ref().map_or_else(Vec::new, |(_, session_id)| {
         crate::domains::page::network_observer_sessions(ctx, &intercepted.page_id, session_id)
     });
-    emit_routed_intercepted_request(intercepted, route, &observers, reply_tx, intercepted_paused);
+    emit_routed_intercepted_request(intercepted, route, loader.as_deref(), &observers, reply_tx, intercepted_paused);
 }
 
 fn emit_routed_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     route: Option<(&str, Option<String>)>,
+    loader: Option<&str>,
     observers: &[String],
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
 ) {
     let Some((frame_id, session_id)) = route else {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
@@ -1522,8 +1535,8 @@ fn emit_routed_intercepted_request(
         "method": "Network.requestWillBeSent",
         "params": {
             "requestId": intercepted.request_id,
-            "loaderId": "",
-            "documentURL": "",
+            "loaderId": loader.unwrap_or(""),
+            "documentURL": if loader.is_some() { intercepted.url.as_str() } else { "" },
             "request": request,
             "timestamp": now,
             "wallTime": now,
@@ -1555,7 +1568,7 @@ fn emit_routed_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_paused.to_string());
-    intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
+    intercepted_paused.insert(intercepted.request_id, PausedIntercept {resolver: intercepted.resolver, main_document: loader.is_some()});
 }
 
 async fn pump_live_page_event_loop(
@@ -1761,7 +1774,7 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<St
 fn handle_fetch_resolution(
     text: &str,
     reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
         let method = req.method.as_str();
@@ -1796,12 +1809,17 @@ fn handle_fetch_resolution(
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                     let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    let headers = req.params.get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
+                    let mut headers = HashMap::new();
+                    if let Some(arr) = req.params.get("responseHeaders").and_then(|value| value.as_array()) {
+                        for header in arr {
+                            let (Some(name), Some(value)) = (header.get("name").and_then(|v| v.as_str()), header.get("value").and_then(|v| v.as_str())) else { continue; };
+                            if name.eq_ignore_ascii_case("set-cookie") {
+                                headers.entry("set-cookie".into()).and_modify(|cookies: &mut String| {
+                                    cookies.push('\n'); cookies.push_str(value);
+                                }).or_insert_with(|| value.to_string());
+                            } else { headers.insert(name.to_string(), value.to_string()); }
+                        }
+                    }
                     // Validate before consuming the pause; keep exact bytes for JS.
                     match decode_optional_binary(&req.params, "body", "fulfillRequest body") {
                         Ok(bytes) => Ok(obscura_js::ops::InterceptResolution::Fulfill {
@@ -1824,7 +1842,8 @@ fn handle_fetch_resolution(
                     let resolver = intercepted_paused
                         .remove(request_id)
                         .expect("the pause was present a few lines above and nothing else can take it");
-                    if resolver.send(resolution).is_ok() && method == "Fetch.failRequest" {
+                    let main_document = resolver.main_document;
+                    if resolver.resolver.send(resolution).is_ok() && method == "Fetch.failRequest" && !main_document {
                         let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed");
                         let mut error_text = String::from("net::ERR_");
                         for (index, ch) in reason.chars().enumerate() {
@@ -1860,7 +1879,7 @@ async fn process_with_interception(
     reply_tx: &mpsc::UnboundedSender<String>,
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    intercepted_paused: &mut HashMap<String, PausedIntercept>,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
     send_command_response: bool,
 ) {
@@ -1935,7 +1954,9 @@ async fn process_with_interception(
 
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
-    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let initial_loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+    let mut loader_id = initial_loader_id.clone();
+    let mut document_request_started = false;
 
     let previous_url = page.url.clone();
     let previous_lifecycle = page.lifecycle;
@@ -2014,6 +2035,10 @@ async fn process_with_interception(
                     std::future::pending().await
                 }
             }, if has_irx => {
+                if is_main_document_intercept(&intercepted, &page_id) {
+                    loader_id = intercepted.request_id.clone();
+                    document_request_started = true;
+                }
                 emit_intercepted_request(
                     intercepted,
                     ctx,
@@ -2104,7 +2129,7 @@ async fn process_with_interception(
             page.url = previous_url;
             page.lifecycle = previous_lifecycle;
         }
-        intercepted_paused.retain(|_, resolver| !resolver.is_closed());
+        intercepted_paused.retain(|_, paused| !paused.resolver.is_closed());
     }
 
     // Fold in network events for script-initiated requests (fetch/XHR/dynamic
@@ -2112,7 +2137,16 @@ async fn process_with_interception(
     // alongside the static navigation subresources (#406).
     page.sync_js_network_events();
     let network_events: Vec<_> = page.network_events.drain(..).collect();
+    let failed_document = if document_request_started && navigate_result.is_err()
+        && !network_events.iter().any(|event| event.request_id == loader_id && event.resource_type == "Document") {
+        Some(loader_id.clone())
+    } else { None };
+    let navigation_error = navigate_result.as_ref().err().cloned();
     let page_url = page.url_string();
+    loader_id = network_events.iter().rev().find(|event| event.resource_type == "Document" && event.url == page_url
+        && event.request_id.strip_prefix(&page_id).is_some_and(|suffix| suffix.starts_with('.')))
+        .map(|event| if event.intercepted { event.request_id.clone() } else { initial_loader_id.clone() })
+        .unwrap_or_else(|| failed_document.clone().unwrap_or(initial_loader_id));
     let page_id_for_events = page.id.clone();
     let reached_network_idle = page.lifecycle.is_network_idle();
 
@@ -2143,9 +2177,16 @@ async fn process_with_interception(
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
+    if !(cancelled && !committed) {
+        if let (Some(request_id), Some(error)) = (&failed_document, &navigation_error) {
+            let error = error.strip_prefix("Network error: ").unwrap_or(error);
+            let error_text = if error.starts_with("net::ERR_") { error } else { "net::ERR_FAILED" };
+            crate::domains::page::emit_navigation_failure(ctx, &session_for_events, request_id, &page_id_for_events, error_text);
+        }
+    }
     if cancelled && !committed {
         crate::domains::page::emit_aborted_navigation(ctx, &session_for_events, &frame_id,
-            &loader_id, &navigation_url, &navigation_method, &page_id_for_events);
+            &loader_id, &navigation_url, &navigation_method, &page_id_for_events, document_request_started);
     } else {
         crate::domains::page::emit_navigation_events(
             ctx,
@@ -2456,6 +2497,35 @@ mod tests {
         assert_eq!(paused.len(), 1);
         assert!(paused.contains_key("fetch-1"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn intercepted_documents_keep_their_own_loader_and_page_identity() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let navigating = ctx.create_page();
+        let other = ctx.create_page();
+        ctx.sessions.insert("driver".into(), navigating.clone());
+        ctx.sessions.insert("other-driver".into(), other.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        let navigation_id = format!("{navigating}.1");
+        let other_id = format!("{other}.1");
+        for (page, request_id, expected_loader) in [(&navigating, navigation_id.as_str(), navigation_id.as_str()),
+            (&other, other_id.as_str(), ""), (&navigating, "fetch-iframe", "")] {
+            let (resolver, _resolution) = tokio::sync::oneshot::channel();
+            let intercepted = obscura_js::ops::InterceptedRequest {
+                request_id: request_id.into(), page_id: page.clone(), url: "http://example.test/".into(),
+                method: "GET".into(), headers: Default::default(), resource_type: "Document".into(), resolver,
+            };
+            super::emit_intercepted_request(intercepted, &ctx,
+                Some((&navigating, "frame-nav", Some("driver".into()))), &tx, &mut paused);
+            let request: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            let pause: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(request["params"]["requestId"], request_id);
+            assert_eq!(request["params"]["loaderId"], expected_loader);
+            assert_eq!(pause["params"]["networkId"], request_id);
+        }
+        assert_eq!(paused.len(), 3);
     }
 
     #[test]
@@ -3759,6 +3829,165 @@ mod tests {
         }).await;
     }
 
+    async fn routed_document_events(scenario: &str) -> Vec<serde_json::Value> {
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/start", listener.local_addr().unwrap());
+            drop(listener);
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "routed-lifecycle".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            let mut intercept_rx = Some(ctx.get_page_mut(&page_id).unwrap().enable_interception());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": url}}).to_string();
+            let mut paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            let navigation = async {
+                super::process_with_interception(&command, &mut ctx, &reply_tx,
+                    &mut server_rx, &mut intercept_rx, &mut paused, &mut deferred, true).await;
+                let _ = done_tx.send(());
+            };
+            let client = async {
+                use base64::Engine as _;
+                let mut events = Vec::new();
+                let mut pauses = 0;
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(text) = reply_rx.recv() => {
+                            let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if event["method"] == "Fetch.requestPaused" {
+                                pauses += 1;
+                                let request_id = &event["params"]["requestId"];
+                                let stop = scenario == "chain-stop" && pauses == 2;
+                                let method = if stop { "Page.stopLoading" }
+                                    else if scenario == "abort" { "Fetch.failRequest" }
+                                    else if scenario == "transport" || (scenario == "chain-fail" && pauses == 2) { "Fetch.continueRequest" }
+                                    else { "Fetch.fulfillRequest" };
+                                let body = if pauses == 1 && scenario.starts_with("chain") {
+                                    "<script>location.replace('/finish')</script>"
+                                } else if pauses == 1 && scenario == "repeat" {
+                                    "<script>location.reload()</script>"
+                                } else { "<title>Finished</title>" };
+                                server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                                    text: json!({"id": pauses + 1, "method": method, "sessionId": session,
+                                        "params": {"requestId": request_id, "errorReason": "Aborted", "responseCode": 200,
+                                            "responseHeaders": [{"name": "Content-Type", "value": "text/html"}],
+                                            "body": base64::engine::general_purpose::STANDARD.encode(body)}}).to_string(),
+                                    reply_tx: reply_tx.clone(),
+                                })).unwrap();
+                            }
+                            events.push(event);
+                        }
+                        _ = &mut done_rx => break,
+                    }
+                }
+                events
+            };
+            let (_, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(navigation, client)
+            }).await.expect("routed navigation must finish");
+            events
+        }).await
+    }
+
+    fn assert_routed_completions(events: &[serde_json::Value], finished: usize, failed: usize) {
+        let requests: Vec<_> = events.iter().filter(|event| event["method"] == "Network.requestWillBeSent").collect();
+        let completed: Vec<_> = events.iter().filter(|event| event["method"] == "Network.loadingFinished").collect();
+        let errors: Vec<_> = events.iter().filter(|event| event["method"] == "Network.loadingFailed").collect();
+        assert_eq!(requests.len(), finished + failed, "{events:?}");
+        assert_eq!(completed.len(), finished, "{events:?}");
+        assert_eq!(errors.len(), failed, "{events:?}");
+        for request in requests {
+            let id = &request["params"]["requestId"];
+            assert_eq!(completed.iter().chain(errors.iter()).filter(|event| &event["params"]["requestId"] == id).count(), 1,
+                "each published request must finish exactly once: {events:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_transport_failure_finishes_its_request() {
+        assert_routed_completions(&routed_document_events("transport").await, 0, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_abort_finishes_once_with_canonical_error() {
+        let events = routed_document_events("abort").await;
+        assert_routed_completions(&events, 0, 1);
+        let error = events.iter().find(|event| event["method"] == "Network.loadingFailed").unwrap();
+        assert_eq!(error["params"]["errorText"], "net::ERR_ABORTED");
+        assert_eq!(error["params"]["canceled"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_script_navigation_preserves_both_completions() {
+        assert_routed_completions(&routed_document_events("chain").await, 2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_reload_preserves_both_completions() {
+        assert_routed_completions(&routed_document_events("repeat").await, 2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_script_navigation_failure_finishes_both_requests() {
+        assert_routed_completions(&routed_document_events("chain-fail").await, 1, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_script_navigation_stop_finishes_both_requests() {
+        assert_routed_completions(&routed_document_events("chain-stop").await, 1, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_finishes_the_intercepted_document_request() {
+        tokio::task::LocalSet::new().run_until(async {
+            let mut ctx = crate::dispatch::CdpContext::new();
+            let page_id = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            let mut intercept_rx = Some(ctx.get_page_mut(&page_id).unwrap().enable_interception());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": "http://127.0.0.1:9/paused"}}).to_string();
+            let mut paused = HashMap::new();
+            let mut deferred = std::collections::VecDeque::new();
+            let client = async {
+                let mut network_id = None;
+                let mut request_events = 0;
+                while let Some(text) = reply_rx.recv().await {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if event["method"] == "Network.requestWillBeSent" { request_events += 1; }
+                    if event["method"] == "Fetch.requestPaused" {
+                        network_id = Some(event["params"]["networkId"].clone());
+                        server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: json!({"id": 2, "method": "Page.stopLoading", "sessionId": session}).to_string(),
+                            reply_tx: reply_tx.clone(),
+                        })).unwrap();
+                    }
+                    if event["method"] == "Network.loadingFailed" {
+                        assert_eq!(Some(event["params"]["requestId"].clone()), network_id,
+                            "cancellation must finish the request that was paused");
+                        assert_eq!(request_events, 1, "a paused request must not be published twice");
+                        break;
+                    }
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(super::process_with_interception(&command, &mut ctx, &reply_tx,
+                    &mut server_rx, &mut intercept_rx, &mut paused, &mut deferred, true), client);
+            }).await.unwrap();
+        }).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn stop_loading_cancels_a_held_document_request() {
         assert_stop_loading_cancels_navigation(false, "Page.stopLoading").await;
@@ -3792,7 +4021,7 @@ mod tests {
     #[test]
     fn fetch_resolution_is_handled_once_by_the_outer_processor() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         assert!(!handle_fetch_resolution(
             r#"{"id":16,"method":"Network.getResponseBody","params":{"requestId":"request-1"}}"#,
@@ -3815,7 +4044,7 @@ mod tests {
         assert!(reply_rx.try_recv().is_err(), "must not emit a duplicate response");
 
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        paused.insert("request-2".into(), resolution_tx);
+        paused.insert("request-2".into(), super::PausedIntercept {resolver: resolution_tx, main_document: false});
         assert!(handle_fetch_resolution(
             r#"{"id":18,"method":"Fetch.failRequest","sessionId":"page-session","params":{"requestId":"request-2","errorReason":"Aborted"}}"#,
             &reply_tx, &mut paused,
@@ -3945,7 +4174,7 @@ mod tests {
     #[test]
     fn continue_request_decodes_a_base64_post_data() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         // base64 of {"a":1}
@@ -3971,7 +4200,7 @@ mod tests {
     #[test]
     fn continue_request_keeps_a_non_utf8_post_data_intact() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         // base64 of the three bytes 00 FF FE, which are not valid UTF-8
@@ -3997,7 +4226,7 @@ mod tests {
     #[test]
     fn continue_request_rejects_post_data_that_is_not_base64_without_wedging_it() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         assert!(handle_fetch_resolution(
@@ -4041,9 +4270,23 @@ mod tests {
 
     // The same strictness on the other arm carrying a CDP `binary` field.
     #[test]
+    fn fulfill_request_preserves_repeated_set_cookie_headers() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("document-1".into(), super::PausedIntercept { resolver: tx, main_document: true })]);
+        let (reply_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        assert!(handle_fetch_resolution(r#"{"id":1,"method":"Fetch.fulfillRequest","params":{"requestId":"document-1","responseCode":200,"responseHeaders":[{"name":"Set-Cookie","value":"first=1; Path=/"},{"name":"Set-Cookie","value":"second=2; Path=/"},{"name":"set-cookie","value":"third=3; Path=/"},{"name":"Content-Type","value":"text/html"}]}}"#,
+            &reply_tx, &mut paused));
+        let Ok(obscura_js::ops::InterceptResolution::Fulfill { headers, .. }) = rx.try_recv() else {
+            panic!("fulfillment must resolve the paused document");
+        };
+        assert_eq!(headers.get("set-cookie").unwrap(), "first=1; Path=/\nsecond=2; Path=/\nthird=3; Path=/");
+        assert_eq!(headers.get("Content-Type").unwrap(), "text/html");
+    }
+
+    #[test]
     fn fulfill_request_rejects_a_body_that_is_not_base64() {
         let (resolution_tx, _resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         assert!(handle_fetch_resolution(
@@ -4068,7 +4311,7 @@ mod tests {
     fn continue_request_rejects_invalid_binary_values_and_allows_retry() {
         for value in [json!(null), json!(42), json!("AA="), json!("AB=="), json!("====")] {
             let (tx, mut rx) = tokio::sync::oneshot::channel();
-            let mut paused = HashMap::from([("request-1".to_string(), tx)]);
+            let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept { resolver: tx, main_document: false })]);
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
             let command = json!({"id": 1, "method": "Fetch.continueRequest",
                 "params": {"requestId": "request-1", "postData": value}}).to_string();
@@ -4091,7 +4334,7 @@ mod tests {
     #[test]
     fn continue_request_without_post_data_leaves_the_body_alone() {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
-        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let mut paused = HashMap::from([("request-1".to_string(), super::PausedIntercept {resolver: resolution_tx, main_document: false})]);
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         assert!(handle_fetch_resolution(
