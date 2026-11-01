@@ -16,7 +16,7 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    chrome_client_hints, cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
@@ -411,7 +411,10 @@ impl StealthHttpClient {
             let effective_headers = supplied.unwrap_or(&extra_headers);
             if let Some(ua) = effective_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v)
                 .or(self.user_agent.as_ref()) {
-                req = req.header("user-agent", ua.as_str());
+                let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(ua);
+                req = req.header("user-agent", ua.as_str())
+                    .header("sec-ch-ua", sec_ch_ua)
+                    .header("sec-ch-ua-platform", sec_ch_ua_platform);
             }
             for (k, v) in effective_headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
                 if k.eq_ignore_ascii_case("origin") {
@@ -607,7 +610,10 @@ impl StealthHttpClient {
         if let Some(ua) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v)
             .or_else(|| extra_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v))
             .or(self.user_agent.as_ref()) {
-            req = req.header("user-agent", ua.as_str());
+            let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(ua);
+            req = req.header("user-agent", ua.as_str())
+                .header("sec-ch-ua", sec_ch_ua)
+                .header("sec-ch-ua-platform", sec_ch_ua_platform);
         }
         for (k, v) in extra_headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
             req = req.header(k.as_str(), v.as_str());
@@ -680,7 +686,18 @@ mod tests {
     use wreq::dns::{Name, Resolve};
 
     #[tokio::test]
-    async fn stealth_user_agent_override_has_one_wire_value_for_navigation_and_script_fetch() {
+    async fn stealth_user_agent_override_has_consistent_wire_hints_for_navigation_and_script_fetch() {
+        let agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        ];
+        let hints = [
+            "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"",
+            "\"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\", \"Chromium\";v=\"130\"",
+            "\"Chromium\";v=\"140\", \"Not=A?Brand\";v=\"24\", \"Google Chrome\";v=\"140\"",
+        ];
+        let platforms = ["\"Windows\"", "\"macOS\"", "\"Linux\""];
         for scripted in [false, true] {
             for override_mode in 0..if scripted { 3 } else { 2 } {
                 let extra = override_mode > 0;
@@ -695,16 +712,23 @@ mod tests {
                     Write::write_all(&mut socket,b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
                     String::from_utf8(request).unwrap()
                 });
-                let client=StealthHttpClient::with_proxy(Arc::new(CookieJar::new()),None,true).with_user_agent(Some("TestingUA/1.0".into()));
-                if extra {client.extra_headers.write().await.insert("user-agent".into(),"HeaderUA/2.0".into());}
-                let request_headers = if override_mode == 2 { [("User-Agent".into(), "RequestUA/3.0".into())].into() } else { std::collections::HashMap::new() };
+                let client=StealthHttpClient::with_proxy(Arc::new(CookieJar::new()),None,true).with_user_agent(Some(agents[0].into()));
+                if extra {client.extra_headers.write().await.insert("user-agent".into(),agents[1].into());}
+                let request_headers = if override_mode == 2 { [("User-Agent".into(), agents[2].into())].into() } else { std::collections::HashMap::new() };
                 let response=if scripted {client.send_single("GET",&url,&request_headers,&[],true,true).await.unwrap()}
                     else {client.fetch(&url).await.unwrap()};
                 assert_eq!(response.status,200);
                 let wire=server.join().unwrap();
-                let agents=wire.lines().filter_map(|line|line.split_once(':')).filter(|(name,_)|name.eq_ignore_ascii_case("user-agent"))
-                    .map(|(_,value)|value.trim()).collect::<Vec<_>>();
-                assert_eq!(agents,vec![if override_mode == 2 {"RequestUA/3.0"} else if extra {"HeaderUA/2.0"} else {"TestingUA/1.0"}],"scripted={scripted}, override={override_mode}: {wire}");
+                for (name, expected) in [
+                    ("user-agent", agents[override_mode]),
+                    ("sec-ch-ua", hints[override_mode]),
+                    ("sec-ch-ua-platform", platforms[override_mode]),
+                ] {
+                    let values = wire.lines().filter_map(|line| line.split_once(':'))
+                        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.trim()).collect::<Vec<_>>();
+                    assert_eq!(values, vec![expected], "{name}: scripted={scripted}, override={override_mode}: {wire}");
+                }
             }
         }
     }
