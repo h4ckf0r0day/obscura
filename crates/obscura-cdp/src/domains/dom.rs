@@ -445,11 +445,12 @@ pub async fn handle(
                 Some(false) => return Err("Node is not a file input element".to_string()),
                 Some(true) => {}
             }
-            let paths: Vec<String> = params
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            let files = params.get("files").and_then(Value::as_array)
+                .ok_or("DOM.setFileInputFiles requires a files array")?;
+            let paths: Vec<String> = files.iter()
+                .map(|file| file.as_str().map(String::from)
+                    .ok_or_else(|| "DOM.setFileInputFiles requires string file paths".to_string()))
+                .collect::<Result<_, _>>()?;
 
             let mut specs = Vec::with_capacity(paths.len());
             for p in &paths {
@@ -1148,6 +1149,17 @@ mod tests {
                 .await.expect_err("invalid target must not be accepted");
             assert!(err.contains(expected), "unexpected error: {err}");
         }
+
+        // The protocol requires a files array containing only string paths.
+        // Dropping malformed entries used to acknowledge a broken command.
+        for files in [json!(null), json!("not-an-array"), json!([42]), json!([null])] {
+            let err = handle("setFileInputFiles",
+                &json!({"nodeId": ids["f"], "files": files}),
+                &mut ctx, &session).await.expect_err("invalid files argument");
+            assert!(err.contains("files") || err.contains("paths"), "{err}");
+        }
+        assert!(handle("setFileInputFiles", &json!({"nodeId":ids["f"]}),
+            &mut ctx, &session).await.is_err());
 
         let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
         handle("setFileInputFiles",
