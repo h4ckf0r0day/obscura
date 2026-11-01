@@ -4931,6 +4931,14 @@ class Element extends Node {
     if ((this.getAttribute('type') || '').toLowerCase() !== 'file') return null;
     return this._files || _emptyFileList();
   }
+  set files(value) {
+    if (this.localName !== 'input' ||
+        (this.getAttribute('type') || '').toLowerCase() !== 'file') return;
+    if (value === null) return;
+    if (!(value instanceof FileList))
+      throw new TypeError("Failed to set 'files': value is not a FileList");
+    this._files = value;
+  }
   set value(v) {
     const tag = this.localName;
     if (tag === 'option') {
@@ -12345,6 +12353,119 @@ if (typeof FileList === "undefined") globalThis.FileList = class FileList {
   [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
   get [Symbol.toStringTag]() { return "FileList"; }
 };
+{
+  const secret = Symbol('data-transfer-internal');
+  class DataTransferItem {
+    constructor(token, kind, type, data) {
+      if (token !== secret) throw new TypeError('Illegal constructor');
+      this.kind = kind;
+      this.type = type;
+      this._data = data;
+    }
+    getAsFile() { return this.kind === 'file' ? this._data : null; }
+    getAsString(callback) {
+      if (this.kind !== 'string' || typeof callback !== 'function') return;
+      const value = this._data;
+      queueMicrotask(() => callback(value));
+    }
+  }
+  class DataTransferItemList {
+    constructor(token, entries, onChange) {
+      if (token !== secret) throw new TypeError('Illegal constructor');
+      this._entries = entries;
+      this._onChange = onChange;
+      this._indexed = 0;
+    }
+    get length() { return this._entries.length; }
+    item(index) { return this._entries[index] || null; }
+    _sync() {
+      for (let i = 0; i < this._indexed; i++) delete this[i];
+      this._indexed = this._entries.length;
+      for (let i = 0; i < this._indexed; i++) {
+        Object.defineProperty(this, i, {
+          configurable: true, enumerable: true, get: () => this._entries[i]
+        });
+      }
+      this._onChange();
+    }
+    add(data, type) {
+      let entry;
+      if (data instanceof File) {
+        entry = new DataTransferItem(secret, 'file', data.type, data);
+      } else {
+        if (arguments.length < 2) throw new TypeError('A type is required for string items');
+        const mime = String(type).toLowerCase();
+        if (this._entries.some(item => item.kind === 'string' && item.type === mime))
+          throw new DOMException('An item with that type already exists', 'NotSupportedError');
+        entry = new DataTransferItem(secret, 'string', mime, String(data));
+      }
+      this._entries.push(entry);
+      this._sync();
+      return entry;
+    }
+    remove(index) {
+      const i = Number(index);
+      if (Number.isInteger(i) && i >= 0 && i < this._entries.length) {
+        this._entries.splice(i, 1);
+        this._sync();
+      }
+    }
+    clear() { this._entries.length = 0; this._sync(); }
+    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+  }
+  class DataTransfer {
+    constructor() {
+      this._entries = [];
+      this._files = Object.create(FileList.prototype);
+      this._fileSlots = 0;
+      this.items = new DataTransferItemList(secret, this._entries, () => this._syncFiles());
+      this._syncFiles();
+      this.dropEffect = 'none';
+      this.effectAllowed = 'all';
+    }
+    _syncFiles() {
+      const files = this._entries.filter(item => item.kind === 'file').map(item => item._data);
+      for (let i = 0; i < this._fileSlots; i++) delete this._files[i];
+      this._fileSlots = files.length;
+      for (let i = 0; i < files.length; i++) {
+        Object.defineProperty(this._files, i, {value: files[i], configurable: true, enumerable: true});
+      }
+      Object.defineProperty(this._files, 'length', {
+        value: files.length, configurable: true, enumerable: false
+      });
+    }
+    get files() { return this._files; }
+    get types() {
+      const types = [];
+      for (const item of this._entries) {
+        if (item.kind === 'string' && !types.includes(item.type)) types.push(item.type);
+      }
+      if (this._entries.some(item => item.kind === 'file')) types.push('Files');
+      return types;
+    }
+    getData(type) {
+      const key = String(type).toLowerCase();
+      return this._entries.find(item => item.kind === 'string' && item.type === key)?._data || '';
+    }
+    setData(type, data) {
+      const key = String(type).toLowerCase();
+      const existing = this._entries.find(item => item.kind === 'string' && item.type === key);
+      if (existing) existing._data = String(data);
+      else this.items.add(String(data), key);
+    }
+    clearData(type) {
+      for (let i = this._entries.length - 1; i >= 0; i--) {
+        if (this._entries[i].kind === 'string' && (type === undefined || this._entries[i].type === String(type).toLowerCase()))
+          this._entries.splice(i, 1);
+      }
+      this.items._sync();
+    }
+    setDragImage(_image, _x, _y) { /* Drag rendering is not available in the engine. */ }
+  }
+  if (typeof globalThis.DataTransfer === 'undefined') globalThis.DataTransfer = DataTransfer;
+  if (typeof globalThis.DataTransferItem === 'undefined') globalThis.DataTransferItem = DataTransferItem;
+  if (typeof globalThis.DataTransferItemList === 'undefined') globalThis.DataTransferItemList = DataTransferItemList;
+}
 // A FormData value keeps Blob/File objects as-is (the multipart serializer reads
 // their bytes); every other value is coerced to a string per the Fetch spec.
 function _isFormBlob(v) {
