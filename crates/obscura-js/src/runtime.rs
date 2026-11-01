@@ -14041,6 +14041,60 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn inner_html_replacement_retains_prepared_render() {
+        let mut rt = setup_runtime(
+            "<style>body{margin:0}.a{height:7px}.tall{height:50px}#list:empty{height:5px}\
+             .wrap{width:20px}.wrap:has(.hit){width:70px}</style>\
+             <div class=wrap id=wrap><div id=list><div class=a></div></div></div>\
+             <div id=after style=height:10px></div>",
+        );
+        let geometry = "(function(){ const r = id => document.getElementById(id).getBoundingClientRect(); \
+            return [r('list').height, r('wrap').width, r('after').y]; })()";
+        assert_eq!(rt.evaluate(geometry).unwrap(), serde_json::json!([7, 20, 7]));
+
+        rt.evaluate("document.getElementById('list').innerHTML = '<div class=\"tall hit\"></div>'")
+            .unwrap();
+        {
+            let state = rt.state.borrow();
+            assert!(state.prepared_render.is_some(), "innerHTML must queue retained style damage");
+            assert!(matches!(
+                state.pending_style_mutations.as_slice(),
+                [
+                    obscura_render::RetainedStyleMutation::Tree(
+                        obscura_render::TreeStyleMutation::Remove { .. }
+                    ),
+                    obscura_render::RetainedStyleMutation::Tree(
+                        obscura_render::TreeStyleMutation::Insert { .. }
+                    ),
+                ]
+            ));
+        }
+        assert_eq!(rt.evaluate(geometry).unwrap(), serde_json::json!([50, 70, 50]));
+
+        // Clearing the list flips :empty on it and drops the :has match on
+        // its parent, both driven by the removed child.
+        rt.evaluate("document.getElementById('list').innerHTML = ''").unwrap();
+        assert!(rt.state.borrow().prepared_render.is_some());
+        assert_eq!(rt.evaluate(geometry).unwrap(), serde_json::json!([5, 20, 5]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn inner_html_style_elements_still_restyle_the_document() {
+        let mut rt = setup_runtime(
+            "<style>body{margin:0}</style><div id=host></div><div id=after style=height:10px></div>",
+        );
+        let height = "document.getElementById('after').getBoundingClientRect().height";
+        assert_eq!(rt.evaluate(height).unwrap().as_f64(), Some(10.0));
+        rt.evaluate("document.getElementById('host').innerHTML = '<style>#after{height:33px!important}</style>'")
+            .unwrap();
+        assert_eq!(rt.evaluate(height).unwrap().as_f64(), Some(33.0));
+        rt.evaluate("document.getElementById('host').innerHTML = '<i>x</i>'").unwrap();
+        assert_eq!(rt.evaluate(height).unwrap().as_f64(), Some(10.0));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn same_parent_moves_keep_geometry_and_observer_records_consistent() {
         let mut rt = setup_runtime(
             "<style>body{margin:0}#parent{display:flex}.item{flex:0 0 40px;height:20px}</style>\
