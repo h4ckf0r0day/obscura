@@ -126,6 +126,9 @@ enum RelationalSelectorKey {
 pub(crate) struct RelationalInvalidation {
     pub rule_order: usize,
     anchor_key: Option<RelationalSelectorKey>,
+    /// Keys which some ancestor of the anchor must have, from compounds left
+    /// of the anchor joined by descendant or child combinators.
+    ancestor_keys: Vec<RelationalSelectorKey>,
     relative_keys: Vec<RelationalSelectorKey>,
     pub anchor_reaches: InvalidationReaches,
     pub unkeyed_subject: bool,
@@ -187,7 +190,18 @@ fn relational_key_may_match(
 
 impl RelationalInvalidation {
     pub(crate) fn anchor_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
-        relational_key_may_match(self.anchor_key.as_ref(), tree, node)
+        if !relational_key_may_match(self.anchor_key.as_ref(), tree, node) {
+            return false;
+        }
+        if self.ancestor_keys.is_empty() {
+            return true;
+        }
+        let ancestors = tree.ancestors(node);
+        self.ancestor_keys.iter().all(|key| {
+            ancestors
+                .iter()
+                .any(|ancestor| relational_key_may_match(Some(key), tree, *ancestor))
+        })
     }
 
     pub(crate) fn relative_path_may_match(&self, tree: &DomTree, node: NodeId) -> bool {
@@ -821,6 +835,16 @@ fn relative_selector_subject_has_key(selector: &str) -> bool {
     false
 }
 
+/// Keys an enclosing selector requires of the element a compound matches.
+/// A `:has()` in the subject compound of an `:is()`/`:where()`/`:not()`
+/// argument is evaluated on that same element, and the argument can only
+/// change the outer match when this context matches too.
+#[derive(Clone, Debug, Default)]
+struct RelationalAnchorContext {
+    key: Option<RelationalSelectorKey>,
+    ancestor_keys: Vec<RelationalSelectorKey>,
+}
+
 /// Pick one positive key which every match of this exact anchor compound must
 /// have. Functional pseudos are skipped as opaque boolean expressions; using
 /// a key from one `:is()` arm as a mandatory filter would be unsound.
@@ -1122,6 +1146,7 @@ fn note_compound_dependencies(
     reaches: InvalidationReaches,
     rule_order: usize,
     inside_relational: bool,
+    anchor_context: &RelationalAnchorContext,
 ) {
     if let Some(local_name) = compound_local_name(compound) {
         map.push_local_name(local_name, rule_order, reaches);
@@ -1237,6 +1262,11 @@ fn note_compound_dependencies(
                 let arguments: String = chars[next + 1..close].iter().collect();
                 match name.as_str() {
                     "is" | "where" | "not" => {
+                        let context = RelationalAnchorContext {
+                            key: relational_anchor_key(compound)
+                                .or_else(|| anchor_context.key.clone()),
+                            ancestor_keys: anchor_context.ancestor_keys.clone(),
+                        };
                         for alternative in split_selector_list(&arguments) {
                             note_selector_dependencies(
                                 map,
@@ -1244,6 +1274,7 @@ fn note_compound_dependencies(
                                 reaches,
                                 rule_order,
                                 !inside_relational,
+                                Some(&context),
                             );
                         }
                     }
@@ -1296,7 +1327,9 @@ fn note_compound_dependencies(
                         });
                         map.push_relational_invalidation(RelationalInvalidation {
                             rule_order,
-                            anchor_key: relational_anchor_key(compound),
+                            anchor_key: relational_anchor_key(compound)
+                                .or_else(|| anchor_context.key.clone()),
+                            ancestor_keys: anchor_context.ancestor_keys.clone(),
                             relative_keys,
                             anchor_reaches: reaches,
                             unkeyed_subject: unkeyed,
@@ -1313,6 +1346,7 @@ fn note_compound_dependencies(
                                 InvalidationReaches::CONSERVATIVE,
                                 rule_order,
                                 false,
+                                None,
                             );
                         }
                     }
@@ -1336,6 +1370,7 @@ fn note_compound_dependencies(
                                     InvalidationReaches::CONSERVATIVE,
                                     rule_order,
                                     !inside_relational,
+                                    None,
                                 );
                             }
                         }
@@ -1374,6 +1409,7 @@ fn note_selector_dependencies(
     outer_reaches: InvalidationReaches,
     rule_order: usize,
     record_tree_siblings: bool,
+    subject_context: Option<&RelationalAnchorContext>,
 ) {
     if record_tree_siblings {
         let (adjacent, general) = selector_sibling_combinators(selector);
@@ -1384,7 +1420,18 @@ fn note_selector_dependencies(
     if malformed {
         map.mark_conservative(rule_order);
     }
-    for (compound, local_reaches) in compounds {
+    let subject_index = compounds.len().saturating_sub(1);
+    let mut ancestor_keys: Vec<RelationalSelectorKey> = Vec::new();
+    for (index, (compound, local_reaches)) in compounds.into_iter().enumerate() {
+        // Only the subject compound matches the element the enclosing
+        // selector constrains; earlier compounds match its relatives.
+        let mut context = subject_context
+            .filter(|_| index == subject_index)
+            .cloned()
+            .unwrap_or_default();
+        for key in &ancestor_keys {
+            push_relational_selector_key(&mut context.ancestor_keys, key.clone());
+        }
         if record_tree_siblings
             && local_reaches.contains(InvalidationReaches::SIBLINGS)
             && !relative_selector_subject_has_key(&compound)
@@ -1401,7 +1448,15 @@ fn note_selector_dependencies(
             reaches,
             rule_order,
             !record_tree_siblings,
+            &context,
         );
+        // Every later compound is inside the subtree of one matching this
+        // compound; sibling combinators keep the same parent.
+        if local_reaches.contains(InvalidationReaches::DESCENDANTS) {
+            if let Some(key) = relational_anchor_key(&compound) {
+                push_relational_selector_key(&mut ancestor_keys, key);
+            }
+        }
     }
 }
 
@@ -1416,6 +1471,7 @@ fn note_selector_for_invalidation(
         InvalidationReaches::SELF,
         rule_order,
         true,
+        None,
     );
 }
 
@@ -7787,6 +7843,49 @@ mod tests {
             relational_anchor_key("[xlink|href].host:has(.signal)"),
             Some(RelationalSelectorKey::Class("host".into())),
         );
+    }
+
+    #[test]
+    fn relational_anchor_context_inherits_from_enclosing_selector() {
+        let map = test_invalidation_map(
+            r#"
+                #flyout:not(:has([id^=row-])) { color:red }
+                .item:is(.open :has(> .badge)) { color:red }
+                .group:where(:is(:has(*))) { color:red }
+                .outer :not(:has(.inner)) { color:red }
+                .list:not(:has(.a) .b) { color:red }
+                .page #box > div:has(:not(script)) { color:red }
+                .row + .card:has(.tag) { color:red }
+            "#,
+        );
+        let contexts = map
+            .relational_invalidations()
+            .iter()
+            .map(|entry| (entry.anchor_key.clone(), entry.ancestor_keys.clone()))
+            .collect::<Vec<_>>();
+        let class = |name: &str| RelationalSelectorKey::Class(name.into());
+        assert_eq!(
+            contexts,
+            vec![
+                (Some(RelationalSelectorKey::Id("flyout".into())), vec![]),
+                (Some(class("item")), vec![class("open")]),
+                (Some(class("group")), vec![]),
+                (None, vec![class("outer")]),
+                (None, vec![]),
+                (
+                    Some(RelationalSelectorKey::LocalName("div".into())),
+                    vec![class("page"), RelationalSelectorKey::Id("box".into())],
+                ),
+                (Some(class("card")), vec![]),
+            ],
+        );
+
+        let tree = obscura_dom::parse_html(
+            "<main class=page><section id=box><div id=inside></div></section><div id=outside></div></main>",
+        );
+        let entry = &map.relational_invalidations()[5];
+        assert!(entry.anchor_may_match(&tree, tree.get_element_by_id("inside").unwrap()));
+        assert!(!entry.anchor_may_match(&tree, tree.get_element_by_id("outside").unwrap()));
     }
 
     #[test]
