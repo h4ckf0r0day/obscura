@@ -430,6 +430,21 @@ pub async fn handle(
                 return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
             }
             let node_id = resolve_node_id(page, params)?;
+            // Reject invalid targets before reading any local paths. The old
+            // handler reported success even for missing nodes and non-file
+            // elements, leaving callers waiting for a change event forever.
+            let is_file_input = u32::try_from(node_id).ok().and_then(|id| {
+                page.with_dom(|dom| dom.get_node(NodeId::new(id)).map(|node| {
+                    node.as_element().is_some_and(|name| name.local.as_ref() == "input")
+                        && node.get_attribute("type").is_some_and(|ty| ty.eq_ignore_ascii_case("file"))
+                }))
+                .flatten()
+            });
+            match is_file_input {
+                None => return Err("Could not find node with given id".to_string()),
+                Some(false) => return Err("Node is not a file input element".to_string()),
+                Some(true) => {}
+            }
             let paths: Vec<String> = params
                 .get("files")
                 .and_then(|v| v.as_array())
@@ -454,7 +469,9 @@ pub async fn handle(
                  if (el && globalThis.__obscura_setInputFiles) {{ globalThis.__obscura_setInputFiles(el, {1}); return true; }} return false; }})()",
                 node_id, specs_json
             );
-            let _ = page.evaluate(&code);
+            if page.evaluate(&code).as_bool() != Some(true) {
+                return Err("Could not set files on the input element".to_string());
+            }
             Ok(json!({}))
         }
         "getBoxModel" => {
@@ -1095,6 +1112,51 @@ mod tests {
             err.contains("allow-file-access"),
             "error must point at the allow-file-access flag: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_file_input_files_validates_target_before_reading_paths() {
+        let mut ctx = CdpContext::new_with_security(None, false, None, true);
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        crate::domains::page::handle(
+            "navigate",
+            &json!({"url": "data:text/html,<input id=f type=file><input id=t type=text><div id=d></div>"}),
+            &mut ctx,
+            &session,
+        ).await.unwrap();
+
+        let find = |name: &str| format!("#{name}");
+        let mut ids = HashMap::new();
+        for name in ["f", "t", "d"] {
+            let result = handle("querySelector", &json!({"selector": find(name)}),
+                &mut ctx, &session).await.unwrap();
+            ids.insert(name, result["nodeId"].as_u64().unwrap());
+        }
+
+        // Missing, wrong-element and wrong-input-type nodes must be rejected
+        // without first attempting to open a path supplied by the CDP client.
+        let missing = "/nonexistent-obscura-upload-test-file.bin";
+        for (node, expected) in [
+            (999_999_u64, "Could not find node"),
+            (ids["t"], "not a file input"),
+            (ids["d"], "not a file input"),
+        ] {
+            let err = handle("setFileInputFiles",
+                &json!({"nodeId":node,"files":[missing]}), &mut ctx, &session)
+                .await.expect_err("invalid target must not be accepted");
+            assert!(err.contains(expected), "unexpected error: {err}");
+        }
+
+        let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        handle("setFileInputFiles",
+            &json!({"nodeId":ids["f"],"files":[existing]}),
+            &mut ctx, &session).await.expect("valid file input must be accepted");
+        let result = ctx.get_session_page_mut(&session).unwrap().evaluate(
+            "(() => { const f = document.getElementById('f'); return [f.files.length, f.files[0].name]; })()"
+        );
+        assert_eq!(result, json!([1, "Cargo.toml"]));
     }
 
     // issue #576: DOM.getBoxModel / getContentQuads build their quad from f64
