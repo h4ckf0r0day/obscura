@@ -1049,7 +1049,13 @@ pub fn emit_navigation_events(
             tracing::warn!("could not produce navigation screencast frame: {error}");
         }
     }
-    let mut phase3 = if ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed) {
+    let failed = ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed);
+    let mut lifecycle_timestamps = [Some(ts), None, None, None, None];
+    if !failed {
+        lifecycle_timestamps[1] = Some(ts);
+        lifecycle_timestamps[2] = Some(ts);
+    }
+    let mut phase3 = if failed {
         Vec::new()
     } else { vec![
         CdpEvent {
@@ -1075,6 +1081,8 @@ pub fn emit_navigation_events(
     ] };
     if !phase3.is_empty() && (reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded)) {
         let idle_ts = timestamp();
+        lifecycle_timestamps[3] = Some(idle_ts);
+        lifecycle_timestamps[4] = Some(idle_ts);
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
     phase3.push(CdpEvent {
@@ -1083,6 +1091,7 @@ pub fn emit_navigation_events(
         session_id: es,
     });
     ctx.pending_events.extend(phase3);
+    ctx.lifecycle_timestamps.insert(page_id.to_string(), lifecycle_timestamps);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
     // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
@@ -1454,6 +1463,7 @@ pub async fn handle(
             if let Some((page_id, frame_id, url)) = initial {
                 ctx.nav_events_emitted.insert(page_id.clone());
                 let ts = timestamp();
+                ctx.lifecycle_timestamps.insert(page_id.clone(), [Some(ts); 5]);
                 let loader_id = format!("loader-blank-{page_id}");
                 let es = session_id.clone();
                 // Build the frame through the schema-complete helper: generated
@@ -1599,6 +1609,20 @@ pub async fn handle(
                 }
                 if enabled {
                     ctx.lifecycle_enabled_sessions.insert(session.clone());
+                    if let Some(page) = ctx.get_session_page(session_id) {
+                        if let (Some(timings), Some(loader_id)) = (
+                            ctx.lifecycle_timestamps.get(&page.id), ctx.current_loader_ids.get(&page.id),
+                        ) {
+                            let events = crate::dispatch::LIFECYCLE_PHASES.iter().zip(timings)
+                                .filter_map(|(name, time)| time.map(|timestamp| CdpEvent {
+                                    method: "Page.lifecycleEvent".into(),
+                                    params: json!({"frameId": page.frame_id, "loaderId": loader_id,
+                                        "name": name, "timestamp": timestamp}),
+                                    session_id: session_id.clone(),
+                                })).collect::<Vec<_>>();
+                            ctx.pending_events.extend(events);
+                        }
+                    }
                 } else {
                     ctx.lifecycle_enabled_sessions.remove(session);
                 }
