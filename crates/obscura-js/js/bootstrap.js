@@ -11793,7 +11793,10 @@ function _emptyFileList() { return _makeFileList([]); }
 // read them via FileReader or upload them via fetch/FormData, then input+change
 // fire as a genuine selection would (issue #359).
 globalThis.__obscura_setInputFiles = function(el, specs) {
-  const files = (specs || []).map((s) => {
+  // CDP represents an OS file selection: without multiple, only one file
+  // can be selected, even if the automation client provided several paths.
+  const selected = el.hasAttribute("multiple") ? (specs || []) : (specs || []).slice(0, 1);
+  const files = selected.map((s) => {
     let bytes;
     try {
       const bin = atob(s.b64 || "");
