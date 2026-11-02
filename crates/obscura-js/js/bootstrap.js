@@ -7081,8 +7081,9 @@ class Document extends Node {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
     return this._styleSheetList;
   }
-  get forms() { return this.querySelectorAll("form"); }
-  get images() { return this.querySelectorAll("img"); }
+  // HTMLCollections, so legacy `document.forms.frmMain` / `images.logo` resolve.
+  get forms() { return HTMLCollection._from(this.querySelectorAll("form")); }
+  get images() { return HTMLCollection._from(this.querySelectorAll("img")); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
@@ -14384,6 +14385,37 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
+// Form named access (`form.hdLink`, `document.frmMain.txtName.value`): a
+// control's id or name, or an img's, read as a property of its form. A Proxy
+// sits between HTMLFormElement.prototype and Element.prototype, so it is only
+// consulted for names nothing else defines. Own properties and every DOM
+// member still win, unlike Chrome's [LegacyOverrideBuiltIns], so an
+// `<input name="submit">` does not hide form.submit(). Bootstrap-internal
+// `_names` are never looked up. The getPrototypeOf trap keeps Element.prototype
+// on the chain for instanceof.
+function _formNamedValue(form, name) {
+  const matches = [];
+  for (const el of form.elements) {
+    if (el.id === name || el.getAttribute("name") === name) matches.push(el);
+  }
+  if (matches.length === 0) {
+    for (const img of form.querySelectorAll("img")) {
+      if (img.id === name || img.getAttribute("name") === name) matches.push(img);
+    }
+  }
+  if (matches.length === 0) return undefined;
+  return matches.length === 1 ? matches[0] : HTMLCollection._from(matches);
+}
+Object.setPrototypeOf(HTMLFormElement.prototype, new Proxy(Element.prototype, {
+  get(target, key, receiver) {
+    const value = Reflect.get(target, key, receiver);
+    if (value !== undefined || typeof key !== "string" || key[0] === "_" || !(receiver instanceof HTMLFormElement)) {
+      return value;
+    }
+    return _formNamedValue(receiver, key);
+  },
+  getPrototypeOf() { return Element.prototype; },
+}));
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
@@ -14893,6 +14925,7 @@ function _windowNamedValue(name) {
 
 function _ensureWindowNamedProperty(name) {
   name = String(name || "");
+  _ensureDocumentNamedProperty(name);
   if (!name || _windowNamedPropertyNames.has(name)) return;
   // Existing own Window properties win over named elements.
   if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
@@ -14919,6 +14952,7 @@ function _ensureWindowNamedProperty(name) {
 }
 
 function _reconcileWindowNamedProperty(name) {
+  _reconcileDocumentNamedProperty(name);
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
   try { delete globalThis[name]; } catch (_error) {}
@@ -14945,11 +14979,76 @@ function _reconcileWindowNamedProperties(names) {
   if (!doc) return;
   const present = _windowNamedNamesInTree(doc);
   for (const name of names) {
+    _reconcileDocumentNamedProperty(name);
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
       try { delete globalThis[name]; } catch (_error) {}
       _windowNamedPropertyNames.delete(name);
     }
   }
+}
+
+// Document named access (`document.frmMain`). Its names are a subset of the
+// Window's: the name of embed, form, iframe, img and object, the id of object,
+// and the id of an img that also has a name. Accessors are installed and
+// removed alongside the Window ones. Unlike Chrome, a named element never
+// replaces an existing Document member (`<img name="cookie">` leaves
+// document.cookie alone), because the bootstrap reads those members itself.
+const _documentNamedPropertyNames = new WeakMap();
+
+// Filters the native Window candidates with native attribute reads, so page
+// overrides of querySelectorAll/getAttribute cannot change the result.
+function _documentNamedCandidates(doc, name) {
+  if (!doc || !name) return [];
+  const out = [];
+  for (const [nid] of _windowNamedCandidates(name)) {
+    const tag = _domParse("local_name", nid);
+    if (!_windowNamedNameTags.has(tag)) continue;
+    const ownName = _domParse("get_attribute", nid, "name");
+    const byId = _domParse("get_attribute", nid, "id") === name
+      && (tag === "object" || (tag === "img" && !!ownName));
+    if (ownName === name || byId) out.push([nid, tag]);
+  }
+  return out;
+}
+
+function _documentNamedValue(doc, name) {
+  const matches = _documentNamedCandidates(doc, name);
+  if (matches.length === 0) return undefined;
+  if (matches.length === 1) {
+    const [nid, tag] = matches[0];
+    const el = _wrapEl(nid);
+    return tag === "iframe" ? (el.contentWindow || el) : el;
+  }
+  return HTMLCollection._from(matches.map(([nid]) => _wrapEl(nid)));
+}
+
+function _ensureDocumentNamedProperty(name) {
+  const doc = globalThis.document;
+  if (!doc || !name || name in doc) return;
+  if (_documentNamedCandidates(doc, name).length === 0) return;
+  let names = _documentNamedPropertyNames.get(doc);
+  if (!names) _documentNamedPropertyNames.set(doc, names = new Set());
+  try {
+    Object.defineProperty(doc, name, {
+      get() { return _documentNamedValue(doc, name); },
+      set(value) {
+        names.delete(name);
+        Object.defineProperty(doc, name, { value, writable: true, configurable: true, enumerable: true });
+      },
+      configurable: true,
+      enumerable: true,
+    });
+    names.add(name);
+  } catch (_error) {}
+}
+
+function _reconcileDocumentNamedProperty(name) {
+  const doc = globalThis.document;
+  const names = doc && _documentNamedPropertyNames.get(doc);
+  if (!names || !names.has(name)) return;
+  if (_documentNamedCandidates(doc, name).length !== 0) return;
+  try { delete doc[name]; } catch (_error) {}
+  names.delete(name);
 }
 
 globalThis.DOMTokenList = DOMTokenList;
