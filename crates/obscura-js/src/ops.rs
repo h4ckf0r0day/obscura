@@ -28,6 +28,8 @@ use serde::Deserialize;
 use crate::import_map::ImportMap;
 use crate::write_stream::DocumentWriteStream;
 
+mod sync_fetch;
+
 pub type InterceptCallback = Arc<
     Mutex<
         Option<Box<dyn Fn(String, String, String) -> Option<(u16, String, String)> + Send + Sync>>,
@@ -1100,6 +1102,13 @@ fn push_capped(list: &mut Vec<String>, item: String, max: usize) {
         let overflow = list.len() - max;
         list.drain(0..overflow);
     }
+}
+
+/// CDP request id for a scripted fetch()/XHR. Async and synchronous requests
+/// share one counter so `fetch-{N}` ids stay unique and increasing.
+fn next_fetch_request_id() -> String {
+    static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
@@ -3439,14 +3448,17 @@ pub fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client,
             return Ok(client.clone());
         }
     }
-    let client = build_request_client(proxy_url)?;
+    let client = build_request_client(proxy_url, false)?;
     if let Ok(mut write) = cache.write() {
         write.entry(key).or_insert_with(|| client.clone());
     }
     Ok(client)
 }
 
-fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+fn build_request_client(
+    proxy_url: Option<&str>,
+    allow_private_network: bool,
+) -> Result<reqwest::Client, String> {
     // Redirects are followed manually below so each hop can be re-validated
     // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
     // With reqwest's default auto-follow, an attacker-controlled origin can
@@ -3464,7 +3476,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .timeout(fetch_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
-            false,
+            allow_private_network,
         )))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
@@ -3994,8 +4006,7 @@ async fn fetch_url_inner(
         // Allocate once, before interception. CDP must use this identity for
         // the request start, completion and retained response body.
         // The CDP resolver map spans pages and navigations on a connection.
-        static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let request_id = next_fetch_request_id();
         let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
             gs.intercept_tx.clone()
         } else {
@@ -7828,6 +7839,7 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_report_browser_exception(),
         op_fetch_url(),
+        sync_fetch::op_fetch_url_sync(),
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),

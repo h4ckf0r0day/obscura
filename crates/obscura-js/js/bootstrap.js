@@ -8897,6 +8897,45 @@ _markNative(XMLHttpRequestEventTarget.prototype.addEventListener);
 _markNative(XMLHttpRequestEventTarget.prototype.removeEventListener);
 _markNative(XMLHttpRequestEventTarget.prototype.dispatchEvent);
 
+// Synchronous send() (issue #908). The exchange completes inside
+// op_fetch_url_sync before this returns. Per the XHR spec a sync request
+// fires no loadstart/progress/readyState 2-3 events; on success it ends with
+// readystatechange(4), load and loadend, and on a network error it throws a
+// NetworkError DOMException without firing events.
+function _xhrSendSync(xhr, body) {
+  if (xhr.responseType !== '') {
+    throw new DOMException(
+      "Failed to execute 'send' on 'XMLHttpRequest': synchronous requests from a document must not set a response type.",
+      'InvalidAccessError');
+  }
+  const url = _resolveUrl(xhr._url);
+  const method = String(xhr._method || 'GET').toUpperCase();
+  const headers = _filterRequestHeaders(xhr._headers);
+  const bytes = (method === 'GET' || method === 'HEAD') ? new Uint8Array(0) : _serializeBody(body, headers, true);
+  let pageOrigin = '';
+  try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch (e) {}
+  const parsed = JSON.parse(__obscuraCore.ops.op_fetch_url_sync(
+    url, method, JSON.stringify(headers), bytes, pageOrigin,
+    xhr.withCredentials ? 'include' : 'same-origin'));
+  if (xhr._aborted) return;
+  if (parsed.blocked || parsed.failed || parsed.corsBlocked) {
+    xhr.status = 0;
+    xhr.readyState = 4;
+    throw new DOMException(
+      "Failed to execute 'send' on 'XMLHttpRequest': Failed to load '" + url + "'.", 'NetworkError');
+  }
+  xhr.status = parsed.status;
+  xhr.statusText = parsed.statusText || '';
+  xhr.responseURL = parsed.url || url;
+  for (const [k, v] of Object.entries(parsed.headers || {})) xhr._responseHeaders[k] = v;
+  const text = new TextDecoder().decode(_base64ToUint8Array(parsed.bodyBase64 || ''));
+  xhr.responseText = text;
+  xhr.response = text;
+  xhr._setReadyState(4);
+  xhr._fireEvent('load');
+  xhr._fireEvent('loadend');
+}
+
 globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarget {
   static UNSENT = 0;
   static OPENED = 1;
@@ -8937,6 +8976,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   open(method, url, async_) {
     this._method = method;
     this._url = url;
+    // The two-argument form is async. With three or more arguments `async`
+    // is a boolean, so an explicit undefined means synchronous (issue #908).
+    this._async = arguments.length < 3 ? true : !!async_;
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -8971,6 +9013,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   send(body) {
     if (this.readyState !== 1) return;
     if (this._aborted) return;
+    if (this._async === false) {
+      _xhrSendSync(this, body);
+      return;
+    }
 
     const xhr = this;
     this._fireEvent('loadstart');
