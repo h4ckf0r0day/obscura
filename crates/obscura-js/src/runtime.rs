@@ -9032,6 +9032,197 @@ mod tests {
     }
 
     #[test]
+    fn custom_element_attribute_reactions_observe_removal_and_can_restore_the_attribute() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const log = [];
+            class RestoreEl extends HTMLElement {
+                static get observedAttributes() { return ['mode']; }
+                attributeChangedCallback(name, oldValue, newValue) {
+                    log.push([oldValue, newValue, this.getAttribute(name)]);
+                    if (newValue === null) this.setAttribute(name, 'restored');
+                }
+            }
+            customElements.define('restore-el', RestoreEl);
+            const results = [];
+            for (const remove of [
+                el => el.removeAttribute('mode'),
+                el => el.toggleAttribute('mode', false),
+                el => el.removeAttributeNS(null, 'mode'),
+            ]) {
+                const el = document.createElement('restore-el');
+                el.setAttribute('mode', 'before');
+                log.length = 0;
+                remove(el);
+                results.push([log.slice(), el.getAttribute('mode'), el.getAttributeNS(null, 'mode')]);
+            }
+            return results;
+        "#).unwrap();
+        let expected = serde_json::json!([
+            [["before", null, null], [null, "restored", "restored"]], "restored", "restored"
+        ]);
+        assert_eq!(result, serde_json::json!([expected, expected, expected]));
+    }
+
+    #[test]
+    fn custom_element_namespace_reactions_observe_updated_attributes_and_style() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const log = [];
+            class StyledEl extends HTMLElement {
+                static get observedAttributes() { return ['style']; }
+                attributeChangedCallback(name, oldValue, newValue) {
+                    log.push([newValue, this.getAttribute(name), this.style.color]);
+                    if (newValue === null) this.setAttribute('style', 'color: red');
+                }
+            }
+            customElements.define('styled-el', StyledEl);
+            const el = document.createElement('styled-el');
+            el.setAttribute('style', 'color: blue');
+            log.length = 0;
+            el.setAttributeNS(null, 'style', 'color: green');
+            el.removeAttributeNS(null, 'style');
+            return [log, el.getAttribute('style'), el.style.color];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [["color: green", "color: green", "green"], [null, null, ""],
+                ["color: red", "color: red", "red"]],
+            "color: red", "red"
+        ]));
+    }
+
+    #[test]
+    fn custom_elements_connect_and_upgrade_on_insertion() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class XEl extends HTMLElement {
+                    constructor() { super(); log.push('ctor'); }
+                    connectedCallback() {
+                        log.push('connected');
+                        if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+                    }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('x-el', XEl);
+                const created = document.createElement('x-el');
+                log.push('created');
+                document.body.appendChild(created);
+                log.push('appended:' + (created.shadowRoot !== null));
+                const holder = document.createElement('div');
+                holder.innerHTML = '<x-el></x-el>';
+                log.push('parsed:' + (holder.firstChild instanceof XEl));
+                document.body.appendChild(holder);
+                log.push('inner:' + (holder.firstChild.shadowRoot !== null));
+                document.body.innerHTML = '<x-el></x-el>';
+                log.push('set:' + (document.body.firstChild instanceof XEl));
+                document.body.firstChild.remove();
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "ctor", "created", "connected", "appended:true",
+                "parsed:false", "ctor", "connected", "inner:true",
+                "disconnected", "disconnected", "ctor", "connected", "set:true",
+                "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_get_reactions_for_moves_and_observed_attributes() {
+        let mut rt = setup_runtime(r#"<html><body><a-el id="a" mode="x" other="y"></a-el><p id="p"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class AEl extends HTMLElement {
+                    static get observedAttributes() { return ['mode']; }
+                    attributeChangedCallback(name, oldValue, newValue) {
+                        log.push(name + ':' + oldValue + '>' + newValue);
+                    }
+                    connectedCallback() { log.push('connected'); }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('a-el', AEl);
+                const a = document.getElementById('a');
+                a.setAttribute('mode', 'y');
+                a.setAttribute('other', 'z');
+                a.removeAttribute('mode');
+                a.removeAttribute('mode');
+                document.getElementById('p').appendChild(a);
+                const detached = document.createElement('div');
+                detached.appendChild(a);
+                detached.removeChild(a);
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "mode:null>x", "connected", "mode:x>y", "mode:y>null",
+                "disconnected", "connected", "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_in_a_connected_shadow_tree_connect() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class InEl extends HTMLElement {
+                    connectedCallback() { log.push('inner'); }
+                }
+                class OutEl extends HTMLElement {
+                    connectedCallback() {
+                        const root = this.attachShadow({ mode: 'open' });
+                        root.innerHTML = '<in-el></in-el>';
+                        log.push('outer');
+                    }
+                }
+                customElements.define('in-el', InEl);
+                customElements.define('out-el', OutEl);
+                const host = document.createElement('out-el');
+                document.body.appendChild(host);
+                host.shadowRoot.appendChild(document.createElement('in-el'));
+                return [log, host.shadowRoot.firstChild instanceof InEl];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([["inner", "outer", "inner"], true]));
+    }
+
+    #[test]
+    fn throwing_connected_callback_is_reported_not_thrown() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const reported = [];
+                globalThis.reportError = (e) => reported.push(e.message);
+                class BadEl extends HTMLElement {
+                    connectedCallback() { throw new Error('connect failed'); }
+                }
+                customElements.define('bad-el', BadEl);
+                const el = document.createElement('bad-el');
+                document.body.appendChild(el);
+                return [el.isConnected, reported];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, ["connect failed"]]));
+    }
+
+    #[test]
     fn editing_command_detection_reports_unsupported_commands_without_mutation() {
         let mut rt = setup_runtime("<body><p>unchanged</p><iframe></iframe></body>");
         assert_eq!(rt.evaluate(r#"(() => {
