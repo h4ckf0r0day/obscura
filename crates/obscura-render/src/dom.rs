@@ -4098,6 +4098,9 @@ fn retained_style_plan(
         }
 
         let map = sheet.invalidation_map();
+        if map.has_dynamic_attribute_reads() {
+            return RetainedStylePlan::Full;
+        }
         let mut dependencies = Vec::new();
         dependencies.extend_from_slice(map.attribute_dependencies(&name));
         if name == "id" {
@@ -4212,12 +4215,17 @@ fn shadow_stylesheets_ignore_attributes<'a>(
     viewport: (f32, f32),
     names: impl Iterator<Item = &'a str> + Clone,
 ) -> bool {
-    collect_shadow_stylesheets(tree, viewport, crate::CssMediaType::Screen)
+    collect_shadow_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen)
         .values()
-        .all(|sheet| {
-            names
-                .clone()
-                .all(|name| sheet.invalidation_map().attribute_dependencies(name).is_empty())
+        .flatten()
+        .all(|source| {
+            let bytes = source.as_bytes();
+            // shortcut: uncertain source spellings use full layout; avoid parsing
+            // shadow CSS twice when a dependency already requires that fallback.
+            !bytes.contains(&b'\\')
+                && !bytes.windows(4).any(|part| part.eq_ignore_ascii_case(b"attr"))
+                && names.clone().all(|name| !name.is_empty()
+                    && !bytes.windows(name.len()).any(|part| part.eq_ignore_ascii_case(name.as_bytes())))
         })
 }
 
@@ -4261,7 +4269,8 @@ pub(crate) fn image_source_updates_without_style_damage(
     }
     let sources = document_stylesheet_sources(tree, viewport, crate::CssMediaType::Screen);
     let (sheet, cache_hit) = cache.get_or_parse(tree, &sources, viewport, crate::CssMediaType::Screen);
-    if !cache_hit || names.iter().any(|name| !sheet.invalidation_map().attribute_dependencies(name).is_empty())
+    if !cache_hit || sheet.invalidation_map().has_dynamic_attribute_reads()
+        || names.iter().any(|name| !sheet.invalidation_map().attribute_dependencies(name).is_empty())
         || !shadow_stylesheets_ignore_attributes(tree, viewport, names.iter().map(String::as_str))
     {
         return None;
@@ -4490,6 +4499,25 @@ fn collect_shadow_stylesheets(
     viewport: (f32, f32),
     media_type: crate::CssMediaType,
 ) -> HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>> {
+    collect_shadow_stylesheet_sources(tree, viewport, media_type)
+        .into_iter()
+        .map(|(root, sources)| {
+            let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
+                tree, &sources, viewport, media_type,
+            );
+            (root, std::sync::Arc::new(sheet))
+        })
+        .collect()
+}
+
+fn collect_shadow_stylesheet_sources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+) -> HashMap<NodeId, Vec<String>> {
+    if !tree.has_shadow_roots() {
+        return HashMap::new();
+    }
     let external = tree.external_stylesheets();
     let mut roots = Vec::new();
     let mut stack = vec![tree.document()];
@@ -4542,10 +4570,7 @@ fn collect_shadow_stylesheets(
                     sources.push(tree.text_content(node_id));
                 }
             }
-            let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
-                tree, &sources, viewport, media_type,
-            );
-            (root, std::sync::Arc::new(sheet))
+            (root, sources)
         })
         .collect()
 }
