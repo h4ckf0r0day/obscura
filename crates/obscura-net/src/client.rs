@@ -640,17 +640,35 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
+/// Whether requests through `proxy_url` leave the target name for the proxy to
+/// resolve. `socks5://` and `socks4://` resolve the target locally through
+/// `SsrfGuardResolver` and hand the proxy a checked address, so they need no
+/// second lookup. HTTP(S) proxies, `socks5h://` and `socks4a://` resolve it
+/// themselves.
+pub fn proxy_resolves_remotely(proxy_url: Option<&str>) -> bool {
+    let Some(proxy_url) = proxy_url else {
+        return false;
+    };
+    let scheme = Url::parse(proxy_url).map(|url| url.scheme().to_ascii_lowercase());
+    !matches!(scheme.as_deref(), Ok("socks5" | "socks4"))
+}
+
 /// The DNS half of the SSRF gate for a request that goes through a proxy.
 ///
-/// With a proxy configured, reqwest and wreq resolve only the proxy's own host
-/// and hand the target name to the proxy unresolved, so `SsrfGuardResolver`
-/// never sees it and a name that resolves to 127.0.0.1 or 169.254.169.254 would
-/// be fetched by the proxy. This resolves the target locally and applies the
-/// same deny-set. A name that does not resolve locally is refused as well:
+/// With a proxy that resolves names itself (see `proxy_resolves_remotely`),
+/// reqwest and wreq resolve only the proxy's own host and hand it the target
+/// name unresolved, so `SsrfGuardResolver` never sees it and a name that
+/// resolves to 127.0.0.1 or 169.254.169.254 would be fetched by the proxy. This
+/// resolves the target locally and applies the same deny-set. A name that does
+/// not resolve locally is refused as well:
 /// otherwise a name only the proxy's network knows (an internal zone,
 /// metadata.google.internal) would pass unchecked. Literal IP hosts are left to
 /// `validate_url`, which already checks them. Every transport calls this at the
 /// same points as `validate_url`, for the first request and for each redirect.
+///
+/// The proxy still resolves the name a second time, so a name whose answer
+/// changes between the two lookups (DNS rebinding) can get past this check;
+/// only handing the proxy the checked address closes that, as `socks5://` does.
 pub async fn validate_proxied_host(url: &Url, allow_private_network: bool) -> Result<(), String> {
     if allow_private_network || env_allows_private_network() {
         return Ok(());
@@ -658,6 +676,12 @@ pub async fn validate_proxied_host(url: &Url, allow_private_network: bool) -> Re
     let Some(url::Host::Domain(domain)) = url.host() else {
         return Ok(());
     };
+    // RFC 7686: an .onion name is never sent to DNS. Only the proxy's Tor
+    // network can reach it, so a local lookup would leak it and always fail.
+    let lower = domain.to_ascii_lowercase();
+    if lower == "onion" || lower.ends_with(".onion") {
+        return Ok(());
+    }
     let port = url.port_or_known_default().unwrap_or(80);
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
         .await
@@ -1462,7 +1486,7 @@ impl ObscuraHttpClient {
         mut request_headers: Option<HashMap<String, String>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
-        if self.proxy_url.is_some() {
+        if proxy_resolves_remotely(self.proxy_url.as_deref()) {
             validate_proxied_host(url, self.allow_private_network).await.map_err(ObscuraNetError::Network)?;
         }
         validate_request_mode(&request, url)?;
@@ -1702,7 +1726,7 @@ impl ObscuraHttpClient {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
-                    if self.proxy_url.is_some() {
+                    if proxy_resolves_remotely(self.proxy_url.as_deref()) {
                         validate_proxied_host(&next_url, self.allow_private_network)
                             .await
                             .map_err(ObscuraNetError::Network)?;
@@ -2113,6 +2137,18 @@ mod ssrf_tests {
         // Literal IPs are validate_url's job; the opt-in lifts the check.
         assert!(check("http://127.0.0.1/", false).await.is_ok());
         assert!(check("http://localhost/", true).await.is_ok());
+        // .onion never reaches DNS (RFC 7686); only the proxy can resolve it.
+        assert!(check("http://example2zxdsjqbe.onion/", false).await.is_ok());
+    }
+
+    #[test]
+    fn only_proxies_that_resolve_names_themselves_need_the_check() {
+        assert!(!super::proxy_resolves_remotely(None));
+        assert!(!super::proxy_resolves_remotely(Some("socks5://127.0.0.1:1080")));
+        assert!(!super::proxy_resolves_remotely(Some("SOCKS4://127.0.0.1:1080")));
+        for proxy in ["http://p:8080", "https://p:8443", "socks5h://p:1080", "socks4a://p:1080"] {
+            assert!(super::proxy_resolves_remotely(Some(proxy)), "{proxy}");
+        }
     }
 
     #[test]

@@ -4023,7 +4023,7 @@ async fn fetch_url_inner(
     // Same rule as the rewrite below: a URL the gate cannot parse is one it
     // cannot check, so it never reaches the transport.
     let gate_error = match url::Url::parse(&url) {
-        Ok(parsed_url) => gate_fetch_url(&parsed_url, allow_private_network, proxy_url.is_some()).await.err(),
+        Ok(parsed_url) => gate_fetch_url(&parsed_url, allow_private_network, obscura_net::proxy_resolves_remotely(proxy_url.as_deref())).await.err(),
         Err(err) => Some(format!("Unparsable URL blocked: {}", err)),
     };
     if let Some(e) = gate_error {
@@ -4168,7 +4168,7 @@ async fn fetch_url_inner(
                 .to_string());
             }
         };
-        if let Err(reason) = gate_fetch_url(&parsed, allow_private_network, proxy_url.is_some()).await {
+        if let Err(reason) = gate_fetch_url(&parsed, allow_private_network, obscura_net::proxy_resolves_remotely(proxy_url.as_deref())).await {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -4480,7 +4480,7 @@ async fn fetch_url_inner(
         };
 
         // Re-validate every redirect target against the SSRF policy.
-        if let Err(reason) = gate_fetch_url(&next_url, allow_private_network, proxy_url.is_some()).await {
+        if let Err(reason) = gate_fetch_url(&next_url, allow_private_network, obscura_net::proxy_resolves_remotely(proxy_url.as_deref())).await {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",

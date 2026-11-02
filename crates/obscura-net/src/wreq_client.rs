@@ -18,7 +18,8 @@ use url::Url;
 use crate::client::{
     cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
     redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
-    same_site_context, serialized_request_origin, validate_cors_response, validate_proxied_host,
+    proxy_resolves_remotely, same_site_context, serialized_request_origin, validate_cors_response,
+    validate_proxied_host,
     validate_request_mode, validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError,
     RequestInfo, RequestMode, ResourceRequest, Response, SsrfGuardResolver,
 };
@@ -187,7 +188,7 @@ async fn send_get_with_connection_reset_retry(
 pub struct StealthHttpClient {
     client: wreq::Client,
     allow_private_network: bool,
-    /// A proxy is configured, so targets need `validate_proxied_host`.
+    /// The proxy resolves target names itself, so they need `validate_proxied_host`.
     proxied: bool,
     /// Lets `fetch_file_url` read local files. Off by default.
     pub allow_file_access: bool,
@@ -285,7 +286,7 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             allow_private_network,
-            proxied: proxy_url.is_some(),
+            proxied: proxy_resolves_remotely(proxy_url),
             allow_file_access: false,
             block_trackers: tracker_blocking_enabled(
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
@@ -304,8 +305,8 @@ impl StealthHttpClient {
         self
     }
 
-    /// True when requests leave through a proxy, so callers that validate
-    /// URLs themselves must also run `validate_proxied_host`.
+    /// True when the proxy resolves target names itself, so callers that
+    /// validate URLs themselves must also run `validate_proxied_host`.
     pub fn is_proxied(&self) -> bool {
         self.proxied
     }

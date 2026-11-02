@@ -11,7 +11,7 @@ pub use client::{
     env_allows_private_network, is_forbidden_ip, CallbackRegistry, ObscuraHttpClient,
     ObscuraNetError, RequestCallback, RequestCredentials, RequestInfo, RequestMode,
     ResourceRequest, ResourceType, Response, ResponseCallback, SsrfGuardResolver,
-    validate_proxied_host,
+    proxy_resolves_remotely, validate_proxied_host,
 };
 pub use cookies::{
     canonical_domain, default_cookie_path, same_site, CookieInfo, CookieJar, SameSiteContext,
