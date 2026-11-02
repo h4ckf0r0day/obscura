@@ -6,16 +6,13 @@
 /// Must be evaluated against a Page that has a fully-bootstrapped JS runtime.
 pub const HTML_TO_MARKDOWN_JS: &str = r#"
 (function() {
-    function toMd(el, depth) {
-        if (!el) return '';
-        var out = '';
-        if (el.nodeType === 3) return el.textContent || '';
-        if (el.nodeType !== 1) return '';
+    // Post-order walk on an explicit stack: a deep tree cannot overflow the
+    // JS stack, and every node is converted once. A <tr> reuses its cells'
+    // results instead of converting each cell again, which doubled the work
+    // for every level of nested tables.
+    function finish(el, frame) {
         var tag = (el.tagName || '').toLowerCase();
-        var children = '';
-        var cn = el.childNodes || [];
-        for (var i = 0; i < cn.length; i++) children += toMd(cn[i], depth);
-        children = children.replace(/\n{3,}/g, '\n\n');
+        var children = frame.parts.join('').replace(/\n{3,}/g, '\n\n');
         switch(tag) {
             case 'h1': return '\n# ' + children.trim() + '\n\n';
             case 'h2': return '\n## ' + children.trim() + '\n\n';
@@ -50,10 +47,7 @@ pub const HTML_TO_MARKDOWN_JS: &str = r#"
             case 'thead': case 'tbody': case 'tfoot': return children;
             case 'tr':
                 var cells = [];
-                var tds = el.childNodes || [];
-                for (var j = 0; j < tds.length; j++) {
-                    if (tds[j].nodeType === 1) cells.push(toMd(tds[j], depth).trim());
-                }
+                for (var j = 0; j < frame.cells.length; j++) cells.push(frame.cells[j].trim());
                 return '| ' + cells.join(' | ') + ' |\n';
             case 'th': case 'td': return children;
             case 'script': case 'style': case 'noscript': case 'link': case 'meta': return '';
@@ -64,7 +58,25 @@ pub const HTML_TO_MARKDOWN_JS: &str = r#"
         }
     }
     var body = document.body || document.documentElement;
-    var md = toMd(body, 0);
+    if (!body) return '';
+    var stack = [{ node: body, index: 0, parts: [], cells: [] }];
+    var md = '';
+    while (stack.length) {
+        var frame = stack[stack.length - 1];
+        var cn = frame.node.childNodes || [];
+        if (frame.index < cn.length) {
+            var child = cn[frame.index++];
+            if (child.nodeType === 3) frame.parts.push(child.textContent || '');
+            else if (child.nodeType === 1) stack.push({ node: child, index: 0, parts: [], cells: [] });
+            continue;
+        }
+        stack.pop();
+        var out = finish(frame.node, frame);
+        if (!stack.length) { md = out; break; }
+        var parent = stack[stack.length - 1];
+        parent.parts.push(out);
+        parent.cells.push(out);
+    }
     md = md.replace(/\n{3,}/g, '\n\n').trim();
     return md;
 })()
