@@ -169,6 +169,11 @@ await browser.disconnect();  // leaves obscura serve running
 
 ## Page lifecycle
 
+`Page.setLifecycleEventsEnabled` replays completed lifecycle phases for the
+current main-frame document to the requesting session, with their original
+timestamps and loader ID. This lets a client attach after the initial page load
+without waiting for a load event that has already happened.
+
 `Page.stopLoading` cancels an in-flight document or parser-resource request,
 clears queued document navigation, and leaves the target usable. Rendering
 builds also cancel pending image/font loads, including `Image`/`decode()`
