@@ -4488,13 +4488,13 @@ class Element extends Node {
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
-    if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [localName, customOldValue, value, ns || null]);
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
+    if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [localName, customOldValue, value, ns || null]);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -4511,7 +4511,6 @@ class Element extends Node {
     _dom("remove_attribute", this._nid, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
-    if (customOldValue !== null) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, null, null]);
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
@@ -4537,6 +4536,7 @@ class Element extends Node {
         image._imageSourceChanged();
       }
     }
+    if (customOldValue !== null) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, null, null]);
   }
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
@@ -4550,10 +4550,10 @@ class Element extends Node {
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
-    if (customOldValue !== null) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, null, ns || null]);
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
+    if (customOldValue !== null) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, null, ns || null]);
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
