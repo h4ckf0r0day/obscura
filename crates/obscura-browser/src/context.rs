@@ -618,12 +618,6 @@ mod tests {
         assert_eq!(profile.local_storage.get("https://app.example", "secret"), None);
         assert!(!Arc::ptr_eq(&a.indexed_db, &b.indexed_db));
         assert!(!Arc::ptr_eq(&a.indexed_db, &profile.indexed_db));
-        // Closing a connection merges only the origins it changed.
-        b.local_storage.set("https://other.example", "k".into(), "b".into());
-        a.local_storage.merge_changed_into(&profile.local_storage);
-        assert_eq!(profile.local_storage.get("https://app.example", "secret"), Some("a".to_string()));
-        assert_eq!(profile.local_storage.get("https://other.example", "k"), None);
-        assert_eq!(profile.local_storage.changed_origins(), vec!["https://app.example".to_string()]);
     }
 
     /// An unchanged store must not touch the disk, or every navigation on a

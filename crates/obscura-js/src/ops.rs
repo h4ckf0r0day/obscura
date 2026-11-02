@@ -321,17 +321,6 @@ impl OriginStorage {
         copy
     }
 
-    /// Write the origins this store changed into `target` and mark them changed
-    /// there, so the target's next flush persists them. Origins this store did
-    /// not touch keep the target's value.
-    pub fn merge_changed_into(&self, target: &OriginStorage) {
-        for origin in self.changed_origins() {
-            if target.load(&origin, self.snapshot(&origin)) {
-                target.lock().changed.insert(origin);
-            }
-        }
-    }
-
     pub fn clear(&self, origin: &str) {
         let mut inner = self.lock();
         if let Some(entries) = inner.origins.remove(origin) {

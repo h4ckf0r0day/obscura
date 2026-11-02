@@ -533,10 +533,11 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     bctx.set_allow_file_access(allow_file_access);
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
-    // Cookie deltas are merged here, but new connections always clone the
-    // immutable startup snapshot and can never inherit another live client's
-    // session state.
-    let persistence_ctx = Arc::new(shared_ctx.isolated_copy("persistence".to_string(), true));
+    // Cookie and localStorage deltas are merged here, but new connections
+    // always clone the immutable startup snapshot and can never inherit another
+    // live client's session state. A connection copy (not a persistent copy)
+    // keeps the template's localStorage out of the merge target.
+    let persistence_ctx = Arc::new(shared_ctx.connection_copy("persistence".to_string()));
     let persistence_lock = Arc::new(std::sync::Mutex::new(()));
 
     // One graceful-shutdown watcher for the whole server. It flips the accept
@@ -837,6 +838,7 @@ fn run_connection(
                 context_template.connection_copy("default".to_string()),
             );
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
+            let initial_local_storage = default_context.local_storage.entries();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -930,7 +932,11 @@ fn run_connection(
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
-                persisted_context.local_storage.merge_changed_into(&persistence_context.local_storage);
+                merge_local_storage_delta(
+                    &persistence_context.local_storage,
+                    &initial_local_storage,
+                    &persisted_context.local_storage.entries(),
+                );
                 persistence_context.save_storage();
             }
 
@@ -944,6 +950,40 @@ fn run_connection(
     if let Err(e) = spawned {
         error!("connection thread spawn failed: {}", e);
         live_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+type OriginEntries = [(String, Vec<(String, String)>)];
+
+/// localStorage counterpart of `merge_cookie_delta`: apply only the keys this
+/// connection set or removed, so two connections that wrote different keys of
+/// one origin both keep them and an untouched key never overwrites a newer one.
+fn merge_local_storage_delta(
+    destination: &obscura_js::ops::OriginStorage,
+    initial: &OriginEntries,
+    current: &OriginEntries,
+) {
+    let index = |entries: &OriginEntries| -> HashMap<String, HashMap<String, String>> {
+        entries
+            .iter()
+            .map(|(origin, items)| (origin.clone(), items.iter().cloned().collect()))
+            .collect()
+    };
+    let initial = index(initial);
+    let current = index(current);
+    for (origin, items) in &initial {
+        for key in items.keys() {
+            if !current.get(origin).is_some_and(|now| now.contains_key(key)) {
+                destination.remove(origin, key);
+            }
+        }
+    }
+    for (origin, items) in &current {
+        for (key, value) in items {
+            if initial.get(origin).and_then(|before| before.get(key)) != Some(value) {
+                destination.set(origin, key.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -2421,8 +2461,8 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         bearer_authorized, control_refusal, handle_fetch_resolution, is_navigate_method,
-        merge_cookie_delta, parse_cdp_headers, pump_live_page_event_loop,
-        websocket_authority, ControlRefusal,
+        merge_cookie_delta, merge_local_storage_delta, parse_cdp_headers,
+        pump_live_page_event_loop, websocket_authority, ControlRefusal,
     };
     #[cfg(feature = "render")]
     use super::pump_and_forward_screencast_frames;
@@ -3110,6 +3150,27 @@ mod tests {
         assert!(cookies.iter().any(|c| c.name == "other"));
         assert!(cookies.iter().any(|c| c.name == "added"));
         assert!(!cookies.iter().any(|c| c.name == "removed"));
+    }
+
+    #[test]
+    fn local_storage_delta_keeps_keys_from_both_connections() {
+        let origin = "https://app.example";
+        let entries = |items: &[(&str, &str)]| {
+            vec![(origin.to_string(), items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())]
+        };
+        let destination = obscura_js::ops::OriginStorage::default();
+        // Connection A already closed and wrote `a`; `sid` was updated meanwhile.
+        destination.load(origin, vec![("a".into(), "A".into()), ("sid".into(), "newer".into()), ("gone".into(), "x".into())]);
+        // Connection B started from {sid: old, gone: x}, removed `gone`, added `b`.
+        let initial = entries(&[("sid", "old"), ("gone", "x")]);
+        let current = entries(&[("sid", "old"), ("b", "B")]);
+
+        merge_local_storage_delta(&destination, &initial, &current);
+
+        assert_eq!(destination.get(origin, "a"), Some("A".to_string()));
+        assert_eq!(destination.get(origin, "b"), Some("B".to_string()));
+        assert_eq!(destination.get(origin, "sid"), Some("newer".to_string()));
+        assert_eq!(destination.get(origin, "gone"), None);
     }
 
     #[cfg(feature = "render")]
