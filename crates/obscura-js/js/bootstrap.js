@@ -8767,7 +8767,7 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
     : (request ? request.body : undefined);
   const body = _serializeBody(initBody, _h, !(inheritsRequestBody && init.headers !== undefined));
   const hdrs = JSON.stringify(_h);
-  const fetchMode = init.mode || (request ? request.mode : "cors");
+  const fetchMode = _checkRequestMode(init.mode !== undefined ? String(init.mode) : (request ? request.mode : "cors"), "fetch");
   const fetchRedirect = init.redirect || (request ? request.redirect : "follow");
   const fetchCredentials = init.credentials !== undefined
     ? String(init.credentials)
@@ -8845,6 +8845,15 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   }
   return response;
 });
+// RequestMode is an enum: an unknown value is a TypeError, and a page may not
+// construct a navigate-mode request. The native fetch also fails closed, but
+// the error must reach the page the way browsers raise it.
+function _checkRequestMode(mode, where) {
+  if (mode === "cors" || mode === "no-cors" || mode === "same-origin") return mode;
+  throw new TypeError(mode === "navigate"
+    ? "Failed to execute '" + where + "': Cannot construct a Request with a RequestInit whose mode member is set as 'navigate'."
+    : "Failed to execute '" + where + "': The provided value '" + mode + "' is not a valid enum value of type RequestMode.");
+}
 globalThis.fetch = (input, init = {}) => _fetch(input, init);
 
 if (typeof Headers === "undefined") {
@@ -9227,7 +9236,7 @@ if (typeof Request === 'undefined') {
       this.headers = new Headers(_filterRequestHeaders(init.headers));
       _requestHeaderGuards.add(this.headers);
       this.body = init.body || null;
-      this.mode = init.mode || 'cors';
+      this.mode = _checkRequestMode(init.mode !== undefined ? String(init.mode) : (input?.mode || 'cors'), "Request");
       this.credentials = init.credentials !== undefined
         ? String(init.credentials)
         : (inputRequest ? inputRequest.credentials : 'same-origin');

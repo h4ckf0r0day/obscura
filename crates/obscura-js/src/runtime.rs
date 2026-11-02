@@ -23071,6 +23071,47 @@ mod tests {
         );
     }
 
+    // Only "cors" got CORS checks and only "no-cors" made answers opaque, so any
+    // other mode string read cross-origin responses. Unknown values must be a
+    // TypeError and same-origin mode must refuse another origin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_modes_other_than_cors_and_no_cors_cannot_read_other_origins() {
+        let (mut rt, redirector) = cross_origin_intermediate_redirect_runtime();
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        const out = [];
+                        for (const mode of ["same-origin", "NAVIGATE", "navigate", "websocket"]) {{
+                            try {{
+                                await fetch("{redirector}/start", {{ mode }});
+                                out.push(mode + ": allowed");
+                            }} catch (e) {{
+                                out.push(mode + ": " + e.name);
+                            }}
+                        }}
+                        try {{ new Request("{redirector}/start", {{ mode: "navigate" }}); out.push("Request navigate: allowed"); }}
+                        catch (e) {{ out.push("Request navigate: " + e.name); }}
+                        return out;
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                "same-origin: TypeError", "NAVIGATE: TypeError", "navigate: TypeError",
+                "websocket: TypeError", "Request navigate: TypeError",
+            ])
+        );
+    }
+
     /// HTTP-redirect fetch returns a network error as soon as the
     /// redirect count *reaches* 20, and only increments it afterwards. So
     /// the twentieth hop must still succeed:
