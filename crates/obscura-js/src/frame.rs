@@ -130,16 +130,14 @@ impl FrameRealm {
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
         // top-level has already taken the wrong branch.
-        realm
-            .run(
-                parent,
-                &format!(
-                    "globalThis.__obscura_frameId = {frame_id};\
-                     globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();"
-                ),
-            )
-            .ok()?;
+        let watchdog = parent.arm_watchdog(std::time::Duration::from_secs(5));
+        let initialized = realm.run(parent, &format!(
+            "globalThis.__obscura_frameId = {frame_id};\
+             globalThis.__obscura_parentFrameId = {parent_frame_id};\
+             globalThis.__obscura_init();"
+        ));
+        parent.disarm_watchdog(watchdog);
+        initialized.ok()?;
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
