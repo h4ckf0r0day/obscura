@@ -15713,6 +15713,7 @@ function _frameWindowFor(frameId) {
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
+  const parentId = Reflect.get(real, '__obscura_parentFrameId') || 0;
   const post = _markNative(function (data, targetOrigin, _transfer) {
     _sendRealmMessage(frameId, data, targetOrigin);
   });
@@ -15720,6 +15721,11 @@ function _frameWindowFor(frameId) {
     get(target, prop) {
       if (prop === 'postMessage') return post;
       if (prop === '__obscura_wrapsRealm') return true;
+      // Message sources can be grandchildren. Resolve their actual parent in
+      // the caller's realm so replies keep both the recipient and sender.
+      if (prop === 'parent') return parentId === _realmFrameId
+        ? globalThis : (_frameWindowFor(parentId) || _remoteWindow(parentId));
+      if (prop === 'top') return globalThis.top;
       // Not `receiver`: an accessor on a real global must run with the global
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
