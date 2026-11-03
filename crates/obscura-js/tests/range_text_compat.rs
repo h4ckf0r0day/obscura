@@ -32,6 +32,7 @@ fn set_range_text_matches_chromium_for_empty_and_nonempty_controls() {
         run('beyond', 'abc', [0, 0], 'X', [6, 9]);
         const i = document.getElementById('i');
         i.value = 'abc';
+        out.inputAssignment = [i.selectionStart, i.selectionEnd];
         i.setRangeText('X', 1, 2);
         out.input = [i.value, i.selectionStart, i.selectionEnd];
         try { document.getElementById('n').setRangeText('X', 1, 2); }
@@ -51,6 +52,7 @@ fn set_range_text_matches_chromium_for_empty_and_nonempty_controls() {
         "reversed": "IndexSizeError",
         "beyond": ["abcX", 0, 0, "forward"],
         "input": ["aXc", 3, 3],
+        "inputAssignment": [3, 3],
         "number": "InvalidStateError"
     }));
 }

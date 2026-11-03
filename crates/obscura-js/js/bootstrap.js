@@ -4959,6 +4959,13 @@ class Element extends Node {
     if (tag === 'textarea') {
       this.textContent = value;
     }
+    // Programmatic value assignment places the text cursor at the end in
+    // Chromium. setRangeText() uses that position when preserving selection.
+    const type = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
+    if (tag === 'textarea' ||
+        (tag === 'input' && ['text', 'search', 'tel', 'url', 'password'].includes(type))) {
+      this.setSelectionRange(value.length, value.length);
+    }
   }
   get min() { return this.getAttribute('min') || ''; }
   set min(v) { this.setAttribute('min', v); }
