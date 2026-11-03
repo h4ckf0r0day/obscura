@@ -153,8 +153,9 @@ usable on common LTS servers with glibc 2.35+.
 ### Docker
 
 ```bash
+export OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)"
 docker run -d --name obscura -p 127.0.0.1:9222:9222 \
-  -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
+  -e OBSCURA_CDP_TOKEN \
   h4ckf0r0day/obscura
 ```
 
@@ -179,7 +180,7 @@ cargo build --release -p obscura-cli --bins --no-default-features
 cargo build --release -p obscura-cli --bins --no-default-features --features stealth
 ```
 
-Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
+Requires current stable Rust ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
 The stealth build also compiles BoringSSL and generates bindings, so it needs
 CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
 
@@ -228,6 +229,7 @@ obscura fetch https://example.com --screenshot page.png
 
 # The screenshot flag also has a short form
 obscura fetch https://example.com -s page.png
+```
 
 ### Testing against localhost / LAN dev servers
 
@@ -244,7 +246,6 @@ obscura serve --port 9222 --allow-private-network
 
 See [docs/Environment-variables.md](docs/Environment-variables.md) for the
 full allow/deny rules (DNS-resolution-time checks included).
-```
 
 ## Rendering
 
@@ -414,7 +415,7 @@ To download a large resource without one giant `Network.getResponseBody` blob, c
 Obscura embeds V8 directly. Use `--v8-flags` to pass raw flags through to V8, same syntax as Chromium's `--js-flags` and Node's command-line flags. Most common use is raising the heap cap to fix `JavaScript heap out of memory` on JS-heavy pages:
 
 ```bash
-obscura --v8-flags "--max-old-space-size=4096" fetch <url>
+obscura --v8-flags "--max-old-space-size=4096" fetch https://example.com
 ```
 
 ### Heavy SPAs (script execution budget)

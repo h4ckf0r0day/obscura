@@ -2,7 +2,10 @@
 
 Official documentation for Obscura, maintained in this repository.
 
-Obscura is an open-source headless browser engine written in Rust. It runs JavaScript via V8, speaks the Chrome DevTools Protocol, and works as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
+Obscura is an independent headless browser engine written in Rust. It runs
+JavaScript through V8 and provides a Chrome DevTools Protocol endpoint for
+Puppeteer and Playwright. These docs describe the code on `main`; installed
+release versions may differ.
 
 ## Versus headless Chrome
 
