@@ -8,6 +8,15 @@
     "build": "tsc",
     "test": "node --test"
   },
-  "keywords": ["browser", "headless", "automation", "ai-agents", "v8"],
-  "license": "Apache-2.0"
+  "keywords": [
+    "browser",
+    "headless",
+    "automation",
+    "ai-agents",
+    "v8"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^26.6.6"
+  }
 }

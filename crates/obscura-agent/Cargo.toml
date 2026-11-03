@@ -1,6 +1,6 @@
 [package]
 name = "obscura-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Autonomous AI-agent browser action protocol and semantic DOM distillation for Obscura Next"
@@ -15,3 +15,4 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+

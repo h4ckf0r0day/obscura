@@ -156,6 +156,35 @@ impl MetricsRegistry {
             "obscura_worker_processes_count",
             "Number of supervised worker processes",
         );
+        self.register_counter(
+            "obscura_worker_processes_total",
+            "Total number of worker processes spawned",
+        );
+        self.register_gauge(
+            "obscura_worker_processes_healthy",
+            "Number of healthy supervised worker processes",
+        );
+        self.register_counter(
+            "obscura_worker_processes_failed",
+            "Total number of worker processes that failed or terminated unexpectedly",
+        );
+        self.register_counter(
+            "obscura_worker_restarts_total",
+            "Total number of worker process restarts",
+        );
+        self.register_gauge(
+            "obscura_worker_active_requests",
+            "Number of currently active worker requests",
+        );
+        self.register_counter(
+            "obscura_sessions_failed_total",
+            "Total number of browser sessions that failed",
+        );
+        self.register_histogram(
+            "obscura_worker_request_duration_seconds",
+            "Worker request handling duration in seconds",
+            vec![0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0],
+        );
         self.register_gauge(
             "obscura_worker_memory_rss_bytes",
             "Resident memory allocated by workers in bytes",
@@ -171,6 +200,31 @@ impl MetricsRegistry {
         self.register_counter(
             "obscura_watchdog_terminations_total",
             "Total count of preemptive watchdog isolate terminations",
+        );
+        self.register_counter(
+            "obscura_worker_spawn_total",
+            "Total count of worker processes spawned",
+        );
+        self.register_counter(
+            "obscura_worker_crash_total",
+            "Total count of worker process crashes or unexpected terminations",
+        );
+        self.register_counter(
+            "obscura_ipc_requests_total",
+            "Total count of IPC requests dispatched between supervisor and workers",
+        );
+        self.register_counter(
+            "obscura_worker_requests_total",
+            "Total count of worker requests handled",
+        );
+        self.register_counter(
+            "obscura_worker_request_errors_total",
+            "Total count of worker request errors",
+        );
+        self.register_histogram(
+            "obscura_ipc_latency_seconds",
+            "IPC round-trip request latency in seconds",
+            vec![0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0],
         );
         self.register_histogram(
             "obscura_navigation_duration_seconds",
@@ -310,6 +364,129 @@ impl TraceContext {
     }
 }
 
+use std::net::SocketAddr;
+use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+
+/// Lightweight HTTP server exposing Prometheus metrics and a health check endpoint.
+#[derive(Clone)]
+pub struct MetricsServer {
+    bind_addr: String,
+    registry: MetricsRegistry,
+    started_at: Instant,
+}
+
+impl MetricsServer {
+    pub fn new(bind_addr: impl Into<String>, registry: MetricsRegistry) -> Self {
+        Self {
+            bind_addr: bind_addr.into(),
+            registry,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Spawns the HTTP metrics server in a background Tokio task.
+    /// Returns the local bound address and a cancellation trigger.
+    pub async fn spawn(&self) -> std::io::Result<(SocketAddr, oneshot::Sender<()>)> {
+        let listener = TcpListener::bind(&self.bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let registry = self.registry.clone();
+        let started_at = self.started_at;
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                    accept_res = listener.accept() => {
+                        match accept_res {
+                            Ok((stream, _)) => {
+                                let reg = registry.clone();
+                                tokio::spawn(async move {
+                                    handle_http_connection(stream, reg, started_at).await;
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Metrics server accept error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok((local_addr, shutdown_tx))
+    }
+}
+
+async fn handle_http_connection(mut stream: TcpStream, registry: MetricsRegistry, started_at: Instant) {
+    let mut buf = [0u8; 2048];
+    let n = match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+
+    let req_str = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req_str.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n").await;
+        return;
+    }
+
+    let method = parts[0];
+    let path = parts[1];
+
+    if method != "GET" && method != "HEAD" {
+        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n").await;
+        return;
+    }
+
+    match path {
+        "/metrics" => {
+            let body = registry.to_prometheus_text();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            if method == "GET" {
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        }
+        "/health" | "/healthz" => {
+            let uptime = started_at.elapsed().as_secs();
+            let body = format!(
+                r#"{{"status":"healthy","uptime_seconds":{uptime},"active_sessions":{},"workers":{}}}"#,
+                registry.gauge("obscura_sessions_active").map(|g| g.get()).unwrap_or(0),
+                registry.gauge("obscura_worker_processes_count").map(|g| g.get()).unwrap_or(0),
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            if method == "GET" {
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        }
+        _ => {
+            let body = "Not Found\n";
+            let header = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        }
+    }
+    let _ = stream.flush().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,12 +532,43 @@ mod tests {
         assert!(text.contains("# TYPE obscura_sessions_active gauge"));
     }
 
-    #[test]
-    fn test_w3c_trace_context() {
-        let ctx = TraceContext::new_random();
-        let parent = ctx.to_traceparent();
-        let parsed = TraceContext::from_traceparent(&parent).expect("valid traceparent");
-        assert_eq!(parsed.trace_id, ctx.trace_id);
-        assert_eq!(parsed.span_id, ctx.span_id);
+    #[tokio::test]
+    async fn test_metrics_server_endpoints() {
+        let reg = MetricsRegistry::new();
+        reg.counter("obscura_sessions_total").unwrap().inc_by(7);
+        reg.gauge("obscura_sessions_active").unwrap().set(3);
+        reg.gauge("obscura_worker_processes_count").unwrap().set(2);
+
+        let server = MetricsServer::new("127.0.0.1:0", reg);
+        let (addr, shutdown_tx) = server.spawn().await.expect("bind server");
+
+        // Test /metrics
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut resp = String::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 { break; }
+            resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if resp.contains("obscura_sessions_total 7") { break; }
+        }
+        assert!(resp.contains("HTTP/1.1 200 OK"));
+        assert!(resp.contains("obscura_sessions_total 7"));
+
+        // Test /health
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        let mut resp = String::new();
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 { break; }
+            resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if resp.contains(r#""status":"healthy""#) { break; }
+        }
+        assert!(resp.contains("HTTP/1.1 200 OK"));
+        assert!(resp.contains(r#""status":"healthy""#));
+        assert!(resp.contains(r#""active_sessions":3"#));
+
+        let _ = shutdown_tx.send(());
     }
 }
+

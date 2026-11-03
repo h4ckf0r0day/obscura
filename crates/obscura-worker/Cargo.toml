@@ -1,6 +1,6 @@
 [package]
 name = "obscura-worker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Independent runtime worker and session lifecycle manager for Obscura Next"
@@ -9,10 +9,15 @@ description = "Independent runtime worker and session lifecycle manager for Obsc
 name = "obscura-runtime-worker"
 path = "src/bin/worker_main.rs"
 
+[[bin]]
+name = "obscura-worker"
+path = "src/bin/obscura_worker.rs"
+
 [dependencies]
 obscura-browser = { path = "../obscura-browser" }
 obscura-isolation = { path = "../obscura-isolation" }
 obscura-telemetry = { path = "../obscura-telemetry" }
+obscura-agent = { path = "../obscura-agent" }
 obscura-dom = { path = "../obscura-dom" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,3 +30,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+

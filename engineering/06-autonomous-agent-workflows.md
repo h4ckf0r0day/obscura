@@ -54,3 +54,4 @@ The action protocol supports the following atomic agent operations:
 - `screenshot(path, full_page)`: Capture visual verification screenshot.
 - `wait_for_selector(selector, timeout_ms)`: Wait for element to appear in DOM.
 - `wait_for_idle(settle_ms)`: Wait for network requests and DOM mutations to stabilize.
+

@@ -1,6 +1,6 @@
 [package]
 name = "obscura-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Worker supervision tree, self-healing process manager, and lifecycle recycling for Obscura Next"
@@ -17,3 +17,4 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+

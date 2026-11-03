@@ -1,10 +1,12 @@
-# Hardened runtime worker image for Obscura Next
-FROM debian:bookworm-slim
+# Multi-stage hardened runtime worker image for Obscura Next
+# Stage 1: Builder (assumes pre-built binaries or provide a cargo build stage)
+FROM debian:bookworm-slim AS runtime
 
-# Install minimal SSL runtime certificates & ca-certificates
+# Install minimal SSL runtime certificates, ca-certificates, and curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-privileged system user
@@ -12,13 +14,24 @@ RUN groupadd -g 10001 obscura && \
     useradd -u 10001 -g obscura -s /bin/false -m obscura
 
 COPY target/release/obscura /usr/local/bin/obscura
-COPY target/release/obscura-worker /usr/local/bin/obscura-worker
+COPY target/release/obscura-runtime-worker /usr/local/bin/obscura-runtime-worker
+
+# Symlink for compatibility
+RUN ln -sf /usr/local/bin/obscura-runtime-worker /usr/local/bin/obscura-worker
 
 USER obscura:obscura
 WORKDIR /home/obscura
 
 ENV OBSCURA_STEALTH=1
 ENV RUST_LOG=warn
+ENV OBSCURA_WORKER_BIN=/usr/local/bin/obscura-runtime-worker
+ENV OBSCURA_METRICS_PORT=9100
+
+EXPOSE 9222
+EXPOSE 9100
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+  CMD curl -sf http://127.0.0.1:9100/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/obscura"]
 CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]

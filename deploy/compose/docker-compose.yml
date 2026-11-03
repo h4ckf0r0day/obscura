@@ -8,11 +8,13 @@ services:
     command: ["serve", "--port", "9222", "--host", "0.0.0.0", "--workers", "4"]
     ports:
       - "9222:9222"
+      - "9100:9100"
     environment:
       - OBSCURA_STEALTH=1
       - RUST_LOG=info
+      - OBSCURA_METRICS_PORT=9100
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9222/json/version"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9100/health"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -29,4 +31,7 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+    depends_on:
+      obscura-supervisor:
+        condition: service_healthy
     restart: unless-stopped

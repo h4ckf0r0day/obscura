@@ -27,3 +27,4 @@ export interface SemanticNode {
 }
 
 export type WaitUntil = 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2';
+

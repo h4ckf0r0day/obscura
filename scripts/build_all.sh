@@ -11,3 +11,4 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release --workspace
 
 echo "All workspace binaries built successfully!"
 ls -lh target/release/obscura target/release/obscura-worker target/release/obscura-runtime-worker 2>/dev/null || true
+

@@ -63,3 +63,4 @@ trace: session_request
 
 ### Trace Context Propagation
 When client requests carry W3C Trace Context headers (`traceparent`, `tracestate`), Obscura Next extracts and attaches the parent context so client AI agents have full distributed traces across the agent framework and the browser runtime.
+

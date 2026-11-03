@@ -38,3 +38,4 @@ class SemanticNode:
     is_interactive: bool = False
     attributes: Dict[str, str] = field(default_factory=dict)
     children: List['SemanticNode'] = field(default_factory=list)
+

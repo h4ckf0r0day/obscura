@@ -34,3 +34,4 @@ OBSCURA_BIN="${ROOT_DIR}/target/release/obscura" python3 obstacle-course/run.py 
 echo "=========================================================="
 echo "    Obscura Next Bootstrap & Verification COMPLETE!       "
 echo "=========================================================="
+

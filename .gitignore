@@ -2,3 +2,7 @@ target/
 .DS_Store
 __pycache__/
 *.pyc
+
+# SDK build artifacts
+sdk/typescript/node_modules/
+sdk/typescript/dist/

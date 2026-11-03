@@ -96,3 +96,4 @@ To prevent sudden process abortion on V8 heap exhaustion:
 1. `add_near_heap_limit_callback` registers a callback when heap memory approaches the quota.
 2. The callback triggers `terminate_execution()` and temporarily extends headroom by 64 MB.
 3. This allows V8 to unwind cleanly, return an error to Rust, and avoid a process crash.
+

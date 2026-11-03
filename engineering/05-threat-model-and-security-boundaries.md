@@ -30,3 +30,4 @@ In production deployments, workers run inside isolated Linux namespaces or conta
 - **Network Namespace**: Optional network policy restricting egress to approved proxy egress gateways.
 - **Read-Only Root Filesystem**: Worker container filesystem mounted read-only with a temporary in-memory tmpfs for scratch operations.
 - **Dropping Privileges**: Workers run as non-root user `obscura:obscura` (UID 10001).
+
