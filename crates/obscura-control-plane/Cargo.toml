@@ -1,0 +1,20 @@
+[package]
+name = "obscura-control-plane"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Distributed control plane persistence and orchestration for Obscura Next"
+
+[dependencies]
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+obscura-telemetry = { path = "../obscura-telemetry" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
