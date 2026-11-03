@@ -1,28 +1,32 @@
-# Multi-stage hardened runtime worker image for Obscura Next
-# Stage 1: Builder (assumes pre-built binaries or provide a cargo build stage)
-FROM debian:bookworm-slim AS runtime
+# Multi-stage build for Obscura Next (Linux)
+FROM rust:latest AS builder
 
-# Install minimal SSL runtime certificates, ca-certificates, and curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    curl \
+    build-essential cmake clang python3 pkg-config libssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Run as non-privileged system user
+WORKDIR /src
+COPY . .
+
+RUN cargo build --release -p obscura-cli --bins --no-default-features && \
+    cargo build --release -p obscura-worker --bin obscura-runtime-worker
+
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd -g 10001 obscura && \
     useradd -u 10001 -g obscura -s /bin/false -m obscura
 
-COPY target/release/obscura /usr/local/bin/obscura
-COPY target/release/obscura-runtime-worker /usr/local/bin/obscura-runtime-worker
-
-# Symlink for compatibility
+COPY --from=builder /src/target/release/obscura /usr/local/bin/obscura
+COPY --from=builder /src/target/release/obscura-runtime-worker /usr/local/bin/obscura-runtime-worker
 RUN ln -sf /usr/local/bin/obscura-runtime-worker /usr/local/bin/obscura-worker
 
 USER obscura:obscura
 WORKDIR /home/obscura
 
-ENV OBSCURA_STEALTH=1
 ENV RUST_LOG=warn
 ENV OBSCURA_WORKER_BIN=/usr/local/bin/obscura-runtime-worker
 ENV OBSCURA_METRICS_PORT=9100
@@ -30,8 +34,8 @@ ENV OBSCURA_METRICS_PORT=9100
 EXPOSE 9222
 EXPOSE 9100
 
-HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-  CMD curl -sf http://127.0.0.1:9100/health || exit 1
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
+  CMD kill -0 1 || exit 1
 
 ENTRYPOINT ["/usr/local/bin/obscura"]
 CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]

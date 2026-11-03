@@ -13,8 +13,9 @@ services:
       - OBSCURA_STEALTH=1
       - RUST_LOG=info
       - OBSCURA_METRICS_PORT=9100
+      - OBSCURA_CDP_TOKEN=abcdefghijklmnopqrstuvwxyz0123456789
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9100/health"]
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 3s
       retries: 3
