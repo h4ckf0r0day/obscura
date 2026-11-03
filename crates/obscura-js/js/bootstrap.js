@@ -4449,6 +4449,9 @@ class Element extends Node {
     if (n === "id" || (n === "name" && _windowNameEligibleElement(this))) {
       if (this.getRootNode() === globalThis.document) {
         _ensureWindowNamedProperty(value);
+        for (const name of _domParse("document_named_names", this._nid, "self") || []) {
+          _installDocumentNamedProperty(name);
+        }
       }
       if (previousWindowName && previousWindowName !== value) {
         _reconcileWindowNamedProperty(previousWindowName);
@@ -14925,7 +14928,6 @@ function _windowNamedValue(name) {
 
 function _ensureWindowNamedProperty(name) {
   name = String(name || "");
-  _ensureDocumentNamedProperty(name);
   if (!name || _windowNamedPropertyNames.has(name)) return;
   // Existing own Window properties win over named elements.
   if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
@@ -14971,6 +14973,7 @@ function _registerWindowNamedTree(root) {
   if (!root || !root.isConnected || root.getRootNode() !== globalThis.document) return;
   const names = _windowNamedNamesInTree(root);
   for (const name of names) _ensureWindowNamedProperty(name);
+  for (const name of _documentNamedNamesInTree(root)) _installDocumentNamedProperty(name);
 }
 
 function _reconcileWindowNamedProperties(names) {
@@ -14978,8 +14981,13 @@ function _reconcileWindowNamedProperties(names) {
   const doc = globalThis.document;
   if (!doc) return;
   const present = _windowNamedNamesInTree(doc);
+  const documentNames = _documentNamedPropertyNames.get(doc);
+  const documentPresent = documentNames && documentNames.size ? _documentNamedNamesInTree(doc) : null;
   for (const name of names) {
-    _reconcileDocumentNamedProperty(name);
+    if (documentPresent && documentNames.has(name) && !documentPresent.has(name)) {
+      try { delete doc[name]; } catch (_error) {}
+      documentNames.delete(name);
+    }
     if (_windowNamedPropertyNames.has(name) && !present.has(name)) {
       try { delete globalThis[name]; } catch (_error) {}
       _windowNamedPropertyNames.delete(name);
@@ -14990,10 +14998,16 @@ function _reconcileWindowNamedProperties(names) {
 // Document named access (`document.frmMain`). Its names are a subset of the
 // Window's: the name of embed, form, iframe, img and object, the id of object,
 // and the id of an img that also has a name. Accessors are installed and
-// removed alongside the Window ones. Unlike Chrome, a named element never
-// replaces an existing Document member (`<img name="cookie">` leaves
-// document.cookie alone), because the bootstrap reads those members itself.
+// removed alongside the Window ones, from one native walk of the inserted or
+// remaining tree, never a document scan per name. Unlike Chrome, a named
+// element never replaces an existing Document member (`<img name="cookie">`
+// leaves document.cookie alone), because the bootstrap reads those members
+// itself.
 const _documentNamedPropertyNames = new WeakMap();
+
+function _documentNamedNamesInTree(root) {
+  return new Set(root ? _domParse("document_named_names", root._nid) || [] : []);
+}
 
 // Filters the native Window candidates with native attribute reads, so page
 // overrides of querySelectorAll/getAttribute cannot change the result.
@@ -15022,10 +15036,10 @@ function _documentNamedValue(doc, name) {
   return HTMLCollection._from(matches.map(([nid]) => _wrapEl(nid)));
 }
 
-function _ensureDocumentNamedProperty(name) {
+// Called for names already known to belong to a document-named element.
+function _installDocumentNamedProperty(name) {
   const doc = globalThis.document;
   if (!doc || !name || name in doc) return;
-  if (_documentNamedCandidates(doc, name).length === 0) return;
   let names = _documentNamedPropertyNames.get(doc);
   if (!names) _documentNamedPropertyNames.set(doc, names = new Set());
   try {
