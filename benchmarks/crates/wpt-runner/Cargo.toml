@@ -1,0 +1,20 @@
+[package]
+name = "wpt-runner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runs Web Platform Tests against Obscura and reports conformance results."
+
+[[bin]]
+name = "wpt-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>SSR Hydration</title>
+  <script src="../vendor/preact.umd.js"></script>
+</head>
+<body>
+  <!-- Server-rendered markup: the <ul> and its 10 <li> items are present in the
+       initial HTML, so even a no-JS scraper already sees the list. Hydration
+       must reuse this existing DOM. To prove the client actually took over we
+       capture a value the server-rendered HTML never contained: the hydrated
+       component computes a checksum (sum of indices 0..9 = 45) at render time
+       and writes it out, and we mark the status node from the client. This is
+       the Next.js / Preact pattern: pre-rendered HTML plus a hydrate() call. -->
+  <div id="app"><ul id="list"><li>Item 0</li><li>Item 1</li><li>Item 2</li><li>Item 3</li><li>Item 4</li><li>Item 5</li><li>Item 6</li><li>Item 7</li><li>Item 8</li><li>Item 9</li></ul></div>
+  <div id="status">server</div>
+  <script>
+    (function () {
+      var h = preact.h;
+      var COUNT = 10;
+      var items = [];
+      for (var i = 0; i < COUNT; i++) items.push('Item ' + i);
+
+      window.__hydrated = false;
+      window.__checksum = -1;
+
+      // Same vdom the server produced. The render runs only on the client; it
+      // computes a checksum that proves the client component executed.
+      function List() {
+        window.__hydrated = true;
+        window.__checksum = items.reduce(function (acc, _t, idx) { return acc + idx; }, 0);
+        return h('ul', { id: 'list' }, items.map(function (t, idx) {
+          return h('li', { key: idx }, t);
+        }));
+      }
+
+      preact.hydrate(h(List), document.getElementById('app'));
+
+      // After hydration mark the status node from the client so the rendered
+      // DOM also reflects the takeover.
+      document.getElementById('status').textContent = 'client';
+
+      var lis = document.querySelectorAll('#app li');
+      var took = window.__hydrated && document.getElementById('status').textContent === 'client';
+      window.__obstacle = 'hydrate:' + lis.length + ':' + (took ? 'client' : 'server') + ':' + window.__checksum;
+    })();
+  </script>
+</body>
+</html>

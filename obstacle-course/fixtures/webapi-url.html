@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>URL API</title></head>
+<body>
+  <!-- URL decomposition: exercises the WHATWG URL parser (host, port, auth,
+       search, hash, pathname). Many lightweight engines stub this out. -->
+  <script>
+    (function () {
+      var u = new URL('https://u:p@h.test:8/a?x=1#y');
+      window.__obstacle = 'url:' + u.protocol + ':' + u.username + ':' + u.password +
+        ':' + u.hostname + ':' + u.port + ':' + u.host + ':' + u.pathname +
+        ':' + u.search + ':' + u.hash;
+    })();
+  </script>
+</body>
+</html>

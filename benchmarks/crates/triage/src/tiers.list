@@ -1,0 +1,163 @@
+# Obscura WPT conformance tiers (manifest, v1).
+#
+# Defines which Web Platform Test directories count toward Obscura's conformance
+# tiers. The split is by CAPABILITY, not by outcome: a directory is excluded only
+# when it needs a capability Obscura intentionally does not implement (layout /
+# rendering, a media pipeline, real hardware, or a live network peer), never
+# because its tests happen to fail. This file is the published, auditable source
+# of truth behind the Core / Relevant pass-rate numbers.
+#
+# Format: "<tier> <prefix>" per line. A test matches when its path equals
+# <prefix> or starts with "<prefix>/". First matching rule wins (top to bottom),
+# so specific exclusions are listed before the broad tier globs. Unmatched tests
+# fall into "other" and count only toward the Full total.
+#
+# Tiers:
+#   core      scraping / automation contract: the DOM/HTML/URL/fetch surface
+#             every scrape and automation run depends on. Headline metric + SLA.
+#   relevant  broader JS-observable correctness that needs no layout, rendering,
+#             media pipeline, or hardware. (Reported as Core + Relevant.)
+#   exclude   intentionally out of scope (capability Obscura does not implement).
+
+# ---- Exclusions: carve non-applicable subtrees out of otherwise-core dirs ----
+exclude css
+exclude editing
+exclude html/rendering
+exclude html/canvas
+exclude html/editing
+exclude html/interaction
+exclude html/semantics/embedded-content
+exclude html/semantics/popovers/popover-layout
+exclude mathml
+exclude svg/painting
+exclude svg/animations
+exclude svg/render
+exclude web-animations
+exclude scroll-animations
+exclude css-transitions
+exclude intersection-observer
+exclude resize-observer
+exclude layout-instability
+exclude visual-viewport
+exclude scroll-to-text-fragment
+exclude pointerevents
+exclude pointerlock
+exclude touch-events
+exclude input-events
+exclude uievents/mouse
+exclude fullscreen
+exclude picture-in-picture
+exclude paint-timing
+exclude largest-contentful-paint
+exclude element-timing
+exclude long-animation-frame
+exclude longtask-timing
+exclude navigation-timing
+exclude resource-timing
+exclude event-timing
+exclude media-source
+exclude mediacapture-streams
+exclude mediacapture-record
+exclude mediacapture-image
+exclude mediacapture-fromelement
+exclude mediasession
+exclude media-capabilities
+exclude media-playback-quality
+exclude encrypted-media
+exclude webaudio
+exclude webcodecs
+exclude webgl
+exclude webgpu
+exclude webrtc
+exclude webrtc-encoded-transform
+exclude webrtc-extensions
+exclude webrtc-stats
+exclude webrtc-svc
+exclude webxr
+exclude webvtt
+exclude webusb
+exclude web-bluetooth
+exclude bluetooth
+exclude web-nfc
+exclude webauthn
+exclude web-share
+exclude gamepad
+exclude vibration
+exclude accelerometer
+exclude ambient-light
+exclude gyroscope
+exclude magnetometer
+exclude orientation-event
+exclude compute-pressure
+exclude screen-orientation
+exclude screen-wake-lock
+exclude geolocation
+exclude netinfo
+exclude notifications
+exclude push-api
+exclude background-fetch
+exclude background-sync
+exclude service-workers
+exclude payment-request
+exclude payment-handler
+exclude credential-management
+exclude digital-credentials
+exclude clipboard-apis
+exclude speech-api
+exclude remote-playback
+exclude presentation-api
+
+# ---- Core: the scraping / automation contract --------------------------------
+core dom
+core domparsing
+core domxpath
+core html
+core url
+core urlpattern
+core encoding
+core encoding-detection
+core fetch
+core xhr
+core cors
+core webstorage
+core custom-elements
+core shadow-dom
+core mimesniff
+
+# ---- Relevant: broader JS-observable correctness -----------------------------
+relevant svg
+relevant webidl
+relevant streams
+relevant compression
+relevant FileAPI
+relevant uievents
+relevant trusted-types
+relevant sanitizer-api
+relevant workers
+relevant wasm
+relevant WebCryptoAPI
+relevant hr-time
+relevant user-timing
+relevant performance-timeline
+relevant console
+relevant referrer-policy
+relevant content-security-policy
+relevant subresource-integrity
+relevant secure-contexts
+relevant cookies
+relevant storage
+relevant IndexedDB
+relevant websockets
+relevant eventsource
+relevant web-locks
+relevant import-maps
+relevant js
+relevant ecmascript
+relevant wai-aria
+relevant accname
+relevant html-aam
+relevant navigation-api
+relevant page-visibility
+relevant requestidlecallback
+relevant scheduler
+relevant permissions-policy

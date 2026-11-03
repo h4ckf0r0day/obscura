@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/wpt-runner", "crates/perf-bench", "crates/triage"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/h4ckf0r0day/obscura-benchmark"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"

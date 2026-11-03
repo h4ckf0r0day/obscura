@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "obscura-next"
+    static_configs:
+      - targets: ["obscura-supervisor:9222"]

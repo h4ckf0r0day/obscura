@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>HTMLDialogElement</title></head>
+<body>
+  <dialog id="dlg">confirm?</dialog>
+  <!-- HTMLDialogElement: showModal() opens, close('v') sets returnValue and clears
+       the open state. Exercises the dialog element's modal/return-value semantics. -->
+  <script>
+    (function () {
+      var dlg = document.getElementById('dlg');
+      dlg.showModal();
+      var openWhileModal = dlg.open;
+      dlg.close('confirmed');
+      window.__obstacle = 'dialog:' + openWhileModal + ':' + dlg.open + ':' + dlg.returnValue;
+    })();
+  </script>
+</body>
+</html>

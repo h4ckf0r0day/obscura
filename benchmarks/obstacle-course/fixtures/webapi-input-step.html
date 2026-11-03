@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>input valueAsNumber / stepUp</title></head>
+<body>
+  <input id="num" type="number" min="0" max="100" step="5" value="10">
+  <!-- HTMLInputElement number semantics: valueAsNumber reads the parsed value,
+       stepUp(n) advances by n*step and reflects back into value. -->
+  <script>
+    (function () {
+      var input = document.getElementById('num');
+      var before = input.valueAsNumber;
+      input.stepUp(3);
+      var after = input.valueAsNumber;
+      window.__obstacle = 'step:' + before + ':' + after + ':' + input.value;
+    })();
+  </script>
+</body>
+</html>

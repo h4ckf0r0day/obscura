@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>MutationObserver</title></head>
+<body>
+  <div id="container"></div>
+  <!-- MutationObserver pattern: frameworks and analytics widgets watch a
+       container subtree for DOM changes and react in the MO callback. Here we
+       observe #container, append three child nodes, and the callback records how
+       many nodes were added across the delivered mutation records. The observer
+       callback runs as a microtask after the mutations, so a scraper must pump
+       the event loop to see the recorded result. -->
+  <script>
+    (function () {
+      var container = document.getElementById('container');
+      var addedTotal = 0;
+      var batches = 0;
+
+      var mo = new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i++) {
+          batches++;
+          addedTotal += records[i].addedNodes.length;
+        }
+        mo.disconnect();
+        window.__obstacle = 'mo:' + batches + ':' + addedTotal + ':' + container.children.length;
+      });
+
+      mo.observe(container, { childList: true });
+
+      var names = ['alpha', 'beta', 'gamma'];
+      for (var i = 0; i < names.length; i++) {
+        var p = document.createElement('p');
+        p.textContent = names[i];
+        container.appendChild(p);
+      }
+    })();
+  </script>
+</body>
+</html>

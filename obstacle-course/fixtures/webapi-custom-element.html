@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Custom Element define</title></head>
+<body>
+  <api-widget></api-widget>
+  <!-- Custom element: customElements.define + connectedCallback writing content.
+       Verifies upgrade timing and lifecycle callbacks on a connected element. -->
+  <script>
+    (function () {
+      class ApiWidget extends HTMLElement {
+        connectedCallback() {
+          this.textContent = 'widget-ready';
+        }
+      }
+      customElements.define('api-widget', ApiWidget);
+      var el = document.querySelector('api-widget');
+      window.__obstacle = 'ce:' + (el ? el.textContent : 'none');
+    })();
+  </script>
+</body>
+</html>

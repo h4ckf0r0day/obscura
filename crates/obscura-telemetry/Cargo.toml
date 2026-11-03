@@ -1,0 +1,17 @@
+[package]
+name = "obscura-telemetry"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Prometheus instrumentation and OpenTelemetry tracing for Obscura Next"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

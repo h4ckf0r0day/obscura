@@ -1,0 +1,45 @@
+name: Obscura Next CI
+
+on:
+  push:
+    branches: [main, "obscura-next/*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & Verify
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Build Obscura Next
+        run: |
+          CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bins --no-default-features
+
+      - name: Run Crate Unit Tests
+        run: |
+          cargo nextest run -p obscura-agent -p obscura-isolation -p obscura-supervisor -p obscura-telemetry -p obscura-worker -p obscura-ssrf -p obscura-dom
+
+      - name: Run 33-Stage Obstacle Course Gate
+        run: |
+          OBSCURA_BIN=./target/release/obscura python3 obstacle-course/run.py --runs 1 --warmup 0
+
+      - name: Run Security Regression Suite
+        run: |
+          ./scripts/run_security_tests.sh

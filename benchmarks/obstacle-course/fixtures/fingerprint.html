@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fingerprint</title></head>
+<body>
+  <!-- Stealth fingerprint surface: a real Chrome-like navigator with no automation
+       tells. Checks that navigator.userAgent reads as Chrome, navigator.webdriver is
+       not true (the classic bot tell), and platform/language/timezone are populated
+       and consistent. Encoded as a compact deterministic string so version bumps in
+       the UA do not break the expectation. -->
+  <script>
+    (function () {
+      var ua = String(navigator.userAgent || '');
+      var isChrome = /Chrome\/\d+/.test(ua) && /AppleWebKit/.test(ua);
+      var wd = navigator.webdriver;
+      // The security-relevant property: webdriver must NOT advertise automation.
+      var wdClean = (wd === false || wd === undefined || wd === null);
+      var plat = String(navigator.platform || '');
+      var lang0 = (navigator.languages && navigator.languages[0]) || '';
+      var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+      window.__obstacle = 'fp:chrome=' + (isChrome ? 1 : 0) +
+                          ':wdclean=' + (wdClean ? 1 : 0) +
+                          ':plat=' + plat +
+                          ':lang=' + lang0 +
+                          ':tz=' + tz;
+    })();
+  </script>
+</body>
+</html>

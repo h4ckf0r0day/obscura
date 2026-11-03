@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Static Page</title></head>
+<body>
+  <main>
+    <h1>Obstacle Course: Static</h1>
+    <article>
+      <p>Paragraph one with some scrapeable text.</p>
+      <p>Paragraph two.</p>
+      <p>Paragraph three.</p>
+      <p>Paragraph four.</p>
+      <p>Paragraph five.</p>
+    </article>
+  </main>
+  <!-- Baseline: pure HTML, no script. Measures fetch + parse + DOM-query speed. -->
+  <script>
+    window.__obstacle = 'static:' + document.querySelectorAll('p').length + ':' + document.title;
+  </script>
+</body>
+</html>

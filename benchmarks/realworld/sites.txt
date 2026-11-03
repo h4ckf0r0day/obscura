@@ -1,0 +1,134 @@
+# Real-world scrape-target corpus for the obscura render-success benchmark.
+#
+# These are pages people actually scrape, across the categories real scraping
+# workloads hit. The live web drifts, so success rates are a snapshot.
+#
+# IMPORTANT: run this with `--chrome` (obscura vs headless Chrome side by side).
+# Many of these sites block datacenter IPs (anti-bot / CAPTCHA / login walls), so
+# from a server they fail for EVERY engine. A failure only indicts obscura's
+# engine when Chrome succeeds on the same URL and obscura does not. Same-IP
+# Chrome comparison separates "engine gap" from "site blocks everyone".
+#
+# One URL per line; blank lines and lines starting with # are ignored.
+
+# ---------------- reference / encyclopedic (scraper-friendly) ----------------
+https://en.wikipedia.org/wiki/Web_scraping
+https://en.wikipedia.org/wiki/Headless_browser
+https://simple.wikipedia.org/wiki/Computer
+https://www.imdb.com/title/tt0111161/
+https://www.imdb.com/chart/top/
+https://www.goodreads.com/book/show/3735293-clean-code
+https://stackoverflow.com/questions/tagged/web-scraping
+https://stackoverflow.com/questions/2861/options-for-html-scraping
+https://superuser.com/
+https://serverfault.com/
+
+# ---------------- news / media (article + section pages) ----------------
+https://www.bbc.com/news
+https://www.bbc.com/news/technology
+https://www.theguardian.com/international
+https://www.theguardian.com/technology
+https://techcrunch.com/
+https://arstechnica.com/
+https://www.theverge.com/
+https://www.reuters.com/
+https://apnews.com/
+https://www.npr.org/
+https://news.ycombinator.com/
+https://lobste.rs/
+https://slashdot.org/
+https://www.cnbc.com/world/
+
+# ---------------- e-commerce / product / pricing (anti-bot heavy) ----------------
+https://www.amazon.com/dp/B08N5WRWNW
+https://www.ebay.com/sch/i.html?_nkw=laptop
+https://www.etsy.com/c/jewelry
+https://www.walmart.com/
+https://www.bestbuy.com/
+https://www.target.com/
+https://www.newegg.com/
+https://www.ikea.com/us/en/
+https://www.aliexpress.com/
+https://www.wayfair.com/
+https://shop.tesla.com/
+https://www.apple.com/shop/buy-iphone
+
+# ---------------- marketplaces / listings / classifieds ----------------
+https://www.zillow.com/homes/for_sale/
+https://www.realtor.com/
+https://www.redfin.com/
+https://www.apartments.com/
+https://www.craigslist.org/about/sites
+https://www.autotrader.com/
+https://www.cars.com/
+
+# ---------------- jobs ----------------
+https://www.indeed.com/
+https://www.glassdoor.com/
+https://weworkremotely.com/
+https://remoteok.com/
+https://jobs.lever.co/
+https://boards.greenhouse.io/
+
+# ---------------- travel / booking (heavy SPA + anti-bot) ----------------
+https://www.booking.com/
+https://www.airbnb.com/
+https://www.expedia.com/
+https://www.kayak.com/
+https://www.tripadvisor.com/
+https://www.yelp.com/
+
+# ---------------- finance / crypto / data ----------------
+https://finance.yahoo.com/
+https://www.investing.com/
+https://coinmarketcap.com/
+https://www.coingecko.com/
+https://www.marketwatch.com/
+https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193&type=10-K
+
+# ---------------- search / aggregators ----------------
+https://html.duckduckgo.com/html/?q=web+scraping
+https://lite.duckduckgo.com/lite/?q=web+scraping
+https://www.bing.com/search?q=web+scraping
+https://search.marginalia.nu/search?query=web+scraping
+
+# ---------------- forums / community / social (scrapeable surfaces) ----------------
+https://old.reddit.com/r/programming/
+https://www.reddit.com/r/programming/
+https://www.quora.com/
+https://news.ycombinator.com/newest
+https://forum.djangoproject.com/
+
+# ---------------- dev / packages / docs (mainstream + JS-heavy SPAs) ----------------
+https://github.com/torvalds/linux
+https://github.com/trending
+https://gitlab.com/explore
+https://pypi.org/project/requests/
+https://www.npmjs.com/package/react
+https://crates.io/crates/serde
+https://developer.mozilla.org/en-US/docs/Web/HTML
+https://docs.python.org/3/library/asyncio.html
+https://stackoverflow.blog/
+https://news.ycombinator.com/item?id=1
+
+# ---------------- client-rendered SPAs (real JS execution required) ----------------
+https://react.dev/
+https://vuejs.org/
+https://svelte.dev/
+https://angular.dev/
+https://www.solidjs.com/
+https://remix.run/
+https://nextjs.org/
+https://nuxt.com/
+https://stripe.com/
+https://vercel.com/
+https://openai.com/
+https://linear.app/
+
+# ---------------- weather / utility / misc public ----------------
+https://www.weather.gov/
+https://weather.com/
+https://www.timeanddate.com/
+https://httpbin.org/html
+https://example.com
+https://www.iana.org/domains/reserved

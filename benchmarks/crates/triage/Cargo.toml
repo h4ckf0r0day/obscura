@@ -1,0 +1,17 @@
+[package]
+name = "triage"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bug catcher: turns wpt-runner JSON dumps into a ranked, deduplicated list of root causes."
+
+[[bin]]
+name = "triage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true

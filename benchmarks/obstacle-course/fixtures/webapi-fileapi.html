@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>File API</title></head>
+<body>
+  <!-- File API: Blob construction + FileReader.readAsText (async, fires a load
+       event). Exercises the Blob/FileReader shim and the event loop. -->
+  <script>
+    (function () {
+      var blob = new Blob(['obstacle ', 'blob ', 'text'], { type: 'text/plain' });
+      var reader = new FileReader();
+      reader.onload = function () {
+        window.__obstacle = 'file:' + blob.size + ':' + reader.result;
+      };
+      reader.onerror = function () {
+        window.__obstacle = 'file:error';
+      };
+      reader.readAsText(blob);
+    })();
+  </script>
+</body>
+</html>

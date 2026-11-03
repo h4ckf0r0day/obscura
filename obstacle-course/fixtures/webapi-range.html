@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Range API</title></head>
+<body>
+  <div id="src"><span>Alpha</span><span>Beta</span><span>Gamma</span></div>
+  <!-- Range: createRange + selectNodeContents + toString. The stringifier walks
+       the selected subtree and concatenates text content. -->
+  <script>
+    (function () {
+      var src = document.getElementById('src');
+      var range = document.createRange();
+      range.selectNodeContents(src);
+      var text = range.toString();
+      window.__obstacle = 'range:' + range.startOffset + ':' + range.endOffset + ':' + text;
+    })();
+  </script>
+</body>
+</html>

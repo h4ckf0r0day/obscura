@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  obscura-supervisor:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.worker
+    command: ["serve", "--port", "9222", "--host", "0.0.0.0", "--workers", "4"]
+    ports:
+      - "9222:9222"
+    environment:
+      - OBSCURA_STEALTH=1
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9222/json/version"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped

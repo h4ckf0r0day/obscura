@@ -1,0 +1,8 @@
+{
+  "articles": [
+    { "id": "a1", "slug": "headless-rendering", "title": "Headless Rendering", "author": "Mara K.", "body": "Real JavaScript execution makes the rendered DOM match what a user sees." },
+    { "id": "a2", "slug": "client-side-routing", "title": "Client Side Routing", "author": "Dev T.", "body": "pushState routers swap views without a full navigation." },
+    { "id": "a3", "slug": "data-fetching", "title": "Data Fetching", "author": "Lena R.", "body": "Same-origin fetch() feeds the store before the first paint settles." },
+    { "id": "a4", "slug": "state-management", "title": "State Management", "author": "Omar S.", "body": "A shared store keeps selection and list state consistent across routes." }
+  ]
+}

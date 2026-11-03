@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Modern JS platform APIs</title></head>
+<body>
+  <!-- Modern platform-API surface that production code relies on, exercised through
+       a top-level async/await flow: Promise.allSettled (mixed fulfil/reject),
+       Promise.any (first winner), structuredClone (deep copy independence),
+       AbortController + AbortSignal.aborted state, TextEncoder/TextDecoder UTF-8
+       round-trip (multi-byte chars), crypto.randomUUID() v4 shape, and an async
+       crypto.subtle.digest SHA-256 verified against the known digest of "abc".
+       The result is one deterministic token string so a single assert covers them. -->
+  <script>
+    (async function () {
+      try {
+        var parts = [];
+
+        // Promise.allSettled with a mixed batch
+        var settled = await Promise.allSettled([
+          Promise.resolve('ok'),
+          Promise.reject(new Error('nope')),
+          Promise.resolve('ok2')
+        ]);
+        parts.push('settled=' + settled.map(function (r) { return r.status; }).join(','));
+
+        // Promise.any picks the first fulfilled
+        var winner = await Promise.any([
+          Promise.reject(new Error('a')),
+          Promise.resolve('first'),
+          Promise.resolve('second')
+        ]);
+        parts.push('any=' + winner);
+
+        // structuredClone deep-copies (mutating the clone must not touch source)
+        var src = { nested: { list: [1, 2] } };
+        var clone = structuredClone(src);
+        clone.nested.list.push(3);
+        parts.push('clone=' + src.nested.list.length + '/' + clone.nested.list.length);
+
+        // AbortController: aborted state flips deterministically
+        var ac = new AbortController();
+        var before = ac.signal.aborted;
+        ac.abort();
+        parts.push('abort=' + before + '/' + ac.signal.aborted);
+
+        // TextEncoder/TextDecoder UTF-8 round-trip with multi-byte characters
+        var enc = new TextEncoder();
+        var dec = new TextDecoder('utf-8');
+        var text = 'café❤🚀'; // "café" + heart + rocket
+        var bytes = enc.encode(text);
+        var back = dec.decode(bytes);
+        parts.push('codec=' + (back === text ? 'ok' : 'fail') + ':' + bytes.length);
+
+        // crypto.randomUUID v4 shape (value is random, only the shape is asserted)
+        var uuid = crypto.randomUUID();
+        var uuidOk = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid);
+        parts.push('uuid=' + (uuidOk ? 'v4' : 'bad'));
+
+        // crypto.subtle.digest SHA-256 of "abc" (known answer test)
+        var digestBuf = await crypto.subtle.digest('SHA-256', enc.encode('abc'));
+        var hex = Array.from(new Uint8Array(digestBuf)).map(function (b) {
+          return b.toString(16).padStart(2, '0');
+        }).join('');
+        parts.push('sha256=' + hex.slice(0, 12));
+
+        window.__obstacle = 'platform|' + parts.join('|');
+      } catch (e) {
+        window.__obstacle = 'platform:error:' + (e && e.message ? e.message : e);
+      }
+    })();
+  </script>
+</body>
+</html>

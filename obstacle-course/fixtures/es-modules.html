@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ES Modules</title></head>
+<body>
+  <div id="out"></div>
+  <!-- <script type=module>: a static import of ../modules/util.js (in the
+       initial module graph) plus a runtime dynamic import() of
+       ../modules/lazy.js (a code-split chunk that itself imports util.js).
+       This is the bundler-output shape every modern SPA ships. window.__obstacle
+       is set only after the dynamic chunk resolves, so the runner's async
+       settle is exercised too. -->
+  <script type="module">
+    import { PREFIX, sum, range } from '../modules/util.js';
+
+    (async function () {
+      try {
+        var nums = range(5);          // [0,1,2,3,4]
+        var staticSum = sum(nums);    // 10  (static import works)
+
+        var lazy = await import('../modules/lazy.js');  // code-split chunk
+        var fib10 = lazy.fib(10);     // 55 (dynamic import works)
+        var lazySum = lazy.total(nums); // 10 (lazy chunk re-uses util graph)
+
+        var text = PREFIX + ':' + staticSum + ':' + fib10 + ':' + lazySum;
+        document.getElementById('out').textContent = text;
+        window.__obstacle = 'esm:' + text;
+      } catch (err) {
+        window.__obstacle = 'esm:error:' + (err && err.message ? err.message : err);
+      }
+    })();
+  </script>
+</body>
+</html>

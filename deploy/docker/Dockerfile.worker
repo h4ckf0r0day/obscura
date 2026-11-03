@@ -1,0 +1,24 @@
+# Hardened runtime worker image for Obscura Next
+FROM debian:bookworm-slim
+
+# Install minimal SSL runtime certificates & ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Run as non-privileged system user
+RUN groupadd -g 10001 obscura && \
+    useradd -u 10001 -g obscura -s /bin/false -m obscura
+
+COPY target/release/obscura /usr/local/bin/obscura
+COPY target/release/obscura-worker /usr/local/bin/obscura-worker
+
+USER obscura:obscura
+WORKDIR /home/obscura
+
+ENV OBSCURA_STEALTH=1
+ENV RUST_LOG=warn
+
+ENTRYPOINT ["/usr/local/bin/obscura"]
+CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]

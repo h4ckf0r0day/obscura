@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Extraction: Markdown</title></head>
+<body>
+  <main>
+    <article>
+      <h1>Markdown Extraction Demo</h1>
+      <p>Obscura can serialize the rendered DOM straight to Markdown.</p>
+      <h2>Supported Constructs</h2>
+      <ul>
+        <li>Headings of multiple levels</li>
+        <li>Unordered and ordered lists</li>
+        <li>Inline and fenced code</li>
+      </ul>
+      <p>Read the <a href="https://github.com/h4ckf0r0day/obscura">project on GitHub</a> for details.</p>
+      <pre><code>const page = await browser.newPage();</code></pre>
+    </article>
+  </main>
+  <!-- markdown dump should contain heading '# ', list '- ', code fence, and link '](' markers. -->
+</body>
+</html>

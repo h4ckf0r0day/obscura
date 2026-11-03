@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Extraction: HTML Serialize</title></head>
+<body>
+  <main>
+    <section id="content" class="serialized">
+      <h1>Serialized HTML Output</h1>
+      <p data-role="lede">Obscura serializes the live DOM tree back to HTML.</p>
+      <table>
+        <thead><tr><th>Key</th><th>Value</th></tr></thead>
+        <tbody><tr><td>engine</td><td>obscura</td></tr></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    // Mutate the DOM at runtime so the serialized html proves JS-rendered state is captured.
+    var p = document.createElement('p');
+    p.id = 'injected';
+    p.textContent = 'Injected after load via script.';
+    document.querySelector('#content').appendChild(p);
+  </script>
+</body>
+</html>

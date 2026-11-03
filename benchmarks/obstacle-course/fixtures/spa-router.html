@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>SPA Router</title></head>
+<body>
+  <div id="view">home</div>
+  <!-- Client-side routing: a pushState router renders route content without a
+       navigation. SPAs (Next.js/React Router/vue-router) depend on history +
+       location reading correctly after pushState. -->
+  <script>
+    (function () {
+      var routes = { '/': 'home', '/about': 'About Page', '/products': 'Products Page' };
+      function render() {
+        var path = location.pathname;
+        document.getElementById('view').textContent = routes[path] || ('unknown:' + path);
+      }
+      function navigate(path) { history.pushState({}, '', path); render(); }
+      window.addEventListener('popstate', render);
+      navigate('/products');
+      window.__obstacle = 'route:' + location.pathname + ':' + document.getElementById('view').textContent;
+    })();
+  </script>
+</body>
+</html>

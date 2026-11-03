@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>Vue App</title>
+  <script src="../vendor/vue.global.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <!-- Mount a real Vue 3 app client-side and read the rendered DOM. Vue's
+       global build exposes window.Vue with createApp. mount() flushes the
+       initial render synchronously, so the list is in the DOM by the time
+       mount() returns. -->
+  <script>
+    (function () {
+      var items = [];
+      for (var i = 0; i < 100; i++) items.push('Item ' + i);
+      var app = Vue.createApp({
+        data: function () { return { items: items }; },
+        template: '<ul id="list"><li v-for="(t, i) in items" :key="i">{{ t }}</li></ul>'
+      });
+      app.mount('#app');
+      var lis = document.querySelectorAll('#app li');
+      window.__obstacle = 'vue:' + lis.length + ':' + (lis[0] ? lis[0].textContent : 'none');
+    })();
+  </script>
+</body>
+</html>

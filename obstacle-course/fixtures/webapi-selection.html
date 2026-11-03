@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Selection API</title></head>
+<body>
+  <div id="sel"><p>one</p><p>two</p><p>three</p></div>
+  <!-- Selection: getSelection().selectAllChildren over a container, then read
+       the selection back via toString and rangeCount. -->
+  <script>
+    (function () {
+      var host = document.getElementById('sel');
+      var selection = window.getSelection();
+      selection.selectAllChildren(host);
+      window.__obstacle = 'sel:' + selection.rangeCount + ':' + selection.toString();
+    })();
+  </script>
+</body>
+</html>

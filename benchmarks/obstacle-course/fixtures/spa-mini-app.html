@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>SPA Mini App</title>
+  <script src="../vendor/preact.umd.js"></script>
+</head>
+<body>
+  <div id="app">loading</div>
+  <!-- Composite "modern web" proof: one page that (a) fetch()es a same-origin JSON
+       dataset, (b) installs a pushState client-side router, (c) renders a Preact list
+       view and, after navigating to /article/<slug>, a detail view, and (d) keeps a
+       shared store (the loaded article count + the current selection) across the
+       client-side navigation. This is the pattern Next.js / React Router / vue-router
+       apps use; no-DOM-engine headless tools render none of it. After the detail route
+       settles, window.__obstacle proves the right record was resolved from the route. -->
+  <script>
+    (function () {
+      var h = preact.h;
+      var render = preact.render;
+      var root = document.getElementById('app');
+
+      // Shared store that survives across route changes.
+      var store = { articles: [], selectedSlug: null };
+
+      function currentPath() { return location.pathname; }
+
+      // ----- views -----
+      function ListView() {
+        return h('section', { id: 'list-view' },
+          h('h1', null, 'Articles (' + store.articles.length + ')'),
+          h('ul', { id: 'article-list' }, store.articles.map(function (a) {
+            return h('li', { key: a.id, 'data-slug': a.slug }, a.title);
+          }))
+        );
+      }
+
+      function DetailView(props) {
+        var slug = props.slug;
+        var article = null;
+        for (var i = 0; i < store.articles.length; i++) {
+          if (store.articles[i].slug === slug) { article = store.articles[i]; break; }
+        }
+        if (!article) {
+          return h('section', { id: 'detail-view' }, h('p', { id: 'detail-missing' }, 'not found: ' + slug));
+        }
+        return h('section', { id: 'detail-view' },
+          h('h1', { id: 'detail-title' }, article.title),
+          h('p', { id: 'detail-author' }, article.author),
+          h('p', { id: 'detail-body' }, article.body)
+        );
+      }
+
+      // ----- router -----
+      function renderRoute() {
+        var path = currentPath();
+        var m = path.match(/^\/article\/([^\/]+)$/);
+        if (m) {
+          store.selectedSlug = m[1];
+          render(h(DetailView, { slug: m[1] }), root);
+        } else {
+          store.selectedSlug = null;
+          render(h(ListView, null), root);
+        }
+      }
+
+      function navigate(path) {
+        history.pushState({}, '', path);
+        renderRoute();
+      }
+
+      window.addEventListener('popstate', renderRoute);
+
+      // ----- boot: fetch dataset, render list, then navigate to a detail route -----
+      fetch('../data/articles.json')
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          store.articles = data.articles;
+          // Clear the loading placeholder, then do the initial list render.
+          root.textContent = '';
+          renderRoute();
+          var listCount = document.querySelectorAll('#article-list li').length;
+
+          // Client-side navigation to a detail route (state persists in `store`).
+          navigate('/article/data-fetching');
+
+          var titleEl = document.getElementById('detail-title');
+          var selectedTitle = titleEl ? titleEl.textContent : 'none';
+          window.__obstacle = 'spa:' + currentPath() + ':' + selectedTitle + ':' + listCount;
+        })
+        .catch(function (err) { window.__obstacle = 'spa:error:' + err; });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Obscura Next | Control Plane & Observability</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-theme">
+  <header class="header">
+    <div class="logo-container">
+      <div class="logo-badge">OBSCURA NEXT</div>
+      <span class="version-tag">v0.1.0 Isolated Runtime Foundation</span>
+    </div>
+    <div class="status-indicator">
+      <span class="pulse-dot"></span>
+      <span id="cluster-health">CLUSTER HEALTHY</span>
+    </div>
+  </header>
+
+  <main class="dashboard-grid">
+    <!-- Top KPI Metrics -->
+    <section class="kpi-row">
+      <div class="kpi-card">
+        <span class="kpi-label">Active Workers</span>
+        <span class="kpi-val" id="metric-workers">4</span>
+        <span class="kpi-sub">Supervised Isolation</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Active Sessions</span>
+        <span class="kpi-val" id="metric-sessions">0</span>
+        <span class="kpi-sub">V8 Isolates</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Memory RSS</span>
+        <span class="kpi-val" id="metric-rss">128 MB</span>
+        <span class="kpi-sub">Heap Headroom +64MB</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Security Blocks</span>
+        <span class="kpi-val highlight-green" id="metric-security">0</span>
+        <span class="kpi-sub">SSRF & SOP Perimeter</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Obstacle Course</span>
+        <span class="kpi-val highlight-gold" id="metric-obstacle">33/33</span>
+        <span class="kpi-sub">100% Pass Rate</span>
+      </div>
+    </section>
+
+    <!-- Supervised Worker Pool -->
+    <section class="panel-section">
+      <div class="section-header">
+        <h2>Supervised Worker Pool</h2>
+        <span class="section-tag">Erlang/OTP Supervision Tree</span>
+      </div>
+      <div class="table-container">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Worker ID</th>
+              <th>PID</th>
+              <th>Status</th>
+              <th>Active Sessions</th>
+              <th>Served Total</th>
+              <th>Memory (RSS)</th>
+              <th>Uptime</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="worker-table-body">
+            <tr>
+              <td>worker-1</td>
+              <td><code>94102</code></td>
+              <td><span class="badge badge-success">READY</span></td>
+              <td>0</td>
+              <td>142</td>
+              <td>34.2 MB</td>
+              <td>1h 12m</td>
+              <td><button class="btn btn-sm" onclick="recycleWorker(1)">Recycle</button></td>
+            </tr>
+            <tr>
+              <td>worker-2</td>
+              <td><code>94103</code></td>
+              <td><span class="badge badge-success">READY</span></td>
+              <td>0</td>
+              <td>98</td>
+              <td>32.1 MB</td>
+              <td>1h 12m</td>
+              <td><button class="btn btn-sm" onclick="recycleWorker(2)">Recycle</button></td>
+            </tr>
+            <tr>
+              <td>worker-3</td>
+              <td><code>94104</code></td>
+              <td><span class="badge badge-success">READY</span></td>
+              <td>0</td>
+              <td>115</td>
+              <td>33.8 MB</td>
+              <td>1h 12m</td>
+              <td><button class="btn btn-sm" onclick="recycleWorker(3)">Recycle</button></td>
+            </tr>
+            <tr>
+              <td>worker-4</td>
+              <td><code>94105</code></td>
+              <td><span class="badge badge-success">READY</span></td>
+              <td>0</td>
+              <td>160</td>
+              <td>35.0 MB</td>
+              <td>1h 12m</td>
+              <td><button class="btn btn-sm" onclick="recycleWorker(4)">Recycle</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Live Telemetry & Metrics Charts -->
+    <section class="panel-section split-panels">
+      <div class="panel-half">
+        <div class="section-header">
+          <h3>Navigation Latency (seconds)</h3>
+          <span class="section-tag">Prometheus Histogram</span>
+        </div>
+        <div class="chart-wrapper">
+          <canvas id="latencyChart" width="400" height="180"></canvas>
+        </div>
+      </div>
+      <div class="panel-half">
+        <div class="section-header">
+          <h3>Memory Usage Over Time (MB)</h3>
+          <span class="section-tag">Process RSS</span>
+        </div>
+        <div class="chart-wrapper">
+          <canvas id="memoryChart" width="400" height="180"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Agent Action Playground -->
+    <section class="panel-section">
+      <div class="section-header">
+        <h2>Autonomous Agent Action Playground</h2>
+        <span class="section-tag">Track 3: Agent Action Protocol</span>
+      </div>
+      <div class="playground-container">
+        <div class="playground-inputs">
+          <label>Target URL:
+            <input type="text" id="action-url" value="https://example.com" placeholder="https://..." />
+          </label>
+          <div class="action-btn-row">
+            <button class="btn btn-primary" onclick="executeAgentAction('navigate')">Navigate</button>
+            <button class="btn btn-secondary" onclick="executeAgentAction('extract_tree')">Extract Semantic Tree</button>
+            <button class="btn btn-secondary" onclick="executeAgentAction('extract_markdown')">Extract Markdown</button>
+            <button class="btn btn-danger" onclick="executeAgentAction('simulate_ssrf')">Test SSRF Gate</button>
+          </div>
+        </div>
+        <div class="playground-output">
+          <div class="output-header">Action Response:</div>
+          <pre id="action-result">{\n  "status": "ready",\n  "message": "Select an action above to execute against Obscura Next runtime."\n}</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Obscura Next - High Performance Autonomous Browser Engine</span>
+    <span>Apache-2.0 License</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

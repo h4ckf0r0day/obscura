@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>IntersectionObserver Infinite Scroll</title>
+  <style>.card { height: 10px; } #sentinel { height: 1px; }</style>
+</head>
+<body>
+  <div id="feed"></div>
+  <div id="sentinel"></div>
+  <!-- Infinite-scroll / lazy-load pattern: an IntersectionObserver watches a
+       sentinel at the end of the feed. Each time the sentinel intersects the
+       viewport, a batch of items is appended and a new sentinel observed. This
+       is the core Next.js / React feed loading pattern. Headless tools without a
+       real layout/observer pipeline never fire the callback and load 0 items.
+       All five batches fit in the viewport. Each replacement sentinel gets
+       an initial observation; an unchanged intersecting target does not
+       receive repeated callbacks just because the feed changes. -->
+  <script>
+    (function () {
+      var feed = document.getElementById('feed');
+      var loaded = 0;
+      var BATCH = 10;
+      var MAX = 50;
+
+      function appendBatch() {
+        for (var i = 0; i < BATCH; i++) {
+          var card = document.createElement('div');
+          card.className = 'card';
+          card.textContent = 'Item ' + loaded;
+          feed.appendChild(card);
+          loaded++;
+        }
+      }
+
+      var io = new IntersectionObserver(function (entries) {
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].isIntersecting && loaded < MAX) {
+            io.unobserve(entries[i].target);
+            appendBatch();
+            if (loaded >= MAX) {
+              io.disconnect();
+              window.__obstacle = 'io:' + feed.querySelectorAll('.card').length;
+            } else {
+              var sentinel = document.createElement('div');
+              sentinel.id = 'sentinel';
+              entries[i].target.parentNode.replaceChild(sentinel, entries[i].target);
+              io.observe(sentinel);
+            }
+          }
+        }
+      });
+
+      io.observe(document.getElementById('sentinel'));
+    })();
+  </script>
+</body>
+</html>

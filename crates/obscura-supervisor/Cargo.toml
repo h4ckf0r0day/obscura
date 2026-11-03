@@ -1,0 +1,19 @@
+[package]
+name = "obscura-supervisor"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Worker supervision tree, self-healing process manager, and lifecycle recycling for Obscura Next"
+
+[dependencies]
+obscura-worker = { path = "../obscura-worker" }
+obscura-telemetry = { path = "../obscura-telemetry" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Timers</title></head>
+<body>
+  <div id="out">pending</div>
+  <!-- Deferred content via a setTimeout chain + a microtask. Exercises the
+       post-load event-loop settle (Page::settle / the --wait window): a scraper
+       that reads at the load event would miss this; obscura must pump the loop. -->
+  <script>
+    (function () {
+      var steps = [];
+      Promise.resolve().then(function () { steps.push('microtask'); });
+      setTimeout(function () {
+        steps.push('t1');
+        setTimeout(function () {
+          steps.push('t2');
+          document.getElementById('out').textContent = 'done';
+          window.__obstacle = 'timers:' + steps.join(',') + ':' + document.getElementById('out').textContent;
+        }, 30);
+      }, 30);
+    })();
+  </script>
+</body>
+</html>

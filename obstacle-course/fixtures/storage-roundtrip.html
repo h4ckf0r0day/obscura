@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Web Storage Round-trip</title></head>
+<body>
+  <div id="out">pending</div>
+  <!-- Web Storage pattern: SPAs persist auth tokens, feature flags, and view
+       state in localStorage/sessionStorage and read them back on hydration. Here
+       we write a key to each store, read both back, and report the round-tripped
+       values. Tools that stub storage as a no-op read back empty strings. -->
+  <script>
+    (function () {
+      localStorage.setItem('ls_key', 'local-value');
+      sessionStorage.setItem('ss_key', 'session-value');
+
+      var ls = localStorage.getItem('ls_key');
+      var ss = sessionStorage.getItem('ss_key');
+
+      window.__obstacle = 'storage:' + ls + ':' + ss + ':' + localStorage.length + ':' + sessionStorage.length;
+      document.getElementById('out').textContent = window.__obstacle;
+    })();
+  </script>
+</body>
+</html>

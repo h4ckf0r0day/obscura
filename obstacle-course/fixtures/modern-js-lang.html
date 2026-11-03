@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Modern JS language features</title></head>
+<body>
+  <!-- Modern ES language + data-structure surface. Proves the V8 runtime is current,
+       not a stale interpreter: optional chaining (?.), nullish coalescing (??),
+       array/object destructuring with defaults, spread, template literals,
+       Map/Set, BigInt arithmetic past Number.MAX_SAFE_INTEGER, Array.flatMap,
+       Array.prototype.at(negative), and Object.fromEntries. Each step folds a
+       deterministic token into the result so a single string asserts them all. -->
+  <script>
+    (function () {
+      try {
+        var parts = [];
+
+        // optional chaining + nullish coalescing
+        var cfg = { server: { port: 8080 } };
+        var port = cfg?.server?.port ?? 0;
+        var host = cfg?.server?.host ?? 'localhost';
+        parts.push('opt=' + host + ':' + port);
+
+        // destructuring with defaults + rest
+        var [first, , third = 'd'] = ['a', 'b'];
+        var { tag = 'div', cls = 'box' } = { tag: 'span' };
+        parts.push('dst=' + first + third + tag + cls);
+
+        // spread (array + object merge)
+        var base = [1, 2];
+        var merged = [...base, 3, 4];
+        var obj = { ...{ x: 1 }, ...{ y: 2 } };
+        parts.push('spr=' + merged.join('') + '/' + (obj.x + obj.y));
+
+        // template literal with expression
+        var n = 6;
+        parts.push(`tpl=${n * 7}`);
+
+        // Map / Set
+        var m = new Map();
+        m.set('a', 1).set('b', 2);
+        var s = new Set([1, 1, 2, 3, 3, 3]);
+        parts.push('col=' + (m.get('a') + m.get('b')) + ':' + s.size);
+
+        // BigInt arithmetic beyond Number.MAX_SAFE_INTEGER (2^53-1 = 9007199254740991)
+        var big = 9007199254740991n + 10n;
+        parts.push('big=' + big.toString());
+
+        // Array.flatMap + Array.prototype.at
+        var fm = [1, 2, 3].flatMap(function (v) { return [v, -v]; });
+        parts.push('fm=' + fm.join(',') + ':' + fm.at(-1));
+
+        // Object.fromEntries (Map -> plain object round-trip)
+        var fe = Object.fromEntries(m);
+        parts.push('fe=' + (fe.a + fe.b));
+
+        window.__obstacle = 'lang|' + parts.join('|');
+      } catch (e) {
+        window.__obstacle = 'lang:error:' + (e && e.message ? e.message : e);
+      }
+    })();
+  </script>
+</body>
+</html>

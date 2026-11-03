@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Async Render</title></head>
+<body>
+  <ul id="list"></ul>
+  <!-- Async data flow: fetch() a same-origin JSON resource, then render. Exercises
+       the fetch shim + promise/event-loop settle (content only exists after the
+       network round-trip resolves). -->
+  <script>
+    (function () {
+      fetch('../data/items.json')
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          var ul = document.getElementById('list');
+          data.items.forEach(function (name) {
+            var li = document.createElement('li');
+            li.textContent = name;
+            ul.appendChild(li);
+          });
+          var lis = document.querySelectorAll('#list li');
+          window.__obstacle = 'async:' + lis.length + ':' + (lis[0] ? lis[0].textContent : 'none');
+        })
+        .catch(function (err) { window.__obstacle = 'async:error:' + err; });
+    })();
+  </script>
+</body>
+</html>

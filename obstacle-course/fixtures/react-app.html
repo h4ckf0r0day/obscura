@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>React App</title>
+  <script src="../vendor/react.min.js"></script>
+  <script src="../vendor/react-dom.min.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <!-- The headline differentiator: render a real React app client-side and read
+       the resulting DOM. Lightweight engines without enough DOM/JS surface can't
+       run React at all. Uses the legacy synchronous ReactDOM.render for a
+       deterministic, settle-free assertion. -->
+  <script>
+    (function () {
+      var e = React.createElement;
+      var items = [];
+      for (var i = 0; i < 100; i++) items.push('Item ' + i);
+      function List() {
+        return e('ul', { id: 'list' }, items.map(function (t, i) { return e('li', { key: i }, t); }));
+      }
+      ReactDOM.render(e(List), document.getElementById('app'));
+      var lis = document.querySelectorAll('#app li');
+      window.__obstacle = 'react:' + lis.length + ':' + (lis[0] ? lis[0].textContent : 'none');
+    })();
+  </script>
+</body>
+</html>

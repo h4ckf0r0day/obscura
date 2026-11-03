@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>DOM Build</title></head>
+<body>
+  <table id="t"><tbody id="tb"></tbody></table>
+  <!-- Vanilla-JS DOM throughput: build 5000 rows via createElement/appendChild. -->
+  <script>
+    (function () {
+      var tb = document.getElementById('tb');
+      for (var i = 0; i < 5000; i++) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.textContent = 'row ' + i;
+        td.setAttribute('data-i', String(i));
+        tr.appendChild(td);
+        tb.appendChild(tr);
+      }
+      window.__obstacle = 'rows:' + document.querySelectorAll('#t tr').length;
+    })();
+  </script>
+</body>
+</html>

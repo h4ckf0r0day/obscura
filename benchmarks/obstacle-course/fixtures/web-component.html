@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Web Component</title></head>
+<body>
+  <my-card title="Hello"></my-card>
+  <my-card title="World"></my-card>
+  <!-- Custom element + shadow DOM: a capability bracket many lightweight headless
+       engines skip. Verifies define/upgrade, connectedCallback, and shadow render. -->
+  <script>
+    class MyCard extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = '<section><h2>' + (this.getAttribute('title') || '') + '</h2><p>card body</p></section>';
+      }
+    }
+    customElements.define('my-card', MyCard);
+    (function () {
+      const cards = document.querySelectorAll('my-card');
+      const first = cards[0] && cards[0].shadowRoot ? cards[0].shadowRoot.querySelector('h2').textContent : 'none';
+      window.__obstacle = 'wc:' + cards.length + ':' + first;
+    })();
+  </script>
+</body>
+</html>

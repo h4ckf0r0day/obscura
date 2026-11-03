@@ -11,6 +11,11 @@ members = [
     "crates/obscura-render",
     "crates/obscura-cli",
     "crates/obscura",
+    "crates/obscura-telemetry",
+    "crates/obscura-isolation",
+    "crates/obscura-worker",
+    "crates/obscura-supervisor",
+    "crates/obscura-agent",
 ]
 exclude = ["vendor/taffy", "vendor/cosmic-text", "vendor/wreq-util"]
 
@@ -29,6 +34,11 @@ obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
 obscura-render = { path = "crates/obscura-render" }
+obscura-telemetry = { path = "crates/obscura-telemetry" }
+obscura-isolation = { path = "crates/obscura-isolation" }
+obscura-worker = { path = "crates/obscura-worker" }
+obscura-supervisor = { path = "crates/obscura-supervisor" }
+obscura-agent = { path = "crates/obscura-agent" }
 
 html5ever = "0.39"
 markup5ever = "0.39"

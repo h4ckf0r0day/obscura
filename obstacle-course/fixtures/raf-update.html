@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>requestAnimationFrame Update</title></head>
+<body>
+  <div id="box">pending</div>
+  <!-- requestAnimationFrame pattern: animation and layout-driven UIs schedule DOM
+       writes inside rAF callbacks (chart libs, virtualized lists, progress bars).
+       Here a chain of two rAF callbacks advances a counter and writes the final
+       value into the DOM. A headless tool without a frame loop never runs the
+       callbacks and the box stays "pending". -->
+  <script>
+    (function () {
+      var box = document.getElementById('box');
+      var frames = 0;
+
+      function tick() {
+        frames++;
+        if (frames < 2) {
+          requestAnimationFrame(tick);
+        } else {
+          box.textContent = 'frame ' + frames;
+          window.__obstacle = 'raf:' + frames + ':' + box.textContent;
+        }
+      }
+
+      requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>

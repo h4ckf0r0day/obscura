@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>TextDecoder legacy charset</title></head>
+<body>
+  <!-- TextDecoder with a legacy (non-UTF-8) charset. Decoding Shift_JIS bytes to
+       Japanese requires the full Encoding Standard label/index tables. -->
+  <script>
+    (function () {
+      try {
+        var d = new TextDecoder('shift_jis');
+        var out = d.decode(new Uint8Array([0x82, 0xA0]));
+        window.__obstacle = 'td:' + out;
+      } catch (e) {
+        window.__obstacle = 'td:error:' + e.message;
+      }
+    })();
+  </script>
+</body>
+</html>

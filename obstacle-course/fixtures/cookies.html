@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Cookies</title></head>
+<body>
+  <!-- document.cookie round-trip: a real cookie jar backs the page so a value written
+       from JS is readable back from JS. A no-DOM engine that stubs document.cookie to
+       an empty string fails this. Writes two cookies and reads them back parsed. -->
+  <script>
+    (function () {
+      document.cookie = 'k=v';
+      document.cookie = 'session=abc123';
+      var jar = {};
+      String(document.cookie || '').split(';').forEach(function (pair) {
+        var i = pair.indexOf('=');
+        if (i < 0) return;
+        var name = pair.slice(0, i).trim();
+        var val = pair.slice(i + 1).trim();
+        if (name) jar[name] = val;
+      });
+      window.__obstacle = 'cookie:k=' + (jar.k || '') + ':session=' + (jar.session || '');
+    })();
+  </script>
+</body>
+</html>

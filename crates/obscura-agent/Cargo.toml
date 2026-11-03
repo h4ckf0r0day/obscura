@@ -1,0 +1,17 @@
+[package]
+name = "obscura-agent"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Autonomous AI-agent browser action protocol and semantic DOM distillation for Obscura Next"
+
+[dependencies]
+obscura-dom = { path = "../obscura-dom" }
+obscura-telemetry = { path = "../obscura-telemetry" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

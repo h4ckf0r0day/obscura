@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>Preact App</title>
+  <script src="../vendor/preact.umd.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <!-- Render a real Preact app client-side via h()/render() and read the
+       resulting DOM. Preact's UMD build exposes window.preact with h and
+       render. render() is synchronous so the assertion settles without
+       waiting. -->
+  <script>
+    (function () {
+      var h = preact.h;
+      var items = [];
+      for (var i = 0; i < 100; i++) items.push('Item ' + i);
+      function List() {
+        return h('ul', { id: 'list' }, items.map(function (t, i) {
+          return h('li', { key: i }, t);
+        }));
+      }
+      preact.render(h(List), document.getElementById('app'));
+      var lis = document.querySelectorAll('#app li');
+      window.__obstacle = 'preact:' + lis.length + ':' + (lis[0] ? lis[0].textContent : 'none');
+    })();
+  </script>
+</body>
+</html>
