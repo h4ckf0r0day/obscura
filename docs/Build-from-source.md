@@ -1,6 +1,6 @@
 ## Requirements
 
-- Rust 1.75+ ([rustup.rs](https://rustup.rs))
+- Current stable Rust ([rustup.rs](https://rustup.rs))
 - C compiler (gcc or clang)
 - ~5 GB free disk space (V8 compiles from source on first build)
 
@@ -29,7 +29,7 @@ cargo build --release -p obscura-cli --bins --features render,stealth
 ```
 
 This is the complete rendering build with the stealth wreq/BoringSSL transport,
-TLS fingerprint randomization, browser-identity protections, and tracker
+a consistent browser TLS fingerprint, browser-identity protections, and tracker
 blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## Without rendering
@@ -93,11 +93,12 @@ cargo install --path crates/obscura-cli --features render
 cargo nextest run --release --features render --no-fail-fast
 ```
 
-Integration suite:
+CDP integration tests are registered in `crates/obscura-cdp/tests/integration.rs`.
+Run them with:
 
 ```bash
-python3 tests/test_all.py
+cargo nextest run --release --features render -p obscura-cdp --test integration
 ```
 
 Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
-because the engine owns a single V8 isolate per process.
+to keep V8 runtime state isolated.

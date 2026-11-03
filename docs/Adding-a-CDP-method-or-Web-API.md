@@ -30,10 +30,19 @@ pub async fn do_thing(
 
 ### 2. Register in the dispatcher
 
-In `crates/obscura-cdp/src/dispatch.rs`, add a match arm:
+Export the module in `crates/obscura-cdp/src/domains/mod.rs`:
 
 ```rust
-"MyDomain.doThing" => domains::my_domain::do_thing(&req.params, ctx, &req.session_id).await,
+pub mod my_domain;
+```
+
+The dispatcher splits `Domain.method` before matching the domain. In
+`crates/obscura-cdp/src/dispatch.rs`, add a domain arm:
+
+```rust
+"MyDomain" if method == "doThing" => {
+    domains::my_domain::do_thing(&req.params, ctx, &req.session_id).await
+}
 ```
 
 ### 3. Test it
@@ -60,15 +69,18 @@ async fn my_domain_do_thing_returns_ok() {
 }
 ```
 
-Run:
+Register `cdp_my_domain` in the `integration_tests!` list in
+`crates/obscura-cdp/tests/integration.rs`, then run:
 
 ```bash
-cargo nextest run --release --features render -p obscura-cdp my_domain
+cargo nextest run --release --features render -p obscura-cdp --test integration -E 'test(cdp_my_domain::)'
 ```
 
 ## Adding a Web API
 
-Worked example: `crypto.subtle.digest`, real implementation backed by a Rust hash op.
+`crypto.subtle.digest` is already implemented. The excerpts below show the
+JS-to-Rust flow. Modify the existing op and shim when extending it; do not
+register a duplicate op.
 
 ### 1. Add the Rust op
 
@@ -84,40 +96,45 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
         "SHA-256" => sha2::Sha256::digest(data).to_vec(),
         "SHA-384" => sha2::Sha384::digest(data).to_vec(),
         "SHA-512" => sha2::Sha512::digest(data).to_vec(),
-        _         => sha2::Sha256::digest(data).to_vec(),
+        "SHA-512/224" => sha2::Sha512_224::digest(data).to_vec(),
+        "SHA-512/256" => sha2::Sha512_256::digest(data).to_vec(),
+        _ => vec![], // The JS shim rejects unsupported names before this call.
     }
 }
 ```
 
 ### 2. Register the op
 
-In the same file, `build_extension()`:
+In the same file, add the op to the vector in `build_extension()`:
 
 ```rust
-ops: std::borrow::Cow::Owned(vec![
+let mut ops = vec![
     op_dom(),
-    op_console_msg(),
-    // ...
+    // Other registered ops...
     op_subtle_digest(),
-]),
+];
 ```
 
 ### 3. Add the JS shim
 
-In `crates/obscura-js/js/bootstrap.js`:
+The existing crypto implementation in `crates/obscura-js/js/bootstrap.js`
+validates inputs before calling the private native bridge. Its digest method is:
 
 ```js
-globalThis.crypto = globalThis.crypto || {};
-globalThis.crypto.subtle = globalThis.crypto.subtle || {};
-globalThis.crypto.subtle.digest = function digest(algorithm, data) {
-  const algName = typeof algorithm === 'string' ? algorithm : algorithm.name;
-  const bytes = data instanceof ArrayBuffer
-    ? new Uint8Array(data)
-    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  const out = Deno.core.ops.op_subtle_digest(algName, bytes);
-  return Promise.resolve(out.buffer);
-};
+async digest(algorithm, data) {
+  const name = (typeof algorithm === "string" ? algorithm : algorithm && algorithm.name || "")
+    .toUpperCase().replace("_", "-");
+  if (name !== "SHA-1" && name !== "SHA-256" && name !== "SHA-384" &&
+      name !== "SHA-512" && name !== "SHA-512/224" && name !== "SHA-512/256") {
+    throw new DOMException("Unrecognized algorithm name", "NotSupportedError");
+  }
+  return bufferOf(__obscuraCore.ops.op_subtle_digest(name, toBytes(data)));
+}
 ```
+
+`toBytes` and `bufferOf` are helpers in the same crypto closure. The async method
+turns validation errors into rejected promises. Do not expose the native bridge
+to page scripts or substitute a different algorithm for unsupported input.
 
 ### 4. Add a dependency if needed
 
@@ -131,17 +148,20 @@ sha2 = "0.10"
 ### 5. Smoke test
 
 ```bash
-cargo build --release --features render
+cargo build --release -p obscura-cli --bins --features render
 ./target/release/obscura fetch https://example.com --eval "
   crypto.subtle.digest('SHA-256', new TextEncoder().encode('hi'))
-    .then(buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join(''))
-"
+    .then(buf => {
+      document.body.textContent = Array.from(new Uint8Array(buf))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+    })
+" --dump text
 ```
 
 ## Tips
 
 - Keep the JS shim thin. All side effects go through ops.
-- Use `Promise.resolve` to keep async-shaped APIs callable from sync ops.
+- Use async wrappers when validation failures must reject a promise.
 - Match the spec: Web API names and shapes are checked by Puppeteer / Playwright wrappers.
 - DOM mutations go through `op_dom`, not new ops.
 - For events that need to fire across handlers, use the existing `_makeListenerBox` helper in `bootstrap.js`.
