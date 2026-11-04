@@ -2618,6 +2618,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "obscura-scheduler"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "obscura-control-plane",
+ "obscura-telemetry",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "obscura-ssrf"
 version = "0.2.0"
 

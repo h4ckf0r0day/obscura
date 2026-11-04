@@ -70,6 +70,8 @@ pub struct Job {
     pub max_attempts: i32,
     pub fencing_token: i64,
     pub worker_id: Option<Uuid>,
+    pub dispatch_id: Option<Uuid>,
+    pub execution_attempt_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -148,7 +150,7 @@ impl ControlPlane {
 
     pub async fn get_job(&self, job_id: Uuid, tenant_id: Uuid) -> Result<Job> {
         let row = sqlx::query(
-            "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, created_at, updated_at FROM jobs WHERE job_id = $1 AND tenant_id = $2",
+            "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, dispatch_id, execution_attempt_id, created_at, updated_at FROM jobs WHERE job_id = $1 AND tenant_id = $2",
         )
         .bind(job_id)
         .bind(tenant_id)
@@ -168,6 +170,8 @@ impl ControlPlane {
             max_attempts: row.get("max_attempts"),
             fencing_token: row.get("fencing_token"),
             worker_id: row.get("worker_id"),
+            dispatch_id: row.get("dispatch_id"),
+            execution_attempt_id: row.get("execution_attempt_id"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
@@ -175,7 +179,7 @@ impl ControlPlane {
 
     pub async fn list_jobs(&self, tenant_id: Uuid, limit: i64) -> Result<Vec<Job>> {
         let rows = sqlx::query(
-            "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, created_at, updated_at FROM jobs WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2",
+            "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, dispatch_id, execution_attempt_id, created_at, updated_at FROM jobs WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2",
         )
         .bind(tenant_id)
         .bind(limit)
@@ -196,6 +200,8 @@ impl ControlPlane {
                 max_attempts: row.get("max_attempts"),
                 fencing_token: row.get("fencing_token"),
                 worker_id: row.get("worker_id"),
+                dispatch_id: row.get("dispatch_id"),
+                execution_attempt_id: row.get("execution_attempt_id"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
             })
@@ -204,7 +210,7 @@ impl ControlPlane {
 
     pub async fn cancel_job(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
         let res = sqlx::query(
-            "UPDATE jobs SET status = 'cancelled', updated_at = now() WHERE job_id = $1 AND tenant_id = $2 AND status IN ('pending','queued','assigned')",
+            "UPDATE jobs SET status = 'cancelled', updated_at = now() WHERE job_id = $1 AND tenant_id = $2 AND status IN ('pending','queued','assigned','dispatched','running','scheduled')",
         )
         .bind(job_id)
         .bind(tenant_id)
@@ -600,5 +606,181 @@ mod phase3_tests {
         // second run publishes nothing new
         assert_eq!(n2, 0);
         assert!(n1 >= 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: scheduler support
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRecord {
+    pub worker_id: Uuid,
+    pub tenant_id: Option<Uuid>,
+    pub status: String,
+    pub capabilities: serde_json::Value,
+    pub capacity: i32,
+    pub active_jobs: i32,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+impl ControlPlane {
+    pub async fn register_worker(
+        &self,
+        tenant_id: Option<Uuid>,
+        capabilities: serde_json::Value,
+        capacity: i32,
+    ) -> Result<Uuid> {
+        let worker_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workers (worker_id, tenant_id, status, capabilities, capacity, last_heartbeat_at) VALUES ($1,$2,'healthy',$3,$4,now())",
+        )
+        .bind(worker_id)
+        .bind(tenant_id)
+        .bind(&capabilities)
+        .bind(capacity)
+        .execute(self.pool())
+        .await?;
+        Ok(worker_id)
+    }
+
+    pub async fn worker_heartbeat(&self, worker_id: Uuid) -> Result<()> {
+        let res = sqlx::query("UPDATE workers SET last_heartbeat_at = now(), status = 'healthy' WHERE worker_id = $1")
+            .bind(worker_id)
+            .execute(self.pool())
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(ControlPlaneError::NotFound(worker_id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn list_healthy_workers(&self, tenant_id: Option<Uuid>) -> Result<Vec<WorkerRecord>> {
+        let rows = sqlx::query(
+            "SELECT worker_id, tenant_id, status, capabilities, capacity, active_jobs, last_heartbeat_at FROM workers WHERE status = 'healthy' AND ($1::uuid IS NULL OR tenant_id IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|r| WorkerRecord {
+            worker_id: r.get("worker_id"),
+            tenant_id: r.get("tenant_id"),
+            status: r.get("status"),
+            capabilities: r.get("capabilities"),
+            capacity: r.get("capacity"),
+            active_jobs: r.get("active_jobs"),
+            last_heartbeat_at: r.get("last_heartbeat_at"),
+        }).collect())
+    }
+
+    /// Atomically claim a pending job for scheduling. Returns job if claimed.
+    pub async fn claim_pending_job(&self) -> Result<Option<Job>> {
+        let mut tx = self.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, dispatch_id, execution_attempt_id, created_at, updated_at FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let job = match row {
+            Some(r) => {
+                let job_id: Uuid = r.get("job_id");
+                let tenant_id: Uuid = r.get("tenant_id");
+                sqlx::query("UPDATE jobs SET status = 'scheduled', updated_at = now() WHERE job_id = $1")
+                    .bind(job_id)
+                    .execute(&mut *tx)
+                    .await?;
+                Some(Job {
+                    job_id,
+                    tenant_id,
+                    status: "scheduled".to_string(),
+                    url: r.get("url"),
+                    operation: r.get("operation"),
+                    payload: r.get("payload"),
+                    idempotency_key: r.get("idempotency_key"),
+                    attempt_count: r.get("attempt_count"),
+                    max_attempts: r.get("max_attempts"),
+                    fencing_token: r.get("fencing_token"),
+                    worker_id: r.get("worker_id"),
+                    dispatch_id: r.get("dispatch_id"),
+                    execution_attempt_id: r.get("execution_attempt_id"),
+                    created_at: r.get("created_at"),
+                    updated_at: Utc::now(),
+                })
+            }
+            None => None,
+        };
+        tx.commit().await?;
+        Ok(job)
+    }
+
+    pub async fn mark_dispatched(&self, job_id: Uuid, tenant_id: Uuid, worker_id: Uuid, dispatch_id: Uuid, attempt_id: Uuid) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query(
+            "UPDATE jobs SET status='dispatched', worker_id=$1, dispatch_id=$2, execution_attempt_id=$3, attempt_count=attempt_count+1, updated_at=now() WHERE job_id=$4 AND tenant_id=$5 AND status='scheduled'",
+        )
+        .bind(worker_id)
+        .bind(dispatch_id)
+        .bind(attempt_id)
+        .bind(job_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE workers SET active_jobs = active_jobs + 1 WHERE worker_id = $1")
+            .bind(worker_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO job_attempts (attempt_id, job_id, worker_id, fencing_token, status) VALUES ($1,$2,$3,0,'dispatched')",
+        )
+        .bind(attempt_id)
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn mark_running(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE jobs SET status='running', updated_at=now() WHERE job_id=$1 AND tenant_id=$2 AND status='dispatched'")
+            .bind(job_id).bind(tenant_id).execute(self.pool()).await?;
+        Ok(())
+    }
+
+    pub async fn complete_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, result: serde_json::Value) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("UPDATE jobs SET status='completed', updated_at=now(), completed_at=now() WHERE job_id=$1 AND tenant_id=$2")
+            .bind(job_id).bind(tenant_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE job_attempts SET status='completed', finished_at=now() WHERE attempt_id=$1")
+            .bind(attempt_id).execute(&mut *tx).await?;
+        // decrement worker active
+        sqlx::query("UPDATE workers SET active_jobs = GREATEST(active_jobs-1,0) WHERE worker_id = (SELECT worker_id FROM jobs WHERE job_id=$1)")
+            .bind(job_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO job_events (job_id, event_type, payload) VALUES ($1,'completed',$2)")
+            .bind(job_id).bind(result).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn fail_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, error_code: &str, error_message: &str, retryable: bool) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        // get attempt count
+        let row = sqlx::query("SELECT attempt_count, max_attempts FROM jobs WHERE job_id=$1 AND tenant_id=$2")
+            .bind(job_id).bind(tenant_id).fetch_one(&mut *tx).await?;
+        let attempts: i32 = row.get("attempt_count");
+        let max: i32 = row.get("max_attempts");
+        let new_status = if retryable && attempts < max { "pending" } else { "failed" };
+        sqlx::query("UPDATE jobs SET status=$1, updated_at=now() WHERE job_id=$2 AND tenant_id=$3")
+            .bind(new_status).bind(job_id).bind(tenant_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE job_attempts SET status='failed', finished_at=now(), error_code=$1, error_message=$2 WHERE attempt_id=$3")
+            .bind(error_code).bind(error_message).bind(attempt_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE workers SET active_jobs = GREATEST(active_jobs-1,0) WHERE worker_id = (SELECT worker_id FROM jobs WHERE job_id=$1)")
+            .bind(job_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cancel_job_phase4(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
+        self.cancel_job(job_id, tenant_id).await
     }
 }

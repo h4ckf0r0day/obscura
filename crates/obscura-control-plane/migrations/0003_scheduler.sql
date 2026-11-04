@@ -1,0 +1,4 @@
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS active_jobs INT NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dispatch_id UUID;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS execution_attempt_id UUID;
+CREATE INDEX IF NOT EXISTS idx_jobs_dispatch ON jobs (dispatch_id);
