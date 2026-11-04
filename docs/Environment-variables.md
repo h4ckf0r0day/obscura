@@ -54,7 +54,10 @@ This shorter budget applies when the document body already contains more than 50
 
 ### `OBSCURA_CDP_COMMAND_TIMEOUT_MS`
 
-Per-command deadline for the CDP server. A hung page (a runaway `Runtime.evaluate`, a synchronous DOM op) is terminated after this budget so one bad session cannot hold the shared V8 lock and stall the others. Default 60000 (60 seconds); `0` disables it. Navigation self-bounds via `OBSCURA_NAV_TIMEOUT_MS` well under this.
+Per-command V8 deadline for the CDP server. Default 60000 (60 seconds); `0`
+disables it. The watchdog terminates JavaScript that exceeds the budget so it
+can release the connection's V8 lock. It cannot preempt native Rust work. Keep
+this budget above `OBSCURA_NAV_TIMEOUT_MS`.
 
 ```bash
 OBSCURA_CDP_COMMAND_TIMEOUT_MS=30000 obscura serve
@@ -80,10 +83,51 @@ OBSCURA_FETCH_TIMEOUT_MS=15000 obscura serve
 
 ### `OBSCURA_PROXY`
 
-Default proxy URL used by `obscura-worker` for the parallel `scrape` command when no `--proxy` flag is set.
+Default proxy URL for `serve` and direct `obscura-worker` invocations.
+The `scrape` command passes its `--proxy` value to workers through this variable;
+an unset `--proxy` clears the inherited worker value. Use `--proxy` for `fetch`,
+`scrape`, and `mcp`.
 
 ```bash
-OBSCURA_PROXY=http://proxy.example.com:8080 obscura scrape - < urls.txt
+OBSCURA_PROXY=http://proxy.example.com:8080 obscura serve
+```
+
+## Resource limits
+
+Values below are non-negative integers. Byte limits use bytes, not MiB.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OBSCURA_FETCH_MAX_BODY_BYTES` | 104857600 for JS fetch/XHR; 33554432 for modules | Maximum buffered response size. Setting it overrides both defaults. |
+| `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` | 128 | Maximum retained response bodies in each page/runtime cache. Zero disables retention. |
+| `OBSCURA_NETWORK_BODY_BUFFER_BYTES` | 2097152 | Largest individual response body retained for CDP retrieval. Zero disables retention; this is not a total-cache byte limit. |
+| `OBSCURA_IO_STREAM_MAX_ENTRIES` | 32 | Maximum open CDP response-body streams per connection. |
+| `OBSCURA_IO_STREAM_MAX_BYTES` | 268435456 | Total bytes retained by those streams. Oldest streams are evicted when a limit is exceeded. |
+| `OBSCURA_MAX_LIVE_FRAMES` | 64 | Maximum live child frames per page, including initial realms awaiting adoption. |
+| `OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES` | 4096 | Maximum queued cross-frame messages. |
+| `OBSCURA_FRAME_MESSAGE_QUEUE_BYTES` | 8388608 | Maximum bytes in the cross-frame message queue. |
+
+Disabling response-body retention does not disable network events. Reading an
+evicted CDP body or stream returns an error.
+
+## Rendering
+
+These settings require a render-enabled build.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OBSCURA_SHOT_W` / `OBSCURA_SHOT_H` | 1280 / 720 | CLI screenshot viewport in CSS pixels, set before navigation. |
+| `OBSCURA_SHOT_ANIMATION_TIME_MS` | Live timeline | Sample CSS animations at a finite, non-negative time for a CLI screenshot. |
+| `OBSCURA_RENDER_RESOURCE_DEADLINE_MS` | 3000 | Resource preparation budget before CLI/CDP screenshots, in milliseconds. |
+| `OBSCURA_RENDER_RESOURCE_WARMUP_MS` | 1000 | Resource preparation budget before navigation scripts, in milliseconds. |
+| `OBSCURA_RENDER_RESOURCE_POST_SCRIPT_WARMUP_MS` | 1000 | Resource preparation budget after navigation scripts, in milliseconds. |
+| `OBSCURA_RENDER_RESOURCE_SETTLE_WARMUP_MS` | 1000 | Resource preparation budget after settling, bounded by its remaining time. |
+
+For example:
+
+```bash
+OBSCURA_SHOT_W=1440 OBSCURA_SHOT_H=1000 \
+  obscura fetch https://example.com --screenshot page.png
 ```
 
 ## Stealth and identity
@@ -123,7 +167,7 @@ OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
 
 ### `OBSCURA_PROFILE`
 
-Pin a specific browser profile from the built-in pool by index (`0`-based). Each profile keeps `navigator.platform`, `userAgentData`, the UA string, and the GPU renderer internally consistent. Without it a single stable profile is used.
+Pin a specific browser profile from the built-in pool by index (`0`-based). Each profile keeps `navigator.platform`, `userAgentData`, and the UA string internally consistent. Without it a single stable profile is used.
 
 ```bash
 OBSCURA_PROFILE=2 obscura serve
@@ -139,12 +183,24 @@ OBSCURA_ROTATE_PROFILE=1 obscura serve
 
 ## MCP
 
-### `OBSCURA_MCP_ALLOWED_ORIGINS`
+### `OBSCURA_STORAGE_DIR`
 
-Comma-separated `Origin` allowlist for the HTTP MCP transport (`obscura mcp --http`). Browser requests are refused by default; when set, only listed origins are accepted. Native, non-browser MCP clients (which send no `Origin`) are always allowed.
+Persistent profile directory for MCP. Equivalent to passing `--storage-dir`
+before the `mcp` subcommand. See [Persist cookies and storage](Persist-cookies-and-storage.md).
 
 ```bash
-OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" obscura mcp --http --host 0.0.0.0
+OBSCURA_STORAGE_DIR=./obscura-data obscura mcp
+```
+
+### `OBSCURA_MCP_ALLOWED_ORIGINS`
+
+Comma-separated `Origin` allowlist for the HTTP MCP transport (`obscura mcp --http`). Browser requests are refused by default; when set, only listed origins are accepted. Native clients without an `Origin` header pass the origin check.
+If `OBSCURA_MCP_TOKEN` is set, they still need that token.
+
+```bash
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" \
+OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
+  obscura mcp --http --host 0.0.0.0
 ```
 
 ### `OBSCURA_MCP_TOKEN`
@@ -168,7 +224,8 @@ RUST_LOG=obscura=debug obscura serve
 RUST_LOG=obscura_cdp=trace,obscura_browser=debug obscura serve
 ```
 
-`--verbose` on the CLI is equivalent to `RUST_LOG=obscura=info`.
+`--verbose` selects debug-level logging unless `RUST_LOG` supplies a filter.
+The default filter is `warn`; `--quiet` selects `off`.
 
 ## Build
 
@@ -177,7 +234,7 @@ RUST_LOG=obscura_cdp=trace,obscura_browser=debug obscura serve
 Forces `cargo build` to use the system OpenSSL instead of compiling the vendored copy. Set to `1` on hosts where the vendored OpenSSL fails (older VPS with AVX-512 issues).
 
 ```bash
-OPENSSL_NO_VENDOR=1 cargo build --release --features render
+OPENSSL_NO_VENDOR=1 cargo build --release -p obscura-cli --bins --features render
 ```
 
 ## V8
@@ -194,4 +251,5 @@ User flags are appended after the defaults, but V8 applies flag implications aft
 
 ## HTTP proxy environment
 
-Obscura does not honor `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. Use `--proxy` or `OBSCURA_PROXY`.
+Obscura does not honor `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. Use `--proxy`; `OBSCURA_PROXY` is available for `serve` and direct worker
+invocations as described above.

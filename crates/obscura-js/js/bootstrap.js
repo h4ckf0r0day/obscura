@@ -2360,6 +2360,7 @@ function _runPostConnectionSteps(nodes) {
       __prepareInsertedSubtree(n);
       if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
     }
+    for (const n of nodes) _connectCustomElements(n, true);
   } finally {
     _postConnection = outer;
   }
@@ -2374,6 +2375,75 @@ function _iframeConnectionPending(iframe) {
     return !!state.cursor && _rngOrder(state.cursor, iframe) < 0;
   }
   return false;
+}
+
+// Custom element reactions for connection changes. Only defined names are
+// queried, so a page without definitions pays one Map size check per
+// insertion or removal. The reactions run once the DOM operation is done.
+let _customElementSelector = '';
+let _customElementSelectorSize = 0;
+function _definedCustomElementsIn(root, inclusive) {
+  const registry = globalThis.customElements?._registry;
+  if (!registry || registry.size === 0) return null;
+  const type = root.nodeType;
+  if (type !== 1 && type !== 11) return null;
+  if (_customElementSelectorSize !== registry.size) {
+    _customElementSelector = Array.from(registry.keys(), (name) => name.replace(/\./g, '\\.')).join(',');
+    _customElementSelectorSize = registry.size;
+  }
+  const found = [];
+  if (inclusive && type === 1 && registry.has(root.localName)) _pushCustomElementTree(root, found);
+  const ids = _domParse("query_selector_all_scoped", root._nid, _customElementSelector) || [];
+  for (const nid of ids) {
+    const el = _wrapEl(+nid);
+    if (el) _pushCustomElementTree(el, found);
+  }
+  return found;
+}
+// Shadow-including tree order: a custom element, then the defined elements of
+// its shadow tree, then its light descendants. Only custom element hosts are
+// visited, which is where components keep nested components.
+function _pushCustomElementTree(el, found) {
+  found.push(el);
+  const shadow = _shadowRootForHost(el, true);
+  if (shadow) {
+    const nested = _definedCustomElementsIn(shadow, false);
+    if (nested) for (const inner of nested) found.push(inner);
+  }
+}
+// Upgrades or connects the defined elements of a subtree that just became
+// connected, in tree order.
+function _connectCustomElements(root, inclusive) {
+  const elements = _definedCustomElementsIn(root, inclusive);
+  if (!elements || elements.length === 0 || !root.isConnected) return;
+  const registry = globalThis.customElements;
+  for (const el of elements) {
+    if (!el.__customUpgraded) registry._upgradeElement(el, registry._registry.get(el.localName));
+    else _customElementCallback(el, 'connectedCallback');
+  }
+}
+// Collected before a connected subtree leaves the tree, called after.
+function _connectedCustomElementsIn(root, inclusive) {
+  const elements = _definedCustomElementsIn(root, inclusive);
+  if (!elements || elements.length === 0 || !root.isConnected) return null;
+  return elements;
+}
+function _disconnectCustomElements(elements) {
+  if (elements) for (const el of elements) _customElementCallback(el, 'disconnectedCallback');
+}
+function _customElementCallback(el, name, args) {
+  if (!el.__customUpgraded || el.__customUpgradeFailed) return;
+  const callback = el[name];
+  if (typeof callback !== 'function') return;
+  try { callback.apply(el, args || []); }
+  catch (e) { globalThis.reportError?.(e); }
+}
+// attributeChangedCallback: the old value is only read for an upgraded
+// element whose definition observes the attribute.
+function _customElementObserves(el, localName) {
+  if (!el.__customUpgraded || el.__customUpgradeFailed) return false;
+  const observed = globalThis.customElements?._observedAttributes?.get(el.localName);
+  return !!observed && observed.has(localName);
 }
 
 function __prepareInsertedSubtree(root) {
@@ -2702,6 +2772,7 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
   const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
   const removedWindowNames = _windowNamedNamesInTree(child);
   if (child instanceof Element) _releaseLinkedStylesheetsIn(child);
+  const leavingCustomElements = _connectedCustomElementsIn(child, true);
   const parentConnected = parent.isConnected;
   const removed = _dom("remove_child", child._nid) === "true";
   if (!removed) {
@@ -2713,12 +2784,14 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
   _detachStyleSheetsInSubtree(child);
   _reconcileWindowNamedProperties(removedWindowNames);
   if (observed) _queueTreeMutationRecord(parent, [], [child], previousSibling, nextSibling);
+  _disconnectCustomElements(leavingCustomElements);
 }
 
 // Move one node under `parent` before `child` (append when null). A node
 // that still has a parent is removed from it first, which old-parent
 // observers see as a removal (adopt runs "remove" before inserting).
 function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  let leavingCustomElements = null;
   if (node._shadowParent) {
     node._shadowParent.removeChild(node);
   } else {
@@ -2729,6 +2802,7 @@ function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
         _queueTreeMutationRecord(oldParent, [], [node], previousSibling, nextSibling);
       }
       _detachStyleSheetsInSubtree(node);
+      leavingCustomElements = _connectedCustomElementsIn(node, true);
     }
   }
   const parentConnected = parent.isConnected;
@@ -2743,6 +2817,7 @@ function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
   _seedInsertedTreeState(node, parent, parentConnected);
   if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
   _registerWindowNamedTree(node);
+  _disconnectCustomElements(leavingCustomElements);
 }
 
 // "Insert": returns the inserted nodes. `suppress` skips parent's record.
@@ -4220,6 +4295,7 @@ class Element extends Node {
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
     for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
     _releaseLinkedStylesheetsIn(this);
+    const leavingCustomElements = _connectedCustomElementsIn(this, false);
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
@@ -4237,6 +4313,8 @@ class Element extends Node {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
     }
+    _disconnectCustomElements(leavingCustomElements);
+    _connectCustomElements(this, false);
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() {
@@ -4356,6 +4434,7 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttribute(n) : null;
+    const customOldValue = _customElementObserves(this, n) ? this.getAttribute(n) : undefined;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
@@ -4383,6 +4462,7 @@ class Element extends Node {
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, n, null, observedOldValue);
+    if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, value, null]);
     if (this.localName === "source"
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
@@ -4404,6 +4484,7 @@ class Element extends Node {
       ? this.hasAttribute('open')
       : null;
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
+    const customOldValue = _customElementObserves(this, localName) ? this.getAttributeNS(ns, localName) : undefined;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
@@ -4413,6 +4494,7 @@ class Element extends Node {
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
+    if (customOldValue !== undefined) _customElementCallback(this, 'attributeChangedCallback', [localName, customOldValue, value, ns || null]);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -4425,6 +4507,7 @@ class Element extends Node {
       ? this.getAttribute(n)
       : null;
     const observedOldValue = _hasMutationObservers() ? this.getAttribute(n) : null;
+    const customOldValue = _customElementObserves(this, n) ? this.getAttribute(n) : null;
     _dom("remove_attribute", this._nid, n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, null, observedOldValue);
@@ -4453,6 +4536,7 @@ class Element extends Node {
         image._imageSourceChanged();
       }
     }
+    if (customOldValue !== null) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, null, null]);
   }
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
@@ -4462,12 +4546,14 @@ class Element extends Node {
       : null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
+    const customOldValue = _customElementObserves(this, n) ? this.getAttributeNS(ns, n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
+    if (customOldValue !== null) _customElementCallback(this, 'attributeChangedCallback', [n, customOldValue, null, ns || null]);
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -7157,12 +7243,15 @@ class DocumentFragment extends Node {
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
     const html = String(v ?? "");
+    const leavingCustomElements = _connectedCustomElementsIn(this, false);
     if (this._fragmentContext) {
       _dom("set_inner_html_context", this._nid, _fragmentContextPayload(this._fragmentContext, html));
     } else {
       _dom("set_inner_html", this._nid, html);
     }
     _connectInsertedFrames(this, html);
+    _disconnectCustomElements(leavingCustomElements);
+    _connectCustomElements(this, false);
   }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
@@ -11182,8 +11271,18 @@ function _isValidCustomElementName(name) {
   // PotentialCustomElementName (approx): lowercase start, a hyphen, no uppercase.
   return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(name);
 }
+// Read once at define time, as the spec does, and only when the class has an
+// attributeChangedCallback.
+function _observedAttributesOf(cls) {
+  if (typeof cls.prototype?.attributeChangedCallback !== 'function') return null;
+  const list = cls.observedAttributes;
+  if (list == null) return null;
+  const names = new Set();
+  for (const name of list) names.add(String(name));
+  return names.size ? names : null;
+}
 class CustomElementRegistry {
-  constructor() { this._registry = new Map(); this._byCtor = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
+  constructor() { this._registry = new Map(); this._byCtor = new Map(); this._observedAttributes = new Map(); this._whenDefinedResolvers = new Map(); this._defining = false; }
   define(name, cls, opts) {
     if (!_isConstructorCE(cls)) throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not a constructor.");
     if (!_isValidCustomElementName(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError");
@@ -11191,7 +11290,12 @@ class CustomElementRegistry {
     if (this._registry.has(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
     if (this._byCtor.has(cls)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the constructor has already been used with this registry", "NotSupportedError");
     this._defining = true;
-    try { this._byCtor.set(cls, name); this._defineInner(name, cls, opts); } finally { this._defining = false; }
+    try {
+      const observed = _observedAttributesOf(cls);
+      this._byCtor.set(cls, name);
+      if (observed) this._observedAttributes.set(name, observed);
+      this._defineInner(name, cls, opts);
+    } finally { this._defining = false; }
   }
   _defineInner(name, cls, opts) {
     this._registry.set(name, cls);
@@ -11230,9 +11334,15 @@ class CustomElementRegistry {
       if (constructed !== el) {
         throw new TypeError("Custom element constructor did not produce the element being upgraded");
       }
-      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
-        try { el.connectedCallback(); } catch (e) {}
+      const observed = this._observedAttributes.get(el.localName);
+      if (observed) {
+        for (const attr of Array.from(el.attributes)) {
+          if (observed.has(attr.localName)) {
+            _customElementCallback(el, 'attributeChangedCallback', [attr.localName, null, attr.value, attr.namespaceURI]);
+          }
+        }
       }
+      if (el.isConnected) _customElementCallback(el, 'connectedCallback');
     } catch (e) {
       el.__customUpgradeFailed = true;
     }
@@ -12536,6 +12646,12 @@ const _checkXmlWellFormed = (html) => {
 // "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
 // flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
 // skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
+// Pages replace String.prototype.startsWith with polyfills that ignore the
+// position argument (`this.substr(0, a.length) === a`; iasWorld county sites
+// ship one). Every `startsWith(x, i)` below then tested the start of the
+// input, so any XML beginning with `<?xml` read as a parse error.
+const _startsWithAt = Function.prototype.call.bind(String.prototype.startsWith);
+
 function _xmlWellFormed(src) {
   const s = String(src);
   const stack = [];
@@ -12546,10 +12662,10 @@ function _xmlWellFormed(src) {
     const lt = s.indexOf('<', i);
     if (lt === -1) break;
     i = lt;
-    if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i + 4); if (e === -1) return false; i = e + 3; continue; }
-    if (s.startsWith('<![CDATA[', i)) { const e = s.indexOf(']]>', i + 9); if (e === -1) return false; i = e + 3; continue; }
-    if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i + 2); if (e === -1) return false; i = e + 2; continue; }
-    if (s.startsWith('<!', i)) { const e = s.indexOf('>', i + 2); if (e === -1) return false; i = e + 1; continue; }
+    if (_startsWithAt(s, '<!--', i)) { const e = s.indexOf('-->', i + 4); if (e === -1) return false; i = e + 3; continue; }
+    if (_startsWithAt(s, '<![CDATA[', i)) { const e = s.indexOf(']]>', i + 9); if (e === -1) return false; i = e + 3; continue; }
+    if (_startsWithAt(s, '<?', i)) { const e = s.indexOf('?>', i + 2); if (e === -1) return false; i = e + 2; continue; }
+    if (_startsWithAt(s, '<!', i)) { const e = s.indexOf('>', i + 2); if (e === -1) return false; i = e + 1; continue; }
     // A start/end/self-closing tag: find its '>' while skipping quoted regions.
     let j = i + 1, quote = null;
     while (j < n) {
@@ -15720,6 +15836,7 @@ function _frameWindowFor(frameId) {
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
+  const parentId = Reflect.get(real, '__obscura_parentFrameId') || 0;
   const post = _markNative(function (data, targetOrigin, _transfer) {
     _sendRealmMessage(frameId, data, targetOrigin);
   });
@@ -15727,6 +15844,11 @@ function _frameWindowFor(frameId) {
     get(target, prop) {
       if (prop === 'postMessage') return post;
       if (prop === '__obscura_wrapsRealm') return true;
+      // Message sources can be grandchildren. Resolve their actual parent in
+      // the caller's realm so replies keep both the recipient and sender.
+      if (prop === 'parent') return parentId === _realmFrameId
+        ? globalThis : (_frameWindowFor(parentId) || _remoteWindow(parentId));
+      if (prop === 'top') return globalThis.top;
       // Not `receiver`: an accessor on a real global must run with the global
       // itself as `this`, not with this proxy.
       return Reflect.get(target, prop);
