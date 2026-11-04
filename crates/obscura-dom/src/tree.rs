@@ -637,6 +637,11 @@ impl DomTree {
         self.inner.borrow().shadow_roots_by_host.get(&host).copied()
     }
 
+    /// Whether any native shadow roots exist, including detached roots.
+    pub fn has_shadow_roots(&self) -> bool {
+        !self.inner.borrow().shadow_roots.is_empty()
+    }
+
     pub fn shadow_root_info(&self, root: NodeId) -> Option<ShadowRoot> {
         self.inner.borrow().shadow_roots.get(&root).copied()
     }

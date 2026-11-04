@@ -1,0 +1,2 @@
+[workspace]
+publish_features = ["tokio-rt"]

@@ -1607,7 +1607,8 @@ async fn fetch_original_response(
                 Arc::new(obscura_net::CookieJar::new()),
                 proxy.as_deref(),
                 false,
-            );
+            )
+            .with_user_agent(user_agent);
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
                 Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),

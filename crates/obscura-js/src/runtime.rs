@@ -1196,6 +1196,12 @@ impl ObscuraJsRuntime {
     pub fn has_pending_frame_tasks(&self) -> bool {
         let state = self.state.borrow();
         !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
+            || self.realm_states().borrow().has_pending_navigation()
+    }
+
+    #[doc(hidden)]
+    pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.realm_states().borrow().take_pending_navigations()
     }
 
     /// postMessage traffic waiting to be delivered to another realm.
@@ -2580,13 +2586,19 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
+    #[doc(hidden)]
+    pub fn set_frame_preload_scripts(&self, scripts: &[String]) {
+        self.realm_states().borrow_mut().frame_preload_scripts = scripts.to_vec();
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
         self.state.borrow_mut().navigation_timing.record("domLoading");
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_script_with_timeout(
             "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
+            "globalThis.__obscura_init();",
+            std::time::Duration::from_secs(5),
         );
     }
 
@@ -3766,8 +3778,8 @@ impl ObscuraJsRuntime {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
 
-        // Publish settled protocol replies before parking on unrelated page work.
-        if self.has_ready_cdp_evaluations() { return Ok(false); }
+        // Let the page adopt frame documents and deliver messages before parking.
+        if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() { return Ok(false); }
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
@@ -3787,7 +3799,7 @@ impl ObscuraJsRuntime {
                     "autonomous browser task exceeded its task budget".into(),
                 ));
             }
-            if self.has_ready_cdp_evaluations() {
+            if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
                 return std::task::Poll::Ready(Ok(false));
             }
             match tick {
@@ -6310,6 +6322,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_exposes_builtins_as_properties() {
+        // Go's wasm_exec uses `self` as its global object and reads
+        // self.Object / self.Promise / self.JSON; an undefined one makes the
+        // wasm panic with "call of Value.Invoke on undefined".
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-scope-builtins",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                const names = ['Object', 'Array', 'Promise', 'JSON', 'Uint8Array', 'Date', 'Reflect', 'WebAssembly', 'Headers', 'AbortController'];
+                postMessage({
+                    missing: names.filter(n => typeof self[n] === 'undefined'),
+                    viaGlobalThis: names.filter(n => typeof globalThis[n] === 'undefined'),
+                    sameObject: self.Object === Object && self.Promise === Promise,
+                    globalThisIsSelf: globalThis === self,
+                    noDocument: typeof self.document === 'undefined' && typeof self.window === 'undefined',
+                    callable: self.JSON.stringify(new self.Promise(() => {}) instanceof self.Promise),
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([{
+                "missing": [], "viaGlobalThis": [], "sameObject": true,
+                "globalThisIsSelf": true, "noDocument": true, "callable": "true",
+            }])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_initialization_error_does_not_rerun_source() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -7631,6 +7684,23 @@ mod tests {
             .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror') ? true : false;})()")
             .unwrap();
         assert_eq!(has_err, serde_json::json!(true));
+    }
+
+    #[test]
+    fn dom_parser_ignores_page_startswith_polyfill() {
+        // iasWorld county sites replace startsWith with a polyfill that ignores
+        // the position argument; their SOAP responses start with `<?xml`.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(r#"(function(){
+                String.prototype.startsWith = function(a){ return this.substr(0, a.length) === a; };
+                var xml = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><R xmlns="http://tempuri.org/"><GetSearchExistsResult>true</GetSearchExistsResult></R></soap:Body></soap:Envelope>';
+                var d = new DOMParser().parseFromString(xml, 'text/xml');
+                if (d.querySelector('parsererror')) return 'ERR';
+                return d.getElementsByTagName('GetSearchExistsResult')[0].textContent;
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!("true"));
     }
 
     #[test]
@@ -8976,6 +9046,197 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([1, 0, true]));
+    }
+
+    #[test]
+    fn custom_element_attribute_reactions_observe_removal_and_can_restore_the_attribute() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const log = [];
+            class RestoreEl extends HTMLElement {
+                static get observedAttributes() { return ['mode']; }
+                attributeChangedCallback(name, oldValue, newValue) {
+                    log.push([oldValue, newValue, this.getAttribute(name)]);
+                    if (newValue === null) this.setAttribute(name, 'restored');
+                }
+            }
+            customElements.define('restore-el', RestoreEl);
+            const results = [];
+            for (const remove of [
+                el => el.removeAttribute('mode'),
+                el => el.toggleAttribute('mode', false),
+                el => el.removeAttributeNS(null, 'mode'),
+            ]) {
+                const el = document.createElement('restore-el');
+                el.setAttribute('mode', 'before');
+                log.length = 0;
+                remove(el);
+                results.push([log.slice(), el.getAttribute('mode'), el.getAttributeNS(null, 'mode')]);
+            }
+            return results;
+        "#).unwrap();
+        let expected = serde_json::json!([
+            [["before", null, null], [null, "restored", "restored"]], "restored", "restored"
+        ]);
+        assert_eq!(result, serde_json::json!([expected, expected, expected]));
+    }
+
+    #[test]
+    fn custom_element_namespace_reactions_observe_updated_attributes_and_style() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const log = [];
+            class StyledEl extends HTMLElement {
+                static get observedAttributes() { return ['style']; }
+                attributeChangedCallback(name, oldValue, newValue) {
+                    log.push([newValue, this.getAttribute(name), this.style.color]);
+                    if (newValue === null) this.setAttribute('style', 'color: red');
+                }
+            }
+            customElements.define('styled-el', StyledEl);
+            const el = document.createElement('styled-el');
+            el.setAttribute('style', 'color: blue');
+            log.length = 0;
+            el.setAttributeNS(null, 'style', 'color: green');
+            el.removeAttributeNS(null, 'style');
+            return [log, el.getAttribute('style'), el.style.color];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [["color: green", "color: green", "green"], [null, null, ""],
+                ["color: red", "color: red", "red"]],
+            "color: red", "red"
+        ]));
+    }
+
+    #[test]
+    fn custom_elements_connect_and_upgrade_on_insertion() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class XEl extends HTMLElement {
+                    constructor() { super(); log.push('ctor'); }
+                    connectedCallback() {
+                        log.push('connected');
+                        if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+                    }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('x-el', XEl);
+                const created = document.createElement('x-el');
+                log.push('created');
+                document.body.appendChild(created);
+                log.push('appended:' + (created.shadowRoot !== null));
+                const holder = document.createElement('div');
+                holder.innerHTML = '<x-el></x-el>';
+                log.push('parsed:' + (holder.firstChild instanceof XEl));
+                document.body.appendChild(holder);
+                log.push('inner:' + (holder.firstChild.shadowRoot !== null));
+                document.body.innerHTML = '<x-el></x-el>';
+                log.push('set:' + (document.body.firstChild instanceof XEl));
+                document.body.firstChild.remove();
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "ctor", "created", "connected", "appended:true",
+                "parsed:false", "ctor", "connected", "inner:true",
+                "disconnected", "disconnected", "ctor", "connected", "set:true",
+                "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_get_reactions_for_moves_and_observed_attributes() {
+        let mut rt = setup_runtime(r#"<html><body><a-el id="a" mode="x" other="y"></a-el><p id="p"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class AEl extends HTMLElement {
+                    static get observedAttributes() { return ['mode']; }
+                    attributeChangedCallback(name, oldValue, newValue) {
+                        log.push(name + ':' + oldValue + '>' + newValue);
+                    }
+                    connectedCallback() { log.push('connected'); }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('a-el', AEl);
+                const a = document.getElementById('a');
+                a.setAttribute('mode', 'y');
+                a.setAttribute('other', 'z');
+                a.removeAttribute('mode');
+                a.removeAttribute('mode');
+                document.getElementById('p').appendChild(a);
+                const detached = document.createElement('div');
+                detached.appendChild(a);
+                detached.removeChild(a);
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "mode:null>x", "connected", "mode:x>y", "mode:y>null",
+                "disconnected", "connected", "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_in_a_connected_shadow_tree_connect() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class InEl extends HTMLElement {
+                    connectedCallback() { log.push('inner'); }
+                }
+                class OutEl extends HTMLElement {
+                    connectedCallback() {
+                        const root = this.attachShadow({ mode: 'open' });
+                        root.innerHTML = '<in-el></in-el>';
+                        log.push('outer');
+                    }
+                }
+                customElements.define('in-el', InEl);
+                customElements.define('out-el', OutEl);
+                const host = document.createElement('out-el');
+                document.body.appendChild(host);
+                host.shadowRoot.appendChild(document.createElement('in-el'));
+                return [log, host.shadowRoot.firstChild instanceof InEl];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([["inner", "outer", "inner"], true]));
+    }
+
+    #[test]
+    fn throwing_connected_callback_is_reported_not_thrown() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const reported = [];
+                globalThis.reportError = (e) => reported.push(e.message);
+                class BadEl extends HTMLElement {
+                    connectedCallback() { throw new Error('connect failed'); }
+                }
+                customElements.define('bad-el', BadEl);
+                const el = document.createElement('bad-el');
+                document.body.appendChild(el);
+                return [el.isConnected, reported];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, ["connect failed"]]));
     }
 
     #[test]
@@ -23928,6 +24189,41 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate("document.doctype === null").unwrap();
         assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[test]
+    fn document_implementation_is_a_dom_implementation_interface() {
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const impl = document.implementation;
+            let illegal = false;
+            try { new DOMImplementation(); } catch (e) { illegal = e instanceof TypeError; }
+            const doc = impl.createHTMLDocument("t");
+            return [typeof DOMImplementation, impl instanceof DOMImplementation,
+                impl === document.implementation, illegal,
+                Object.prototype.toString.call(impl),
+                Object.getOwnPropertyDescriptor(globalThis, "DOMImplementation").enumerable,
+                doc.implementation instanceof DOMImplementation,
+                doc.implementation !== impl,
+                impl.createDocumentType("html", "", "").ownerDocument === document];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "function", true, true, true, "[object DOMImplementation]",
+            false, true, true, true
+        ]));
+    }
+
+    #[test]
+    fn document_adopted_stylesheets_is_configurable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const desc = Object.getOwnPropertyDescriptor(Document.prototype, "adoptedStyleSheets");
+            Object.defineProperty(Document.prototype, "adoptedStyleSheets", {
+                get: desc.get, set: desc.set, configurable: true,
+            });
+            return [desc.configurable, Array.isArray(document.adoptedStyleSheets)];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
     }
 
     #[test]

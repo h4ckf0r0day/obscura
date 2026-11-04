@@ -29,7 +29,8 @@ obscura mcp --http --port 3000
 The HTTP transport binds `127.0.0.1` by default. Bind all interfaces with `--host` for a container or sidecar deployment:
 
 ```bash
-obscura mcp --http --host 0.0.0.0 --port 3000
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" \
+  obscura mcp --http --host 0.0.0.0 --port 3000
 ```
 
 With stealth and proxy:
@@ -90,7 +91,10 @@ Interact:
 
 Wait and run JS:
 
-- `browser_wait_for`, `browser_wait_for_text`, `browser_evaluate`
+- `browser_wait_for`, `browser_wait_for_text`, `browser_wait_for_function`, `browser_evaluate`
+
+`browser_wait_for_function` polls the JavaScript expression in `function` until
+it becomes truthy. `timeout` defaults to 30000 ms and `pollIntervalMs` to 100 ms.
 
 `browser_evaluate` accepts JavaScript scripts, executes them once, and waits for
 returned promises. `timeoutMs` defaults to 5000 ms and bounds synchronous
