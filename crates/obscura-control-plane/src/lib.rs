@@ -104,6 +104,17 @@ impl ControlPlane {
         idempotency_key: Option<&str>,
         max_attempts: i32,
     ) -> Result<Job> {
+        // Basic SSRF literal-IP guard at control plane boundary
+        if let Ok(parsed) = url::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    if obscura_ssrf::is_forbidden_ip(ip) {
+                        return Err(ControlPlaneError::Conflict("SSRF blocked".into()));
+                    }
+                }
+            }
+        }
+
         // Idempotency: return existing if key present
         if let Some(key) = idempotency_key {
             if let Some(existing) = sqlx::query_as::<_, (Uuid,)>(
@@ -209,16 +220,21 @@ impl ControlPlane {
     }
 
     pub async fn cancel_job(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
         let res = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', updated_at = now() WHERE job_id = $1 AND tenant_id = $2 AND status IN ('pending','queued','assigned','dispatched','running','scheduled')",
         )
         .bind(job_id)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if res.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Err(ControlPlaneError::Conflict("job cannot be cancelled".into()));
         }
+        sqlx::query("UPDATE workers SET active_jobs = GREATEST(active_jobs-1,0) WHERE worker_id = (SELECT worker_id FROM jobs WHERE job_id=$1)")
+            .bind(job_id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -349,9 +365,12 @@ impl NatsClient {
         let bytes = serde_json::to_vec(envelope).map_err(|e| {
             ControlPlaneError::Conflict(format!("serialize: {e}"))
         })?;
+        use async_nats::HeaderMap;
+        let mut headers = HeaderMap::new();
+        headers.insert("Nats-Msg-Id", envelope.event_id.to_string().parse::<async_nats::HeaderValue>().unwrap());
         let ack = self
             .jetstream
-            .publish(subject.to_string(), bytes.into())
+            .publish_with_headers(subject.to_string(), headers, bytes.into())
             .await
             .map_err(|e| ControlPlaneError::Conflict(format!("publish: {e}")))?;
         ack.await
@@ -657,7 +676,7 @@ impl ControlPlane {
 
     pub async fn list_healthy_workers(&self, tenant_id: Option<Uuid>) -> Result<Vec<WorkerRecord>> {
         let rows = sqlx::query(
-            "SELECT worker_id, tenant_id, status, capabilities, capacity, active_jobs, last_heartbeat_at FROM workers WHERE status = 'healthy' AND ($1::uuid IS NULL OR tenant_id IS NULL OR tenant_id = $1)",
+            "SELECT worker_id, tenant_id, status, capabilities, capacity, active_jobs, last_heartbeat_at FROM workers WHERE status = 'healthy' AND last_heartbeat_at > now() - interval '30 seconds' AND ($1::uuid IS NULL OR tenant_id IS NULL OR tenant_id = $1)",
         )
         .bind(tenant_id)
         .fetch_all(self.pool())
@@ -782,5 +801,97 @@ impl ControlPlane {
 
     pub async fn cancel_job_phase4(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
         self.cancel_job(job_id, tenant_id).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase: Lease & Fencing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Lease {
+    pub lease_id: Uuid,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub owner_id: Uuid,
+    pub fencing_token: i64,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl ControlPlane {
+    pub async fn acquire_lease(&self, resource_type: &str, resource_id: &str, owner_id: Uuid, ttl_secs: i64) -> Result<Lease> {
+        let mut tx = self.pool().begin().await?;
+        // expire old
+        sqlx::query("DELETE FROM leases WHERE resource_type=$1 AND resource_id=$2 AND expires_at < now()")
+            .bind(resource_type).bind(resource_id).execute(&mut *tx).await?;
+        // check existing
+        let existing = sqlx::query("SELECT lease_id, owner_id, fencing_token, expires_at FROM leases WHERE resource_type=$1 AND resource_id=$2 FOR UPDATE")
+            .bind(resource_type).bind(resource_id).fetch_optional(&mut *tx).await?;
+        if let Some(r) = existing {
+            let expires: DateTime<Utc> = r.get("expires_at");
+            if expires > Utc::now() {
+                return Err(ControlPlaneError::Conflict("lease held".into()));
+            }
+        }
+        let token: i64 = sqlx::query_scalar("SELECT nextval('fencing_token_seq')")
+            .fetch_one(&mut *tx).await?;
+        let lease_id = Uuid::new_v4();
+        let expires_at = Utc::now() + chrono::Duration::seconds(ttl_secs);
+        sqlx::query(
+            "INSERT INTO leases (lease_id, resource_type, resource_id, owner_id, fencing_token, expires_at) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (resource_type, resource_id) DO UPDATE SET owner_id=$4, fencing_token=$5, expires_at=$6, renewed_at=now()",
+        )
+        .bind(lease_id).bind(resource_type).bind(resource_id).bind(owner_id).bind(token).bind(expires_at)
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Lease { lease_id, resource_type: resource_type.to_string(), resource_id: resource_id.to_string(), owner_id, fencing_token: token, expires_at })
+    }
+
+    pub async fn validate_fencing(&self, resource_type: &str, resource_id: &str, fencing_token: i64) -> Result<bool> {
+        let row = sqlx::query("SELECT fencing_token FROM leases WHERE resource_type=$1 AND resource_id=$2")
+            .bind(resource_type).bind(resource_id).fetch_optional(self.pool()).await?;
+        match row {
+            Some(r) => {
+                let current: i64 = r.get("fencing_token");
+                Ok(current == fencing_token)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub async fn renew_lease(&self, lease_id: Uuid, ttl_secs: i64) -> Result<()> {
+        let res = sqlx::query("UPDATE leases SET expires_at = now() + ($2 || ' seconds')::interval, renewed_at = now() WHERE lease_id = $1 AND expires_at > now()")
+            .bind(lease_id).bind(ttl_secs).execute(self.pool()).await?;
+        if res.rows_affected() == 0 {
+            return Err(ControlPlaneError::Conflict("lease expired or not found".into()));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Basic authorization primitives
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub subject: String,
+    pub tenant_id: Option<Uuid>,
+    pub is_admin: bool,
+    pub is_worker: bool,
+}
+
+impl Principal {
+    pub fn can_access_tenant(&self, tenant_id: Uuid) -> bool {
+        self.is_admin || self.tenant_id == Some(tenant_id)
+    }
+}
+
+impl ControlPlane {
+    pub fn authorize_tenant(&self, principal: &Principal, tenant_id: Uuid) -> Result<()> {
+        if principal.can_access_tenant(tenant_id) {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::Conflict("unauthorized tenant access".into()))
+        }
     }
 }

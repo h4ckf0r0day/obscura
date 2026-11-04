@@ -157,6 +157,13 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Startup reconciliation: reclaim scheduled jobs and schedule pending.
+    pub async fn reconcile(&self) -> Result<()> {
+        // schedule all pending
+        while self.schedule_one().await.unwrap_or(false) {}
+        Ok(())
+    }
+
     /// Run scheduling loop consuming job.submitted events.
     pub async fn run(&self) -> Result<()> {
         // ensure stream

@@ -2484,6 +2484,7 @@ dependencies = [
  "async-nats",
  "chrono",
  "futures",
+ "obscura-ssrf",
  "obscura-telemetry",
  "serde",
  "serde_json",
@@ -2491,6 +2492,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -2673,6 +2675,27 @@ dependencies = [
  "obscura-isolation",
  "obscura-telemetry",
  "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "obscura-worker-agent"
+version = "0.3.0"
+dependencies = [
+ "async-nats",
+ "chrono",
+ "futures",
+ "obscura-control-plane",
+ "obscura-scheduler",
+ "obscura-supervisor",
+ "obscura-telemetry",
+ "obscura-worker",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

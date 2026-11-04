@@ -213,6 +213,24 @@ impl MetricsRegistry {
             "obscura_ipc_requests_total",
             "Total count of IPC requests dispatched between supervisor and workers",
         );
+        self.register_counter("obscura_scheduler_jobs_received_total", "Total scheduler jobs received");
+        self.register_counter("obscura_scheduler_jobs_scheduled_total", "Total scheduler jobs scheduled");
+        self.register_counter("obscura_scheduler_jobs_dispatched_total", "Total scheduler jobs dispatched");
+        self.register_counter("obscura_scheduler_jobs_rejected_total", "Total scheduler jobs rejected");
+        self.register_counter("obscura_scheduler_dispatch_errors_total", "Total scheduler dispatch errors");
+        self.register_gauge("obscura_scheduler_queue_depth", "Scheduler queue depth");
+        self.register_gauge("obscura_scheduler_active_jobs", "Scheduler active jobs");
+        self.register_histogram("obscura_scheduler_dispatch_duration_seconds", "Scheduler dispatch duration", vec![0.001,0.005,0.01,0.05,0.1,0.5,1.0,5.0]);
+        self.register_histogram("obscura_scheduler_job_wait_duration_seconds", "Job wait duration", vec![0.01,0.05,0.1,0.5,1.0,5.0,30.0]);
+        self.register_counter("obscura_scheduler_retries_total", "Total scheduler retries");
+        self.register_counter("obscura_scheduler_worker_selection_total", "Total worker selections");
+        self.register_gauge("obscura_worker_active", "Active workers");
+        self.register_counter("obscura_worker_restarts_total", "Worker restarts");
+        self.register_gauge("obscura_worker_heartbeat_age_seconds", "Worker heartbeat age");
+        self.register_counter("obscura_lease_acquisitions_total", "Lease acquisitions");
+        self.register_counter("obscura_lease_expirations_total", "Lease expirations");
+        self.register_counter("obscura_stale_worker_rejections_total", "Stale worker rejections");
+
         self.register_gauge("obscura_outbox_pending", "Number of pending outbox events");
         self.register_counter("obscura_outbox_published_total", "Total outbox events published");
         self.register_counter("obscura_outbox_failed_total", "Total outbox publish failures");

@@ -18,6 +18,7 @@ members = [
     "crates/obscura-agent",
     "crates/obscura-control-plane",
     "crates/obscura-scheduler",
+    "crates/obscura-worker-agent",
 ]
 exclude = ["vendor/taffy", "vendor/cosmic-text", "vendor/wreq-util"]
 
@@ -43,6 +44,7 @@ obscura-supervisor = { path = "crates/obscura-supervisor" }
 obscura-agent = { path = "crates/obscura-agent" }
 obscura-control-plane = { path = "crates/obscura-control-plane" }
 obscura-scheduler = { path = "crates/obscura-scheduler" }
+obscura-worker-agent = { path = "crates/obscura-worker-agent" }
 
 html5ever = "0.39"
 markup5ever = "0.39"

@@ -11,7 +11,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 parking_lot = "0.12"
-tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
