@@ -2,6 +2,79 @@ use obscura_js::runtime::ObscuraJsRuntime;
 use serde_json::json;
 
 #[test]
+fn value_assignment_preserves_unchanged_selection_without_calling_page_methods() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<input id='i' value='abc'><textarea id='t'>abc</textarea>"));
+    rt.run_page_init();
+    let value = rt.evaluate(r#"(() => {
+        return ['i', 't'].map(id => {
+            const element = document.getElementById(id);
+            element.value = 'abc';
+            const initial = [element.selectionStart, element.selectionEnd];
+            element.value = '';
+            const empty = [element.selectionStart, element.selectionEnd];
+            element.value = 'abc';
+            element.setSelectionRange(1, 2, 'backward');
+            element.value = 'abc';
+            const unchanged = [element.selectionStart, element.selectionEnd, element.selectionDirection];
+            element.setSelectionRange = () => { throw new Error('page method called'); };
+            let error = null;
+            try { element.value = 'abcd'; } catch (e) { error = e.message; }
+            return [initial, empty, unchanged, element.value, element.selectionStart, element.selectionEnd, error];
+        });
+    })()"#).unwrap();
+    assert_eq!(value, json!([
+        [[0, 0], [0, 0], [1, 2, "backward"], "abcd", 4, 4, null],
+        [[0, 0], [0, 0], [1, 2, "backward"], "abcd", 4, 4, null]
+    ]));
+}
+
+#[test]
+fn value_assignment_does_not_read_page_attribute_or_text_content_getters() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<body></body>"));
+    rt.run_page_init();
+    let value = rt.evaluate(r#"(() => {
+        return ['input', 'textarea'].map(tag => {
+            const element = document.createElement(tag);
+            if (tag === 'textarea') {
+                const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent');
+                Object.defineProperty(element, 'textContent', {
+                    get() { throw new Error('page getter called'); }, set: descriptor.set
+                });
+            } else {
+                const getAttribute = element.getAttribute;
+                element.getAttribute = function(name) {
+                    if (name === 'value') throw new Error('page getter called');
+                    return getAttribute.call(this, name);
+                };
+            }
+            try { element.value = 'abc'; return element.value; }
+            catch (e) { return e.message; }
+        });
+    })()"#).unwrap();
+    assert_eq!(value, json!(["abc", "abc"]));
+}
+
+#[test]
+fn set_range_text_converts_unsigned_offsets_before_clamping_to_value_length() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<input id='i'>"));
+    rt.run_page_init();
+    let value = rt.evaluate(r#"(() => {
+        const input = document.getElementById('i');
+        return [Infinity, -Infinity, NaN, 4294967296, 4294967297, -1, -1.5, 0.9, '0x1', 1n].map(offset => {
+            input.value = 'abc';
+            try { input.setRangeText('X', offset, offset); return input.value; }
+            catch (e) { return e.name; }
+        });
+    })()"#).unwrap();
+    assert_eq!(value, json!([
+        "Xabc", "Xabc", "Xabc", "Xabc", "aXbc", "abcX", "abcX", "Xabc", "aXbc", "TypeError"
+    ]));
+}
+
+#[test]
 fn set_range_text_matches_chromium_for_empty_and_nonempty_controls() {
     let mut rt = ObscuraJsRuntime::new();
     rt.set_dom(obscura_dom::parse_html(
