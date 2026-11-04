@@ -213,6 +213,16 @@ impl MetricsRegistry {
             "obscura_ipc_requests_total",
             "Total count of IPC requests dispatched between supervisor and workers",
         );
+        self.register_gauge("obscura_outbox_pending", "Number of pending outbox events");
+        self.register_counter("obscura_outbox_published_total", "Total outbox events published");
+        self.register_counter("obscura_outbox_failed_total", "Total outbox publish failures");
+        self.register_counter("obscura_outbox_retries_total", "Total outbox retries");
+        self.register_histogram("obscura_outbox_publish_duration_seconds", "Outbox publish duration", vec![0.001,0.005,0.01,0.05,0.1,0.5,1.0,5.0]);
+        self.register_counter("obscura_nats_publish_ack_total", "Total NATS publish acks");
+        self.register_counter("obscura_nats_publish_errors_total", "Total NATS publish errors");
+        self.register_counter("obscura_nats_redeliveries_total", "Total NATS redeliveries");
+        self.register_gauge("obscura_nats_connection_status", "NATS connection status (1=connected)");
+
         self.register_counter(
             "obscura_worker_requests_total",
             "Total count of worker requests handled",

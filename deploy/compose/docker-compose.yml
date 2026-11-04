@@ -26,6 +26,21 @@ services:
           memory: 2G
           cpus: '2.0'
 
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v2.45.0
     volumes:
@@ -36,3 +51,6 @@ services:
       obscura-supervisor:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  nats_data:

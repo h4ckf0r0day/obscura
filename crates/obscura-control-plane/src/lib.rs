@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
+use std::time::Instant;
+use futures::StreamExt;
+use obscura_telemetry::global_metrics;
 use uuid::Uuid;
 
 #[derive(Error, Debug)]
@@ -246,5 +249,356 @@ mod tests {
         assert!(!list.is_empty());
 
         cp.cancel_job(job.job_id, tenant.tenant_id).await.expect("cancel");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event envelope
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub schema_version: u32,
+    pub tenant_id: Option<Uuid>,
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    pub occurred_at: DateTime<Utc>,
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub payload: serde_json::Value,
+}
+
+impl EventEnvelope {
+    pub fn new(event_type: &str, aggregate_type: &str, aggregate_id: &str, payload: serde_json::Value) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            schema_version: 1,
+            tenant_id: None,
+            aggregate_type: aggregate_type.to_string(),
+            aggregate_id: aggregate_id.to_string(),
+            occurred_at: Utc::now(),
+            correlation_id: None,
+            causation_id: None,
+            payload,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(ControlPlaneError::Conflict(format!(
+                "unsupported schema version: {}",
+                self.schema_version
+            )));
+        }
+        if self.event_type.is_empty() {
+            return Err(ControlPlaneError::Conflict("event_type required".into()));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NATS client wrapper
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct NatsClient {
+    client: async_nats::Client,
+    jetstream: async_nats::jetstream::Context,
+}
+
+impl NatsClient {
+    pub async fn connect(url: &str) -> Result<Self> {
+        let client = async_nats::connect(url).await.map_err(|e| {
+            ControlPlaneError::Conflict(format!("nats connect: {e}"))
+        })?;
+        let jetstream = async_nats::jetstream::new(client.clone());
+        Ok(Self { client, jetstream })
+    }
+
+    pub fn jetstream(&self) -> &async_nats::jetstream::Context {
+        &self.jetstream
+    }
+
+    pub async fn ensure_stream(&self, name: &str, subjects: Vec<String>) -> Result<()> {
+        let cfg = async_nats::jetstream::stream::Config {
+            name: name.to_string(),
+            subjects,
+            retention: async_nats::jetstream::stream::RetentionPolicy::Limits,
+            storage: async_nats::jetstream::stream::StorageType::File,
+            ..Default::default()
+        };
+        self.jetstream
+            .get_or_create_stream(cfg)
+            .await
+            .map_err(|e| ControlPlaneError::Conflict(format!("stream: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn publish(&self, subject: &str, envelope: &EventEnvelope) -> Result<()> {
+        envelope.validate()?;
+        let bytes = serde_json::to_vec(envelope).map_err(|e| {
+            ControlPlaneError::Conflict(format!("serialize: {e}"))
+        })?;
+        let ack = self
+            .jetstream
+            .publish(subject.to_string(), bytes.into())
+            .await
+            .map_err(|e| ControlPlaneError::Conflict(format!("publish: {e}")))?;
+        ack.await
+            .map_err(|e| ControlPlaneError::Conflict(format!("ack: {e}")))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outbox publisher
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct OutboxPublisher {
+    control: ControlPlane,
+    nats: NatsClient,
+    claimer: String,
+    batch_size: i64,
+}
+
+impl OutboxPublisher {
+    pub fn new(control: ControlPlane, nats: NatsClient, claimer: &str, batch_size: i64) -> Self {
+        Self {
+            control,
+            nats,
+            claimer: claimer.to_string(),
+            batch_size,
+        }
+    }
+
+    pub async fn publish_pending(&self) -> Result<usize> {
+        // Claim batch safely
+        let claimed = self.claim_batch().await?;
+        let mut published = 0;
+        for row in claimed {
+            let subject = format!("obscura.{}.{}", row.aggregate_type, row.event_type.trim_start_matches("job."));
+            // map event_type to subject-ish; fallback
+            let subject = if row.event_type == "job.submitted" {
+                "obscura.jobs.submitted".to_string()
+            } else {
+                subject
+            };
+
+            let envelope = EventEnvelope {
+                event_id: row.outbox_id_uuid(),
+                event_type: row.event_type.clone(),
+                schema_version: 1,
+                tenant_id: None,
+                aggregate_type: row.aggregate_type.clone(),
+                aggregate_id: row.aggregate_id.clone(),
+                occurred_at: row.created_at,
+                correlation_id: None,
+                causation_id: None,
+                payload: row.payload.clone(),
+            };
+
+            let pub_start = Instant::now();
+            match self.nats.publish(&subject, &envelope).await {
+                Ok(()) => {
+                    sqlx::query(
+                        "UPDATE outbox_events SET published_at = now(), claimed_at = NULL WHERE outbox_id = $1",
+                    )
+                    .bind(row.outbox_id)
+                    .execute(self.control.pool())
+                    .await?;
+                    published += 1;
+                    let metrics = global_metrics();
+                    if let Some(c) = metrics.counter("obscura_outbox_published_total") { c.inc(); }
+                    if let Some(c) = metrics.counter("obscura_nats_publish_ack_total") { c.inc(); }
+                    if let Some(h) = metrics.histogram("obscura_outbox_publish_duration_seconds") { h.observe_duration(pub_start.elapsed()); }
+                }
+                Err(e) => {
+                    sqlx::query(
+                        "UPDATE outbox_events SET attempts = attempts + 1, claimed_at = NULL WHERE outbox_id = $1",
+                    )
+                    .bind(row.outbox_id)
+                    .execute(self.control.pool())
+                    .await?;
+                    let metrics = global_metrics();
+                    if let Some(c) = metrics.counter("obscura_outbox_failed_total") { c.inc(); }
+                    if let Some(c) = metrics.counter("obscura_nats_publish_errors_total") { c.inc(); }
+                    tracing::warn!(outbox_id = row.outbox_id, error = %e, "outbox publish failed");
+                }
+            }
+        }
+        Ok(published)
+    }
+
+    async fn claim_batch(&self) -> Result<Vec<OutboxRow>> {
+        let mut tx = self.control.pool().begin().await?;
+        let rows = sqlx::query(
+            "SELECT outbox_id, aggregate_type, aggregate_id, event_type, payload, created_at FROM outbox_events WHERE published_at IS NULL AND (claimed_at IS NULL OR claimed_at < now() - interval '1 minute') ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(self.batch_size)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let outbox_id: i64 = r.get("outbox_id");
+            sqlx::query(
+                "UPDATE outbox_events SET claimed_at = now(), claimed_by = $1 WHERE outbox_id = $2",
+            )
+            .bind(&self.claimer)
+            .bind(outbox_id)
+            .execute(&mut *tx)
+            .await?;
+            out.push(OutboxRow {
+                outbox_id,
+                aggregate_type: r.get("aggregate_type"),
+                aggregate_id: r.get("aggregate_id"),
+                event_type: r.get("event_type"),
+                payload: r.get("payload"),
+                created_at: r.get("created_at"),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OutboxRow {
+    outbox_id: i64,
+    aggregate_type: String,
+    aggregate_id: String,
+    event_type: String,
+    payload: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+impl OutboxRow {
+    fn outbox_id_uuid(&self) -> Uuid {
+        // deterministic-ish: use uuid from outbox_id via nil + bytes not possible; generate stable by hashing? Use Uuid::new_v4 not stable.
+        // For idempotency use a deterministic uuid v5 from outbox_id.
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, self.outbox_id.to_string().as_bytes())
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Consumer foundation
+// ---------------------------------------------------------------------------
+
+pub struct NatsConsumer {
+    consumer: async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
+}
+
+impl NatsConsumer {
+    pub async fn create(
+        js: &async_nats::jetstream::Context,
+        stream: &str,
+        durable_name: &str,
+    ) -> Result<Self> {
+        let cfg = async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some(durable_name.to_string()),
+            ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+            max_deliver: 5,
+            ..Default::default()
+        };
+        let consumer = js
+            .create_consumer_on_stream(cfg, stream)
+            .await
+            .map_err(|e| ControlPlaneError::Conflict(format!("consumer: {e}")))?;
+        Ok(Self { consumer })
+    }
+
+    pub async fn next_message(&self) -> Result<Option<async_nats::jetstream::Message>> {
+        let mut messages = self
+            .consumer
+            .messages()
+            .await
+            .map_err(|e| ControlPlaneError::Conflict(format!("messages: {e}")))?;
+        match messages.next().await {
+            Some(Ok(m)) => Ok(Some(m)),
+            Some(Err(e)) => Err(ControlPlaneError::Conflict(format!("next: {e}"))),
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase3_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_nats_stream_and_outbox_publish() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5433/obscura".to_string());
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+
+        let cp = ControlPlane::connect(&db_url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let nats = NatsClient::connect(&nats_url).await.expect("nats");
+        nats.ensure_stream("OBScura_JOBS", vec!["obscura.jobs.>".to_string()])
+            .await
+            .expect("stream");
+
+        let tenant = cp.create_tenant("t3").await.expect("tenant");
+        let job = cp
+            .submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("k3"), 3)
+            .await
+            .expect("submit");
+
+        let publisher = OutboxPublisher::new(cp.clone(), nats.clone(), "pub-1", 10);
+        let n = publisher.publish_pending().await.expect("publish");
+        assert!(n >= 1);
+
+        // verify published_at set
+        let row: (Option<chrono::DateTime<Utc>>, ) = sqlx::query_as(
+            "SELECT published_at FROM outbox_events WHERE aggregate_id = $1",
+        )
+        .bind(job.job_id.to_string())
+        .fetch_one(cp.pool())
+        .await
+        .expect("row");
+        assert!(row.0.is_some());
+
+        // consumer foundation
+        let consumer = NatsConsumer::create(nats.jetstream(), "OBScura_JOBS", "test-consumer")
+            .await
+            .expect("consumer");
+        let msg = consumer.next_message().await.expect("next");
+        assert!(msg.is_some());
+        if let Some(m) = msg {
+            m.ack().await.expect("ack");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_publication_safe() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5433/obscura".to_string());
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+
+        let cp = ControlPlane::connect(&db_url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+        let nats = NatsClient::connect(&nats_url).await.expect("nats");
+        nats.ensure_stream("OBScura_JOBS", vec!["obscura.jobs.>".to_string()])
+            .await
+            .expect("stream");
+
+        let tenant = cp.create_tenant("t4").await.expect("tenant");
+        cp.submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("k4"), 3)
+            .await
+            .expect("submit");
+
+        let publisher = OutboxPublisher::new(cp.clone(), nats.clone(), "pub-2", 10);
+        let n1 = publisher.publish_pending().await.expect("p1");
+        let n2 = publisher.publish_pending().await.expect("p2");
+        // second run publishes nothing new
+        assert_eq!(n2, 0);
+        assert!(n1 >= 1);
     }
 }
