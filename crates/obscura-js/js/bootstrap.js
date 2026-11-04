@@ -3501,6 +3501,13 @@ function _setElemHrefPart(el, part, value) {
   if (c) el.setAttribute('href', c.href);
 }
 
+// Unknown input types use the text state and support selection.
+const _INPUT_NO_SELECTION_TYPES = new Set([
+  'hidden', 'email', 'date', 'month', 'week', 'time', 'datetime-local',
+  'number', 'range', 'color', 'checkbox', 'radio', 'file',
+  'submit', 'image', 'reset', 'button',
+]);
+
 // --- <input> number/date conversion (valueAsNumber/valueAsDate/stepUp/Down) ---
 // Applicable types and their step scale factor + default step (HTML spec).
 const _INPUT_NUM_TYPES = { date: 1, month: 1, week: 1, time: 1, 'datetime-local': 1, number: 1, range: 1 };
@@ -5049,7 +5056,7 @@ class Element extends Node {
     // Chromium. setRangeText() uses that position when preserving selection.
     const type = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
     if (tag === 'textarea' ||
-        (tag === 'input' && ['text', 'search', 'tel', 'url', 'password'].includes(type))) {
+        (tag === 'input' && !_INPUT_NO_SELECTION_TYPES.has(type))) {
       this.setSelectionRange(value.length, value.length);
     }
   }
@@ -19355,7 +19362,7 @@ if (!Element.prototype.setRangeText) {
     const tag = this.localName;
     const inputType = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
     if (tag !== 'textarea' && !(tag === 'input' &&
-        ['text', 'search', 'tel', 'url', 'password'].includes(inputType))) {
+        !_INPUT_NO_SELECTION_TYPES.has(inputType))) {
       throw new DOMException('This input element does not support text selection.', 'InvalidStateError');
     }
     if (arguments.length < 1 || arguments.length === 2)
