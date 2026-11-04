@@ -5047,17 +5047,32 @@ class Element extends Node {
       return;
     }
     const value = String(v);
+    const type = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
+    const supportsSelection = tag === 'textarea' ||
+      (tag === 'input' && !_INPUT_NO_SELECTION_TYPES.has(type));
+    let changed = false;
+    if (supportsSelection) {
+      if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
+      let previous = _formValues[this._nid];
+      if (previous === undefined) {
+        previous = (tag === 'textarea'
+          ? _domParse('text_content', this._nid)
+          : _domParse('get_attribute', this._nid, 'value')) ?? '';
+      }
+      changed = previous !== value;
+    }
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
       this.textContent = value;
     }
-    // Programmatic value assignment places the text cursor at the end in
-    // Chromium. setRangeText() uses that position when preserving selection.
-    const type = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
-    if (tag === 'textarea' ||
-        (tag === 'input' && !_INPUT_NO_SELECTION_TYPES.has(type))) {
-      this.setSelectionRange(value.length, value.length);
+    // Assigning the same value preserves selection. Internal updates must not
+    // invoke a page override of setSelectionRange().
+    if (changed || (supportsSelection && !_ns_selectionStart.has(this))) {
+      const position = changed ? value.length : 0;
+      _ns_selectionStart.set(this, position);
+      _ns_selectionEnd.set(this, position);
+      _ns_selectionDir.set(this, 'none');
     }
   }
   get min() { return this.getAttribute('min') || ''; }
@@ -19372,8 +19387,8 @@ if (!Element.prototype.setRangeText) {
       throw new TypeError("Failed to execute 'setRangeText': invalid selection mode");
     const value = String(this.value ?? '');
     const text = String(replacement);
-    let lo = arguments.length < 3 ? (this.selectionStart ?? 0) : Math.max(0, Math.trunc(Number(start)) || 0);
-    let hi = arguments.length < 3 ? (this.selectionEnd ?? 0) : Math.max(0, Math.trunc(Number(end)) || 0);
+    let lo = arguments.length < 3 ? (this.selectionStart ?? 0) : (+start >>> 0);
+    let hi = arguments.length < 3 ? (this.selectionEnd ?? 0) : (+end >>> 0);
     if (lo > hi) throw new DOMException('Start is greater than end.', 'IndexSizeError');
     lo = Math.min(lo, value.length);
     hi = Math.min(hi, value.length);
