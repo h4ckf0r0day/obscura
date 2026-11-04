@@ -2204,6 +2204,8 @@ fn search_body(
 const KEENABLE_SEARCH_URL: &str = "https://api.keenable.ai/v1/search";
 const KEENABLE_PUBLIC_SEARCH_URL: &str = "https://api.keenable.ai/v1/search/public";
 const WEB_SEARCH_SNIPPET_CHARS: usize = 500;
+// Room for 50 results with multi-KB snippets, bounded before JSON parsing.
+const WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// `web_search` sends the agent's queries to a third-party API, so it is
 /// listed and callable only when the operator opts in.
@@ -2248,6 +2250,15 @@ async fn tool_web_search(args: &Value, state: &mut BrowserState) -> Result<Strin
         .filter(|key| !key.is_empty());
     let request = web_search_request(query, limit, api_key.as_deref());
 
+    let body = fetch_web_search(request, state, api_key.is_none()).await?;
+    Ok(format_web_results(query, &body))
+}
+
+async fn fetch_web_search(
+    request: WebSearchRequest,
+    state: &BrowserState,
+    keyless: bool,
+) -> Result<Value, String> {
     // The context's client carries the configured proxy, CA roots and SSRF guard.
     let client = state.context.http_client.request_client().await;
     let mut builder = client.post(request.url).body(request.body);
@@ -2257,19 +2268,21 @@ async fn tool_web_search(args: &Value, state: &mut BrowserState) -> Result<Strin
     let response = builder.send().await
         .map_err(|error| format!("web search request failed: {error}"))?;
     let status = response.status();
-    let body = response.bytes().await
+    let response_url = response.url().clone();
+    let body = obscura_net::client::read_reqwest_body_limited(
+        response, &response_url, WEB_SEARCH_RESPONSE_BYTES,
+    ).await
         .map_err(|error| format!("web search response failed: {error}"))?;
     if !status.is_success() {
-        let hint = if status.as_u16() == 429 && api_key.is_none() {
+        let hint = if status.as_u16() == 429 && keyless {
             " (set KEENABLE_API_KEY for higher rate limits)"
         } else {
             ""
         };
         return Err(format!("web search returned HTTP {}{hint}", status.as_u16()));
     }
-    let body: Value = serde_json::from_slice(&body)
-        .map_err(|error| format!("web search returned invalid JSON: {error}"))?;
-    Ok(format_web_results(query, &body))
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("web search returned invalid JSON: {error}"))
 }
 
 /// One JSON object per line, like `browser_links`. Keenable returns the page
@@ -2849,6 +2862,122 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    async fn web_search_response_fixture(
+        response: String,
+        hold_open: bool,
+    ) -> (BrowserState, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST http://search.test/v1/search/public HTTP/1.1\r\n");
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut request = vec![0; length.expect("request Content-Length")];
+            socket.read_exact(&mut request).await.unwrap();
+            let sent = socket.get_mut().write_all(response.as_bytes()).await;
+            if hold_open {
+                if sent.is_ok() {
+                    // Leave the response incomplete until the client drops it.
+                    let _ = socket.read_u8().await;
+                }
+            } else {
+                sent.unwrap();
+            }
+        });
+        let state = BrowserState::new(Some(format!("http://{address}")), None, false);
+        (state, fixture)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_response_limit_accepts_normal_and_fifty_result_bodies() {
+        let small = json!({"results": [{
+            "title": "Small fixture", "url": "https://example.test/", "snippet": "small result"
+        }]}).to_string();
+        let results: Vec<Value> = (0..50).map(|index| json!({
+            "title": format!("Result {index}"),
+            "url": format!("https://example.test/{index}"),
+            "snippet": "word ".repeat(1600),
+        })).collect();
+        let mut boundary = json!({"results": results}).to_string();
+        assert!(boundary.len() < WEB_SEARCH_RESPONSE_BYTES);
+        boundary.extend(std::iter::repeat(' ').take(WEB_SEARCH_RESPONSE_BYTES - boundary.len()));
+
+        for (body, count) in [(small, 1), (boundary, 50)] {
+            for chunked in [false, true] {
+                let response = if chunked {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{body}\r\n0\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let (state, fixture) = web_search_response_fixture(response, false).await;
+                let request = WebSearchRequest {
+                    url: "http://search.test/v1/search/public",
+                    ..web_search_request("obscura", 50, None)
+                };
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    fetch_web_search(request, &state, true),
+                ).await.expect("search response timed out").unwrap();
+                assert_eq!(result["results"].as_array().unwrap().len(), count);
+                assert_eq!(format_web_results("obscura", &result).lines().count(), count);
+                if count == 1 {
+                    assert_eq!(result["results"][0]["snippet"], "small result");
+                } else {
+                    assert_eq!(result["results"][49]["title"], "Result 49");
+                    assert_eq!(result["results"][49]["snippet"].as_str().unwrap().len(), 8000);
+                }
+                fixture.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_response_limit_rejects_overflow_before_eof() {
+        let limit = WEB_SEARCH_RESPONSE_BYTES;
+        let mut body = json!({"results": []}).to_string();
+        body.extend(std::iter::repeat(' ').take(limit + 1 - body.len()));
+        assert_eq!(body.len(), limit + 1);
+        let responses = [
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", limit + 1),
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{body}\r\n", body.len()),
+            format!("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n{body}"),
+        ];
+        for response in responses {
+            let (state, fixture) = web_search_response_fixture(response, true).await;
+            let request = WebSearchRequest {
+                url: "http://search.test/v1/search/public",
+                ..web_search_request("obscura", 50, None)
+            };
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fetch_web_search(request, &state, true),
+            ).await.expect("oversized response must fail before EOF").unwrap_err();
+            assert!(error.contains("web search response failed:"), "{error}");
+            assert!(error.contains(&format!("exceeded {limit} byte limit")), "{error}");
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture)
+                .await.expect("response connection was not closed").unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

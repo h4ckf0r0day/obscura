@@ -164,6 +164,7 @@ The browser tools act on pages the agent already has a URL for. To let it find
 pages first, set `OBSCURA_WEB_SEARCH=keenable` in the server's environment.
 This adds a `web_search` tool (`query`, optional `limit`, default 5, max 50)
 that returns one JSON object per line with `title`, `url`, and `snippet`.
+Responses larger than 1 MiB after decompression return a tool error.
 
 The tool is not listed unless the variable is set. Each call sends the query
 to the Keenable search API (`api.keenable.ai`) through the configured proxy.
