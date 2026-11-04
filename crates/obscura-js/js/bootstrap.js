@@ -19360,7 +19360,7 @@ if (!Element.prototype.setRangeText) {
     }
     if (arguments.length < 1 || arguments.length === 2)
       throw new TypeError("Failed to execute 'setRangeText': invalid number of arguments");
-    const mode = arguments.length >= 4 ? String(selectMode) : 'preserve';
+    const mode = selectMode === undefined ? 'preserve' : String(selectMode);
     if (!['select', 'start', 'end', 'preserve'].includes(mode))
       throw new TypeError("Failed to execute 'setRangeText': invalid selection mode");
     const value = String(this.value ?? '');
