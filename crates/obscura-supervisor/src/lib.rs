@@ -947,3 +947,36 @@ mod tests {
         supervisor.shutdown().await.expect("shutdown");
     }
 }
+
+#[cfg(test)]
+mod process_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_graceful_shutdown() {
+        let worker_bin = resolve_worker_binary(std::path::Path::new("obscura-runtime-worker"));
+        if !worker_bin.exists() {
+            eprintln!("Skipping: worker binary not found");
+            return;
+        }
+        let config = SupervisorConfig {
+            worker_bin,
+            pool_size: 1,
+            ..SupervisorConfig::default()
+        };
+        let supervisor = WorkerPoolSupervisor::new(config);
+        supervisor.start().await.expect("start");
+        assert_eq!(supervisor.healthy_count(), 1);
+        supervisor.shutdown().await.expect("shutdown");
+        assert_eq!(supervisor.pool_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_worker_kill_idempotent() {
+        let worker = Arc::new(SupervisedWorker::new(99, Some(999)));
+        worker.mark_ready();
+        // kill twice should not panic
+        worker.kill().await.unwrap();
+        worker.kill().await.unwrap();
+    }
+}

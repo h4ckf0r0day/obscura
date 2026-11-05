@@ -123,7 +123,7 @@ async fn main() {
                                     _ = &mut loss_rx => {
                                         renew_handle.abort();
                                         // Kill the child process
-                                        let _ = worker_clone.kill().await;
+                                        let _ = worker_clone.shutdown(std::time::Duration::from_secs(5)).await;
                                         // ownership lost: fail job, don't persist success
                                         let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "LEASE_LOST", "ownership lost", true).await;
                                         tracing::warn!(job_id = %dispatch.job_id, "lease lost during execution; child killed");
