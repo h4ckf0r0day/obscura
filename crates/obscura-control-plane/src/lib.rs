@@ -257,14 +257,14 @@ mod tests {
 
         let tenant = cp.create_tenant("test-tenant").await.expect("tenant");
         let job = cp
-            .submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("key-1"), 3)
+            .submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("key-1"), 3)
             .await
             .expect("submit");
         assert_eq!(job.status, "pending");
 
         // idempotency
         let job2 = cp
-            .submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("key-1"), 3)
+            .submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("key-1"), 3)
             .await
             .expect("submit2");
         assert_eq!(job.job_id, job2.job_id);
@@ -577,7 +577,7 @@ mod phase3_tests {
 
         let tenant = cp.create_tenant("t3").await.expect("tenant");
         let job = cp
-            .submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("k3"), 3)
+            .submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("k3"), 3)
             .await
             .expect("submit");
 
@@ -741,7 +741,7 @@ impl ControlPlane {
         let mut tx = self.pool().begin().await?;
         let token: i64 = sqlx::query_scalar("SELECT nextval('fencing_token_seq')")
             .fetch_one(&mut *tx).await?;
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE jobs SET status='dispatched', worker_id=$1, dispatch_id=$2, execution_attempt_id=$3, fencing_token=$4, attempt_count=attempt_count+1, updated_at=now() WHERE job_id=$5 AND tenant_id=$6 AND status='scheduled'",
         )
         .bind(worker_id)
@@ -752,6 +752,10 @@ impl ControlPlane {
         .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
+        if res.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Err(ControlPlaneError::Conflict("job not in scheduled state".into()));
+        }
         sqlx::query("UPDATE workers SET active_jobs = active_jobs + 1 WHERE worker_id = $1")
             .bind(worker_id)
             .execute(&mut *tx)
@@ -1096,8 +1100,6 @@ mod auth_tests {
         cp.migrate().await.expect("migrate");
 
         let tenant = cp.create_tenant("auth-tenant").await.expect("tenant");
-        let admin = Principal::service("test-admin");
-        // make admin
         let admin = Principal { subject: "admin".into(), tenant_id: None, is_admin: true, is_worker: false };
         cp.create_credential(&admin, "cred-1", "user1", Some(tenant.tenant_id), "secret123", false, false, None)
             .await.expect("create cred");
