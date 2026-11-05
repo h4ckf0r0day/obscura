@@ -4,6 +4,8 @@ use obscura_supervisor::{SupervisorConfig, WorkerPoolSupervisor};
 use obscura_worker::{WorkerCommand, WorkerRequest, NavigationWaitUntil, SessionConfig};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 #[tokio::main]
@@ -48,9 +50,9 @@ async fn main() {
                         if let Ok(dispatch) = serde_json::from_value::<DispatchMessage>(env.payload) {
                             if dispatch.worker_id == worker_id {
                                 // Acquire lease before execution
-                                let lease = cp.acquire_lease("job", &dispatch.job_id.to_string(), worker_id, 60).await;
-                                let fencing_token = match lease {
-                                    Ok(l) => l.fencing_token,
+                                let lease = cp.acquire_lease("job", &dispatch.job_id.to_string(), worker_id, 30).await;
+                                let (lease_id, fencing_token) = match lease {
+                                    Ok(l) => (l.lease_id, l.fencing_token),
                                     Err(_) => {
                                         let _ = msg.ack().await;
                                         continue;
@@ -79,14 +81,41 @@ async fn main() {
                                         timeout_ms: Some(30000),
                                     },
                                 };
-                                let resp = supervisor.dispatch(req).await;
-                                let principal = cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap();
-                                match resp {
-                                    Ok(r) if r.ok => {
-                                        let _ = cp.complete_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, r.result.unwrap_or(serde_json::json!({}))).await;
+
+                                // Renewal channel
+                                let (loss_tx, mut loss_rx) = oneshot::channel::<()>();
+                                let cp_renew = cp.clone();
+                                let renew_handle = tokio::spawn(async move {
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                        if cp_renew.renew_lease(lease_id, 30).await.is_err() {
+                                            let _ = loss_tx.send(());
+                                            break;
+                                        }
                                     }
-                                    _ => {
-                                        let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "EXEC_ERROR", "execution failed", true).await;
+                                });
+
+                                let principal = cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap();
+                                // Execute browser with select against lease loss
+                                let exec_future = supervisor.dispatch(req);
+                                tokio::select! {
+                                    resp = exec_future => {
+                                        // cancel renewal
+                                        renew_handle.abort();
+                                        match resp {
+                                            Ok(r) if r.ok => {
+                                                let _ = cp.complete_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, r.result.unwrap_or(serde_json::json!({}))).await;
+                                            }
+                                            _ => {
+                                                let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "EXEC_ERROR", "execution failed", true).await;
+                                            }
+                                        }
+                                    }
+                                    _ = &mut loss_rx => {
+                                        renew_handle.abort();
+                                        // ownership lost: fail job, don't persist success
+                                        let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "LEASE_LOST", "ownership lost", true).await;
+                                        tracing::warn!(job_id = %dispatch.job_id, "lease lost during execution");
                                     }
                                 }
                             }
