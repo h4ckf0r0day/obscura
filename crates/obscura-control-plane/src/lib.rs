@@ -97,7 +97,7 @@ impl ControlPlane {
 
     pub async fn submit_job(
         &self,
-        principal: Option<&Principal>,
+        principal: &Principal,
         tenant_id: Uuid,
         url: &str,
         operation: &str,
@@ -105,9 +105,7 @@ impl ControlPlane {
         idempotency_key: Option<&str>,
         max_attempts: i32,
     ) -> Result<Job> {
-        if let Some(p) = principal {
-            self.authorize_tenant(p, tenant_id)?;
-        }
+        self.authorize_tenant(principal, tenant_id)?;
         // Basic SSRF literal-IP guard at control plane boundary
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -129,7 +127,7 @@ impl ControlPlane {
             .fetch_optional(&self.pool)
             .await?
             {
-                return self.get_job(None, existing.0, tenant_id).await;
+                return self.get_job_internal(existing.0, tenant_id).await;
             }
         }
 
@@ -160,13 +158,11 @@ impl ControlPlane {
         .await?;
 
         tx.commit().await?;
-        self.get_job(None, job_id, tenant_id).await
+        self.get_job_internal(job_id, tenant_id).await
     }
 
-    pub async fn get_job(&self, principal: Option<&Principal>, job_id: Uuid, tenant_id: Uuid) -> Result<Job> {
-        if let Some(p) = principal {
-            self.authorize_tenant(p, tenant_id)?;
-        }
+    pub async fn get_job(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid) -> Result<Job> {
+        self.authorize_tenant(principal, tenant_id)?;
         let row = sqlx::query(
             "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, dispatch_id, execution_attempt_id, created_at, updated_at FROM jobs WHERE job_id = $1 AND tenant_id = $2",
         )
@@ -195,10 +191,8 @@ impl ControlPlane {
         })
     }
 
-    pub async fn list_jobs(&self, principal: Option<&Principal>, tenant_id: Uuid, limit: i64) -> Result<Vec<Job>> {
-        if let Some(p) = principal {
-            self.authorize_tenant(p, tenant_id)?;
-        }
+    pub async fn list_jobs(&self, principal: &Principal, tenant_id: Uuid, limit: i64) -> Result<Vec<Job>> {
+        self.authorize_tenant(principal, tenant_id)?;
         let rows = sqlx::query(
             "SELECT job_id, tenant_id, status, url, operation, payload, idempotency_key, attempt_count, max_attempts, fencing_token, worker_id, dispatch_id, execution_attempt_id, created_at, updated_at FROM jobs WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2",
         )
@@ -229,10 +223,8 @@ impl ControlPlane {
             .collect())
     }
 
-    pub async fn cancel_job(&self, principal: Option<&Principal>, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
-        if let Some(p) = principal {
-            self.authorize_tenant(p, tenant_id)?;
-        }
+    pub async fn cancel_job(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
+        self.authorize_tenant(principal, tenant_id)?;
         let mut tx = self.pool().begin().await?;
         let res = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', updated_at = now() WHERE job_id = $1 AND tenant_id = $2 AND status IN ('pending','queued','assigned','dispatched','running','scheduled')",
@@ -277,13 +269,13 @@ mod tests {
             .expect("submit2");
         assert_eq!(job.job_id, job2.job_id);
 
-        let fetched = cp.get_job(None, job.job_id, tenant.tenant_id).await.expect("get");
+        let fetched = cp.get_job_internal(job.job_id, tenant.tenant_id).await.expect("get");
         assert_eq!(fetched.job_id, job.job_id);
 
-        let list = cp.list_jobs(None, tenant.tenant_id, 10).await.expect("list");
+        let list = cp.list_jobs_internal(tenant.tenant_id, 10).await.expect("list");
         assert!(!list.is_empty());
 
-        cp.cancel_job(None, job.job_id, tenant.tenant_id).await.expect("cancel");
+        cp.cancel_job_internal(job.job_id, tenant.tenant_id).await.expect("cancel");
     }
 }
 
@@ -628,7 +620,7 @@ mod phase3_tests {
             .expect("stream");
 
         let tenant = cp.create_tenant("t4").await.expect("tenant");
-        cp.submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("k4"), 3)
+        cp.submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("k4"), 3)
             .await
             .expect("submit");
 
@@ -783,7 +775,8 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub async fn complete_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, result: serde_json::Value) -> Result<()> {
+    pub async fn complete_job(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, result: serde_json::Value) -> Result<()> {
+        self.authorize_tenant(principal, tenant_id)?;
         let mut tx = self.pool().begin().await?;
         // validate fencing token
         let row = sqlx::query("SELECT fencing_token FROM jobs WHERE job_id=$1 AND tenant_id=$2 FOR UPDATE")
@@ -806,7 +799,8 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub async fn fail_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, error_code: &str, error_message: &str, retryable: bool) -> Result<()> {
+    pub async fn fail_job(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, error_code: &str, error_message: &str, retryable: bool) -> Result<()> {
+        self.authorize_tenant(principal, tenant_id)?;
         let mut tx = self.pool().begin().await?;
         let row = sqlx::query("SELECT fencing_token FROM jobs WHERE job_id=$1 AND tenant_id=$2 FOR UPDATE")
             .bind(job_id).bind(tenant_id).fetch_optional(&mut *tx).await?
@@ -831,9 +825,29 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub async fn cancel_job_phase4(&self, principal: Option<&Principal>, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
+    pub async fn cancel_job_phase4(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
         self.cancel_job(principal, job_id, tenant_id).await
     }
+
+    // Internal (trusted) methods that bypass authorization.
+    // These must only be called by scheduler, worker agent, and tests
+    // with an explicitly trusted service principal.
+    pub async fn submit_job_internal(&self, tenant_id: Uuid, url: &str, operation: &str, payload: serde_json::Value, idempotency_key: Option<&str>, max_attempts: i32) -> Result<Job> {
+        self.submit_job(&Principal::service("internal"), tenant_id, url, operation, payload, idempotency_key, max_attempts).await
+    }
+
+    pub async fn get_job_internal(&self, job_id: Uuid, tenant_id: Uuid) -> Result<Job> {
+        self.get_job(&Principal::service("internal"), job_id, tenant_id).await
+    }
+
+    pub async fn list_jobs_internal(&self, tenant_id: Uuid, limit: i64) -> Result<Vec<Job>> {
+        self.list_jobs(&Principal::service("internal"), tenant_id, limit).await
+    }
+
+    pub async fn cancel_job_internal(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
+        self.cancel_job(&Principal::service("internal"), job_id, tenant_id).await
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +929,24 @@ pub struct Principal {
 impl Principal {
     pub fn can_access_tenant(&self, tenant_id: Uuid) -> bool {
         self.is_admin || self.tenant_id == Some(tenant_id)
+    }
+
+    pub fn service(name: &str) -> Self {
+        Self {
+            subject: format!("service:{}", name),
+            tenant_id: None,
+            is_admin: true,
+            is_worker: false,
+        }
+    }
+
+    pub fn tenant(tenant_id: Uuid) -> Self {
+        Self {
+            subject: format!("tenant:{}", tenant_id),
+            tenant_id: Some(tenant_id),
+            is_admin: false,
+            is_worker: false,
+        }
     }
 }
 
