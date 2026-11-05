@@ -1120,3 +1120,78 @@ mod auth_tests {
         assert!(cp.authenticate("cred-2", "secret456").await.is_err());
     }
 }
+
+#[cfg(test)]
+mod f5_adversarial_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stale_completion_rejected_after_new_owner() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant("f5-tenant").await.expect("tenant");
+        let w_a = cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
+        let w_b = cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
+
+        let job = cp.submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("f5-key"), 3).await.unwrap();
+        let claimed = cp.claim_pending_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job_id, job.job_id);
+
+        let token_a = cp.mark_dispatched(job.job_id, tenant.tenant_id, w_a, Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+
+        // B acquires lease, updates fencing token
+        let lease_b = cp.acquire_lease("job", &job.job_id.to_string(), w_b, 60).await.unwrap();
+        cp.update_job_fencing_token(job.job_id, tenant.tenant_id, lease_b.fencing_token).await.unwrap();
+
+        let principal = Principal { subject: "test".into(), tenant_id: None, is_admin: true, is_worker: false };
+
+        // A's stale completion rejected
+        let r = cp.complete_job(&principal, job.job_id, tenant.tenant_id, Uuid::new_v4(), token_a, serde_json::json!({"from":"A"})).await;
+        assert!(r.is_err(), "stale completion should be rejected");
+
+        // A's stale failure rejected
+        let r = cp.fail_job(&principal, job.job_id, tenant.tenant_id, Uuid::new_v4(), token_a, "ERR", "stale", true).await;
+        assert!(r.is_err(), "stale failure should be rejected");
+
+        // B completes with new token
+        let r = cp.complete_job(&principal, job.job_id, tenant.tenant_id, Uuid::new_v4(), lease_b.fencing_token, serde_json::json!({"from":"B"})).await;
+        assert!(r.is_ok(), "B completion should succeed");
+
+        // Verify final state
+        let final_job = cp.get_job_internal(job.job_id, tenant.tenant_id).await.unwrap();
+        assert_eq!(final_job.status, "completed");
+        assert_eq!(final_job.fencing_token, lease_b.fencing_token);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_dispatch_safe() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant("f5-dup").await.expect("tenant");
+        let w = cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
+
+        let job = cp.submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("f5-dup-key"), 3).await.unwrap();
+
+        // First claim succeeds
+        let claimed1 = cp.claim_pending_job().await.unwrap();
+        assert!(claimed1.is_some());
+
+        // Second claim returns None (job no longer pending)
+        let claimed2 = cp.claim_pending_job().await.unwrap();
+        assert!(claimed2.is_none(), "duplicate claim should return None");
+
+        // mark_dispatched once
+        let token = cp.mark_dispatched(job.job_id, tenant.tenant_id, w, Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+        assert!(token > 0);
+
+        // Second mark_dispatched should fail (status no longer scheduled)
+        let result = cp.mark_dispatched(job.job_id, tenant.tenant_id, w, Uuid::new_v4(), Uuid::new_v4()).await;
+        assert!(result.is_err(), "duplicate dispatch should fail");
+    }
+}
