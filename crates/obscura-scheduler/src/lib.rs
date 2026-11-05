@@ -155,7 +155,7 @@ impl Scheduler {
 
     /// Cancel a job.
     pub async fn cancel(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
-        self.control.cancel_job_phase4(job_id, tenant_id).await?;
+        self.control.cancel_job_phase4(None, job_id, tenant_id).await?;
         Ok(())
     }
 
@@ -226,14 +226,14 @@ mod tests {
 
         let sched = Scheduler::new(cp.clone(), nats.clone());
         // submit job
-        let job = cp.submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("sk1"), 3).await.unwrap();
+        let job = cp.submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("sk1"), 3).await.unwrap();
 
         // schedule one
         let scheduled = sched.schedule_one().await.unwrap();
         assert!(scheduled);
 
         // job should be dispatched
-        let j = cp.get_job(job.job_id, tenant.tenant_id).await.unwrap();
+        let j = cp.get_job(None, job.job_id, tenant.tenant_id).await.unwrap();
         assert_eq!(j.status, "dispatched");
         assert_eq!(j.worker_id, Some(worker_id));
     }
@@ -253,7 +253,7 @@ mod tests {
 
         // submit 5 jobs
         for i in 0..5 {
-            cp.submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some(&format!("mk{}", i)), 3).await.unwrap();
+            cp.submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some(&format!("mk{}", i)), 3).await.unwrap();
         }
 
         let sched1 = Scheduler::new(cp.clone(), nats.clone());
@@ -280,18 +280,18 @@ mod tests {
 
         let tenant = cp.create_tenant("sched-t3").await.unwrap();
         cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
-        let job = cp.submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("cancel1"), 3).await.unwrap();
+        let job = cp.submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("cancel1"), 3).await.unwrap();
         let sched = Scheduler::new(cp.clone(), nats.clone());
         sched.schedule_one().await.unwrap();
-        let j = cp.get_job(job.job_id, tenant.tenant_id).await.unwrap();
+        let j = cp.get_job(None, job.job_id, tenant.tenant_id).await.unwrap();
         // cancel
         sched.cancel(job.job_id, tenant.tenant_id).await.unwrap();
         // fail path
-        let job2 = cp.submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("fail1"), 3).await.unwrap();
+        let job2 = cp.submit_job(None, tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("fail1"), 3).await.unwrap();
         sched.schedule_one().await.unwrap();
-        let j2 = cp.get_job(job2.job_id, tenant.tenant_id).await.unwrap();
+        let j2 = cp.get_job(None, job2.job_id, tenant.tenant_id).await.unwrap();
         sched.handle_failure(j2.job_id, tenant.tenant_id, j2.execution_attempt_id.unwrap(), j2.fencing_token, "ERR", "boom", false).await.unwrap();
-        let j2f = cp.get_job(job2.job_id, tenant.tenant_id).await.unwrap();
+        let j2f = cp.get_job(None, job2.job_id, tenant.tenant_id).await.unwrap();
         assert_eq!(j2f.status, "failed");
     }
 }
