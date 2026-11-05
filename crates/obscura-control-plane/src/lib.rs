@@ -904,6 +904,12 @@ impl ControlPlane {
         }
     }
 
+    pub async fn update_job_fencing_token(&self, job_id: Uuid, tenant_id: Uuid, token: i64) -> Result<()> {
+        sqlx::query("UPDATE jobs SET fencing_token = $1, updated_at = now() WHERE job_id = $2 AND tenant_id = $3")
+            .bind(token).bind(job_id).bind(tenant_id).execute(self.pool()).await?;
+        Ok(())
+    }
+
     pub async fn renew_lease(&self, lease_id: Uuid, ttl_secs: i64) -> Result<()> {
         let res = sqlx::query("UPDATE leases SET expires_at = now() + ($2 || ' seconds')::interval, renewed_at = now() WHERE lease_id = $1 AND expires_at > now()")
             .bind(lease_id).bind(ttl_secs).execute(self.pool()).await?;

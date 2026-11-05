@@ -1,8 +1,7 @@
-use async_nats::jetstream::Context;
 use obscura_control_plane::{ControlPlane, NatsClient, NatsConsumer, Principal};
 use obscura_scheduler::DispatchMessage;
 use obscura_supervisor::{SupervisorConfig, WorkerPoolSupervisor};
-use obscura_worker::{WorkerCommand, WorkerRequest};
+use obscura_worker::{WorkerCommand, WorkerRequest, NavigationWaitUntil, SessionConfig};
 use std::path::PathBuf;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -27,7 +26,6 @@ async fn main() {
     let worker_id = cp.register_worker(tenant_id, serde_json::json!({}), 4).await.expect("register worker");
     cp.worker_heartbeat(worker_id).await.ok();
 
-    // supervisor pool
     let config = SupervisorConfig {
         worker_bin: PathBuf::from(worker_bin),
         pool_size: 1,
@@ -36,7 +34,6 @@ async fn main() {
     let supervisor = WorkerPoolSupervisor::new(config);
     supervisor.start().await.expect("supervisor start");
 
-    // consumer for dispatch
     let consumer = NatsConsumer::create(nats.jetstream(), "OBScura_JOBS", "worker-agent")
         .await
         .expect("consumer");
@@ -46,39 +43,50 @@ async fn main() {
     loop {
         match consumer.next_message().await {
             Ok(Some(msg)) => {
-                // parse envelope
                 if let Ok(env) = serde_json::from_slice::<obscura_control_plane::EventEnvelope>(&msg.payload) {
                     if env.event_type == "job.dispatch" {
                         if let Ok(dispatch) = serde_json::from_value::<DispatchMessage>(env.payload) {
                             if dispatch.worker_id == worker_id {
-                                // execute
-                                let req = WorkerRequest {
-                                    id: Some(dispatch.dispatch_id.to_string()),
-                                    version: "1.0".to_string(),
-                                    command: obscura_worker::WorkerCommand::Navigate {
-                                        session_id: format!("session-{}", dispatch.job_id),
-                                        url: dispatch.url.clone(),
-                                        wait_until: obscura_worker::NavigationWaitUntil::Load,
-                                        timeout_ms: Some(30000),
-                                    },
+                                // Acquire lease before execution
+                                let lease = cp.acquire_lease("job", &dispatch.job_id.to_string(), worker_id, 60).await;
+                                let fencing_token = match lease {
+                                    Ok(l) => l.fencing_token,
+                                    Err(_) => {
+                                        let _ = msg.ack().await;
+                                        continue;
+                                    }
                                 };
+                                let _ = cp.update_job_fencing_token(dispatch.job_id, dispatch.tenant_id, fencing_token).await;
+
                                 // ensure session exists
                                 let create_req = WorkerRequest {
                                     id: Some(format!("create-{}", dispatch.dispatch_id)),
                                     version: "1.0".to_string(),
-                                    command: obscura_worker::WorkerCommand::SessionCreate {
+                                    command: WorkerCommand::SessionCreate {
                                         session_id: format!("session-{}", dispatch.job_id),
-                                        config: obscura_worker::SessionConfig::default(),
+                                        config: SessionConfig::default(),
                                     },
                                 };
                                 let _ = supervisor.dispatch(create_req).await;
+
+                                let req = WorkerRequest {
+                                    id: Some(dispatch.dispatch_id.to_string()),
+                                    version: "1.0".to_string(),
+                                    command: WorkerCommand::Navigate {
+                                        session_id: format!("session-{}", dispatch.job_id),
+                                        url: dispatch.url.clone(),
+                                        wait_until: NavigationWaitUntil::Load,
+                                        timeout_ms: Some(30000),
+                                    },
+                                };
                                 let resp = supervisor.dispatch(req).await;
+                                let principal = cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap();
                                 match resp {
                                     Ok(r) if r.ok => {
-                                        cp.complete_job(&cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, r.result.unwrap_or(serde_json::json!({}))).await.ok();
+                                        let _ = cp.complete_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, r.result.unwrap_or(serde_json::json!({}))).await;
                                     }
                                     _ => {
-                                        cp.fail_job(&cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, "EXEC_ERROR", "execution failed", true).await.ok();
+                                        let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "EXEC_ERROR", "execution failed", true).await;
                                     }
                                 }
                             }
