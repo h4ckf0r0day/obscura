@@ -18,6 +18,7 @@ obscura-telemetry = { path = "../obscura-telemetry" }
 obscura-ssrf = { path = "../obscura-ssrf" }
 url = "2"
 sha2 = "0.10"
+subtle = "2"
 hex = "0.4"
 
 async-nats = "0.38"

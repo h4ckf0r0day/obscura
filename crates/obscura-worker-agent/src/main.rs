@@ -75,10 +75,10 @@ async fn main() {
                                 let resp = supervisor.dispatch(req).await;
                                 match resp {
                                     Ok(r) if r.ok => {
-                                        cp.complete_job(&cp.service_principal("worker-agent"), dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, r.result.unwrap_or(serde_json::json!({}))).await.ok();
+                                        cp.complete_job(&cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, r.result.unwrap_or(serde_json::json!({}))).await.ok();
                                     }
                                     _ => {
-                                        cp.fail_job(&cp.service_principal("worker-agent"), dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, "EXEC_ERROR", "execution failed", true).await.ok();
+                                        cp.fail_job(&cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, "EXEC_ERROR", "execution failed", true).await.ok();
                                     }
                                 }
                             }

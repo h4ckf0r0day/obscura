@@ -143,19 +143,19 @@ impl Scheduler {
 
     /// Handle job completion reported by worker.
     pub async fn handle_completion(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, result: serde_json::Value) -> Result<()> {
-        self.control.complete_job(&self.control.service_principal("scheduler"), job_id, tenant_id, attempt_id, fencing_token, result).await?;
+        self.control.complete_job(&self.control.service_principal("scheduler", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), job_id, tenant_id, attempt_id, fencing_token, result).await?;
         Ok(())
     }
 
     /// Handle job failure.
     pub async fn handle_failure(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, code: &str, msg: &str, retryable: bool) -> Result<()> {
-        self.control.fail_job(&self.control.service_principal("scheduler"), job_id, tenant_id, attempt_id, fencing_token, code, msg, retryable).await?;
+        self.control.fail_job(&self.control.service_principal("scheduler", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), job_id, tenant_id, attempt_id, fencing_token, code, msg, retryable).await?;
         Ok(())
     }
 
     /// Cancel a job.
     pub async fn cancel(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
-        self.control.cancel_job_phase4(&self.control.service_principal("scheduler"), job_id, tenant_id).await?;
+        self.control.cancel_job_phase4(&self.control.service_principal("scheduler", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap(), job_id, tenant_id).await?;
         Ok(())
     }
 
