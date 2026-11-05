@@ -833,19 +833,19 @@ impl ControlPlane {
     // These must only be called by scheduler, worker agent, and tests
     // with an explicitly trusted service principal.
     pub async fn submit_job_internal(&self, tenant_id: Uuid, url: &str, operation: &str, payload: serde_json::Value, idempotency_key: Option<&str>, max_attempts: i32) -> Result<Job> {
-        self.submit_job(&Principal::service("internal"), tenant_id, url, operation, payload, idempotency_key, max_attempts).await
+        self.submit_job(&self.service_principal("internal"), tenant_id, url, operation, payload, idempotency_key, max_attempts).await
     }
 
     pub async fn get_job_internal(&self, job_id: Uuid, tenant_id: Uuid) -> Result<Job> {
-        self.get_job(&Principal::service("internal"), job_id, tenant_id).await
+        self.get_job(&self.service_principal("internal"), job_id, tenant_id).await
     }
 
     pub async fn list_jobs_internal(&self, tenant_id: Uuid, limit: i64) -> Result<Vec<Job>> {
-        self.list_jobs(&Principal::service("internal"), tenant_id, limit).await
+        self.list_jobs(&self.service_principal("internal"), tenant_id, limit).await
     }
 
     pub async fn cancel_job_internal(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
-        self.cancel_job(&Principal::service("internal"), job_id, tenant_id).await
+        self.cancel_job(&self.service_principal("internal"), job_id, tenant_id).await
     }
 
 }
@@ -920,10 +920,10 @@ impl ControlPlane {
 
 #[derive(Debug, Clone)]
 pub struct Principal {
-    pub subject: String,
-    pub tenant_id: Option<Uuid>,
-    pub is_admin: bool,
-    pub is_worker: bool,
+    subject: String,
+    tenant_id: Option<Uuid>,
+    is_admin: bool,
+    is_worker: bool,
 }
 
 impl Principal {
@@ -931,7 +931,13 @@ impl Principal {
         self.is_admin || self.tenant_id == Some(tenant_id)
     }
 
-    pub fn service(name: &str) -> Self {
+    pub fn subject(&self) -> &str { &self.subject }
+    pub fn tenant_id(&self) -> Option<Uuid> { self.tenant_id }
+    pub fn is_admin(&self) -> bool { self.is_admin }
+    pub fn is_worker(&self) -> bool { self.is_worker }
+
+    // Controlled constructors — only callable within this crate.
+    pub(crate) fn service(name: &str) -> Self {
         Self {
             subject: format!("service:{}", name),
             tenant_id: None,
@@ -940,7 +946,7 @@ impl Principal {
         }
     }
 
-    pub fn tenant(tenant_id: Uuid) -> Self {
+    pub(crate) fn tenant(tenant_id: Uuid) -> Self {
         Self {
             subject: format!("tenant:{}", tenant_id),
             tenant_id: Some(tenant_id),
@@ -948,7 +954,17 @@ impl Principal {
             is_worker: false,
         }
     }
+
+    pub(crate) fn worker(worker_id: Uuid, tenant_id: Option<Uuid>) -> Self {
+        Self {
+            subject: format!("worker:{}", worker_id),
+            tenant_id,
+            is_admin: false,
+            is_worker: true,
+        }
+    }
 }
+
 
 impl ControlPlane {
     pub fn authorize_tenant(&self, principal: &Principal, tenant_id: Uuid) -> Result<()> {
@@ -957,5 +973,123 @@ impl ControlPlane {
         } else {
             Err(ControlPlaneError::Conflict("unauthorized tenant access".into()))
         }
+    }
+
+    pub fn service_principal(&self, name: &str) -> Principal {
+        Principal::service(name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credential-backed authentication
+// ---------------------------------------------------------------------------
+
+use sha2::{Digest, Sha256};
+
+impl ControlPlane {
+    pub async fn create_credential(
+        &self,
+        credential_id: &str,
+        subject: &str,
+        tenant_id: Option<Uuid>,
+        secret: &str,
+        is_admin: bool,
+        is_worker: bool,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let hash = hex::encode(Sha256::digest(secret.as_bytes()));
+        sqlx::query(
+            "INSERT INTO credentials (credential_id, subject, tenant_id, secret_hash, is_admin, is_worker, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(credential_id)
+        .bind(subject)
+        .bind(tenant_id)
+        .bind(hash)
+        .bind(is_admin)
+        .bind(is_worker)
+        .bind(expires_at)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn authenticate(&self, credential_id: &str, secret: &str) -> Result<Principal> {
+        let row = sqlx::query(
+            "SELECT subject, tenant_id, secret_hash, is_admin, is_worker, revoked, expires_at FROM credentials WHERE credential_id = $1",
+        )
+        .bind(credential_id)
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| ControlPlaneError::Conflict("invalid credential".into()))?;
+
+        let stored_hash: String = row.get("secret_hash");
+        let input_hash = hex::encode(Sha256::digest(secret.as_bytes()));
+        // constant-time-ish comparison
+        if stored_hash != input_hash {
+            return Err(ControlPlaneError::Conflict("invalid credential".into()));
+        }
+        let revoked: bool = row.get("revoked");
+        if revoked {
+            return Err(ControlPlaneError::Conflict("credential revoked".into()));
+        }
+        let expires: Option<DateTime<Utc>> = row.get("expires_at");
+        if let Some(exp) = expires {
+            if exp < Utc::now() {
+                return Err(ControlPlaneError::Conflict("credential expired".into()));
+            }
+        }
+        let subject: String = row.get("subject");
+        let tenant_id: Option<Uuid> = row.get("tenant_id");
+        let is_admin: bool = row.get("is_admin");
+        let is_worker: bool = row.get("is_worker");
+        // Construct Principal internally (controlled)
+        Ok(Principal {
+            subject,
+            tenant_id,
+            is_admin,
+            is_worker,
+        })
+    }
+
+    pub async fn revoke_credential(&self, credential_id: &str) -> Result<()> {
+        sqlx::query("UPDATE credentials SET revoked = true WHERE credential_id = $1")
+            .bind(credential_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_credential_auth() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant("auth-tenant").await.expect("tenant");
+        cp.create_credential("cred-1", "user1", Some(tenant.tenant_id), "secret123", false, false, None)
+            .await.expect("create cred");
+
+        // valid
+        let p = cp.authenticate("cred-1", "secret123").await.expect("auth");
+        assert_eq!(p.tenant_id(), Some(tenant.tenant_id));
+        assert!(!p.is_admin());
+
+        // invalid secret
+        assert!(cp.authenticate("cred-1", "wrong").await.is_err());
+
+        // revoked
+        cp.revoke_credential("cred-1").await.expect("revoke");
+        assert!(cp.authenticate("cred-1", "secret123").await.is_err());
+
+        // expired
+        cp.create_credential("cred-2", "user2", Some(tenant.tenant_id), "secret456", false, false, Some(Utc::now() - chrono::Duration::seconds(10)))
+            .await.expect("create cred2");
+        assert!(cp.authenticate("cred-2", "secret456").await.is_err());
     }
 }
