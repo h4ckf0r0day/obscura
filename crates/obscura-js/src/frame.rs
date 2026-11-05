@@ -700,6 +700,49 @@ mod tests {
     }
 
     #[test]
+    fn nested_message_source_parent_keeps_the_intermediate_frame() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _child = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/child", "<html><body></body></html>").unwrap();
+        let _grandchild = FrameRealm::new(&mut parent, 2, 1,
+            "https://parent.example/grandchild", "<html><body></body></html>").unwrap();
+        parent.execute_script("nested-message-parent", r#"
+            globalThis.sources = [];
+            addEventListener('message', event => sources.push(event.source));
+            __obscura_deliverMessage('{"v":"child"}', 'https://parent.example', 1, '*');
+            __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
+            sources[1].parent.postMessage('reply', '*');
+        "#).unwrap();
+        assert_eq!(parent.evaluate(
+            "[sources[1].parent === sources[0], sources[1].parent.parent === window, sources[1].top === window]"
+        ).unwrap(), serde_json::json!([true, true, true]));
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id,
+        )).collect::<Vec<_>>(), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn message_source_parent_stays_opaque_across_origins() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _child = FrameRealm::new(&mut parent, 1, 0,
+            "https://other.example/child", "<html><body></body></html>").unwrap();
+        let _grandchild = FrameRealm::new(&mut parent, 2, 1,
+            "https://parent.example/grandchild", "<html><body></body></html>").unwrap();
+        parent.execute_script("opaque-message-parent", r#"
+            addEventListener('message', event => { globalThis.sourceParent = event.source.parent; });
+            __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
+            sourceParent.postMessage('reply', '*');
+        "#).unwrap();
+        assert_eq!(parent.evaluate("[sourceParent !== window, sourceParent.document === undefined]").unwrap(),
+            serde_json::json!([true, true]));
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id,
+        )).collect::<Vec<_>>(), vec![(1, 0)]);
+    }
+
+    #[test]
     fn nested_initial_frame_uses_its_owner_document_not_the_entered_page() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         parent.execute_script("nested-initial-frame", r#"

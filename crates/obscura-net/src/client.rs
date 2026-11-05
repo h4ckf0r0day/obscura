@@ -819,7 +819,8 @@ fn reject_oversized_content_length(
     Ok(())
 }
 
-async fn read_reqwest_body_limited(
+/// Read a response with a cap on both advertised and decoded body bytes.
+pub async fn read_reqwest_body_limited(
     mut response: reqwest::Response,
     url: &Url,
     limit: usize,

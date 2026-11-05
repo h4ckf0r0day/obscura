@@ -1,4 +1,4 @@
-Obscura is a workspace of nine crates.
+Obscura is a workspace of ten crates.
 
 ```
 obscura-cli       CLI entry point. fetch, serve, scrape, mcp.
@@ -7,6 +7,7 @@ obscura-browser   Page type, navigation, lifecycle events.
 obscura-js        V8 runtime via deno_core. bootstrap.js + Rust ops.
 obscura-dom       DOM tree implementation.
 obscura-net       HTTP client, stealth client, cookie jar, robots cache, tracker blocklist.
+obscura-ssrf      Shared URL and IP-address validation for request policies.
 obscura-mcp       Model Context Protocol server.
 obscura-render    CSS cascade, retained layout, text shaping, and CPU paint.
 obscura           Embeddable Rust library API (Browser, Page, Element, CookieStore).
@@ -71,20 +72,20 @@ The relevant paths are `Page::screenshot_with_animation_sample` and
 `crates/obscura-js/src/runtime.rs`, and `RenderResourceCache` in
 `crates/obscura-render/src/paint.rs`.
 
-## Single V8 isolate
+## CDP execution
 
-All pages in a process share one V8 isolate. The isolate is single-threaded by design.
+Each CDP connection runs page work on its own OS thread and current-thread
+Tokio runtime. Socket I/O uses a separate thread. Connections can execute in
+parallel; `--max-connections` bounds live connections per worker process.
 
-`obscura_js::v8_lock::global()` is a `tokio::sync::Mutex` that serializes V8 work. A handler that wants to run JS must acquire the lock first:
+Each page runtime owns a V8 isolate. `CdpContext::v8_lock` serializes V8 work
+within one connection so handlers do not interleave isolate entry. It is not a
+process-wide lock. Long operations use `process_with_interception` in
+`server.rs` so the connection can keep processing interception messages.
 
-```rust
-let _guard = obscura_js::v8_lock::global().lock().await;
-page.evaluate(expr).await
-```
-
-The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
-
-This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
+Targets and sessions belong to the connection that created them. A separate
+browser WebSocket does not attach to another connection's pages. Within one
+connection, additional flattened sessions can observe the same target.
 
 ## Child frames
 
@@ -108,7 +109,7 @@ for Playwright frame locators or iframe screenshot fidelity.
 
 ## Robustness
 
-One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a single shared watchdog the dispatcher arms around every CDP command, so a runaway page cannot hold the V8 lock and wedge other sessions (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
+`obscura-js/runtime.rs` provides a V8 termination watchdog (`arm_watchdog`, `run_event_loop_bounded`) that terminates the isolate from a separate thread when synchronous work overruns a budget, because `tokio::time::timeout` cannot preempt synchronous V8. It bounds the post-load settle, the navigation event-loop pumps, and `--eval`. The complete script phase is bounded by `OBSCURA_SCRIPT_DEADLINE_MS`; enhancement modules have a shorter per-module graph-loading/evaluation budget controlled by `OBSCURA_MODULE_BUDGET_MS`, while modules mounting an empty SPA shell receive the full script deadline. `obscura-js/cdp_watchdog.rs` is a watchdog the dispatcher arms around CDP commands, to release the connection's V8 lock after an execution timeout (tunable via `OBSCURA_CDP_COMMAND_TIMEOUT_MS`). `op_dom` is wrapped in `catch_unwind` so a DOM-op panic degrades to a null result instead of aborting the process through V8's FFI frame, and `obscura-dom/tree.rs` rejects cyclic reparenting that would make tree walks loop forever. Scripted `fetch()`/XHR and module network requests are timeout-bounded (`OBSCURA_FETCH_TIMEOUT_MS`), and the one-shot `fetch` CLI has a process-level hard deadline as a final backstop.
 
 ## JS bridge
 
@@ -117,7 +118,8 @@ One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8
 `obscura-js/src/ops.rs` registers Rust ops that the bootstrap calls into:
 
 ```js
-Deno.core.ops.op_dom('insert_before', parentNid, refNid, newNid);
+// bootstrap.js helper; the reference node determines the parent.
+_dom('insert_before', newNid, refNid);
 ```
 
 Adding a Web API usually means:
@@ -141,9 +143,12 @@ OS threads. This is not a complete WorkerGlobalScope implementation.
 ## CDP session model
 
 Each CDP client connection gets attached to one or more targets.
-Session IDs are `"{targetId}-session"`. The dispatcher routes by `sessionId` in the incoming frame to the right `Page`.
+Managed sessions use `"{targetId}-session"`. Explicit `Target.attachToTarget`
+calls return distinct session IDs. Treat those IDs as opaque and send the
+returned value as `sessionId` on subsequent commands.
 
-Targets are created by `Target.createTarget`. Closing the WebSocket detaches all sessions but leaves the pages running.
+Targets are created by `Target.createTarget`. Closing the WebSocket ends that connection's sessions and page runtimes.
+The server continues accepting other connections.
 
 ## Lifecycle
 

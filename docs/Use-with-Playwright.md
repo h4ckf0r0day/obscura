@@ -1,3 +1,5 @@
+Examples use Node.js ES modules. Save scripts with a `.mjs` extension.
+
 ## Setup
 
 ```bash
@@ -8,7 +10,7 @@ npm install playwright
 ## Connect
 
 ```js
-const { chromium } = require('playwright');
+import { chromium } from 'playwright';
 
 const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
 const context = browser.contexts()[0] || await browser.newContext();
@@ -25,7 +27,8 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle' });
 ```
 
-Default is `domcontentloaded`. Other values: `load`, `networkidle`.
+Default is `load`. Other values include `domcontentloaded`, `networkidle`, and
+`commit`.
 
 Navigating to `text/plain`, `text/markdown`, or `text/x-markdown` responses
 preserves literal markup as text instead of parsing it as HTML.
@@ -145,7 +148,8 @@ await Promise.all([
 ]);
 ```
 
-Pages share one V8 isolate. CPU-bound JS on one page blocks the others.
+Pages on one CDP connection serialize JavaScript work. Separate CDP connections
+run on separate threads and can execute in parallel.
 
 ## Screenshots, scrolling, and PDF
 

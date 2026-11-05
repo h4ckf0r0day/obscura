@@ -7925,6 +7925,21 @@ mod tests {
         assert_eq!(called.value.unwrap(), serde_json::json!(["function", true]));
     }
 
+    // Anti-bot scripts walk `parent` from a frame's window until they reach
+    // their own; a chain that never gets there hangs the page for good.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loaded_frame_parent_chain_reaches_the_page() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page("frame-parent", &base, "<html><body></body></html>");
+        let script = "new Promise(resolve => { const frame = document.createElement('iframe'); \
+            frame.onload = () => { const w = frame.contentWindow; \
+                resolve([w.parent === window, w.top === window, \
+                    w.parent.parent === window]); }; \
+            frame.src = '/child.html'; document.body.appendChild(frame); })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!([true, true, true]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_frame_script_fetch_keeps_all_siblings_resumable() {
         let (mut page, requests, slow_seen) =
