@@ -2240,11 +2240,22 @@ fn web_search_request(query: &str, limit: u64, api_key: Option<&str>) -> WebSear
     }
 }
 
+fn web_search_limit(args: &Value) -> u64 {
+    args.get("limit").and_then(|value| {
+        value.as_u64().or_else(|| {
+            // JSON numbers such as 1.0 are stored as f64, even when integral.
+            value.as_f64()
+                .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+                .map(|number| number as u64)
+        })
+    }).unwrap_or(5).clamp(1, 50)
+}
+
 async fn tool_web_search(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let query = args.get("query").and_then(Value::as_str).map(str::trim)
         .filter(|query| !query.is_empty())
         .ok_or("Missing query parameter")?;
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5).clamp(1, 50);
+    let limit = web_search_limit(args);
     let api_key = std::env::var("KEENABLE_API_KEY").ok()
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty());
@@ -3003,6 +3014,26 @@ mod tests {
         let mut state = BrowserState::new(None, None, false);
         let error = tool_web_search(&json!({"query": "  "}), &mut state).await.unwrap_err();
         assert!(error.contains("Missing query"), "{error}");
+    }
+
+    #[test]
+    fn web_search_request_honors_integer_valued_json_limits() {
+        let omitted: Value = serde_json::from_str("{}").unwrap();
+        assert_eq!(web_search_limit(&omitted), 5);
+        for (limit, expected) in [
+            ("1", 1), ("1.0", 1), ("1e0", 1),
+            ("50", 50), ("50.0", 50), ("5e1", 50),
+            ("0", 1), ("0.0", 1), ("-0.0", 1),
+            ("51", 50), ("51.0", 50),
+            ("18446744073709551615", 50), ("1e100", 50),
+            ("-1", 5), ("-1.0", 5), ("1.5", 5),
+            ("null", 5), (r#""1""#, 5), ("true", 5),
+        ] {
+            let args: Value = serde_json::from_str(&format!(r#"{{"limit":{limit}}}"#)).unwrap();
+            let request = web_search_request("obscura", web_search_limit(&args), None);
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(body["max_results"], json!(expected), "limit={limit}");
+        }
     }
 
     #[test]
