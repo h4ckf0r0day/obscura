@@ -767,6 +767,21 @@ fn handle_tools_list(id: Value) -> RpcResponse {
         ]);
     }
 
+    if web_search_enabled() {
+        tools.push(json!({
+            "name": "web_search",
+            "description": "Search the web and return matching pages, one JSON object per line with title, url, and a short snippet. Use it to find pages to open with browser_navigate. Queries are sent to the Keenable search API.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "number", "description": "Max results to return (default 5, max 50)" }
+                },
+                "required": ["query"]
+            }
+        }));
+    }
+
     RpcResponse::ok(id, json!({ "tools": tools }))
 }
 
@@ -834,6 +849,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_search" => tool_search(args, state),
         "browser_storage_state" => tool_storage_state(state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
+        "web_search" if web_search_enabled() => tool_web_search(args, state).await,
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -2185,6 +2201,131 @@ fn search_body(
     out
 }
 
+const KEENABLE_SEARCH_URL: &str = "https://api.keenable.ai/v1/search";
+const KEENABLE_PUBLIC_SEARCH_URL: &str = "https://api.keenable.ai/v1/search/public";
+const WEB_SEARCH_SNIPPET_CHARS: usize = 500;
+// Room for 50 results with multi-KB snippets, bounded before JSON parsing.
+const WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// `web_search` sends the agent's queries to a third-party API, so it is
+/// listed and callable only when the operator opts in.
+fn web_search_enabled() -> bool {
+    std::env::var("OBSCURA_WEB_SEARCH")
+        .is_ok_and(|provider| provider.trim().eq_ignore_ascii_case("keenable"))
+}
+
+struct WebSearchRequest {
+    url: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+}
+
+/// The public endpoint needs no account. A key only raises the rate limit.
+fn web_search_request(query: &str, limit: u64, api_key: Option<&str>) -> WebSearchRequest {
+    let mut headers = vec![
+        ("content-type", "application/json".to_string()),
+        ("x-keenable-title", "Obscura".to_string()),
+    ];
+    let url = match api_key {
+        Some(key) => {
+            headers.push(("x-api-key", key.to_string()));
+            KEENABLE_SEARCH_URL
+        }
+        None => KEENABLE_PUBLIC_SEARCH_URL,
+    };
+    WebSearchRequest {
+        url,
+        headers,
+        body: json!({ "query": query, "max_results": limit }).to_string(),
+    }
+}
+
+fn web_search_limit(args: &Value) -> u64 {
+    args.get("limit").and_then(|value| {
+        value.as_u64().or_else(|| {
+            // JSON numbers such as 1.0 are stored as f64, even when integral.
+            value.as_f64()
+                .filter(|number| number.is_finite() && *number >= 0.0 && number.fract() == 0.0)
+                .map(|number| number as u64)
+        })
+    }).unwrap_or(5).clamp(1, 50)
+}
+
+async fn tool_web_search(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let query = args.get("query").and_then(Value::as_str).map(str::trim)
+        .filter(|query| !query.is_empty())
+        .ok_or("Missing query parameter")?;
+    let limit = web_search_limit(args);
+    let api_key = std::env::var("KEENABLE_API_KEY").ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let request = web_search_request(query, limit, api_key.as_deref());
+
+    let body = fetch_web_search(request, state, api_key.is_none()).await?;
+    Ok(format_web_results(query, &body))
+}
+
+async fn fetch_web_search(
+    request: WebSearchRequest,
+    state: &BrowserState,
+    keyless: bool,
+) -> Result<Value, String> {
+    // The context's client carries the configured proxy, CA roots and SSRF guard.
+    let client = state.context.http_client.request_client().await;
+    let mut builder = client.post(request.url).body(request.body);
+    for (name, value) in request.headers {
+        builder = builder.header(name, value);
+    }
+    let response = builder.send().await
+        .map_err(|error| format!("web search request failed: {error}"))?;
+    let status = response.status();
+    let response_url = response.url().clone();
+    let body = obscura_net::client::read_reqwest_body_limited(
+        response, &response_url, WEB_SEARCH_RESPONSE_BYTES,
+    ).await
+        .map_err(|error| format!("web search response failed: {error}"))?;
+    if !status.is_success() {
+        let hint = if status.as_u16() == 429 && keyless {
+            " (set KEENABLE_API_KEY for higher rate limits)"
+        } else {
+            ""
+        };
+        return Err(format!("web search returned HTTP {}{hint}", status.as_u16()));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("web search returned invalid JSON: {error}"))
+}
+
+/// One JSON object per line, like `browser_links`. Keenable returns the page
+/// text in `snippet` (`description` is empty), often several KB of it.
+fn format_web_results(query: &str, body: &Value) -> String {
+    let compact = |text: &str, max_chars: usize| {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.chars().count() <= max_chars {
+            return text;
+        }
+        let mut cut: String = text.chars().take(max_chars).collect();
+        cut.push_str("...");
+        cut
+    };
+    let lines: Vec<String> = body.get("results").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|result| {
+            let url = result.get("url").and_then(Value::as_str)?;
+            let field = |name: &str| result.get(name).and_then(Value::as_str).unwrap_or("");
+            Some(json!({
+                "title": compact(field("title"), 200),
+                "url": url,
+                "snippet": compact(field("snippet"), WEB_SEARCH_SNIPPET_CHARS),
+            }).to_string())
+        })
+        .collect();
+    if lines.is_empty() {
+        format!("No results for {query:?}.")
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Export full session state: cookies + localStorage + sessionStorage
 /// for every origin the page knows about. Agents stash this between
 /// runs to skip a login flow.
@@ -2732,6 +2873,202 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    async fn web_search_response_fixture(
+        response: String,
+        hold_open: bool,
+    ) -> (BrowserState, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST http://search.test/v1/search/public HTTP/1.1\r\n");
+            let mut length = None;
+            loop {
+                line.clear();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut request = vec![0; length.expect("request Content-Length")];
+            socket.read_exact(&mut request).await.unwrap();
+            let sent = socket.get_mut().write_all(response.as_bytes()).await;
+            if hold_open {
+                if sent.is_ok() {
+                    // Leave the response incomplete until the client drops it.
+                    let _ = socket.read_u8().await;
+                }
+            } else {
+                sent.unwrap();
+            }
+        });
+        let state = BrowserState::new(Some(format!("http://{address}")), None, false);
+        (state, fixture)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_response_limit_accepts_normal_and_fifty_result_bodies() {
+        let small = json!({"results": [{
+            "title": "Small fixture", "url": "https://example.test/", "snippet": "small result"
+        }]}).to_string();
+        let results: Vec<Value> = (0..50).map(|index| json!({
+            "title": format!("Result {index}"),
+            "url": format!("https://example.test/{index}"),
+            "snippet": "word ".repeat(1600),
+        })).collect();
+        let mut boundary = json!({"results": results}).to_string();
+        assert!(boundary.len() < WEB_SEARCH_RESPONSE_BYTES);
+        boundary.extend(std::iter::repeat(' ').take(WEB_SEARCH_RESPONSE_BYTES - boundary.len()));
+
+        for (body, count) in [(small, 1), (boundary, 50)] {
+            for chunked in [false, true] {
+                let response = if chunked {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{body}\r\n0\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let (state, fixture) = web_search_response_fixture(response, false).await;
+                let request = WebSearchRequest {
+                    url: "http://search.test/v1/search/public",
+                    ..web_search_request("obscura", 50, None)
+                };
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    fetch_web_search(request, &state, true),
+                ).await.expect("search response timed out").unwrap();
+                assert_eq!(result["results"].as_array().unwrap().len(), count);
+                assert_eq!(format_web_results("obscura", &result).lines().count(), count);
+                if count == 1 {
+                    assert_eq!(result["results"][0]["snippet"], "small result");
+                } else {
+                    assert_eq!(result["results"][49]["title"], "Result 49");
+                    assert_eq!(result["results"][49]["snippet"].as_str().unwrap().len(), 8000);
+                }
+                fixture.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_response_limit_rejects_overflow_before_eof() {
+        let limit = WEB_SEARCH_RESPONSE_BYTES;
+        let mut body = json!({"results": []}).to_string();
+        body.extend(std::iter::repeat(' ').take(limit + 1 - body.len()));
+        assert_eq!(body.len(), limit + 1);
+        let responses = [
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", limit + 1),
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{body}\r\n", body.len()),
+            format!("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n{body}"),
+        ];
+        for response in responses {
+            let (state, fixture) = web_search_response_fixture(response, true).await;
+            let request = WebSearchRequest {
+                url: "http://search.test/v1/search/public",
+                ..web_search_request("obscura", 50, None)
+            };
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fetch_web_search(request, &state, true),
+            ).await.expect("oversized response must fail before EOF").unwrap_err();
+            assert!(error.contains("web search response failed:"), "{error}");
+            assert!(error.contains(&format!("exceeded {limit} byte limit")), "{error}");
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture)
+                .await.expect("response connection was not closed").unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_is_hidden_and_rejected_without_opt_in() {
+        std::env::remove_var("OBSCURA_WEB_SEARCH");
+        assert!(listed_tools().iter().all(|tool| tool["name"] != "web_search"));
+        let mut state = BrowserState::new(None, None, false);
+        let response = handle_tool_call(
+            json!(1),
+            &json!({"name": "web_search", "arguments": {"query": "obscura"}}),
+            &mut state,
+        ).await.result.expect("tool response");
+        assert_eq!(response["isError"], true);
+        assert!(response.to_string().contains("Unknown tool: web_search"), "{response}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn web_search_is_advertised_when_enabled_and_requires_a_query() {
+        std::env::set_var("OBSCURA_WEB_SEARCH", "keenable");
+        let tools = listed_tools();
+        let tool = tools.iter().find(|tool| tool["name"] == "web_search").expect("web_search tool");
+        assert_eq!(tool["inputSchema"]["required"], json!(["query"]));
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_web_search(&json!({"query": "  "}), &mut state).await.unwrap_err();
+        assert!(error.contains("Missing query"), "{error}");
+    }
+
+    #[test]
+    fn web_search_request_honors_integer_valued_json_limits() {
+        let omitted: Value = serde_json::from_str("{}").unwrap();
+        assert_eq!(web_search_limit(&omitted), 5);
+        for (limit, expected) in [
+            ("1", 1), ("1.0", 1), ("1e0", 1),
+            ("50", 50), ("50.0", 50), ("5e1", 50),
+            ("0", 1), ("0.0", 1), ("-0.0", 1),
+            ("51", 50), ("51.0", 50),
+            ("18446744073709551615", 50), ("1e100", 50),
+            ("-1", 5), ("-1.0", 5), ("1.5", 5),
+            ("null", 5), (r#""1""#, 5), ("true", 5),
+        ] {
+            let args: Value = serde_json::from_str(&format!(r#"{{"limit":{limit}}}"#)).unwrap();
+            let request = web_search_request("obscura", web_search_limit(&args), None);
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(body["max_results"], json!(expected), "limit={limit}");
+        }
+    }
+
+    #[test]
+    fn web_search_request_is_keyless_unless_a_key_is_set() {
+        let public = web_search_request("rust headless browser", 5, None);
+        assert_eq!(public.url, "https://api.keenable.ai/v1/search/public");
+        assert!(public.headers.contains(&("x-keenable-title", "Obscura".to_string())));
+        assert!(public.headers.iter().all(|(name, _)| *name != "x-api-key"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&public.body).unwrap(),
+            json!({"query": "rust headless browser", "max_results": 5})
+        );
+
+        let keyed = web_search_request("rust", 3, Some("test-key"));
+        assert_eq!(keyed.url, "https://api.keenable.ai/v1/search");
+        assert!(keyed.headers.contains(&("x-api-key", "test-key".to_string())));
+    }
+
+    #[test]
+    fn web_search_results_use_snippet_and_stay_compact() {
+        let long = "word ".repeat(400);
+        let body = json!({"results": [
+            {"title": "  Obscura\n docs ", "url": "https://docs.obscura.sh/", "description": "", "snippet": format!("Line one\n\n{long}")},
+            {"title": "no url", "snippet": "dropped"}
+        ]});
+        let out = format_web_results("obscura", &body);
+        let lines: Vec<Value> = out.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(lines.len(), 1, "{out}");
+        assert_eq!(lines[0]["title"], "Obscura docs");
+        assert_eq!(lines[0]["url"], "https://docs.obscura.sh/");
+        let snippet = lines[0]["snippet"].as_str().unwrap();
+        assert!(snippet.starts_with("Line one word word"), "{snippet}");
+        assert!(snippet.ends_with("..."));
+        assert_eq!(snippet.chars().count(), WEB_SEARCH_SNIPPET_CHARS + 3);
+        assert_eq!(format_web_results("nothing", &json!({"results": []})), "No results for \"nothing\".");
     }
 
     #[tokio::test]
