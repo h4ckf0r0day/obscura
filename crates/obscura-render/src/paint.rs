@@ -1192,6 +1192,40 @@ impl PreparedRender {
         &self.layout
     }
 
+    /// Ordinary in-flow border boxes that should stay on one printed page.
+    /// The PDF exporter slices this continuous layout without mutating it.
+    pub fn print_avoid_ranges(&self, tree: &DomTree) -> Vec<(f32, f32)> {
+        let layout = &self.layout;
+        // Shorter flow slices also shorten the capture viewport. Preserve the
+        // existing fixed/sticky repeat geometry until flow and overlay clips
+        // can be fragmented independently in paint order.
+        if layout.styles.iter().any(|(id, style)| {
+            layout.rects.contains_key(id) && (style.position_fixed || style.position_sticky)
+        }) {
+            return Vec::new();
+        }
+        let mut excluded = std::collections::HashSet::new();
+        let mut ranges = Vec::new();
+        for id in std::iter::once(tree.document()).chain(crate::dom::rendered_descendants(tree, tree.document())) {
+            let inherited = crate::dom::rendered_parent(tree, id).is_some_and(|parent| excluded.contains(&parent));
+            let Some(style) = layout.styles.get(&id) else { continue; };
+            if inherited || style.position.is_some() || style.float.is_some()
+                || !style.transform_ops.is_empty() || style.column_count.is_some_and(|count| count > 1)
+            {
+                excluded.insert(id);
+                continue;
+            }
+            if style.break_inside_avoid_page && style.display != crate::Display::Inline
+                && !style.display_contents
+            {
+                if let Some(rect) = layout.rects.get(&id) {
+                    ranges.push((rect.y, rect.y + rect.height));
+                }
+            }
+        }
+        ranges
+    }
+
     pub fn content_size(&self) -> (f32, f32) {
         self.content_size
     }

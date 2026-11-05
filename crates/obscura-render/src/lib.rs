@@ -1402,6 +1402,8 @@ pub struct LayoutStyle {
     /// explicit and lets the balancing path distinguish authored break
     /// avoidance as finer-grained fragmentation is added.
     pub break_inside_avoid: bool,
+    /// Page fragmentation avoidance, separate from `avoid-column`.
+    pub break_inside_avoid_page: bool,
 
     /// `border-spacing: <horizontal> <vertical>?` (or the `cellspacing`
     /// attribute). Only meaningful on a `<table>`; taffy has no native table

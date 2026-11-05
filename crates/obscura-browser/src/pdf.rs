@@ -189,12 +189,58 @@ fn pagination_plan(
     })
 }
 
+/// Source intervals remain contiguous. A shortened page leaves blank paper,
+/// then the following page resumes at precisely the previous source boundary.
+fn page_slices(content_height: f32, page_height: f32, mut avoid: Vec<(f32, f32)>) -> Result<Vec<(f32, f32)>, RasterPdfError> {
+    avoid.retain(|&(top, bottom)| top.is_finite() && bottom.is_finite()
+        && top >= 0.0 && bottom > top && bottom - top <= page_height);
+    avoid.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    // Nested and overlapping boxes must agree on a boundary. If their union
+    // cannot fit one page, avoidance is unsatisfiable and normal slicing wins.
+    // Merging also prevents a chain of overlapping boxes from causing a
+    // quadratic series of tiny pages on untrusted documents.
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for (top, bottom) in avoid {
+        if let Some(last) = merged.last_mut().filter(|last| top < last.1) {
+            last.1 = last.1.max(bottom);
+        } else {
+            merged.push((top, bottom));
+        }
+    }
+    merged.retain(|&(top, bottom)| bottom - top <= page_height);
+    let mut pages = Vec::new();
+    let mut y = 0.0;
+    while y < content_height {
+        if pages.len() == MAX_PDF_DOCUMENT_PAGES {
+            return Err(RasterPdfError::TooManyPages(MAX_PDF_DOCUMENT_PAGES));
+        }
+        let mut end = (y + page_height).min(content_height);
+        let upper = merged.partition_point(|&(top, _)| top < end);
+        if let Some(&(top, bottom)) = upper.checked_sub(1).map(|index| &merged[index]) {
+            if top > y && bottom > end { end = top; }
+        }
+        if end <= y { return Err(RasterPdfError::RasterWorkLimitExceeded); }
+        pages.push((y, end - y));
+        y = end;
+    }
+    Ok(pages)
+}
+
+#[cfg(test)]
 fn validate_selected_raster_work(
     content_width: f32,
     content_height: f32,
     plan: PaginationPlan,
     selected_pages: &[usize],
 ) -> Result<(), RasterPdfError> {
+    if selected_pages.iter().any(|&page| page >= plan.page_count) {
+        return Err(RasterPdfError::EmptyPageRange);
+    }
+    validate_raster_slices(content_width, selected_pages.iter().map(|&page|
+        (content_height - page as f32 * plan.css_page_height).min(plan.css_page_height)))
+}
+
+fn validate_raster_slices(content_width: f32, heights: impl IntoIterator<Item = f32>) -> Result<(), RasterPdfError> {
     let pixel_width = content_width.ceil();
     if !pixel_width.is_finite()
         || pixel_width <= 0.0
@@ -204,12 +250,8 @@ fn validate_selected_raster_work(
     }
     let pixel_width = pixel_width as u64;
     let mut total_pixels = 0u64;
-    for &page_index in selected_pages {
-        if page_index >= plan.page_count {
-            return Err(RasterPdfError::EmptyPageRange);
-        }
-        let y = page_index as f32 * plan.css_page_height;
-        let slice_height = (content_height - y).min(plan.css_page_height).ceil();
+    for height in heights {
+        let slice_height = height.ceil();
         if !slice_height.is_finite()
             || slice_height <= 0.0
             || slice_height > obscura_js::MAX_CAPTURE_DIMENSION as f32
@@ -356,16 +398,24 @@ impl Page {
                 printable_height,
                 options.scale,
             )?;
-            let selected_pages = selected_page_indices(plan.page_count, &options.page_ranges)?;
-            validate_selected_raster_work(content_width, content_height, plan, &selected_pages)?;
+            let avoid = js.prepared_print_avoid_ranges();
+            let slices = if avoid.is_empty() {
+                (0..plan.page_count).map(|index| {
+                    let y = index as f32 * plan.css_page_height;
+                    (y, (content_height - y).min(plan.css_page_height))
+                }).collect()
+            } else {
+                page_slices(content_height, plan.css_page_height, avoid)?
+            };
+            let selected_pages = selected_page_indices(slices.len(), &options.page_ranges)?;
+            validate_raster_slices(content_width, selected_pages.iter().map(|&page| slices[page].1))?;
 
             if vector_text {
                 return text::encode_pages(
                     selected_pages.len(), (page_width, page_height),
                     (left, bottom + printable_height), plan.points_per_css_pixel,
                     |output_page_index| {
-                        let y = selected_pages[output_page_index] as f32 * plan.css_page_height;
-                        let height = (content_height - y).min(plan.css_page_height);
+                        let (y, height) = slices[selected_pages[output_page_index]];
                         let paint = js.print_prepared_region_at_scroll(
                             CaptureRegion::new(0.0, y, content_width, height, 1.0),
                             (0.0, y), options.print_background,
@@ -383,9 +433,7 @@ impl Page {
                 bottom,
                 printable_height,
                 |output_page_index| {
-                    let page_index = selected_pages[output_page_index];
-                    let y = page_index as f32 * plan.css_page_height;
-                    let slice_height = (content_height - y).min(plan.css_page_height);
+                    let (y, slice_height) = slices[selected_pages[output_page_index]];
                     let png = js
                         .screenshot_prepared_region_at_scroll_with_backgrounds(
                             CaptureRegion::new(0.0, y, content_width, slice_height, 1.0),
@@ -825,6 +873,18 @@ mod tests {
     }
 
     #[test]
+    fn avoid_slices_cover_nested_overlapping_and_oversize_boxes_without_losing_content() {
+        assert_eq!(page_slices(240.0, 100.0, vec![(80.0, 150.0), (90.0, 130.0)]).unwrap(),
+            vec![(0.0, 80.0), (80.0, 100.0), (180.0, 60.0)]);
+        assert_eq!(page_slices(240.0, 100.0, vec![(50.0, 120.0), (100.0, 170.0)]).unwrap(),
+            vec![(0.0, 100.0), (100.0, 100.0), (200.0, 40.0)]);
+        assert_eq!(page_slices(240.0, 100.0, vec![(0.0, 240.0), (20.0, 130.0), (f32::NAN, 99.0)]).unwrap(),
+            vec![(0.0, 100.0), (100.0, 100.0), (200.0, 40.0)]);
+        assert_eq!(page_slices(240.0, 200.0, vec![(80.0, 230.0)]).unwrap(),
+            vec![(0.0, 80.0), (80.0, 160.0)]);
+    }
+
+    #[test]
     fn page_ranges_clip_deduplicate_and_preserve_document_order() {
         assert_eq!(selected_page_indices(4, &[]).unwrap(), vec![0, 1, 2, 3]);
         assert_eq!(
@@ -921,6 +981,47 @@ mod tests {
         let scaled = export(scaled);
         assert!(String::from_utf8_lossy(&scaled).contains("/Count 6"));
         assert_eq!(compact(extract(&scaled)), compact(extract(&pdf)));
+    }
+
+    #[test]
+    fn pdf_keeps_avoid_blocks_and_their_text_on_one_page() {
+        for declaration in ["break-inside:avoid", "page-break-inside:avoid", "break-inside:avoid-page"] {
+            let context = std::sync::Arc::new(crate::BrowserContext::new("pdf-avoid".into()));
+            let mut page = crate::Page::new("pdf-avoid".into(), context);
+            page.set_viewport((200.0, 80.0));
+            let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+            runtime.set_dom(obscura_dom::parse_html(&format!("<html><body style='margin:0;font:16px Arial'>\
+                <div style='height:70px;background:#eeeeee'></div>\
+                <div style='{declaration};height:50px;box-sizing:border-box;border:2px solid #333;padding:3px;background:#00ff00'>\
+                <div>Keep together</div><div>Last row</div></div></body></html>")));
+            runtime.set_url("https://example.test/avoid");
+            runtime.set_viewport(200.0, 80.0);
+            runtime.run_page_init();
+            page.js = Some(runtime);
+            let options = RasterPdfOptions {
+                paper_width_in: 200.0 / POINTS_PER_INCH,
+                paper_height_in: 80.0 / POINTS_PER_INCH,
+                margin_top_in: 0.0, margin_bottom_in: 0.0,
+                margin_left_in: 0.0, margin_right_in: 0.0,
+                print_background: true,
+                ..RasterPdfOptions::default()
+            };
+            let rasters = pdf_page_rasters(&page.raster_pdf(options.clone()).unwrap());
+            assert_eq!(rasters.len(), 2, "{declaration}");
+            assert_eq!(rasters[0].height(), 70, "no part of the avoid box belongs on page one: {declaration}");
+            assert_eq!(rasters[1].height(), 50, "the whole border box belongs on page two: {declaration}");
+            let mut selected = options;
+            selected.page_ranges = vec![RasterPdfPageRange { start: Some(2), end: Some(2) }];
+            let pdf = page.print_pdf_with_animation_sample(selected, page.live_animation_sample()).unwrap();
+            let commands = pdf_page_commands(&pdf);
+            let text = commands.split("/ActualText <FEFF").skip(1).map(|tail| {
+                let units = tail.split('>').next().unwrap().as_bytes().chunks_exact(4)
+                    .map(|chunk| u16::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap())
+                    .collect::<Vec<_>>();
+                String::from_utf16(&units).unwrap()
+            }).collect::<String>();
+            assert_eq!(text.chars().filter(|c| !c.is_whitespace()).collect::<String>(), "KeeptogetherLastrow", "{declaration}");
+        }
     }
 
     #[test]

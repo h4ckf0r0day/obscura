@@ -1876,10 +1876,28 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 .find_map(parse_column_count);
         }
         "break-inside" => {
-            style.break_inside_avoid = matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "avoid" | "avoid-column"
-            );
+            let value = value.trim().to_ascii_lowercase();
+            if matches!(value.as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+                style.break_inside_avoid = false;
+                style.break_inside_avoid_page = false;
+            }
+            if matches!(value.as_str(), "auto" | "avoid" | "avoid-page" | "avoid-column") {
+                style.break_inside_avoid = matches!(value.as_str(), "avoid" | "avoid-column");
+                style.break_inside_avoid_page = matches!(value.as_str(), "avoid" | "avoid-page");
+            }
+        }
+        "page-break-inside" => {
+            // The legacy property aliases break-inside, including resets of
+            // its column meaning, rather than introducing a second cascade.
+            let value = value.trim().to_ascii_lowercase();
+            if matches!(value.as_str(), "initial" | "unset" | "revert" | "revert-layer") {
+                style.break_inside_avoid = false;
+                style.break_inside_avoid_page = false;
+            }
+            if matches!(value.as_str(), "auto" | "avoid") {
+                style.break_inside_avoid = value == "avoid";
+                style.break_inside_avoid_page = value == "avoid";
+            }
         }
         "-webkit-column-break-inside" => {
             style.break_inside_avoid = value.trim().eq_ignore_ascii_case("avoid");
@@ -2262,6 +2280,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "columns"
             | "-webkit-columns"
             | "break-inside"
+            | "page-break-inside"
             | "-webkit-column-break-inside"
             | "border-spacing"
             | "border-collapse"
@@ -3093,7 +3112,8 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "columns" | "-webkit-columns" => split_ws_paren(value)
             .into_iter()
             .any(|token| parse_column_count(token).is_some()),
-        "break-inside" => matches!(lower.as_str(), "auto" | "avoid" | "avoid-column"),
+        "break-inside" => matches!(lower.as_str(), "auto" | "avoid" | "avoid-column" | "avoid-page"),
+        "page-break-inside" => matches!(lower.as_str(), "auto" | "avoid"),
         "-webkit-column-break-inside" => matches!(lower.as_str(), "auto" | "avoid"),
         "grid-auto-flow" => {
             let tokens = lower.split_whitespace().collect::<Vec<_>>();
@@ -9108,9 +9128,32 @@ mod tests {
         let shorthand = compute_style("div", Some("columns: 240px 3; break-inside: avoid-column"));
         assert_eq!(shorthand.column_count, Some(3));
         assert!(shorthand.break_inside_avoid);
+        assert!(!shorthand.break_inside_avoid_page);
 
         let reset = compute_style("div", Some("column-count: 4; columns: auto"));
         assert_eq!(reset.column_count, None);
+    }
+
+    #[test]
+    fn page_break_inside_alias_uses_the_same_cascade_as_break_inside() {
+        for (css, page, column) in [
+            ("break-inside:avoid", true, true),
+            ("break-inside:avoid-page", true, false),
+            ("break-inside:avoid;break-inside:initial", false, false),
+            ("break-inside:avoid;break-inside:unset", false, false),
+            ("break-inside:avoid;page-break-inside:initial", false, false),
+            ("page-break-inside:avoid;page-break-inside:unset", false, false),
+            ("page-break-inside:avoid;break-inside:auto", false, false),
+            ("break-inside:avoid-column;page-break-inside:auto", false, false),
+            ("break-inside:avoid-page;page-break-inside:avoid", true, true),
+            ("page-break-inside:avoid!important;break-inside:auto", true, true),
+            ("break-inside:avoid-column!important;page-break-inside:avoid", false, true),
+            ("page-break-inside:avoid;page-break-inside:avoid-column", true, true),
+        ] {
+            let style = compute_style("div", Some(css));
+            assert_eq!(style.break_inside_avoid_page, page, "{css}");
+            assert_eq!(style.break_inside_avoid, column, "{css}");
+        }
     }
 
     #[test]

@@ -2083,6 +2083,18 @@ impl ObscuraJsRuntime {
         })
     }
 
+    #[cfg(feature = "render")]
+    pub fn prepared_print_avoid_ranges(&self) -> Vec<(f32, f32)> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            if ensure_resolved_scroll(state).is_none() { return Vec::new(); }
+            match (&state.dom, &state.prepared_render) {
+                (Some(dom), Some(render)) => render.print_avoid_ranges(dom),
+                _ => Vec::new(),
+            }
+        })
+    }
+
     /// Return the exact responsive candidates selected for live `<img>`
     /// elements and `<video poster>` resources without loading them. The
     /// browser layer can then fetch them concurrently through the page-owned
@@ -18002,7 +18014,279 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn document_close_load_waits_for_eager_images_but_not_lazy_images() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = two_by_three_png();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Nonblocking accept keeps the fixture bounded even before the fix,
+            // when document.close never requests these unobserved parser images.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                use std::io::{Read as _, Write as _};
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+                let mut request = [0u8; 2048];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                let path = request.split_whitespace().nth(1).unwrap().to_string();
+                let _ = sent.send(path.clone());
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let bytes = if path == "/logo.png" { &png[..] } else { &b"not an image"[..] };
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                let _ = stream.write_all(bytes);
+            }
+        });
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("http://{address}/page.html"));
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.run_page_init();
+        let result = rt.evaluate_for_cdp(&format!(r#"
+            new Promise(resolve => {{
+                document.open();
+                let domSawPending = false;
+                document.addEventListener('DOMContentLoaded', () => {{
+                    domSawPending = document.readyState === 'interactive';
+                }}, {{once:true}});
+                window.addEventListener('load', () => resolve([
+                    domSawPending, document.readyState,
+                    document.getElementById('logo').complete,
+                    document.getElementById('logo').naturalWidth,
+                    document.getElementById('broken').complete,
+                    document.getElementById('broken').naturalWidth,
+                ]), {{once:true}});
+                document.write('<img id="logo" style="max-width:300px;max-height:70px" src="http://{address}/logo.png"><img id="broken" src="http://{address}/broken.png"><img loading="LAZY" src="http://{address}/lazy.png">');
+                document.close();
+                setTimeout(() => resolve('timed out'), 2000);
+            }})
+        "#), true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([true, "complete", true, 2, true, 0]));
+        let mut paths = received.try_iter().collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, ["/broken.png", "/logo.png"]);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_replacement_cancels_images_waiting_for_a_resource_permit() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("http://127.0.0.1:9/");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.state.borrow_mut().render_resource_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        rt.run_page_init();
+        let result = rt.evaluate_for_cdp(r#"
+            new Promise(resolve => {
+                document.open();
+                document.write('<img src="pending.png">');
+                document.close();
+                window.addEventListener('load', () => resolve(document.body.textContent), {once:true});
+                setTimeout(() => {
+                    document.open(); document.write('<body>replacement</body>'); document.close();
+                }, 20);
+                setTimeout(() => resolve('timed out'), 1000);
+            })
+        "#, true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!("replacement"));
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert!(rt.state.borrow().render_image_in_flight.is_empty());
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_close_same_url_replacement_keeps_the_new_image_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = two_by_three_png();
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    use std::io::{Read as _, Write as _};
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                    let _ = stream.write_all(&png);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&format!("http://{address}/"));
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        rt.state.borrow_mut().render_resource_limiter = limiter.clone();
+        rt.run_page_init();
+        let replace = "document.open();document.write('<img src=\"same.png\">');document.close();";
+        rt.execute_script("old-image", replace).unwrap();
+        rt.run_event_loop_bounded(30).await.unwrap();
+        assert_eq!(rt.state.borrow().render_image_in_flight.len(), 1);
+        let generation = rt.state.borrow().document_generation;
+        rt.execute_script("new-image", replace).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.state.borrow().document_generation, generation, "document.open must preserve unrelated browser tasks");
+        assert_eq!(rt.state.borrow().render_image_in_flight.len(), 1, "canceled leaders must not remove or restart a replacement request");
+        limiter.add_permits(1);
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(rt.evaluate("[document.readyState,document.images[0].naturalWidth]").unwrap(),
+            serde_json::json!(["complete", 2]));
+        assert!(rt.state.borrow().render_image_in_flight.is_empty());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn print_avoid_ranges_preserve_overlay_geometry_and_use_print_media() {
+        for (extra, expected) in [
+            ("", true),
+            ("<aside style='position:fixed;bottom:0'>footer</aside>", false),
+            ("<aside style='position:sticky;top:0'>header</aside>", false),
+            ("<style>@media print{aside{display:none}}</style><aside style='position:fixed;bottom:0'>footer</aside>", true),
+        ] {
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(parse_html(&format!("<html><body><div style='height:70px'></div><div style='height:50px;break-inside:avoid'>keep</div>{extra}</body></html>")));
+            rt.set_viewport(200.0, 80.0);
+            rt.run_page_init();
+            rt.set_render_media(crate::CssMediaType::Print);
+            assert_eq!(!rt.prepared_print_avoid_ranges().is_empty(), expected, "{extra}");
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_images_own_their_lifecycle_origin_and_cancellation_but_share_the_page_budget() {
+        use base64::Engine as _;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let running = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_running = running.clone();
+        let server_requests = requests.clone();
+        let png = two_by_three_png();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut workers = Vec::new();
+            while server_running.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let running = server_running.clone();
+                    let requests = server_requests.clone();
+                    let png = png.clone();
+                    workers.push(std::thread::spawn(move || {
+                        use std::io::{Read as _, Write as _};
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+                        let mut bytes = [0u8; 4096];
+                        let n = stream.read(&mut bytes).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&bytes[..n]).to_string();
+                        let image = request.starts_with("GET /image.png ");
+                        requests.lock().unwrap().push(request);
+                        if image {
+                            // No CORS headers: the child's inherited origin must
+                            // make anonymous CORS a same-origin credentialed load.
+                            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                            let _ = stream.write_all(&png);
+                        } else {
+                            while running.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                        }
+                    }));
+                } else { std::thread::sleep(std::time::Duration::from_millis(5)); }
+            }
+            for worker in workers { worker.join().unwrap(); }
+        });
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(&format!("<html><body><img><img><img><img id='parentImage' src='{base}/parent.png'></body></html>")));
+        rt.set_url(&format!("{base}/page.html"));
+        let jar = Arc::new(obscura_net::CookieJar::new());
+        jar.set_cookie("frame_cookie=yes; Path=/", &url::Url::parse(&base).unwrap());
+        rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(jar, None, true)));
+        let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+        rt.state.borrow_mut().render_resource_limiter = limiter.clone();
+        rt.run_page_init();
+        let data = base64::engine::general_purpose::STANDARD.encode(two_by_three_png());
+        let result = rt.evaluate_for_cdp(&format!(r#"
+            new Promise(resolve => {{
+                void document.getElementById('parentImage').complete;
+                globalThis.imageFrame = document.createElement('iframe');
+                document.body.appendChild(imageFrame);
+                const child = imageFrame.contentDocument;
+                child.open();
+                imageFrame.contentWindow.addEventListener('load', () => resolve([
+                    child.readyState, child.images[0].naturalWidth,
+                    document.getElementById('parentImage').complete,
+                ]), {{once:true}});
+                child.write('<img src="data:image/png;base64,{data}">'); child.close();
+                setTimeout(() => resolve('timed out'), 1000);
+            }})
+        "#), true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!(["complete", 2, false]));
+        rt.run_event_loop_bounded(30).await.unwrap();
+        assert_eq!(rt.state.borrow().render_image_in_flight.len(), 1);
+        let result = rt.evaluate_for_cdp(&format!(r#"
+            new Promise(resolve => {{
+                const child = imageFrame.contentDocument; child.open();
+                child.write('<img crossorigin="anonymous" src="{base}/image.png">'); child.close();
+                // Repeated-close WindowProxy load forwarding is separate from
+                // the child's own lifecycle. Observe the actual document state.
+                const check = () => {{
+                    if (child.readyState === 'complete') resolve(child.images[0].naturalWidth);
+                    else setTimeout(check, 1);
+                }};
+                check();
+                setTimeout(() => resolve(['timed out', child.readyState, child.images[0].complete, child.images[0].naturalWidth]), 1000);
+            }})
+        "#), true, true).await.unwrap();
+        assert_eq!(result.value.as_ref().and_then(serde_json::Value::as_f64), Some(2.0),
+            "result={:?}, permits={}, requests={:?}", result.value, limiter.available_permits(), requests.lock().unwrap());
+        assert!(requests.lock().unwrap().iter().any(|request|
+            request.starts_with("GET /image.png ") && request.to_ascii_lowercase().contains("cookie: frame_cookie=yes")));
+        rt.execute_script("pending-child-image", &format!(r#"
+            imageFrame.contentDocument.open();
+            imageFrame.contentDocument.write('<img src="{base}/child.png"><img src="{base}/child.png">');
+            imageFrame.contentDocument.close();
+        "#)).unwrap();
+        rt.run_event_loop_bounded(50).await.unwrap();
+        assert_eq!(limiter.available_permits(), 0, "parent and child must share the page limiter");
+        rt.execute_script("remove-pending-image-frame", "imageFrame.remove();").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(limiter.available_permits(), 1, "retiring a frame releases its leader and follower operations");
+        assert_eq!(rt.state.borrow().render_image_in_flight.len(), 1, "child reset/retirement must not cancel the parent image");
+        assert_eq!(rt.state.borrow().page_in_flight.load(Ordering::Relaxed), 1);
+        running.store(false, Ordering::SeqCst);
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn parser_images_load_concurrently_without_blocking_the_event_loop() {
+        parser_image_concurrency(crate::ops::RENDER_RESOURCE_CONCURRENCY).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_requests_share_the_page_resource_limit() {
+        parser_image_concurrency(2).await;
+    }
+
+    #[cfg(feature = "render")]
+    async fn parser_image_concurrency(limit: usize) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -18047,6 +18331,7 @@ mod tests {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(&html));
         rt.set_url(&format!("{base}/page.html"));
+        rt.state.borrow_mut().render_resource_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
         rt.set_http_client(std::sync::Arc::new(
             obscura_net::ObscuraHttpClient::with_full_options(
                 std::sync::Arc::new(obscura_net::CookieJar::new()),
@@ -18104,9 +18389,11 @@ mod tests {
             "two elements selecting one URL must share a single request"
         );
         assert!(
-            max_active.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            max_active.load(std::sync::atomic::Ordering::SeqCst) >= limit.min(3),
             "slow image requests did not overlap"
         );
+        assert!(max_active.load(std::sync::atomic::Ordering::SeqCst) <= limit,
+            "image requests must share the page resource limit");
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "four 150ms image requests serialized: {elapsed:?}"

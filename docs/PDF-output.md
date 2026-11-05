@@ -12,6 +12,14 @@ Pagination, page ranges, paper size, margins, scale, print media and
 Images and unsupported paint remain raster content in their original paint
 order. Both base64 and stream transfer modes are supported.
 
+Ordinary in-flow blocks with `break-inside: avoid`, `break-inside: avoid-page`
+or `page-break-inside: avoid` move to the next page when they fit there. Taller
+blocks still split. This uses continuous-layout slices, so avoidance is disabled
+for documents with rendered fixed or sticky boxes. Positioned, floated,
+transformed and multicolumn subtrees also retain the existing slicing behavior.
+Unused paper below a shortened slice stays white rather than extending CSS
+backgrounds into the gap.
+
 The first vector-text path covers ordinary inline formatting contexts with
 opaque solid text and standalone static TrueType outlines. Text inside atomic
 stacking contexts, floats, transforms or opacity groups remains raster.
