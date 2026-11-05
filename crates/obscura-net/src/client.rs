@@ -206,6 +206,14 @@ pub struct ResourceRequest {
 }
 
 impl ResourceRequest {
+    pub fn navigation_from_document(initiator: &Url) -> Self {
+        Self {
+            initiator: Some(initiator.clone()),
+            referrer: Some(initiator.clone()),
+            ..Self::navigation()
+        }
+    }
+
     pub fn navigation() -> Self {
         Self {
             resource_type: ResourceType::Document,
@@ -1164,6 +1172,19 @@ impl ObscuraHttpClient {
             .await
     }
 
+    /// A form submission retains its owning document through HTTP redirects.
+    pub async fn post_form_from_document_with_callbacks(
+        &self,
+        url: &Url,
+        body: &str,
+        initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let request = initiator.map(ResourceRequest::navigation_from_document)
+            .unwrap_or_else(ResourceRequest::navigation);
+        self.fetch_with_profile(Method::POST, url, Some(body.as_bytes().to_vec()), callbacks, request).await
+    }
+
     pub async fn fetch_with_method(
         &self,
         initial_method: Method,
@@ -1514,7 +1535,7 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
+                HeaderValue::from_static(if redirect_tainted && request.initiator.is_some() { "cross-site" } else { request_fetch_site(&request, &current_url) }),
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-mode"),
@@ -1594,8 +1615,12 @@ impl ObscuraHttpClient {
             }
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
-            if cors_required(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&request_origin) {
+            let document_post = request.mode == RequestMode::Navigate
+                && !matches!(method, Method::GET | Method::HEAD) && request.initiator.is_some();
+            if cors_required(&request, &current_url) || document_post {
+                let origin = if document_post && request.initiator.as_ref().is_some_and(|source|
+                    source.scheme() == "https" && current_url.scheme() == "http") { "null" } else { &request_origin };
+                if let Ok(value) = HeaderValue::from_str(origin) {
                     headers.insert(reqwest::header::ORIGIN, value);
                 }
             } else {
@@ -2176,6 +2201,101 @@ mod ssrf_tests {
             "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn form_navigation_same_origin_metadata_and_direct_navigation() {
+        let (target, mut received) = http_fixture(vec![ok_response("", "posted"), ok_response("", "direct")]).await;
+        let source = target.join("/source?keep=1#fragment").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("confirm=fixture; Path=/; SameSite=Strict", &source);
+        let client = ObscuraHttpClient::with_full_options(jar, None, true);
+        let response = client.post_form_from_document_with_callbacks(&target, "confirm=a%2Bb&name=fixture", Some(&source), None).await.unwrap();
+        assert_eq!(response.body, b"posted");
+        let request = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /resource http/1.1"));
+        assert!(request.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(request.contains("sec-fetch-mode: navigate\r\n"));
+        assert!(request.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        assert!(request.contains(&format!("referer: {}source?keep=1\r\n", source.origin().ascii_serialization() + "/")));
+        assert!(request.contains("cookie: confirm=fixture\r\n"));
+        assert!(request.contains("content-type: application/x-www-form-urlencoded\r\n"));
+        client.fetch(&target).await.unwrap();
+        let direct = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(direct.contains("sec-fetch-site: none\r\n"));
+        assert!(!direct.contains("\r\norigin:"));
+        assert!(!direct.contains("\r\nreferer:"));
+    }
+
+    #[tokio::test]
+    async fn form_navigation_cross_origin_redirect_preserves_post_and_downgrade_policy() {
+        let (target, mut received) = http_fixture(vec![
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            ok_response("", "arrived"),
+        ]).await;
+        let source = Url::parse("https://source.example/form?private=1").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("strict=private; Path=/; SameSite=Strict", &target);
+        jar.set_cookie("lax=private; Path=/; SameSite=Lax", &target);
+        let client = ObscuraHttpClient::with_full_options(jar, None, true);
+        client.post_form_from_document_with_callbacks(&target, "field=unchanged", Some(&source), None).await.unwrap();
+        for _ in 0..2 {
+            let request = received.recv().await.unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("post "));
+            assert!(request.contains("sec-fetch-site: cross-site\r\n"));
+            // HTTPS to HTTP must not disclose either the Origin or Referer.
+            assert!(request.contains("origin: null\r\n"));
+            assert!(!request.contains("\r\nreferer:"));
+            assert!(!request.contains("\r\ncookie:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn form_navigation_cross_origin_redirect_back_taints_origin_and_site() {
+        let (final_target, mut final_received) = http_fixture(vec![ok_response("", "arrived")]).await;
+        let redirect = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {final_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (other_origin, mut other_received) = http_fixture(vec![redirect]).await;
+        let source = final_target.join("/form").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        client.post_form_from_document_with_callbacks(&other_origin, "field=unchanged", Some(&source), None).await.unwrap();
+        let first = other_received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(first.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        assert!(first.contains("sec-fetch-site: cross-site\r\n"));
+        let returned = final_received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(returned.starts_with("post "));
+        assert!(returned.contains("origin: null\r\n"));
+        assert!(returned.contains("sec-fetch-site: cross-site\r\n"));
+    }
+
+    #[tokio::test]
+    async fn form_navigation_direct_cross_origin_redirect_still_has_no_initiator() {
+        let (target, mut final_received) = http_fixture(vec![ok_response("", "arrived")]).await;
+        let redirect = format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (initial, mut initial_received) = http_fixture(vec![redirect]).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        client.fetch(&initial).await.unwrap();
+        for request in [initial_received.recv().await.unwrap(), final_received.recv().await.unwrap()] {
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains("sec-fetch-site: none\r\n"));
+            assert!(!request.contains("\r\norigin:"));
+            assert!(!request.contains("\r\nreferer:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn form_navigation_post_redirect_to_get_removes_origin() {
+        let (target, mut received) = http_fixture(vec![redirect_to_self(), ok_response("", "arrived")]).await;
+        let source = target.join("/form").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        client.post_form_from_document_with_callbacks(&target, "field=unchanged", Some(&source), None).await.unwrap();
+        let post = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(post.starts_with("post "));
+        assert!(post.contains("sec-fetch-site: same-origin\r\n"));
+        let get = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(get.starts_with("get "));
+        assert!(get.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(!get.contains("\r\norigin:"));
+        assert!(!get.contains("\r\ncontent-type:"));
     }
 
     fn redirect_to_self() -> String {

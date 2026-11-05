@@ -3165,7 +3165,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
         )
         .await
         {
@@ -3441,6 +3441,7 @@ impl Page {
         method: &str,
         body: &str,
         initial_referrer: &str,
+        initial_initiator: Option<&Url>,
     ) -> Result<(), PageError> {
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
@@ -3458,6 +3459,7 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
+        let mut document_initiator = initial_initiator.cloned();
         let chain_limit = self.navigation_chain_limit();
         for chain in 0..chain_limit {
             self.navigate_single(
@@ -3466,6 +3468,7 @@ impl Page {
                 &current_method,
                 &current_body,
                 &document_referrer,
+                document_initiator.as_ref(),
                 deadline,
             )
             .await?;
@@ -3490,6 +3493,7 @@ impl Page {
                     current_url,
                     next_url
                 );
+                document_initiator = self.url.clone();
                 document_referrer = self
                     .url
                     .as_ref()
@@ -3523,6 +3527,7 @@ impl Page {
         method: &str,
         body: &str,
         referrer: &str,
+        initiator: Option<&Url>,
         deadline: tokio::time::Instant,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
@@ -3620,7 +3625,7 @@ impl Page {
             })
         } else if method == "POST" {
             self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
+                .post_form_from_document_with_callbacks(&url, body, initiator, Some(&self.callbacks))
                 .await
         } else {
             self.do_fetch(&url).await
@@ -5151,7 +5156,8 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
-        let source_url = self.url.as_ref().and_then(|source| {
+        let initiator = self.url.clone();
+        let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
         let nav_timeout = self.navigation_timeout();
@@ -5159,7 +5165,7 @@ impl Page {
         tokio::time::timeout(
             nav_timeout,
             self.navigate_with_wait_post_inner(
-                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url,
+                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
             ),
         ).await.map_err(|_| {
             self.lifecycle = crate::lifecycle::LifecycleState::Failed;
@@ -6019,6 +6025,69 @@ mod tests {
 
         let data_source = url::Url::parse("data:text/html,source").unwrap();
         assert_eq!(navigation_referrer(&data_source, &cross_origin), "");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_native_submit_preserves_document_metadata_fields_and_cookies() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let length = headers.lines().find_map(|line| line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                        if bytes.len() >= end + 4 + length { break; }
+                    }
+                }
+                tx.send(String::from_utf8(bytes).unwrap()).unwrap();
+                let response = if index == 0 {
+                    let body = "<form id='login' method='POST' action='/submit'><input name='confirm' value='token+value'><input name='same' value='first'><input name='same' value='second'></form><script>document.getElementById('login').submit()</script>";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: confirm=fixture; Path=/; SameSite=Strict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else if index == 1 {
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "form-origin".to_string(), None, false, None, None, true));
+        let mut page = super::Page::new("form-origin".to_string(), context);
+        let origin = format!("http://{address}");
+        page.navigate(&format!("{origin}/source?keep=1")).await.unwrap();
+        assert_eq!(page.url_string(), format!("{origin}/final"));
+        page.navigate(&format!("{origin}/direct")).await.unwrap();
+        server.join().unwrap();
+        let requests: Vec<String> = rx.try_iter().collect();
+        assert_eq!(requests.len(), 4);
+        for request in &requests[1..3] {
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.starts_with("post "));
+            assert!(headers.contains("sec-fetch-site: same-origin\r\n"));
+            assert!(headers.contains(&format!("origin: {origin}\r\n")));
+            assert!(headers.contains(&format!("referer: {origin}/source?keep=1\r\n")));
+            assert!(headers.contains("cookie: confirm=fixture"));
+            let fields: Vec<_> = url::form_urlencoded::parse(body.as_bytes()).map(|(k,v)| (k.into_owned(),v.into_owned())).collect();
+            assert_eq!(fields, vec![("confirm".into(),"token+value".into()),("same".into(),"first".into()),("same".into(),"second".into())]);
+        }
+        let direct = requests[3].to_ascii_lowercase();
+        assert!(direct.starts_with("get /direct "));
+        assert!(direct.contains("sec-fetch-site: none\r\n"));
+        assert!(!direct.contains("\r\norigin:"));
+        assert!(!direct.contains("\r\nreferer:"));
     }
 
     #[tokio::test(flavor = "current_thread")]
