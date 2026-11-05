@@ -60,6 +60,15 @@ async fn main() {
                                 };
                                 let _ = cp.update_job_fencing_token(dispatch.job_id, dispatch.tenant_id, fencing_token).await;
 
+                                // Pick a worker to track for cancellation
+                                let worker = match supervisor.pick_least_loaded() {
+                                    Ok(w) => w,
+                                    Err(_) => {
+                                        let _ = msg.ack().await;
+                                        continue;
+                                    }
+                                };
+
                                 // ensure session exists
                                 let create_req = WorkerRequest {
                                     id: Some(format!("create-{}", dispatch.dispatch_id)),
@@ -69,7 +78,7 @@ async fn main() {
                                         config: SessionConfig::default(),
                                     },
                                 };
-                                let _ = supervisor.dispatch(create_req).await;
+                                let _ = worker.send_request(create_req, std::time::Duration::from_secs(10)).await;
 
                                 let req = WorkerRequest {
                                     id: Some(dispatch.dispatch_id.to_string()),
@@ -97,10 +106,10 @@ async fn main() {
 
                                 let principal = cp.service_principal("worker-agent", &std::env::var("OBSCURA_SERVICE_BOOTSTRAP_SECRET").unwrap_or_default()).unwrap();
                                 // Execute browser with select against lease loss
-                                let exec_future = supervisor.dispatch(req);
+                                let worker_clone = worker.clone();
+                                let exec_future = worker_clone.send_request(req, std::time::Duration::from_secs(35));
                                 tokio::select! {
                                     resp = exec_future => {
-                                        // cancel renewal
                                         renew_handle.abort();
                                         match resp {
                                             Ok(r) if r.ok => {
@@ -113,9 +122,11 @@ async fn main() {
                                     }
                                     _ = &mut loss_rx => {
                                         renew_handle.abort();
+                                        // Kill the child process
+                                        let _ = worker_clone.kill().await;
                                         // ownership lost: fail job, don't persist success
                                         let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "LEASE_LOST", "ownership lost", true).await;
-                                        tracing::warn!(job_id = %dispatch.job_id, "lease lost during execution");
+                                        tracing::warn!(job_id = %dispatch.job_id, "lease lost during execution; child killed");
                                     }
                                 }
                             }
