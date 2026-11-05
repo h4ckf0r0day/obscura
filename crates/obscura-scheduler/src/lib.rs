@@ -27,6 +27,7 @@ pub struct DispatchMessage {
     pub tenant_id: Uuid,
     pub attempt_id: Uuid,
     pub worker_id: Uuid,
+    pub fencing_token: i64,
     pub url: String,
     pub operation: String,
     pub correlation_id: Option<Uuid>,
@@ -97,7 +98,7 @@ impl Scheduler {
         let dispatch_id = Uuid::new_v4();
         let attempt_id = Uuid::new_v4();
 
-        self.control
+        let fencing_token = self.control
             .mark_dispatched(job.job_id, job.tenant_id, worker.worker_id, dispatch_id, attempt_id)
             .await?;
 
@@ -108,6 +109,7 @@ impl Scheduler {
             tenant_id: job.tenant_id,
             attempt_id,
             worker_id: worker.worker_id,
+            fencing_token,
             url: job.url.clone(),
             operation: job.operation.clone(),
             correlation_id: None,
@@ -140,14 +142,14 @@ impl Scheduler {
     }
 
     /// Handle job completion reported by worker.
-    pub async fn handle_completion(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, result: serde_json::Value) -> Result<()> {
-        self.control.complete_job(job_id, tenant_id, attempt_id, result).await?;
+    pub async fn handle_completion(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, result: serde_json::Value) -> Result<()> {
+        self.control.complete_job(job_id, tenant_id, attempt_id, fencing_token, result).await?;
         Ok(())
     }
 
     /// Handle job failure.
-    pub async fn handle_failure(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, code: &str, msg: &str, retryable: bool) -> Result<()> {
-        self.control.fail_job(job_id, tenant_id, attempt_id, code, msg, retryable).await?;
+    pub async fn handle_failure(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, code: &str, msg: &str, retryable: bool) -> Result<()> {
+        self.control.fail_job(job_id, tenant_id, attempt_id, fencing_token, code, msg, retryable).await?;
         Ok(())
     }
 
@@ -288,7 +290,7 @@ mod tests {
         let job2 = cp.submit_job(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("fail1"), 3).await.unwrap();
         sched.schedule_one().await.unwrap();
         let j2 = cp.get_job(job2.job_id, tenant.tenant_id).await.unwrap();
-        sched.handle_failure(j2.job_id, tenant.tenant_id, j2.execution_attempt_id.unwrap(), "ERR", "boom", false).await.unwrap();
+        sched.handle_failure(j2.job_id, tenant.tenant_id, j2.execution_attempt_id.unwrap(), j2.fencing_token, "ERR", "boom", false).await.unwrap();
         let j2f = cp.get_job(job2.job_id, tenant.tenant_id).await.unwrap();
         assert_eq!(j2f.status, "failed");
     }

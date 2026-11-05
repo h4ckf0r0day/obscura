@@ -73,13 +73,12 @@ async fn main() {
                                 };
                                 let _ = supervisor.dispatch(create_req).await;
                                 let resp = supervisor.dispatch(req).await;
-                                // report result
                                 match resp {
                                     Ok(r) if r.ok => {
-                                        cp.complete_job(dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, r.result.unwrap_or(serde_json::json!({}))).await.ok();
+                                        cp.complete_job(dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, r.result.unwrap_or(serde_json::json!({}))).await.ok();
                                     }
                                     _ => {
-                                        cp.fail_job(dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, "EXEC_ERROR", "execution failed", true).await.ok();
+                                        cp.fail_job(dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, dispatch.fencing_token, "EXEC_ERROR", "execution failed", true).await.ok();
                                     }
                                 }
                             }

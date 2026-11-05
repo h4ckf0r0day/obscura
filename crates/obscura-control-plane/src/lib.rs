@@ -732,14 +732,17 @@ impl ControlPlane {
         Ok(job)
     }
 
-    pub async fn mark_dispatched(&self, job_id: Uuid, tenant_id: Uuid, worker_id: Uuid, dispatch_id: Uuid, attempt_id: Uuid) -> Result<()> {
+    pub async fn mark_dispatched(&self, job_id: Uuid, tenant_id: Uuid, worker_id: Uuid, dispatch_id: Uuid, attempt_id: Uuid) -> Result<i64> {
         let mut tx = self.pool().begin().await?;
+        let token: i64 = sqlx::query_scalar("SELECT nextval('fencing_token_seq')")
+            .fetch_one(&mut *tx).await?;
         sqlx::query(
-            "UPDATE jobs SET status='dispatched', worker_id=$1, dispatch_id=$2, execution_attempt_id=$3, attempt_count=attempt_count+1, updated_at=now() WHERE job_id=$4 AND tenant_id=$5 AND status='scheduled'",
+            "UPDATE jobs SET status='dispatched', worker_id=$1, dispatch_id=$2, execution_attempt_id=$3, fencing_token=$4, attempt_count=attempt_count+1, updated_at=now() WHERE job_id=$5 AND tenant_id=$6 AND status='scheduled'",
         )
         .bind(worker_id)
         .bind(dispatch_id)
         .bind(attempt_id)
+        .bind(token)
         .bind(job_id)
         .bind(tenant_id)
         .execute(&mut *tx)
@@ -749,15 +752,16 @@ impl ControlPlane {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "INSERT INTO job_attempts (attempt_id, job_id, worker_id, fencing_token, status) VALUES ($1,$2,$3,0,'dispatched')",
+            "INSERT INTO job_attempts (attempt_id, job_id, worker_id, fencing_token, status) VALUES ($1,$2,$3,$4,'dispatched')",
         )
         .bind(attempt_id)
         .bind(job_id)
         .bind(worker_id)
+        .bind(token)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(token)
     }
 
     pub async fn mark_running(&self, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
@@ -766,8 +770,16 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub async fn complete_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, result: serde_json::Value) -> Result<()> {
+    pub async fn complete_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, result: serde_json::Value) -> Result<()> {
         let mut tx = self.pool().begin().await?;
+        // validate fencing token
+        let row = sqlx::query("SELECT fencing_token FROM jobs WHERE job_id=$1 AND tenant_id=$2 FOR UPDATE")
+            .bind(job_id).bind(tenant_id).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| ControlPlaneError::NotFound(job_id.to_string()))?;
+        let current: i64 = row.get("fencing_token");
+        if current != fencing_token {
+            return Err(ControlPlaneError::Conflict("stale fencing token".into()));
+        }
         sqlx::query("UPDATE jobs SET status='completed', updated_at=now(), completed_at=now() WHERE job_id=$1 AND tenant_id=$2")
             .bind(job_id).bind(tenant_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE job_attempts SET status='completed', finished_at=now() WHERE attempt_id=$1")
@@ -781,8 +793,15 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub async fn fail_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, error_code: &str, error_message: &str, retryable: bool) -> Result<()> {
+    pub async fn fail_job(&self, job_id: Uuid, tenant_id: Uuid, attempt_id: Uuid, fencing_token: i64, error_code: &str, error_message: &str, retryable: bool) -> Result<()> {
         let mut tx = self.pool().begin().await?;
+        let row = sqlx::query("SELECT fencing_token FROM jobs WHERE job_id=$1 AND tenant_id=$2 FOR UPDATE")
+            .bind(job_id).bind(tenant_id).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| ControlPlaneError::NotFound(job_id.to_string()))?;
+        let current: i64 = row.get("fencing_token");
+        if current != fencing_token {
+            return Err(ControlPlaneError::Conflict("stale fencing token".into()));
+        }
         // get attempt count
         let row = sqlx::query("SELECT attempt_count, max_attempts FROM jobs WHERE job_id=$1 AND tenant_id=$2")
             .bind(job_id).bind(tenant_id).fetch_one(&mut *tx).await?;
