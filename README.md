@@ -101,7 +101,8 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       Unique free tools: Proxy Bandwidth Checker, Meta Tag Checker, IP Lookup and others!<br><br>
       🎁 <b>Special codes for Obscura users:</b><br>
       <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
-      <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies
+      <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies <br>
+      <b>OBSCURA2X</b> - 2X traffic for Black Friday
     </td>
 </table>
 
