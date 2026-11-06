@@ -678,6 +678,15 @@ impl ControlPlane {
         }
         Ok(())
     }
+    pub async fn expire_stale_workers(&self, threshold_secs: i64) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "UPDATE workers SET status = 'unavailable' WHERE status = 'healthy' AND last_heartbeat_at < now() - ($1 || ' seconds')::interval RETURNING worker_id",
+        )
+        .bind(threshold_secs)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("worker_id")).collect())
+    }
 
     pub async fn list_healthy_workers(&self, tenant_id: Option<Uuid>) -> Result<Vec<WorkerRecord>> {
         let rows = sqlx::query(
@@ -838,6 +847,14 @@ impl ControlPlane {
             "UPDATE workers SET active_jobs = COALESCE((
                 SELECT COUNT(*) FROM jobs WHERE jobs.worker_id = workers.worker_id AND jobs.status IN ('dispatched','running')
             ), 0)"
+        ).execute(self.pool()).await?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn recover_abandoned_executions(&self) -> Result<u64> {
+        // Reclaim jobs assigned to unavailable workers with expired leases
+        let res = sqlx::query(
+            "UPDATE jobs SET status = 'pending', updated_at = now()              WHERE status IN ('dispatched', 'running')              AND worker_id IN (SELECT worker_id FROM workers WHERE status = 'unavailable')              AND (lease_id IS NULL OR lease_id NOT IN (SELECT lease_id FROM session_leases WHERE expires_at > now()))"
         ).execute(self.pool()).await?;
         Ok(res.rows_affected())
     }
