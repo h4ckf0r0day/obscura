@@ -975,7 +975,20 @@ impl ResourceCache {
     }
 }
 
-fn response_cache_lifetime(response: &Response) -> Option<Duration> {
+fn response_cache_lifetime(response: &Response, response_delay: Duration) -> Option<Duration> {
+    response_cache_lifetime_with_clock(response, response_delay, || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|time| time.as_secs())
+    })
+}
+
+fn response_cache_lifetime_with_clock(
+    response: &Response,
+    response_delay: Duration,
+    now: impl FnOnce() -> Option<u64>,
+) -> Option<Duration> {
     if !(200..300).contains(&response.status)
         || !response.redirected_from.is_empty()
         || response.header("set-cookie").is_some()
@@ -985,20 +998,71 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
     {
         return None;
     }
-    let cache_control = response.header("cache-control")?;
-    let mut max_age = None;
-    for directive in cache_control.split(',').map(str::trim) {
-        let lower = directive.to_ascii_lowercase();
-        if lower == "no-store" || lower == "no-cache" {
-            return None;
+    if let Some(cache_control) = response.header("cache-control") {
+        let mut max_age = None;
+        for directive in cache_control.split(',').map(str::trim) {
+            let (name, value) = match directive.split_once('=') {
+                Some((name, value)) => (name.trim(), Some(value.trim())),
+                None => (directive, None),
+            };
+            if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
+                // Qualified no-cache would require stripping or validating fields.
+                return None;
+            }
+            if name.eq_ignore_ascii_case("max-age") {
+                let value = value?;
+                let value = if value.starts_with('"') { value.strip_prefix('"')?.strip_suffix('"')? } else { value };
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let seconds = value.parse::<u64>().ok()?;
+                // Invalid or repeated explicit freshness must not enable heuristics.
+                if max_age.replace(seconds).is_some() {
+                    return None;
+                }
+            }
         }
-        if let Some(value) = lower.strip_prefix("max-age=") {
-            max_age = value.trim_matches('"').parse::<u64>().ok();
+        if let Some(seconds) = max_age {
+            return (seconds > 0).then(|| Duration::from_secs(seconds));
         }
     }
-    max_age
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
+    heuristic_cache_lifetime(response, now()?, response_delay)
+}
+
+/// Upper bound for a heuristic lifetime, so a file last changed years ago is
+/// still re-checked at least daily.
+const HEURISTIC_FRESHNESS_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// RFC 9111 4.2.2: with no explicit expiry a cache may assign a heuristic
+/// freshness lifetime. Browsers use 10% of the time since Last-Modified, so
+/// servers that send only Last-Modified for static files (common on older
+/// stacks) do not get every script re-downloaded on each navigation.
+fn heuristic_cache_lifetime(response: &Response, now: u64, response_delay: Duration) -> Option<Duration> {
+    // Heuristically cacheable 2xx codes (RFC 9110 15.1).
+    if !matches!(response.status, 200 | 203 | 204 | 206) {
+        return None;
+    }
+    // An explicit Expires is not evaluated here; stay uncached rather than
+    // second-guess it with a heuristic.
+    if response.header("expires").is_some() {
+        return None;
+    }
+    let last_modified = crate::cookies::parse_http_date(response.header("last-modified")?).ok()?;
+    // An unparsed Date must not make an old response look newly generated.
+    let date = match response.header("date") {
+        Some(value) => crate::cookies::parse_http_date(value).ok()?,
+        None => now,
+    };
+    let lifetime = Duration::from_secs(date.checked_sub(last_modified)? / 10).min(HEURISTIC_FRESHNESS_CAP);
+    // Freshness is measured from origin generation/validation, not cache insertion.
+    let age = match response.header("age") {
+        Some(value) => value.parse::<u64>().ok()?,
+        None => 0,
+    };
+    let current_age = Duration::from_secs(now.saturating_sub(date))
+        .max(Duration::from_secs(age).checked_add(response_delay)?);
+    let lifetime = lifetime.checked_sub(current_age)?;
+    (!lifetime.is_zero()).then_some(lifetime)
 }
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
@@ -1340,6 +1404,7 @@ impl ObscuraHttpClient {
                     sender,
                     finished: false,
                 };
+                let request_started = Instant::now();
                 let result = self
                     .fetch_with_profile_uncached(
                         initial_method,
@@ -1350,7 +1415,7 @@ impl ObscuraHttpClient {
                     )
                     .await;
                 let shared_outcome = match &result {
-                    Ok(response) => match response_cache_lifetime(response) {
+                    Ok(response) => match response_cache_lifetime(response, request_started.elapsed()) {
                         Some(lifetime) => {
                             self.resource_loader.lock().unwrap().cache.insert(
                                 cache_key,
@@ -1774,6 +1839,7 @@ pub enum ObscuraNetError {
 mod resource_cache_tests {
     use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
         RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
+    use super::{response_cache_lifetime, response_cache_lifetime_with_clock, HEURISTIC_FRESHNESS_CAP};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use url::Url;
@@ -1838,6 +1904,137 @@ mod resource_cache_tests {
         assert_eq!(cache.entries.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
+    }
+
+
+    fn heuristic_test_response(status: u16, headers: &[(&str, &str)]) -> Response {
+        Response {
+            url: Url::parse("http://example.test/app.js").unwrap(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: vec![1],
+            redirected_from: Vec::new(),
+        }
+    }
+
+    // Receive the dated unit fixtures at their Date, independent of the wall clock.
+    fn cache_lifetime_at_fixture_time(response: &Response) -> Option<Duration> {
+        response_cache_lifetime_with_clock(response, Duration::ZERO, || {
+            crate::cookies::parse_http_date("Fri, 06 Nov 2026 08:59:06 GMT").ok()
+        })
+    }
+
+    #[test]
+    fn last_modified_without_explicit_expiry_gets_a_tenth_of_its_age() {
+        // 3 days 21 h 1 min 46 s (334906 s) since Last-Modified: a tenth is 33490 s.
+        let response = heuristic_test_response(200, &[
+            ("date", "Fri, 06 Nov 2026 08:59:06 GMT"),
+            ("last-modified", "Mon, 02 Nov 2026 11:57:20 GMT"),
+        ]);
+        assert_eq!(cache_lifetime_at_fixture_time(&response), Some(Duration::from_secs(33490)));
+    }
+
+    #[test]
+    fn heuristic_lifetime_is_capped_and_respects_explicit_directives() {
+        let old = [("date", "Fri, 06 Nov 2026 08:59:06 GMT"), ("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT")];
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &old)), Some(HEURISTIC_FRESHNESS_CAP));
+        // A directive without max-age (public, private) still allows the heuristic.
+        let with_public = [old[0], old[1], ("cache-control", "public")];
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &with_public)), Some(HEURISTIC_FRESHNESS_CAP));
+        for blocked in [
+            vec![old[0], old[1], ("cache-control", "no-cache")],
+            vec![old[0], old[1], ("cache-control", "no-store")],
+            vec![old[0], old[1], ("cache-control", "max-age=0")],
+            vec![old[0], old[1], ("expires", "Fri, 06 Nov 2026 09:00:00 GMT")],
+            vec![old[0], old[1], ("set-cookie", "a=1")],
+            vec![old[0], ("last-modified", "Fri, 06 Nov 2026 08:59:06 GMT")],
+            vec![old[0], ("last-modified", "Sat, 07 Nov 2026 00:00:00 GMT")],
+            vec![old[0], ("last-modified", "not a date")],
+            vec![old[0]],
+        ] {
+            assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &blocked)), None, "{blocked:?}");
+        }
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(201, &old)), None);
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(404, &old)), None);
+        // Explicit max-age still wins over the heuristic.
+        let explicit = [old[0], old[1], ("cache-control", "max-age=60")];
+        assert_eq!(cache_lifetime_at_fixture_time(&heuristic_test_response(200, &explicit)), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn explicit_cache_directives_do_not_fall_back_to_heuristic_freshness() {
+        for directive in [
+            "max-age=invalid",
+            "max-age=-1",
+            "max-age=18446744073709551616",
+            "max-age",
+            "max-age=",
+            "max-age = 0",
+            "max-age=\"0\"",
+            "max-age=0, max-age=60",
+            "max-age=60, max-age=invalid",
+            "no-cache=\"X-Version\"",
+            "No-Cache = \"X-Version, X-Other\"",
+        ] {
+            let response = heuristic_test_response(200, &[
+                ("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT"),
+                ("cache-control", directive),
+            ]);
+            assert_eq!(response_cache_lifetime(&response, Duration::ZERO), None, "{directive}");
+        }
+    }
+
+    #[test]
+    fn already_stale_heuristic_responses_are_not_cached() {
+        let old = "Mon, 01 Jan 2018 00:00:00 GMT";
+        for headers in [
+            vec![("last-modified", old), ("age", "86400")],
+            vec![("last-modified", old), ("age", "18446744073709551616")],
+            vec![
+                ("date", "Tue, 02 Jan 2018 00:00:00 GMT"),
+                ("last-modified", old),
+            ],
+            vec![
+                ("date", "Tuesday, 02-Jan-18 00:00:00 GMT"),
+                ("last-modified", old),
+            ],
+            vec![
+                ("date", "Tue Jan  2 00:00:00 2018"),
+                ("last-modified", old),
+            ],
+        ] {
+            assert_eq!(
+                response_cache_lifetime(&heuristic_test_response(200, &headers), Duration::ZERO),
+                None,
+                "{headers:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn remaining_heuristic_freshness_accounts_for_age_and_transport_delay() {
+        let response = heuristic_test_response(200, &[
+            ("date", "Fri, 06 Nov 2026 08:59:06 GMT"),
+            ("last-modified", "Mon, 02 Nov 2026 11:57:20 GMT"),
+            ("age", "1000"),
+        ]);
+        let now = crate::cookies::parse_http_date("Fri, 06 Nov 2026 08:59:06 GMT").unwrap();
+        let delay = Duration::from_millis(200);
+        assert_eq!(
+            response_cache_lifetime_with_clock(&response, delay, || Some(now)),
+            Some(Duration::from_secs(32490) - delay),
+        );
+        assert_eq!(
+            response_cache_lifetime_with_clock(&response, delay, || Some(now + 2000)),
+            Some(Duration::from_secs(31490)),
+        );
+        assert_eq!(
+            response_cache_lifetime_with_clock(&response, Duration::from_secs(33490), || Some(now)),
+            None,
+        );
     }
 
 }
@@ -2778,6 +2975,52 @@ mod ssrf_tests {
 
         assert_eq!(responses.len(), 24);
         assert_eq!(network_requests.load(Ordering::SeqCst), 24);
+    }
+
+    #[tokio::test]
+    async fn last_modified_only_subresource_is_reused_on_the_next_load() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Last-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\n",
+        )
+        .await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        for _ in 0..3 {
+            let response = client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+        }
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_last_modified_subresources_are_not_reused() {
+        for headers in [
+            "Last-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\nAge: 86400\r\n",
+            "Date: Tue, 02 Jan 2018 00:00:00 GMT\r\nLast-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\n",
+            "Date: Tue Jan  2 00:00:00 2018\r\nLast-Modified: Mon, 01 Jan 2018 00:00:00 GMT\r\n",
+        ] {
+            let (url, network_requests) = cacheable_resource_fixture(200, headers).await;
+            let initiator = url.join("/page.html").unwrap();
+            let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+            let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+            for _ in 0..2 {
+                let response = client
+                    .fetch_resource_with_callbacks(&url, request.clone(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status, 200);
+            }
+            assert_eq!(
+                network_requests.load(Ordering::SeqCst),
+                2,
+                "{headers}",
+            );
+        }
     }
 
     #[tokio::test]

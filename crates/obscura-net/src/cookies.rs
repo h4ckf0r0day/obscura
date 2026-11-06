@@ -653,7 +653,7 @@ struct PersistedCookie {
     host_only: Option<bool>,
 }
 
-fn parse_http_date(s: &str) -> Result<u64, ()> {
+pub(crate) fn parse_http_date(s: &str) -> Result<u64, ()> {
     let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
     let s = s.replace('-', " ");
