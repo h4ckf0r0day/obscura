@@ -36,7 +36,9 @@ async fn main() {
     let supervisor = WorkerPoolSupervisor::new(config);
     supervisor.start().await.expect("supervisor start");
 
-    let consumer = NatsConsumer::create(nats.jetstream(), "OBScura_JOBS", "worker-agent")
+    let consumer_name = std::env::var("NATS_CONSUMER_NAME")
+        .unwrap_or_else(|_| format!("worker-agent-{}", worker_id));
+    let consumer = NatsConsumer::create(nats.jetstream(), "OBScura_JOBS", &consumer_name)
         .await
         .expect("consumer");
 
