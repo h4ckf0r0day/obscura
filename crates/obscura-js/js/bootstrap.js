@@ -3710,6 +3710,9 @@ for (const _name of ['__obscura_activateLabel', '__obscura_activateSummary', '__
   Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
 }
 
+// Elements that take a form="" content attribute (HTML "form-associated").
+const _FORM_ATTRIBUTE_ELEMENTS = new Set(["button", "fieldset", "input", "object", "output", "select", "textarea"]);
+
 function _isSubmitButton(el) {
   if (!el || typeof el.localName !== "string") return false;
   const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
@@ -5461,6 +5464,13 @@ class Element extends Node {
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
   get form() {
+    // A form="" attribute on a form-associated element names its owner by id
+    // and wins over ancestry; an id that is not a <form> means no owner.
+    if (_FORM_ATTRIBUTE_ELEMENTS.has(this.localName) && this.hasAttribute('form')) {
+      const doc = this.ownerDocument;
+      const owner = doc && doc.getElementById ? doc.getElementById(this.getAttribute('form')) : null;
+      return owner && owner.localName === 'form' ? owner : null;
+    }
     let p = this.parentNode;
     while (p && p.localName !== 'form') p = p.parentNode;
     return p;
@@ -5570,9 +5580,26 @@ class Element extends Node {
     if (cancelled) return;
     this._navigateSubmit(submitter);
   }
+  // Controls this form owns, in tree order: descendants that do not name
+  // another form with form="", plus controls elsewhere whose form="" names
+  // this one. Only an id can be named, so without one the subtree suffices.
+  _ownedControls(selector) {
+    const doc = this.ownerDocument;
+    const scope = this.getAttribute('id') && doc && doc.querySelectorAll ? doc : this;
+    // Common case: no form="" in scope and no nested form, so the owned
+    // controls are exactly the descendants and the per-control check is skipped.
+    if (!scope.querySelector('[form]') && !this.querySelector('form')) return this.querySelectorAll(selector);
+    const candidates = scope.querySelectorAll(selector);
+    const out = [];
+    for (let i = 0; i < candidates.length; i++) {
+      if (candidates[i].form === this) out.push(candidates[i]);
+    }
+    return out;
+  }
   _navigateSubmit(submitter) {
     const pairs = [];
-    const fields = this.querySelectorAll('input, select, textarea');
+    const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
+    const fields = this._ownedControls('input, select, textarea, button');
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i];
       const name = f.getAttribute('name');
@@ -5590,14 +5617,27 @@ class Element extends Node {
 
       let val;
       if (tag === 'select') {
-        const opt = f.querySelector('option[selected]') || f.querySelector('option');
-        val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
+        // Current selectedness (selectedIndex and user choices update the
+        // option, not always its attribute); a multiple select contributes
+        // one entry per selected, enabled option.
+        const opts = f.options;
+        const chosen = [];
+        for (let j = 0; j < opts.length; j++) {
+          if (opts[j].selected && !opts[j].hasAttribute('disabled')) chosen.push(opts[j]);
+        }
+        const multiple = f.hasAttribute('multiple');
+        if (!multiple && chosen.length > 1) chosen.splice(0, chosen.length - 1);
+        if (!multiple && !chosen.length && opts.length && !opts[0].hasAttribute('disabled')) chosen.push(opts[0]);
+        for (const opt of chosen) {
+          const optValue = opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent;
+          pairs.push(enc(name) + '=' + enc(optValue));
+        }
+        continue;
       } else if (tag === 'textarea') {
         val = f.value || f.textContent || '';
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
       pairs.push(enc(name) + '=' + enc(val));
     }
 
@@ -14392,7 +14432,7 @@ Object.defineProperties(HTMLInputElement.prototype, {
 });
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
-  get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
+  get elements() { return HTMLCollection._from(this._ownedControls("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
