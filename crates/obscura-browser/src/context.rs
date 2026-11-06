@@ -14,6 +14,10 @@ pub struct BrowserContext {
     pub indexed_db: Arc<obscura_js::indexed_db::IndexedDbStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
+    /// The UA the caller set explicitly (`--user-agent`), or `None` when the
+    /// profile default was resolved. Stealth mode uses it for the wire UA and
+    /// navigator.userAgent; `None` keeps the stealth defaults.
+    pub user_agent_override: Option<String>,
     pub platform: String,
     pub ua_platform: String,
     pub ua_platform_version: String,
@@ -182,6 +186,7 @@ impl BrowserContext {
             client.block_trackers = true;
         }
         let profile = crate::profiles::select_profile();
+        let user_agent_override = user_agent.clone();
         let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
         let platform = profile.platform.to_string();
         let ua_platform = profile.ua_platform.to_string();
@@ -205,6 +210,7 @@ impl BrowserContext {
             indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
             http_client,
             user_agent: resolved_ua,
+            user_agent_override,
             platform,
             ua_platform,
             ua_platform_version,
@@ -281,6 +287,7 @@ impl BrowserContext {
                 else { Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()) },
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
+            user_agent_override: self.user_agent_override.clone(),
             platform: self.platform.clone(),
             ua_platform: self.ua_platform.clone(),
             ua_platform_version: self.ua_platform_version.clone(),

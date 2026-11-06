@@ -130,16 +130,14 @@ impl FrameRealm {
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
         // top-level has already taken the wrong branch.
-        realm
-            .run(
-                parent,
-                &format!(
-                    "globalThis.__obscura_frameId = {frame_id};\
-                     globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();"
-                ),
-            )
-            .ok()?;
+        let watchdog = parent.arm_watchdog(std::time::Duration::from_secs(5));
+        let initialized = realm.run(parent, &format!(
+            "globalThis.__obscura_frameId = {frame_id};\
+             globalThis.__obscura_parentFrameId = {parent_frame_id};\
+             globalThis.__obscura_init();"
+        ));
+        parent.disarm_watchdog(watchdog);
+        initialized.ok()?;
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
@@ -699,6 +697,49 @@ mod tests {
             (0, frame.frame_id(), "https://parent.example"),
             (frame.frame_id(), frame.frame_id(), "https://parent.example"),
         ]);
+    }
+
+    #[test]
+    fn nested_message_source_parent_keeps_the_intermediate_frame() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _child = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/child", "<html><body></body></html>").unwrap();
+        let _grandchild = FrameRealm::new(&mut parent, 2, 1,
+            "https://parent.example/grandchild", "<html><body></body></html>").unwrap();
+        parent.execute_script("nested-message-parent", r#"
+            globalThis.sources = [];
+            addEventListener('message', event => sources.push(event.source));
+            __obscura_deliverMessage('{"v":"child"}', 'https://parent.example', 1, '*');
+            __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
+            sources[1].parent.postMessage('reply', '*');
+        "#).unwrap();
+        assert_eq!(parent.evaluate(
+            "[sources[1].parent === sources[0], sources[1].parent.parent === window, sources[1].top === window]"
+        ).unwrap(), serde_json::json!([true, true, true]));
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id,
+        )).collect::<Vec<_>>(), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn message_source_parent_stays_opaque_across_origins() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _child = FrameRealm::new(&mut parent, 1, 0,
+            "https://other.example/child", "<html><body></body></html>").unwrap();
+        let _grandchild = FrameRealm::new(&mut parent, 2, 1,
+            "https://parent.example/grandchild", "<html><body></body></html>").unwrap();
+        parent.execute_script("opaque-message-parent", r#"
+            addEventListener('message', event => { globalThis.sourceParent = event.source.parent; });
+            __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
+            sourceParent.postMessage('reply', '*');
+        "#).unwrap();
+        assert_eq!(parent.evaluate("[sourceParent !== window, sourceParent.document === undefined]").unwrap(),
+            serde_json::json!([true, true]));
+        let messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.iter().map(|message| (
+            message.target_frame_id, message.source_frame_id,
+        )).collect::<Vec<_>>(), vec![(1, 0)]);
     }
 
     #[test]

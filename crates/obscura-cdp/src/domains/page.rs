@@ -899,23 +899,11 @@ pub fn emit_navigation_events(
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
     // via `requestId === loaderId && type === "Document"` (issue #189).
-    let nav_request_ids: Vec<String> = {
-        let mut nav_seen = false;
-        network_events
-            .iter()
-            .map(|ev| {
-                if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
-                    nav_seen = true;
-                    loader_id.to_string()
-                } else {
-                    ev.request_id.clone()
-                }
-            })
-            .collect()
-    };
-    let nav_idx: Option<usize> = network_events
-        .iter()
-        .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
+    let nav_idx = network_events.iter().rposition(|event| event.resource_type == "Document" && event.url == page_url
+        && event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')));
+    let nav_request_ids: Vec<String> = network_events.iter().enumerate().map(|(index, event)| {
+        if Some(index) == nav_idx { loader_id.to_string() } else { event.request_id.clone() }
+    }).collect();
 
     // The main resource's body is stored under its internal request id, but the
     // client sees it as `loader_id` (the requestId we report above). Alias it so
@@ -942,12 +930,14 @@ pub fn emit_navigation_events(
     if let Some(idx) = nav_idx {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
+        if !net_event.intercepted {
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
             params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
-        if fetch_pause_matches(ctx, &net_event.url) {
+        }
+        if !net_event.intercepted && fetch_pause_matches(ctx, &net_event.url) {
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
@@ -1038,7 +1028,8 @@ pub fn emit_navigation_events(
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": if net_event.resource_type == "Document" && net_event.intercepted
+                && net_event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')) { rid.as_str() } else { loader_id }, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
             session_id: es.clone(),
         });
         ctx.pending_events.push(CdpEvent {
@@ -1058,7 +1049,13 @@ pub fn emit_navigation_events(
             tracing::warn!("could not produce navigation screencast frame: {error}");
         }
     }
-    let mut phase3 = if ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed) {
+    let failed = ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed);
+    let mut lifecycle_timestamps = [Some(ts), None, None, None, None];
+    if !failed {
+        lifecycle_timestamps[1] = Some(ts);
+        lifecycle_timestamps[2] = Some(ts);
+    }
+    let mut phase3 = if failed {
         Vec::new()
     } else { vec![
         CdpEvent {
@@ -1084,6 +1081,8 @@ pub fn emit_navigation_events(
     ] };
     if !phase3.is_empty() && (reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded)) {
         let idle_ts = timestamp();
+        lifecycle_timestamps[3] = Some(idle_ts);
+        lifecycle_timestamps[4] = Some(idle_ts);
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
     phase3.push(CdpEvent {
@@ -1092,6 +1091,7 @@ pub fn emit_navigation_events(
         session_id: es,
     });
     ctx.pending_events.extend(phase3);
+    ctx.lifecycle_timestamps.insert(page_id.to_string(), lifecycle_timestamps);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
     // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
@@ -1273,18 +1273,32 @@ fn network_loading_failed(
     }
 }
 
+pub(crate) fn emit_navigation_failure(
+    ctx: &mut CdpContext, session_id: &Option<String>, request_id: &str, page_id: &str, error_text: &str,
+) {
+    let start = ctx.pending_events.len();
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.loadingFailed".into(), session_id: session_id.clone(),
+        params: json!({"requestId": request_id, "timestamp": timestamp(), "type": "Document",
+            "errorText": error_text, "canceled": error_text == "net::ERR_ABORTED"}),
+    });
+    fan_out_network_events(ctx, page_id, session_id, start);
+}
+
 pub(crate) fn emit_aborted_navigation(
     ctx: &mut CdpContext, session_id: &Option<String>, frame_id: &str,
-    loader_id: &str, url: &str, method: &str, page_id: &str,
+    loader_id: &str, url: &str, method: &str, page_id: &str, request_started: bool,
 ) {
     let start = ctx.pending_events.len();
     let ts = timestamp();
+    if !request_started {
     ctx.pending_events.push(CdpEvent {
         method: "Network.requestWillBeSent".into(), session_id: session_id.clone(),
         params: json!({"requestId": loader_id, "loaderId": loader_id, "documentURL": url,
             "request": {"url": url, "method": method, "headers": {}}, "timestamp": ts,
             "wallTime": ts, "initiator": {"type": "other"}, "type": "Document", "frameId": frame_id}),
     });
+    }
     ctx.pending_events.push(CdpEvent {
         method: "Network.loadingFailed".into(), session_id: session_id.clone(),
         params: json!({"requestId": loader_id, "timestamp": ts, "type": "Document",
@@ -1357,7 +1371,8 @@ async fn do_navigate(
         );
     }
 
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let preload_page = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+    let preload_scripts = ctx.preload_sources_for_page(&preload_page);
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
@@ -1448,6 +1463,7 @@ pub async fn handle(
             if let Some((page_id, frame_id, url)) = initial {
                 ctx.nav_events_emitted.insert(page_id.clone());
                 let ts = timestamp();
+                ctx.lifecycle_timestamps.insert(page_id.clone(), [Some(ts); 5]);
                 let loader_id = format!("loader-blank-{page_id}");
                 let es = session_id.clone();
                 // Build the frame through the schema-complete helper: generated
@@ -1593,6 +1609,20 @@ pub async fn handle(
                 }
                 if enabled {
                     ctx.lifecycle_enabled_sessions.insert(session.clone());
+                    if let Some(page) = ctx.get_session_page(session_id) {
+                        if let (Some(timings), Some(loader_id)) = (
+                            ctx.lifecycle_timestamps.get(&page.id), ctx.current_loader_ids.get(&page.id),
+                        ) {
+                            let events = crate::dispatch::LIFECYCLE_PHASES.iter().zip(timings)
+                                .filter_map(|(name, time)| time.map(|timestamp| CdpEvent {
+                                    method: "Page.lifecycleEvent".into(),
+                                    params: json!({"frameId": page.frame_id, "loaderId": loader_id,
+                                        "name": name, "timestamp": timestamp}),
+                                    session_id: session_id.clone(),
+                                })).collect::<Vec<_>>();
+                            ctx.pending_events.extend(events);
+                        }
+                    }
                 } else {
                     ctx.lifecycle_enabled_sessions.remove(session);
                 }
@@ -1607,6 +1637,7 @@ pub async fn handle(
             {
                 return Err("Immediate scripts in isolated worlds are not supported".to_string());
             }
+            let page_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
             ctx.preload_counter += 1;
             let identifier = format!("{}", ctx.preload_counter);
             if !source.is_empty() {
@@ -1629,6 +1660,9 @@ pub async fn handle(
             // Store empty sources too: Chrome returns a removable id for them.
             ctx.preload_scripts
                 .push((identifier.clone(), source.to_string()));
+            ctx.preload_script_pages.insert(identifier.clone(), page_id.clone());
+            let sources = ctx.preload_sources_for_page(&page_id);
+            if let Some(page) = ctx.get_page_mut(&page_id) { page.set_preload_scripts(sources); }
             Ok(json!({ "identifier": identifier }))
         }
         "removeScriptToEvaluateOnNewDocument" => {
@@ -1636,12 +1670,19 @@ pub async fn handle(
                 .get("identifier")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let page_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+            if ctx.preload_script_pages.get(identifier) != Some(&page_id) {
+                return Err("Script not found".to_string());
+            }
             // Chrome reports an unknown or already removed id as an error.
             let before = ctx.preload_scripts.len();
             ctx.preload_scripts.retain(|(id, _)| id != identifier);
             if ctx.preload_scripts.len() == before {
                 return Err("Script not found".to_string());
             }
+            ctx.preload_script_pages.remove(identifier);
+            let sources = ctx.preload_sources_for_page(&page_id);
+            if let Some(page) = ctx.get_page_mut(&page_id) { page.set_preload_scripts(sources); }
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
@@ -1764,8 +1805,8 @@ pub async fn handle(
                 (url, snapshot.0, snapshot.1)
             };
             if let Some(url) = target_url {
-                let preload_scripts: Vec<String> =
-                    ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+                let preload_page = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+                let preload_scripts = ctx.preload_sources_for_page(&preload_page);
                 let nav_result = {
                     let page = ctx
                         .get_session_page_mut(session_id)
@@ -2051,7 +2092,8 @@ mod tests {
         let events = [("document-internal", "Document", "https://example.test/", 200),
             ("script-1", "Script", "https://example.test/app.js", 404)]
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
-                request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+                request_id: if kind == "Document" { format!("{page}.1") } else { id.into() },
+                intercepted: false, url: url.into(), method: "GET".into(),
                 resource_type: kind.into(), status, headers: Default::default(),
                 response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
                 error_text: None,
@@ -2144,6 +2186,50 @@ mod tests {
         assert!(ctx.pending_events.iter().all(|event| event.method != "Network.requestWillBeSent"));
         assert_eq!(ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).count(), 2);
         assert!(!ctx.pending_events.iter().any(|event| event.session_id.as_deref() == Some("observer-b")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preload_scripts_stay_with_their_target_and_are_released_on_close() {
+        let mut ctx = CdpContext::new();
+        let first = ctx.create_page(); let second = ctx.create_page();
+        let a = Some(format!("{first}-session")); let b = Some(format!("{second}-session"));
+        ctx.sessions.insert(a.clone().unwrap(), first.clone());
+        ctx.sessions.insert(b.clone().unwrap(), second.clone());
+        let registration = handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.owner='first'; globalThis.count=(globalThis.count||0)+1",
+        }), &mut ctx, &a).await.unwrap();
+        handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.owner='second'; globalThis.count=(globalThis.count||0)+1",
+        }), &mut ctx, &b).await.unwrap();
+        for (session, owner) in [(&a, "first"), (&b, "second")] {
+            handle("navigate", &json!({"url":"about:blank"}), &mut ctx, session).await.unwrap();
+            assert_eq!(ctx.get_session_page_mut(session).unwrap().evaluate_script("[owner, count]").unwrap(),
+                json!([owner, 1]));
+        }
+        handle("addScriptToEvaluateOnNewDocument", &json!({"source":"globalThis.latest=true"}),
+            &mut ctx, &a).await.unwrap();
+        {
+            let page = ctx.get_session_page_mut(&a).unwrap();
+            assert_eq!(page.evaluate_script("typeof latest").unwrap(), json!("undefined"));
+            page.evaluate_script("(() => { const f=document.createElement('iframe'); f.srcdoc='<p>child</p>'; document.body.appendChild(f); })()").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while page.frames.is_empty() { page.run_autonomous_event_loop_turn().await.unwrap(); }
+            }).await.expect("child document must load");
+            assert_eq!(page.evaluate_in_frame(0, "[owner, count, latest]").unwrap(), json!(["first", 1, true]));
+        }
+        assert_eq!(handle("removeScriptToEvaluateOnNewDocument", &registration, &mut ctx, &b)
+            .await.unwrap_err(), "Script not found");
+        assert_eq!(ctx.preload_scripts.len(), 3);
+        ctx.remove_page(&first);
+        assert_eq!(ctx.preload_scripts.len(), 1);
+        assert_eq!(ctx.preload_script_pages.len(), 1);
+        assert!(ctx.preload_script_pages.values().all(|owner| owner == &second));
+        handle("navigate", &json!({"url":"data:text/html,<title>next</title>"}), &mut ctx, &b).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&b).unwrap().evaluate_script("[owner, count]").unwrap(),
+            json!(["second", 1]));
+        ctx.remove_page(&second);
+        assert!(ctx.preload_scripts.is_empty());
+        assert!(ctx.preload_script_pages.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2541,6 +2627,37 @@ mod tests {
     }
 
     #[test]
+    fn same_url_frame_response_cannot_replace_the_main_document_loader() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+        let url = "https://example.test/";
+        let document = obscura_browser::NetworkEvent {
+            request_id: format!("{page_id}.1"), intercepted: true,
+            url: url.into(), method: "GET".into(), resource_type: "Document".into(),
+            status: 200, headers: Default::default(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([
+                ("content-type".into(), "text/html".into()),
+            ])), body_size: 0, timestamp: 42.0, error_text: None,
+        };
+        let frame = obscura_browser::NetworkEvent {
+            request_id: "fetch-1".into(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::from([
+                ("content-type".into(), "image/png".into()),
+            ])), ..document.clone()
+        };
+        emit_navigation_events(&mut ctx, &session_id, &page_id, &document.request_id,
+            url, &page_id, &[document.clone(), frame], WaitUntil::Load, true);
+        let committed = ctx.pending_events.iter().find(|event| event.method == "Page.frameNavigated").unwrap();
+        assert_eq!(committed.params["frame"]["mimeType"], "text/html");
+        let responses: Vec<_> = ctx.pending_events.iter().filter(|event| event.method == "Network.responseReceived").collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].params["requestId"], document.request_id);
+        assert_eq!(responses[1].params["requestId"], "fetch-1");
+    }
+
+    #[test]
     fn intercepted_document_is_paused_before_frame_commit() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
@@ -2550,7 +2667,7 @@ mod tests {
         ctx.fetch_intercept.enabled = true;
         let page_url = "https://example.test/";
         let event = obscura_browser::NetworkEvent {
-            request_id: "document-internal".into(),
+            request_id: format!("{page_id}.1"),
             intercepted: false,
             url: page_url.into(),
             method: "GET".into(),

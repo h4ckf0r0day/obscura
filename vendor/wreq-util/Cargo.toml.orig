@@ -1,0 +1,94 @@
+[package]
+name = "wreq-util"
+description = "Common utilities for wreq"
+repository = "https://github.com/0x676e67/wreq-util"
+documentation = "https://docs.rs/wreq-util"
+keywords = ["http", "client", "emulation", "ja3", "ja4"]
+authors = ["0x676e67 <gngppz@gmail.com>"]
+version = "3.0.0-rc.12"
+readme = "README.md"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = ["emulation"]
+
+tokio-rt = ["wreq/tokio-rt"]
+compio-rt = ["wreq/compio-rt"]
+
+emulation = ["dep:typed-builder", "dep:brotli", "dep:flate2", "dep:zstd"]
+emulation-serde = ["dep:serde"]
+emulation-compression = []
+
+tower-delay = ["dep:tower", "dep:pin-project-lite", "tokio/time"]
+
+[dependencies]
+wreq = { version = "6.0.0-rc", default-features = false }
+
+# Optional deps...
+
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+tokio = { version = "1.52.1", default-features = false, optional = true }
+tower = { version = "0.5.2", default-features = false, optional = true }
+typed-builder = { version = "0.23.2", optional = true }
+pin-project-lite = { version = "0.2.17", optional = true }
+
+## Compression algorithms
+brotli = { version = "8.0.2", optional = true }
+flate2 = { version = "1.1.9", optional = true }
+zstd = { version = "0.13.3", optional = true }
+
+[dev-dependencies]
+wreq = "6.0.0-rc"
+tokio = { version = "1.48.0", features = ["full"] }
+hyper = { version = "1.10.1", default-features = false, features = [
+    "http1",
+    "http2",
+    "server",
+] }
+hyper-util = { version = "0.1.20", features = [
+    "http1",
+    "http2",
+    "server-auto",
+    "tokio",
+] }
+http = "1"
+
+[lib]
+doctest = false
+
+[[test]]
+name = "client"
+path = "tests/client.rs"
+
+[[test]]
+name = "emulate_chrome"
+path = "tests/emulate_chrome.rs"
+
+[[test]]
+name = "emulate_okhttp"
+path = "tests/emulate_okhttp.rs"
+
+[[test]]
+name = "emulate_firefox"
+path = "tests/emulate_firefox.rs"
+
+[[test]]
+name = "emulate_safari"
+path = "tests/emulate_safari.rs"
+
+[[example]]
+name = "emulate"
+path = "examples/emulate.rs"
+required-features = ["emulation"]
+
+[[example]]
+name = "tower_delay"
+path = "examples/tower_delay.rs"
+required-features = ["tower-delay"]

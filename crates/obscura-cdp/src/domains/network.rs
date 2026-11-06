@@ -136,7 +136,7 @@ pub async fn handle(
 
             match body {
                 Some(body) => Ok(json!({
-                    "body": body.body,
+                    "body": body.cdp_body(),
                     "base64Encoded": body.base64_encoded,
                 })),
                 None => Err(format!("No response body found for requestId {}", request_id)),

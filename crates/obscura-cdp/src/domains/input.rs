@@ -303,6 +303,7 @@ pub async fn handle(
                                 var ctl = globalThis.__obscura_labeledControl(labelHost);\
                                 if (ctl && ctl !== clickTarget && globalThis.__obscura_activateLabel(labelHost, ctl, true)) {{ return; }}\
                             }}\
+                            if (globalThis.__obscura_activateSummary(clickTarget)) return;\
                             var link = clickTarget.closest ? clickTarget.closest('a[href]') : null;\
                             if (!link && tag === 'A' && clickTarget.getAttribute('href')) link = clickTarget;\
                             var submitButton = tag === 'BUTTON' ? clickTarget : (clickTarget.closest ? clickTarget.closest('button') : null);\

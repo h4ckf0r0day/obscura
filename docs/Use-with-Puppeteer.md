@@ -1,3 +1,5 @@
+Examples use Node.js ES modules. Save scripts with a `.mjs` extension.
+
 ## Setup
 
 ```bash
@@ -8,7 +10,7 @@ npm install puppeteer-core
 ## Connect
 
 ```js
-const puppeteer = require('puppeteer-core');
+import puppeteer from 'puppeteer-core';
 
 const browser = await puppeteer.connect({
   browserWSEndpoint: 'ws://127.0.0.1:9222',
@@ -26,7 +28,7 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 await page.goto('https://example.com', { waitUntil: 'networkidle0', timeout: 60000 });
 ```
 
-Default `waitUntil` is `domcontentloaded`. Other values: `load`, `networkidle2`, `networkidle0`.
+Default `waitUntil` is `load`. Other values: `domcontentloaded`, `networkidle2`, `networkidle0`.
 
 ## Evaluate
 
@@ -46,7 +48,7 @@ const items = await page.evaluate(() => {
 ```js
 await page.click('#login-button');
 await page.type('#username', 'alice');
-await page.fill('#password', 'secret');  // alias of .type for compat
+await page.type('#password', 'secret');
 
 await page.waitForSelector('#dashboard');
 await page.waitForFunction(() => window.appReady === true);
@@ -114,7 +116,8 @@ await Promise.all([
 ]);
 ```
 
-Pages share one V8 isolate. Concurrent JS execution serializes through a lock. CPU-bound JS on one page blocks the others.
+Pages on one CDP connection serialize JavaScript work. Separate CDP connections
+run on separate threads and can execute in parallel.
 
 ## Screenshots, scrolling, and PDF
 
@@ -169,6 +172,11 @@ await browser.disconnect();  // leaves obscura serve running
 
 ## Page lifecycle
 
+`Page.setLifecycleEventsEnabled` replays completed lifecycle phases for the
+current main-frame document to the requesting session, with their original
+timestamps and loader ID. This lets a client attach after the initial page load
+without waiting for a load event that has already happened.
+
 `Page.stopLoading` cancels an in-flight document or parser-resource request,
 clears queued document navigation, and leaves the target usable. Rendering
 builds also cancel pending image/font loads, including `Image`/`decode()`
@@ -186,7 +194,7 @@ are not implemented by this change.
 
 - Some device emulation, service-worker, native media, long-tail CSS, and
   compositor behavior remains incomplete relative to Chromium.
-- Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
+- CPU-bound JavaScript can delay other pages on the same CDP connection.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.
 
 Network events are shared by sessions attached to the same target. An additional

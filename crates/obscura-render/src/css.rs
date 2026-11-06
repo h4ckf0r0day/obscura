@@ -244,9 +244,14 @@ pub struct InvalidationMap {
     adjacent_sibling_selectors: bool,
     general_sibling_selectors: bool,
     unkeyed_sibling_selectors: bool,
+    dynamic_attribute_reads: bool,
 }
 
 impl InvalidationMap {
+    pub(crate) fn has_dynamic_attribute_reads(&self) -> bool {
+        self.dynamic_attribute_reads
+    }
+
     pub fn id_dependencies(&self, id: &str) -> &[InvalidationDependency] {
         self.ids.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -1353,6 +1358,22 @@ fn note_compound_dependencies(
                         );
                         map.mark_conservative(rule_order);
                     }
+                    "host" => {
+                        // The argument matches the shadow host from inside
+                        // its shadow tree, so key its dependencies but always
+                        // take the full fallback.
+                        map.push_state(name, rule_order, reaches);
+                        map.mark_conservative(rule_order);
+                        for alternative in split_selector_list(&arguments) {
+                            note_selector_dependencies(
+                                map,
+                                alternative.trim(),
+                                InvalidationReaches::CONSERVATIVE,
+                                rule_order,
+                                !inside_relational,
+                            );
+                        }
+                    }
                     _ => {
                         // A compiled functional pseudo outside the explicitly
                         // modeled set may hide selector or document state.
@@ -1427,6 +1448,16 @@ fn note_selector_for_invalidation(
 /// in the selector.  Keep this deliberately broader than the property parser;
 /// an extra self invalidation is cheap, while missing a supported `attr()`
 /// spelling would retain stale computed values.
+#[cfg(feature = "paint")]
+pub(crate) fn declaration_value_reads_attribute(value: &str, attribute: &str) -> bool {
+    if !value.as_bytes().windows(4).any(|part| part.eq_ignore_ascii_case(b"attr")) {
+        return false;
+    }
+    let mut dependencies = InvalidationMap::default();
+    note_declaration_attribute_dependencies(&mut dependencies, value, 0);
+    dependencies.has_dynamic_attribute_reads() || !dependencies.attribute_dependencies(attribute).is_empty()
+}
+
 fn note_declaration_attribute_dependencies(
     map: &mut InvalidationMap,
     declarations: &str,
@@ -1502,6 +1533,10 @@ fn note_declaration_attribute_dependencies(
             name_start += 1;
         }
         let (attribute, name_end) = consume_css_identifier(&chars, name_start);
+        if chars.get(name_end) == Some(&'(') {
+            // An attribute name supplied by var() is resolved at computed-value time.
+            map.dynamic_attribute_reads = true;
+        }
         if !attribute.is_empty() && name_end <= close {
             map.push_attribute(attribute, rule_order, InvalidationReaches::SELF);
         }
