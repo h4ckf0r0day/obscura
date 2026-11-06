@@ -980,3 +980,58 @@ mod process_lifecycle_tests {
         worker.kill().await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod process_harness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_process_graceful_termination() {
+        let worker_bin = resolve_worker_binary(std::path::Path::new("obscura-runtime-worker"));
+        if !worker_bin.exists() { return; }
+        let config = SupervisorConfig { worker_bin, pool_size: 1, ..SupervisorConfig::default() };
+        let supervisor = WorkerPoolSupervisor::new(config);
+        supervisor.start().await.expect("start");
+        assert_eq!(supervisor.healthy_count(), 1);
+        // Graceful shutdown
+        supervisor.shutdown().await.expect("shutdown");
+        assert_eq!(supervisor.pool_size(), 0);
+        assert_eq!(supervisor.healthy_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_forced_termination_idempotent() {
+        let worker = Arc::new(SupervisedWorker::new(100, Some(1000)));
+        worker.mark_ready();
+        // First kill
+        worker.kill().await.unwrap();
+        assert!(!worker.is_ready.load(std::sync::atomic::Ordering::Acquire));
+        // Second kill should not panic
+        worker.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_isolation() {
+        let w1 = Arc::new(SupervisedWorker::new(201, Some(2001)));
+        let w2 = Arc::new(SupervisedWorker::new(202, Some(2002)));
+        w1.mark_ready();
+        w2.mark_ready();
+        // Kill w1 only
+        w1.kill().await.unwrap();
+        // w2 should still be ready
+        assert!(w2.is_ready.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!w1.is_ready.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_cleans_multiple() {
+        let worker_bin = resolve_worker_binary(std::path::Path::new("obscura-runtime-worker"));
+        if !worker_bin.exists() { return; }
+        let config = SupervisorConfig { worker_bin, pool_size: 3, ..SupervisorConfig::default() };
+        let supervisor = WorkerPoolSupervisor::new(config);
+        supervisor.start().await.expect("start");
+        assert_eq!(supervisor.pool_size(), 3);
+        supervisor.shutdown().await.expect("shutdown");
+        assert_eq!(supervisor.pool_size(), 0);
+    }
+}
