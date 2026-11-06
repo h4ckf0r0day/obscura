@@ -832,6 +832,14 @@ impl ControlPlane {
     pub async fn cancel_job_phase4(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
         self.cancel_job(principal, job_id, tenant_id).await
     }
+    pub async fn reconcile_stuck_jobs(&self) -> Result<u64> {
+        let r1 = sqlx::query("UPDATE jobs SET status = 'pending', updated_at = now() WHERE status = 'scheduled' AND updated_at < now() - interval '5 minutes'")
+            .execute(self.pool()).await?;
+        let r2 = sqlx::query("UPDATE jobs SET status = 'pending', updated_at = now() WHERE status = 'dispatched' AND updated_at < now() - interval '5 minutes'")
+            .execute(self.pool()).await?;
+        Ok(r1.rows_affected() + r2.rows_affected())
+    }
+
 
     // Internal (trusted) methods that bypass authorization.
     // These must only be called by scheduler, worker agent, and tests

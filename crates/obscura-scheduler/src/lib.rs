@@ -159,8 +159,10 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Startup reconciliation: reclaim scheduled jobs and schedule pending.
+    /// Startup reconciliation: reclaim scheduled/dispatched jobs and schedule pending.
     pub async fn reconcile(&self) -> Result<()> {
+        // Reclaim stuck jobs via control plane
+        let _ = self.control.reconcile_stuck_jobs().await;
         // schedule all pending
         while self.schedule_one().await.unwrap_or(false) {}
         Ok(())
