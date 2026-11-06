@@ -985,20 +985,52 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
     {
         return None;
     }
-    let cache_control = response.header("cache-control")?;
-    let mut max_age = None;
-    for directive in cache_control.split(',').map(str::trim) {
-        let lower = directive.to_ascii_lowercase();
-        if lower == "no-store" || lower == "no-cache" {
-            return None;
+    if let Some(cache_control) = response.header("cache-control") {
+        let mut max_age = None;
+        for directive in cache_control.split(',').map(str::trim) {
+            let lower = directive.to_ascii_lowercase();
+            if lower == "no-store" || lower == "no-cache" {
+                return None;
+            }
+            if let Some(value) = lower.strip_prefix("max-age=") {
+                max_age = value.trim_matches('"').parse::<u64>().ok();
+            }
         }
-        if let Some(value) = lower.strip_prefix("max-age=") {
-            max_age = value.trim_matches('"').parse::<u64>().ok();
+        if let Some(seconds) = max_age {
+            return (seconds > 0).then(|| Duration::from_secs(seconds));
         }
     }
-    max_age
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
+    heuristic_cache_lifetime(response)
+}
+
+/// Upper bound for a heuristic lifetime, so a file last changed years ago is
+/// still re-checked at least daily.
+const HEURISTIC_FRESHNESS_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// RFC 9111 4.2.2: with no explicit expiry a cache may assign a heuristic
+/// freshness lifetime. Browsers use 10% of the time since Last-Modified, so
+/// servers that send only Last-Modified for static files (common on older
+/// stacks) do not get every script re-downloaded on each navigation.
+fn heuristic_cache_lifetime(response: &Response) -> Option<Duration> {
+    // Heuristically cacheable 2xx codes (RFC 9110 15.1).
+    if !matches!(response.status, 200 | 203 | 204 | 206) {
+        return None;
+    }
+    // An explicit Expires is not evaluated here; stay uncached rather than
+    // second-guess it with a heuristic.
+    if response.header("expires").is_some() {
+        return None;
+    }
+    let last_modified = crate::cookies::parse_http_date(response.header("last-modified")?).ok()?;
+    let date = match response.header("date").map(crate::cookies::parse_http_date) {
+        Some(Ok(date)) => date,
+        _ => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    };
+    let lifetime = Duration::from_secs(date.checked_sub(last_modified)? / 10).min(HEURISTIC_FRESHNESS_CAP);
+    (!lifetime.is_zero()).then_some(lifetime)
 }
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
@@ -1774,6 +1806,7 @@ pub enum ObscuraNetError {
 mod resource_cache_tests {
     use super::{ResourceCache, ResourceCacheKey, ResourceType, RequestMode,
         RequestCredentials, Response, RESOURCE_CACHE_MAX_ENTRIES};
+    use super::{response_cache_lifetime, HEURISTIC_FRESHNESS_CAP};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use url::Url;
@@ -1838,6 +1871,57 @@ mod resource_cache_tests {
         assert_eq!(cache.entries.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.insertion_order.len(), RESOURCE_CACHE_MAX_ENTRIES);
         assert_eq!(cache.body_bytes, RESOURCE_CACHE_MAX_ENTRIES);
+    }
+
+
+    fn heuristic_test_response(status: u16, headers: &[(&str, &str)]) -> Response {
+        Response {
+            url: Url::parse("http://example.test/app.js").unwrap(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: vec![1],
+            redirected_from: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn last_modified_without_explicit_expiry_gets_a_tenth_of_its_age() {
+        // 3 days 21 h 1 min 46 s (334906 s) since Last-Modified: a tenth is 33490 s.
+        let response = heuristic_test_response(200, &[
+            ("date", "Fri, 06 Nov 2026 08:59:06 GMT"),
+            ("last-modified", "Mon, 02 Nov 2026 11:57:20 GMT"),
+        ]);
+        assert_eq!(response_cache_lifetime(&response), Some(Duration::from_secs(33490)));
+    }
+
+    #[test]
+    fn heuristic_lifetime_is_capped_and_respects_explicit_directives() {
+        let old = [("date", "Fri, 06 Nov 2026 08:59:06 GMT"), ("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT")];
+        assert_eq!(response_cache_lifetime(&heuristic_test_response(200, &old)), Some(HEURISTIC_FRESHNESS_CAP));
+        // A directive without max-age (public, private) still allows the heuristic.
+        let with_public = [old[0], old[1], ("cache-control", "public")];
+        assert_eq!(response_cache_lifetime(&heuristic_test_response(200, &with_public)), Some(HEURISTIC_FRESHNESS_CAP));
+        for blocked in [
+            vec![old[0], old[1], ("cache-control", "no-cache")],
+            vec![old[0], old[1], ("cache-control", "no-store")],
+            vec![old[0], old[1], ("cache-control", "max-age=0")],
+            vec![old[0], old[1], ("expires", "Fri, 06 Nov 2026 09:00:00 GMT")],
+            vec![old[0], old[1], ("set-cookie", "a=1")],
+            vec![old[0], ("last-modified", "Fri, 06 Nov 2026 08:59:06 GMT")],
+            vec![old[0], ("last-modified", "Sat, 07 Nov 2026 00:00:00 GMT")],
+            vec![old[0], ("last-modified", "not a date")],
+            vec![old[0]],
+        ] {
+            assert_eq!(response_cache_lifetime(&heuristic_test_response(200, &blocked)), None, "{blocked:?}");
+        }
+        assert_eq!(response_cache_lifetime(&heuristic_test_response(201, &old)), None);
+        assert_eq!(response_cache_lifetime(&heuristic_test_response(404, &old)), None);
+        // Explicit max-age still wins over the heuristic.
+        let explicit = [old[0], old[1], ("cache-control", "max-age=60")];
+        assert_eq!(response_cache_lifetime(&heuristic_test_response(200, &explicit)), Some(Duration::from_secs(60)));
     }
 
 }
@@ -2778,6 +2862,26 @@ mod ssrf_tests {
 
         assert_eq!(responses.len(), 24);
         assert_eq!(network_requests.load(Ordering::SeqCst), 24);
+    }
+
+    #[tokio::test]
+    async fn last_modified_only_subresource_is_reused_on_the_next_load() {
+        let (url, network_requests) = cacheable_resource_fixture(
+            200,
+            "Date: Fri, 06 Nov 2026 08:59:06 GMT\r\nLast-Modified: Mon, 02 Nov 2026 11:57:20 GMT\r\n",
+        )
+        .await;
+        let initiator = url.join("/page.html").unwrap();
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+        for _ in 0..3 {
+            let response = client
+                .fetch_resource_with_callbacks(&url, request.clone(), None)
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+        }
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
