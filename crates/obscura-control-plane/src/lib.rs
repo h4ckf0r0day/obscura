@@ -832,11 +832,25 @@ impl ControlPlane {
     pub async fn cancel_job_phase4(&self, principal: &Principal, job_id: Uuid, tenant_id: Uuid) -> Result<()> {
         self.cancel_job(principal, job_id, tenant_id).await
     }
+    pub async fn reconcile_worker_capacity(&self) -> Result<u64> {
+        // Recompute active_jobs from non-terminal job attempts
+        let res = sqlx::query(
+            "UPDATE workers SET active_jobs = COALESCE((
+                SELECT COUNT(*) FROM jobs WHERE jobs.worker_id = workers.worker_id AND jobs.status IN ('dispatched','running')
+            ), 0)"
+        ).execute(self.pool()).await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn reconcile_stuck_jobs(&self) -> Result<u64> {
-        let r1 = sqlx::query("UPDATE jobs SET status = 'pending', updated_at = now() WHERE status = 'scheduled' AND updated_at < now() - interval '5 minutes'")
-            .execute(self.pool()).await?;
-        let r2 = sqlx::query("UPDATE jobs SET status = 'pending', updated_at = now() WHERE status = 'dispatched' AND updated_at < now() - interval '5 minutes'")
-            .execute(self.pool()).await?;
+        // Reclaim scheduled jobs that have no active lease and are stale
+        let r1 = sqlx::query(
+            "UPDATE jobs SET status = 'pending', updated_at = now()              WHERE status = 'scheduled' AND updated_at < now() - interval '5 minutes'              AND (lease_id IS NULL OR lease_id NOT IN (SELECT lease_id FROM session_leases WHERE expires_at > now()))"
+        ).execute(self.pool()).await?;
+        // Reclaim dispatched jobs with expired leases
+        let r2 = sqlx::query(
+            "UPDATE jobs SET status = 'pending', updated_at = now()              WHERE status = 'dispatched' AND updated_at < now() - interval '5 minutes'              AND (lease_id IS NULL OR lease_id NOT IN (SELECT lease_id FROM session_leases WHERE expires_at > now()))"
+        ).execute(self.pool()).await?;
         Ok(r1.rows_affected() + r2.rows_affected())
     }
 
