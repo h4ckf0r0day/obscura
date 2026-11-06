@@ -1,21 +1,19 @@
 # F5_TWO_WORKER_TAKEOVER_EVIDENCE
 
-## Status
-Process-level harness tests: 4/4 PASS (graceful termination, forced termination idempotent, cancellation isolation, multi-worker shutdown).
-DB-level fencing: 6/6 PASS (real PostgreSQL).
-Scheduler: 3/3 PASS (real PostgreSQL + NATS).
-Worker agent E2E: PASS (single worker, job completed).
+## Status: PARTIALLY VERIFIED
 
-## Process Termination
-- test_process_graceful_termination: PASS
-- test_process_forced_termination_idempotent: PASS
-- test_cancellation_isolation: PASS
-- test_shutdown_cleans_multiple: PASS
+### Verified
+- DB-level fencing: 6/6 tests PASS (real PostgreSQL)
+- Scheduler: 3/3 tests PASS (real PostgreSQL + NATS)
+- Supervisor process lifecycle: 4/4 tests PASS (no Docker)
+- Worker agent E2E: PASS (single worker, job completed)
+- Multi-worker coexistence: VERIFIED (2 agents, job completed)
+- NATS multi-worker consumer isolation: IMPLEMENTED
 
-## Two-Worker Takeover
-- BLOCKED: Requires 2 worker agents with unique consumer names (hardcoded "worker-agent").
+### Blocked
+- Process-level termination on lease loss (child PID reaping): no integration harness
+- Two-worker stale-result rejection E2E: requires 2 worker agents + real browser
+- Full adversarial pipeline with ownership takeover: requires multi-process harness
+- Worker agent crash recovery: not tested
 
-## Full Adversarial E2E
-- BLOCKED: Requires multi-process orchestration.
-
-## F5 Status: PARTIALLY RESOLVED
+### F5 Status: PARTIALLY RESOLVED
