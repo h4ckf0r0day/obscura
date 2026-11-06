@@ -1219,3 +1219,78 @@ mod f5_adversarial_tests {
         assert!(result.is_err(), "duplicate dispatch should fail");
     }
 }
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_capacity_normal_assignment() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant(&format!("cap-tenant-{}", uuid::Uuid::new_v4())).await.expect("tenant");
+        let worker = cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
+
+        let job = cp.submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("cap-key"), 3).await.unwrap();
+        let claimed = cp.claim_pending_job().await.unwrap().unwrap();
+        let token = cp.mark_dispatched(claimed.job_id, tenant.tenant_id, worker, Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+
+        let w = cp.list_healthy_workers(Some(tenant.tenant_id)).await.unwrap();
+        let wr = w.iter().find(|x| x.worker_id == worker).unwrap();
+        assert_eq!(wr.active_jobs, 1);
+
+        // complete
+        cp.complete_job(&Principal::service("test"), claimed.job_id, tenant.tenant_id, claimed.execution_attempt_id.unwrap_or(Uuid::new_v4()), token, serde_json::json!({})).await.unwrap();
+        let w = cp.list_healthy_workers(Some(tenant.tenant_id)).await.unwrap();
+        let wr = w.iter().find(|x| x.worker_id == worker).unwrap();
+        assert_eq!(wr.active_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn test_capacity_cancel_decrements() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant(&format!("cap-cancel-{}", uuid::Uuid::new_v4())).await.expect("tenant");
+        let worker = cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
+
+        let job = cp.submit_job_internal(tenant.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("cap-cancel-key"), 3).await.unwrap();
+        let claimed = cp.claim_pending_job().await.unwrap().unwrap();
+        cp.mark_dispatched(claimed.job_id, tenant.tenant_id, worker, Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+
+        let principal = Principal { subject: "admin".into(), tenant_id: None, is_admin: true, is_worker: false };
+        cp.cancel_job(&principal, claimed.job_id, tenant.tenant_id).await.unwrap();
+
+        let w = cp.list_healthy_workers(Some(tenant.tenant_id)).await.unwrap();
+        let wr = w.iter().find(|x| x.worker_id == worker).unwrap();
+        assert_eq!(wr.active_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn test_capacity_reconciliation() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant(&format!("cap-recon-{}", uuid::Uuid::new_v4())).await.expect("tenant");
+        let worker = cp.register_worker(Some(tenant.tenant_id), serde_json::json!({}), 4).await.unwrap();
+
+        // Manually inflate active_jobs
+        sqlx::query("UPDATE workers SET active_jobs = 99 WHERE worker_id = $1")
+            .bind(worker).execute(cp.pool()).await.unwrap();
+
+        // Reconcile
+        let affected = cp.reconcile_worker_capacity().await.unwrap();
+        assert!(affected >= 1);
+
+        let w = cp.list_healthy_workers(Some(tenant.tenant_id)).await.unwrap();
+        let wr = w.iter().find(|x| x.worker_id == worker).unwrap();
+        assert_eq!(wr.active_jobs, 0);
+    }
+}
