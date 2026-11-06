@@ -2,19 +2,30 @@
 
 ## F5 Status: PARTIALLY RESOLVED
 
-### Verified (Real PostgreSQL + NATS + 2 Worker Agents)
-- DB-level fencing: 6/6 tests PASS (real PostgreSQL)
-- Scheduler: 3/3 tests PASS (real PostgreSQL + NATS)
+### Verified (Real PostgreSQL + NATS)
+- DB-level fencing: 6/6 tests PASS
+  - test_stale_token_rejected: PASS
+  - test_concurrent_lease_acquisition: PASS
+  - test_lease_expiry_and_renewal: PASS
+  - test_stale_completion_rejected_after_new_owner: PASS
+  - test_duplicate_dispatch_safe: PASS
+  - auth_tests::test_credential_auth: PASS
+- Scheduler: 3/3 tests PASS
+  - test_worker_selection_and_dispatch: PASS
+  - test_multi_scheduler_no_duplicate_claim: PASS
+  - test_cancel_and_failure: PASS
 - Supervisor process lifecycle: 4/4 tests PASS (no Docker)
+  - test_process_graceful_termination: PASS
+  - test_process_forced_termination_idempotent: PASS
+  - test_cancellation_isolation: PASS
+  - test_shutdown_cleans_multiple: PASS
 - Worker agent E2E: PASS (job completed through full pipeline)
-- Multi-scheduler: PASS (5 jobs, 2 schedulers, no duplicate claims)
-- NATS multi-worker consumer isolation: VERIFIED (2 worker agents started, both connected, job assigned to one worker, completed successfully)
-- Multi-worker coexistence: VERIFIED (2 agents registered as separate workers, both connected to NATS)
+- Multi-worker coexistence: VERIFIED (2 agents, job completed)
 
 ### Blocked
-- Process-level termination on lease loss (child PID reaping): not tested
-- Two-worker stale-result rejection E2E: not tested (requires forcing lease expiry with 2 agents)
-- Full adversarial pipeline with ownership takeover: not tested
+- Process-level termination on lease loss (child PID reaping): no integration harness
+- Two-worker stale-result rejection E2E: requires 2 worker agents + real browser
+- Full adversarial pipeline with ownership takeover: requires multi-process harness
 - Worker agent crash recovery: not tested
 
 ### Acceptance Criteria
@@ -25,8 +36,7 @@
 - [ ] Browser execution stops on ownership loss (not verified)
 - [x] Stale results rejected (DB-level tested)
 - [x] Duplicate dispatch safe (DB-level tested)
-- [x] Multi-worker coexistence verified (2 agents, job assigned + completed)
 - [ ] Adversarial E2E tests pass (BLOCKED)
 
 ## Verdict: PARTIALLY RESOLVED
-DB-level fencing, scheduler, process lifecycle, and single/multi-worker E2E verified. Process-level termination and adversarial ownership takeover remain BLOCKED.
+DB-level fencing and single-worker E2E verified. Process-level termination and E2E adversarial tests remain BLOCKED.
