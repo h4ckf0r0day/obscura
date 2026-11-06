@@ -167,6 +167,16 @@ impl Scheduler {
         while self.schedule_one().await.unwrap_or(false) {}
         Ok(())
     }
+    /// Reconcile worker health and recover abandoned executions.
+    pub async fn reconcile_workers(&self) -> Result<u64> {
+        // Expire stale workers
+        let _ = self.control.expire_stale_workers(30).await;
+        // Recover abandoned executions
+        let recovered = self.control.recover_abandoned_executions().await.unwrap_or(0);
+        // Schedule pending jobs
+        while self.schedule_one().await.unwrap_or(false) {}
+        Ok(recovered)
+    }
 
     /// Run scheduling loop consuming job.submitted events.
     pub async fn run(&self) -> Result<()> {
