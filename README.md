@@ -132,14 +132,28 @@ tar xzf obscura-aarch64-macos.tar.gz
 # macOS Intel
 curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
+```
 
-# Windows
-Download the `.zip` from the releases page and extract it manually.
+### Windows
+
+x86_64 Windows only (no 32-bit build).
+
+Download `obscura-x86_64-windows.zip` from
+[Releases](https://github.com/h4ckf0r0day/obscura/releases),
+extract it, and add the folder to your PATH. No C++ build tools are required.
+
+Alternatively, with [Scoop](https://scoop.sh/) installed:
+
+```powershell
+# Direct manifest install (available once this change merges to main):
+scoop install https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/scoop/obscura.json
 ```
 
 No Chrome, no Node.js, no dependencies. Release archives include both
-`obscura` and `obscura-worker`; keep them in the same directory for the
-parallel `scrape` command.
+`obscura` and `obscura-worker`: manual zip installs should keep both in
+the same directory for the parallel `scrape` command; scoop handles
+placement automatically (both binaries land in the app dir with shims
+on PATH).
 
 | Archive suffix | Rendering | Stealth transport |
 |----------------|-----------|-------------------|
@@ -147,6 +161,9 @@ parallel `scrape` command.
 | `-stealth` | Yes | Yes |
 | `-no-render` | No | No |
 | `-no-render-stealth` | No | Yes |
+
+The scoop install pulls the default variant (rendering, no stealth). For
+stealth on Windows, download the `-stealth` archive manually.
 
 Linux release builds target Ubuntu 22.04 so the downloaded binary remains
 usable on common LTS servers with glibc 2.35+.
