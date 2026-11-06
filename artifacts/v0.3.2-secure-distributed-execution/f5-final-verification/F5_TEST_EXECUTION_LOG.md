@@ -1,17 +1,18 @@
 # F5 Test Execution Log
 
 ## Environment
-- Docker daemon: UNSTABLE (intermittently unavailable)
-- PostgreSQL: Available when daemon up
-- NATS: Available when daemon up
+- Docker: Available (intermittently)
+- PostgreSQL: Available
+- NATS: Available
 
-## Tests Executed (when Docker available)
+## Tests Executed
 - cargo test -p obscura-control-plane: 6/6 PASS
 - cargo test -p obscura-scheduler: 3/3 PASS
-- Worker agent E2E: PASS (job completed)
+- Worker agent E2E: PASS (FINAL_STATUS=completed)
+- cargo check --workspace: PASS
 
 ## Tests Blocked
 - Process-level termination (no harness)
-- Two-worker stale-result E2E
-- Full adversarial pipeline E2E
+- Two-worker stale-result E2E (consumer name collision)
+- Full adversarial pipeline with ownership takeover
 - Worker agent crash recovery

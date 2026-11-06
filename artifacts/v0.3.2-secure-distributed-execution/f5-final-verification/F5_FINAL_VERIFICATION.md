@@ -2,16 +2,16 @@
 
 ## F5 Status: PARTIALLY RESOLVED
 
-### Verified (DB-level, real PostgreSQL)
-- 6 control-plane tests PASS (stale token, concurrent acquisition, expiry/renewal, stale completion, duplicate dispatch, credential auth)
-- 3 scheduler tests PASS (selection+dispatch, multi-scheduler, cancel+failure)
+### Verified
+- DB-level fencing: 6/6 tests PASS (real PG)
+- Scheduler: 3/3 tests PASS (real PG+NATS)
 - Worker agent E2E: PASS (job completed through full pipeline)
+- Multi-scheduler: PASS (no duplicate claims)
 
-### Blocked (Docker daemon unstable)
-- Process-level termination (child PID reaping)
-- Two-worker stale-result rejection E2E
-- Full adversarial pipeline E2E
-- Worker agent crash recovery
+### Blocked
+- Process-level termination (child PID reaping): not tested
+- Two-worker stale-result rejection E2E: not tested (consumer name collision)
+- Full adversarial pipeline with ownership takeover: not tested
 
 ### Acceptance Criteria
 - [x] Lease acquisition precedes execution
@@ -24,4 +24,3 @@
 - [ ] Adversarial E2E tests pass (BLOCKED)
 
 ## Verdict: PARTIALLY RESOLVED
-DB-level fencing verified. Process-level and E2E adversarial tests blocked by Docker daemon instability.

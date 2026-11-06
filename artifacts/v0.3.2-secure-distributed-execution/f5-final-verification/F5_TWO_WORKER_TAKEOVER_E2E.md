@@ -1,12 +1,11 @@
 # F5 Two-Worker Takeover E2E
 
-## Status: BLOCKED (Docker daemon unstable)
+## Status: BLOCKED (requires 2 worker agents with unique consumer names)
 
-## DB-Level Evidence (Verified)
-- test_stale_completion_rejected_after_new_owner: PASS (6/6 control-plane tests)
-- test_concurrent_lease_acquisition: PASS
-- test_duplicate_dispatch_safe: PASS
-- Stale token rejection: verified at DB level.
+## Evidence
+- Single-worker E2E verified: job completed.
+- Two-worker takeover: NOT TESTED (worker agent uses hardcoded consumer name "worker-agent"; second instance would conflict).
+- DB-level fencing: 6 tests PASS (stale token rejected, concurrent acquisition, etc.)
 
-## Process-Level Evidence
-- BLOCKED: Requires 2 worker agents + real browser + PG + NATS.
+## Recommendation
+- Make consumer name configurable per worker agent (env var) to support multiple agents.
