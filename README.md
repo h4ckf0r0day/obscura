@@ -138,20 +138,15 @@ tar xzf obscura-x86_64-macos.tar.gz
 
 x86_64 Windows only (no 32-bit build).
 
-Fresh machines: if you install from a bucket, you'll also need Git for
-Windows (`winget install --id Git.Git`). No C++ build tools or .NET
-required.
+Download `obscura-x86_64-windows.zip` from
+[Releases](https://github.com/h4ckf0r0day/obscura/releases),
+extract it, and add the folder to your PATH. No C++ build tools are required.
+
+Alternatively, with [Scoop](https://scoop.sh/) installed:
 
 ```powershell
-# Manual (works today): download the Windows .zip from the
-# releases page, extract it, and add the folder to your PATH.
-
-# Direct manifest install (available once this branch merges to main):
-scoop install https://github.com/h4ckf0r0day/obscura/raw/main/scoop/obscura.json
-
-# Once a public bucket hosts the manifest, point scoop at it once:
-scoop bucket add obscura-bucket <bucket-url>
-scoop install obscura
+# Direct manifest install (available once this change merges to main):
+scoop install https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/scoop/obscura.json
 ```
 
 No Chrome, no Node.js, no dependencies. Release archives include both
