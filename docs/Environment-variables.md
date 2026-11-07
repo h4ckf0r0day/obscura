@@ -81,6 +81,24 @@ Request timeout for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. W
 OBSCURA_FETCH_TIMEOUT_MS=15000 obscura serve
 ```
 
+### `OBSCURA_REQUEST_TIMEOUT_MS`
+
+Total time limit for each HTTP request the browser makes for a page: the document and every subresource, from connecting to the last body byte, on both the default and the stealth transport. Default 30000 (30 seconds); `0` removes the total limit. A document still arriving at the limit fails the navigation, and a subresource still arriving is dropped. Scripted `fetch()` and `XMLHttpRequest` keep their own total limit, `OBSCURA_FETCH_TIMEOUT_MS`. The navigation as a whole stays bounded by `OBSCURA_NAV_TIMEOUT_MS`.
+
+```bash
+OBSCURA_REQUEST_TIMEOUT_MS=70000 OBSCURA_NAV_TIMEOUT_MS=90000 obscura serve
+```
+
+### `OBSCURA_REQUEST_IDLE_TIMEOUT_MS`
+
+Stall limit for each HTTP request: how long connecting, waiting for the response headers, or waiting between two reads of the body may take. A response that keeps arriving is never cut by it. Unset or `0` means no stall limit (the default). It applies beside `OBSCURA_REQUEST_TIMEOUT_MS`, so to let slow responses finish while still failing silent ones, raise or remove the total limit and set this one:
+
+```bash
+OBSCURA_REQUEST_TIMEOUT_MS=0 OBSCURA_REQUEST_IDLE_TIMEOUT_MS=20000 OBSCURA_NAV_TIMEOUT_MS=90000 obscura serve
+```
+
+The `fetch` command's `--timeout` sets its navigation limit; raise it too when a request may take longer than 30 seconds.
+
 ### `OBSCURA_PROXY`
 
 Default proxy URL for `serve` and direct `obscura-worker` invocations.
