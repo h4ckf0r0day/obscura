@@ -15,6 +15,9 @@ tracing = "0.1"
 thiserror = "2"
 parking_lot = "0.12"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

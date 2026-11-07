@@ -4,7 +4,9 @@ use obscura_supervisor::{SupervisorConfig, WorkerPoolSupervisor};
 use obscura_worker::{WorkerCommand, WorkerRequest, NavigationWaitUntil, SessionConfig};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -47,6 +49,9 @@ async fn main() {
     let supervisor = WorkerPoolSupervisor::new(config);
     supervisor.start().await.expect("supervisor start");
 
+    // Job-scoped process handle registry
+    let job_handles: Arc<StdMutex<HashMap<Uuid, Arc<obscura_supervisor::SupervisedWorker>>>> = Arc::new(StdMutex::new(HashMap::new()));
+
     let consumer_name = std::env::var("NATS_CONSUMER_NAME")
         .unwrap_or_else(|_| format!("worker-agent-{}", worker_id));
     let consumer = NatsConsumer::create(nats.jetstream(), "OBScura_JOBS", &consumer_name)
@@ -73,7 +78,7 @@ async fn main() {
                                 };
                                 let _ = cp.update_job_fencing_token(dispatch.job_id, dispatch.tenant_id, fencing_token).await;
 
-                                // Pick a worker to track for cancellation
+                                // Pick a worker and register in job-scoped registry
                                 let worker = match supervisor.pick_least_loaded() {
                                     Ok(w) => w,
                                     Err(_) => {
@@ -81,6 +86,16 @@ async fn main() {
                                         continue;
                                     }
                                 };
+                                // Register job-scoped handle
+                                {
+                                    let mut reg = job_handles.lock().unwrap();
+                                    if reg.contains_key(&dispatch.job_id) {
+                                        // Duplicate dispatch; skip
+                                        let _ = msg.ack().await;
+                                        continue;
+                                    }
+                                    reg.insert(dispatch.job_id, worker.clone());
+                                }
 
                                 // ensure session exists
                                 let create_req = WorkerRequest {
@@ -141,6 +156,11 @@ async fn main() {
                                         let _ = cp.fail_job(&principal, dispatch.job_id, dispatch.tenant_id, dispatch.attempt_id, fencing_token, "LEASE_LOST", "ownership lost", true).await;
                                         tracing::warn!(job_id = %dispatch.job_id, "lease lost during execution; child killed");
                                     }
+                                }
+                                // Remove from registry after execution
+                                {
+                                    let mut reg = job_handles.lock().unwrap();
+                                    reg.remove(&dispatch.job_id);
                                 }
                             }
                         }

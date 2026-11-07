@@ -2646,6 +2646,7 @@ version = "0.2.0"
 name = "obscura-supervisor"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "obscura-telemetry",
  "obscura-worker",
  "parking_lot",

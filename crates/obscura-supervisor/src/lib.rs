@@ -142,6 +142,15 @@ impl SupervisedWorker {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // Create a new process group on Unix
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+
         let mut child_proc = cmd
             .spawn()
             .map_err(|e| SupervisorError::SpawnFailed(format!("Failed to spawn {resolved:?}: {e}")))?;
