@@ -3,6 +3,43 @@ target/
 __pycache__/
 *.pyc
 
+# Local dependencies and build outputs
+node_modules/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local logs, caches, and temporary test output
+*.log
+.cache/
+tmp/
+temp/
+test-results/
+playwright-report/
+
+# Browser profiles and downloaded browser caches
+browser-profile/
+browser-profiles/
+browser-cache/
+.cache/ms-playwright/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated captures and temporary documents
+screenshots/
+tmp-*.png
+tmp-*.pdf
+
 # SDK build artifacts
 sdk/typescript/node_modules/
 sdk/typescript/dist/
