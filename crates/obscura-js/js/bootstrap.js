@@ -4805,7 +4805,9 @@ class Element extends Node {
       // click path in input.rs, which already treats <input type=image> as a
       // submit button.
       if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
+        // The form owner, not the nearest ancestor: form="" and parser
+        // association can give a button to a form it is not inside.
+        const form = this.form || null;
         // A real submit-button click fires the cancelable submit event, so use
         // requestSubmit() (not the plain submit() method, which now bypasses it).
         if (form && typeof form.requestSubmit === 'function') {
@@ -5473,7 +5475,14 @@ class Element extends Node {
     }
     let p = this.parentNode;
     while (p && p.localName !== 'form') p = p.parentNode;
-    return p;
+    if (p || !_FORM_ATTRIBUTE_ELEMENTS.has(this.localName)) return p;
+    // No form ancestor: the parser may still have given this control to a
+    // form it closed early (a <form> misnested in a table). That owner holds
+    // while both stay in the same tree.
+    const owner = _domParse("parser_form_owner", this._nid);
+    if (owner === null) return null;
+    const form = _wrapEl(owner);
+    return form && form.getRootNode() === this.getRootNode() ? form : null;
   }
   // Label association, per the HTML labelable-elements list. Playwright's
   // getByLabel and its follow-label retargeting read these; without them a
@@ -5585,10 +5594,11 @@ class Element extends Node {
   // this one. Only an id can be named, so without one the subtree suffices.
   _ownedControls(selector) {
     const doc = this.ownerDocument;
-    const scope = this.getAttribute('id') && doc && doc.querySelectorAll ? doc : this;
-    // Common case: no form="" in scope and no nested form, so the owned
-    // controls are exactly the descendants and the per-control check is skipped.
-    if (!scope.querySelector('[form]') && !this.querySelector('form')) return this.querySelectorAll(selector);
+    const parserControls = _domParse("form_has_parser_controls", this._nid) === true;
+    const scope = (this.getAttribute('id') || parserControls) && doc && doc.querySelectorAll ? doc : this;
+    // Common case: no form="" in scope, no nested form and no parser-associated
+    // controls outside, so the owned controls are exactly the descendants.
+    if (!parserControls && !scope.querySelector('[form]') && !this.querySelector('form')) return this.querySelectorAll(selector);
     const candidates = scope.querySelectorAll(selector);
     const out = [];
     for (let i = 0; i < candidates.length; i++) {

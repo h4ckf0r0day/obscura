@@ -2374,6 +2374,16 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     };
 
     match cmd.as_str() {
+        "parser_form_owner" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.parser_form_owner(nid)
+                .map(|form| form.index().to_string())
+                .unwrap_or_else(|| "null".to_string())
+        }
+        "form_has_parser_controls" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.form_has_parser_controls(nid).to_string()
+        }
         "get_form_state" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
             dom.form_control_state(nid)
