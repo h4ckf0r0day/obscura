@@ -108,7 +108,7 @@ libraries wait for lifecycle events according to their own options.
 - `page.exposeFunction`
 - `page.content`, `page.title`, `page.url`
 - `page.screenshot` for viewport, clipped, and full-page capture
-- `page.pdf` for raster-backed print output
+- `page.pdf` for print output with embedded text and raster fallbacks
 - raw CDP `Page.startScreencast` with frame acknowledgements (`page.createCDPSession()`
   in Puppeteer; `context.newCDPSession(page)` in Playwright)
 
@@ -173,7 +173,8 @@ their non-table children.
 
 - Pages on one CDP connection serialize JavaScript work. Separate connections
   execute on separate threads.
-- PDF output is raster-backed; text is not selectable and tagged PDF,
-  headers/footers, outlines, and full CSS paged media are not implemented.
+- [PDF output](PDF-output.md) includes selectable text for supported text.
+  Some effects remain raster. Tagged PDF, headers/footers, outlines, and full
+  CSS paged media are not implemented.
 - Service workers, native media playback, some Web APIs, and long-tail CSS or
   compositor effects are still incomplete relative to Chromium.

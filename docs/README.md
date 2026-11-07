@@ -21,7 +21,7 @@ release versions may differ.
 
 Rendering and stealth are both first-class capabilities. Release builds
 support screenshots, scroll-aware layout, activity-driven CDP screencasting,
-and raster PDF export; stealth builds retain all of those surfaces while adding
+and PDF export; stealth builds retain all of those surfaces while adding
 the wreq/BoringSSL transport and browser-identity protections.
 
 ## Quickstart

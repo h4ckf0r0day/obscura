@@ -7180,7 +7180,14 @@ class Document extends Node {
       _dom('document_lifecycle', 'DOMContentLoaded');
       const complete = () => {
         if (generation !== this._writeGeneration) return;
-        if (__dynLoadDelayingPending > 0) { setTimeout(complete, 1); return; }
+        // Parser images are otherwise loaded on observation. Start every eager
+        // request before checking readiness so they load concurrently, and do
+        // not emit document load until either decoding or failure completes.
+        let imagesPending = false;
+        for (const image of this.querySelectorAll('img')) {
+          if (image.loading !== 'lazy' && !image.complete) imagesPending = true;
+        }
+        if (__dynLoadDelayingPending > 0 || imagesPending) { setTimeout(complete, 1); return; }
         _dom('performance_lifecycle', 'domComplete');
         globalThis.__documentReadyState__ = 'complete';
         this.dispatchEvent(new Event('readystatechange'));
@@ -7522,7 +7529,7 @@ class HTMLImageElement extends Element {
   set srcset(value) { this.setAttribute("srcset", value); }
   get sizes() { return this.getAttribute("sizes") || ""; }
   set sizes(value) { this.setAttribute("sizes", value); }
-  get loading() { return this.getAttribute("loading") || "eager"; }
+  get loading() { return (this.getAttribute("loading") || "").toLowerCase() === "lazy" ? "lazy" : "eager"; }
   set loading(value) { this.setAttribute("loading", value); }
   get decoding() { return this.getAttribute("decoding") || "auto"; }
   set decoding(value) { this.setAttribute("decoding", value); }
@@ -7616,7 +7623,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(this._nid >>> 0, _realmFrameId)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -7640,7 +7647,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {

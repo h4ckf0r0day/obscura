@@ -53,6 +53,13 @@ static MONO_O: &[u8] = include_bytes!("../assets/liberation-mono-oblique.ttf");
 static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.ttf");
 static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
 static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
+// Only these immutable, bundled programs enter the PDF subsetter. Font
+// names and metadata supplied by a page are not a trust signal.
+pub(crate) fn is_bundled_print_font(data: &[u8]) -> bool {
+    [SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO,
+        MONO_R, MONO_B, MONO_O, MONO_BO, SYSTEM_R, SYSTEM_B]
+        .into_iter().any(|font| std::ptr::eq(data, font))
+}
 static EMOJI_R: &[u8] = include_bytes!("../assets/noto-color-emoji.ttf");
 #[cfg(test)]
 static FALLBACK: &[u8] = SYSTEM_R;
@@ -3676,6 +3683,84 @@ impl TextEngine {
             raster_scale,
             false,
         );
+    }
+
+    /// Capture the same shaped glyphs used by paint. An unsupported item is
+    /// left intact for the raster painter, including its complete decorations.
+    pub(crate) fn print_item(
+        &mut self,
+        idx: usize,
+        offset: (f32, f32),
+        clip_override: Option<Rect>,
+        width: u32,
+        height: u32,
+        print_economy: bool,
+    ) -> Option<(Vec<crate::PrintCluster>, Option<Rect>)> {
+        let item = self.items.get(idx)?;
+        let clip = clip_override.or(item.clip);
+        if !inline_item_may_intersect_surface(item, offset, clip, height, 1.0) {
+            return Some((Vec::new(), clip));
+        }
+        if item.marker.is_some() || !item.clip_fills.is_empty() { return None; }
+        let origin = (item.origin.0 + offset.0, item.origin.1 + offset.1);
+        let starts = item.owner_text.as_deref()
+            .filter(|_| !item.relative_owner_ranges.is_empty() || !item.boundary_events.is_empty())
+            .map(|source| source_line_starts(&item.buffer, source)).unwrap_or_default();
+        let surface = Rect { x: 0.0, y: 0.0, width: width as f32, height: height as f32 };
+        let visible = match clip { Some(c) => c.intersect(&surface)?, None => surface };
+        let mut clusters: Vec<crate::PrintCluster> = Vec::new();
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            let line_offset = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            let source_start = starts.get(run.line_i).copied().unwrap_or(0);
+            let source_end = source_start + run.text.len();
+            let alignment = line_edge_alignment_shift(item, source_start, source_end);
+            let mut prior_range = None;
+            for g in run.glyphs {
+                if g.metadata & META_DECORATIONS != 0 || metadata_fill(g.metadata).is_some()
+                    || g.font_is_variable || !g.cache_key_flags.is_empty() { return None; }
+                let mut color = g.color_opt.map(|c| [c.r(), c.g(), c.b(), c.a()])
+                    .unwrap_or([0, 0, 0, 255]);
+                if color[3] == 0 { continue; }
+                if color[3] != 255 { return None; }
+                if print_economy { color = crate::paint::print_economy_color(color); }
+                let font = self.font_system.get_font(g.font_id)?;
+                if !crate::PrintFont::supported(&font) { return None; }
+                let mut relative = glyph_relative_offset(&item.relative_owner_ranges, source_start, g.start, g.end);
+                relative.0 += alignment + line_advance_before_text(item, source_start + g.start, source_start, source_end);
+                let x = origin.0 + g.x + g.font_size * g.x_offset + line_offset + relative.0;
+                let y = origin.1 + run.line_y + g.y - g.font_size * g.y_offset + relative.1;
+                if ![x, y, g.font_size].iter().all(|v| v.is_finite()) || g.font_size <= 0.0 { return None; }
+                let face = font.rustybuzz();
+                if let Some(bounds) = face.glyph_bounding_box(cosmic_text::ttf_parser::GlyphId(g.glyph_id)) {
+                    let scale = g.font_size / face.units_per_em() as f32;
+                    let ink = Rect { x: x + bounds.x_min as f32 * scale,
+                        y: y - bounds.y_max as f32 * scale,
+                        width: (bounds.x_max as f32 - bounds.x_min as f32) * scale,
+                        height: (bounds.y_max as f32 - bounds.y_min as f32) * scale };
+                    if ink.intersect(&visible).is_none() { continue; }
+                } else {
+                    let advance = Rect { x, y: y - g.font_size,
+                        width: g.w.max(1.0), height: g.font_size };
+                    if advance.intersect(&visible).is_none() { continue; }
+                }
+                count += 1;
+                if count > 1_000_000 { return None; }
+                let range = (g.start, g.end);
+                if prior_range != Some(range) {
+                    let text = run.text.get(g.start..g.end)?;
+                    bytes = bytes.saturating_add(text.len());
+                    if bytes > 16 * 1024 * 1024 { return None; }
+                    clusters.push(crate::PrintCluster { text: text.to_owned(), glyphs: Vec::new() });
+                    prior_range = Some(range);
+                }
+                clusters.last_mut()?.glyphs.push(crate::PrintGlyph {
+                    font: crate::PrintFont(font), id: g.glyph_id, size: g.font_size, x, y, color,
+                });
+            }
+        }
+        Some((clusters, clip))
     }
 
     pub(crate) fn paint_item_with_clip_mask_scaled_for_print(
