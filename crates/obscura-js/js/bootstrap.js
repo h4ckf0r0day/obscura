@@ -8066,6 +8066,28 @@ Object.defineProperty(globalThis, 'location', {
   enumerable: true,
 });
 
+// `window.origin` / bare `origin` is a real global, not just location.origin.
+// Code that references the bare identifier (e.g. Quasar's boot sequence)
+// throws ReferenceError if it's missing entirely, same failure mode as the
+// missing FileList global. Tracks the current page like location.origin does,
+// via a getter rather than a snapshot taken once at bootstrap time.
+Object.defineProperty(globalThis, 'origin', {
+  get() { return globalThis.location.origin; },
+  // [Replaceable]: `origin` is a replaceable Window attribute in browsers, not
+  // a read-only accessor. Headless Chrome's descriptor is configurable with a
+  // setter, and `origin = "x"` succeeds (shadowing it with an own data
+  // property) even in strict-mode page code. Mirror that here, matching the
+  // same pattern used for `window.event` and `window.scheduler`, so framework
+  // bootstrap that assigns to it does not throw.
+  set(value) {
+    Object.defineProperty(globalThis, 'origin', {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  },
+  configurable: true,
+  enumerable: true,
+});
+
 globalThis.window = globalThis;
 globalThis.self = globalThis;
 globalThis.top = globalThis;

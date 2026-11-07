@@ -162,3 +162,97 @@ async fn assignment_shadows_window_named_element_property() {
     assert_eq!(val["writable"], true);
     assert_eq!(val["hasGetter"], false);
 }
+
+// `window.origin` (and the bare `origin` identifier) is a real Window global,
+// not just `location.origin`. Code that reads the bare identifier (e.g.
+// Quasar's boot sequence) throws ReferenceError if it is missing. Chrome
+// exposes it as a replaceable accessor: the descriptor is configurable with a
+// getter and a setter, and `origin = "x"` succeeds (shadowing it with an own
+// data property) even in strict-mode page code. These guard that shape.
+#[tokio::test(flavor = "current_thread")]
+async fn window_origin_is_a_bare_global_mirroring_location_origin() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(function () {
+            // Bare identifier resolution: no `window.` qualifier.
+            const bare = origin;
+            return JSON.stringify({
+                bareResolves: bare === location.origin,
+                windowSame: window.origin === location.origin,
+                globalThisSame: globalThis.origin === location.origin,
+                nonEmpty: typeof bare === 'string' && bare.length > 0,
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["bareResolves"], true, "bare `origin` must resolve to location.origin");
+    assert_eq!(val["windowSame"], true);
+    assert_eq!(val["globalThisSame"], true);
+    assert_eq!(val["nonEmpty"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn window_origin_descriptor_is_a_replaceable_accessor() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(function () {
+            const d = Object.getOwnPropertyDescriptor(window, 'origin');
+            return JSON.stringify({
+                configurable: d.configurable,
+                enumerable: d.enumerable,
+                hasGetter: typeof d.get === 'function',
+                hasSetter: typeof d.set === 'function',
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    // Headless Chrome parity: configurable accessor with both a getter and a
+    // setter. A non-configurable getter-only property (the previous shape)
+    // makes strict-mode assignment throw and blocks redefinition.
+    assert_eq!(val["configurable"], true, "origin must be configurable, like Chrome");
+    assert_eq!(val["enumerable"], true);
+    assert_eq!(val["hasGetter"], true);
+    assert_eq!(val["hasSetter"], true, "origin must have a setter so assignment does not throw");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assigning_window_origin_shadows_it_in_strict_mode() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(
+        &mut ctx,
+        2,
+        r#"(function () {
+            'use strict';
+            const before = origin;
+            // In a getter-only world this assignment throws
+            // "Cannot set property origin ... which has only a getter".
+            origin = 'override';
+            const d = Object.getOwnPropertyDescriptor(window, 'origin');
+            return JSON.stringify({
+                beforeWasLocationOrigin: before === location.origin,
+                value: window.origin,
+                bareValue: origin,
+                writable: d.writable === true,
+                hasGetter: typeof d.get === 'function',
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let val = serde_json::from_str::<Value>(v["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(val["beforeWasLocationOrigin"], true);
+    // Replaceable: assignment succeeds and shadows the accessor with a writable
+    // data property, matching window.event / window.scheduler.
+    assert_eq!(val["value"], "override");
+    assert_eq!(val["bareValue"], "override");
+    assert_eq!(val["writable"], true);
+    assert_eq!(val["hasGetter"], false, "assignment must replace the accessor with a data property");
+}
