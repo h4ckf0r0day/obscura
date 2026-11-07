@@ -8066,6 +8066,30 @@ Object.defineProperty(globalThis, 'location', {
   enumerable: true,
 });
 
+// Window.origin is replaceable and reads the document origin, including
+// inherited about:blank/srcdoc origins, rather than a pending navigation URL.
+const _windowOriginDescriptor = Object.getOwnPropertyDescriptor({
+  get origin() {
+    if (this === globalThis) return _realmOrigin();
+    const get = _documentRealmMember(this, 'windowOrigin');
+    if (get) return get.call(this);
+    throw new TypeError('Illegal invocation');
+  },
+  set origin(value) {
+    if (this !== globalThis) {
+      const set = _documentRealmMember(this, 'setWindowOrigin');
+      if (set) return set.call(this, value);
+      throw new TypeError('Illegal invocation');
+    }
+    Object.defineProperty(this, 'origin', {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  },
+}, 'origin');
+_markNative(_windowOriginDescriptor.get);
+_markNative(_windowOriginDescriptor.set);
+Object.defineProperty(globalThis, 'origin', _windowOriginDescriptor);
+
 globalThis.window = globalThis;
 globalThis.self = globalThis;
 globalThis.top = globalThis;
@@ -17502,6 +17526,13 @@ if (!globalThis.crypto.subtle) {
       throw new DOMException(String((e && e.message) || e), "OperationError");
     }
   }
+  async function runOpAsync(fn) {
+    try { return await fn(); }
+    catch (e) {
+      if (e instanceof DOMException) throw e;
+      throw new DOMException(String((e && e.message) || e), "OperationError");
+    }
+  }
 
   // The JWK `alg` of an AES or HMAC key, or undefined for the others.
   function jwkAlg(key, bytes) {
@@ -17627,7 +17658,7 @@ if (!globalThis.crypto.subtle) {
         const hash = normalizeHash(alg.hash);
         const salt = toBytes(alg.salt);
         const iterations = alg.iterations >>> 0;
-        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
+        return bufferOf(await runOpAsync(() => __obscuraCore.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
       }
       if (alg.name === "HKDF") {
         const hash = normalizeHash(alg.hash);
@@ -18790,6 +18821,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['windowOrigin', _windowOriginDescriptor.get],
+  ['setWindowOrigin', _windowOriginDescriptor.set],
 ]));
 
 globalThis.__obscura_init_frames = function() {

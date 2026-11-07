@@ -5188,7 +5188,8 @@ mod tests {
 
     use super::read_body_capped;
     use super::url_set_inner;
-    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_derive, push_capped};
+    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_blocks, pbkdf2_can_inline, pbkdf2_derive,
+        pbkdf2_derive_with, validate_pbkdf2, CancelPbkdf2OnDrop, push_capped};
     use super::{intercept_fulfill_response, visible_response_headers};
     use base64::{Engine as _, engine::general_purpose::STANDARD as FULFILL_BASE64};
 
@@ -5473,6 +5474,76 @@ mod tests {
         let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+    #[test]
+    fn pbkdf2_bounds_the_combined_work_before_deriving() {
+        let error = validate_pbkdf2("SHA-1", PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES)
+            .expect_err("iteration and output caps alone must not permit unbounded work");
+        assert!(error.to_string().contains("work"), "{error}");
+        assert!(validate_pbkdf2("SHA-256", PBKDF2_MAX_ITERATIONS, 32).is_ok());
+        assert!(validate_pbkdf2("SHA-256", 0, 32).is_err());
+    }
+
+    #[test]
+    fn pbkdf2_native_fast_path_is_bounded_by_work_and_input_size() {
+        assert!(pbkdf2_can_inline(4096, 512, 512));
+        assert!(!pbkdf2_can_inline(4097, 8, 8));
+        assert!(!pbkdf2_can_inline(1, 512, 513));
+        assert!(!pbkdf2_can_inline(1, usize::MAX, 1));
+    }
+
+    #[test]
+    fn pbkdf2_cancelled_work_stops_even_with_few_or_no_output_blocks() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        for iterations in [1, 2, 4096, 4097, PBKDF2_MAX_ITERATIONS] {
+            for length in [0, 32, 65] {
+                let error = pbkdf2_derive_with(
+                    "SHA-256", b"password", b"salt", iterations, length, &cancelled,
+                ).expect_err("cancellation must be checked before every derivation");
+                assert!(error.to_string().contains("cancelled"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pbkdf2_block_boundary_checks_cancellation_below_the_round_interval() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut output = [7; 65];
+        assert!(!pbkdf2_blocks::<hmac::Hmac<sha2::Sha256>>(
+            b"password", b"salt", 1, &mut output, &cancelled,
+        ));
+        assert_eq!(output, [7; 65], "cancelled work must not start its first block");
+    }
+
+    #[test]
+    fn pbkdf2_blocks_match_existing_primitives_and_rfc6070() {
+        let derived = pbkdf2_derive("SHA-1", b"password", b"salt", 4096, 20).unwrap();
+        let hex: String = derived.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "4b007901b765489abead49d926f721d065a429c1");
+        for (hash, length) in [("SHA-1", 45), ("SHA-256", 70), ("SHA-384", 49), ("SHA-512", 130)] {
+            for iterations in [1, 2, 5000] {
+                let derived = pbkdf2_derive(hash, b"password", b"salt", iterations, length).unwrap();
+                let mut expected = vec![0; length as usize];
+                match hash {
+                    "SHA-1" => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-256" => pbkdf2::pbkdf2_hmac::<sha2::Sha256>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-384" => pbkdf2::pbkdf2_hmac::<sha2::Sha384>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-512" => pbkdf2::pbkdf2_hmac::<sha2::Sha512>(b"password", b"salt", iterations, &mut expected),
+                    _ => unreachable!(),
+                }
+                assert_eq!(derived, expected, "{hash}, iterations={iterations}, length={length}");
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_pbkdf2_waiter_signals_cancellation() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelPbkdf2OnDrop(cancelled.clone());
+        assert!(!cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        drop(guard);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // HKDF and the CSPRNG draw share the same DoS shape: both size an output
@@ -7227,24 +7298,24 @@ fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno
     parse_jwk(bytes)
 }
 
-/// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
-/// page JS drives this op on the single-threaded runtime: an unbounded
-/// iteration count pins the V8 isolate (blocking every other CDP command on the
-/// connection) and a huge output length forces an unbounded `vec![0u8; length]`
-/// allocation. Both caps sit far above any legitimate use — OWASP recommends
-/// ~600k iterations and derived keys are tens of bytes.
+/// Bound page-controlled PBKDF2 CPU work and output allocation. Normal derived
+/// keys use tens of bytes; each hash-sized output block repeats every round.
 const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
 const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+const PBKDF2_MAX_WORK: u64 = 1_000_000_000;
 
-/// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
-/// are unit-testable without the `#[op2]` wrapper.
-fn pbkdf2_derive(
+fn pbkdf2_can_inline(work: u64, password_length: usize, salt_length: usize) -> bool {
+    work <= 4096 && password_length.saturating_add(salt_length) <= 1024
+}
+
+fn validate_pbkdf2(
     hash: &str,
-    password: &[u8],
-    salt: &[u8],
     iterations: u32,
     length: u32,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+) -> Result<u64, deno_error::JsErrorBox> {
+    if iterations == 0 {
+        return Err(crypto_err("PBKDF2 iteration count must be positive"));
+    }
     if iterations > PBKDF2_MAX_ITERATIONS {
         return Err(crypto_err(format!(
             "PBKDF2 iteration count {iterations} exceeds the supported maximum of {PBKDF2_MAX_ITERATIONS}"
@@ -7255,29 +7326,137 @@ fn pbkdf2_derive(
             "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
         )));
     }
-    use pbkdf2::pbkdf2_hmac;
-    let mut dk = vec![0u8; length as usize];
-    match hash {
-        "SHA-1" => pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut dk),
-        "SHA-256" => pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut dk),
-        "SHA-384" => pbkdf2_hmac::<sha2::Sha384>(password, salt, iterations, &mut dk),
-        "SHA-512" => pbkdf2_hmac::<sha2::Sha512>(password, salt, iterations, &mut dk),
+    let block_length = match hash {
+        "SHA-1" => 20,
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
         _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    let work = u64::from(iterations) * u64::from(length).div_ceil(block_length);
+    if work > PBKDF2_MAX_WORK {
+        return Err(crypto_err(format!(
+            "PBKDF2 work of {iterations} iterations over {length} bytes exceeds the supported maximum of {PBKDF2_MAX_WORK}"
+        )));
+    }
+    Ok(work)
+}
+
+#[cfg(test)]
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    pbkdf2_derive_with(hash, password, salt, iterations, length, &cancelled)
+}
+
+fn pbkdf2_derive_with(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: u32,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    validate_pbkdf2(hash, iterations, length)?;
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crypto_err("PBKDF2 derivation was cancelled"));
+    }
+    let mut dk = vec![0u8; length as usize];
+    let completed = match hash {
+        "SHA-1" => pbkdf2_blocks::<hmac::Hmac<sha1::Sha1>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-256" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha256>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-384" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha384>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-512" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha512>>(password, salt, iterations, &mut dk, cancelled),
+        _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    if !completed {
+        return Err(crypto_err("PBKDF2 derivation was cancelled"));
     }
     Ok(dk)
 }
 
-/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+fn pbkdf2_blocks<M>(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    output: &mut [u8],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> bool
+where
+    M: hmac::Mac + hmac::digest::KeyInit + Clone,
+{
+    use std::sync::atomic::Ordering;
+    let prf = <M as hmac::digest::KeyInit>::new_from_slice(password)
+        .expect("HMAC accepts a key of any length");
+    for (index, block) in output.chunks_mut(<M as hmac::digest::OutputSizeUser>::output_size()).enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut mac = prf.clone();
+        mac.update(salt);
+        mac.update(&(index as u32 + 1).to_be_bytes());
+        let mut value = mac.finalize().into_bytes();
+        block.copy_from_slice(&value[..block.len()]);
+        for round in 1..iterations {
+            if round % 4096 == 0 && cancelled.load(Ordering::Relaxed) {
+                return false;
+            }
+            let mut mac = prf.clone();
+            mac.update(&value);
+            value = mac.finalize().into_bytes();
+            for (byte, next) in block.iter_mut().zip(value.iter()) {
+                *byte ^= next;
+            }
+        }
+    }
+    true
+}
+
+struct CancelPbkdf2OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelPbkdf2OnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn pbkdf2_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+        std::sync::Arc::new(tokio::sync::Semaphore::new((cores / 2).max(1)))
+    })
+}
+
+/// Keep large derivations off the page thread, retaining their permits until
+/// workers exit. Small bounded work avoids blocking-pool scheduling overhead.
 #[op2]
 #[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+async fn op_subtle_pbkdf2(
+    #[string] hash: String,
+    #[buffer(copy)] password: Vec<u8>,
+    #[buffer(copy)] salt: Vec<u8>,
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    pbkdf2_derive(hash, password, salt, iterations, length)
+    let work = validate_pbkdf2(&hash, iterations, length)?;
+    if pbkdf2_can_inline(work, password.len(), salt.len()) {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        return pbkdf2_derive_with(&hash, &password, &salt, iterations, length, &cancelled);
+    }
+    let slot = pbkdf2_slots().clone().acquire_owned().await
+        .map_err(|error| crypto_err(format!("PBKDF2 unavailable: {error}")))?;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelPbkdf2OnDrop(cancelled.clone());
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        pbkdf2_derive_with(&hash, &password, &salt, iterations, length, &cancelled)
+    }).await.map_err(|error| crypto_err(format!("PBKDF2 task failed: {error}")))?
 }
 
 /// Generous DoS backstop on HKDF output length. HKDF itself rejects output
