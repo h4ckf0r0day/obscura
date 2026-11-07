@@ -137,6 +137,16 @@ The noninteractive dialog defaults dismiss `confirm()` (`false`), cancel
 do not emit client-controlled CDP dialogs. `Page.handleJavaScriptDialog`
 continues to resolve the separate beforeunload confirmation from `Page.close`.
 
+`HTMLTableElement.rows` is a live, read-only HTMLCollection. Native traversal
+orders header rows first, body/direct rows next, and footer rows last, excluding
+nested tables and foreign namespaces. Reads reuse the collection until a DOM
+mutation invalidates its row snapshot. This also supports Playwright's implicit
+table-header role calculation; it does not add the other missing table APIs.
+Wrapper classification keeps canonical HTML names on a single scalar native
+read; prefixed or foreign names include namespace/local-name metadata in that
+same read. Table construction and parser/wrapper workloads are covered by the
+public performance smoke gate.
+
 `window.origin` (including the bare `origin` identifier) reports the owning
 document's origin, including inherited blank-frame origins. Page assignment
 replaces this property without changing the document's actual origin.

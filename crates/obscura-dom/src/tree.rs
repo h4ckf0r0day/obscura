@@ -1277,6 +1277,38 @@ impl DomTree {
         result
     }
 
+    /// HTML table rows: header sections first, body/direct rows in tree order,
+    /// and footer sections last. Nested tables do not contribute rows.
+    pub fn table_rows(&self, table: NodeId) -> Option<Vec<NodeId>> {
+        let html_tag = |id| self.with_node(id, |node| {
+            node.as_element().filter(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            }).map(|name| name.local.clone())
+        }).flatten();
+        if html_tag(table).as_ref().map(|tag| tag.as_ref()) != Some("table") {
+            return None;
+        }
+        let mut head = Vec::new();
+        let mut body = Vec::new();
+        let mut foot = Vec::new();
+        for child in self.children(table) {
+            let Some(tag) = html_tag(child) else { continue };
+            let rows = match tag.as_ref() {
+                "tr" => { body.push(child); continue; }
+                "thead" => &mut head,
+                "tbody" => &mut body,
+                "tfoot" => &mut foot,
+                _ => continue,
+            };
+            rows.extend(self.children(child).into_iter().filter(|row| {
+                html_tag(*row).as_ref().map(|tag| tag.as_ref()) == Some("tr")
+            }));
+        }
+        head.extend(body);
+        head.extend(foot);
+        Some(head)
+    }
+
     /// Snapshot the direct children of `host`'s shadow root. Ordinary
     /// `children(host)` continues to return only light children.
     pub fn shadow_children(&self, host: NodeId) -> Option<Vec<NodeId>> {
@@ -2044,6 +2076,38 @@ mod tests {
             template_contents: None,
             mathml_annotation_xml_integration_point: false,
         })
+    }
+
+    #[test]
+    fn table_rows_order_sections_and_exclude_nested_or_foreign_rows() {
+        let tree = DomTree::new();
+        let table = element(&tree, "table");
+        let mut expected = Vec::new();
+        for tag in ["tfoot", "tbody", "thead"] {
+            let section = element(&tree, tag);
+            tree.append_child(table, section);
+            let row = element(&tree, "tr");
+            tree.append_child(section, row);
+            expected.push(row);
+        }
+        let direct = element(&tree, "tr");
+        tree.append_child(table, direct);
+        let nested = element(&tree, "table");
+        tree.append_child(expected[1], nested);
+        let nested_row = element(&tree, "tr");
+        tree.append_child(nested, nested_row);
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, Namespace::from("urn:foreign"), LocalName::from("tr")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(table, foreign);
+        assert_eq!(tree.table_rows(table), Some(vec![expected[2], expected[1], direct, expected[0]]));
+        assert_eq!(tree.table_rows(nested), Some(vec![nested_row]));
+        tree.append_child(table, expected[2]);
+        assert_eq!(tree.table_rows(table), Some(vec![expected[1], direct, expected[2], expected[0]]));
+        assert_eq!(tree.table_rows(foreign), None);
+        assert_eq!(tree.table_rows(NodeId::new(u32::MAX)), None);
     }
 
     #[test]

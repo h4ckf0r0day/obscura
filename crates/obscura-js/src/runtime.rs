@@ -4607,6 +4607,93 @@ impl Default for ObscuraJsRuntime {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn table_rows_are_live_ordered_readonly_collections() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const table = document.createElement('table');
+            document.body.append(table);
+            for (const [section, id] of [['tfoot','foot'],['tbody','body'],['thead','head']]) {
+                const group = document.createElement(section);
+                group.innerHTML = '<tr id="'+id+'"><td></td></tr>';
+                table.append(group);
+            }
+            const direct = document.createElement('tr');
+            direct.id = 'direct';
+            table.append(direct);
+            table.querySelector('td').innerHTML = '<table><tr id="nested"><td></td></tr></table>';
+            table.querySelector('thead').append(document.createElementNS('urn:foreign', 'tr'));
+            const rows = table.rows;
+            const initial = Array.from(rows, row => row.id);
+            const collection = [rows === table.rows, rows instanceof HTMLCollection,
+                Array.isArray(rows), Object.prototype.toString.call(rows),
+                rows.item(1).id, rows.namedItem('head').id, rows.head.id,
+                Object.keys(rows), 'head' in rows, rows.item(99)];
+            const writes = [Reflect.set(rows, '0', null), Reflect.set(rows, 'length', 0),
+                Reflect.defineProperty(rows, '1', {value:null}), Reflect.deleteProperty(rows, '0')];
+            rows.custom = 'expando';
+            const reflection = [Object.keys(rows), Object.getOwnPropertyNames(rows),
+                Reflect.deleteProperty(rows, '99')];
+            Object.defineProperty(rows, Symbol.toStringTag, {value:'CustomCollection', configurable:false});
+            reflection.push(Object.prototype.toString.call(rows));
+            table.querySelector('thead').textContent = '';
+            direct.id = 'renamed';
+            direct.setAttribute('name', 'alias');
+            const changed = [rows.length, rows[0].id, rows.renamed === direct,
+                rows.alias === direct, 'head' in rows, rows.head === undefined];
+            direct.id = '99';
+            const numericName = [Object.getOwnPropertyNames(rows).includes('99'),
+                rows[99] === undefined, rows.namedItem('99') === direct,
+                Reflect.deleteProperty(rows, '99')];
+            table.textContent = '';
+            return {initial, collection, writes, reflection, changed, numericName, empty:rows.length};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":["head","body","direct","foot"],
+            "collection":[true,true,false,"[object HTMLCollection]","body","head","head",
+                ["0","1","2","3"],true,null],
+            "writes":[false,false,false,false],
+            "reflection":[["0","1","2","3","custom"],
+                ["0","1","2","3","head","body","direct","foot","custom"],true,"[object CustomCollection]"],
+            "changed":[3,"body",true,true,false,true], "numericName":[true,true,true,true], "empty":0,
+        }));
+    }
+
+    #[test]
+    fn table_rows_preserve_factory_brands_and_reject_non_table_receivers() {
+        let mut rt = setup_runtime("<html><body><table><tr><th>Header</th></tr></table><h1>Heading</h1></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const parsed = document.querySelector('table');
+            const created = document.createElement('table');
+            const cloned = parsed.cloneNode(true);
+            const getter = Object.getOwnPropertyDescriptor(HTMLTableElement.prototype, 'rows').get;
+            const invalid = [document.createElement('div'), {},
+                document.createElementNS('urn:foreign', 'table')].map(value => {
+                try { getter.call(value); return false; } catch (error) { return error instanceof TypeError; }
+            });
+            let illegalConstructor = false;
+            try { new HTMLTableElement(); } catch (error) { illegalConstructor = error instanceof TypeError; }
+            return [parsed instanceof HTMLTableElement, created instanceof HTMLTableElement,
+                cloned instanceof HTMLTableElement, cloned.rows.length, parsed.rows.length,
+                document.querySelector('h1') instanceof HTMLTableElement, invalid, illegalConstructor,
+                HTMLTableElement.length, getter.name, getter.toString()];
+        })()"#).unwrap(), serde_json::json!([true,true,true,1,1,false,[true,true,true],true,
+            0,"get rows","function get rows() { [native code] }"]));
+    }
+
+    #[test]
+    fn table_rows_are_live_in_child_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><table><tr><th>Header</th></tr></table></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            const table = document.querySelector('table');
+            const rows = table.rows;
+            const branded = table instanceof HTMLTableElement && rows instanceof HTMLCollection;
+            table.querySelector('tbody').append(document.createElement('tr'));
+            return [branded, rows.length, table.cloneNode(true).rows.length];
+        })()"#).unwrap(), serde_json::json!([true,2,2]));
+    }
+
+    #[test]
     fn noninteractive_dialogs_do_not_accept_destructive_confirmation() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {
