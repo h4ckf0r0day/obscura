@@ -106,6 +106,23 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     Err("nodeId, backendNodeId, or objectId required".to_string())
 }
 
+async fn run_file_input_command(page: &mut Page, function: &str, object_id: Option<&str>,
+    specs: Value, validate_only: bool) -> Result<(), String> {
+    let specs = serde_json::to_string(&specs).map_err(|error| error.to_string())?;
+    let command = format!("function() {{ return ({function}).call(this, {specs}, {validate_only}); }}");
+    let result = page.call_function_on_for_cdp_with_timeout(&command, object_id,
+        &[], true, false, 30_000).await?;
+    if result.thrown {
+        return Err(format!("Could not set input files: {}", result.description));
+    }
+    match result.value.as_ref().and_then(Value::as_str) {
+        Some("ok") => Ok(()),
+        Some("missing") => Err("Could not find node with given id".into()),
+        Some("invalid") => Err("Node is not a file input element".into()),
+        _ => Err("Could not set files on the input element".into()),
+    }
+}
+
 /// Standard base64 (with padding). Used to ferry file bytes to the JS layer for
 /// DOM.setFileInputFiles without pulling in a dependency.
 fn encode_base64(input: &[u8]) -> String {
@@ -429,12 +446,39 @@ pub async fn handle(
             if !page.context.allow_file_access {
                 return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
             }
-            let node_id = resolve_node_id(page, params)?;
-            let paths: Vec<String> = params
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            let files = params.get("files").and_then(Value::as_array)
+                .ok_or("DOM.setFileInputFiles requires a files array")?;
+            let paths: Vec<&str> = files.iter().map(|file| file.as_str()
+                .ok_or_else(|| "DOM.setFileInputFiles requires string file paths".to_string()))
+                .collect::<Result<_, _>>()?;
+            // Keep remote handles intact: a child-frame node's numeric id
+            // belongs to its own DOM, not the page's root DOM.
+            let (object_id, receiver) = if params.get("nodeId").is_some()
+                || params.get("backendNodeId").is_some() {
+                let node_id = params.get("nodeId").or_else(|| params.get("backendNodeId"))
+                    .and_then(Value::as_u64).ok_or("valid nodeId or backendNodeId required")?;
+                let exists = u32::try_from(node_id).ok().and_then(|id| {
+                    page.with_dom(|dom| dom.get_node(NodeId::new(id)).is_some())
+                }).unwrap_or(false);
+                if !exists { return Err("Could not find node with given id".into()); }
+                (None, format!("globalThis._wrap({node_id})"))
+            } else {
+                let object_id = params.get("objectId").and_then(Value::as_str)
+                    .ok_or("nodeId, backendNodeId, or objectId required")?;
+                (Some(object_id), "this".to_string())
+            };
+            let function = format!(
+                "function(specs, validateOnly) {{\
+                    var el = {receiver};\
+                    if (!el || !el.nodeType) return 'missing';\
+                    var owner = el.ownerDocument && el.ownerDocument.defaultView || globalThis;\
+                    if (typeof owner.__obscura_setInputFiles !== 'function')\
+                        throw new Error('File input helper unavailable');\
+                    return owner.__obscura_setInputFiles(el, specs, validateOnly) === true\
+                        ? 'ok' : (validateOnly ? 'invalid' : 'failed');\
+                }}"
+            );
+            run_file_input_command(page, &function, object_id, json!([]), true).await?;
 
             let mut specs = Vec::with_capacity(paths.len());
             for p in &paths {
@@ -448,13 +492,7 @@ pub async fn handle(
                 specs.push(json!({ "name": name, "type": guess_mime(p), "b64": encode_base64(&bytes) }));
             }
 
-            let specs_json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
-            let code = format!(
-                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
-                 if (el && globalThis.__obscura_setInputFiles) {{ globalThis.__obscura_setInputFiles(el, {1}); return true; }} return false; }})()",
-                node_id, specs_json
-            );
-            let _ = page.evaluate(&code);
+            run_file_input_command(page, &function, object_id, json!(specs), false).await?;
             Ok(json!({}))
         }
         "getBoxModel" => {

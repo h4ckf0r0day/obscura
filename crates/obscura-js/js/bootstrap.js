@@ -11961,14 +11961,15 @@ function _emptyFileList() { return _makeFileList([]); }
 // Rust side. Real File objects (backed by the bytes) are created so page code can
 // read them via FileReader or upload them via fetch/FormData, then input+change
 // fire as a genuine selection would (issue #359).
-globalThis.__obscura_setInputFiles = function(el, specs) {
-  const files = (specs || []).map((s) => {
-    let bytes;
-    try {
-      const bin = atob(s.b64 || "");
-      bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    } catch (_e) { bytes = new Uint8Array(0); }
+globalThis.__obscura_setInputFiles = function(el, specs, validateOnly = false) {
+  if (!el || _cache.get(el._nid) !== el || !(el instanceof HTMLInputElement)
+      || (el.getAttribute('type') || '').toLowerCase() !== 'file') return false;
+  if (validateOnly) return true;
+  const selected = el.hasAttribute('multiple') ? (specs || []) : (specs || []).slice(0, 1);
+  const files = selected.map((s) => {
+    const bin = atob(s.b64 || "");
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new File([bytes], s.name || "", { type: s.type || "" });
   });
   el._files = _makeFileList(files);
@@ -11977,8 +11978,9 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   // trusted events; upload flows that gate their change handler on
   // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
   // ones, which would silently break the exact case this feature targets.
-  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
-  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
+  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true })));
+  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true })));
+  return true;
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
