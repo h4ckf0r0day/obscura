@@ -4994,6 +4994,11 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
+    // File values reflect the selected FileList, not the form-value cache.
+    if (tag === 'input' && (this.getAttribute('type') || '').toLowerCase() === 'file') {
+      // Chrome exposes a file input's value as C:\fakepath\<first filename>.
+      return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
+    }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     if (tag === 'textarea') return this.textContent;
@@ -5008,10 +5013,6 @@ class Element extends Node {
         // browser, not the empty string.
         const attr = this.getAttribute('value');
         return attr !== null ? attr : 'on';
-      }
-      if (itype === 'file') {
-        // Chrome exposes a file input's value as C:\fakepath\<first filename>.
-        return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
       }
     }
     return this.getAttribute("value") || "";
@@ -5044,6 +5045,17 @@ class Element extends Node {
         const optVal = attrV !== null ? attrV : opts[i].textContent;
         opts[i].selected = optVal === wanted;
       }
+      return;
+    }
+    if (tag === 'input' && (this.getAttribute('type') || '').toLowerCase() === 'file') {
+      // A page cannot select a local path using value. Empty/null clears silently.
+      const value = v === null ? '' : String(v);
+      if (value !== '') {
+        throw new DOMException("This input element accepts a filename, which may only be programmatically set to the empty string.", 'InvalidStateError');
+      }
+      this._files = _emptyFileList();
+      _formValues[this._nid] = '';
+      _dom("set_form_value", this._nid, '');
       return;
     }
     const value = String(v);
