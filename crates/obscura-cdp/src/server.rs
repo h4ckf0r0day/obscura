@@ -44,13 +44,15 @@ const MAX_PENDING_WS_HANDOFFS: usize = 128;
 // V8 isolates. `MAX_PENDING_WS_HANDOFFS` above bounds only the handoff queue —
 // connections that have already been handed off are unbounded without this.
 //
-// 128 matches the handoff bound and is well above any real client fan-out
-// (Playwright/Puppeteer use one connection per browser). Threads are what this
-// actually bounds: with arenas capped by `cap_malloc_arenas`, 128 idle
-// connections cost 146 threads, 33.2 GiB of reserved address space and 51 MiB
-// resident -- and nearly all of that 33.2 GiB is V8's process-wide sandbox,
-// which is there at zero connections. Override with `--max-connections`.
+// 128 matches the handoff bound and is well above normal client fan-out
+// (Playwright/Puppeteer use one connection per browser). This also bounds
+// per-connection native stack reservations and V8 isolates. Stack address
+// space is reserved rather than committed. Override with --max-connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+
+// Match the CLI's native stack so supported deep parser trees cannot abort
+// every connection during recursive layout, paint, or serialization.
+const CDP_CONN_STACK_BYTES: usize = 512 * 1024 * 1024;
 
 // How long shutdown waits for connection threads to finish before persisting
 // the cookie jar. Well under the 10s `docker stop` gives us before SIGKILL.
@@ -831,6 +833,7 @@ fn run_connection(
     let slot = live_connections.clone();
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
+        .stack_size(CDP_CONN_STACK_BYTES)
         .spawn(move || {
             let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
@@ -2699,6 +2702,135 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("connection and I/O threads must stop on socket close");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_survives_deep_parser_and_scripted_layouts() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::time::Duration;
+        use tokio::sync::Notify;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(1));
+        let live_server = live.clone();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let context = crate::dispatch::CdpContext::new().default_context;
+            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(Notify::new()), live_server);
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+        accept.await.unwrap();
+        ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget",
+            "params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+        let target_id = loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["id"] == 1 {
+                    break value["result"]["targetId"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        let session = format!("{target_id}-session");
+        let scripted = "(function(){document.body.textContent='';let parent=document.body;for(let i=0;i<1500;i++){const child=document.createElement('div');parent.appendChild(child);parent=child}parent.textContent='content';const r=document.body.getBoundingClientRect();return {height:r.height,nodes:document.querySelectorAll('div').length}})()";
+        for (index, (count, with_mutations)) in [(400, false), (10000, false), (1500, true)].into_iter().enumerate() {
+            let expression = if with_mutations {
+                scripted.to_string()
+            } else {
+                format!("(function(){{document.body.innerHTML='<div>'.repeat({count})+'content';const r=document.body.getBoundingClientRect();return {{height:r.height,nodes:document.querySelectorAll('div').length}}}})()")
+            };
+            let id = index + 2;
+            ws.send(Message::Text(json!({"id":id,"method":"Runtime.evaluate","sessionId":session,
+                "params":{"expression":expression,"returnByValue":true}}).to_string().into())).await.unwrap();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(20), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == id {
+                        assert!(value["error"].is_null(), "{value}");
+                        assert!(value["result"]["exceptionDetails"].is_null(), "{value}");
+                        assert_eq!(value["result"]["result"]["value"]["nodes"].as_u64(), Some(count), "{value}");
+                        assert!(value["result"]["result"]["value"]["height"].as_f64().unwrap() > 0.0, "{value}");
+                        break;
+                    }
+                }
+            }
+        }
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("deep-document connection must release its slot");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_page_tcp_resets_release_every_connection() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::time::Duration;
+        use tokio_tungstenite::{MaybeTlsStream, tungstenite::Message};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let live_server = live.clone();
+        let accept = tokio::spawn(async move {
+            let context = crate::dispatch::CdpContext::new().default_context;
+            for _ in 0..8 {
+                let (stream, _) = listener.accept().await.unwrap();
+                live_server.fetch_add(1, Ordering::AcqRel);
+                super::run_connection(stream.into_std().unwrap(), context.clone(), context.clone(),
+                    Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server.clone());
+            }
+        });
+        for _ in 0..8 {
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+            ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget",
+                "params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+            let target_id = loop {
+                let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == 1 {
+                        break value["result"]["targetId"].as_str().unwrap().to_string();
+                    }
+                }
+            };
+            ws.send(Message::Text(json!({"id":2,"method":"Runtime.evaluate",
+                "sessionId":format!("{target_id}-session"),
+                "params":{"expression":"requestAnimationFrame(function busy(){requestAnimationFrame(busy)});const channel=new MessageChannel();channel.port1.onmessage=()=>channel.port2.postMessage(null);channel.port2.postMessage(null);'armed'","returnByValue":true}})
+                .to_string().into())).await.unwrap();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == 2 {
+                        assert_eq!(value["result"]["result"]["value"], "armed", "{value}");
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Zero linger sends an RST without a WebSocket close handshake.
+            #[allow(deprecated)]
+            match ws.get_mut() {
+                MaybeTlsStream::Plain(stream) => stream.set_linger(Some(Duration::ZERO)).unwrap(),
+                _ => panic!("local ws connection unexpectedly used TLS"),
+            }
+            drop(ws);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while live.load(Ordering::Acquire) != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("busy disconnected page must release its connection");
+        }
+        accept.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

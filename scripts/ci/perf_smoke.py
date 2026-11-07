@@ -48,6 +48,16 @@ SCENARIOS = {
         200000,
     ),
 }
+SCENARIOS.update({
+    f"html-parse-depth-{depth}": (
+        "(function(){const html='<div>'.repeat(" + str(depth) + ")+"
+        "'text'+'</div>'.repeat(" + str(depth) + ");"
+        "for(let i=0;i<3;i++)document.body.innerHTML=html.repeat(60);"
+        "return document.querySelectorAll('div').length})()",
+        depth * 60,
+    )
+    for depth in (4, 32, 128, 300)
+})
 
 
 class Handler(BaseHTTPRequestHandler):
