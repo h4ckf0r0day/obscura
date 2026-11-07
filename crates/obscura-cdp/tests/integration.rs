@@ -42,6 +42,7 @@ integration_tests!(
     execution_context_pruned_on_navigation,
     file_navigation_gate,
     form_submit_method_bypasses_listener,
+    iframe_blob_src,
     iframe_event_dispatch,
     input_activation_author_accessors,
     input_key_event_escaping,
