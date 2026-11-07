@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::error::Error;
 #[cfg(feature = "stealth")]
 use std::sync::Arc;
-#[cfg(feature = "stealth")]
-use std::time::Duration;
 
 #[cfg(feature = "stealth")]
 use futures_util::StreamExt;
@@ -16,8 +14,10 @@ use url::Url;
 
 #[cfg(feature = "stealth")]
 use crate::client::{
-    cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
-    redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
+    cors_required, default_request_idle_timeout, default_request_timeout,
+    env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
+    redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer,
+    response_too_large,
     same_site_context, serialized_request_origin, validate_cors_response, validate_request_mode,
     validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
     ResourceRequest, Response, SsrfGuardResolver,
@@ -230,13 +230,19 @@ impl StealthHttpClient {
                     .allow_obsolete_multiline_headers_in_responses(true)
                     .build(),
             )
-            .timeout(Duration::from_secs(30))
             // SSRF guard: reject hostnames that resolve to a private/loopback
             // IP. Use the same opt-in as the `validate_url` calls below so
             // `--allow-private-network` reaches this transport (#793); the
             // resolver still honours OBSCURA_ALLOW_PRIVATE_NETWORK on its own.
             .dns_resolver(Arc::new(SsrfGuardResolver::new(allow_private_network)))
             .redirect(wreq::redirect::Policy::none());
+        // The same request limits as the reqwest transport (client.rs).
+        if let Some(total) = default_request_timeout() {
+            builder = builder.timeout(total);
+        }
+        if let Some(idle) = default_request_idle_timeout() {
+            builder = builder.read_timeout(idle).connect_timeout(idle);
+        }
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
         //

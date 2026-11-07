@@ -861,6 +861,38 @@ pub async fn read_reqwest_body_limited(
     Ok(body)
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// Total time one HTTP request may take, connect to the last body byte.
+/// `OBSCURA_REQUEST_TIMEOUT_MS`; `0` means no total limit. Applies to the
+/// document and every subresource the browser loads, on both transports.
+pub(crate) fn default_request_timeout() -> Option<Duration> {
+    request_timeout_from_env_value(std::env::var("OBSCURA_REQUEST_TIMEOUT_MS").ok().as_deref())
+}
+
+fn request_timeout_from_env_value(value: Option<&str>) -> Option<Duration> {
+    let milliseconds = value
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+    (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
+}
+
+/// How long one HTTP request may go without progress: until the response
+/// headers arrive, then between two body reads.
+/// `OBSCURA_REQUEST_IDLE_TIMEOUT_MS`; unset or `0` means no idle limit.
+pub(crate) fn default_request_idle_timeout() -> Option<Duration> {
+    request_idle_timeout_from_env_value(
+        std::env::var("OBSCURA_REQUEST_IDLE_TIMEOUT_MS").ok().as_deref(),
+    )
+}
+
+fn request_idle_timeout_from_env_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(Duration::from_millis)
+}
+
 pub struct ObscuraHttpClient {
     client: tokio::sync::OnceCell<Client>,
     proxy_url: Option<String>,
@@ -869,7 +901,10 @@ pub struct ObscuraHttpClient {
     pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    /// Total limit per request; `Duration::ZERO` means none.
     pub timeout: Duration,
+    /// Limit per request without progress; `None` means none.
+    pub idle_timeout: Option<Duration>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
     resource_loader: std::sync::Mutex<ResourceLoaderState>,
@@ -1152,7 +1187,8 @@ impl ObscuraHttpClient {
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            timeout: Duration::from_secs(30),
+            timeout: default_request_timeout().unwrap_or(Duration::ZERO),
+            idle_timeout: default_request_idle_timeout(),
             block_trackers: false,
             resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
             allow_private_network,
@@ -1172,7 +1208,6 @@ impl ObscuraHttpClient {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
-                .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
@@ -1180,6 +1215,16 @@ impl ObscuraHttpClient {
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
+
+            if !self.timeout.is_zero() {
+                builder = builder.timeout(self.timeout);
+            }
+            if let Some(idle) = self.idle_timeout {
+                // read_timeout covers the wait for the response headers and
+                // each body read after them, so a response that keeps
+                // arriving is never cut by it.
+                builder = builder.read_timeout(idle).connect_timeout(idle);
+            }
 
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
@@ -2963,6 +3008,54 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
+    async fn idle_timeout_cuts_a_silent_response() {
+        let (target, started) = hanging_fixture().await;
+        let mut client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client.timeout = Duration::ZERO;
+        client.idle_timeout = Some(Duration::from_millis(50));
+        let begin = std::time::Instant::now();
+        let fetch = client.fetch(&target);
+        let (_, result) = tokio::join!(started, fetch);
+        assert!(result.is_err());
+        assert!(begin.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_does_not_cut_a_response_that_keeps_arriving() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\n")
+                .await;
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let _ = stream.write_all(b"x").await;
+            }
+        });
+        let target = Url::parse(&format!("http://{address}/trickle")).unwrap();
+        let mut client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client.timeout = Duration::ZERO;
+        client.idle_timeout = Some(Duration::from_millis(200));
+        let response = client.fetch(&target).await.unwrap();
+        assert_eq!(response.body, b"xxxxxxxxxx");
+    }
+
+    #[tokio::test]
     async fn callbacks_fire_once_across_redirects() {
         let redirect = "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let (target, _) = http_fixture(vec![redirect.to_string(), ok_response("", "done")]).await;
@@ -3487,5 +3580,43 @@ mod file_access_tests {
         assert_eq!(client.fetch(&url).await.unwrap().body, b"local-secret");
         client.set_allow_file_access(false);
         assert!(client.fetch(&url).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod request_timeout_tests {
+    use super::{request_idle_timeout_from_env_value, request_timeout_from_env_value};
+    use std::time::Duration;
+
+    #[test]
+    fn request_timeout_environment_default_remains_thirty_seconds() {
+        assert_eq!(
+            request_timeout_from_env_value(None),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            request_timeout_from_env_value(Some("not-a-timeout")),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn request_timeout_environment_override_and_zero() {
+        assert_eq!(
+            request_timeout_from_env_value(Some("70000")),
+            Some(Duration::from_secs(70))
+        );
+        assert_eq!(request_timeout_from_env_value(Some("0")), None);
+    }
+
+    #[test]
+    fn request_idle_timeout_environment_default_is_none() {
+        assert_eq!(request_idle_timeout_from_env_value(None), None);
+        assert_eq!(request_idle_timeout_from_env_value(Some("not-a-timeout")), None);
+        assert_eq!(request_idle_timeout_from_env_value(Some("0")), None);
+        assert_eq!(
+            request_idle_timeout_from_env_value(Some("15000")),
+            Some(Duration::from_secs(15))
+        );
     }
 }
