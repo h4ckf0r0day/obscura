@@ -4603,6 +4603,47 @@ pub struct NonGeometricStyleCache {
     custom_properties: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
     ancestors: HashMap<NodeId, (Option<f32>, bool, bool, bool)>,
     path: Vec<NodeId>,
+    /// Ancestor filter for `path`, kept across reads so a document-order walk
+    /// pushes and pops one level per element instead of rebuilding the filter
+    /// from the root for every element.
+    matcher: obscura_dom::selector::Matcher,
+    /// Which `path` entries pushed a level onto `matcher` (elements do).
+    pushed: Vec<bool>,
+    /// Drop the styles of nodes that leave `path`, for a single document-order
+    /// read that never comes back to a finished branch.
+    retain_path_only: bool,
+}
+
+/// The inherited cascade state after one path node, as the root-to-node walk
+/// carries it to the next level.
+#[cfg(feature = "paint")]
+struct PathState {
+    props: std::rc::Rc<HashMap<String, String>>,
+    cell_padding: Option<f32>,
+    dark: bool,
+    color: Option<[u8; 4]>,
+    pointer_events: bool,
+    visibility_hidden: bool,
+    ancestor_display_none: bool,
+    parent_is_item_container: bool,
+    root: bool,
+}
+
+#[cfg(feature = "paint")]
+impl PathState {
+    fn root() -> Self {
+        Self {
+            props: std::rc::Rc::new(HashMap::new()),
+            cell_padding: None,
+            dark: false,
+            color: None,
+            pointer_events: false,
+            visibility_hidden: false,
+            ancestor_display_none: false,
+            parent_is_item_container: false,
+            root: true,
+        }
+    }
 }
 
 #[cfg(feature = "paint")]
@@ -4633,7 +4674,7 @@ impl NonGeometricStyleCache {
         Self {
             has_container_queries: sheet.has_container_queries(), sheet, viewport, quirks,
             styles: HashMap::new(), custom_properties: HashMap::new(), ancestors: HashMap::new(),
-            path: Vec::new(),
+            path: Vec::new(), matcher: tree.matcher(), pushed: Vec::new(), retain_path_only: false,
         }
     }
 
@@ -4652,50 +4693,111 @@ impl NonGeometricStyleCache {
         if self.ancestors.contains_key(&id) {
             return self.styles.get(&id);
         }
+        // In a document-order walk the parent ends the previous path, so the new
+        // path is that prefix plus `id`. Any other read rebuilds it from the root.
+        let parent = tree.with_node(id, |node| node.parent).flatten();
+        let (mut common, mut suffix) = match parent
+            .and_then(|parent| self.path.iter().rposition(|node| *node == parent))
+        {
+            Some(index) => (index + 1, vec![id]),
+            None => self.split_path(tree, id),
+        };
+        // The prefix passed this check when it joined the path.
+        if suffix.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)) {
+            return None;
+        }
+        self.truncate_path(common);
+        // The cached state of the last shared ancestor is what the walk from the
+        // root reached after it. Only elements are cached, so a path that shares
+        // just the document node starts over from the root.
+        let state = match common.checked_sub(1).map(|last| self.cached_state(self.path[last])) {
+            None => Some(PathState::root()),
+            Some(Some(state)) => Some(state),
+            Some(None) => None,
+        };
+        let state = match state {
+            Some(state) => state,
+            None => {
+                self.truncate_path(0);
+                (common, suffix) = self.split_path(tree, id);
+                PathState::root()
+            }
+        };
+        debug_assert_eq!(common, self.path.len());
+        if self.extend_path(tree, &suffix, state).is_none() {
+            self.reset(tree);
+            return None;
+        }
+        self.styles.get(&id)
+    }
+
+    /// `id`'s root-to-node path split at the length it shares with `self.path`.
+    fn split_path(&self, tree: &DomTree, id: NodeId) -> (usize, Vec<NodeId>) {
         let mut path = tree.ancestors(id);
         path.reverse();
         path.push(id);
-        if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)) {
-            return None;
-        }
-        // Completed branches need their computed values, not another retained
-        // copy of each inherited custom-property environment.
         let common = self.path.iter().zip(&path).take_while(|(old, new)| old == new).count();
-        for previous in self.path.drain(common..) {
+        let suffix = path.split_off(common);
+        (common, suffix)
+    }
+
+    /// Leave the first `len` path entries, popping the matcher levels and the
+    /// state of every node that leaves.
+    fn truncate_path(&mut self, len: usize) {
+        for (previous, pushed) in self.path.drain(len..).zip(self.pushed.drain(len..)) {
+            // Completed branches need their computed values, not another
+            // retained copy of each inherited custom-property environment.
             self.custom_properties.remove(&previous);
+            if self.retain_path_only {
+                self.styles.remove(&previous);
+                self.ancestors.remove(&previous);
+            }
+            if pushed {
+                self.matcher.pop_ancestor();
+            }
         }
-        self.path.extend_from_slice(&path[common..]);
-        let mut matcher = tree.matcher();
-        let mut props = std::rc::Rc::new(HashMap::new());
-        let mut cell_padding = None;
-        let mut dark = false;
-        let mut color = None;
-        let mut pointer_events = false;
-        let mut visibility_hidden = false;
+    }
+
+    fn cached_state(&self, node: NodeId) -> Option<PathState> {
+        let &(cell_padding, dark, ancestor_display_none, parent_is_item_container) =
+            self.ancestors.get(&node)?;
+        let style = self.styles.get(&node)?;
+        Some(PathState {
+            props: self.custom_properties.get(&node)?.clone(),
+            cell_padding,
+            dark,
+            color: style.color,
+            pointer_events: style.pointer_events_none.unwrap_or(false),
+            visibility_hidden: style.computed_visibility_hidden,
+            ancestor_display_none,
+            parent_is_item_container,
+            root: false,
+        })
+    }
+
+    /// After an unsupported dependency the path, matcher and caches may be
+    /// half updated; the next read starts from nothing.
+    fn reset(&mut self, tree: &DomTree) {
+        self.path.clear();
+        self.pushed.clear();
+        self.matcher = tree.matcher();
+        self.styles.clear();
+        self.custom_properties.clear();
+        self.ancestors.clear();
+    }
+
+    fn extend_path(&mut self, tree: &DomTree, suffix: &[NodeId], state: PathState) -> Option<()> {
+        let PathState {
+            mut props, mut cell_padding, mut dark, mut color, mut pointer_events,
+            mut visibility_hidden, mut ancestor_display_none, mut parent_is_item_container, mut root,
+        } = state;
         let shadow_sheets = HashMap::new();
         let mut timeline = crate::AnimationTimelineState::default();
-        let mut ancestor_display_none = false;
-        let mut parent_is_item_container = false;
-        let mut root = true;
-        for &node in &path {
-            if let Some(&(padding, scheme, hidden, item_container)) = self.ancestors.get(&node)
-                .filter(|_| self.custom_properties.contains_key(&node))
-            {
-                props = self.custom_properties.get(&node)?.clone();
-                cell_padding = padding;
-                dark = scheme;
-                ancestor_display_none = hidden;
-                parent_is_item_container = item_container;
-                let style = self.styles.get(&node)?;
-                color = style.color;
-                pointer_events = style.pointer_events_none.unwrap_or(false);
-                visibility_hidden = style.computed_visibility_hidden;
-                root = false;
-                matcher.push_ancestor(tree, node);
-                continue;
-            }
+        for &node in suffix {
+            self.path.push(node);
+            self.pushed.push(false);
             let (next_props, next_padding, next_dark, element) = cascade_node_style(
-                tree, node, &self.sheet, &self.sheet, &shadow_sheets, &mut matcher,
+                tree, node, &self.sheet, &self.sheet, &shadow_sheets, &mut self.matcher,
                 &mut self.styles, &mut self.custom_properties, &props, &mut None, self.quirks,
                 self.viewport, crate::AnimationSample::default(), &mut timeline,
                 cell_padding, dark, None, ancestor_display_none,
@@ -4704,7 +4806,8 @@ impl NonGeometricStyleCache {
             cell_padding = next_padding;
             dark = next_dark;
             if !element { continue; }
-            matcher.push_ancestor(tree, node);
+            self.matcher.push_ancestor(tree, node);
+            *self.pushed.last_mut()? = true;
             let style = self.styles.get_mut(&node)?;
             // Native-control normalization hides this input even against
             // author display declarations; no intrinsic geometry is needed.
@@ -4746,7 +4849,7 @@ impl NonGeometricStyleCache {
             }
             self.ancestors.insert(node, (cell_padding, dark, ancestor_display_none, parent_is_item_container));
         }
-        self.styles.get(&id)
+        Some(())
     }
 }
 
@@ -4766,15 +4869,13 @@ pub fn accessibility_styles_without_layout(
         crate::css::Stylesheet::parse_for_viewport_and_media(tree, &sources, viewport, media_type),
     ));
     let mut cascade = NonGeometricStyleCache::from_sheet(tree, viewport, sheet);
+    cascade.retain_path_only = true;
     let mut result = HashMap::new();
     for id in tree.descendants(tree.document()) {
         if !tree.with_node(id, |node| node.is_element()).unwrap_or(false) { continue; }
         let style = cascade.resolve_style(tree, id, "visibility")?;
         if style.animation_name.is_some() { return None; }
         result.insert(id, (style.display == crate::Display::None, style.visibility_hidden));
-        let path = &cascade.path;
-        cascade.styles.retain(|id, _| path.contains(id));
-        cascade.ancestors.retain(|id, _| path.contains(id));
     }
     Some(result)
 }
@@ -15719,6 +15820,54 @@ mod tests {
                     "completed sibling branches must not retain inherited custom-property maps");
             }
         }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn document_order_walk_matches_a_fresh_cascade_per_element() {
+        // A deep chain with side branches at several depths, so the walk pops
+        // more than one level at a time, over every inherited input the walk
+        // restores from its cache.
+        let mut body = String::new();
+        for i in 0..300 {
+            body.push_str(&format!("<div class=d{} id=n{i}>", i % 8));
+            if i % 25 == 0 {
+                body.push_str("<span class=side>s</span><input type=hidden><p><b>b</b></p>");
+            }
+        }
+        body.push('x');
+        body.push_str(&"</div>".repeat(300));
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body {{ --v: visible; color-scheme: dark; color: rgb(1, 2, 3) }}
+            .d0 {{ display:flex }} .d1 {{ display:grid; visibility:hidden }}
+            .d2 {{ display:contents; color: rgb(9, 9, 9) }}
+            .d3 {{ position:absolute; display:inline }}
+            .d4 {{ float:left; display:inline-block; visibility:var(--v); pointer-events:none }}
+            .d5 {{ --v: hidden; display:inline }} .d6 {{ visibility:visible; pointer-events:auto }}
+            .d7 {{ color: rgb(200, 0, 0) }} .side {{ visibility:visible }} b {{ display:none }}
+        </style><body>{body}<table><tr><td id=cell>c</td></tr></table></body>"#));
+        let viewport = (400.0, 200.0);
+        let sources = document_stylesheet_sources(&tree, viewport, crate::CssMediaType::Screen);
+        let sheet = std::sync::Arc::new(crate::css::Stylesheet::parse_for_viewport_and_media(
+            &tree, &sources, viewport, crate::CssMediaType::Screen,
+        ));
+        let mut walk = NonGeometricStyleCache::from_sheet(&tree, viewport, sheet.clone());
+        walk.retain_path_only = true;
+        let summary = |style: &crate::LayoutStyle| format!("{:?}", (
+            style.display, style.visibility_hidden, style.computed_visibility_hidden,
+            style.color, style.pointer_events_none, style.position,
+        ));
+        let mut checked = 0;
+        for id in tree.descendants(tree.document()) {
+            if !tree.with_node(id, |node| node.is_element()).unwrap_or(false) { continue; }
+            let walked = summary(walk.resolve_style(&tree, id, "visibility").unwrap());
+            let mut fresh = NonGeometricStyleCache::from_sheet(&tree, viewport, sheet.clone());
+            let expected = summary(fresh.resolve_style(&tree, id, "visibility").unwrap());
+            assert_eq!(walked, expected, "element {id:?}");
+            assert!(walk.styles.len() <= walk.path.len(), "the walk keeps only its current path");
+            checked += 1;
+        }
+        assert!(checked > 350, "{checked}");
     }
 
     #[cfg(feature = "paint")]

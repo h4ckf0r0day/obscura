@@ -250,6 +250,9 @@ struct Visibility {
 /// Names and visibility for one unchanged document, without AX node serialization.
 pub struct AccessibilityContext {
     visibility: HashMap<NodeId, Visibility>,
+    /// Inherited contenteditable state, filled in tree order like `visibility`
+    /// so a node never walks its ancestors (that was quadratic in tree depth).
+    editable: HashMap<NodeId, bool>,
     elements_by_id: HashMap<String, NodeId>,
     labels: HashMap<NodeId, Vec<NodeId>>,
 }
@@ -269,7 +272,7 @@ impl AccessibilityContext {
         if role.is_empty() { return None; }
         let mut result = json!({"backendDOMNodeId":id.raw(),"role":ax_value_role(role)});
         if let Some(name) = compute_name(dom, &node, self) { result["name"] = ax_value_string(&name); }
-        if let Some(value) = compute_value(dom, &node) { result["value"] = ax_value_string(&value); }
+        if let Some(value) = compute_value(dom, &node, self) { result["value"] = ax_value_string(&value); }
         let properties = compute_properties(dom, &node);
         if !properties.is_empty() { result["properties"] = json!(properties); }
         Some(result)
@@ -278,6 +281,7 @@ impl AccessibilityContext {
     fn new(dom: &DomTree, ids: &[NodeId], styles: &HashMap<NodeId, AccessibilityStyle>) -> Self {
         let mut context = Self {
             visibility: HashMap::new(),
+            editable: HashMap::new(),
             elements_by_id: HashMap::new(),
             labels: HashMap::new(),
         };
@@ -307,6 +311,14 @@ impl AccessibilityContext {
                     visibility_hidden: style.visibility_hidden.unwrap_or(parent.visibility_hidden),
                 },
             );
+            let parent_editable = node
+                .parent
+                .and_then(|id| context.editable.get(&id))
+                .copied()
+                .unwrap_or(false);
+            context
+                .editable
+                .insert(*id, contenteditable_keyword(&node).unwrap_or(parent_editable));
             if let Some(value) = node.get_attribute("id").filter(|value| !value.is_empty()) {
                 context
                     .elements_by_id
@@ -343,6 +355,18 @@ impl AccessibilityContext {
         self.visibility
             .get(&id)
             .is_some_and(|state| state.subtree_hidden || state.visibility_hidden)
+    }
+
+    /// Editable while its parent is not. A node outside the context's document
+    /// falls back to walking its own ancestors.
+    fn is_content_editing_host(&self, dom: &DomTree, node: &obscura_dom::Node) -> bool {
+        let editable = |id: NodeId| {
+            self.editable
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| is_effectively_contenteditable(dom, id))
+        };
+        editable(node.id) && node.parent.is_none_or(|parent| !editable(parent))
     }
 }
 
@@ -559,7 +583,11 @@ fn compute_name(dom: &DomTree, node: &obscura_dom::Node, context: &Accessibility
 }
 
 /// Compute the accessible value for a node (e.g., current input value).
-fn compute_value(dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
+fn compute_value(
+    dom: &DomTree,
+    node: &obscura_dom::Node,
+    context: &AccessibilityContext,
+) -> Option<String> {
     if let NodeData::Element { name, attrs, .. } = &node.data {
         let tag = name.local.as_ref();
         if tag == "input" || tag == "textarea" || tag == "select" {
@@ -575,7 +603,7 @@ fn compute_value(dom: &DomTree, node: &obscura_dom::Node) -> Option<String> {
                 .map(|a| a.value.clone());
         }
 
-        if is_content_editing_host(dom, node) {
+        if context.is_content_editing_host(dom, node) {
             return Some(dom.text_content(node.id));
         }
     }
@@ -615,13 +643,6 @@ fn is_effectively_contenteditable(dom: &DomTree, node_id: NodeId) -> bool {
         current = node.parent;
     }
     false
-}
-
-fn is_content_editing_host(dom: &DomTree, node: &obscura_dom::Node) -> bool {
-    is_effectively_contenteditable(dom, node.id)
-        && node
-            .parent
-            .is_none_or(|parent| !is_effectively_contenteditable(dom, parent))
 }
 
 /// Compute accessibility properties for a node.
