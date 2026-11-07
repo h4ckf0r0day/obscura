@@ -535,10 +535,12 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     bctx.set_allow_file_access(allow_file_access);
     let shared_ctx = Arc::new(bctx);
     // Persistence is deliberately separate from the connection template.
-    // Cookie deltas are merged here, but new connections always clone the
+    // Cookie and localStorage deltas are merged here, but new connections clone the
     // immutable startup snapshot and can never inherit another live client's
     // session state.
-    let persistence_ctx = Arc::new(shared_ctx.isolated_copy("persistence".to_string(), true));
+    let mut persistence = shared_ctx.connection_copy("persistence".to_string());
+    persistence.storage_dir = shared_ctx.storage_dir.clone();
+    let persistence_ctx = Arc::new(persistence);
     let persistence_lock = Arc::new(std::sync::Mutex::new(()));
 
     // One graceful-shutdown watcher for the whole server. It flips the accept
@@ -837,9 +839,10 @@ fn run_connection(
         .spawn(move || {
             let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(
-                context_template.isolated_copy("default".to_string(), true),
+                context_template.connection_copy("default".to_string()),
             );
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
+            let initial_local_storage = default_context.local_storage.isolated_snapshot();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -933,6 +936,11 @@ fn run_connection(
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
+                merge_local_storage_delta(
+                    &persistence_context.local_storage,
+                    &initial_local_storage,
+                    &persisted_context.local_storage,
+                );
                 persistence_context.save_storage();
             }
 
@@ -946,6 +954,13 @@ fn run_connection(
     if let Err(e) = spawned {
         error!("connection thread spawn failed: {}", e);
         live_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn merge_local_storage_delta(destination: &obscura_js::ops::OriginStorage,
+    initial: &obscura_js::ops::OriginStorage, current: &obscura_js::ops::OriginStorage) {
+    if !destination.merge_changes(initial, current) {
+        tracing::warn!("localStorage changes exceeded the persistent profile storage budget");
     }
 }
 
@@ -2421,6 +2436,41 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_storage_delta_does_not_discard_existing_values_when_profile_is_full() {
+        use obscura_js::ops::OriginStorage;
+        let origin = "https://app.test";
+        let initial = OriginStorage::default();
+        let current = initial.isolated_snapshot();
+        assert!(current.set(origin, "new".into(), "value".into()));
+        let destination = OriginStorage::default();
+        assert!(destination.load(origin, vec![("k".into(), "x".repeat(5 * 1024 * 1024 - 1))]));
+        super::merge_local_storage_delta(&destination, &initial, &current);
+        assert_eq!(destination.len(origin), 1);
+        assert_eq!(destination.key(origin, 0).as_deref(), Some("k"));
+        assert!(!destination.is_dirty());
+    }
+
+    #[test]
+    fn local_storage_delta_preserves_other_clients_values_and_key_order() {
+        use obscura_js::ops::OriginStorage;
+        let origin = "https://app.test";
+        let initial = OriginStorage::default();
+        assert!(initial.load(origin, vec![("sid".into(), "old".into()), ("gone".into(), "x".into())]));
+        let current = initial.isolated_snapshot();
+        current.remove(origin, "gone");
+        assert!(current.set(origin, "first".into(), "1".into()));
+        assert!(current.set(origin, "second".into(), "2".into()));
+        let destination = OriginStorage::default();
+        assert!(destination.load(origin, vec![("a".into(), "A".into()),
+            ("sid".into(), "newer".into()), ("gone".into(), "x".into())]));
+        super::merge_local_storage_delta(&destination, &initial, &current);
+        assert_eq!(destination.snapshot(origin), vec![("a".into(), "A".into()),
+            ("sid".into(), "newer".into()), ("first".into(), "1".into()), ("second".into(), "2".into())]);
+        super::merge_local_storage_delta(&destination, &initial, &initial);
+        assert_eq!(destination.get(origin, "sid").as_deref(), Some("newer"));
+    }
+
     use super::{
         bearer_authorized, control_refusal, handle_fetch_resolution, is_navigate_method,
         merge_cookie_delta, parse_cdp_headers, pump_live_page_event_loop,
