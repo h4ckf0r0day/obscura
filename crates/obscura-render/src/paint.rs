@@ -10764,7 +10764,7 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
             && values[3].is_finite()
             && values[2] > 0.0
             && values[3] > 0.0)
-            .then_some(values[2] / values[3])
+            .then(|| values[2] / values[3])
     });
     let ratio = match (width, height) {
         (Some(width), Some(height)) => Some(width / height),
@@ -12576,6 +12576,24 @@ mod tests {
         )
             .is_none()
         );
+    }
+
+    #[test]
+    fn svg_image_metadata_ignores_short_view_box() {
+        // A viewBox with fewer than four numbers is invalid and gives no ratio;
+        // reading it must not index past the parsed values.
+        for view_box in ["0 0", "0 0 24", "24", ""] {
+            let svg = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20' viewBox='{view_box}'/>"
+            );
+            if let Some(meta) = svg_image_intrinsic_metadata(svg.as_bytes()) {
+                assert_eq!(meta.ratio, Some(0.5), "viewBox {view_box:?}");
+            }
+            let svg = format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='{view_box}'/>");
+            if let Some(meta) = svg_image_intrinsic_metadata(svg.as_bytes()) {
+                assert_eq!(meta.ratio, None, "viewBox {view_box:?}");
+            }
+        }
     }
 
     #[test]

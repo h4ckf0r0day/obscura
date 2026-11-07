@@ -991,7 +991,7 @@ fn split_css_imports(css: &str) -> (Vec<StylesheetImport>, String) {
 /// statement body (the text between `@import` and `;`).
 fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
     let s = stmt.trim();
-    let is_url_fn = s.len() >= 4 && s[..4].eq_ignore_ascii_case("url(");
+    let is_url_fn = s.get(..4).is_some_and(|head| head.eq_ignore_ascii_case("url("));
     let (url, media) = if is_url_fn {
         let rest = &s[4..];
         let end = rest.find(')')?;
@@ -10902,6 +10902,18 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn parse_import_url_accepts_non_ascii_without_url_function() {
+        // A statement whose fourth byte falls inside a multi-byte character
+        // must not be sliced there.
+        assert_eq!(
+            parse_import_url(" \"Guía.css\""),
+            Some(StylesheetImport { url: "Guía.css".to_string(), media: None })
+        );
+        assert_eq!(parse_import_url("aí;"), None);
+        assert_eq!(parse_import_url("é"), None);
     }
 
     #[test]
