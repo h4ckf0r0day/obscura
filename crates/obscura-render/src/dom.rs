@@ -19865,6 +19865,67 @@ mod tests {
     }
 
     #[test]
+    fn retained_relational_anchor_context_keeps_peer_clean() {
+        let mut clean = String::new();
+        for index in 0..2_000 {
+            clean.push_str(&format!("<span class=clean data-index={index}></span>"));
+        }
+        for insert in [true, false] {
+            let tree = parse_html(&format!(
+                r#"<style>.host:not(:has(> .signal)) .dependent{{width:157px}}#box > div:has(:not(script)){{height:3px}}.clean{{height:1px}}</style>
+                   <div id=page><main><section id=host class=host><i id=signal class=signal></i><b class=dependent></b></section><aside>{clean}</aside></main><section id=box><div></div></section></div>"#,
+            ));
+            let host = tree.get_element_by_id("host").unwrap();
+            let signal = tree.get_element_by_id("signal").unwrap();
+            if insert {
+                tree.remove_child(signal);
+            }
+            let mut cache = crate::css::StylesheetCache::default();
+            let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+                &tree,
+                (800.0, 600.0),
+                &HashMap::new(),
+                &[],
+                &mut cache,
+            );
+            let mutation = if insert {
+                tree.append_child(host, signal);
+                TreeStyleMutation::Insert {
+                    node: signal,
+                    old_parent: None,
+                    new_parent: host,
+                }
+            } else {
+                tree.remove_child(signal);
+                TreeStyleMutation::Remove {
+                    node: signal,
+                    old_parent: host,
+                }
+            };
+            let retained = RetainedStyleMaps {
+                styles: std::mem::take(&mut initial.styles),
+                custom_properties: std::mem::take(&mut initial.custom_properties),
+            };
+            let (incremental, telemetry) = layout_dom_with_web_fonts_pass_limit(
+                &tree,
+                (800.0, 600.0),
+                &HashMap::new(),
+                &[],
+                None,
+                Some(&mut cache),
+                Some(retained),
+                &[mutation.into()],
+            );
+            let full = layout_dom(&tree, (800.0, 600.0));
+            assert_computed_styles_match("relational anchor context peer", &incremental, &full);
+            assert_eq!(incremental.rects, full.rects);
+            assert_eq!(telemetry.retained_fallback, 0, "{telemetry:?}");
+            assert!(telemetry.retained_reused >= 2_000, "{telemetry:?}");
+            assert!(telemetry.retained_fresh < 24, "{telemetry:?}");
+        }
+    }
+
+    #[test]
     fn retained_tree_invalidation_keeps_large_unrelated_branch_clean() {
         let mut clean = String::new();
         for index in 0..2_000 {
