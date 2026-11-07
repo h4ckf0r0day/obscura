@@ -19235,6 +19235,107 @@ mod tests {
     }
 
     #[test]
+    fn window_origin_is_replaceable_without_changing_the_document_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const descriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+            const initial = origin;
+            const value = { replaced: true };
+            origin = value;
+            const replaced = Object.getOwnPropertyDescriptor(window, 'origin');
+            const errors = [];
+            for (const member of [descriptor.get, descriptor.set]) {
+                try { member.call({}, 'fake'); errors.push('allowed'); }
+                catch (error) { errors.push(error.name); }
+            }
+            location.href = 'https://destination.example/next';
+            return [initial, descriptor.configurable, descriptor.enumerable,
+                descriptor.get.name, descriptor.set.name,
+                descriptor.get.length, descriptor.set.length,
+                origin === value, replaced.writable, replaced.configurable,
+                replaced.enumerable, descriptor.get.call(window), location.origin, errors];
+        })()"#).unwrap(), serde_json::json!([
+            "http://example.com", true, true, "get origin", "set origin", 0, 1,
+            true, true, true, true, "http://example.com", "https://destination.example",
+            ["TypeError", "TypeError"]
+        ]));
+    }
+
+    #[test]
+    fn window_origin_uses_the_receiver_realm_and_inherits_blank_frame_origins() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            const child = frame.contentWindow;
+            const descriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+            const initial = [origin, child.origin, child.location.origin,
+                descriptor.get.call(child)];
+            const value = { child: true };
+            descriptor.set.call(child, value);
+            const replaced = child.origin === value;
+            const parentUnchanged = origin === 'http://example.com';
+            const deleted = delete child.origin;
+            return [initial, replaced, parentUnchanged, deleted,
+                descriptor.get.call(child), Object.hasOwn(child, 'origin')];
+        })()"#).unwrap(), serde_json::json!([
+            ["http://example.com", "http://example.com", "null", "http://example.com"],
+            true, true, true, "http://example.com", false
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pbkdf2_derivation_does_not_block_page_timers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const key = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('password'), 'PBKDF2', false, ['deriveBits']);
+            const derivation = crypto.subtle.deriveBits({
+                name: 'PBKDF2', hash: 'SHA-256',
+                salt: new TextEncoder().encode('salt'), iterations: 1000000,
+            }, key, 256);
+            const first = await Promise.race([
+                derivation.then(() => 'derivation'),
+                new Promise(resolve => setTimeout(() => resolve('timer'), 0)),
+            ]);
+            return [first, (await derivation).byteLength];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(["timer", 32])));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pbkdf2_async_derivation_snapshots_buffers_and_reports_operation_errors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const key = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('password'), 'PBKDF2', false, ['deriveBits']);
+            const salt = new TextEncoder().encode('salt');
+            const derivation = crypto.subtle.deriveBits({
+                name: 'PBKDF2', hash: 'SHA-1', salt, iterations: 4096,
+            }, key, 160);
+            salt.fill(0);
+            const hex = Array.from(new Uint8Array(await derivation),
+                byte => byte.toString(16).padStart(2, '0')).join('');
+            const errors = [];
+            for (const [iterations, bits] of [[0, 256], [10000001, 256], [10000000, 8388608]]) {
+                try {
+                    await crypto.subtle.deriveBits({
+                        name: 'PBKDF2', hash: 'SHA-1', salt, iterations,
+                    }, key, bits);
+                    errors.push('allowed');
+                } catch (error) {
+                    errors.push([error instanceof DOMException, error.name]);
+                }
+            }
+            return [hex, errors];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([
+            "4b007901b765489abead49d926f721d065a429c1",
+            [[true, "OperationError"], [true, "OperationError"], [true, "OperationError"]]
+        ])));
+    }
+
+    #[test]
     fn test_button_click_dispatches_listener() {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt

@@ -115,6 +115,17 @@ for Playwright frame locators or iframe screenshot fidelity.
 
 `obscura-js/js/bootstrap.js` provides the browser globals: `document`, `window`, `navigator`, `location`, observers, fetch, indexedDB, etc.
 
+`window.origin` (including the bare `origin` identifier) reports the owning
+document's origin, including inherited blank-frame origins. Page assignment
+replaces this property without changing the document's actual origin.
+
+Short, bounded PBKDF2 derivations retain a native fast path. Larger derivations
+run on bounded blocking workers rather than the page thread. Dropping an
+awaiting future cancels that background work; the worker retains its admission
+permit until it exits. Limits are 10 million iterations, 1 MiB of output, and
+1 billion iterations multiplied by hash-sized output blocks. Zero-iteration
+or over-limit derivations reject with `OperationError`.
+
 `obscura-js/src/ops.rs` registers Rust ops that the bootstrap calls into:
 
 ```js
