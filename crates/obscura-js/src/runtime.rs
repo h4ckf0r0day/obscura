@@ -7842,6 +7842,51 @@ mod tests {
     }
 
     #[test]
+    fn legacy_named_access_to_forms_and_controls() {
+        // Legacy ASP.NET pages (iasWorld) read `document.frmMain.hdLink.value`.
+        let mut rt = setup_runtime(r#"<html><body>
+            <form name="frmMain" id="f"><input type="hidden" name="hdLink" value="a"><input id="byId"><input name="submit"></form>
+            <img name="logo" src="x.png"><img name="cookie"><div id="plain"></div><object id="obj"></object></body></html>"#);
+        let result = rt
+            .evaluate(r#"(function(){
+                var f = document.getElementById('f');
+                var r = {
+                    doc: document.frmMain === f,
+                    inDoc: 'frmMain' in document,
+                    forms: document.forms.frmMain === f && document.forms.namedItem('frmMain') === f,
+                    images: document.images.logo === document.logo,
+                    control: document.frmMain.hdLink.value,
+                    byId: f.byId === document.getElementById('byId'),
+                    submitStaysMethod: typeof f.submit === 'function',
+                    cookieStaysString: typeof document.cookie === 'string',
+                    divNotNamed: document.plain === undefined,
+                    instanceOfElement: f instanceof Element && f instanceof HTMLFormElement,
+                    missing: f.nope === undefined,
+                    objectById: document.obj === document.getElementById('obj'),
+                };
+                var late = document.createElement('img');
+                late.id = 'lateId';
+                document.body.appendChild(late);
+                r.imgIdWithoutName = !('lateId' in document);
+                late.setAttribute('name', 'lateName');
+                r.lateName = document.lateName === late && document.lateId === late;
+                f.remove();
+                r.removed = document.frmMain === undefined && !('frmMain' in document);
+                return r;
+            })()"#)
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "doc": true, "inDoc": true, "forms": true, "images": true, "control": "a",
+                "byId": true, "submitStaysMethod": true, "cookieStaysString": true,
+                "divNotNamed": true, "instanceOfElement": true, "missing": true, "removed": true,
+                "objectById": true, "imgIdWithoutName": true, "lateName": true,
+            })
+        );
+    }
+
+    #[test]
     fn dom_parser_accepts_well_formed_xml() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ok = rt
