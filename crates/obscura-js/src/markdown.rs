@@ -59,15 +59,16 @@ pub const HTML_TO_MARKDOWN_JS: &str = r#"
     }
     var body = document.body || document.documentElement;
     if (!body) return '';
-    var stack = [{ node: body, index: 0, parts: [], cells: [] }];
+    var stack = [{ node: body, kids: body.childNodes || [], index: 0, parts: [], cells: [] }];
     var md = '';
     while (stack.length) {
         var frame = stack[stack.length - 1];
-        var cn = frame.node.childNodes || [];
+        // read once per node: childNodes builds a fresh list on every access
+        var cn = frame.kids;
         if (frame.index < cn.length) {
             var child = cn[frame.index++];
             if (child.nodeType === 3) frame.parts.push(child.textContent || '');
-            else if (child.nodeType === 1) stack.push({ node: child, index: 0, parts: [], cells: [] });
+            else if (child.nodeType === 1) stack.push({ node: child, kids: child.childNodes || [], index: 0, parts: [], cells: [] });
             continue;
         }
         stack.pop();
