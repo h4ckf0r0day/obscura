@@ -8188,9 +8188,13 @@ fn ensure_prepared_render_with_base_url(
             .then(|| state.prepared_render.take())
             .flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
-        let prepared = {
+        // Anti-panic boundary: style and layout run inside a JS op (a geometry
+        // read), and deno_core's op callbacks are `extern "C"`, so a panic in
+        // the layout engine would abort the process. A page whose layout
+        // panics loses its layout for this read instead.
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let dom = state.dom.as_ref()?;
-            match previous {
+            Some(match previous {
                 Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
                     dom,
                     viewport,
@@ -8238,6 +8242,13 @@ fn ensure_prepared_render_with_base_url(
                         &mut state.animation_timeline,
                     )?,
                 },
+            })
+        }));
+        let prepared = match prepared {
+            Ok(prepared) => prepared?,
+            Err(_) => {
+                tracing::error!("layout panicked; the page has no layout for this read");
+                return None;
             }
         };
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
