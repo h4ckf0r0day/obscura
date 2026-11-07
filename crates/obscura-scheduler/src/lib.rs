@@ -177,6 +177,13 @@ impl Scheduler {
         while self.schedule_one().await.unwrap_or(false) {}
         Ok(recovered)
     }
+    /// Run periodic reconciliation in a background task.
+    pub async fn run_reconciliation_loop(&self, interval_secs: u64) {
+        loop {
+            let _ = self.reconcile_workers().await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        }
+    }
 
     /// Run scheduling loop consuming job.submitted events.
     pub async fn run(&self) -> Result<()> {
