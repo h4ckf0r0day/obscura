@@ -2655,12 +2655,19 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 None => "null".into(),
             }
         }
+        "table_rows" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.table_rows(nid).map(|rows| {
+                rows.into_iter().map(|row| row.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom
+            dom
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
-                        if name.ns == html5ever::ns!(html) {
+                        let html = name.ns == html5ever::ns!(html);
+                        let tag = if html {
                             match &name.prefix {
                                 Some(prefix) => {
                                     let mut qualified = format!("{}:{}", prefix, name.local);
@@ -2674,12 +2681,17 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
                                 None => name.local.to_string(),
                             }
+                        };
+                        if arg2 == "interface" && (!html || name.prefix.is_some()
+                            || name.local.as_ref().bytes().any(|byte| byte.is_ascii_uppercase())) {
+                            serde_json::json!([tag, name.ns.as_ref(), name.local.as_ref()]).to_string()
+                        } else {
+                            serde_json::Value::String(tag).to_string()
                         }
                     })
                 })
                 .flatten()
-                .unwrap_or_default();
-            serde_json::to_string(&name).unwrap_or("\"\"".into())
+                .unwrap_or_else(|| "\"\"".into())
         }
         "prefix" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);

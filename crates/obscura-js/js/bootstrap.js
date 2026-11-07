@@ -7869,41 +7869,47 @@ globalThis.VTTCue = VTTCue;
 const _htmlInterfaceToken = {};
 const _additionalHtmlElementClasses = Object.create(null);
 const _elementClassFor = (function _elementClassFor(nid) {
-  const tag = _domParse("tag_name", nid);
-  if (tag.includes(":") && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    return _elementClassForKnownName("http://www.w3.org/1999/xhtml", _domParse("local_name", nid));
+  // Canonical HTML names keep the scalar fast path. Other names carry their
+  // namespace/local name in the same native read rather than two more ops.
+  const info = _domParse("tag_name", nid, "interface");
+  const canonicalHTML = typeof info === 'string';
+  const tag = canonicalHTML ? info : info[0];
+  const namespace = canonicalHTML ? "http://www.w3.org/1999/xhtml" : info[1];
+  const localName = canonicalHTML ? null : info[2];
+  if (!canonicalHTML && tag.includes(":") && namespace === "http://www.w3.org/1999/xhtml") {
+    return _elementClassForKnownName(namespace, localName);
   }
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
   // namespace for possible SVG wrappers.
-  if (tag && tag !== tag.toUpperCase()
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
+  if (!canonicalHTML && tag && tag !== tag.toUpperCase()
+      && namespace === "http://www.w3.org/2000/svg") {
     const svgClass = _svgElementClasses[tag];
     if (svgClass) return svgClass;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "INPUT" && globalThis.HTMLInputElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
+      && (canonicalHTML || namespace === "http://www.w3.org/1999/xhtml"
+        && localName === "input")) return globalThis.HTMLInputElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
   if (tag === "META" && globalThis.HTMLMetaElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
+      && (canonicalHTML || namespace === "http://www.w3.org/1999/xhtml"
+        && localName === "meta")) return globalThis.HTMLMetaElement;
   if ((tag === "OL" || tag === "LI")
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    const localName = _domParse("local_name", nid);
-    if (localName === "ol") return HTMLOListElement;
-    if (localName === "li") return HTMLLIElement;
+      && namespace === "http://www.w3.org/1999/xhtml") {
+    const local = canonicalHTML ? tag.toLowerCase() : localName;
+    if (local === "ol") return HTMLOListElement;
+    if (local === "li") return HTMLLIElement;
   }
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+      && namespace === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLSlotElement;
   }
   if (tag === "IFRAME" && globalThis.HTMLIFrameElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+      && namespace === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLIFrameElement;
   }
   if (tag === "IMG") return HTMLImageElement;
@@ -7912,8 +7918,8 @@ const _elementClassFor = (function _elementClassFor(nid) {
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
   const additional = _additionalHtmlElementClasses[tag];
-  if (additional && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === tag.toLowerCase()) return additional;
+  if (additional && (canonicalHTML || namespace === "http://www.w3.org/1999/xhtml"
+      && localName === tag.toLowerCase())) return additional;
   return Element;
 });
 const _elementClassForKnownName = (function _elementClassForKnownName(namespace, localName) {
@@ -14461,7 +14467,6 @@ globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
 }
-globalThis.HTMLTableElement = Element;
 // <iframe> needs its own brand: with `HTMLIFrameElement = Element` every
 // element passed `instanceof HTMLIFrameElement`, so style-loader's
 // "insert target is an iframe" branch took `contentDocument.head` of <head>
@@ -14555,7 +14560,7 @@ for (const [name, tags] of Object.entries({
   HTMLMeterElement: ['meter'], HTMLModElement: ['del', 'ins'], HTMLObjectElement: ['object'],
   HTMLOptGroupElement: ['optgroup'], HTMLOutputElement: ['output'], HTMLParamElement: ['param'],
   HTMLPictureElement: ['picture'], HTMLQuoteElement: ['blockquote', 'q'], HTMLSourceElement: ['source'],
-  HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
+  HTMLTableElement: ['table'], HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
   HTMLTableColElement: ['col', 'colgroup'], HTMLTableRowElement: ['tr'],
   HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
 })) {
@@ -14895,6 +14900,99 @@ const _htmlCollectionProxy = {
     return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
   },
 };
+const _tableRowCollections = new WeakMap();
+function _tableRowsGetter() {
+  if (!this || _cache.get(this._nid) !== this) {
+    const owner = this && this.ownerDocument && this.ownerDocument.defaultView;
+    if (owner && owner !== globalThis) {
+      const getter = Object.getOwnPropertyDescriptor(owner.HTMLTableElement.prototype, 'rows').get;
+      return getter.call(this);
+    }
+    throw new TypeError('Illegal invocation');
+  }
+  if (_tableRowCollections.has(this)) return _tableRowCollections.get(this);
+  const table = this;
+  let epoch = -1;
+  let elements = [];
+  function refresh() {
+    if (epoch !== _domMutationEpoch) {
+      const ids = _domParse('table_rows', table._nid);
+      if (ids === null) throw new TypeError('Illegal invocation');
+      elements = ids.map(_wrapEl);
+      epoch = _domMutationEpoch;
+    }
+    return elements;
+  }
+  const index = key => typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key)
+    && Number(key) < 4294967295;
+  const target = Object.create(HTMLCollection.prototype);
+  const collection = new Proxy(target, {
+    get(t, key, receiver) {
+      const rows = refresh();
+      if (key === 'length') return rows.length;
+      if (key === Symbol.toStringTag && !Reflect.has(t, key)) return 'HTMLCollection';
+      if (index(key)) return rows[Number(key)];
+      const value = Reflect.get(t, key, receiver);
+      if (value !== undefined || typeof key !== 'string') return value;
+      return HTMLCollection.prototype.namedItem.call(receiver, key) || undefined;
+    },
+    has(t, key) {
+      if (index(key)) return Number(key) < refresh().length;
+      return Reflect.has(t, key) || (typeof key === 'string'
+        && !!HTMLCollection.prototype.namedItem.call(collection, key));
+    },
+    ownKeys(t) {
+      const rows = refresh();
+      const keys = new Set();
+      for (let i = 0; i < rows.length; i++) keys.add(String(i));
+      rows.forEach(row => {
+        for (const name of [row.id, row.getAttribute('name')]) {
+          if (name && !Reflect.has(t, name)) keys.add(name);
+        }
+      });
+      for (const key of Reflect.ownKeys(t)) keys.add(key);
+      return [...keys];
+    },
+    getOwnPropertyDescriptor(t, key) {
+      if (index(key)) {
+        const row = refresh()[Number(key)];
+        return row ? {value: row, writable: false, enumerable: true, configurable: true} : undefined;
+      }
+      const descriptor = Reflect.getOwnPropertyDescriptor(t, key);
+      if (descriptor || typeof key !== 'string' || Reflect.has(t, key)) return descriptor;
+      const row = HTMLCollection.prototype.namedItem.call(collection, key);
+      return row ? {value: row, writable: false, enumerable: false, configurable: true} : undefined;
+    },
+    set(t, key, value, receiver) {
+      if (key === 'length' || index(key)
+          || (typeof key === 'string' && !Reflect.has(t, key)
+            && HTMLCollection.prototype.namedItem.call(collection, key))) return false;
+      return Reflect.set(t, key, value, receiver);
+    },
+    defineProperty(t, key, descriptor) {
+      if (key === 'length' || index(key)
+          || (typeof key === 'string' && !Reflect.has(t, key)
+            && HTMLCollection.prototype.namedItem.call(collection, key))) return false;
+      return Reflect.defineProperty(t, key, descriptor);
+    },
+    deleteProperty(t, key) {
+      if (index(key)) return Number(key) >= refresh().length;
+      if (typeof key === 'string' && !Reflect.has(t, key)
+          && HTMLCollection.prototype.namedItem.call(collection, key)) return false;
+      return Reflect.deleteProperty(t, key);
+    },
+    preventExtensions() { return false; },
+  });
+  refresh();
+  _tableRowCollections.set(table, collection);
+  return collection;
+}
+Object.defineProperty(HTMLTableElement, 'length', {value: 0, configurable: true});
+Object.defineProperty(_tableRowsGetter, 'name', {value: 'get rows', configurable: true});
+Object.defineProperty(HTMLTableElement.prototype, 'rows', {
+  get: _tableRowsGetter, enumerable: true, configurable: true,
+});
+_markNative(_tableRowsGetter);
 // True for elements in the HTML namespace (the only ones whose name attribute
 // contributes to an HTMLCollection's supported property names).
 function _isHTMLEl(el) {

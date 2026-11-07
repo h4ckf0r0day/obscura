@@ -47,6 +47,14 @@ SCENARIOS = {
         "(() => {let h=document.createElement('div');document.body.append(h);let r=h.attachShadow({mode:'open'});let n=0;for(let i=0;i<200000;i++)if(h.shadowRoot===r)n++;return n;})()",
         200000,
     ),
+    "table-create": (
+        "(() => {for(let i=0;i<5000;i++)document.body.append(document.createElement('table'));return document.querySelectorAll('table').length})()",
+        5000,
+    ),
+    "table-parse-wrap": (
+        "(() => {document.body.innerHTML='<table><tr><td>row</td></tr></table>'.repeat(5000);return document.querySelectorAll('table').length})()",
+        5000,
+    ),
 }
 SCENARIOS.update({
     f"html-parse-depth-{depth}": (
