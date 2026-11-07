@@ -283,6 +283,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                             request_id: request_id.clone(), intercepted: false,
                             url: url.clone(), method: "GET".to_string(),
                             resource_type: "Script".to_string(), status: 0,
+                            request_headers: Default::default(), has_post_data: false, post_data: None,
                             response_headers: Default::default(), body_size: 0,
                             timestamp: 0.0, error_text: None,
                         }),
@@ -336,6 +337,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 request_id, intercepted: false,
                                 url: resp.url.to_string(), method: "GET".to_string(),
                                 resource_type: "Script".to_string(), status: resp.status,
+                                request_headers: Default::default(), has_post_data: false, post_data: None,
                                 response_headers: resp.headers.clone(), body_size: resp.body.len(),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
