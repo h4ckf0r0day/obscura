@@ -50,6 +50,10 @@ cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hkdf = "0.12"
+# ECDSA P-256 (sign/verify, SEC1/SPKI/PKCS#8 keys). Same RustCrypto stack.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+# The ECPrivateKey inside a PKCS#8 key, to check its curve parameters.
+sec1 = { version = "0.7", default-features = false, features = ["der"] }
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
