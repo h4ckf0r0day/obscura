@@ -4607,6 +4607,34 @@ impl Default for ObscuraJsRuntime {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn file_input_validation_is_nonmutating_and_selection_honors_multiple() {
+        let mut rt = setup_runtime("<input id=single type=file><input id=multi type=file multiple><div id=wrong></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const single = document.getElementById('single');
+            const multi = document.getElementById('multi');
+            const specs = [{name:'one',b64:'AID/'},{name:'two',b64:'BAU='}];
+            const events = [];
+            for (const type of ['input','change']) {
+                single.addEventListener(type, event => events.push([type,event.isTrusted]));
+            }
+            const selected = __obscura_setInputFiles(single, specs);
+            const previous = single.files;
+            const validation = __obscura_setInputFiles(single, [], true);
+            const preserved = single.files === previous;
+            __obscura_setInputFiles(multi, specs);
+            const counts = [single.files.length, multi.files.length];
+            const invalid = __obscura_setInputFiles(document.getElementById('wrong'), specs);
+            const forged = __obscura_setInputFiles(Object.create(HTMLInputElement.prototype), specs);
+            __obscura_setInputFiles(single, []);
+            return {selected,validation,preserved,counts,invalid,forged,events,empty:single.files.length};
+        })()"#).unwrap(), serde_json::json!({
+            "selected":true, "validation":true, "preserved":true, "counts":[1,2],
+            "invalid":false, "forged":false,
+            "events":[["input",true],["change",true],["input",true],["change",true]], "empty":0,
+        }));
+    }
+
+    #[test]
     fn table_rows_are_live_ordered_readonly_collections() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {

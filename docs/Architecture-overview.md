@@ -132,6 +132,13 @@ for Playwright frame locators or iframe screenshot fidelity.
 
 `obscura-js/js/bootstrap.js` provides the browser globals: `document`, `window`, `navigator`, `location`, observers, fetch, indexedDB, etc.
 
+`DOM.setFileInputFiles` requires the existing `--allow-file-access` opt-in,
+validates the target and file-path array before reading local files, and reports
+selection failures as CDP errors. Remote handles retain their owning frame
+rather than being reduced to root-DOM node numbers. The owning realm creates
+the File objects and emits trusted input/change events; non-multiple inputs
+select only the first file. In-memory DataTransfer payloads remain a separate API.
+
 The noninteractive dialog defaults dismiss `confirm()` (`false`), cancel
 `prompt()` (`null`), and let `alert()` return without blocking. These functions
 do not emit client-controlled CDP dialogs. `Page.handleJavaScriptDialog`

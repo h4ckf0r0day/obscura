@@ -41,6 +41,7 @@ integration_tests!(
     execution_context_ownership,
     execution_context_pruned_on_navigation,
     file_navigation_gate,
+    file_upload_integrity,
     form_submit_method_bypasses_listener,
     iframe_event_dispatch,
     input_activation_author_accessors,
