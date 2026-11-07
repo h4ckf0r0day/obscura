@@ -1927,6 +1927,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid" => parse_grid_shorthand(style, value),
         "grid-auto-flow" => style.grid_auto_flow = parse_grid_auto_flow(value),
         "grid-area" => set_grid_area(style, value),
+        "grid-column" | "grid-row" | "grid-column-start" | "grid-column-end"
+        | "grid-row-start" | "grid-row-end"
+            if !grid_placement_declaration_is_valid(
+                value,
+                matches!(name, "grid-column" | "grid-row"),
+            ) => {}
         "grid-column" => set_grid_placement(style, value, true),
         "grid-row" => set_grid_placement(style, value, false),
         "grid-column-start" => set_grid_placement_side(style, value, true, true),
@@ -4882,6 +4888,31 @@ fn consume_grid_integer_math(parser: &mut cssparser::Parser<'_, '_>) -> bool {
         parser.reset(&state);
     }
     valid
+}
+
+/// Whether a `grid-column`/`grid-row` shorthand (`shorthand`) or one of their
+/// longhands is a valid declaration. CSS Grid 1 section 8.3 makes zero and
+/// negative spans and a line number of zero invalid (`span 0`, `0`), so the
+/// declaration is ignored like any other invalid one, and `var()` values that
+/// substitute to one (Shopify's `span var(--menu-content-columns-desktop) / -1`
+/// with the variable at 0) get the same treatment here as an unresolvable
+/// `var()`. Letting `span 0` through gave taffy a zero-track grid area, which
+/// panics in track sizing.
+fn grid_placement_declaration_is_valid(value: &str, shorthand: bool) -> bool {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    ) {
+        return true;
+    }
+    let parts = split_top_level(value, '/');
+    if parts.len() > if shorthand { 2 } else { 1 } {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|part| !part.trim().is_empty() && parse_grid_line_kind(part.trim()).is_some())
 }
 
 /// Store a `grid-column`/`grid-row` value. Numeric/`span` forms resolve to a
