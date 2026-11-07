@@ -1,4 +1,7 @@
 {
+  "deep-parser-layout": [
+    {"name": "fragment depth matches Chromium without losing the last element", "color": "#3186e8", "x": 545, "width": 80, "height": 20}
+  ],
   "hidden-table-rows": [
     {"name": "rowspan counts visible rows only", "color": "#1971c2", "x": 20, "y": 20, "width": 30, "height": 40},
     {"name": "next visible row occupies the second column", "color": "#e8590c", "x": 50, "y": 40, "width": 30, "height": 20},

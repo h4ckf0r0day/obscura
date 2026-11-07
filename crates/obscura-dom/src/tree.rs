@@ -1,5 +1,5 @@
 use html5ever::{LocalName, Namespace, Prefix, QualName};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -247,6 +247,9 @@ impl Node {
 
 pub struct DomTree {
     inner: RefCell<DomTreeInner>,
+    // Only the last parser parent/child pair is cached; external tree changes
+    // invalidate it rather than maintaining depths across DOM reparenting.
+    pub(crate) parser_depth_cache: Cell<Option<(NodeId, usize, NodeId, usize)>>,
 }
 
 /// Host-fetched author CSS kept outside the page-visible DOM.
@@ -305,6 +308,7 @@ impl DomTree {
             data: NodeData::Document,
         };
         DomTree {
+            parser_depth_cache: Cell::new(None),
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
@@ -883,6 +887,7 @@ impl DomTree {
     where
         F: FnOnce(&mut Node) -> R,
     {
+        self.parser_depth_cache.set(None);
         let mut inner = self.inner.borrow_mut();
         if inner.nodes.get(id.index()).and_then(Option::as_ref)
             .is_some_and(|node| matches!(node.data, NodeData::Text { .. })) {
@@ -892,6 +897,7 @@ impl DomTree {
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
+        self.parser_depth_cache.set(None);
         // Per DOM spec, appending a node to itself is a HierarchyRequestError;
         // here we treat it as a no-op rather than panic. Without this the
         // sibling-pointer fixup below sets the node's prev_sibling to itself
@@ -978,6 +984,7 @@ impl DomTree {
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
+        self.parser_depth_cache.set(None);
         // Per DOM spec: if the node being inserted IS the reference node,
         // the operation is a no-op (the node is already in its target
         // position). Without this, the linked-list fixup below sets the
@@ -1066,6 +1073,7 @@ impl DomTree {
     }
 
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
+        self.parser_depth_cache.set(None);
         let mut inner = self.inner.borrow_mut();
 
         // The document and registered ShadowRoots have no ordinary parent and

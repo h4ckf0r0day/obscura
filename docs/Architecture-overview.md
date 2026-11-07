@@ -88,6 +88,18 @@ within one connection so handlers do not interleave isolate entry. It is not a
 process-wide lock. Long operations use `process_with_interception` in
 `server.rs` so the connection can keep processing interception messages.
 
+Connection threads reserve the same 512 MiB native stack address range as the
+CLI, with memory committed on demand. This protects recursive native rendering
+from the small default thread stack. HTML parsing also flattens excessive
+nesting like Chromium: 511 nested divs in a document and 512 in a fragment,
+without discarding elements or text. This parser rule does not cap DOM mutations.
+The last parser parent/child depths are cached to avoid walking every ancestor
+on ordinary insertions; DOM mutations invalidate that cache. The
+`render-repros/deep-parser-layout.html` fixture covers retained content and the
+Chromium-compatible fragment depth.
+The performance smoke gate includes balanced HTML trees at depths 4, 32, 128,
+and 300 so the depth guard cannot hide a parser throughput regression.
+
 Targets and sessions belong to the connection that created them. A separate
 browser WebSocket does not attach to another connection's pages. Within one
 connection, additional flattened sessions can observe the same target.
