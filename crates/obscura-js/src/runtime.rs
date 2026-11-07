@@ -6459,6 +6459,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_import_scripts_runs_preloaded_targets_in_order() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-import-scripts",
+            r#"
+            globalThis.__workerReplies = [];
+            const sources = {
+                'https://example.com/w/worker.js':
+                    'importScripts("lib/a.js", \'https://cdn.example.com/b.js\'); ' +
+                    'postMessage([typeof importScripts, self.libA, typeof libB, order.join(",")]);',
+                'https://example.com/w/lib/a.js':
+                    'self.order = ["a"]; self.libA = "A"; importScripts("nested.js");',
+                'https://example.com/w/nested.js': 'order.push("nested");',
+                'https://cdn.example.com/b.js': 'this.libB = function () {}; order.push("b");',
+            };
+            globalThis.fetch = async url => url in sources
+                ? { ok: true, text: async () => sources[url] }
+                : { ok: false, text: async () => '' };
+            const worker = new Worker('https://example.com/w/worker.js');
+            worker.onmessage = event => __workerReplies.push(event.data);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__workerReplies, typeof importScripts, typeof libA]")
+                .unwrap(),
+            serde_json::json!([
+                [["function", "A", "function", "a,nested,b"]],
+                "undefined",
+                "undefined"
+            ])
+        );
+        rt.execute_script("worker-cleanup", "worker.terminate();")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_import_scripts_reports_targets_that_did_not_load() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-import-scripts-failure",
+            r#"
+            globalThis.__workerReplies = [];
+            globalThis.__workerErrors = [];
+            const source =
+                'const tryImport = url => { try { importScripts(url); return "loaded"; } ' +
+                'catch (e) { return e.name + ": " + e.message; } }; ' +
+                'const dynamic = "https://example.com/" + ["missing", "js"].join("."); ' +
+                'postMessage([tryImport("https://example.com/gone.js"), tryImport(dynamic), ' +
+                'tryImport("relative.js")]); ' +
+                'importScripts("https://example.com/gone.js"); postMessage("after");';
+            globalThis.fetch = async () => ({ ok: false, text: async () => '' });
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => __workerReplies.push(event.data);
+            worker.onerror = error => __workerErrors.push(error.name);
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        // A blob worker's base URL is the blob URL, so a relative target does
+        // not resolve.
+        let prefix = "Failed to execute 'importScripts' on 'WorkerGlobalScope':";
+        assert_eq!(
+            rt.evaluate("[__workerReplies, __workerErrors]").unwrap(),
+            serde_json::json!([
+                [[
+                    format!("NetworkError: {prefix} The script at 'https://example.com/gone.js' failed to load."),
+                    format!("NetworkError: {prefix} The script at 'https://example.com/missing.js' failed to load."),
+                    format!("SyntaxError: {prefix} The URL 'relative.js' is invalid.")
+                ]],
+                ["NetworkError"]
+            ])
+        );
+        rt.execute_script(
+            "worker-cleanup",
+            "worker.terminate(); URL.revokeObjectURL(url);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn self_requeueing_message_channel_yields_to_timers() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
