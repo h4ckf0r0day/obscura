@@ -1067,9 +1067,9 @@ fn heuristic_cache_lifetime(response: &Response, now: u64, response_delay: Durat
 
 /// Derive the sec-ch-ua and sec-ch-ua-platform client-hint header values from a
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
-/// the non-stealth HTTP path agrees with navigator.userAgentData instead of
+/// both HTTP paths agree with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
+pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
     let major: usize = ua
         .split("Chrome/")
         .nth(1)
