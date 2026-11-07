@@ -16923,6 +16923,24 @@ mod tests {
         assert_eq!(result.as_f64().unwrap() as usize, 180_000);
     }
 
+    // Forgiving-base64: invalid input throws like browsers do instead of
+    // decoding to U+FFFF, which any page could use to tell this engine apart.
+    #[test]
+    fn atob_rejects_what_forgiving_base64_rejects() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const run = (x) => { try { return Array.from(atob(x), (c) => c.charCodeAt(0)).join('.'); } catch (e) { return e.name; } };
+            return [' ab cd ', 'ab==', 'abc=', 'YR', null, '*', 'a', 'ab=c', 'abcd=', '=', 'ab cd', undefined]
+                .map(run).concat([atob.name, btoa.name, (() => { try { requestIdleCallback(1); return 'ok'; } catch (e) { return e.name; } })()]);
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "105.183.29", "105", "105.183", "97", "158.233.101",
+            "InvalidCharacterError", "InvalidCharacterError", "InvalidCharacterError",
+            "InvalidCharacterError", "InvalidCharacterError", "InvalidCharacterError",
+            "InvalidCharacterError", "atob", "btoa", "TypeError",
+        ]));
+    }
+
     // #996: btoa maps each code unit to one Latin-1 byte and throws for code
     // points above 0xFF — it must not UTF-8-encode the input.
     #[test]

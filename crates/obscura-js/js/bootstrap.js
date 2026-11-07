@@ -9232,6 +9232,9 @@ if (typeof URL === 'undefined' || !URL.prototype || !URL.__obscura) {
 }
 
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function requestIdleCallback(cb, opts) {
+  if (typeof cb !== 'function') {
+    throw new TypeError("Failed to execute 'requestIdleCallback' on 'Window': parameter 1 is not of type 'Function'.");
+  }
   const start = Date.now();
   return setTimeout(() => {
     cb({
@@ -13514,16 +13517,25 @@ for (const [name, local] of [['localStorage', true], ['sessionStorage', false]])
   }});
 }
 
-globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
-globalThis.atob = globalThis.atob || ((s) => {
-  const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const r=[];
-  s=String(s).replace(/[\t\n\f\r ]/g,"");
-  for(let i=0;i<s.length;i+=4){
-    const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]);
-    r.push((a<<2)|(b>>4));
-    if(cc>=0)r.push(((b&15)<<4)|(cc>>2));
-    if(d>=0)r.push(((cc&3)<<6)|d);
+globalThis.btoa = globalThis.btoa || function btoa(data) { if (arguments.length < 1) throw new TypeError("Failed to execute 'btoa' on 'Window': 1 argument required, but only 0 present."); const s = String(data); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; };
+globalThis.atob = globalThis.atob || function atob(data) {
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'atob' on 'Window': 1 argument required, but only 0 present.");
+  // WHATWG forgiving-base64 decode: drop ASCII whitespace, allow one or two
+  // trailing '=' only on a length divisible by 4, and reject a length that
+  // leaves one character over or anything outside the alphabet. Decoding
+  // invalid input instead returned U+FFFF garbage where browsers throw.
+  let s = String(data).replace(/[\t\n\f\r ]/g, "");
+  if (s.length % 4 === 0) s = s.replace(/={1,2}$/, "");
+  if (s.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(s)) {
+    throw new DOMException("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", "InvalidCharacterError");
+  }
+  const c = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const r = [];
+  let buffer = 0, bits = 0;
+  for (let i = 0; i < s.length; i++) {
+    buffer = ((buffer << 6) | c.indexOf(s[i])) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) { bits -= 8; r.push((buffer >> bits) & 0xff); }
   }
   // Spreading a large decoded payload into one call overflows V8's argument
   // stack. Angular and other SSR frameworks routinely decode blobs large
@@ -13532,7 +13544,9 @@ globalThis.atob = globalThis.atob || ((s) => {
   const chunk=0x8000;
   for(let i=0;i<r.length;i+=chunk) out+=String.fromCharCode(...r.slice(i,i+chunk));
   return out;
-});
+};
+_markNative(globalThis.atob);
+_markNative(globalThis.btoa);
 
 // Functional History API. The earlier stub returned constant state and was a
 // no-op on push/replace, so any SPA that tried to update its URL (Next.js
