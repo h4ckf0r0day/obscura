@@ -132,6 +132,11 @@ for Playwright frame locators or iframe screenshot fidelity.
 
 `obscura-js/js/bootstrap.js` provides the browser globals: `document`, `window`, `navigator`, `location`, observers, fetch, indexedDB, etc.
 
+The noninteractive dialog defaults dismiss `confirm()` (`false`), cancel
+`prompt()` (`null`), and let `alert()` return without blocking. These functions
+do not emit client-controlled CDP dialogs. `Page.handleJavaScriptDialog`
+continues to resolve the separate beforeunload confirmation from `Page.close`.
+
 `window.origin` (including the bare `origin` identifier) reports the owning
 document's origin, including inherited blank-frame origins. Page assignment
 replaces this property without changing the document's actual origin.
