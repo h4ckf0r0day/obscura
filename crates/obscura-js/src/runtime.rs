@@ -4606,6 +4606,30 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn noninteractive_dialogs_do_not_accept_destructive_confirmation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const records = ["keep"];
+            const accepted = confirm("Delete this record?");
+            if (accepted) records.pop();
+            return {accepted, records, prompt: prompt("Edit", "draft"),
+                alertResult: typeof alert("Notice")};
+        })()"#).unwrap(), serde_json::json!({
+            "accepted": false, "records": ["keep"], "prompt": null,
+            "alertResult": "undefined",
+        }));
+    }
+
+    #[test]
+    fn noninteractive_dialog_defaults_apply_to_child_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, "confirm('Delete?')").unwrap(),
+            serde_json::json!(false));
+    }
+
     #[cfg(obscura_external_bootstrap)]
     #[test]
     fn snapshot_core_methods_have_bytecode_before_first_use() {
