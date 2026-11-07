@@ -1634,6 +1634,46 @@ fn retained_style_mutation(
     }
 }
 
+/// `innerHTML` replaces a connected element's whole child list. Describe that
+/// to the retained planner as the removal of every current child plus an
+/// in-place reinsertion of the element, so its new subtree is restyled while
+/// the removed children still invalidate `:has`, `:empty`, structural and
+/// sibling selectors exactly as `removeChild` would. Must run before the op.
+#[cfg(feature = "render")]
+fn retained_child_list_replacement(
+    dom: &DomTree,
+    arg1: &str,
+) -> Option<Vec<obscura_render::RetainedStyleMutation>> {
+    let target = NodeId::new(arg1.parse::<u32>().ok().filter(|nid| *nid > 0)?);
+    if dom.containing_shadow_root(target).is_some() {
+        return None;
+    }
+    let parent = dom.with_node(target, |node| node.parent)??;
+    if !dom.with_node(parent, |node| node.is_element())? {
+        return None;
+    }
+    let mut mutations = dom
+        .children(target)
+        .into_iter()
+        .map(|node| {
+            obscura_render::TreeStyleMutation::Remove {
+                node,
+                old_parent: target,
+            }
+            .into()
+        })
+        .collect::<Vec<_>>();
+    mutations.push(
+        obscura_render::TreeStyleMutation::Insert {
+            node: target,
+            old_parent: Some(parent),
+            new_parent: parent,
+        }
+        .into(),
+    );
+    Some(mutations)
+}
+
 #[cfg(feature = "render")]
 // Modern hydration can touch thousands of distinct connected nodes before the
 // first rendering opportunity. Keep a bounded safety valve for adversarial
@@ -2259,9 +2299,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         let invalidate_geometry =
             invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
         #[cfg(feature = "render")]
-        let retained_style_mutation = if invalidate_geometry && state.prepared_render.is_some() {
-            state.dom.as_ref().and_then(|dom| {
-                retained_style_mutation(dom, &cmd, &arg1, &arg2, true)
+        let retained_style_mutations = if invalidate_geometry && state.prepared_render.is_some() {
+            state.dom.as_ref().and_then(|dom| match cmd.as_str() {
+                "set_inner_html" | "set_inner_html_context" => {
+                    retained_child_list_replacement(dom, &arg1)
+                }
+                _ => retained_style_mutation(dom, &cmd, &arg1, &arg2, true)
+                    .map(|mutation| vec![mutation]),
             })
         } else {
             None
@@ -2332,9 +2376,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     .animation_timeline
                     .note_subtree_start_candidate(root, mutation_time_ms);
             }
-            if let Some(mutation) = retained_style_mutation {
+            if let Some(mutations) = retained_style_mutations {
                 let retained = state.prepared_render.is_some()
-                    && queue_retained_style_mutation(&mut state.pending_style_mutations, mutation);
+                    && mutations.into_iter().all(|mutation| {
+                        queue_retained_style_mutation(&mut state.pending_style_mutations, mutation)
+                    });
                 if !retained {
                     state.prepared_render = None;
                     state.pending_style_mutations.clear();
