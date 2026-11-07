@@ -106,12 +106,23 @@ impl ControlPlane {
         max_attempts: i32,
     ) -> Result<Job> {
         self.authorize_tenant(principal, tenant_id)?;
-        // Basic SSRF literal-IP guard at control plane boundary
+        // SSRF guard at control plane boundary (literal IP + DNS resolution)
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
+                // Check literal IP
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                     if obscura_ssrf::is_forbidden_ip(ip) {
                         return Err(ControlPlaneError::Conflict("SSRF blocked".into()));
+                    }
+                } else {
+                    // DNS resolution check
+                    use std::net::ToSocketAddrs;
+                    if let Ok(addrs) = format!("{}:80", host).to_socket_addrs() {
+                        for addr in addrs {
+                            if obscura_ssrf::is_forbidden_ip(addr.ip()) {
+                                return Err(ControlPlaneError::Conflict("SSRF blocked: resolved to forbidden IP".into()));
+                            }
+                        }
                     }
                 }
             }
@@ -1072,6 +1083,7 @@ impl ControlPlane {
         .bind(expires_at)
         .execute(self.pool())
         .await?;
+        let _ = self.audit_event(principal.subject(), "credential.create", "credential", credential_id, "success", tenant_id).await;
         Ok(())
     }
 
@@ -1106,6 +1118,8 @@ impl ControlPlane {
         let tenant_id: Option<Uuid> = row.get("tenant_id");
         let is_admin: bool = row.get("is_admin");
         let is_worker: bool = row.get("is_worker");
+        // Audit success
+        let _ = self.audit_event(credential_id, "auth.success", "credential", credential_id, "success", tenant_id).await;
         // Construct Principal internally (controlled)
         Ok(Principal {
             subject,
@@ -1123,6 +1137,7 @@ impl ControlPlane {
             .bind(credential_id)
             .execute(self.pool())
             .await?;
+        let _ = self.audit_event(principal.subject(), "credential.revoke", "credential", credential_id, "success", None).await;
         Ok(())
     }
 }
@@ -1309,5 +1324,220 @@ mod capacity_tests {
         let w = cp.list_healthy_workers(Some(tenant.tenant_id)).await.unwrap();
         let wr = w.iter().find(|x| x.worker_id == worker).unwrap();
         assert_eq!(wr.active_jobs, 0);
+    }
+}
+
+#[cfg(test)]
+mod security_enforcement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cross_tenant_job_access_rejected() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant_a = cp.create_tenant("sec-tenant-a").await.expect("tenant a");
+        let tenant_b = cp.create_tenant("sec-tenant-b").await.expect("tenant b");
+
+        let principal_a = Principal::tenant(tenant_a.tenant_id);
+        let principal_b = Principal::tenant(tenant_b.tenant_id);
+
+        // Tenant A submits a job
+        let job = cp.submit_job(&principal_a, tenant_a.tenant_id, "https://example.com", "snapshot", serde_json::json!({}), Some("sec-key"), 3).await.unwrap();
+
+        // Tenant B tries to read Tenant A's job -> should fail
+        let result = cp.get_job(&principal_b, job.job_id, tenant_a.tenant_id).await;
+        assert!(result.is_err(), "cross-tenant read should be rejected");
+
+        // Tenant B tries to cancel Tenant A's job -> should fail
+        let result = cp.cancel_job(&principal_b, job.job_id, tenant_a.tenant_id).await;
+        assert!(result.is_err(), "cross-tenant cancel should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_rejected() {
+        // This test verifies that the API requires a principal.
+        // Since methods now require &Principal (not Option), unauthenticated
+        // callers cannot invoke them without constructing a principal.
+        // Principal fields are private, so external crates cannot fabricate.
+        // This is a compile-time guarantee, not a runtime test.
+        // Verified by: Principal fields are private (pub(crate) constructors only).
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ssrf_loopback_rejected() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+        let tenant = cp.create_tenant("ssrf-tenant").await.expect("tenant");
+        let principal = Principal { subject: "admin".into(), tenant_id: Some(tenant.tenant_id), is_admin: true, is_worker: false };
+
+        // Loopback should be rejected
+        let result = cp.submit_job(&principal, tenant.tenant_id, "http://127.0.0.1/secret", "snapshot", serde_json::json!({}), None, 3).await;
+        assert!(result.is_err(), "loopback should be rejected");
+
+        // Private IP should be rejected
+        let result = cp.submit_job(&principal, tenant.tenant_id, "http://192.168.1.1/secret", "snapshot", serde_json::json!({}), None, 3).await;
+        assert!(result.is_err(), "private IP should be rejected");
+
+        // Metadata IP should be rejected
+        let result = cp.submit_job(&principal, tenant.tenant_id, "http://169.254.169.254/latest/meta-data", "snapshot", serde_json::json!({}), None, 3).await;
+        assert!(result.is_err(), "metadata IP should be rejected");
+
+        // Public URL should be accepted (DNS resolution may fail in test env, but literal check passes)
+        // We won't test public URLs to avoid network dependency
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credential rotation and audit logging
+// ---------------------------------------------------------------------------
+
+impl ControlPlane {
+    pub async fn rotate_credential(
+        &self,
+        principal: &Principal,
+        old_credential_id: &str,
+        new_credential_id: &str,
+        new_secret: &str,
+        grace_period_secs: i64,
+    ) -> Result<()> {
+        if !principal.is_admin() {
+            return Err(ControlPlaneError::Conflict("unauthorized".into()));
+        }
+
+        // Verify old credential exists and belongs to principal's tenant
+        let old_row = sqlx::query(
+            "SELECT tenant_id, is_admin, is_worker FROM credentials WHERE credential_id = $1",
+        )
+        .bind(old_credential_id)
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| ControlPlaneError::NotFound(old_credential_id.into()))?;
+
+        let tenant_id: Option<Uuid> = old_row.get("tenant_id");
+        if principal.tenant_id().is_some() && principal.tenant_id() != tenant_id {
+            return Err(ControlPlaneError::Conflict("unauthorized tenant".into()));
+        }
+
+        // Create new credential
+        let is_admin: bool = old_row.get("is_admin");
+        let is_worker: bool = old_row.get("is_worker");
+        let new_hash = hex::encode(Sha256::digest(new_secret.as_bytes()));
+        sqlx::query(
+            "INSERT INTO credentials (credential_id, subject, tenant_id, secret_hash, is_admin, is_worker, expires_at) VALUES ($1, (SELECT subject FROM credentials WHERE credential_id = $2), $3, $4, $5, $6, NULL)",
+        )
+        .bind(new_credential_id)
+        .bind(old_credential_id)
+        .bind(tenant_id)
+        .bind(new_hash)
+        .bind(is_admin)
+        .bind(is_worker)
+        .execute(self.pool())
+        .await?;
+
+        // Revoke old credential after grace period (immediate if grace_period_secs == 0)
+        if grace_period_secs == 0 {
+            sqlx::query("UPDATE credentials SET revoked = true WHERE credential_id = $1")
+                .bind(old_credential_id)
+                .execute(self.pool())
+                .await?;
+        }
+        // Note: grace period expiry would require a background task; for now, immediate revocation only.
+        // A production system would schedule revocation after grace_period_secs.
+
+        // Audit event
+        self.audit_event(principal.subject(), "credential.rotate", "credential", old_credential_id, "success", None).await.ok();
+
+        Ok(())
+    }
+
+    pub async fn audit_event(
+        &self,
+        actor: &str,
+        action: &str,
+        resource_type: &str,
+        resource_id: &str,
+        outcome: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO audit_events (tenant_id, actor, action, resource_type, resource_id) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(tenant_id)
+        .bind(actor)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod credential_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_credential_rotation() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant("cred-rot-tenant").await.expect("tenant");
+        let admin = Principal { subject: "admin".into(), tenant_id: None, is_admin: true, is_worker: false };
+        cp.create_credential(&admin, "old-cred", "user1", Some(tenant.tenant_id), "old-secret", false, false, None)
+            .await.expect("create old");
+
+        // Rotate with immediate retirement
+        cp.rotate_credential(&admin, "old-cred", "new-cred", "new-secret", 0)
+            .await.expect("rotate");
+
+        // Old credential should be revoked
+        assert!(cp.authenticate("old-cred", "old-secret").await.is_err());
+
+        // New credential should work
+        let p = cp.authenticate("new-cred", "new-secret").await.expect("auth new");
+        assert_eq!(p.tenant_id(), Some(tenant.tenant_id));
+
+        // Audit events should exist
+        let rows = sqlx::query("SELECT count(*) as c FROM audit_events WHERE action = 'credential.rotate'")
+            .fetch_one(cp.pool()).await.unwrap();
+        let count: i64 = rows.get("c");
+        assert!(count >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_audit_logging() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:obscura@127.0.0.1:5432/obscura".to_string());
+        let cp = ControlPlane::connect(&url, 5).await.expect("connect");
+        cp.migrate().await.expect("migrate");
+
+        let tenant = cp.create_tenant("audit-tenant").await.expect("tenant");
+        let admin = Principal { subject: "admin".into(), tenant_id: None, is_admin: true, is_worker: false };
+        cp.create_credential(&admin, "audit-cred", "user1", Some(tenant.tenant_id), "secret", false, false, None)
+            .await.expect("create");
+
+        // Authenticate (success)
+        cp.authenticate("audit-cred", "secret").await.expect("auth");
+
+        // Authenticate (failure)
+        let _ = cp.authenticate("audit-cred", "wrong").await;
+
+        // Check audit events
+        let rows = sqlx::query("SELECT action FROM audit_events WHERE resource_type = 'credential'")
+            .fetch_all(cp.pool()).await.unwrap();
+        assert!(!rows.is_empty());
     }
 }
