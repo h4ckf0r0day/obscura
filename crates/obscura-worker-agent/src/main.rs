@@ -28,6 +28,17 @@ async fn main() {
     let worker_id = cp.register_worker(tenant_id, serde_json::json!({}), 4).await.expect("register worker");
     cp.worker_heartbeat(worker_id).await.ok();
 
+    // Start periodic heartbeat task
+    let cp_hb = cp.clone();
+    let hb_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if cp_hb.worker_heartbeat(worker_id).await.is_err() {
+                tracing::warn!("heartbeat failed");
+            }
+        }
+    });
+
     let config = SupervisorConfig {
         worker_bin: PathBuf::from(worker_bin),
         pool_size: 1,
