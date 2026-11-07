@@ -14413,7 +14413,6 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
@@ -14437,7 +14436,6 @@ globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
 }
-globalThis.HTMLTableElement = Element;
 // <iframe> needs its own brand: with `HTMLIFrameElement = Element` every
 // element passed `instanceof HTMLIFrameElement`, so style-loader's
 // "insert target is an iframe" branch took `contentDocument.head` of <head>
@@ -14514,7 +14512,6 @@ globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
   assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
   assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
 };
-globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
@@ -14532,6 +14529,7 @@ for (const [name, tags] of Object.entries({
   HTMLOptGroupElement: ['optgroup'], HTMLOutputElement: ['output'], HTMLParamElement: ['param'],
   HTMLPictureElement: ['picture'], HTMLQuoteElement: ['blockquote', 'q'], HTMLSourceElement: ['source'],
   HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
+  HTMLTableElement: ['table'], HTMLSelectElement: ['select'], HTMLOptionElement: ['option'],
   HTMLTableColElement: ['col', 'colgroup'], HTMLTableRowElement: ['tr'],
   HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
 })) {
@@ -14552,6 +14550,164 @@ for (const [name, tags] of Object.entries({
     _additionalHtmlElementClasses[tag] = Interface;
     _additionalHtmlElementClasses[tag.toUpperCase()] = Interface;
   }
+}
+
+// Legacy select and table members (HTML "HTMLSelectElement", "HTMLOptionElement",
+// "HTMLTableElement", "HTMLTableSectionElement", "HTMLTableRowElement" and
+// "HTMLTableCellElement"). Older pages read them constantly, e.g.
+// `table.rows[i].cells[j]` and `select.item(select.selectedIndex)`.
+function _childrenNamed(parent, names) {
+  const out = [];
+  for (let c = parent.firstElementChild; c; c = c.nextElementSibling) {
+    if (names.includes(c.localName) && c.namespaceURI === 'http://www.w3.org/1999/xhtml') out.push(c);
+  }
+  return out;
+}
+function _tableRows(table) {
+  // thead rows, then rows of tbody and direct tr children in tree order, then tfoot rows.
+  const head = [], body = [], foot = [];
+  for (let c = table.firstElementChild; c; c = c.nextElementSibling) {
+    const n = c.localName;
+    if (n === 'tr') body.push(c);
+    else if (n === 'thead') head.push(..._childrenNamed(c, ['tr']));
+    else if (n === 'tbody') body.push(..._childrenNamed(c, ['tr']));
+    else if (n === 'tfoot') foot.push(..._childrenNamed(c, ['tr']));
+  }
+  return head.concat(body, foot);
+}
+function _indexSizeError(method, iface, index, max) {
+  return new DOMException(
+    "Failed to execute '" + method + "' on '" + iface + "': The index provided (" + index + ") is outside the range [-1, " + max + "].",
+    'IndexSizeError');
+}
+function _insertRowAt(container, rows, index, iface) {
+  index = Number(index) | 0;
+  if (index < -1 || index > rows.length) throw _indexSizeError('insertRow', iface, index, rows.length);
+  const row = container.ownerDocument.createElement('tr');
+  if (index === -1 || index === rows.length) {
+    // Appending goes into the last row's parent (a table's last section).
+    (rows.length ? rows[rows.length - 1].parentNode : container).appendChild(row);
+  } else {
+    rows[index].parentNode.insertBefore(row, rows[index]);
+  }
+  return row;
+}
+function _deleteAt(list, index, method, iface) {
+  index = Number(index) | 0;
+  if (index === -1) { if (list.length) list[list.length - 1].remove(); return; }
+  if (index < 0 || index >= list.length) throw _indexSizeError(method, iface, index, list.length);
+  list[index].remove();
+}
+{
+  const def = (C, members) => {
+    for (const [k, d] of Object.entries(members)) {
+      Object.defineProperty(C.prototype, k, Object.assign({ configurable: true, enumerable: true }, d));
+    }
+  };
+  def(HTMLSelectElement, {
+    length: {
+      get() { return this.options.length; },
+      set(v) {
+        const n = Number(v) >>> 0;
+        const opts = this.options;
+        for (let i = opts.length - 1; i >= n; i--) opts[i].remove();
+        for (let i = opts.length; i < n; i++) this.appendChild(this.ownerDocument.createElement('option'));
+      },
+    },
+    item: { writable: true, value: function item(index) { return this.options[Number(index) >>> 0] || null; } },
+    namedItem: { writable: true, value: function namedItem(name) {
+      name = String(name);
+      const opts = this.options;
+      for (let i = 0; i < opts.length; i++) {
+        if (opts[i].id === name || opts[i].getAttribute('name') === name) return opts[i];
+      }
+      return null;
+    } },
+    // select.remove(index) removes an option; with no argument it is ChildNode.remove().
+    remove: { writable: true, value: function remove(index) {
+      if (arguments.length === 0) return Element.prototype.remove.call(this);
+      const opt = this.options[Number(index) | 0];
+      if (opt) opt.remove();
+    } },
+  });
+  def(HTMLOptionElement, {
+    index: { get() {
+      let p = this.parentElement;
+      if (p && p.localName === 'optgroup') p = p.parentElement;
+      if (!p || p.localName !== 'select') return 0;
+      const opts = p.options;
+      for (let i = 0; i < opts.length; i++) if (opts[i] === this) return i;
+      return 0;
+    } },
+  });
+  def(HTMLTableElement, {
+    tHead: { get() { return _childrenNamed(this, ['thead'])[0] || null; } },
+    tFoot: { get() { return _childrenNamed(this, ['tfoot'])[0] || null; } },
+    tBodies: { get() { return HTMLCollection._from(_childrenNamed(this, ['tbody'])); } },
+    rows: { get() { return HTMLCollection._from(_tableRows(this)); } },
+    createTBody: { writable: true, value: function createTBody() {
+      const tbody = this.ownerDocument.createElement('tbody');
+      const bodies = _childrenNamed(this, ['tbody']);
+      const last = bodies[bodies.length - 1];
+      this.insertBefore(tbody, last ? last.nextSibling : null);
+      return tbody;
+    } },
+    insertRow: { writable: true, value: function insertRow(index = -1) {
+      const rows = _tableRows(this);
+      if (!rows.length && (Number(index) | 0) <= 0 && (Number(index) | 0) >= -1) {
+        const bodies = _childrenNamed(this, ['tbody']);
+        const body = bodies.length ? bodies[bodies.length - 1] : this.appendChild(this.ownerDocument.createElement('tbody'));
+        return body.appendChild(this.ownerDocument.createElement('tr'));
+      }
+      return _insertRowAt(this, rows, index, 'HTMLTableElement');
+    } },
+    deleteRow: { writable: true, value: function deleteRow(index) {
+      _deleteAt(_tableRows(this), index, 'deleteRow', 'HTMLTableElement');
+    } },
+  });
+  def(HTMLTableSectionElement, {
+    rows: { get() { return HTMLCollection._from(_childrenNamed(this, ['tr'])); } },
+    insertRow: { writable: true, value: function insertRow(index = -1) {
+      return _insertRowAt(this, _childrenNamed(this, ['tr']), index, 'HTMLTableSectionElement');
+    } },
+    deleteRow: { writable: true, value: function deleteRow(index) {
+      _deleteAt(_childrenNamed(this, ['tr']), index, 'deleteRow', 'HTMLTableSectionElement');
+    } },
+  });
+  def(HTMLTableRowElement, {
+    cells: { get() { return HTMLCollection._from(_childrenNamed(this, ['td', 'th'])); } },
+    rowIndex: { get() {
+      const p = this.parentElement;
+      if (!p) return -1;
+      const table = p.localName === 'table' ? p
+        : (['thead', 'tbody', 'tfoot'].includes(p.localName) && p.parentElement && p.parentElement.localName === 'table' ? p.parentElement : null);
+      return table ? _tableRows(table).indexOf(this) : -1;
+    } },
+    sectionRowIndex: { get() {
+      const p = this.parentElement;
+      if (!p) return -1;
+      if (p.localName === 'table') return _tableRows(p).indexOf(this);
+      if (['thead', 'tbody', 'tfoot'].includes(p.localName)) return _childrenNamed(p, ['tr']).indexOf(this);
+      return -1;
+    } },
+    insertCell: { writable: true, value: function insertCell(index = -1) {
+      const cells = _childrenNamed(this, ['td', 'th']);
+      index = Number(index) | 0;
+      if (index < -1 || index > cells.length) throw _indexSizeError('insertCell', 'HTMLTableRowElement', index, cells.length);
+      const cell = this.ownerDocument.createElement('td');
+      this.insertBefore(cell, index === -1 || index === cells.length ? null : cells[index]);
+      return cell;
+    } },
+    deleteCell: { writable: true, value: function deleteCell(index) {
+      _deleteAt(_childrenNamed(this, ['td', 'th']), index, 'deleteCell', 'HTMLTableRowElement');
+    } },
+  });
+  def(HTMLTableCellElement, {
+    cellIndex: { get() {
+      const p = this.parentElement;
+      return p && p.localName === 'tr' ? _childrenNamed(p, ['td', 'th']).indexOf(this) : -1;
+    } },
+  });
 }
 
 // SVGAnimatedString backs the className and href reflections on SVG elements.
