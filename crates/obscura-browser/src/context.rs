@@ -249,6 +249,19 @@ impl BrowserContext {
         Self::with_options(id, proxy_url, false)
     }
 
+    /// The context for one CDP client connection. Like a persistent copy it
+    /// starts from the template's cookies and localStorage, but both are the
+    /// connection's own: localStorage is a snapshot whose changes the server
+    /// merges back into the profile when the connection closes, and IndexedDB
+    /// (which is never written to disk) starts empty. A persistent copy shares
+    /// the template's live stores, so two clients would read each other's data.
+    pub fn connection_copy(&self, id: String) -> Self {
+        let mut copy = self.isolated_copy(id, true);
+        copy.local_storage = Arc::new(self.local_storage.deep_copy());
+        copy.indexed_db = Arc::new(obscura_js::indexed_db::IndexedDbStorage::default());
+        copy
+    }
+
     /// Create a context with the same browser configuration but independent
     /// mutable network state. Persistent copies start with the template's
     /// current cookies; incognito copies start empty and never write to the
@@ -589,6 +602,22 @@ mod tests {
             persistent.local_storage.get("https://app.example", "k"),
             Some("v".to_string())
         );
+    }
+
+    #[test]
+    fn connection_copies_do_not_share_live_storage() {
+        let profile = BrowserContext::with_storage("profile".into(), None);
+        profile.local_storage.set("https://app.example", "seed".into(), "1".into());
+        let a = profile.connection_copy("a".into());
+        let b = profile.connection_copy("b".into());
+        // Both start from the profile's data...
+        assert_eq!(b.local_storage.get("https://app.example", "seed"), Some("1".to_string()));
+        // ...but a write on one client is not visible to the other or the profile.
+        a.local_storage.set("https://app.example", "secret".into(), "a".into());
+        assert_eq!(b.local_storage.get("https://app.example", "secret"), None);
+        assert_eq!(profile.local_storage.get("https://app.example", "secret"), None);
+        assert!(!Arc::ptr_eq(&a.indexed_db, &b.indexed_db));
+        assert!(!Arc::ptr_eq(&a.indexed_db, &profile.indexed_db));
     }
 
     /// An unchanged store must not touch the disk, or every navigation on a

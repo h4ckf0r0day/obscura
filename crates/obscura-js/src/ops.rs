@@ -310,6 +310,17 @@ impl OriginStorage {
 
     pub fn is_dirty(&self) -> bool { !self.lock().changed.is_empty() }
 
+    /// An independent copy of every origin, with nothing marked changed. Each
+    /// CDP connection works on one of these so a client never sees another
+    /// live client's storage.
+    pub fn deep_copy(&self) -> OriginStorage {
+        let copy = OriginStorage::default();
+        for (origin, items) in self.entries() {
+            copy.load(&origin, items);
+        }
+        copy
+    }
+
     pub fn clear(&self, origin: &str) {
         let mut inner = self.lock();
         if let Some(entries) = inner.origins.remove(origin) {
