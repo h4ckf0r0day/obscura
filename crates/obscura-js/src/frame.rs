@@ -1798,6 +1798,40 @@ mod tests {
     }
 
     #[test]
+    fn data_transfer_file_list_assignment_supports_playwright_payloads() {
+        let mut rt = page(
+            "https://example.com/",
+            "<html><body><input type=file id=f multiple></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const input = document.getElementById('f');
+            const dt = new DataTransfer();
+            const first = new File([new Uint8Array([0, 128, 255])], 'one.png', {type:'image/png'});
+            const second = new File([new Uint8Array([4, 5])], 'two.png', {type:'image/png'});
+            const events = [];
+            for (const type of ['input', 'change']) input.addEventListener(type, () => events.push(type));
+            dt.items.add(first);
+            dt.items.add(second);
+            const list = dt.files;
+            input.files = list;
+            const before = [
+                typeof DataTransfer, typeof DataTransferItemList,
+                input.files instanceof FileList, input.files === list,
+                String(input.files.length), input.files[0].name,
+                String(input.files[0].size), input.files.item(1).name,
+                String(events.length)
+            ];
+            dt.items.remove(0);
+            input.dispatchEvent(new Event('input', {bubbles:true}));
+            input.dispatchEvent(new Event('change', {bubbles:true}));
+            return before.concat([String(input.files.length), input.files[0].name, events.join(',')]);
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "function", "function", true, true, "2", "one.png", "3", "two.png", "0", "1", "two.png", "input,change"
+        ]));
+    }
+
+    #[test]
     fn file_list_iteration_preserves_uploaded_files() {
         let mut rt = page(
             "https://example.com/",
