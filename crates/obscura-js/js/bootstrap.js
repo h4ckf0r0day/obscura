@@ -2027,9 +2027,10 @@ function _eventTargetDispatch(target, event) {
   event._dispatching = true;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
-  event.target = target;
-  event.currentTarget = target;
-  event.eventPhase = 2;
+  const state = _eventStateOf(event) || event;
+  state.target = target;
+  state.currentTarget = target;
+  state.eventPhase = 2;
   try {
     // Other EventTargets register their IDL handlers in the listener list.
     const eventHandler = target === globalThis ? target['on' + event.type] : null;
@@ -2062,8 +2063,8 @@ function _eventTargetDispatch(target, event) {
     }
     return !event.defaultPrevented;
   } finally {
-    event.currentTarget = null;
-    event.eventPhase = 0;
+    state.currentTarget = null;
+    state.eventPhase = 0;
     event._dispatching = false;
   }
 }
@@ -2085,20 +2086,20 @@ Object.defineProperty(globalThis, "event", {
   configurable: true,
 });
 
-function _domEventInvoke(target, event, capture, phase) {
+function _domEventInvoke(target, event, capture, phase, state) {
   const previousEvent = _currentWindowEvent;
   // The spec leaves the current event untouched for targets in a shadow tree.
   if (!event._inShadowTree) _currentWindowEvent = event;
   try {
-    _domEventInvokeHandlers(target, event, capture, phase);
+    _domEventInvokeHandlers(target, event, capture, phase, state);
   } finally {
     _currentWindowEvent = previousEvent;
   }
 }
 
-function _domEventInvokeHandlers(target, event, capture, phase) {
-  event.currentTarget = target;
-  event.eventPhase = phase;
+function _domEventInvokeHandlers(target, event, capture, phase, state = _eventStateOf(event) || event) {
+  state.currentTarget = target;
+  state.eventPhase = phase;
 
   // Content attributes and IDL event handlers participate in the non-capture
   // listener group. Keep their existing position ahead of listeners installed
@@ -2151,7 +2152,10 @@ function _domEventDispatch(target, event) {
   event._dispatching = true;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
-  event.target = target;
+  // One lookup per dispatch; a plain object standing in for an event keeps
+  // ordinary properties.
+  const state = _eventStateOf(event) || event;
+  state.target = target;
   const path = [];
   let ancestor = target.parentNode || null;
   while (ancestor) {
@@ -2171,27 +2175,27 @@ function _domEventDispatch(target, event) {
 
   try {
     for (let index = path.length - 1; index >= 0; index--) {
-      _domEventInvoke(path[index], event, true, 1);
+      _domEventInvoke(path[index], event, true, 1, state);
       if (event._propagationStopped) break;
     }
 
     if (!event._propagationStopped) {
-      _domEventInvoke(target, event, true, 2);
+      _domEventInvoke(target, event, true, 2, state);
       if (!event._immediatePropagationStopped) {
-        _domEventInvoke(target, event, false, 2);
+        _domEventInvoke(target, event, false, 2, state);
       }
     }
 
     if (event.bubbles && !event._propagationStopped) {
       for (const currentTarget of path) {
-        _domEventInvoke(currentTarget, event, false, 3);
+        _domEventInvoke(currentTarget, event, false, 3, state);
         if (event._propagationStopped) break;
       }
     }
     return !event.defaultPrevented;
   } finally {
-    event.currentTarget = null;
-    event.eventPhase = 0;
+    state.currentTarget = null;
+    state.eventPhase = 0;
     event._dispatching = false;
   }
 }
@@ -8908,8 +8912,8 @@ class XMLHttpRequestEventTarget {
   dispatchEvent(event) {
     if (!event || !event.type) return false;
     const ev = (typeof event === 'object') ? event : { type: event };
-    ev.target = ev.target || this;
-    ev.currentTarget = ev.currentTarget || this;
+    _eventSet(ev, "target", ev.target || this);
+    _eventSet(ev, "currentTarget", ev.currentTarget || this);
     const type = ev.type;
     const handlers = (this._listeners && this._listeners[type]) || [];
     for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
@@ -9113,8 +9117,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   dispatchEvent(event) {
     if (!event || !event.type) return false;
     const ev = (typeof event === 'object') ? event : { type: event };
-    ev.target = ev.target || this;
-    ev.currentTarget = ev.currentTarget || this;
+    _eventSet(ev, "target", ev.target || this);
+    _eventSet(ev, "currentTarget", ev.currentTarget || this);
     const type = ev.type;
     const handlers = (this._listeners && this._listeners[type]) || [];
     for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
@@ -11950,11 +11954,84 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
+// Event's attributes are accessors on Event.prototype, as WebIDL defines every
+// attribute (WebIDL "Attributes": an accessor property on the interface
+// prototype object; DOM "Interface Event"), not own data properties of each
+// event. Scripts take the getters from the prototype, e.g.
+// Object.getOwnPropertyDescriptor(Event.prototype, "type").get, and Shopify's
+// exit-interstitial inline script throws "type is not defined" when there is
+// none. The values live in a private field of the event (#state). An event
+// made in another realm (a frame's event dispatched by its parent's code) has
+// that realm's field instead: each realm puts its field reader in a private
+// slot on its Event.prototype (op_event_state), and code that meets a foreign
+// event finds the reader through the event's prototype chain and caches the
+// state in a WeakMap, so both realms share one target and phase.
+const _eventStates = new WeakMap();
+let _eventOwnState;
+// Registered on this realm's first event: ops are not available while the
+// startup snapshot is built, and no other realm can hold one of our events
+// before that.
+let _eventReaderRegistered = false;
+function _eventStateOf(event) {
+  if (event === null || (typeof event !== "object" && typeof event !== "function")) return undefined;
+  const own = _eventOwnState(event);
+  if (own !== undefined) return own;
+  let state = _eventStates.get(event);
+  if (state === undefined) {
+    state = _eventForeignState(event);
+    if (state) _eventStates.set(event, state);
+  }
+  return state;
+}
+function _eventForeignState(event) {
+  try {
+    for (let proto = Object.getPrototypeOf(event); proto; proto = Object.getPrototypeOf(proto)) {
+      const reader = __obscuraCore.ops.op_event_state(proto, undefined);
+      if (typeof reader === "function") return reader(event);
+    }
+  } catch (_) {}
+  return undefined;
+}
+function _eventSlot(event) {
+  const state = _eventStateOf(event);
+  if (!state) throw new TypeError("Illegal invocation");
+  return state;
+}
+// Internal writes (dispatch, init*Event). A plain object standing in for an
+// event (the XHR and abort paths accept one) keeps an ordinary property.
+function _eventSet(event, key, value) {
+  const state = _eventStateOf(event);
+  if (state) state[key] = value; else event[key] = value;
+}
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  #state;
+  static { _eventOwnState = (event) => #state in event ? event.#state : undefined; }
+  constructor(t,o={}) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present.");
+    const state = {type:String(t),bubbles:!!o.bubbles,cancelable:!!o.cancelable,composed:!!o.composed,defaultPrevented:false,target:null,currentTarget:null,eventPhase:0,timeStamp:performance.now()};
+    this.#state = state;
+    if (!_eventReaderRegistered) { _eventReaderRegistered = true; __obscuraCore.ops.op_event_state(Event.prototype, _eventOwnState); }
+    this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false;
+  }
+  get type() { return (#state in this ? this.#state : _eventSlot(this)).type; }
+  get target() { return (#state in this ? this.#state : _eventSlot(this)).target; }
+  get srcElement() { return (#state in this ? this.#state : _eventSlot(this)).target; }
+  get currentTarget() { return (#state in this ? this.#state : _eventSlot(this)).currentTarget; }
+  get eventPhase() { return (#state in this ? this.#state : _eventSlot(this)).eventPhase; }
+  get bubbles() { return (#state in this ? this.#state : _eventSlot(this)).bubbles; }
+  get cancelable() { return (#state in this ? this.#state : _eventSlot(this)).cancelable; }
+  get defaultPrevented() { return (#state in this ? this.#state : _eventSlot(this)).defaultPrevented; }
+  get composed() { return (#state in this ? this.#state : _eventSlot(this)).composed; }
+  get timeStamp() { return (#state in this ? this.#state : _eventSlot(this)).timeStamp; }
   get isTrusted() { return _trustedEvents.has(this); }
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  // Legacy: cancelBubble mirrors the stop propagation flag, returnValue the
+  // inverse of the canceled flag; setting true / false sets the flag.
+  get cancelBubble() { (#state in this ? this.#state : _eventSlot(this)); return !!this._propagationStopped; }
+  set cancelBubble(value) { (#state in this ? this.#state : _eventSlot(this)); if (value) this._propagationStopped = true; }
+  get returnValue() { return !(#state in this ? this.#state : _eventSlot(this)).defaultPrevented; }
+  set returnValue(value) { (#state in this ? this.#state : _eventSlot(this)); if (!value) this.preventDefault(); }
+  preventDefault() { const state = (#state in this ? this.#state : _eventSlot(this)); if (state.cancelable) state.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
+  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); const state = (#state in this ? this.#state : _eventSlot(this)); state.type=String(type);state.bubbles=!!bubbles;state.cancelable=!!cancelable;state.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
     if (!this.target) return [];
     const path = [];
@@ -11987,20 +12064,43 @@ globalThis.__obscura_fireBeforeUnload = function() {
 };
 _markNative(BeforeUnloadEvent);
 _markNative(Event);
+// DOM "Interface Event" constants, on the interface and its prototype.
+for (const [name, value] of [["NONE", 0], ["CAPTURING_PHASE", 1], ["AT_TARGET", 2], ["BUBBLING_PHASE", 3]]) {
+  for (const target of [Event, Event.prototype]) {
+    Object.defineProperty(target, name, { value, enumerable: true, writable: false, configurable: false });
+  }
+}
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
   // instead of new CustomEvent(...). See issue #41.
   initCustomEvent(type,bubbles,cancelable,detail) {
-    this.type = type;
-    this.bubbles = !!bubbles;
-    this.cancelable = !!cancelable;
+    this.initEvent(type,bubbles,cancelable);
     this.detail = detail;
   }
 };
 globalThis.MouseEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null;this.movementX=o.movementX||0;this.movementY=o.movementY||0; }
+  constructor(t,o={}) {
+    super(t,o);this.view=o.view||null;this.detail=o.detail||0;
+    const state = _eventSlot(this);
+    state.screenX=o.screenX||0;state.screenY=o.screenY||0;state.clientX=o.clientX||0;state.clientY=o.clientY||0;state.ctrlKey=!!o.ctrlKey;state.altKey=!!o.altKey;state.shiftKey=!!o.shiftKey;state.metaKey=!!o.metaKey;state.button=o.button||0;state.buttons=o.buttons||0;state.relatedTarget=o.relatedTarget||null;state.movementX=o.movementX||0;state.movementY=o.movementY||0;
+  }
+  // MouseEvent's own attributes are prototype accessors like Event's (UI Events
+  // "Interface MouseEvent"); the view and detail of UIEvent stay on the event.
+  get screenX() { return _eventSlot(this).screenX; }
+  get screenY() { return _eventSlot(this).screenY; }
+  get clientX() { return _eventSlot(this).clientX; }
+  get clientY() { return _eventSlot(this).clientY; }
+  get ctrlKey() { return _eventSlot(this).ctrlKey; }
+  get shiftKey() { return _eventSlot(this).shiftKey; }
+  get altKey() { return _eventSlot(this).altKey; }
+  get metaKey() { return _eventSlot(this).metaKey; }
+  get button() { return _eventSlot(this).button; }
+  get buttons() { return _eventSlot(this).buttons; }
+  get relatedTarget() { return _eventSlot(this).relatedTarget; }
+  get movementX() { return _eventSlot(this).movementX; }
+  get movementY() { return _eventSlot(this).movementY; }
   get pageX() { return this.clientX + (globalThis.scrollX || 0); }
   get pageY() { return this.clientY + (globalThis.scrollY || 0); }
   get x() { return this.clientX; }
@@ -12029,16 +12129,17 @@ globalThis.MouseEvent = class extends Event {
     this.initEvent(type,canBubble,cancelable);
     this.view=view===undefined?null:view;
     this.detail=detail||0;
-    this.screenX=screenX||0;
-    this.screenY=screenY||0;
-    this.clientX=clientX||0;
-    this.clientY=clientY||0;
-    this.ctrlKey=!!ctrlKey;
-    this.altKey=!!altKey;
-    this.shiftKey=!!shiftKey;
-    this.metaKey=!!metaKey;
-    this.button=button||0;
-    this.relatedTarget=relatedTarget===undefined?null:relatedTarget;
+    const state = _eventSlot(this);
+    state.screenX=screenX||0;
+    state.screenY=screenY||0;
+    state.clientX=clientX||0;
+    state.clientY=clientY||0;
+    state.ctrlKey=!!ctrlKey;
+    state.altKey=!!altKey;
+    state.shiftKey=!!shiftKey;
+    state.metaKey=!!metaKey;
+    state.button=button||0;
+    state.relatedTarget=relatedTarget===undefined?null:relatedTarget;
   }
 };
 globalThis.KeyboardEvent = class extends Event {
@@ -12154,7 +12255,12 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
   }
 };
 globalThis.ClipboardEvent = class extends Event {};
-globalThis.SubmitEvent = class extends Event {};
+// SubmitEvent.submitter is a prototype accessor (HTML "The SubmitEvent
+// interface"), initialised from the init dictionary.
+globalThis.SubmitEvent = class SubmitEvent extends Event {
+  constructor(t,o={}) { super(t,o); _eventSlot(this).submitter=o.submitter||null; }
+  get submitter() { return _eventSlot(this).submitter; }
+};
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
 // newState are "open"/"closed". These events do not bubble; beforetoggle is
@@ -12314,7 +12420,7 @@ let _createDependentAbortSignal;
     state.dependents.clear();
     const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
     _trustedEvents.add(evt);
-    try { evt.target = signal; evt.currentTarget = signal; } catch (_) {}
+    try { _eventSet(evt, "target", signal); _eventSet(evt, "currentTarget", signal); } catch (_) {}
     emit(signal, evt);
   }
   function fire(signal, reason) {
@@ -12465,14 +12571,26 @@ if (typeof Blob === "undefined") globalThis.Blob = class Blob {
   arrayBuffer() { return Promise.resolve(_arrayBufferFromBytes(this._bytes)); }
   bytes() { return Promise.resolve(this._bytes.slice()); }
 };
+// File's name and lastModified are prototype accessors (File API "The File
+// Interface"; WebIDL attributes), read like Event's through the descriptor.
+const _fileStates = new WeakMap();
+function _fileSlot(file) {
+  const state = _fileStates.get(file);
+  if (!state) throw new TypeError("Illegal invocation");
+  return state;
+}
 if (typeof File === "undefined") globalThis.File = class File extends Blob {
   constructor(parts, name, opts) {
     if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
     opts = opts || {};
     super(parts, opts);
-    this.name = String(name);
-    this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
+    _fileStates.set(this, {
+      name: String(name),
+      lastModified: opts.lastModified != null ? Number(opts.lastModified) : Date.now(),
+    });
   }
+  get name() { return _fileSlot(this).name; }
+  get lastModified() { return _fileSlot(this).lastModified; }
   get [Symbol.toStringTag]() { return "File"; }
 };
 // Issue #1232: `typeof FileList` was `undefined`, so apps that reference it
@@ -13708,6 +13826,52 @@ globalThis.atob = globalThis.atob || ((s) => {
   });
 })();
 
+// The Navigation API's event interfaces (HTML "The NavigateEvent interface",
+// "The NavigationDestination interface"). `navigation` below exists, so scripts
+// that feature-detect it read NavigateEvent.prototype's accessors; without the
+// interfaces Shopify's storefront inline script threw a ReferenceError. Our
+// navigation never fires navigate, so intercept()/scroll() have no dispatch to
+// act in and throw as they do outside one.
+globalThis.NavigationDestination = class NavigationDestination {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get url() { return _eventSlot(this).url; }
+  get key() { return _eventSlot(this).key; }
+  get id() { return _eventSlot(this).id; }
+  get index() { return _eventSlot(this).index; }
+  get sameDocument() { return _eventSlot(this).sameDocument; }
+  getState() { return _eventSlot(this).state; }
+};
+globalThis.NavigateEvent = class NavigateEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'NavigateEvent': 2 arguments required, but only " + arguments.length + " present.");
+    init = init || {};
+    if (!(init.destination instanceof NavigationDestination)) throw new TypeError("Failed to construct 'NavigateEvent': Failed to read the 'destination' property from 'NavigateEventInit': Required member is undefined.");
+    if (!(init.signal instanceof AbortSignal)) throw new TypeError("Failed to construct 'NavigateEvent': Failed to read the 'signal' property from 'NavigateEventInit': Required member is undefined.");
+    super(type, init);
+    const navigationType = init.navigationType === undefined ? "push" : String(init.navigationType);
+    if (!["push", "replace", "reload", "traverse"].includes(navigationType)) throw new TypeError("Failed to construct 'NavigateEvent': The provided value '" + navigationType + "' is not a valid enum value of type NavigationType.");
+    Object.assign(_eventSlot(this), {
+      navigationType, destination: init.destination, canIntercept: !!init.canIntercept,
+      userInitiated: !!init.userInitiated, hashChange: !!init.hashChange, signal: init.signal,
+      formData: init.formData || null, downloadRequest: init.downloadRequest == null ? null : String(init.downloadRequest),
+      info: init.info, hasUAVisualTransition: !!init.hasUAVisualTransition, sourceElement: init.sourceElement || null,
+    });
+  }
+  get navigationType() { return _eventSlot(this).navigationType; }
+  get destination() { return _eventSlot(this).destination; }
+  get canIntercept() { return _eventSlot(this).canIntercept; }
+  get userInitiated() { return _eventSlot(this).userInitiated; }
+  get hashChange() { return _eventSlot(this).hashChange; }
+  get signal() { return _eventSlot(this).signal; }
+  get formData() { return _eventSlot(this).formData; }
+  get downloadRequest() { return _eventSlot(this).downloadRequest; }
+  get info() { return _eventSlot(this).info; }
+  get hasUAVisualTransition() { return _eventSlot(this).hasUAVisualTransition; }
+  get sourceElement() { return _eventSlot(this).sourceElement; }
+  intercept() { _eventSlot(this); throw new DOMException("Failed to execute 'intercept' on 'NavigateEvent': intercept() may only be called while the navigate event is being dispatched.", "InvalidStateError"); }
+  scroll() { _eventSlot(this); throw new DOMException("Failed to execute 'scroll' on 'NavigateEvent': scroll() may only be called while the navigate event is being dispatched.", "InvalidStateError"); }
+};
+
 // Navigation API. New framework routers increasingly prefer `navigation`
 // over popstate/history. Keep it backed by the functional History API above
 // so both surfaces agree about the current URL and state.
@@ -14881,7 +15045,7 @@ function _isHTMLEl(el) {
 function _nodeList(els) {
   const nl = new NodeList();
   for (let i = 0; i < els.length; i++) nl[i] = els[i];
-  nl.length = els.length;
+  _nodeListLengths.set(nl, els.length);
   return nl;
 }
 
@@ -14988,8 +15152,23 @@ globalThis.DOMTokenList = DOMTokenList;
 // It keeps the array-like surface scripts actually use: indexed access, length,
 // item(), forEach(), entries/keys/values, and iteration (so spread and for..of
 // work).
+// length is a prototype accessor (DOM "Interface NodeList"), not an own
+// property: scripts read it through the descriptor. _nodeList records it; a
+// list moved to a frame's NodeList.prototype (_relevantNodeList) is counted
+// once in that realm. The lists are static snapshots, so the count holds.
+const _nodeListLengths = new WeakMap();
 globalThis.NodeList = class NodeList {
-  constructor() { this.length = 0; }
+  constructor() { _nodeListLengths.set(this, 0); }
+  get length() {
+    let length = _nodeListLengths.get(this);
+    if (length === undefined) {
+      if (this === NodeList.prototype || !NodeList.prototype.isPrototypeOf(this)) throw new TypeError("Illegal invocation");
+      length = 0;
+      while (Object.prototype.hasOwnProperty.call(this, length)) length++;
+      _nodeListLengths.set(this, length);
+    }
+    return length;
+  }
   item(i) { i = i >>> 0; return this[i] != null ? this[i] : null; }
   forEach(cb, thisArg) {
     for (let i = 0; i < this.length; i++) cb.call(thisArg, this[i], i, this);

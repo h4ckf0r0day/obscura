@@ -24303,6 +24303,86 @@ mod tests {
         assert_eq!(d, serde_json::json!("world"));
     }
 
+    // WebIDL attributes are accessors on the interface prototype. Shopify's
+    // storefront inline script takes the getters that way and threw
+    // "TypeError: type is not defined" when Event.prototype had none (and then
+    // "NavigateEvent is not defined", as `navigation` exists).
+    #[test]
+    fn test_event_attributes_are_prototype_accessors() {
+        let mut rt = setup_runtime(r#"<html><body><form id="f"><button id="b">Go</button></form></body></html>"#);
+        rt.execute_script(
+            "test",
+            r#"
+            const desc = (proto, name) => {
+              for (let o = proto; o; o = Object.getPrototypeOf(o)) {
+                const d = Object.getOwnPropertyDescriptor(o, name);
+                if (d) return d;
+              }
+              throw new TypeError(`${name} is not defined`);
+            };
+            const get = (proto, name) => Function.prototype.call.bind(desc(proto, name).get);
+            const type = get(Event.prototype, "type"), target = get(Event.prototype, "target");
+            const phase = get(Event.prototype, "eventPhase"), button = get(MouseEvent.prototype, "button");
+            const submitter = get(SubmitEvent.prototype, "submitter"), fileName = get(File.prototype, "name");
+            const length = get(NodeList.prototype, "length");
+            const setBubble = desc(Event.prototype, "cancelBubble").set;
+            const b = document.getElementById("b"), seen = [];
+            b.addEventListener("click", e => {
+              seen.push(type(e), target(e) === b, phase(e), button(e));
+              setBubble.call(e, true);
+            });
+            document.body.addEventListener("click", () => seen.push("bubbled"));
+            b.dispatchEvent(new MouseEvent("click", {bubbles: true, button: 2}));
+            seen.push(submitter(new SubmitEvent("submit", {submitter: b})) === b);
+            seen.push(fileName(new File([], "a.txt")), length(document.querySelectorAll("button")));
+            seen.push(desc(Event.prototype, "type").set === undefined, Object.keys(new Event("x")).includes("type"));
+            let illegal = "";
+            try { type({}); } catch (e) { illegal = e.constructor.name; }
+            seen.push(illegal, Event.CAPTURING_PHASE, typeof get(NavigateEvent.prototype, "navigationType"));
+            seen.push(typeof get(NavigationDestination.prototype, "url"));
+            globalThis.__seen = seen;
+        "#,
+        )
+        .unwrap();
+        let seen = rt.evaluate("globalThis.__seen").unwrap();
+        assert_eq!(
+            seen,
+            serde_json::json!([
+                "click", true, 2, 2, true, "a.txt", 1, true, false, "TypeError", 1, "function",
+                "function"
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_event_state_crosses_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"() => {
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const w = frame.contentWindow, seen = [];
+            const get = (proto, name) => Object.getOwnPropertyDescriptor(proto, name).get;
+            // A frame's event dispatched by this realm's code.
+            const foreign = new w.MouseEvent('ping', {bubbles: true, button: 1});
+            document.body.addEventListener('ping', e => seen.push(e === foreign, e.target === document.body, e.eventPhase, e.button));
+            document.body.dispatchEvent(foreign);
+            seen.push(get(Event.prototype, 'type').call(foreign), get(Event.prototype, 'target').call(foreign) === document.body, foreign.eventPhase);
+            // This realm's event dispatched by the frame's code.
+            const own = new Event('pong'), div = w.document.createElement('div');
+            w.document.body.appendChild(div);
+            div.addEventListener('pong', e => seen.push(e === own, e.target === div, e.eventPhase));
+            div.dispatchEvent(own);
+            seen.push(get(w.Event.prototype, 'type').call(own));
+            let illegal = '';
+            try { get(Event.prototype, 'type').call(Object.create(w.Event.prototype)); } catch (e) { illegal = e.constructor.name; }
+            seen.push(illegal);
+            return seen;
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(
+            result.value,
+            Some(serde_json::json!([true, true, 2, 1, "ping", true, 0, true, true, 2, "pong", "TypeError"]))
+        );
+    }
+
     #[test]
     fn test_create_event_returns_correct_class() {
         let mut rt = setup_runtime("<html><body></body></html>");
