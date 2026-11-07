@@ -3936,6 +3936,22 @@ enum FetchOptions {
     Cancelable { cancel_rid: u32, destination: String },
 }
 
+/// The network error for a same-origin-mode request that would leave the page's
+/// origin, in the shape the fetch shim reports as a CORS failure.
+fn same_origin_mode_blocked(url: &str, page_origin: &str) -> String {
+    serde_json::json!({
+        "status": 0,
+        "body": "",
+        "url": url,
+        "headers": {},
+        "corsBlocked": true,
+        "corsError": format!(
+            "Request mode is \"same-origin\" but the URL's origin is not same as the request origin {page_origin}."
+        ),
+    })
+    .to_string()
+}
+
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
@@ -4199,6 +4215,17 @@ async fn fetch_url_inner(
         origin.clone()
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
+    // Fail closed: "no-cors" relaxes CORS (a cross-origin answer becomes
+    // opaque) and "same-origin" refuses other origins; every other value,
+    // valid or not, gets the CORS checks. Unknown modes used to skip both, so
+    // fetch(url, { mode: 'same-origin' }) read cross-origin responses.
+    let mode = match mode.as_str() {
+        "no-cors" | "same-origin" => mode,
+        _ => "cors".to_string(),
+    };
+    if mode == "same-origin" && is_cross_origin {
+        return Ok(same_origin_mode_blocked(&url, &page_origin));
+    }
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -4363,6 +4390,9 @@ async fn fetch_url_inner(
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
+        if mode == "same-origin" && current_is_cross_origin {
+            return Ok(same_origin_mode_blocked(current_url.as_str(), &page_origin));
+        }
         crossed_origin |= current_is_cross_origin;
         if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
             req = req.header("Origin", &page_origin);
@@ -4686,6 +4716,9 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
+        if mode == "same-origin" && current_is_cross_origin {
+            return Ok(same_origin_mode_blocked(parsed_current.as_str(), &page_origin));
+        }
         crossed_origin |= current_is_cross_origin;
         if sends_origin_header(&current_method, current_is_cross_origin) {
             req_headers.insert("origin".to_string(), page_origin.clone());
