@@ -797,8 +797,9 @@ impl ObscuraJsRuntime {
     /// the global so page script can never reach `Deno.core.ops`.
     ///
     /// Bootstrap keeps the core reference in a private const. Once deno_core
-    /// has bound the ops, this removes both public globals before page code can
-    /// run, leaving the handoff as the host's only route to child realms.
+    /// has bound the ops, this removes the public globals (`Deno`, the handoff
+    /// and deno_core's `__bootstrap`) before page code can run, leaving the
+    /// handoff as the host's only route to child realms.
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
 
@@ -811,6 +812,10 @@ impl ObscuraJsRuntime {
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
         let deno_key = v8::String::new(scope, "Deno")?;
+        // deno_core's own alias of the same core object (`__bootstrap.core`).
+        // Deno's runtime deletes it after bootstrap (99_main.js); left here it
+        // handed every page the raw op table.
+        let bootstrap_key = v8::String::new(scope, "__bootstrap")?;
         let ops_key = v8::String::new(scope, "ops")?;
         let global = context.global(scope);
 
@@ -823,6 +828,7 @@ impl ObscuraJsRuntime {
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
+        global.delete(scope, bootstrap_key.into());
         Some(ops)
     }
 
@@ -920,6 +926,9 @@ impl ObscuraJsRuntime {
         let Some(deno_key) = v8::String::new(scope, "Deno") else {
             return false;
         };
+        let Some(bootstrap_key) = v8::String::new(scope, "__bootstrap") else {
+            return false;
+        };
         let global = context.global(scope);
         let Some(core) = global.get(scope, handoff_key.into()) else {
             return false;
@@ -958,6 +967,7 @@ impl ObscuraJsRuntime {
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
+        global.delete(scope, bootstrap_key.into());
         copied > 0
     }
 
@@ -4835,9 +4845,26 @@ mod tests {
         rt.evaluate("delete globalThis.__obscura_test_ops").unwrap();
 
         assert_eq!(
-            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff]")
+            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff, typeof __bootstrap]")
                 .unwrap(),
-            serde_json::json!(["undefined", "undefined", "undefined"])
+            serde_json::json!(["undefined", "undefined", "undefined", "undefined"])
+        );
+        // A list of names missed deno_core's `__bootstrap.core` alias, which
+        // handed every page the raw ops. Check what any global leads to.
+        assert_eq!(
+            rt.evaluate(r#"(() => {
+                const names = new Set([...Reflect.ownKeys(globalThis), ...(globalThis.__obscura_hide_list || [])]);
+                const reaches = (value) => {
+                    try {
+                        return !!value && (typeof value === 'object' || typeof value === 'function')
+                            && [value, value.core, value.ops && value, value.core && value.core.ops && value.core]
+                                .some((v) => v && v.ops && typeof v.ops.op_dom === 'function');
+                    } catch (e) { return false; }
+                };
+                return [...names].filter((name) => { try { return reaches(globalThis[name]); } catch (e) { return false; } }).map(String);
+            })()"#).unwrap(),
+            serde_json::json!([]),
+            "no page-visible global may lead to the op table"
         );
         assert_eq!(
             rt.evaluate("document.getElementById('value').textContent")
