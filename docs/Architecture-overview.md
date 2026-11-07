@@ -139,6 +139,15 @@ rather than being reduced to root-DOM node numbers. The owning realm creates
 the File objects and emits trusted input/change events; non-multiple inputs
 select only the first file. In-memory DataTransfer payloads remain a separate API.
 
+Each `serve` client connection gets an independent copy-on-write localStorage
+snapshot of the startup profile and a fresh IndexedDB store. Untouched entries
+remain shared even when another key in that origin changes. Only the separate
+persistence context owns the profile directory: connection changes merge by
+changed key at close, so navigation cannot overwrite another connection's
+profile writes. New connections do not inherit other live clients' values.
+Storage-budget failures during persistence are logged. Embeddable persistent
+BrowserContext copies continue to share their profile stores.
+
 The noninteractive dialog defaults dismiss `confirm()` (`false`), cancel
 `prompt()` (`null`), and let `alert()` return without blocking. These functions
 do not emit client-controlled CDP dialogs. `Page.handleJavaScriptDialog`

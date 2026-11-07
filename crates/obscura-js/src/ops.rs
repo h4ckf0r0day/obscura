@@ -168,16 +168,16 @@ const LOCAL_STORAGE_ORIGIN_LIMIT: usize = 5 * 1024 * 1024;
 const LOCAL_STORAGE_TOTAL_LIMIT: usize = 32 * 1024 * 1024;
 const LOCAL_STORAGE_ORIGIN_COUNT_LIMIT: usize = 256;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct OriginStorageEntries {
-    items: Vec<(String, String)>,
+    items: Vec<Arc<(String, String)>>,
     indices: HashMap<String, usize>,
     bytes: usize,
 }
 
 #[derive(Default)]
 struct OriginStorageInner {
-    origins: HashMap<String, OriginStorageEntries>,
+    origins: HashMap<String, Arc<OriginStorageEntries>>,
     bytes: usize,
     changed: HashSet<String>,
 }
@@ -192,14 +192,27 @@ impl OriginStorage {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Independent store; each origin stays shared until its first mutation.
+    pub fn isolated_snapshot(&self) -> Self {
+        let inner = self.lock();
+        Self {
+            inner: std::sync::Mutex::new(OriginStorageInner {
+                origins: inner.origins.clone(),
+                bytes: inner.bytes,
+                changed: HashSet::new(),
+            }),
+        }
+    }
+
     pub fn snapshot(&self, origin: &str) -> Vec<(String, String)> {
-        self.lock().origins.get(origin).map(|entries| entries.items.clone()).unwrap_or_default()
+        self.lock().origins.get(origin).map(|entries|
+            entries.items.iter().map(|entry| entry.as_ref().clone()).collect()).unwrap_or_default()
     }
 
     pub fn get(&self, origin: &str, key: &str) -> Option<String> {
         self.lock().origins.get(origin)
             .and_then(|entries| entries.indices.get(key).and_then(|index| entries.items.get(*index)))
-            .map(|(_, value)| value.clone())
+            .map(|entry| entry.1.clone())
     }
 
     pub fn len(&self, origin: &str) -> usize {
@@ -208,7 +221,7 @@ impl OriginStorage {
 
     pub fn key(&self, origin: &str, index: usize) -> Option<String> {
         self.lock().origins.get(origin).and_then(|entries| entries.items.get(index))
-            .map(|(key, _)| key.clone())
+            .map(|entry| entry.0.clone())
     }
 
     /// Refuse writes over budget without changing the previous value.
@@ -219,8 +232,8 @@ impl OriginStorage {
         let entries = inner.origins.get(origin);
         let index = entries.and_then(|entries| entries.indices.get(&key).copied());
         let previous = entries.and_then(|entries| index.and_then(|index| entries.items.get(index)));
-        if previous.is_some_and(|(_, previous)| previous == &value) { return true; }
-        let previous_bytes = previous.map_or(0, |(name, value)| name.len() + value.len());
+        if previous.is_some_and(|previous| previous.1 == value) { return true; }
+        let previous_bytes = previous.map_or(0, |entry| entry.0.len() + entry.1.len());
         let origin_bytes = entries.map_or(0, |entries| entries.bytes);
         let new_bytes = key.len() + value.len();
         let next_origin_bytes = origin_bytes.saturating_sub(previous_bytes) + new_bytes;
@@ -228,12 +241,12 @@ impl OriginStorage {
         if next_origin_bytes > LOCAL_STORAGE_ORIGIN_LIMIT || next_total_bytes > LOCAL_STORAGE_TOTAL_LIMIT {
             return false;
         }
-        let entries = inner.origins.entry(origin.to_string()).or_default();
+        let entries = Arc::make_mut(inner.origins.entry(origin.to_string()).or_default());
         if let Some(index) = index {
-            entries.items[index].1 = value;
+            entries.items[index] = Arc::new((key, value));
         } else {
             entries.indices.insert(key.clone(), entries.items.len());
-            entries.items.push((key, value));
+            entries.items.push(Arc::new((key, value)));
         }
         entries.bytes = next_origin_bytes;
         inner.bytes = next_total_bytes;
@@ -244,17 +257,18 @@ impl OriginStorage {
     pub fn remove(&self, origin: &str, key: &str) {
         let mut inner = self.lock();
         let removed = inner.origins.get_mut(origin).and_then(|entries| {
-            entries.indices.remove(key).map(|index| {
-                let removed = entries.items.remove(index);
-                entries.bytes -= removed.0.len() + removed.1.len();
-                for (index, (name, _)) in entries.items.iter().enumerate().skip(index) {
-                    if let Some(position) = entries.indices.get_mut(name) { *position = index; }
-                }
-                removed
-            })
+            let index = entries.indices.get(key).copied()?;
+            let entries = Arc::make_mut(entries);
+            entries.indices.remove(key);
+            let removed = entries.items.remove(index);
+            entries.bytes -= removed.0.len() + removed.1.len();
+            for (index, entry) in entries.items.iter().enumerate().skip(index) {
+                if let Some(position) = entries.indices.get_mut(&entry.0) { *position = index; }
+            }
+            Some(removed)
         });
-        if let Some((name, value)) = removed {
-            inner.bytes -= name.len() + value.len();
+        if let Some(removed) = removed {
+            inner.bytes -= removed.0.len() + removed.1.len();
             if inner.origins.get(origin).is_some_and(|entries| entries.items.is_empty()) { inner.origins.remove(origin); }
             inner.changed.insert(origin.to_string());
         }
@@ -263,7 +277,8 @@ impl OriginStorage {
     pub fn entries(&self) -> Vec<(String, Vec<(String, String)>)> {
         let inner = self.lock();
         let mut out: Vec<_> = inner.origins.iter()
-            .map(|(origin, entries)| (origin.clone(), entries.items.clone())).collect();
+            .map(|(origin, entries)| (origin.clone(),
+                entries.items.iter().map(|entry| entry.as_ref().clone()).collect())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -284,7 +299,10 @@ impl OriginStorage {
         let next_bytes = inner.bytes.saturating_sub(previous_bytes).saturating_add(bytes);
         if next_bytes > LOCAL_STORAGE_TOTAL_LIMIT { return false; }
         if items.is_empty() { inner.origins.remove(origin); }
-        else { inner.origins.insert(origin.to_string(), OriginStorageEntries { items, indices, bytes }); }
+        else {
+            let items = items.into_iter().map(Arc::new).collect();
+            inner.origins.insert(origin.to_string(), Arc::new(OriginStorageEntries { items, indices, bytes }));
+        }
         inner.bytes = next_bytes;
         inner.changed.remove(origin);
         true
@@ -296,13 +314,48 @@ impl OriginStorage {
         origins
     }
 
+    /// Merge changed keys without replacing another connection's untouched values.
+    /// A false result means at least one changed value exceeded the destination budget.
+    pub fn merge_changes(&self, initial: &Self, current: &Self) -> bool {
+        let changed = {
+            let current = current.lock();
+            let mut changed: Vec<_> = current.changed.iter()
+                .map(|origin| (origin.clone(), current.origins.get(origin).cloned())).collect();
+            changed.sort_by(|a, b| a.0.cmp(&b.0));
+            changed
+        };
+        let mut accepted = true;
+        for (origin, current) in changed {
+            let initial = initial.lock().origins.get(&origin).cloned();
+            if let Some(initial) = &initial {
+                for entry in &initial.items {
+                    if !current.as_ref().is_some_and(|entries| entries.indices.contains_key(&entry.0)) {
+                        self.remove(&origin, &entry.0);
+                    }
+                }
+            }
+            if let Some(current) = current {
+                for entry in &current.items {
+                    let previous = initial.as_ref().and_then(|entries|
+                        entries.indices.get(&entry.0).and_then(|index| entries.items.get(*index)));
+                    if previous.is_some_and(|previous|
+                        Arc::ptr_eq(previous, entry) || previous.1 == entry.1) { continue; }
+                    if !self.set(&origin, entry.0.clone(), entry.1.clone()) { accepted = false; }
+                }
+            }
+        }
+        accepted
+    }
+
     /// One lock fences mutations and competing writers through acknowledgement.
     pub fn flush_changed(&self, mut write: impl FnMut(&str, &[(String, String)]) -> bool) {
         let mut inner = self.lock();
         let mut origins: Vec<_> = inner.changed.iter().cloned().collect();
         origins.sort();
         for origin in origins {
-            if write(&origin, inner.origins.get(&origin).map_or(&[], |entries| entries.items.as_slice())) {
+            let entries: Vec<_> = inner.origins.get(&origin).map(|entries|
+                entries.items.iter().map(|entry| entry.as_ref().clone()).collect()).unwrap_or_default();
+            if write(&origin, &entries) {
                 inner.changed.remove(&origin);
             }
         }
@@ -4923,6 +4976,57 @@ mod tests {
 
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
+    #[test]
+    fn origin_storage_snapshot_preserves_quota_and_profile_replacement_is_private() {
+        use std::sync::Arc;
+        let origin = "https://a.test";
+        let original = OriginStorage::default();
+        assert!(original.load(origin, vec![("k".into(), "x".repeat(LOCAL_STORAGE_ORIGIN_LIMIT - 1))]));
+        let copy = original.isolated_snapshot();
+        let shared = original.lock().origins[origin].clone();
+        assert!(!copy.set(origin, "extra".into(), String::new()));
+        assert!(Arc::ptr_eq(&shared, &copy.lock().origins[origin]));
+        assert!(copy.changed_origins().is_empty());
+        original.clear(origin);
+        assert_eq!(copy.len(origin), 1);
+        assert!(copy.load(origin, vec![("replacement".into(), "value".into())]));
+        assert_eq!(original.len(origin), 0);
+        assert_eq!(copy.snapshot(origin), vec![("replacement".into(), "value".into())]);
+        assert_eq!(copy.lock().bytes, "replacement".len() + "value".len());
+        copy.remove(origin, "replacement");
+        assert_eq!(copy.lock().bytes, 0);
+        assert_eq!(copy.changed_origins(), [origin]);
+    }
+
+    #[test]
+    fn origin_storage_snapshots_share_untouched_origins_but_not_mutations() {
+        use std::sync::Arc;
+        let original = OriginStorage::default();
+        assert!(original.load("https://a.test", vec![("seed".into(), "initial".into())]));
+        assert!(original.load("https://b.test", vec![("other".into(), "value".into())]));
+        let copy = original.isolated_snapshot();
+        let original_a = original.lock().origins["https://a.test"].clone();
+        let original_b = original.lock().origins["https://b.test"].clone();
+        assert!(Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(copy.changed_origins().is_empty());
+        copy.remove("https://a.test", "missing");
+        assert!(copy.set("https://a.test", "seed".into(), "initial".into()));
+        assert!(Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(copy.set("https://a.test", "new".into(), "value".into()));
+        assert!(!Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(Arc::ptr_eq(&original_a.items[0], &copy.lock().origins["https://a.test"].items[0]));
+        assert!(copy.set("https://a.test", "seed".into(), "changed".into()));
+        assert!(!Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(!Arc::ptr_eq(&original_a.items[0], &copy.lock().origins["https://a.test"].items[0]));
+        assert!(Arc::ptr_eq(&original_b, &copy.lock().origins["https://b.test"]));
+        assert_eq!(original.get("https://a.test", "seed").as_deref(), Some("initial"));
+        assert_eq!(copy.get("https://a.test", "seed").as_deref(), Some("changed"));
+        copy.clear("https://b.test");
+        assert_eq!(original.get("https://b.test", "other").as_deref(), Some("value"));
+        assert_eq!(copy.get("https://b.test", "other"), None);
+        assert_eq!(copy.changed_origins(), ["https://a.test", "https://b.test"]);
+    }
+
     #[test]
     fn origin_storage_deletion_reinsertion_and_profile_replacement_keep_keys_and_quota_consistent() {
         let store = OriginStorage::default();

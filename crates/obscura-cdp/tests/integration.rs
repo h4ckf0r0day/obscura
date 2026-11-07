@@ -32,6 +32,7 @@ integration_tests!(
     concurrent_navigations,
     concurrent_navigations_with_fetch,
     concurrent_page_isolation,
+    connection_storage_isolation,
     control_plane_unblocked,
     document_write_lifecycle,
     dom_get_outer_html_object_id,
