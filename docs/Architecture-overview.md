@@ -57,6 +57,11 @@ viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
 
+Grid and table track sizing stops redistribution when floating-point rounding
+leaves both the track increases and remaining space unchanged. Reaching a
+track limit still counts as progress even when subtracting its increase rounds
+away, so valid redistribution continues without an arbitrary iteration cap.
+
 Page-owned layout and paint never fetch resources synchronously. Missing
 resources load through the page transport, with URL blocking checked both
 for navigation/screenshot warmup and for later renderer misses. The DOM-only
