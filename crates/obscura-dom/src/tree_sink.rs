@@ -231,6 +231,11 @@ impl TreeSink for DomTree {
         });
     }
 
+    fn associate_with_form(&self, target: &NodeId, form: &NodeId, nodes: (&NodeId, Option<&NodeId>)) {
+        // nodes.0 is the intended parent (the table when foster parenting).
+        self.set_parser_form_owner(*target, *form, *nodes.0);
+    }
+
     fn remove_from_parent(&self, target: &NodeId) {
         self.detach(*target);
     }
@@ -706,5 +711,26 @@ mod tests {
             tree.shadow_root_info(contents).unwrap().mode,
             ShadowRootMode::Closed
         );
+    }
+
+    #[test]
+    fn parser_form_owner_is_kept_for_controls_outside_a_misnested_form() {
+        let tree = parse_html(
+            r#"<form id="inner"><input id="normal"></form>
+               <table><form id="f"><tr><td><input id="a"><button id="b"></button><span id="c"></span></td></tr></form></table>"#,
+        );
+        let id = |name: &str| tree.get_element_by_id(name).unwrap();
+        assert!(tree.children(id("f")).is_empty(), "the parser closes the form at once");
+        assert_eq!(tree.parser_form_owner(id("a")), Some(id("f")));
+        assert_eq!(tree.parser_form_owner(id("b")), Some(id("f")));
+        assert_eq!(tree.parser_form_owner(id("c")), None, "only form-associated elements");
+        assert_eq!(tree.parser_form_owner(id("normal")), None, "descendants need no record");
+        assert!(tree.form_has_parser_controls(id("f")));
+        assert!(!tree.form_has_parser_controls(id("inner")));
+
+        tree.detach(id("a"));
+        assert_eq!(tree.parser_form_owner(id("a")), None, "moving a control resets its owner");
+        tree.remove(id("f"));
+        assert_eq!(tree.parser_form_owner(id("b")), None, "a freed form owns nothing");
     }
 }

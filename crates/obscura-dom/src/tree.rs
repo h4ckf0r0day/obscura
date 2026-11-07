@@ -276,6 +276,11 @@ pub(crate) struct DomTreeInner {
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
+    /// Form owners the parser set through its form element pointer for
+    /// controls inserted outside that form's subtree (for example
+    /// `<table><form><tr><td><input>`). Controls inside the form are left out:
+    /// the ancestor walk already finds their owner.
+    parser_form_owners: HashMap<NodeId, NodeId>,
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
     hovered: Option<NodeId>,
@@ -311,6 +316,7 @@ impl DomTree {
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
+                parser_form_owners: HashMap::new(),
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
                 hovered: None,
@@ -463,6 +469,25 @@ impl DomTree {
 
     pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {
         self.inner.borrow().form_controls.get(&node).cloned()
+    }
+
+    /// Record the parser's form owner for `control`, unless the control is
+    /// being inserted inside that form (`parent` is the intended parent).
+    pub fn set_parser_form_owner(&self, control: NodeId, form: NodeId, parent: NodeId) {
+        if self.is_inclusive_ancestor(form, parent) {
+            return;
+        }
+        self.inner.borrow_mut().parser_form_owners.insert(control, form);
+    }
+
+    pub fn parser_form_owner(&self, control: NodeId) -> Option<NodeId> {
+        self.inner.borrow().parser_form_owners.get(&control).copied()
+    }
+
+    /// Whether any control outside `form`'s subtree has `form` as its parser
+    /// form owner.
+    pub fn form_has_parser_controls(&self, form: NodeId) -> bool {
+        self.inner.borrow().parser_form_owners.values().any(|&owner| owner == form)
     }
 
     pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
@@ -1065,6 +1090,18 @@ impl DomTree {
         self.detach_for_reparent(node_id, true);
     }
 
+    fn clear_parser_form_owners(inner: &mut DomTreeInner, root: NodeId) {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            inner.parser_form_owners.remove(&id);
+            let mut child = inner.nodes.get(id.index()).and_then(|n| n.as_ref()).and_then(|n| n.first_child);
+            while let Some(c) = child {
+                stack.push(c);
+                child = inner.nodes.get(c.index()).and_then(|n| n.as_ref()).and_then(|n| n.next_sibling);
+            }
+        }
+    }
+
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         let mut inner = self.inner.borrow_mut();
 
@@ -1079,6 +1116,11 @@ impl DomTree {
             None => return,
         };
         Self::invalidate_cssom_source(&mut inner, node_id);
+        // Only a node that has a parent is being moved or removed. The parser
+        // records the owner before it first appends the control.
+        if parent_id.is_some() && !inner.parser_form_owners.is_empty() {
+            Self::clear_parser_form_owners(&mut inner, node_id);
+        }
         if disconnect && inner
             .nodes
             .get(node_id.index())
@@ -1187,9 +1229,14 @@ impl DomTree {
         // would panic on direct indexing, and freeing an already-freed slot
         // would push it onto the free list a second time — later handing the
         // same NodeId to two live nodes (aliasing).
+        if !inner.parser_form_owners.is_empty() {
+            let freed: HashSet<NodeId> = nodes_to_remove.iter().copied().collect();
+            inner.parser_form_owners.retain(|_, form| !freed.contains(form));
+        }
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
+                inner.parser_form_owners.remove(&id);
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }

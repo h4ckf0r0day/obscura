@@ -315,10 +315,10 @@ pub async fn handle(
                                     else location.assign(href);\
                                 }}\
                             }} else if (submitButton && submitButtonType !== 'button' && submitButtonType !== 'reset' && !globalThis.__obscura_isDisabled(submitButton)) {{\
-                                var form = submitButton.closest ? submitButton.closest('form') : null;\
+                                var form = submitButton.form || null;\
                                 if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(submitButton); }} else {{ form.submit(submitButton); }} }} catch(e) {{}} }}\
                             }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
-                                var form2 = clickTarget.closest ? clickTarget.closest('form') : null;\
+                                var form2 = clickTarget.form || null;\
                                 if (form2) {{ try {{ if (typeof form2.requestSubmit === 'function') {{ form2.requestSubmit(clickTarget); }} else {{ form2.submit(clickTarget); }} }} catch(e) {{}} }}\
                             }} else if ({click_count} >= 3 && (tag === 'INPUT' || tag === 'TEXTAREA')) {{\
                                 var len = clickTarget.value ? clickTarget.value.length : 0;\
