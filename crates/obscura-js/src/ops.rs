@@ -2103,6 +2103,21 @@ fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] 
     [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
 }
 
+/// The subset of `window_named_attributes` that Document exposes: the name of
+/// embed, form, iframe, img and object, the id of object, and the id of an img
+/// that also has a name.
+fn document_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] {
+    let Some(tag) = node.as_element() else { return [None, None] };
+    let [id, name] = window_named_attributes(node);
+    let html = tag.ns.as_ref() == "http://www.w3.org/1999/xhtml";
+    let id = match tag.local.as_ref() {
+        "object" if html => id,
+        "img" if name.is_some() => id,
+        _ => None,
+    };
+    [id, name]
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -2396,13 +2411,16 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             });
             "null".to_string()
         }
-        "window_named_names" => {
+        "window_named_names" | "document_named_names" => {
             let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let attributes = if cmd == "window_named_names" { window_named_attributes } else { document_named_attributes };
             let mut names = Vec::new();
             let mut seen = HashSet::new();
-            for node in std::iter::once(root).chain(dom.descendants(root)) {
+            // arg2 "self" reads only the root, for a single attribute change.
+            let descendants = (arg2 != "self").then(|| dom.descendants(root)).into_iter().flatten();
+            for node in std::iter::once(root).chain(descendants) {
                 dom.with_node(node, |node| {
-                    for name in window_named_attributes(node).into_iter().flatten() {
+                    for name in attributes(node).into_iter().flatten() {
                         if seen.insert(name.to_string()) { names.push(name.to_string()); }
                     }
                 });
