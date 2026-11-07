@@ -17567,6 +17567,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canvas_rect_joins_the_path_and_clip_restricts_painting() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(r#"(() => {
+                const makeContext = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 10;
+                    canvas.height = 10;
+                    return canvas.getContext('2d');
+                };
+                const alphaAt = (ctx, x, y) => ctx.getImageData(x, y, 1, 1).data[3];
+                const ink = (ctx) => {
+                    const data = ctx.getImageData(0, 0, 10, 10).data;
+                    let count = 0;
+                    for (let i = 3; i < data.length; i += 4) if (data[i] > 0) count++;
+                    return count;
+                };
+                const ctx = makeContext();
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, 0, 5, 5);
+                ctx.clip();
+                ctx.restore();
+                const afterRectClip = ink(ctx);
+                ctx.beginPath();
+                ctx.rect(0, 0, 10, 10);
+                const afterRectOnly = ink(ctx);
+                ctx.fillStyle = 'red';
+                ctx.fill();
+                const filled = alphaAt(ctx, 5, 5) > 0;
+                const clipped = makeContext();
+                clipped.beginPath();
+                clipped.rect(0, 0, 5, 5);
+                clipped.clip();
+                clipped.fillStyle = 'red';
+                clipped.fillRect(0, 0, 10, 10);
+                return {
+                    afterRectClip, afterRectOnly, filled,
+                    insideClip: alphaAt(clipped, 4, 4) > 0,
+                    outsideClip: alphaAt(clipped, 7, 7),
+                };
+            })()"#)
+            .unwrap(),
+            serde_json::json!({
+                "afterRectClip": 0,
+                "afterRectOnly": 0,
+                "filled": true,
+                "insideClip": true,
+                "outsideClip": 0,
+            })
+        );
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
