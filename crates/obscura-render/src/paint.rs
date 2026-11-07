@@ -1654,6 +1654,30 @@ impl PreparedRender {
             if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
                 continue;
             }
+            // An ordinary (non-replaced) inline stores a union bounding box in
+            // `layout.rects`, but paints only its per-line fragments. A point
+            // in the empty inter-line / ragged-edge space of that union is not
+            // over any painted pixel, so it must not resolve to this inline and
+            // occlude a control actually rendered there. Narrow the test to the
+            // same tight fragments `getClientRects()` exposes, mapped through
+            // the per-fragment transform and scroll movement.
+            if style.ignores_used_box_sizes() {
+                if let Some(fragments) = self.layout.inline_fragments.get(&id) {
+                    let movement = scroll.movement_for(id);
+                    let transform = self.layout.transforms.get(&id).copied();
+                    let hit_fragment = fragments.iter().any(|fragment| {
+                        let fragment = transform
+                            .map(|transform| transform.map_rect(*fragment))
+                            .unwrap_or(*fragment);
+                        let fx = fragment.x + movement.0;
+                        let fy = fragment.y + movement.1;
+                        x >= fx && x < fx + fragment.width && y >= fy && y < fy + fragment.height
+                    });
+                    if !hit_fragment {
+                        continue;
+                    }
+                }
+            }
             if scroll
                 .inherited_clip_for(id)
                 .is_some_and(|clip| clip.intersect_rect(&point).is_none())
