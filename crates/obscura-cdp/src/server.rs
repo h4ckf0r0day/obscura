@@ -203,6 +203,9 @@ enum ServerMessage {
     },
 }
 
+
+const CDP_CONN_STACK_BYTES: usize = 512 * 1024 * 1024;
+
 pub async fn start(port: u16) -> anyhow::Result<()> {
     start_with_options(port, None, false).await
 }
@@ -831,6 +834,12 @@ fn run_connection(
     let slot = live_connections.clone();
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
+        // Match the CLI's main thread: V8 derives its stack guard from the
+        // native thread, and layout/paint/serialize recurse per DOM level, so a
+        // deep hostile document otherwise overflows this thread's small default
+        // stack and the abort takes down every connection on the server, not
+        // just the offending page. Address space is reserved, not committed.
+        .stack_size(CDP_CONN_STACK_BYTES)
         .spawn(move || {
             let mut slot_guard = SlotGuard(Some(slot));
             let default_context = Arc::new(

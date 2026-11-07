@@ -8,6 +8,31 @@ use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace, QualName};
 
 use crate::tree::{Attribute, DomTree, NodeData, NodeId, ShadowRootMode};
 
+/// Blink's `kMaximumHTMLParserDOMTreeDepth`. Layout, paint and serialization
+/// recurse once per level, so markup alone (a page of unclosed `<div>`s) must
+/// not be able to nest without bound.
+const MAX_PARSER_DEPTH: usize = 512;
+
+impl DomTree {
+    /// Where the parser attaches a new element under `parent`. Past the depth
+    /// cap the element goes to the parent's parent instead, as Blink's
+    /// `HTMLConstructionSite::AttachLater` does, so deeper markup lands as
+    /// siblings at the cap. The open-elements stack of the tree builder is left
+    /// alone, again as in Blink.
+    fn parser_insertion_parent(&self, parent: NodeId) -> NodeId {
+        let mut depth = 0;
+        let mut current = parent;
+        while let Some(up) = self.with_node(current, |node| node.parent).flatten() {
+            depth += 1;
+            if depth > MAX_PARSER_DEPTH {
+                return self.with_node(parent, |node| node.parent).flatten().unwrap_or(parent);
+            }
+            current = up;
+        }
+        parent
+    }
+}
+
 /// DOM's valid-shadow-host-name predicate. Gecko's
 /// `nsContentUtils::IsValidShadowHostName` uses this same HTML allowlist plus
 /// valid custom-element names; keeping the check at the parser boundary makes
@@ -178,7 +203,7 @@ impl TreeSink for DomTree {
     fn append(&self, parent: &NodeId, child: NodeOrText<NodeId>) {
         match child {
             NodeOrText::AppendNode(node_id) => {
-                self.append_child(*parent, node_id);
+                self.append_child(self.parser_insertion_parent(*parent), node_id);
             }
             NodeOrText::AppendText(text) => {
                 self.append_text(*parent, &text);
