@@ -219,6 +219,14 @@ HTMLCollection behavior; remaining select state semantics are separate work.
 The performance smoke gate covers collection reads, scaled owner getters and
 unrelated-attribute mutation workloads alongside the general DOM scenarios.
 
+Document-initiated navigation retains its owning URL for request metadata in
+both HTTP transports, including interception continuations and native POSTs.
+The default referrer policy strips fragments and cross-origin paths and omits
+HTTPS-to-HTTP referrers; downgraded POSTs send `Origin: null`. Cross-origin
+redirect returns retain origin/site taint and cannot restore stripped referrers.
+Unsafe cross-site navigation does not
+send Strict or Lax cookies. Direct API navigation has no document initiator.
+
 Short, bounded PBKDF2 derivations retain a native fast path. Larger derivations
 run on bounded blocking workers rather than the page thread. Dropping an
 awaiting future cancels that background work; the worker retains its admission

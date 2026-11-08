@@ -1812,7 +1812,7 @@ impl Page {
             .unwrap_or([255, 255, 255, 255])
     }
 
-    async fn intercept_navigation(&self, url: &Url, method: &str, body: &str) -> Result<Option<Response>, PageError> {
+    async fn intercept_navigation(&self, url: &Url, method: &str, body: &str, initiator: Option<&Url>) -> Result<Option<Response>, PageError> {
         use obscura_js::ops::{InterceptedRequest, InterceptResolution};
         if !self.intercept_enabled || !matches!(url.scheme(), "http" | "https")
             || (!self.intercept_block_patterns.is_empty() && !self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
@@ -1858,13 +1858,8 @@ impl Page {
                     return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
                 }
                 let method = changed_method.as_deref().unwrap_or(method);
-                let body = changed_body.or_else(|| (!body.is_empty()).then(|| body.as_bytes().to_vec()));
-                #[cfg(feature = "stealth")]
-                if let Some(client) = &self.stealth_client {
-                    return client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
-                        .map(Some).map_err(|error| PageError::NetworkError(error.to_string()));
-                }
-                self.http_client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
+                let body = changed_body.or_else(|| (method == "POST" || !body.is_empty()).then(|| body.as_bytes().to_vec()));
+                self.fetch_navigation_from_document(&target, method, body, headers, initiator).await
                     .map_err(|error| PageError::NetworkError(error.to_string()))?
             }
             Ok(InterceptResolution::Fail {reason}) => {
@@ -1878,6 +1873,17 @@ impl Page {
             Err(_) => return Err(PageError::NetworkError("net::ERR_ABORTED".into())),
         };
         Ok(Some(response))
+    }
+
+    async fn fetch_navigation_from_document(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<std::collections::HashMap<String, String>>, initiator: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            return client.fetch_navigation_request_from_document(url, method, body, headers, initiator, Some(&self.callbacks)).await;
+        }
+        self.http_client.fetch_navigation_request_from_document(url, method, body, headers, initiator, Some(&self.callbacks)).await
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -3165,7 +3171,7 @@ impl Page {
 
         let result = match tokio::time::timeout(
             nav_timeout,
-            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, ""),
+            self.navigate_with_wait_post_inner(url_str, wait_until, method, body, "", None),
         )
         .await
         {
@@ -3441,6 +3447,7 @@ impl Page {
         method: &str,
         body: &str,
         initial_referrer: &str,
+        initial_initiator: Option<&Url>,
     ) -> Result<(), PageError> {
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
@@ -3458,6 +3465,7 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
+        let mut document_initiator = initial_initiator.cloned();
         let chain_limit = self.navigation_chain_limit();
         for chain in 0..chain_limit {
             self.navigate_single(
@@ -3466,6 +3474,7 @@ impl Page {
                 &current_method,
                 &current_body,
                 &document_referrer,
+                document_initiator.as_ref(),
                 deadline,
             )
             .await?;
@@ -3490,6 +3499,7 @@ impl Page {
                     current_url,
                     next_url
                 );
+                document_initiator = self.url.clone();
                 document_referrer = self
                     .url
                     .as_ref()
@@ -3523,6 +3533,7 @@ impl Page {
         method: &str,
         body: &str,
         referrer: &str,
+        initiator: Option<&Url>,
         deadline: tokio::time::Instant,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
@@ -3595,7 +3606,7 @@ impl Page {
         }
 
         self.navigation_timing.record("fetchStart");
-        let intercepted = self.intercept_navigation(&url, method, body).await.map_err(|error| {
+        let intercepted = self.intercept_navigation(&url, method, body, initiator).await.map_err(|error| {
             self.lifecycle = LifecycleState::Failed; error
         })?;
         let was_intercepted = intercepted.is_some();
@@ -3618,10 +3629,11 @@ impl Page {
                 body: body_bytes,
                 redirected_from: Vec::new(),
             })
-        } else if method == "POST" {
-            self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
-                .await
+        } else if method == "POST" || initiator.is_some() {
+            self.fetch_navigation_from_document(
+                &url, if method == "POST" { "POST" } else { "GET" },
+                (method == "POST").then(|| body.as_bytes().to_vec()), None, initiator,
+            ).await
         } else {
             self.do_fetch(&url).await
         }
@@ -5151,7 +5163,8 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
-        let source_url = self.url.as_ref().and_then(|source| {
+        let initiator = self.url.clone();
+        let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
         }).unwrap_or_default();
         let nav_timeout = self.navigation_timeout();
@@ -5159,7 +5172,7 @@ impl Page {
         tokio::time::timeout(
             nav_timeout,
             self.navigate_with_wait_post_inner(
-                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url,
+                url, crate::lifecycle::WaitUntil::Load, method, body, &source_url, initiator.as_ref(),
             ),
         ).await.map_err(|_| {
             self.lifecycle = crate::lifecycle::LifecycleState::Failed;
@@ -6022,17 +6035,146 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_preserves_owning_document_metadata() {
+        assert_form_navigation_preserves_owning_document_metadata(false, false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_owning_document_metadata() {
+        assert_form_navigation_preserves_owning_document_metadata(false, true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_empty_post() {
+        assert_form_navigation_preserves_owning_document_metadata(false, true, true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_preserves_owning_document_metadata_in_stealth() {
+        assert_form_navigation_preserves_owning_document_metadata(true, false, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_owning_document_metadata_in_stealth() {
+        assert_form_navigation_preserves_owning_document_metadata(true, true, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn form_navigation_interception_preserves_empty_post_in_stealth() {
+        assert_form_navigation_preserves_owning_document_metadata(true, true, true).await;
+    }
+
+    async fn assert_form_navigation_preserves_owning_document_metadata(stealth: bool, intercepted: bool, empty: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 2048];
+                loop {
+                    let read = tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut chunk)).await.unwrap().unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head.lines().find_map(|line| line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
+                    }
+                }
+                tx.send(String::from_utf8(request).unwrap()).unwrap();
+                let response = if index == 0 {
+                    let fields = if empty { "" } else { "<input name=confirm value='token+value'><input name=same value=first><input name=same value=second>" };
+                    let body = format!("<form id=f method=post action=/submit>{fields}</form><script>document.getElementById('f').submit()</script>");
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: confirm=fixture; Path=/; SameSite=Strict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                } else if index == 1 {
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let context = Arc::new(BrowserContext::with_storage_and_network("form-origin".into(), None, stealth, None, None, true));
+        let mut page = Page::new("form-origin".into(), context);
+        page.http_client.extra_headers.write().await.extend([
+            ("Origin".into(), "http://forged.example".into()), ("x-native-client".into(), "ordinary".into()),
+        ]);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            page.stealth_client.as_ref().unwrap().extra_headers.write().await.extend([
+                ("Origin".into(), "http://forged.example".into()), ("x-native-client".into(), "stealth".into()),
+            ]);
+        }
+        let resolver = if intercepted {
+            let mut requests = page.enable_interception();
+            Some(tokio::spawn(async move {
+                for _ in 0..3 {
+                    let request = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
+                    let rewrite = (request.method == "POST").then(|| request.url.replace("/submit", "/continued"));
+                    request.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+                        url: rewrite, method: None, headers: None, body: None,
+                    }).ok().unwrap();
+                }
+            }))
+        } else { None };
+        page.navigate(&format!("{origin}/source?keep=1")).await.unwrap();
+        assert_eq!(page.url_string(), format!("{origin}/final"));
+        page.navigate(&format!("{origin}/direct")).await.unwrap();
+        server.await.unwrap();
+        if let Some(resolver) = resolver { resolver.await.unwrap(); }
+        let mut requests = Vec::new();
+        while let Ok(request) = rx.try_recv() { requests.push(request); }
+        assert_eq!(requests.len(), 4);
+        for request in &requests[1..3] {
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.starts_with("post "));
+            assert!(headers.contains("sec-fetch-site: same-origin\r\n"));
+            assert!(headers.contains(&format!("origin: {origin}\r\n")));
+            assert!(headers.contains(&format!("referer: {origin}/source?keep=1\r\n")));
+            assert!(headers.contains("cookie: confirm=fixture\r\n"));
+            assert!(headers.contains("content-type: application/x-www-form-urlencoded\r\n"));
+            assert!(headers.contains(if stealth { "x-native-client: stealth\r\n" } else { "x-native-client: ordinary\r\n" }));
+            assert_eq!(body, if empty { "" } else { "confirm=token%2Bvalue&same=first&same=second" });
+        }
+        if intercepted { assert!(requests[1].starts_with("POST /continued ")); }
+        let direct = requests[3].to_ascii_lowercase();
+        assert!(direct.starts_with("get /direct "));
+        assert!(direct.contains("sec-fetch-site: none\r\n"));
+        assert!(!direct.contains("\r\norigin:"));
+        assert!(!direct.contains("\r\nreferer:"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn document_navigation_referrer_survives_http_redirects() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
 
+            let mut requests = Vec::new();
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 2048];
-                let length = stream.read(&mut request).unwrap();
-                let request_text = String::from_utf8_lossy(&request[..length]);
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    assert!(request.len() < 1024 * 1024);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") { break; }
+                }
+                let request_text = String::from_utf8(request).unwrap();
                 let path = request_text
                     .lines()
                     .next()
@@ -6057,7 +6199,9 @@ mod tests {
                     _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
                 };
                 stream.write_all(response.as_bytes()).unwrap();
+                requests.push(request_text);
             }
+            requests
         });
 
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
@@ -6082,6 +6226,13 @@ mod tests {
             observed,
             serde_json::json!([format!("http://{address}/final"), source])
         );
+        for request in server.join().unwrap().iter().skip(1) {
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get "));
+            assert!(request.contains("sec-fetch-site: same-origin\r\n"));
+            assert!(request.contains(&format!("referer: {source}\r\n")));
+            assert!(!request.contains("\r\norigin:"));
+        }
     }
 
     // #1231: a text/plain or text/markdown response is a plain-text document.

@@ -35,7 +35,7 @@ async fn submitted(html: &str, script: &str, click: bool, method: &str, encoded:
                     break end + 4;
                 }
             };
-            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap().to_owned();
             let request_line = headers.lines().next().unwrap().to_owned();
             let length = headers.lines().filter_map(|line| line.split_once(':'))
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
@@ -51,6 +51,15 @@ async fn submitted(html: &str, script: &str, click: bool, method: &str, encoded:
                 assert_eq!(request_line, "GET /form HTTP/1.1");
                 html.as_str()
             } else {
+                let origin = format!("http://{address}");
+                let headers = headers.to_ascii_lowercase();
+                assert!(headers.contains("sec-fetch-site: same-origin\r\n"));
+                assert!(headers.contains(&format!("referer: {origin}/form\r\n")));
+                if request_line.starts_with("POST ") {
+                    assert!(headers.contains(&format!("origin: {origin}\r\n")));
+                } else {
+                    assert!(!headers.contains("\r\norigin:"));
+                }
                 submitted = Some((request_line,
                     String::from_utf8(bytes[header_end..header_end + length].to_vec()).unwrap()));
                 "<html><body>submitted</body></html>"

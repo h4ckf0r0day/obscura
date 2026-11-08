@@ -206,6 +206,11 @@ pub struct ResourceRequest {
 }
 
 impl ResourceRequest {
+    /// Navigate with metadata and cookie context derived from the owning document.
+    pub fn navigation_from_document(initiator: &Url) -> Self {
+        Self::subresource(ResourceType::Document, initiator)
+    }
+
     pub fn navigation() -> Self {
         Self {
             resource_type: ResourceType::Document,
@@ -435,17 +440,33 @@ pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
     }
 }
 
-pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url, redirect_tainted: bool) -> &'static str {
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
     };
-    if initiator.origin() == target.origin() {
+    if !redirect_tainted && initiator.origin() == target.origin() {
         "same-origin"
     } else {
         // A public-suffix-aware `same-site` classification will be added with
         // the page resource scheduler. Until then, cross-site is the safe
         // conservative value; it never overstates ambient trust.
         "cross-site"
+    }
+}
+
+pub(crate) fn request_origin_header<'a>(
+    request: &ResourceRequest, target: &Url, serialized_origin: &'a str, method_is_safe: bool,
+) -> Option<&'a str> {
+    if cors_required(request, target) {
+        return Some(serialized_origin);
+    }
+    if request.mode != RequestMode::Navigate || method_is_safe || request.initiator.is_none() {
+        return None;
+    }
+    if request.initiator.as_ref().is_some_and(|source| source.scheme() == "https" && target.scheme() == "http") {
+        Some("null")
+    } else {
+        Some(serialized_origin)
     }
 }
 
@@ -466,11 +487,8 @@ pub(crate) fn same_site_context(
     }
 }
 
-pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request
-        .referrer
-        .as_ref()
-        .or(request.initiator.as_ref())?;
+pub(crate) fn request_referrer(source: Option<&Url>, target: &Url) -> Option<String> {
+    let source = source?;
     if !matches!(source.scheme(), "http" | "https")
         || !matches!(target.scheme(), "http" | "https")
         || (source.scheme() == "https" && target.scheme() == "http")
@@ -1473,9 +1491,20 @@ impl ObscuraHttpClient {
         &self, url: &Url, method: &str, body: Option<Vec<u8>>,
         headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation_request_from_document(url, method, body, headers, None, callbacks).await
+    }
+
+    /// Fetch a navigation with an optional owning document, retaining it across redirects.
+    pub async fn fetch_navigation_request_from_document(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
-        self.fetch_request_uncached(method, url, body, callbacks, ResourceRequest::navigation(), headers).await
+        let request = initiator.map(ResourceRequest::navigation_from_document)
+            .unwrap_or_else(ResourceRequest::navigation);
+        self.fetch_request_uncached(method, url, body, callbacks, request, headers).await
     }
 
     async fn fetch_request_uncached(
@@ -1516,6 +1545,7 @@ impl ObscuraHttpClient {
         // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
+        let mut referrer = request.referrer.clone().or_else(|| request.initiator.clone());
         let mut request_callback_fired = false;
 
         for _redirect_count in 0..=max_redirects {
@@ -1579,7 +1609,7 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
+                HeaderValue::from_static(request_fetch_site(&request, &current_url, redirect_tainted)),
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-mode"),
@@ -1592,8 +1622,9 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-dest"),
                 HeaderValue::from_static(request.destination()),
             );
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&referer) {
+            let referer = request_referrer(referrer.as_ref(), &current_url);
+            if let Some(referer) = &referer {
+                if let Ok(value) = HeaderValue::from_str(referer) {
                     headers.insert(reqwest::header::REFERER, value);
                 }
             }
@@ -1659,10 +1690,10 @@ impl ObscuraHttpClient {
             }
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
-            if cors_required(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&request_origin) {
-                    headers.insert(reqwest::header::ORIGIN, value);
-                }
+            if let Some(origin) = request_origin_header(&request, &current_url, &request_origin, matches!(method, Method::GET | Method::HEAD)) {
+                let value = HeaderValue::from_str(origin)
+                    .map_err(|error| ObscuraNetError::Network(format!("Invalid request origin: {error}")))?;
+                headers.insert(reqwest::header::ORIGIN, value);
             } else {
                 headers.remove(reqwest::header::ORIGIN);
             }
@@ -1722,6 +1753,8 @@ impl ObscuraHttpClient {
                     })?;
                     validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
+                    referrer = referer.as_deref().map(Url::parse).transpose()
+                        .map_err(|error| ObscuraNetError::Network(format!("Invalid redirect referrer: {error}")))?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     if next_url.origin() != current_url.origin() {
@@ -2044,7 +2077,7 @@ mod ssrf_tests {
     use super::{
         is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        ResourceRequest, ResourceType, Response, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
@@ -2317,17 +2350,17 @@ mod ssrf_tests {
         let cross_origin = Url::parse("https://cdn.example/image.png").unwrap();
         let downgrade = Url::parse("http://cdn.example/image.png").unwrap();
 
-        assert_eq!(request_fetch_site(&request, &same_origin), "same-origin");
-        assert_eq!(request_fetch_site(&request, &cross_origin), "cross-site");
+        assert_eq!(request_fetch_site(&request, &same_origin, false), "same-origin");
+        assert_eq!(request_fetch_site(&request, &cross_origin, false), "cross-site");
         assert_eq!(
-            request_referrer(&request, &same_origin).as_deref(),
+            request_referrer(Some(&source), &same_origin).as_deref(),
             Some("https://app.example/path?q=1")
         );
         assert_eq!(
-            request_referrer(&request, &cross_origin).as_deref(),
+            request_referrer(Some(&source), &cross_origin).as_deref(),
             Some("https://app.example/")
         );
-        assert_eq!(request_referrer(&request, &downgrade), None);
+        assert_eq!(request_referrer(Some(&source), &downgrade), None);
     }
 
     async fn http_fixture(
@@ -2353,8 +2386,11 @@ mod ssrf_tests {
                         break;
                     }
                     request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head.lines().find_map(|line| line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                        if request.len() >= end + 4 + length { break; }
                     }
                 }
                 let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
@@ -2378,6 +2414,136 @@ mod ssrf_tests {
     fn redirect_to_self() -> String {
         "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .to_string()
+    }
+
+    async fn form_navigation_probe(
+        stealth: bool, target: &Url, source: Option<&Url>, method: &str,
+        body: Option<Vec<u8>>, jar: Arc<CookieJar>,
+    ) -> Response {
+        let headers = Some([("Origin".into(), "http://forged.example".into())].into());
+        #[cfg(feature = "stealth")]
+        if stealth {
+            return crate::StealthHttpClient::with_proxy(jar, None, true)
+                .fetch_navigation_request_from_document(target, method, body, headers, source, None)
+                .await.unwrap();
+        }
+        assert!(!stealth);
+        ObscuraHttpClient::with_full_options(jar, None, true)
+            .fetch_navigation_request_from_document(target, method, body, headers, source, None)
+            .await.unwrap()
+    }
+
+    async fn assert_form_navigation_metadata_and_redirects(stealth: bool) {
+        let (target, mut received) = http_fixture(vec![ok_response("", "posted"), ok_response("", "direct")]).await;
+        let source = target.join("/source?keep=1#fragment").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("confirm=fixture; Path=/; SameSite=Strict", &source);
+        form_navigation_probe(stealth, &target, Some(&source), "POST",
+            Some(b"confirm=a%2Bb&same=first&same=second".to_vec()), jar.clone()).await;
+        let request = received.recv().await.unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.starts_with("post /resource http/1.1"));
+        assert!(headers.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(headers.contains("sec-fetch-mode: navigate\r\n"));
+        assert!(headers.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        assert!(headers.contains(&format!("referer: {}/source?keep=1\r\n", source.origin().ascii_serialization())));
+        assert!(headers.contains("cookie: confirm=fixture\r\n"));
+        assert!(headers.contains("content-type: application/x-www-form-urlencoded\r\n"));
+        assert_eq!(body, "confirm=a%2Bb&same=first&same=second");
+        form_navigation_probe(stealth, &target, None, "GET", None, jar).await;
+        let direct = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(direct.contains("sec-fetch-site: none\r\n"));
+        assert!(!direct.contains("\r\norigin:"));
+        assert!(!direct.contains("\r\nreferer:"));
+
+        let (target, mut received) = http_fixture(vec![redirect_to_self(), ok_response("", "arrived")]).await;
+        let source = target.join("/form").unwrap();
+        form_navigation_probe(stealth, &target, Some(&source), "POST",
+            Some(b"field=unchanged".to_vec()), Arc::new(CookieJar::new())).await;
+        let post = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(post.starts_with("post "));
+        assert!(post.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(post.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        let get = received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(get.starts_with("get "));
+        assert!(get.contains("sec-fetch-site: same-origin\r\n"));
+        assert!(!get.contains("\r\norigin:"));
+        assert!(!get.contains("\r\ncontent-type:"));
+    }
+
+    async fn assert_form_navigation_downgrade_and_cross_site_cookies(stealth: bool) {
+        let (target, mut received) = http_fixture(vec![
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            ok_response("", "arrived"),
+        ]).await;
+        let source = Url::parse("https://source.example/form?private=1").unwrap();
+        let jar = Arc::new(CookieJar::new());
+        jar.set_cookie("strict=private; Path=/; SameSite=Strict", &target);
+        jar.set_cookie("lax=private; Path=/; SameSite=Lax", &target);
+        form_navigation_probe(stealth, &target, Some(&source), "POST", Some(b"field=unchanged".to_vec()), jar).await;
+        for _ in 0..2 {
+            let request = received.recv().await.unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("post "));
+            assert!(request.contains("sec-fetch-site: cross-site\r\n"));
+            assert!(request.contains("origin: null\r\n"));
+            assert!(!request.contains("\r\nreferer:"));
+            assert!(!request.contains("\r\ncookie:"));
+            assert!(request.ends_with("\r\n\r\nfield=unchanged"));
+        }
+    }
+
+    async fn assert_form_navigation_cross_origin_return_taints_metadata(stealth: bool) {
+        let (final_target, mut final_received) = http_fixture(vec![ok_response("", "arrived")]).await;
+        let redirect = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {final_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (other_origin, mut other_received) = http_fixture(vec![redirect]).await;
+        let source = final_target.join("/form?private=1#fragment").unwrap();
+        form_navigation_probe(stealth, &other_origin, Some(&source), "POST",
+            Some(b"field=unchanged".to_vec()), Arc::new(CookieJar::new())).await;
+        let first = other_received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(first.contains(&format!("origin: {}\r\n", source.origin().ascii_serialization())));
+        assert!(first.contains("sec-fetch-site: cross-site\r\n"));
+        assert!(first.contains(&format!("referer: {}/\r\n", source.origin().ascii_serialization())));
+        let returned = final_received.recv().await.unwrap().to_ascii_lowercase();
+        assert!(returned.starts_with("post "));
+        assert!(returned.contains("origin: null\r\n"));
+        assert!(returned.contains("sec-fetch-site: cross-site\r\n"));
+        assert!(returned.contains(&format!("referer: {}/\r\n", source.origin().ascii_serialization())));
+        assert!(!returned.contains("private=1"));
+        assert!(returned.ends_with("\r\n\r\nfield=unchanged"));
+    }
+
+    #[tokio::test]
+    async fn form_navigation_metadata_and_redirects() {
+        assert_form_navigation_metadata_and_redirects(false).await;
+    }
+
+    #[tokio::test]
+    async fn form_navigation_downgrade_and_cross_site_cookies() {
+        assert_form_navigation_downgrade_and_cross_site_cookies(false).await;
+    }
+
+    #[tokio::test]
+    async fn form_navigation_cross_origin_return_taints_metadata() {
+        assert_form_navigation_cross_origin_return_taints_metadata(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn form_navigation_metadata_and_redirects_in_stealth() {
+        assert_form_navigation_metadata_and_redirects(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn form_navigation_downgrade_and_cross_site_cookies_in_stealth() {
+        assert_form_navigation_downgrade_and_cross_site_cookies(true).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn form_navigation_cross_origin_return_taints_metadata_in_stealth() {
+        assert_form_navigation_cross_origin_return_taints_metadata(true).await;
     }
 
     // Browsers read a folded header line (obs-fold, RFC 9112 5.2) as part of
