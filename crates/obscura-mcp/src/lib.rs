@@ -773,6 +773,17 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                         "limit": { "type": "number", "description": "Maximum number of jobs to return (default: 20)" }
                     }
                 }
+            },
+            {
+                "name": "obscura_get_job_result",
+                "description": "Get the result of a completed distributed browser execution job",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": { "type": "string", "description": "Job ID" }
+                    },
+                    "required": ["job_id"]
+                }
             }
     ]).as_array().cloned().expect("MCP tool list must be an array");
 
@@ -888,6 +899,8 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "obscura_cancel_job" => tool_cancel_job(args).await,
         #[cfg(feature = "distributed")]
         "obscura_list_jobs" => tool_list_jobs(args).await,
+        #[cfg(feature = "distributed")]
+        "obscura_get_job_result" => tool_get_job_result(args).await,
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -1038,6 +1051,17 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 #[cfg(feature = "distributed")]
+async fn resolve_mcp_principal(cp: &obscura_control_plane::ControlPlane) -> Result<obscura_control_plane::Principal, String> {
+    let cred_id = std::env::var("OBSCURA_MCP_CREDENTIAL_ID")
+        .map_err(|_| "OBSCURA_MCP_CREDENTIAL_ID not set".to_string())?;
+    let secret = std::env::var("OBSCURA_MCP_CREDENTIAL_SECRET")
+        .map_err(|_| "OBSCURA_MCP_CREDENTIAL_SECRET not set".to_string())?;
+    cp.authenticate(&cred_id, &secret).await
+        .map_err(|e| format!("Authentication failed: {}", e))
+}
+
+#[cfg(feature = "distributed")]
+#[cfg(feature = "distributed")]
 async fn tool_submit_job(args: &Value) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str).ok_or("Missing url")?;
     let operation = args.get("operation").and_then(Value::as_str).unwrap_or("navigate");
@@ -1045,8 +1069,9 @@ async fn tool_submit_job(args: &Value) -> Result<String, String> {
     #[cfg(feature = "distributed")]
     {
         let cp = get_control_plane().await?;
-        let tenant_id = Uuid::new_v4();
-        let job = cp.submit_job_internal(tenant_id, url, operation, serde_json::json!({}), None, 3).await
+        let principal = resolve_mcp_principal(&cp).await?;
+        let tenant_id = principal.tenant_id().ok_or("Principal has no tenant")?;
+        let job = cp.submit_job(&principal, tenant_id, url, operation, serde_json::json!({}), None, 3).await
             .map_err(|e| format!("Failed to submit job: {}", e))?;
         Ok(format!("Job submitted: {} (status: {})", job.job_id, job.status))
     }
@@ -1058,6 +1083,7 @@ async fn tool_submit_job(args: &Value) -> Result<String, String> {
 }
 
 #[cfg(feature = "distributed")]
+#[cfg(feature = "distributed")]
 async fn tool_get_job(args: &Value) -> Result<String, String> {
     let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
     let job_id: Uuid = job_id_str.parse().map_err(|_| "Invalid job_id")?;
@@ -1065,8 +1091,9 @@ async fn tool_get_job(args: &Value) -> Result<String, String> {
     #[cfg(feature = "distributed")]
     {
         let cp = get_control_plane().await?;
-        let tenant_id = Uuid::new_v4();
-        let job = cp.get_job_internal(job_id, tenant_id).await
+        let principal = resolve_mcp_principal(&cp).await?;
+        let tenant_id = principal.tenant_id().ok_or("Principal has no tenant")?;
+        let job = cp.get_job(&principal, job_id, tenant_id).await
             .map_err(|e| format!("Failed to get job: {}", e))?;
         Ok(format!("Job {} status: {} (attempts: {})", job.job_id, job.status, job.attempt_count))
     }
@@ -1078,6 +1105,7 @@ async fn tool_get_job(args: &Value) -> Result<String, String> {
 }
 
 #[cfg(feature = "distributed")]
+#[cfg(feature = "distributed")]
 async fn tool_cancel_job(args: &Value) -> Result<String, String> {
     let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
     let job_id: Uuid = job_id_str.parse().map_err(|_| "Invalid job_id")?;
@@ -1085,8 +1113,9 @@ async fn tool_cancel_job(args: &Value) -> Result<String, String> {
     #[cfg(feature = "distributed")]
     {
         let cp = get_control_plane().await?;
-        let tenant_id = Uuid::new_v4();
-        cp.cancel_job_internal(job_id, tenant_id).await
+        let principal = resolve_mcp_principal(&cp).await?;
+        let tenant_id = principal.tenant_id().ok_or("Principal has no tenant")?;
+        cp.cancel_job(&principal, job_id, tenant_id).await
             .map_err(|e| format!("Failed to cancel job: {}", e))?;
         Ok(format!("Job {} cancelled.", job_id))
     }
@@ -1098,14 +1127,16 @@ async fn tool_cancel_job(args: &Value) -> Result<String, String> {
 }
 
 #[cfg(feature = "distributed")]
+#[cfg(feature = "distributed")]
 async fn tool_list_jobs(args: &Value) -> Result<String, String> {
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as i64;
 
     #[cfg(feature = "distributed")]
     {
         let cp = get_control_plane().await?;
-        let tenant_id = Uuid::new_v4();
-        let jobs = cp.list_jobs_internal(tenant_id, limit).await
+        let principal = resolve_mcp_principal(&cp).await?;
+        let tenant_id = principal.tenant_id().ok_or("Principal has no tenant")?;
+        let jobs = cp.list_jobs(&principal, tenant_id, limit).await
             .map_err(|e| format!("Failed to list jobs: {}", e))?;
         Ok(format!("Found {} jobs.", jobs.len()))
     }
@@ -1122,6 +1153,30 @@ async fn get_control_plane() -> Result<obscura_control_plane::ControlPlane, Stri
         .map_err(|_| "DATABASE_URL not set".to_string())?;
     obscura_control_plane::ControlPlane::connect(&db_url, 5).await
         .map_err(|e| format!("Failed to connect to control plane: {}", e))
+}
+
+#[cfg(feature = "distributed")]
+async fn tool_get_job_result(args: &Value) -> Result<String, String> {
+    let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
+    let job_id: Uuid = job_id_str.parse().map_err(|_| "Invalid job_id")?;
+
+    #[cfg(feature = "distributed")]
+    {
+        let cp = get_control_plane().await?;
+        let principal = resolve_mcp_principal(&cp).await?;
+        let tenant_id = principal.tenant_id().ok_or("Principal has no tenant")?;
+        let job = cp.get_job(&principal, job_id, tenant_id).await
+            .map_err(|e| format!("Failed to get job: {}", e))?;
+        if job.status != "completed" {
+            return Err(format!("Job is not completed (status: {})", job.status));
+        }
+        Ok(format!("Job {} result retrieved (status: completed)", job.job_id))
+    }
+    #[cfg(not(feature = "distributed"))]
+    {
+        let _ = job_id;
+        Err("Distributed execution requires the 'distributed' feature".into())
+    }
 }
 
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {

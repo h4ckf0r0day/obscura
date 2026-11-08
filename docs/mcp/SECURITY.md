@@ -6,8 +6,10 @@
 - Origin allowlist via OBSCURA_MCP_ALLOWED_ORIGINS.
 
 ## Authorization
-- MCP currently uses local BrowserState (no tenant isolation).
-- Control-plane integration would enforce tenant authorization (not yet implemented).
+- MCP currently uses local BrowserState (no tenant isolation) for browser tools.
+- Distributed tools authenticate via OBSCURA_MCP_CREDENTIAL_ID/SECRET env vars.
+- Tenant identity derived from authenticated Principal (not caller-supplied).
+- Cross-tenant access rejected by authorize_tenant().
 
 ## SSRF
 - Inherited from obscura-net: SsrfGuardResolver validates DNS + IP.
