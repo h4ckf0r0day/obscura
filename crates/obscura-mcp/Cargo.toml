@@ -7,7 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
-distributed = ["dep:obscura-control-plane"]
+distributed = ["dep:obscura-control-plane", "dep:uuid"]
 stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 render = ["obscura-browser/render", "dep:base64"]
 
@@ -16,6 +16,7 @@ obscura-browser = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 obscura-control-plane = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }

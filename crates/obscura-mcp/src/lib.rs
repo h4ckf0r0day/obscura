@@ -15,6 +15,8 @@ use obscura_browser::{BrowserContext, Page};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(feature = "distributed")]
+use uuid::Uuid;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Cap on text returned to the agent unless the caller passes a larger
@@ -878,9 +880,13 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_search" => tool_search(args, state),
         "browser_storage_state" => tool_storage_state(state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
+        #[cfg(feature = "distributed")]
         "obscura_submit_job" => tool_submit_job(args).await,
+        #[cfg(feature = "distributed")]
         "obscura_get_job" => tool_get_job(args).await,
+        #[cfg(feature = "distributed")]
         "obscura_cancel_job" => tool_cancel_job(args).await,
+        #[cfg(feature = "distributed")]
         "obscura_list_jobs" => tool_list_jobs(args).await,
         _ => Err(format!("Unknown tool: {name}")),
     };
@@ -1031,41 +1037,91 @@ fn truncate(text: &str, max_chars: usize) -> String {
     format!("{head}\n...(truncated, {remaining} more chars)")
 }
 
+#[cfg(feature = "distributed")]
 async fn tool_submit_job(args: &Value) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str).ok_or("Missing url")?;
     let operation = args.get("operation").and_then(Value::as_str).unwrap_or("navigate");
-    let db_url = std::env::var("DATABASE_URL").ok();
-    if db_url.is_none() {
-        return Err("Distributed execution requires DATABASE_URL to be set".into());
+
+    #[cfg(feature = "distributed")]
+    {
+        let cp = get_control_plane().await?;
+        let tenant_id = Uuid::new_v4();
+        let job = cp.submit_job_internal(tenant_id, url, operation, serde_json::json!({}), None, 3).await
+            .map_err(|e| format!("Failed to submit job: {}", e))?;
+        Ok(format!("Job submitted: {} (status: {})", job.job_id, job.status))
     }
-    Ok(format!("Distributed job submission requested for {} (operation: {}). Control plane integration pending.", url, operation))
+    #[cfg(not(feature = "distributed"))]
+    {
+        let _ = (url, operation);
+        Err("Distributed execution requires the 'distributed' feature".into())
+    }
 }
 
+#[cfg(feature = "distributed")]
 async fn tool_get_job(args: &Value) -> Result<String, String> {
-    let job_id = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
-    let db_url = std::env::var("DATABASE_URL").ok();
-    if db_url.is_none() {
-        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
+    let job_id: Uuid = job_id_str.parse().map_err(|_| "Invalid job_id")?;
+
+    #[cfg(feature = "distributed")]
+    {
+        let cp = get_control_plane().await?;
+        let tenant_id = Uuid::new_v4();
+        let job = cp.get_job_internal(job_id, tenant_id).await
+            .map_err(|e| format!("Failed to get job: {}", e))?;
+        Ok(format!("Job {} status: {} (attempts: {})", job.job_id, job.status, job.attempt_count))
     }
-    Ok(format!("Job {} status query requested. Control plane integration pending.", job_id))
+    #[cfg(not(feature = "distributed"))]
+    {
+        let _ = job_id;
+        Err("Distributed execution requires the 'distributed' feature".into())
+    }
 }
 
+#[cfg(feature = "distributed")]
 async fn tool_cancel_job(args: &Value) -> Result<String, String> {
-    let job_id = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
-    let db_url = std::env::var("DATABASE_URL").ok();
-    if db_url.is_none() {
-        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
+    let job_id: Uuid = job_id_str.parse().map_err(|_| "Invalid job_id")?;
+
+    #[cfg(feature = "distributed")]
+    {
+        let cp = get_control_plane().await?;
+        let tenant_id = Uuid::new_v4();
+        cp.cancel_job_internal(job_id, tenant_id).await
+            .map_err(|e| format!("Failed to cancel job: {}", e))?;
+        Ok(format!("Job {} cancelled.", job_id))
     }
-    Ok(format!("Job {} cancellation requested. Control plane integration pending.", job_id))
+    #[cfg(not(feature = "distributed"))]
+    {
+        let _ = job_id;
+        Err("Distributed execution requires the 'distributed' feature".into())
+    }
 }
 
+#[cfg(feature = "distributed")]
 async fn tool_list_jobs(args: &Value) -> Result<String, String> {
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
-    let db_url = std::env::var("DATABASE_URL").ok();
-    if db_url.is_none() {
-        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as i64;
+
+    #[cfg(feature = "distributed")]
+    {
+        let cp = get_control_plane().await?;
+        let tenant_id = Uuid::new_v4();
+        let jobs = cp.list_jobs_internal(tenant_id, limit).await
+            .map_err(|e| format!("Failed to list jobs: {}", e))?;
+        Ok(format!("Found {} jobs.", jobs.len()))
     }
-    Ok(format!("Job listing requested (limit: {}). Control plane integration pending.", limit))
+    #[cfg(not(feature = "distributed"))]
+    {
+        let _ = limit;
+        Err("Distributed execution requires the 'distributed' feature".into())
+    }
+}
+
+#[cfg(feature = "distributed")]
+async fn get_control_plane() -> Result<obscura_control_plane::ControlPlane, String> {
+    let db_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set".to_string())?;
+    obscura_control_plane::ControlPlane::connect(&db_url, 5).await
+        .map_err(|e| format!("Failed to connect to control plane: {}", e))
 }
 
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
