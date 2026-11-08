@@ -315,10 +315,10 @@ pub async fn handle(
                                     else location.assign(href);\
                                 }}\
                             }} else if (submitButton && submitButtonType !== 'button' && submitButtonType !== 'reset' && !globalThis.__obscura_isDisabled(submitButton)) {{\
-                                var form = submitButton.closest ? submitButton.closest('form') : null;\
+                                var form = submitButton.form;\
                                 if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(submitButton); }} else {{ form.submit(submitButton); }} }} catch(e) {{}} }}\
                             }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
-                                var form2 = clickTarget.closest ? clickTarget.closest('form') : null;\
+                                var form2 = clickTarget.form;\
                                 if (form2) {{ try {{ if (typeof form2.requestSubmit === 'function') {{ form2.requestSubmit(clickTarget); }} else {{ form2.submit(clickTarget); }} }} catch(e) {{}} }}\
                             }} else if ({click_count} >= 3 && (tag === 'INPUT' || tag === 'TEXTAREA')) {{\
                                 var len = clickTarget.value ? clickTarget.value.length : 0;\
@@ -470,7 +470,7 @@ pub async fn handle(
                                     target.setSelectionRange(lower + 1, lower + 1);\
                                     target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
                                 } else {\
-                                    var form = target.form || (target.closest && target.closest('form'));\
+                                    var form = target.form;\
                                     if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
                                 }\
                             })()".replace("$VK", &virtual_key_code.to_string())

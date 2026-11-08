@@ -195,6 +195,30 @@ behavior. The generic `HTMLElement`/`HTMLUnknownElement` hierarchy is separate w
 document's origin, including inherited blank-frame origins. Page assignment
 replaces this property without changing the document's actual origin.
 
+Form ownership and listed-control collection use a native, tree-scoped traversal.
+Native ID and control snapshots are invalidated by ownership-relevant attribute
+and tree mutations, not unrelated class/style/value updates,
+so repeated reads do not rescan the document. A native generation also invalidates
+owning-realm ID and owner snapshots through V8-allocated shared uint32 backing
+storage, without an FFI call per cached getter. Atomic writes and weak observers
+preserve the DOM tree's thread-move support and stop updates when the document
+retires; replacing a runtime's DOM rebinds the buffer and advances its epoch.
+Exporting a DOM also invalidates the runtime's cached getters and retires its
+subscriber until a document is installed again.
+Collection indices wrap nodes lazily, so reading length does not
+construct every external control. Uncached owners use a panic-safe numeric op.
+Connected controls' explicit `form` attributes resolve the first matching ID in
+tree order, including non-form blockers. Disconnected controls use ancestry.
+Parser associations preserve controls outside misnested forms
+until ownership is reset by attribute or tree mutation. Collections and borrowed
+getters stay in the control's owning document. Submission includes external
+controls, live enabled select choices and the activated button's entry. JavaScript
+and CDP clicks use the same owner, while `submit()` still bypasses the cancelable
+event and `requestSubmit()` does not. Collections retain the existing snapshot
+HTMLCollection behavior; remaining select state semantics are separate work.
+The performance smoke gate covers collection reads, scaled owner getters and
+unrelated-attribute mutation workloads alongside the general DOM scenarios.
+
 Short, bounded PBKDF2 derivations retain a native fast path. Larger derivations
 run on bounded blocking workers rather than the page thread. Dropping an
 awaiting future cancels that background work; the worker retains its admission

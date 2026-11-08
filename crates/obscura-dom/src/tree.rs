@@ -2,7 +2,8 @@ use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -245,8 +246,33 @@ impl Node {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct FormOwnershipKey {
+    tag: Option<QualName>,
+    id: Option<String>,
+    form: Option<String>,
+    connected: bool,
+    links: [Option<NodeId>; 5],
+}
+
+impl FormOwnershipKey {
+    fn of(node: &Node) -> Self {
+        Self {
+            tag: node.as_element().cloned(),
+            id: node.get_attribute("id").map(str::to_owned),
+            form: node.get_attribute("form").map(str::to_owned),
+            connected: node.connected,
+            links: [node.parent, node.first_child, node.last_child, node.prev_sibling, node.next_sibling],
+        }
+    }
+}
+
 pub struct DomTree {
     inner: RefCell<DomTreeInner>,
+    form_id_cache: RefCell<HashMap<NodeId, HashMap<String, NodeId>>>,
+    form_controls_cache: RefCell<HashMap<NodeId, Vec<NodeId>>>,
+    form_cache_generation: Arc<AtomicU64>,
+    form_cache_observers: RefCell<Vec<Weak<dyn Fn(u64) + Send + Sync>>>,
     // Only the last parser parent/child pair is cached; external tree changes
     // invalidate it rather than maintaining depths across DOM reparenting.
     pub(crate) parser_depth_cache: Cell<Option<(NodeId, usize, NodeId, usize)>>,
@@ -279,6 +305,8 @@ pub(crate) struct DomTreeInner {
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
+    // Only parser-associated controls outside their form subtree need records.
+    parser_form_owners: HashMap<NodeId, NodeId>,
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
     hovered: Option<NodeId>,
@@ -309,12 +337,17 @@ impl DomTree {
         };
         DomTree {
             parser_depth_cache: Cell::new(None),
+            form_id_cache: RefCell::new(HashMap::new()),
+            form_controls_cache: RefCell::new(HashMap::new()),
+            form_cache_generation: Arc::new(AtomicU64::new(0)),
+            form_cache_observers: RefCell::new(Vec::new()),
             inner: RefCell::new(DomTreeInner {
                 nodes: vec![Some(doc_node)],
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
+                parser_form_owners: HashMap::new(),
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
                 hovered: None,
@@ -619,6 +652,7 @@ impl DomTree {
             return Err(AttachShadowError::InvalidShadowRoot);
         }
 
+        self.invalidate_form_caches();
         let info = ShadowRoot {
             id: root,
             host,
@@ -888,12 +922,33 @@ impl DomTree {
         F: FnOnce(&mut Node) -> R,
     {
         self.parser_depth_cache.set(None);
+        let form_cache_active = Arc::strong_count(&self.form_cache_generation) > 1
+            || !self.form_cache_observers.borrow().is_empty()
+            || !self.form_id_cache.borrow().is_empty()
+            || !self.form_controls_cache.borrow().is_empty();
         let mut inner = self.inner.borrow_mut();
         if inner.nodes.get(id.index()).and_then(Option::as_ref)
             .is_some_and(|node| matches!(node.data, NodeData::Text { .. })) {
             Self::invalidate_cssom_source(&mut inner, id);
         }
-        inner.nodes.get_mut(id.index())?.as_mut().map(f)
+        let old_key = if form_cache_active {
+            inner.nodes.get(id.index()).and_then(Option::as_ref).map(FormOwnershipKey::of)
+        } else { None };
+        let old_form = if !inner.parser_form_owners.is_empty() && inner.parser_form_owners.contains_key(&id) {
+            inner.nodes.get(id.index())?.as_ref()?.get_attribute("form").map(str::to_owned)
+        } else {
+            None
+        };
+        let result = inner.nodes.get_mut(id.index())?.as_mut().map(f);
+        if !inner.parser_form_owners.is_empty() && inner.parser_form_owners.contains_key(&id)
+            && inner.nodes.get(id.index())?.as_ref()?.get_attribute("form") != old_form.as_deref() {
+            inner.parser_form_owners.remove(&id);
+        }
+        let ownership_changed = form_cache_active
+            && inner.nodes.get(id.index()).and_then(Option::as_ref).map(FormOwnershipKey::of) != old_key;
+        drop(inner);
+        if ownership_changed { self.invalidate_form_caches(); }
+        result
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
@@ -1074,6 +1129,7 @@ impl DomTree {
 
     fn detach_for_reparent(&self, node_id: NodeId, disconnect: bool) {
         self.parser_depth_cache.set(None);
+        self.invalidate_form_caches();
         let mut inner = self.inner.borrow_mut();
 
         // The document and registered ShadowRoots have no ordinary parent and
@@ -1087,6 +1143,14 @@ impl DomTree {
             None => return,
         };
         Self::invalidate_cssom_source(&mut inner, node_id);
+        if parent_id.is_some() && !inner.parser_form_owners.is_empty() {
+            let inner = &mut *inner;
+            let nodes = &inner.nodes;
+            inner.parser_form_owners.retain(|control, form| {
+                !Self::ordinary_ancestor(nodes, node_id, *control)
+                    && !Self::ordinary_ancestor(nodes, node_id, *form)
+            });
+        }
         if disconnect && inner
             .nodes
             .get(node_id.index())
@@ -1195,6 +1259,12 @@ impl DomTree {
         // would panic on direct indexing, and freeing an already-freed slot
         // would push it onto the free list a second time — later handing the
         // same NodeId to two live nodes (aliasing).
+        if !inner.parser_form_owners.is_empty() {
+            let freed: HashSet<_> = nodes_to_remove.iter().copied().collect();
+            inner.parser_form_owners.retain(|control, form| {
+                !freed.contains(control) && !freed.contains(form)
+            });
+        }
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
@@ -1311,6 +1381,177 @@ impl DomTree {
                 name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
             }).map(|name| name.local.clone())
         }).flatten()
+    }
+
+    fn ordinary_ancestor(nodes: &[Option<Node>], ancestor: NodeId, node: NodeId) -> bool {
+        let mut current = Some(node);
+        for _ in 0..=nodes.len() {
+            let Some(id) = current else { return false };
+            if id == ancestor { return true; }
+            current = nodes.get(id.index()).and_then(Option::as_ref).and_then(|node| node.parent);
+        }
+        eprintln!("obscura: form-owner ancestor cap hit - tree has a cycle");
+        false
+    }
+
+    fn invalidate_form_caches(&self) {
+        let generation = self.form_cache_generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        self.form_cache_observers.borrow_mut().retain(|observer| {
+            if let Some(observer) = observer.upgrade() {
+                observer(generation);
+                true
+            } else { false }
+        });
+        self.form_id_cache.borrow_mut().clear();
+        self.form_controls_cache.borrow_mut().clear();
+    }
+
+    pub fn form_cache_generation_handle(&self) -> Arc<AtomicU64> {
+        self.form_cache_generation.clone()
+    }
+
+    pub fn watch_form_cache_generation(&self, observer: Weak<dyn Fn(u64) + Send + Sync>) {
+        self.form_cache_observers.borrow_mut().push(observer);
+    }
+
+    fn ordinary_root(inner: &DomTreeInner, node: NodeId) -> Option<NodeId> {
+        let mut current = node;
+        for _ in 0..=inner.nodes.len() {
+            let node = inner.nodes.get(current.index())?.as_ref()?;
+            match node.parent {
+                Some(parent) => current = parent,
+                None => return Some(current),
+            }
+        }
+        eprintln!("obscura: form-owner root cap hit - tree has a cycle");
+        None
+    }
+
+    fn html_tag(node: &Node) -> Option<&str> {
+        node.as_element().filter(|name| name.ns.as_ref() == "http://www.w3.org/1999/xhtml")
+            .map(|name| name.local.as_ref())
+    }
+
+    fn is_listed_control(node: &Node) -> bool {
+        matches!(Self::html_tag(node), Some("button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea"))
+    }
+
+    // One borrowed preorder walk, carrying the nearest form rather than doing
+    // a DOM op and ancestor walk for every control. Shadow trees stay separate.
+    fn visit_form_tree(
+        inner: &DomTreeInner, root: NodeId,
+        mut visit: impl FnMut(NodeId, &Node, Option<NodeId>) -> bool,
+    ) -> Option<()> {
+        let mut next = Some((root, None));
+        let mut siblings = Vec::new();
+        let mut remaining = inner.nodes.len();
+        while let Some((id, owner)) = next.take() {
+            if remaining == 0 {
+                eprintln!("obscura: form-controls traversal cap hit - tree has a cycle");
+                return None;
+            }
+            remaining -= 1;
+            let node = inner.nodes.get(id.index())?.as_ref()?;
+            if !visit(id, node, owner) { return Some(()); }
+            let sibling = if id == root { None } else { node.next_sibling.map(|id| (id, owner)) };
+            if let Some(child) = node.first_child {
+                if let Some(sibling) = sibling { siblings.push(sibling); }
+                next = Some((child, if Self::html_tag(node) == Some("form") { Some(id) } else { owner }));
+            } else {
+                next = sibling.or_else(|| siblings.pop());
+            }
+        }
+        Some(())
+    }
+
+    pub fn set_parser_form_owner(&self, control: NodeId, form: NodeId, parent: NodeId) {
+        if self.is_inclusive_ancestor(form, parent) { return; }
+        self.invalidate_form_caches();
+        self.inner.borrow_mut().parser_form_owners.insert(control, form);
+    }
+
+    /// Resolve explicit, parser and ancestor ownership within one ordinary tree.
+    pub fn form_owner(&self, control: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let node = inner.nodes.get(control.index())?.as_ref()?;
+        if Self::is_listed_control(node) {
+            if let Some(id) = node.get_attribute("form").filter(|_| node.connected) {
+                if id.is_empty() { return None; }
+                let root = Self::ordinary_root(&inner, control)?;
+                if let Some(ids) = self.form_id_cache.borrow().get(&root) {
+                    return ids.get(id).copied().filter(|nid| {
+                        inner.nodes.get(nid.index()).and_then(Option::as_ref)
+                            .is_some_and(|node| Self::html_tag(node) == Some("form"))
+                    });
+                }
+                let mut ids = HashMap::new();
+                Self::visit_form_tree(&inner, root, |nid, node, _| {
+                    if node.is_element() {
+                        if let Some(id) = node.get_attribute("id") { ids.entry(id.to_owned()).or_insert(nid); }
+                    }
+                    true
+                })?;
+                let found = ids.get(id).copied().filter(|nid| {
+                    inner.nodes.get(nid.index()).and_then(Option::as_ref)
+                        .is_some_and(|node| Self::html_tag(node) == Some("form"))
+                });
+                self.form_id_cache.borrow_mut().insert(root, ids);
+                return found;
+            }
+            if let Some(owner) = inner.parser_form_owners.get(&control).copied() {
+                if Self::ordinary_root(&inner, owner).is_some_and(|root| {
+                    Some(root) == Self::ordinary_root(&inner, control)
+                }) {
+                    return Some(owner);
+                }
+            }
+        }
+        let mut parent = node.parent;
+        for _ in 0..=inner.nodes.len() {
+            let id = parent?;
+            let node = inner.nodes.get(id.index())?.as_ref()?;
+            if Self::html_tag(node) == Some("form") { return Some(id); }
+            parent = node.parent;
+        }
+        eprintln!("obscura: form-owner ancestor cap hit - tree has a cycle");
+        None
+    }
+
+    /// Listed controls owned by a form, in tree order, without selector parsing
+    /// or per-control JavaScript ownership checks.
+    pub fn form_controls(&self, form: NodeId) -> Option<Vec<NodeId>> {
+        let inner = self.inner.borrow();
+        let node = inner.nodes.get(form.index())?.as_ref()?;
+        if Self::html_tag(node) != Some("form") { return None; }
+        if let Some(controls) = self.form_controls_cache.borrow().get(&form) {
+            return Some(controls.clone());
+        }
+        let id = node.get_attribute("id").filter(|id| !id.is_empty());
+        let has_parser_controls = inner.parser_form_owners.values().any(|owner| *owner == form);
+        let root = if (node.connected && id.is_some()) || has_parser_controls {
+            Self::ordinary_root(&inner, form)?
+        } else { form };
+        let mut first_id = None;
+        let mut candidates = Vec::new();
+        Self::visit_form_tree(&inner, root, |nid, node, ancestor_form| {
+            if first_id.is_none() && id.is_some() && node.is_element() && node.get_attribute("id") == id {
+                first_id = Some(nid);
+            }
+            if Self::is_listed_control(node) {
+                if let Some(attribute) = node.get_attribute("form").filter(|_| node.connected) {
+                    if Some(attribute) == id { candidates.push((nid, true)); }
+                } else {
+                    let owner = inner.parser_form_owners.get(&nid).copied().or(ancestor_form);
+                    if owner == Some(form) { candidates.push((nid, false)); }
+                }
+            }
+            true
+        })?;
+        let controls: Vec<_> = candidates.into_iter().filter_map(|(nid, explicit)| {
+            (!explicit || first_id == Some(form)).then_some(nid)
+        }).collect();
+        self.form_controls_cache.borrow_mut().insert(form, controls.clone());
+        Some(controls)
     }
 
     /// Options owned by this select, excluding nested select, datalist and
@@ -2114,6 +2355,84 @@ mod tests {
             template_contents: None,
             mathml_annotation_xml_integration_point: false,
         })
+    }
+
+    #[test]
+    fn form_caches_ignore_unrelated_attributes_and_track_owner_identity() {
+        let tree = crate::parse_html("<form id=f><input id=inside></form><input id=outside form=f>");
+        let form = tree.get_element_by_id("f").unwrap();
+        let outside = tree.get_element_by_id("outside").unwrap();
+        let generation = tree.form_cache_generation_handle();
+        assert_eq!(tree.form_owner(outside), Some(form));
+        assert_eq!(tree.form_controls(form).unwrap().len(), 2);
+        let initial = generation.load(Ordering::Relaxed);
+        for (name, value) in [("class", "changed"), ("style", "color:red"), ("value", "new"), ("name", "field")] {
+            tree.with_node_mut(outside, |node| node.set_attribute(name, value.into()));
+            assert_eq!(generation.load(Ordering::Relaxed), initial);
+            assert_eq!(tree.form_owner(outside), Some(form));
+            assert_eq!(tree.form_controls(form).unwrap().len(), 2);
+        }
+        tree.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+        assert_ne!(generation.load(Ordering::Relaxed), initial);
+        assert_eq!(tree.form_owner(outside), None);
+        tree.with_node_mut(form, |node| {
+            if let NodeData::Element { name, .. } = &mut node.data {
+                name.ns = Namespace::from("urn:foreign");
+            }
+        });
+        assert_eq!(tree.form_controls(form), None);
+    }
+
+    #[test]
+    fn form_cache_observers_do_not_keep_retired_subscribers_alive() {
+        let tree = crate::parse_html("<form id=f><input></form>");
+        fn require_send<T: Send>() {}
+        require_send::<DomTree>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let received = generation.clone();
+        let observer: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |value| received.store(value, Ordering::Relaxed));
+        tree.watch_form_cache_generation(Arc::downgrade(&observer));
+        let form = tree.get_element_by_id("f").unwrap();
+        tree.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+        assert_eq!(generation.load(Ordering::Relaxed), tree.form_cache_generation_handle().load(Ordering::Relaxed));
+        drop(observer);
+        let last = generation.load(Ordering::Relaxed);
+        tree.with_node_mut(form, |node| node.set_attribute("id", "again".into()));
+        assert_eq!(generation.load(Ordering::Relaxed), last);
+        assert!(tree.form_cache_observers.borrow().is_empty());
+    }
+
+    #[test]
+    fn form_owner_parser_form_moves_do_not_restore_association() {
+        let tree = crate::parse_html("<table><form id=f><tr><td><input id=a></td></tr></form></table>");
+        let form = tree.get_element_by_id("f").unwrap();
+        let input = tree.get_element_by_id("a").unwrap();
+        assert_eq!(tree.form_owner(input), Some(form));
+        assert_eq!(tree.form_controls(form), Some(vec![input]));
+        tree.append_child(tree.document(), form);
+        assert_eq!(tree.form_owner(input), None);
+        assert_eq!(tree.form_controls(form), Some(vec![]));
+        tree.detach(form);
+        tree.append_child(tree.document(), form);
+        assert_eq!(tree.form_owner(input), None);
+    }
+
+    #[test]
+    fn form_controls_reject_foreign_forms_and_bound_cycles() {
+        let tree = DomTree::new();
+        let form = element(&tree, "form");
+        let input = element(&tree, "input");
+        tree.append_child(form, input);
+        assert_eq!(tree.form_controls(form), Some(vec![input]));
+        assert_eq!(tree.form_owner(input), Some(form));
+        tree.with_node_mut(input, |node| node.next_sibling = Some(input));
+        assert_eq!(tree.form_controls(form), None);
+        tree.with_node_mut(form, |node| {
+            if let NodeData::Element { name, .. } = &mut node.data { name.ns = Namespace::from("urn:foreign"); }
+        });
+        assert_eq!(tree.form_controls(form), None);
+        assert_eq!(tree.form_controls(NodeId::new(u32::MAX)), None);
+        assert_eq!(tree.form_owner(NodeId::new(u32::MAX)), None);
     }
 
     fn element_with_id(tree: &DomTree, local: &str, id: &str) -> NodeId {

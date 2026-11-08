@@ -55,6 +55,27 @@ SCENARIOS = {
         "(() => {document.body.innerHTML='<table><tr><td>row</td></tr></table>'.repeat(5000);return document.querySelectorAll('table').length})()",
         5000,
     ),
+    "form-elements-owned": (
+        "(() => {document.body.innerHTML='<form id=f>'+'<input name=inside>'.repeat(1000)+'</form>';const f=document.getElementById('f');let n=0;for(let i=0;i<200;i++)n+=f.elements.length;return n})()",
+        200000,
+    ),
+    "form-elements-external-mutation": (
+        "(() => {document.body.innerHTML='<form id=f><input name=inside></form>'+'<input form=f name=outside>'.repeat(1000);const f=document.getElementById('f');let n=0;for(let i=0;i<200;i++){document.body.className='state'+i;if(f.elements[0].name==='inside')n++;}return n})()",
+        200,
+    ),
+    "form-owner-ancestor-scaled": (
+        "(() => {document.body.innerHTML='<form id=f><div><div><div><input id=input></div></div></div></form>';const f=document.getElementById('f'),input=document.getElementById('input');let n=0;for(let i=0;i<10000000;i++)n+=input.form===f;return n})()",
+        10000000,
+    ),
+    "form-owner-explicit-scaled": (
+        # Older baselines return null; ownership correctness has separate tests.
+        "(() => {document.body.innerHTML='<form id=f></form><input id=input form=f>';const input=document.getElementById('input');let n=0;for(let i=0;i<10000000;i++)n+=typeof input.form==='object';return n})()",
+        10000000,
+    ),
+    "form-owner-explicit-mutation": (
+        "(() => {document.body.innerHTML='<form id=f></form><input id=input form=f>'+'<div id=extra></div>'.repeat(1000);const input=document.getElementById('input');let n=0;for(let i=0;i<10000;i++){input.className='state'+i;n+=typeof input.form==='object';}return n})()",
+        10000,
+    ),
 }
 SCENARIOS.update({
     f"html-parse-depth-{depth}": (

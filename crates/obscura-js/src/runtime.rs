@@ -1329,7 +1329,7 @@ impl ObscuraJsRuntime {
 
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
-        gs.dom = Some(dom);
+        gs.replace_dom(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -4115,7 +4115,7 @@ impl ObscuraJsRuntime {
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
         }
-        state.dom.take()
+        state.take_dom()
     }
 
     /// Export document-owned script preparation state before the runtime realm
@@ -4665,6 +4665,198 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn form_ownership_tracks_explicit_ids_and_tree_order() {
+        let mut rt = setup_runtime("<form id='f'><input id='a'><input id='b' form='g'><input id='empty' form=''></form><form id='g'></form><input id='c' form='f'><div id='block'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), g = document.getElementById('g');
+            const a = document.getElementById('a'), b = document.getElementById('b');
+            const c = document.getElementById('c'), block = document.getElementById('block');
+            const ids = form => Array.from(form.elements, node => node.id).join(',');
+            const initial = [a.form === f, b.form === g, c.form === f,
+                document.getElementById('empty').form === null, ids(f), ids(g)];
+            block.id = 'f'; f.before(block);
+            const blocked = [c.form === null, ids(f)];
+            f.before(c); block.remove();
+            const reordered = [c.form === f, ids(f)];
+            f.id = 'new';
+            const renamed = [c.form === null, ids(f)];
+            c.setAttribute('form', 'new');
+            return {initial, blocked, reordered, renamed, restored:ids(f)};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[true,true,true,true,"a,c","b"], "blocked":[true,"a"],
+            "reordered":[true,"c,a"], "renamed":[true,"a"], "restored":"c,a"
+        }));
+    }
+
+    #[test]
+    fn form_ownership_lazy_snapshots_preserve_observation_and_array_mutation() {
+        let mut rt = setup_runtime("<form id=f><input id=a name=first><input id=b name=NaN></form><input id=c form=f name=outside>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), a = document.getElementById('a');
+            const b = document.getElementById('b'), c = document.getElementById('c');
+            const fresh = () => f.elements;
+            const collection = fresh();
+            const descriptor = Object.getOwnPropertyDescriptor(collection, '1');
+            const observed = [Array.isArray(collection), collection instanceof HTMLCollection,
+                collection.length === 3, collection.item(0) === a, collection.NaN === b,
+                collection.namedItem('outside') === c, 'outside' in collection,
+                descriptor.value === b && descriptor.writable && descriptor.enumerable && descriptor.configurable,
+                Array.from(collection).every((node, i) => node === [a,b,c][i]),
+                Object.assign({}, collection)[2] === c, c.form === f];
+            const shortened = fresh(); shortened.length = 0; shortened.length = 3;
+            const deleted = fresh(); delete deleted[0];
+            const written = fresh(); written[0] = 'changed';
+            const defined = fresh(); Object.defineProperty(defined, '1', {value:'defined'});
+            const frozen = Object.freeze(fresh());
+            return {observed, mutations:[shortened[0] === undefined, deleted[0] === undefined,
+                written[0] === 'changed', defined[1] === 'defined', frozen[2] === c,
+                fresh()[0] === a && fresh()[1] === b]};
+        })()"#).unwrap(), serde_json::json!({
+            "observed":vec![true;11], "mutations":vec![true;6]
+        }));
+        rt.with_dom(|dom| {
+            let c = dom.get_element_by_id("c").unwrap();
+            dom.form_cache_generation_handle().store(u32::MAX as u64, std::sync::atomic::Ordering::Relaxed);
+            dom.with_node_mut(c, |node| node.set_attribute("form", "missing".into()));
+        });
+        assert_eq!(rt.evaluate("document.getElementById('f').elements.length === 2 && document.getElementById('c').form === null").unwrap(),
+            serde_json::json!(true));
+        rt.with_dom(|dom| {
+            let c = dom.get_element_by_id("c").unwrap();
+            dom.form_cache_generation_handle().store((2u64 << 32) - 1, std::sync::atomic::Ordering::Relaxed);
+            dom.with_node_mut(c, |node| node.set_attribute("form", "f".into()));
+        });
+        assert_eq!(rt.evaluate("document.getElementById('f').elements.length === 3 && document.getElementById('c').form === document.getElementById('f')").unwrap(),
+            serde_json::json!(true));
+        let dom = rt.state.borrow_mut().dom.take().unwrap();
+        let dom = std::thread::spawn(move || {
+            let c = dom.get_element_by_id("c").unwrap();
+            dom.with_node_mut(c, |node| node.set_attribute("form", "missing".into()));
+            dom
+        }).join().unwrap();
+        rt.state.borrow_mut().dom = Some(dom);
+        assert_eq!(rt.evaluate("document.getElementById('f').elements.length === 2 && document.getElementById('c').form === null").unwrap(),
+            serde_json::json!(true));
+        rt.set_dom(parse_html("<form id=f><input></form>"));
+        assert_eq!(rt.evaluate("(() => {const f=document.getElementById('f'); return {length:f.elements.length, ids:Array.from(f.elements,n=>n.id)}})()").unwrap(),
+            serde_json::json!({"length":1,"ids":[""]}));
+    }
+
+    #[test]
+    fn form_ownership_dom_export_invalidates_and_rebinds_cached_getters() {
+        let mut rt = setup_runtime("<form id=f></form><input id=input form=f>");
+        assert_eq!(rt.evaluate("(() => {globalThis.savedInput=document.getElementById('input');globalThis.savedForm=document.getElementById('f');return savedInput.form===savedForm && savedForm.elements.length===1})()").unwrap(),
+            serde_json::json!(true));
+        let dom = rt.take_dom().unwrap();
+        assert_eq!(rt.evaluate_script("savedInput.form===null").unwrap(),
+            serde_json::json!(true));
+        assert!(rt.evaluate_script("savedForm.elements").unwrap_err().contains("TypeError: Illegal invocation"));
+        let dom = std::thread::spawn(move || {
+            let form = dom.get_element_by_id("f").unwrap();
+            dom.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+            dom
+        }).join().unwrap();
+        rt.set_dom(dom);
+        assert_eq!(rt.evaluate_script("savedInput.form===null && savedForm.elements.length===0").unwrap(),
+            serde_json::json!(true));
+        rt.with_dom(|dom| {
+            let input = dom.get_element_by_id("input").unwrap();
+            dom.with_node_mut(input, |node| node.set_attribute("form", "changed".into()));
+        });
+        assert_eq!(rt.evaluate("savedInput.form===savedForm && savedForm.elements.length===1").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn form_ownership_retired_documents_cannot_publish_into_replacement_caches() {
+        let mut rt = setup_runtime("<form id=old><input></form>");
+        rt.evaluate("document.getElementById('old').elements.length").unwrap();
+        let retired = rt.state.borrow_mut().dom.take().unwrap();
+        rt.set_dom(parse_html("<form id=f></form><input id=input form=f>"));
+        let epoch = rt.with_dom(|dom| dom.form_cache_generation_handle().load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        retired.form_cache_generation_handle().store(epoch, std::sync::atomic::Ordering::Relaxed);
+        let old_form = retired.get_element_by_id("old").unwrap();
+        std::thread::spawn(move || {
+            retired.with_node_mut(old_form, |node| node.set_attribute("id", "retired".into()));
+        }).join().unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('input').form === document.getElementById('f')").unwrap(),
+            serde_json::json!(true));
+        rt.with_dom(|dom| {
+            let form = dom.get_element_by_id("f").unwrap();
+            dom.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+        });
+        assert_eq!(rt.evaluate("document.getElementById('input').form === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn form_ownership_updates_cached_lists_on_reset_and_reparenting() {
+        let mut rt = setup_runtime("<form id='f'><input id='a' value='initial'><input id='b' form='g' value='other'></form><form id='g'></form><input id='c' form='f' value='outside'>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), g = document.getElementById('g');
+            const a = document.getElementById('a'), b = document.getElementById('b');
+            const c = document.getElementById('c'), old = f.elements;
+            a.value='changed'; b.value='kept'; c.value='changed'; f.reset();
+            const reset = [a.value,b.value,c.value];
+            g.appendChild(a);
+            const moved = [a.form === g, Array.from(f.elements,n=>n.id).join(','),
+                Array.from(g.elements,n=>n.id).join(',')];
+            c.removeAttribute('form');
+            return {reset,moved,removed:f.elements.length,oldSnapshot:old.length};
+        })()"#).unwrap(), serde_json::json!({
+            "reset":["initial","kept","outside"], "moved":[true,"c","b,a"],
+            "removed":0,"oldSnapshot":2
+        }));
+    }
+
+    #[test]
+    fn form_ownership_preserves_parser_association_until_reset() {
+        let mut rt = setup_runtime("<table><form id='f'><tr><td><span id='box'><input id='a'><button id='b'>Go</button></span></td></tr></form></table><form id='g'></form>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), a = document.getElementById('a');
+            const b = document.getElementById('b'), box = document.getElementById('box');
+            const ids = () => Array.from(f.elements, node => node.id).join(',');
+            const initial = [f.children.length, a.form === f, b.form === f, ids()];
+            a.className = 'kept';
+            const unchanged = a.form === f;
+            a.setAttribute('form', 'missing'); a.removeAttribute('form');
+            const resetAttribute = [a.form === null, ids()];
+            document.body.appendChild(box);
+            return {initial, unchanged, resetAttribute, moved:[b.form === null, ids()]};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[0,true,true,"a,b"], "unchanged":true,
+            "resetAttribute":[true,"b"], "moved":[true,""]
+        }));
+    }
+
+    #[test]
+    fn form_ownership_stays_inside_detached_and_shadow_trees() {
+        let mut rt = setup_runtime("<form id='same'><input id='outer'></form><div id='host'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const host = document.getElementById('host'), root = host.attachShadow({mode:'open'});
+            root.innerHTML = '<form id="same"><input id="a"></form><input id="b" form="same">';
+            const form = root.querySelector('form'), b = root.querySelector('#b');
+            const initial = [b.form === form, Array.from(form.elements, n => n.id).join(','),
+                document.getElementById('same').elements.length];
+            host.remove();
+            const disconnected = [b.form === null, Array.from(form.elements, n => n.id).join(',')];
+            document.body.appendChild(host);
+            const restored = b.form === form;
+            const detached = document.createElement('div');
+            detached.innerHTML = '<form id="same"><input id="ancestor" form="missing"></form><input id="explicit" form="same">';
+            const input = detached.querySelector('#explicit'), owned = detached.querySelector('form');
+            const separate = [input.form === owned, owned.elements[0] === input];
+            const detachedAncestor = detached.querySelector('#ancestor').form === owned;
+            document.body.appendChild(input);
+            return {initial, disconnected, restored, separate, detachedAncestor,
+                moved:input.form === document.getElementById('same')};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[true,"a,b",1], "disconnected":[true,"a"], "restored":true,
+            "separate":[false,false], "detachedAncestor":true, "moved":true
+        }));
+    }
+
     #[test]
     fn html_interface_brands_use_distinct_native_prototypes() {
         let mut rt = setup_runtime("<html><head><style></style><link></head><body><div></div><span></span><a></a><p></p><button></button><h2></h2><template></template></body></html>");

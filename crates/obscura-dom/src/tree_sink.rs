@@ -237,6 +237,10 @@ impl TreeSink for DomTree {
         }
     }
 
+    fn associate_with_form(&self, target: &NodeId, form: &NodeId, nodes: (&NodeId, Option<&NodeId>)) {
+        self.set_parser_form_owner(*target, *form, *nodes.0);
+    }
+
     fn append_based_on_parent_node(
         &self,
         element: &NodeId,
