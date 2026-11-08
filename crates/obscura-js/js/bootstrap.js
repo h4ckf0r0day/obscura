@@ -7336,7 +7336,7 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
-const _selectCacheGet = Map.prototype.get.bind(_cache);
+const _nodeCacheGet = Map.prototype.get.bind(_cache);
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -14599,11 +14599,11 @@ function _selectTagIsValid(nid) {
 }
 function _validateSelectMember() {
   const nid = this && this._nid;
-  return !!this && _selectCacheGet(nid) === this && _selectTagIsValid(nid);
+  return !!this && _nodeCacheGet(nid) === this && _selectTagIsValid(nid);
 }
 function _validateSelect() {
   const nid = this && this._nid;
-  if (!this || _selectCacheGet(nid) !== this) {
+  if (!this || _nodeCacheGet(nid) !== this) {
     const member = this && _documentRealmMember(this, 'validateSelect');
     if (member && member !== _validateSelectMember && _selectApply(member, this, [])) return;
     throw new TypeError('Illegal invocation');
@@ -14612,13 +14612,13 @@ function _validateSelect() {
 }
 function _selectOptionsMember() {
   const nid = this && this._nid;
-  if (!this || _selectCacheGet(nid) !== this) return null;
+  if (!this || _nodeCacheGet(nid) !== this) return null;
   const ids = _domParse('select_options', nid);
   return ids === null ? null : ids.map(_wrapEl);
 }
 function _selectOptions(select) {
   const nid = select && select._nid;
-  if (!select || _selectCacheGet(nid) !== select) {
+  if (!select || _nodeCacheGet(nid) !== select) {
     const member = select && _documentRealmMember(select, 'selectOptions');
     if (member && member !== _selectOptionsMember) {
       const options = _selectApply(member, select, []);
@@ -14632,11 +14632,11 @@ function _selectOptions(select) {
 }
 function _optionIndexMember() {
   const nid = this && this._nid;
-  return this && _selectCacheGet(nid) === this ? _domParse('option_index', nid) : null;
+  return this && _nodeCacheGet(nid) === this ? _domParse('option_index', nid) : null;
 }
 function _optionIndexGetter() {
   const nid = this && this._nid;
-  if (!this || _selectCacheGet(nid) !== this) {
+  if (!this || _nodeCacheGet(nid) !== this) {
     const member = this && _documentRealmMember(this, 'optionIndex');
     if (member && member !== _optionIndexMember) {
       const index = _selectApply(member, this, []);
@@ -19044,6 +19044,8 @@ const _installCaretGeometry = (function _installCaretGeometry() {
 
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
+const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
+const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
   ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
@@ -19057,6 +19059,13 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['selectOptions', _selectOptionsMember],
   ['validateSelect', _validateSelectMember],
   ['optionIndex', _optionIndexMember],
+  ['domNodeReference', function() {
+    const nid = this._nid;
+    if (_nodeCacheGet(nid) !== this) throw new TypeError('Not a current DOM node');
+    const doc = _nodeDocumentOf(this);
+    const url = doc === document && globalThis.__virtualUrl || _nativeDocumentUrl(doc);
+    return [nid, url, _nativeNodeBaseUri(this)];
+  }],
   ['windowOrigin', _windowOriginDescriptor.get],
   ['setWindowOrigin', _windowOriginDescriptor.set],
 ]));

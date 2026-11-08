@@ -4161,6 +4161,65 @@ impl ObscuraJsRuntime {
         state.dom.as_ref().map(f)
     }
 
+    /// Inspect a genuine remote node in its owning document, including foreign
+    /// handles returned through the parent realm. Detached frame handles fail
+    /// instead of resolving the same numeric node id in the main document.
+    pub fn with_remote_dom_node<R>(&mut self, object_id: &str,
+        inspect: impl FnOnce(&DomTree, NodeId, u32, &str, &str) -> R) -> Result<R, String> {
+        self.begin_javascript_task();
+        // getProperties also stores child handles directly in the realm's table.
+        let retrieval = self.resolve_remote_object(object_id).unwrap_or_else(|| {
+            format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id))
+        });
+        let receiver = self.execute_runtime_script("<cdp-dom-node>", retrieval)
+            .map_err(|error| format!("Could not resolve remote node: {error}"))?;
+        let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
+        let reference = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let receiver = v8::Local::new(scope, &receiver);
+            let object = v8::Local::<v8::Object>::try_from(receiver)
+                .map_err(|_| "Remote object is not a DOM node".to_string())?;
+            let (frame_id, members) = crate::ops::document_realm(scope, object)
+                .ok_or("Remote node has no owning document")?;
+            let key = v8::String::new(scope, "domNodeReference").ok_or("DOM member allocation failed")?;
+            let member = members.get(scope, key.into()).ok_or("DOM node member unavailable")?;
+            let function = v8::Local::<v8::Function>::try_from(member)
+                .map_err(|_| "DOM node member is not a function".to_string())?;
+            let value = function.call(scope, receiver, &[])
+                .ok_or_else(|| format!("Could not inspect remote node: {}", exception_text(scope)))?;
+            let metadata = v8::Local::<v8::Array>::try_from(value)
+                .map_err(|_| "Remote node metadata is unavailable".to_string())?;
+            let node_id = metadata.get_index(scope, 0).and_then(|value| value.integer_value(scope))
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or("Remote object is not a current DOM node")?;
+            let url = metadata.get_index(scope, 1).filter(|value| value.is_string())
+                .ok_or("Remote document URL is unavailable")?.to_rust_string_lossy(scope);
+            let base = metadata.get_index(scope, 2).filter(|value| value.is_string())
+                .ok_or("Remote document base URL is unavailable")?.to_rust_string_lossy(scope);
+            Ok::<_, String>((frame_id, NodeId::new(node_id), url, base))
+        })();
+        let fired = self.disarm_watchdog(watchdog);
+        if fired { return Err("Remote node inspection exceeded its deadline".into()); }
+        let (frame_id, node_id, url, base) = reference?;
+        let state = if frame_id == 0 {
+            self.state.clone()
+        } else {
+            let realms = self.realm_states();
+            let realms = realms.borrow();
+            if realms.frame_timers_active(frame_id) != Some(true) {
+                return Err("Remote node belongs to a detached frame".into());
+            }
+            realms.by_frame_id(frame_id).ok_or("Remote node document is unavailable")?
+        };
+        let state = state.borrow();
+        let dom = state.dom.as_ref().ok_or("Remote node document has no DOM")?;
+        if dom.get_node(node_id).is_none() { return Err("Remote node is no longer available".into()); }
+        Ok(inspect(dom, node_id, frame_id, &url, &base))
+    }
+
     #[cfg(feature = "render")]
     pub fn accessibility_styles(&self) -> HashMap<NodeId, AccessibilityStyle> {
         let mut state = self.state.borrow_mut();

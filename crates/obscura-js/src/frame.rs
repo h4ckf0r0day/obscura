@@ -1783,6 +1783,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_dom_nodes_preserve_foreign_document_identity_and_reject_stale_frames() {
+        let mut parent = page("https://example.com/", "<div id=parent>parent</div>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://example.com/child",
+            "<base href='/assets/'><span id=child>child</span>").unwrap();
+        let info = parent.store_object_with_meta(
+            "globalThis.__obscura_frameObjects[1].document.getElementById('child')").unwrap();
+        let object_id = info.object_id.unwrap();
+        let description = parent.with_remote_dom_node(&object_id, |dom, node, frame, url, base| {
+            (frame, url.to_string(), base.to_string(), dom.outer_html(node))
+        }).unwrap();
+        assert_eq!(description, (1, "https://example.com/child".into(),
+            "https://example.com/assets/".into(), "<span id=\"child\">child</span>".into()));
+        frame.execute_script(&mut parent, "history.pushState({},'', '/changed');").unwrap();
+        assert_eq!(parent.with_remote_dom_node(&object_id, |_, _, _, url, base| {
+            (url.to_string(), base.to_string())
+        }).unwrap(), ("https://example.com/changed".into(), "https://example.com/assets/".into()));
+        let document = parent.store_object_with_meta(
+            "globalThis.__obscura_frameObjects[1].document").unwrap().object_id.unwrap();
+        assert_eq!(parent.with_remote_dom_node(&document, |dom, node, frame, _, _| {
+            (node == dom.document(), frame)
+        }).unwrap(), (true, 1));
+        let forged = parent.store_object_with_meta("({_nid:0})").unwrap().object_id.unwrap();
+        parent.execute_script("override", "Map.prototype.get=function(){return this};").unwrap();
+        assert!(parent.with_remote_dom_node(&forged, |_, _, _, _, _| ()).is_err());
+        assert_eq!(parent.with_remote_dom_node(&document, |_, _, frame, _, _| frame).unwrap(), 1);
+        parent.forget_frame_state(frame.frame_id());
+        assert!(parent.with_remote_dom_node(&document, |_, _, _, _, _| ()).is_err());
+    }
+
+    #[test]
     fn opaque_origin_frames_are_never_same_origin() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(

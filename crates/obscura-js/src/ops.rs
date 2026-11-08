@@ -6902,6 +6902,16 @@ fn op_register_document_realm(
 
 /// Resolve a borrowed document member from the receiver's creation realm, not
 /// its public prototype, which a membrane is allowed to replace.
+pub(crate) fn document_realm<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> Option<(u32, v8::Local<'s, v8::Object>)> {
+    let context = receiver.get_creation_context(scope)?;
+    let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+    let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
+    Some((owner, members))
+}
+
 #[op2]
 fn op_document_realm_member<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
@@ -6910,10 +6920,8 @@ fn op_document_realm_member<'s, 'i>(
     caller_frame_id: u32,
 ) -> v8::Local<'s, v8::Value> {
     let member = (|| {
-        let context = receiver.get_creation_context(scope)?;
-        let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+        let (owner, members) = document_realm(scope, receiver)?;
         if owner == caller_frame_id { return None; }
-        let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
         let key = v8::String::new(scope, name)?;
         let value = members.get(scope, key.into())?;
         value.is_function().then_some(value)
