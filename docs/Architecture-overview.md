@@ -178,6 +178,12 @@ borrowed methods on child-realm nodes. Select collections still use the existing
 snapshot HTMLCollection implementation; indexed properties on the select itself
 and the remaining table construction APIs are separate work.
 
+CDP `DOM.querySelector` and `DOM.querySelectorAll` search descendants of the
+requested node, including explicit shadow roots, without crossing into sibling
+or nested shadow trees. Native selector scoping also handles `:scope`. Omitted
+or zero node IDs retain the legacy document fallback; invalid node IDs and
+invalid selectors return protocol errors rather than empty successful results.
+
 `window.origin` (including the bare `origin` identifier) reports the owning
 document's origin, including inherited blank-frame origins. Page assignment
 replaces this property without changing the document's actual origin.
