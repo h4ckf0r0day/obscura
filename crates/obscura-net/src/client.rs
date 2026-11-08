@@ -15,7 +15,7 @@ use url::Url;
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
-fn configured_root_paths() -> Vec<std::path::PathBuf> {
+pub(crate) fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
         paths.push(path.into());
@@ -684,9 +684,10 @@ pub fn proxy_resolves_remotely(proxy_url: Option<&str>) -> bool {
 /// `validate_url`, which already checks them. Every transport calls this at the
 /// same points as `validate_url`, for the first request and for each redirect.
 ///
-/// The proxy still resolves the name a second time, so a name whose answer
-/// changes between the two lookups (DNS rebinding) can get past this check;
-/// only handing the proxy the checked address closes that, as `socks5://` does.
+/// This check alone cannot stop a name whose answer changes before the proxy
+/// resolves it (DNS rebinding). For `http://` and `https://` proxies the
+/// clients therefore send through `pinned_proxy_url`, which hands the proxy
+/// the checked address; this check keeps refused requests' errors readable.
 pub async fn validate_proxied_host(url: &Url, allow_private_network: bool) -> Result<(), String> {
     if allow_private_network || env_allows_private_network() {
         return Ok(());
@@ -701,7 +702,7 @@ pub async fn validate_proxied_host(url: &Url, allow_private_network: bool) -> Re
         return Ok(());
     }
     let port = url.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
+    let addrs: Vec<SocketAddr> = crate::proxy_pin::lookup()(domain.to_string(), port)
         .await
         .map_err(|e| {
             format!(
@@ -709,7 +710,7 @@ pub async fn validate_proxied_host(url: &Url, allow_private_network: bool) -> Re
                 domain, e
             )
         })?
-        .collect();
+        ;
     if addrs.is_empty() {
         return Err(format!(
             "SSRF blocked: '{}' could not be resolved locally to check it before sending it to the proxy",
@@ -1258,6 +1259,7 @@ impl ObscuraHttpClient {
             }
 
             if let Some(ref proxy) = self.proxy_url {
+                let proxy = crate::pinned_proxy_url(proxy, self.allow_private_network);
                 if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
                     builder = builder.proxy(p);
                 }

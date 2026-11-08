@@ -3677,7 +3677,9 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .pool_idle_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(60));
     if let Some(proxy) = proxy_url {
-        let p = reqwest::Proxy::all(proxy)
+        // Same SSRF policy as the resolver above, so the proxy gets checked addresses.
+        let proxy = obscura_net::pinned_proxy_url(proxy, false);
+        let p = reqwest::Proxy::all(proxy.as_str())
             .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
         builder = builder.proxy(p);
     }

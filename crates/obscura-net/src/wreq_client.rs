@@ -275,7 +275,8 @@ impl StealthHttpClient {
         }
 
         if let Some(proxy) = proxy_url {
-            if let Ok(p) = wreq::Proxy::all(proxy) {
+            let proxy = crate::pinned_proxy_url(proxy, allow_private_network);
+            if let Ok(p) = wreq::Proxy::all(proxy.as_str()) {
                 builder = builder.proxy(p);
             }
         }

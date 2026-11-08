@@ -3,6 +3,8 @@ pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
 pub mod robots;
+mod proxy_pin;
+pub use proxy_pin::pinned_proxy_url;
 pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
