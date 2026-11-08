@@ -7105,16 +7105,15 @@ fn select_index_values<'s, 'i>(
 fn select_constructor(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue,
+    _rv: v8::ReturnValue,
 ) {
-    let nid = v8::Local::new(scope, args.get(0));
-    let data = v8::Local::new(scope, args.data());
-    let object = args.this();
-    if args.is_construct_call() && nid.is_uint32() && data.is_string() {
-        match object.set(scope, data, nid) {
-            Some(true) => { rv.set(object.into()); return; }
-            None => return,
-            Some(false) => {}
+    let nid = args.get(0);
+    if args.is_construct_call() && nid.is_uint32() {
+        if let Ok(key) = v8::Local::<v8::String>::try_from(args.data()) {
+            match args.this().create_data_property(scope, key.into(), nid) {
+                Some(true) | None => return,
+                Some(false) => {}
+            }
         }
     }
     if let Some(message) = v8::String::new(scope, "Could not initialize native select") {
