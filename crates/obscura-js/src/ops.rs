@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
@@ -379,8 +380,44 @@ struct StorageOriginCache {
     origin: String,
 }
 
+struct FormCacheBuffer {
+    generation: Arc<AtomicU64>,
+    backing_store: v8::SharedRef<v8::BackingStore>,
+    publisher: Arc<StdMutex<FormCachePublisher>>,
+    observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+struct FormCachePublisher {
+    backing_store: v8::SharedRef<v8::BackingStore>,
+    generation: std::sync::Weak<AtomicU64>,
+}
+
+impl FormCachePublisher {
+    fn publish(&self, generation: u64) {
+        let words = self.backing_store.data().expect("fixed form cache backing storage").cast::<u32>().as_ptr();
+        // The pinned eight-byte V8 allocation was checked for u32 alignment.
+        unsafe {
+            AtomicU32::from_ptr(words).store(generation as u32, AtomicOrdering::Relaxed);
+            AtomicU32::from_ptr(words.add(1)).store((generation >> 32) as u32, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+fn form_cache_observer(
+    publisher: Arc<StdMutex<FormCachePublisher>>,
+    owner: std::sync::Weak<AtomicU64>,
+) -> Arc<dyn Fn(u64) + Send + Sync> {
+    Arc::new(move |generation| {
+        let publisher = publisher.lock().expect("form cache backing storage poisoned");
+        // A retired document can still be retained by native callers.
+        if !std::sync::Weak::ptr_eq(&owner, &publisher.generation) { return; }
+        publisher.publish(generation);
+    })
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    form_cache_buffer: Option<FormCacheBuffer>,
     pub url: String,
     /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
@@ -650,6 +687,32 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    pub(crate) fn replace_dom(&mut self, dom: DomTree) {
+        if let Some(cache) = self.form_cache_buffer.as_mut() {
+            let generation = dom.form_cache_generation_handle();
+            generation.store(cache.generation.load(AtomicOrdering::Relaxed).wrapping_add(1), AtomicOrdering::Relaxed);
+            cache.publisher.lock().expect("form cache backing storage poisoned").generation = Arc::downgrade(&generation);
+            let observer = form_cache_observer(cache.publisher.clone(), Arc::downgrade(&generation));
+            observer(generation.load(AtomicOrdering::Relaxed));
+            dom.watch_form_cache_generation(Arc::downgrade(&observer));
+            cache.observer = Some(observer);
+            cache.generation = generation;
+        }
+        self.dom = Some(dom);
+    }
+
+    pub(crate) fn take_dom(&mut self) -> Option<DomTree> {
+        let dom = self.dom.take()?;
+        if let Some(cache) = self.form_cache_buffer.as_mut() {
+            let mut publisher = cache.publisher.lock().expect("form cache backing storage poisoned");
+            publisher.generation = std::sync::Weak::new();
+            let epoch = cache.generation.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1);
+            publisher.publish(epoch);
+            cache.observer = None;
+        }
+        Some(dom)
+    }
+
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
         self.media_preferences = parent.media_preferences.clone();
         #[cfg(feature = "render")]
@@ -685,6 +748,7 @@ impl ObscuraState {
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
+            form_cache_buffer: None,
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
@@ -2156,6 +2220,61 @@ fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] 
     [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
 }
 
+#[op2(fast)]
+fn op_form_owner(state: &OpState, nid: u32, frame_id: u32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frame_state(state, frame_id).borrow().dom.as_ref()
+            .and_then(|dom| dom.form_owner(NodeId::new(nid)))
+            .map_or(-1, |form| form.raw() as i32)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_form_owner panicked; returning null");
+        -1
+    })
+}
+
+#[op2]
+fn op_form_cache_buffer<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>, state: &OpState, frame_id: u32,
+) -> v8::Local<'s, v8::Value> {
+    let backing_store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut state = shared.borrow_mut();
+        let dom = state.dom.as_ref()?;
+        let generation = dom.form_cache_generation_handle();
+        if let Some(cache) = state.form_cache_buffer.as_ref() {
+            if Arc::ptr_eq(&cache.generation, &generation) {
+                return Some(cache.backing_store.clone());
+            }
+        }
+        let backing_store = v8::SharedArrayBuffer::new_backing_store(scope, 8).make_shared();
+        let Some(data) = backing_store.data() else {
+            tracing::error!("form cache backing storage is empty");
+            return None;
+        };
+        if !data.cast::<AtomicU32>().as_ptr().is_aligned() {
+            tracing::error!("form cache backing storage is not aligned for shared uint32 words");
+            return None;
+        }
+        let publisher = Arc::new(StdMutex::new(FormCachePublisher {
+            backing_store: backing_store.clone(), generation: Arc::downgrade(&generation),
+        }));
+        let observer = form_cache_observer(publisher.clone(), Arc::downgrade(&generation));
+        observer(generation.load(AtomicOrdering::Relaxed));
+        dom.watch_form_cache_generation(Arc::downgrade(&observer));
+        state.form_cache_buffer = Some(FormCacheBuffer {
+            generation, backing_store: backing_store.clone(), publisher, observer: Some(observer),
+        });
+        Some(backing_store)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_form_cache_buffer panicked; rejecting cache");
+        None
+    });
+    match backing_store {
+        Some(store) => v8::SharedArrayBuffer::with_backing_store(scope, &store).into(),
+        None => v8::null(scope).into(),
+    }
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -2707,6 +2826,16 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 }
                 None => "null".into(),
             }
+        }
+        "form_owner" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.form_owner(nid).map(|form| form.index())).to_string()
+        }
+        "form_controls" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.form_controls(nid).map(|controls| {
+                controls.into_iter().map(|control| control.index()).collect::<Vec<_>>()
+            })).to_string()
         }
         "table_rows" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
@@ -8126,6 +8255,8 @@ fn op_frame_preload_scripts(state: &OpState) -> String {
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_form_owner(),
+        op_form_cache_buffer(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),

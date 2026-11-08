@@ -4802,7 +4802,7 @@ class Element extends Node {
       // click path in input.rs, which already treats <input type=image> as a
       // submit button.
       if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
+        const form = this.form;
         // A real submit-button click fires the cancelable submit event, so use
         // requestSubmit() (not the plain submit() method, which now bypasses it).
         if (form && typeof form.requestSubmit === 'function') {
@@ -5463,9 +5463,7 @@ class Element extends Node {
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
   get form() {
-    let p = this.parentNode;
-    while (p && p.localName !== 'form') p = p.parentNode;
-    return p;
+    return _formOwner(this);
   }
   // Label association, per the HTML labelable-elements list. Playwright's
   // getByLabel and its follow-label retargeting read these; without them a
@@ -5577,13 +5575,15 @@ class Element extends Node {
   }
   _navigateSubmit(submitter) {
     const pairs = [];
-    const fields = this.querySelectorAll('input, select, textarea');
+    const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
+    const fields = _formControls(this);
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i];
+      const tag = f.localName;
+      if (!['input', 'select', 'textarea', 'button'].includes(tag)) continue;
       const name = f.getAttribute('name');
       if (!name) continue;
-      if (f.getAttribute('disabled') !== null) continue;
-      const tag = f.localName;
+      if (_isActuallyDisabled(f)) continue;
       const type = (f.getAttribute('type') || '').toLowerCase();
       if ((type === 'checkbox' || type === 'radio') && !f.checked) continue;
       if (type === 'file' || type === 'reset') continue;
@@ -5595,14 +5595,36 @@ class Element extends Node {
 
       let val;
       if (tag === 'select') {
-        const opt = f.querySelector('option[selected]') || f.querySelector('option');
-        val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
+        const opts = _selectOptions(f);
+        const multiple = f.hasAttribute('multiple');
+        const chosen = [];
+        let explicit = false;
+        let firstEnabled = null;
+        for (const opt of opts) {
+          explicit ||= opt._selected !== undefined;
+          const parent = opt.parentElement;
+          const disabled = opt.hasAttribute('disabled')
+            || (parent && parent.namespaceURI === 'http://www.w3.org/1999/xhtml'
+                && parent.localName === 'optgroup' && parent.hasAttribute('disabled'));
+          if (!disabled && !firstEnabled) firstEnabled = opt;
+          if (opt.selected) {
+            if (!multiple) chosen.length = 0;
+            chosen.push([opt, disabled]);
+          }
+        }
+        if (!multiple && !chosen.length && !explicit
+            && (parseInt(f.getAttribute('size'), 10) || 0) <= 1 && firstEnabled) {
+          chosen.push([firstEnabled, false]);
+        }
+        for (const [opt, disabled] of chosen) {
+          if (!disabled) pairs.push(enc(name) + '=' + enc(opt.getAttribute('value') ?? opt.textContent));
+        }
+        continue;
       } else if (tag === 'textarea') {
         val = f.value || f.textContent || '';
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
       pairs.push(enc(name) + '=' + enc(val));
     }
 
@@ -14430,10 +14452,9 @@ Object.defineProperties(HTMLInputElement.prototype, {
 });
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
-  get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
+  get elements() { return _formControls(this); }
   get length() { return this.elements.length; }
-  // Inherit submit() from Element.prototype: it dispatches the cancelable
-  // 'submit' event and (if not prevented) builds form data and navigates.
+  // submit() bypasses the submit event; requestSubmit() dispatches it.
   reset() {
     if (!this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true }))) return;
     for (const f of this.elements) {
@@ -14597,6 +14618,121 @@ for (const [name, tags] of Object.entries({
     _additionalHtmlElementClasses[tag] = Interface;
     _additionalHtmlElementClasses[tag.toUpperCase()] = Interface;
   }
+}
+
+let _formOwnerSnapshots = new WeakMap();
+let _formControlSnapshots = new WeakMap();
+let _formCacheEpoch = null;
+function _formEpoch() {
+  if (!_formCacheEpoch) {
+    const buffer = __obscuraCore.ops.op_form_cache_buffer(_realmFrameId);
+    if (buffer === null) throw new TypeError('Illegal invocation');
+    _formCacheEpoch = new Uint32Array(buffer);
+  }
+  return _formCacheEpoch;
+}
+function _readFormOwner(control) {
+  const epoch = _formEpoch();
+  let snapshot = _formOwnerSnapshots.get(control);
+  if (!snapshot || snapshot.low !== epoch[0] || snapshot.high !== epoch[1]) {
+    snapshot = {low:epoch[0], high:epoch[1],
+      owner:_wrapEl(__obscuraCore.ops.op_form_owner(control._nid, _realmFrameId))};
+    _formOwnerSnapshots.set(control, snapshot);
+  }
+  return snapshot.owner;
+}
+function _formOwnerMember() {
+  if (!this || _nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  return _readFormOwner(this);
+}
+function _formOwner(control) {
+  if (control && _nodeCacheGet(control._nid) === control) {
+    return _readFormOwner(control);
+  }
+  const member = control && _documentRealmMember(control, 'formOwner');
+  if (member && member !== _formOwnerMember) return Reflect.apply(member, control, []);
+  throw new TypeError('Illegal invocation');
+}
+function _formControlsMember() {
+  if (!this || _nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  const epoch = _formEpoch();
+  let snapshot = _formControlSnapshots.get(this);
+  if (!snapshot || snapshot.low !== epoch[0] || snapshot.high !== epoch[1]) {
+    const ids = _domParse('form_controls', this._nid);
+    if (ids === null) throw new TypeError('Illegal invocation');
+    snapshot = {low:epoch[0], high:epoch[1], ids};
+    _formControlSnapshots.set(this, snapshot);
+  }
+  return _formControlsSnapshot(snapshot.ids);
+}
+function _formControls(form) {
+  if (!form || _nodeCacheGet(form._nid) !== form) {
+    const member = form && _documentRealmMember(form, 'formControls');
+    if (member && member !== _formControlsMember) return Reflect.apply(member, form, []);
+    throw new TypeError('Illegal invocation');
+  }
+  return Reflect.apply(_formControlsMember, form, []);
+}
+
+// Keep the existing writable array snapshot, but wrap native IDs only when
+// observed. A length read must not construct every external control wrapper.
+function _formControlsSnapshot(ids) {
+  const target = new HTMLCollection();
+  let hydrated = false;
+  const index = key => typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key)
+    && Number(key) < 4294967295;
+  function materialize(i) {
+    if (!Object.prototype.hasOwnProperty.call(target, i)) target[i] = _wrapEl(ids[i]);
+    return target[i];
+  }
+  function hydrate() {
+    if (hydrated) return;
+    for (let i = 0; i < ids.length; i++) materialize(i);
+    target.length = ids.length;
+    hydrated = true;
+  }
+  return new Proxy(target, {
+    get(t, key, receiver) {
+      if (!hydrated) {
+        if (key === 'length') return ids.length;
+        if (index(key) && Number(key) < ids.length) return materialize(Number(key));
+      }
+      const value = Reflect.get(t, key, receiver);
+      if (value !== undefined || typeof key !== 'string') return value;
+      hydrate();
+      return _htmlCollectionProxy.get(t, key, receiver);
+    },
+    has(t, key) {
+      if (!hydrated && index(key) && Number(key) < ids.length) return true;
+      if (Reflect.has(t, key)) return true;
+      hydrate();
+      return _htmlCollectionProxy.has(t, key);
+    },
+    ownKeys(t) {
+      hydrate();
+      return Reflect.ownKeys(t);
+    },
+    getOwnPropertyDescriptor(t, key) {
+      hydrate();
+      return Reflect.getOwnPropertyDescriptor(t, key);
+    },
+    set(t, key, value, receiver) {
+      hydrate();
+      return Reflect.set(t, key, value, receiver);
+    },
+    defineProperty(t, key, descriptor) {
+      hydrate();
+      return Reflect.defineProperty(t, key, descriptor);
+    },
+    deleteProperty(t, key) {
+      hydrate();
+      return Reflect.deleteProperty(t, key);
+    },
+    preventExtensions(t) {
+      hydrate();
+      return Reflect.preventExtensions(t);
+    },
+  });
 }
 
 const _selectApply = Reflect.apply;
@@ -19066,6 +19202,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
   ['selectOptions', _selectOptionsMember],
+  ['formOwner', _formOwnerMember],
+  ['formControls', _formControlsMember],
   ['validateSelect', _validateSelectMember],
   ['optionIndex', _optionIndexMember],
   ['domNodeReference', function() {
@@ -19098,6 +19236,9 @@ globalThis.__obscura_init_frames = function() {
 globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _formCacheEpoch = null;
+  _formOwnerSnapshots = new WeakMap();
+  _formControlSnapshots = new WeakMap();
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
   _sandboxOpaqueOrigin = _domParse('sandbox_opaque_origin') === true;
   globalThis.__obscura_update_media_preferences();

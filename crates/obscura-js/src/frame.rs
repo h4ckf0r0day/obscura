@@ -551,6 +551,23 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_form_getters_keep_the_owning_document() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><form id='same'><input id='parent'></form></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body><form id='same'><input id='inside'></form><input id='outside' form='same'></body></html>").unwrap();
+        assert_eq!(parent.evaluate(r#"(() => {
+            const doc = globalThis.__obscura_frameObjects[1].document;
+            const form = doc.querySelector('form'), outside = doc.getElementById('outside');
+            const elements = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get;
+            const owner = Object.getOwnPropertyDescriptor(Element.prototype, 'form').get;
+            return [owner.call(outside) === form, elements.call(form)[1] === outside,
+                Array.from(elements.call(form), n => n.id).join(','),
+                document.querySelector('form').elements[0].id];
+        })()"#).unwrap(), serde_json::json!([true,true,"inside,outside","parent"]));
+    }
+
+    #[test]
     fn html_interface_brands_stay_in_the_creation_realm() {
         let mut parent = page("https://parent.example/",
             "<html><body><div id='parent'>Parent</div></body></html>");
