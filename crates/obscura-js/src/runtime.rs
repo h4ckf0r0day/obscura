@@ -239,6 +239,8 @@ pub enum CdpEvaluation {
 pub struct PendingCdpEvaluation {
     object_id: String,
     recipe: Option<String>,
+    // A numeric frame id can be reused after its realm is retired.
+    frame: Option<(u32, v8::Global<v8::Context>)>,
 }
 
 /// CDP remote objects that can be rebuilt when a page's V8 runtime is
@@ -2690,14 +2692,33 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
+        self.start_cdp_evaluation_in_frame(None, expression, return_by_value, await_promise)
+    }
+
+    fn cdp_context(&mut self, frame_id: Option<u32>) -> Result<v8::Global<v8::Context>, String> {
+        match frame_id {
+            Some(id) => self.realm_states().borrow().context(id)
+                .ok_or_else(|| "Execution context was destroyed".to_string()),
+            None => Ok(self.runtime().main_context()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_evaluation_in_frame(
+        &mut self,
+        frame_id: Option<u32>,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
+        let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         // Compile the script itself, not a string passed through the page's eval.
         let record = (|| {
             let mut entered = self.runtime();
-            let context = entered.main_context();
-            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
             v8::tc_scope!(let scope, scope);
             let source = v8::String::new(scope, expression).ok_or("CDP source allocation failed")?;
             let name = v8::String::new(scope, "<eval-remote>").ok_or("CDP origin allocation failed")?;
@@ -2720,7 +2741,8 @@ impl ObscuraJsRuntime {
         self.pending_cdp_evaluations.insert(oid.clone(), record);
         let pending = PendingCdpEvaluation {
             object_id: oid,
-            recipe: if return_by_value { None } else { Some(expression.to_string()) },
+            recipe: if return_by_value || frame_id.is_some() { None } else { Some(expression.to_string()) },
+            frame: frame_id.map(|id| (id, context)),
         };
         if await_promise {
             Ok(CdpEvaluation::Pending(pending))
@@ -2770,18 +2792,57 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
+        self.start_cdp_call_in_frame(
+            None, function_declaration, object_id, arguments, return_by_value, await_promise,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_call_in_frame(
+        &mut self,
+        mut frame_id: Option<u32>,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
+        let mut context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
-        let this_expr = self.resolve_this(object_id);
-        let receiver = self.execute_runtime_script("<cdp-receiver>", this_expr)
-            .map_err(|error| format!("JS error: {error}"))?;
-        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument))
+        let receiver = if object_id.is_some() {
+            let this_expr = self.resolve_this(object_id);
+            self.execute_runtime_script("<cdp-receiver>", this_expr)
+                .map_err(|error| format!("JS error: {error}"))?
+        } else {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
+            let global = scope.get_current_context().global(scope);
+            let value: v8::Local<v8::Value> = global.into();
+            v8::Global::new(scope, value)
+        };
+        if frame_id.is_none() && object_id.is_some() {
+            let creation_context = {
+                let mut entered = self.runtime();
+                let main = entered.main_context();
+                v8::scope_with_context!(scope, entered.v8_isolate(), main);
+                v8::Local::<v8::Object>::try_from(v8::Local::new(scope, &receiver)).ok()
+                    .and_then(|object| object.get_creation_context(scope))
+                    .map(|context| v8::Global::new(scope, context))
+            };
+            if let Some(creation_context) = creation_context {
+                if creation_context != context {
+                    frame_id = self.realm_states().borrow().frame_id_for_context(&creation_context);
+                    if frame_id.is_some() { context = creation_context; }
+                }
+            }
+        }
+        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context))
             .collect::<Result<Vec<_>, _>>()?;
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let record = (|| {
             let mut entered = self.runtime();
-            let context = entered.main_context();
-            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
             v8::tc_scope!(let scope, scope);
             let receiver = v8::Local::new(scope, &receiver);
             let arguments = arguments.iter().map(|argument| v8::Local::new(scope, argument))
@@ -2813,7 +2874,9 @@ impl ObscuraJsRuntime {
         })();
         let record = self.finish_heap_checked(record)?;
         self.pending_cdp_evaluations.insert(oid.clone(), record);
-        let pending = PendingCdpEvaluation { object_id: oid, recipe: None };
+        let pending = PendingCdpEvaluation {
+            object_id: oid, recipe: None, frame: frame_id.map(|id| (id, context)),
+        };
         if await_promise {
             Ok(CdpEvaluation::Pending(pending))
         } else {
@@ -2824,6 +2887,9 @@ impl ObscuraJsRuntime {
     #[doc(hidden)]
     pub fn has_cdp_evaluation(&self, pending: &PendingCdpEvaluation) -> bool {
         self.pending_cdp_evaluations.contains_key(&pending.object_id)
+            && pending.frame.as_ref().is_none_or(|(id, context)| {
+                self.realm_states().borrow().context(*id).as_ref() == Some(context)
+            })
     }
 
     fn has_ready_cdp_evaluations(&mut self) -> bool {
@@ -2841,6 +2907,7 @@ impl ObscuraJsRuntime {
 
     #[doc(hidden)]
     pub fn cdp_evaluation_ready(&mut self, pending: &PendingCdpEvaluation) -> bool {
+        if !self.has_cdp_evaluation(pending) { return false; }
         let Some(record) = self.pending_cdp_evaluations.get(&pending.object_id).cloned() else {
             return false;
         };
@@ -2863,6 +2930,11 @@ impl ObscuraJsRuntime {
         let oid = pending.object_id;
         let record = self.pending_cdp_evaluations.remove(&oid)
             .ok_or("Evaluation result unavailable")?;
+        if pending.frame.as_ref().is_some_and(|(id, context)| {
+            self.realm_states().borrow().context(*id).as_ref() != Some(context)
+        }) {
+            return Err("Execution context was destroyed".into());
+        }
         let (value, rejected) = {
             let mut entered = self.runtime();
             let context = entered.main_context();
@@ -2891,9 +2963,29 @@ impl ObscuraJsRuntime {
             (v8::Global::new(scope, value), rejected)
         };
         if return_by_value && !rejected { return self.v8_to_cdp_value(value); }
-        let meta = self.execute_runtime_script(
-            "<readMeta>", Self::meta_extract_js(&format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid))),
-        ).map_err(|e| format!("JS error: {e}"))?;
+        let meta = if let Some((_, context)) = &pending.frame {
+            let result = (|| {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
+                v8::tc_scope!(let scope, scope);
+                let source = format!("(function(value) {{ return {}; }})", Self::meta_extract_js("value"));
+                let source = v8::String::new(scope, &source).ok_or("CDP metadata allocation failed")?;
+                let function = v8::Script::compile(scope, source, None)
+                    .and_then(|script| script.run(scope))
+                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    .ok_or_else(|| exception_text(scope))?;
+                let value = v8::Local::new(scope, &value);
+                let receiver = v8::undefined(scope).into();
+                let result = function.call(scope, receiver, &[value])
+                    .ok_or_else(|| exception_text(scope))?;
+                Ok(v8::Global::new(scope, result))
+            })();
+            self.finish_heap_checked(result)?
+        } else {
+            self.execute_runtime_script(
+                "<readMeta>", Self::meta_extract_js(&format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid))),
+            ).map_err(|e| format!("JS error: {e}"))?
+        };
         let meta = self.v8_to_json(meta)?;
         let meta = if let serde_json::Value::String(value) = &meta {
             serde_json::from_str(value).unwrap_or(meta)
@@ -4397,7 +4489,11 @@ impl ObscuraJsRuntime {
         }
     }
 
-    fn cdp_call_argument(&mut self, argument: &serde_json::Value) -> Result<v8::Global<v8::Value>, String> {
+    fn cdp_call_argument(
+        &mut self,
+        argument: &serde_json::Value,
+        context: &v8::Global<v8::Context>,
+    ) -> Result<v8::Global<v8::Value>, String> {
         // Remote handles take precedence over value, including rod's value:null.
         if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
             let expression = self.resolve_remote_object(id).unwrap_or_else(|| "undefined".into());
@@ -4414,8 +4510,7 @@ impl ObscuraJsRuntime {
         }
         let result = (|| {
             let mut entered = self.runtime();
-            let context = entered.main_context();
-            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
             v8::tc_scope!(let scope, scope);
             let value = if let Some(value) = argument.get("value") {
                 // JSON data is not an object literal: __proto__ must be an own property.
@@ -5149,6 +5244,28 @@ mod tests {
             select.length = 3;
             return [branded, index, select.item(0).id, select.item(2).index, select.length];
         })()"#).unwrap(), serde_json::json!([true,1,"b",2,3]));
+    }
+
+    #[test]
+    fn pending_cdp_frame_evaluation_rejects_a_retired_realm_with_a_reused_id() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>old</body></html>").unwrap();
+        let evaluation = rt.start_cdp_evaluation_in_frame(
+            Some(1), "new Promise(() => {})", true, true,
+        ).unwrap();
+        let CdpEvaluation::Pending(pending) = evaluation else {
+            panic!("expected a pending child evaluation");
+        };
+        assert!(rt.has_cdp_evaluation(&pending));
+        drop(frame);
+        let _replacement = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>new</body></html>").unwrap();
+        assert!(!rt.has_cdp_evaluation(&pending));
+        assert!(!rt.cdp_evaluation_ready(&pending));
+        assert_eq!(rt.finish_cdp_evaluation(pending, true).unwrap_err(),
+            "Execution context was destroyed");
+        assert!(rt.pending_cdp_evaluations.is_empty());
     }
 
     #[test]

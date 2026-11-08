@@ -1255,6 +1255,10 @@ impl RealmStates {
             .map(|(context, _, _)| context.clone())
     }
 
+    pub(crate) fn frame_id_for_context(&self, context: &v8::Global<v8::Context>) -> Option<u32> {
+        self.entries.iter().find(|(known, _, _)| known == context).map(|(_, id, _)| *id)
+    }
+
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
         self.cancel_frame_timers(frame_id);
         self.entries.retain(|(_, id, _)| *id != frame_id);

@@ -26,6 +26,7 @@ impl DeferredEvaluation {
         let js = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut())
             .ok_or("Execution context was destroyed")?;
         if !js.has_cdp_evaluation(&self.pending) {
+            js.cancel_cdp_evaluation(self.pending);
             return Err("Execution context was destroyed".into());
         }
         let remaining = self.command_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
@@ -60,7 +61,7 @@ pub(crate) async fn start_awaited_evaluation(
     command_budget_ms: u64,
 ) -> Result<Option<DeferredEvaluation>, String> {
     let field = if method == "evaluate" { "contextId" } else { "executionContextId" };
-    validate_context(params, field, ctx, session_id, method)?;
+    let frame_id = validate_context(params, field, ctx, session_id, method)?;
     let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
     let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -69,9 +70,13 @@ pub(crate) async fn start_awaited_evaluation(
     let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
     let Some(js) = page.js.as_mut() else { return Ok(None); };
     let evaluation = if method == "evaluate" {
-        js.start_cdp_evaluation(params.get("expression").and_then(Value::as_str).ok_or("expression required")?, return_by_value, true)?
+        js.start_cdp_evaluation_in_frame(
+            frame_id, params.get("expression").and_then(Value::as_str).ok_or("expression required")?,
+            return_by_value, true,
+        )?
     } else {
-        js.start_cdp_call(
+        js.start_cdp_call_in_frame(
+            frame_id,
             params.get("functionDeclaration").and_then(Value::as_str).unwrap_or("() => undefined"),
             params.get("objectId").and_then(Value::as_str),
             params.get("arguments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
@@ -287,7 +292,7 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            validate_context(params, "contextId", ctx, session_id, "evaluate")?;
+            let frame_id = validate_context(params, "contextId", ctx, session_id, "evaluate")?;
 
             let await_promise = params
                 .get("awaitPromise")
@@ -305,7 +310,8 @@ pub async fn handle(
 
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_with_timeout(
+                with_live_peers(ctx, session_id, |page| page.evaluate_for_cdp_in_frame_with_timeout(
+                    frame_id,
                     expression,
                     return_by_value,
                     await_promise,
@@ -351,7 +357,7 @@ pub async fn handle(
             // callFunctionOn (not `contextId`); a request may omit it when
             // `objectId` is supplied — in that case context validation is a
             // no-op and the default context is used.
-            validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
+            let frame_id = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
 
             // Keep awaitPromise alive for the same command budget as evaluate.
             // Playwright implements waits with callFunctionOn on some utility
@@ -364,7 +370,8 @@ pub async fn handle(
 
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                with_live_peers(ctx, session_id, |page| page.call_function_on_for_cdp_with_timeout(
+                with_live_peers(ctx, session_id, |page| page.call_function_on_for_cdp_in_frame_with_timeout(
+                    frame_id,
                     function_declaration,
                     object_id,
                     &arguments,
@@ -608,7 +615,7 @@ fn validate_context(
     ctx: &crate::dispatch::CdpContext,
     session_id: &Option<String>,
     method: &str,
-) -> Result<(), String> {
+) -> Result<Option<u32>, String> {
     let id = params.get(field).and_then(|value| value.as_i64());
     let unique_id = params.get("uniqueContextId").and_then(|value| value.as_str());
     if id.is_some() && unique_id.is_some() {
@@ -617,24 +624,30 @@ fn validate_context(
         ));
     }
     if id.is_none() && unique_id.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let record = id.and_then(|id| ctx.context_by_id(id))
         .or_else(|| unique_id.and_then(|id| ctx.context_by_unique_id(id)));
     if let Some(record) = record {
         let owner = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
         if owner == Some(&record.page_id) {
-            // This registry currently validates ownership/routing only. A
-            // named isolated context still executes in the owning page's
-            // current V8 runtime/global; it is not a separate V8 realm yet.
-            return Ok(());
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            if record.frame_id == page.frame_id { return Ok(None); }
+            if let Some(frame_id) = record.frame_id.strip_prefix(&page.frame_id)
+                .and_then(|suffix| suffix.strip_prefix("-frame-"))
+                .and_then(|id| id.parse::<u32>().ok())
+            {
+                if page.frames.iter().any(|frame| frame.frame_id() == frame_id) {
+                    return Ok(Some(frame_id));
+                }
+            }
         }
     } else if session_id.is_none() && unique_id.is_none()
         && id.is_some_and(|id| ctx.valid_context_ids.contains(&id))
     {
         // Direct embedders can still reserve an id through the existing public
         // next_isolated_context API. Attached sessions require page ownership.
-        return Ok(());
+        return Ok(None);
     }
     let identity = id.map(|id| id.to_string())
         .or_else(|| unique_id.map(str::to_string))
@@ -645,7 +658,7 @@ fn validate_context(
             identity
         ));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.
