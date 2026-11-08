@@ -5263,6 +5263,44 @@ mod tests {
     }
 
     #[test]
+    fn native_select_factory_preserves_child_clones_and_custom_upgrade_identity() {
+        let mut rt = setup_runtime("<html><body><select id='custom' is='native-select'><option value='a'>A</option></select></body></html>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><select><option value='a'>A</option><option value='b'>B</option></select></body></html>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const select = child.querySelector('select'), option = child.createElement('option');
+            option.value = 'n'; select[0] = option;
+            const clone = select.cloneNode(true);
+            const childChecks = [select[0] === option,
+                select instanceof child.defaultView.HTMLSelectElement,
+                clone[0].value, clone[0] instanceof child.defaultView.HTMLOptionElement,
+                Object.getOwnPropertyDescriptor(select, '0').value === option,
+                Reflect.deleteProperty(select, '0')];
+            Reflect.defineProperty(select, '1', {value:null});
+            let strictDelete = false;
+            try { (function(){'use strict';delete select[0];})(); }
+            catch(e) { strictDelete = e instanceof TypeError; }
+            const retained = document.getElementById('custom');
+            retained.marker = 'retained';
+            class NativeSelect extends HTMLSelectElement {
+                constructor() { super(); this.upgraded = true; this[0].value = 'upgraded'; }
+            }
+            customElements.define('native-select', NativeSelect, {extends:'select'});
+            // Customized-built-in matching is separate from the existing upgrade mechanism.
+            customElements._upgradeElement(retained, NativeSelect);
+            const created = document.createElement('select');
+            created.appendChild(document.createElement('option'));
+            const foreign = document.createElementNS('urn:foreign', 'select');
+            return [childChecks, select.length, select[1] === undefined, strictDelete,
+                retained === document.getElementById('custom'), retained.marker,
+                retained.upgraded, retained instanceof NativeSelect, retained[0].value,
+                created[0] === created.item(0), '0' in foreign];
+        })()"#).unwrap(), serde_json::json!([[true,true,"n",true,true,false],
+            1,true,true,true,"retained",true,true,"upgraded",true,false]));
+    }
+
+    #[test]
     fn noninteractive_dialogs_do_not_accept_destructive_confirmation() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {

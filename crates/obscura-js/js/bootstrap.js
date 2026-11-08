@@ -14601,16 +14601,24 @@ for (const [name, tags] of Object.entries({
   HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
 })) {
   if (globalThis[name] !== undefined && globalThis[name] !== Element) continue;
+  let nativeSelectConstructor = null;
   const Interface = class extends Element {
     constructor(nid, token) {
       if (token !== _htmlInterfaceToken) {
         const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
         if (!entry || new.target !== entry.constructor || entry.constructed) throw new TypeError('Illegal constructor');
       }
-      super(nid);
-      if (name === 'HTMLSelectElement') {
-        return __obscuraCore.ops.op_make_native_select(this, _selectIndexedSnapshot, _selectIndexedSet);
+      if (name === 'HTMLSelectElement' && token === _htmlInterfaceToken) {
+        if (!nativeSelectConstructor) {
+          nativeSelectConstructor = __obscuraCore.ops.op_create_select_constructor(new.target.prototype,
+            _selectIndexedSnapshot, _selectIndexedSet);
+          // Keep the public interface for upgrades, but wrap ordinary selects directly.
+          _additionalHtmlElementClasses.select = nativeSelectConstructor;
+          _additionalHtmlElementClasses.SELECT = nativeSelectConstructor;
+        }
+        return new nativeSelectConstructor(nid);
       }
+      super(nid);
     }
   };
   Object.defineProperty(Interface, 'name', {value: name, configurable: true});

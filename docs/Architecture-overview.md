@@ -184,7 +184,9 @@ actual optgroup parent. Length assignments above 100,000 are rejected with a
 warning rather than attempting unbounded allocation. These APIs also support
 borrowed methods on child-realm nodes. Select collections still use the existing
 snapshot HTMLCollection implementation. Numeric select access uses V8 indexed
-handlers, not a Proxy around ordinary DOM properties. Indexed reads reuse option
+handlers, not a Proxy around ordinary DOM properties. Fresh selects allocate the
+native wrapper directly; custom-element upgrades retain that same wrapper.
+Indexed reads reuse option
 snapshots keyed by the native form mutation generation. Assignments replace or
 remove the actual option and fill gaps with blank options. Non-null assignments
 past the same 100,000 option limit throw RangeError. Supported indices remain

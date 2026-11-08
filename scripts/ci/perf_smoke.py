@@ -67,6 +67,10 @@ SCENARIOS = {
         "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(5000);return document.querySelectorAll('select').length})()",
         5000,
     ),
+    "select-create-wrap-50k": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(50000);return document.querySelectorAll('select').length})()",
+        50000,
+    ),
     "select-item-or-index-hot": (
         "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select'),first=s.item(0),indexed='0' in s;let n=0;for(let i=0;i<1000000;i++)if((indexed?s[0]:s.item(0))===first)n++;return n})()",
         1000000,
