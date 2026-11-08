@@ -5239,6 +5239,30 @@ mod tests {
     }
 
     #[test]
+    fn table_members_preserve_child_realm_collections_and_borrowed_methods() {
+        let mut rt = setup_runtime("<html><body><table><tr><td>Parent</td></tr></table></body></html>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><table><tr><th>Header</th></tr></table></body></html>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const table = child.querySelector('table'), body = table.tBodies[0], row = body.rows[0];
+            const cells = row.cells;
+            const outerGetter = Object.getOwnPropertyDescriptor(HTMLTableRowElement.prototype, 'cells').get;
+            const outerMethod = HTMLTableRowElement.prototype.insertCell;
+            const cell = outerMethod.call(row);
+            const branded = cells instanceof child.defaultView.HTMLCollection
+                && cell instanceof child.defaultView.HTMLTableCellElement;
+            const borrowed = outerGetter !== Object.getOwnPropertyDescriptor(child.defaultView.HTMLTableRowElement.prototype, 'cells').get
+                && outerGetter.call(row) === cells;
+            table.insertRow(0).insertCell();
+            const indices = [row.rowIndex, row.sectionRowIndex, cell.cellIndex];
+            row.deleteCell(0);
+            return [branded, borrowed, cells.length, indices, cell.cellIndex,
+                table.cloneNode(true).rows[1].cells.length, document.querySelector('td').textContent];
+        })()"#).unwrap(), serde_json::json!([true,true,1,[1,1,1],0,1,"Parent"]));
+    }
+
+    #[test]
     fn noninteractive_dialogs_do_not_accept_destructive_confirmation() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {

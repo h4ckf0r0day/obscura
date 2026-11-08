@@ -14608,6 +14608,9 @@ for (const [name, tags] of Object.entries({
         if (!entry || new.target !== entry.constructor || entry.constructed) throw new TypeError('Illegal constructor');
       }
       super(nid);
+      if (name === 'HTMLSelectElement') {
+        return __obscuraCore.ops.op_make_native_select(this, _selectIndexedSnapshot, _selectIndexedSet);
+      }
     }
   };
   Object.defineProperty(Interface, 'name', {value: name, configurable: true});
@@ -14774,6 +14777,36 @@ function _selectOptions(select) {
   const ids = _domParse('select_options', nid);
   if (ids === null) throw new TypeError('Illegal invocation');
   return ids.map(_wrapEl);
+}
+const _selectIndexedSnapshots = new WeakMap();
+function _selectIndexedSnapshot() {
+  if (_nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  const epoch = _formEpoch();
+  let snapshot = _selectIndexedSnapshots.get(this);
+  if (!snapshot || snapshot.low !== epoch[0] || snapshot.high !== epoch[1]) {
+    snapshot = {low:epoch[0], high:epoch[1], options:_selectOptions(this)};
+    _selectIndexedSnapshots.set(this, snapshot);
+  }
+  return snapshot.options;
+}
+function _selectIndexedSet(index, value) {
+  if (_nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  if (value != null) {
+    Reflect.apply(_optionIndexGetter, value, []);
+    if (index >= 100000) throw new RangeError('Maximum supported select length is 100000');
+  }
+  const options = _selectOptions(this);
+  const current = options[index];
+  if (value == null) {
+    if (current) Reflect.apply(_selectElementRemove, current, []);
+  } else if (current !== value) {
+    if (index >= options.length) {
+      if (index > options.length) this.length = index;
+      this.appendChild(value);
+    } else {
+      current.parentNode.replaceChild(value, current);
+    }
+  }
 }
 function _optionIndexMember() {
   const nid = this && this._nid;
@@ -15181,22 +15214,22 @@ const _htmlCollectionProxy = {
   },
 };
 const _tableRowCollections = new WeakMap();
+const _tableRealmMembers = Object.create(null);
 function _tableRowsGetter() {
   if (!this || _cache.get(this._nid) !== this) {
-    const owner = this && this.ownerDocument && this.ownerDocument.defaultView;
-    if (owner && owner !== globalThis) {
-      const getter = Object.getOwnPropertyDescriptor(owner.HTMLTableElement.prototype, 'rows').get;
-      return getter.call(this);
-    }
-    throw new TypeError('Illegal invocation');
+    return _tableMemberReceiver(this, 'HTMLTableElement', 'rows', 'get').call(this);
   }
   if (_tableRowCollections.has(this)) return _tableRowCollections.get(this);
-  const table = this;
+  const collection = _createTableCollection(this, 'table_rows');
+  _tableRowCollections.set(this, collection);
+  return collection;
+}
+function _createTableCollection(table, op) {
   let epoch = -1;
   let elements = [];
   function refresh() {
     if (epoch !== _domMutationEpoch) {
-      const ids = _domParse('table_rows', table._nid);
+      const ids = _domParse(op, table._nid);
       if (ids === null) throw new TypeError('Illegal invocation');
       elements = ids.map(_wrapEl);
       epoch = _domMutationEpoch;
@@ -15264,7 +15297,6 @@ function _tableRowsGetter() {
     preventExtensions() { return false; },
   });
   refresh();
-  _tableRowCollections.set(table, collection);
   return collection;
 }
 Object.defineProperty(HTMLTableElement, 'length', {value: 0, configurable: true});
@@ -15273,6 +15305,182 @@ Object.defineProperty(HTMLTableElement.prototype, 'rows', {
   get: _tableRowsGetter, enumerable: true, configurable: true,
 });
 _markNative(_tableRowsGetter);
+_tableRealmMembers['HTMLTableElement.rows.get'] = _tableRowsGetter;
+function _tableRealmDispatch(iface, member, accessor, args) {
+  if (!this || _nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  const implementation = _tableRealmMembers[iface + '.' + member + '.' + (accessor || 'value')];
+  if (!implementation) throw new TypeError('Illegal invocation');
+  return Reflect.apply(implementation, this, args);
+}
+function _tableMemberReceiver(receiver, iface, member, accessor) {
+  if (receiver && _cache.get(receiver._nid) === receiver) return null;
+  const dispatch = receiver && _documentRealmMember(receiver, 'tableMember');
+  if (dispatch && dispatch !== _tableRealmDispatch) {
+    return (...args) => Reflect.apply(dispatch, receiver, [iface, member, accessor, args]);
+  }
+  throw new TypeError('Illegal invocation');
+}
+function _tableMemberValue(receiver, op) {
+  const value = _domParse(op, receiver._nid);
+  if (value === null) throw new TypeError('Illegal invocation');
+  return value;
+}
+function _tableElementTagMember() {
+  if (!this || _nodeCacheGet(this._nid) !== this) throw new TypeError('Expected an HTMLElement');
+  const info = _domParse('tag_name', this._nid, 'interface');
+  if (typeof info === 'string' && info) return info.toLowerCase();
+  if (info && info[1] === 'http://www.w3.org/1999/xhtml') return info[2];
+  throw new TypeError('Expected an HTMLElement');
+}
+function _tableElementTag(value) {
+  if (value && _nodeCacheGet(value._nid) === value) {
+    return Reflect.apply(_tableElementTagMember, value, []);
+  }
+  const member = value && _documentRealmMember(value, 'tableElementTag');
+  if (member && member !== _tableElementTagMember) return Reflect.apply(member, value, []);
+  throw new TypeError('Expected an HTMLElement');
+}
+function _defineTableGetter(iface, member, op, collection = false, element = false) {
+  const cache = collection ? new WeakMap() : null;
+  const getter = function () {
+    const foreign = _tableMemberReceiver(this, iface, member, 'get');
+    if (foreign) return foreign.call(this);
+    if (cache) {
+      if (cache.has(this)) return cache.get(this);
+      const value = _createTableCollection(this, op);
+      cache.set(this, value);
+      return value;
+    }
+    const value = _tableMemberValue(this, op);
+    return element ? (value.length ? _wrapEl(value[0]) : null) : value;
+  };
+  Object.defineProperty(getter, 'name', {value: 'get ' + member, configurable: true});
+  Object.defineProperty(globalThis[iface].prototype, member, {
+    get: getter, enumerable: true, configurable: true,
+  });
+  _markNative(getter);
+  _tableRealmMembers[iface + '.' + member + '.get'] = getter;
+}
+_defineTableGetter('HTMLTableElement', 'tBodies', 'table_bodies', true);
+_defineTableGetter('HTMLTableElement', 'tHead', 'table_head', false, true);
+_defineTableGetter('HTMLTableElement', 'tFoot', 'table_foot', false, true);
+_defineTableGetter('HTMLTableSectionElement', 'rows', 'table_section_rows', true);
+_defineTableGetter('HTMLTableRowElement', 'cells', 'table_row_cells', true);
+_defineTableGetter('HTMLTableRowElement', 'rowIndex', 'table_row_index');
+_defineTableGetter('HTMLTableRowElement', 'sectionRowIndex', 'table_section_row_index');
+_defineTableGetter('HTMLTableCellElement', 'cellIndex', 'table_cell_index');
+function _defineTableMethod(iface, member, implementation) {
+  const method = function (...args) {
+    const foreign = _tableMemberReceiver(this, iface, member);
+    if (foreign) return foreign.apply(this, args);
+    if (_tableMemberValue(this, 'table_interface') !== iface) throw new TypeError('Illegal invocation');
+    return implementation.apply(this, args);
+  };
+  Object.defineProperty(method, 'name', {value: member, configurable: true});
+  Object.defineProperty(method, 'length', {
+    value: member.startsWith('delete') ? 1 : 0, configurable: true,
+  });
+  Object.defineProperty(globalThis[iface].prototype, member, {
+    value: method, writable: true, enumerable: true, configurable: true,
+  });
+  _markNative(method);
+  _tableRealmMembers[iface + '.' + member + '.value'] = method;
+}
+function _tableIndex(index, length, method, iface, inserting) {
+  index = +index | 0;
+  if (index < -1 || index > length - (inserting ? 0 : 1)) {
+    throw new DOMException("Failed to execute '" + method + "' on '" + iface
+      + "': The index is outside the allowed range.", 'IndexSizeError');
+  }
+  return index;
+}
+function _insertTableRow(rows, container, index, iface) {
+  index = _tableIndex(index, rows.length, 'insertRow', iface, true);
+  const row = container.ownerDocument.createElement('tr');
+  if (index === -1 || index === rows.length) {
+    (rows.length ? rows[rows.length - 1].parentNode : container).appendChild(row);
+  } else {
+    rows[index].parentNode.insertBefore(row, rows[index]);
+  }
+  return row;
+}
+function _deleteTableMember(rows, index, method, iface) {
+  index = _tableIndex(index, rows.length, method, iface, false);
+  if (index === -1) {
+    if (rows.length) rows[rows.length - 1].remove();
+  } else {
+    rows[index].remove();
+  }
+}
+_defineTableMethod('HTMLTableElement', 'createTBody', function () {
+  const body = this.ownerDocument.createElement('tbody');
+  const bodies = this.tBodies;
+  const last = bodies[bodies.length - 1];
+  this.insertBefore(body, last ? last.nextSibling : null);
+  return body;
+});
+_defineTableMethod('HTMLTableElement', 'insertRow', function (index = -1) {
+  index = +index | 0;
+  const rows = this.rows;
+  index = _tableIndex(index, rows.length, 'insertRow', 'HTMLTableElement', true);
+  if (rows.length) return _insertTableRow(rows, this, index, 'HTMLTableElement');
+  const bodies = this.tBodies;
+  const body = bodies.length ? bodies[bodies.length - 1] : this.createTBody();
+  return _insertTableRow(rows, body, index, 'HTMLTableElement');
+});
+_defineTableMethod('HTMLTableElement', 'deleteRow', function (index) {
+  if (!arguments.length) throw new TypeError("Failed to execute 'deleteRow': 1 argument required.");
+  index = +index | 0;
+  _deleteTableMember(this.rows, index, 'deleteRow', 'HTMLTableElement');
+});
+_defineTableMethod('HTMLTableSectionElement', 'insertRow', function (index = -1) {
+  index = +index | 0;
+  return _insertTableRow(this.rows, this, index, 'HTMLTableSectionElement');
+});
+_defineTableMethod('HTMLTableSectionElement', 'deleteRow', function (index) {
+  if (!arguments.length) throw new TypeError("Failed to execute 'deleteRow': 1 argument required.");
+  index = +index | 0;
+  _deleteTableMember(this.rows, index, 'deleteRow', 'HTMLTableSectionElement');
+});
+_defineTableMethod('HTMLTableRowElement', 'insertCell', function (index = -1) {
+  index = +index | 0;
+  const cells = this.cells;
+  index = _tableIndex(index, cells.length, 'insertCell', 'HTMLTableRowElement', true);
+  const cell = this.ownerDocument.createElement('td');
+  this.insertBefore(cell, index === -1 || index === cells.length ? null : cells[index]);
+  return cell;
+});
+_defineTableMethod('HTMLTableRowElement', 'deleteCell', function (index) {
+  if (!arguments.length) throw new TypeError("Failed to execute 'deleteCell': 1 argument required.");
+  index = +index | 0;
+  _deleteTableMember(this.cells, index, 'deleteCell', 'HTMLTableRowElement');
+});
+for (const [member, tag, op] of [['tHead', 'thead', 'table_head'], ['tFoot', 'tfoot', 'table_foot']]) {
+  const setter = function (value) {
+    const foreign = _tableMemberReceiver(this, 'HTMLTableElement', member, 'set');
+    if (foreign) return foreign.call(this, value);
+    _tableMemberValue(this, op);
+    if (value != null) {
+      if (_tableElementTag(value) !== tag) throw new DOMException('Invalid table section', 'HierarchyRequestError');
+    }
+    const current = this[member];
+    if (current) current.remove();
+    if (value == null) return;
+    if (tag === 'tfoot') this.appendChild(value);
+    else {
+      let before = this.firstChild;
+      while (before && _isHTMLEl(before) && ['caption', 'colgroup'].includes(before.localName)) {
+        before = before.nextSibling;
+      }
+      this.insertBefore(value, before);
+    }
+  };
+  Object.defineProperty(setter, 'name', {value: 'set ' + member, configurable: true});
+  Object.defineProperty(HTMLTableElement.prototype, member, {set: setter});
+  _markNative(setter);
+  _tableRealmMembers['HTMLTableElement.' + member + '.set'] = setter;
+}
+Object.freeze(_tableRealmMembers);
 // True for elements in the HTML namespace (the only ones whose name attribute
 // contributes to an HTMLCollection's supported property names).
 function _isHTMLEl(el) {
@@ -19206,6 +19414,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['formControls', _formControlsMember],
   ['validateSelect', _validateSelectMember],
   ['optionIndex', _optionIndexMember],
+  ['tableMember', _tableRealmDispatch],
+  ['tableElementTag', _tableElementTagMember],
   ['domNodeReference', function() {
     const nid = this._nid;
     if (_nodeCacheGet(nid) !== this) throw new TypeError('Not a current DOM node');

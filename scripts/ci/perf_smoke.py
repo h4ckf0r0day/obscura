@@ -55,6 +55,26 @@ SCENARIOS = {
         "(() => {document.body.innerHTML='<table><tr><td>row</td></tr></table>'.repeat(5000);return document.querySelectorAll('table').length})()",
         5000,
     ),
+    "table-rows-hot": (
+        "(() => {document.body.innerHTML='<table><thead><tr><th>head</th></tr></thead><tbody>'+'<tr><td>body</td></tr>'.repeat(100)+'</tbody></table>';const t=document.querySelector('table'),first=t.rows[0];let n=0;for(let i=0;i<1000000;i++){const rows=t.rows;if(rows[0]===first)n+=rows.length;}return n})()",
+        101000000,
+    ),
+    "table-cells-hot": (
+        "(() => {document.body.innerHTML='<table><tbody>'+'<tr><td>A</td><td>B</td><td>C</td></tr>'.repeat(100)+'</tbody></table>';const row=document.querySelector('tr');let n=0;for(let i=0;i<100000;i++){const cells=row.cells||row.children;n+=cells.length;if(cells[0].textContent==='A')n++;}return n})()",
+        400000,
+    ),
+    "select-create-wrap": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(5000);return document.querySelectorAll('select').length})()",
+        5000,
+    ),
+    "select-item-or-index-hot": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select'),first=s.item(0),indexed='0' in s;let n=0;for(let i=0;i<1000000;i++)if((indexed?s[0]:s.item(0))===first)n++;return n})()",
+        1000000,
+    ),
+    "select-existing-getters-hot": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select');let n=0;for(let i=0;i<1000000;i++)n+=s.length;return n})()",
+        2000000,
+    ),
     "form-elements-owned": (
         "(() => {document.body.innerHTML='<form id=f>'+'<input name=inside>'.repeat(1000)+'</form>';const f=document.getElementById('f');let n=0;for(let i=0;i<200;i++)n+=f.elements.length;return n})()",
         200000,

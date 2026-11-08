@@ -1375,6 +1375,61 @@ impl DomTree {
         Some(head)
     }
 
+    fn html_named_children(&self, parent: NodeId, parents: &[&str], children: &[&str]) -> Option<Vec<NodeId>> {
+        let tag = self.html_element_local_name(parent)?;
+        if !parents.contains(&tag.as_ref()) { return None; }
+        Some(self.children(parent).into_iter().filter(|child| {
+            self.html_element_local_name(*child).is_some_and(|tag| children.contains(&tag.as_ref()))
+        }).collect())
+    }
+
+    pub fn table_interface(&self, node: NodeId) -> Option<&'static str> {
+        match self.html_element_local_name(node)?.as_ref() {
+            "table" => Some("HTMLTableElement"),
+            "thead" | "tbody" | "tfoot" => Some("HTMLTableSectionElement"),
+            "tr" => Some("HTMLTableRowElement"),
+            "td" | "th" => Some("HTMLTableCellElement"),
+            _ => None,
+        }
+    }
+
+    pub fn table_sections(&self, table: NodeId, section: &str) -> Option<Vec<NodeId>> {
+        if !["thead", "tbody", "tfoot"].contains(&section) { return None; }
+        self.html_named_children(table, &["table"], &[section])
+    }
+
+    pub fn table_section_rows(&self, section: NodeId) -> Option<Vec<NodeId>> {
+        self.html_named_children(section, &["thead", "tbody", "tfoot"], &["tr"])
+    }
+
+    pub fn table_row_cells(&self, row: NodeId) -> Option<Vec<NodeId>> {
+        self.html_named_children(row, &["tr"], &["td", "th"])
+    }
+
+    pub fn table_row_index(&self, row: NodeId, section_only: bool) -> Option<isize> {
+        if self.html_element_local_name(row)?.as_ref() != "tr" { return None; }
+        let Some(parent) = self.with_node(row, |node| node.parent).flatten() else { return Some(-1) };
+        let rows = match self.html_element_local_name(parent).as_ref().map(|tag| tag.as_ref()) {
+            Some("table") => self.table_rows(parent),
+            Some("thead" | "tbody" | "tfoot") if section_only => self.table_section_rows(parent),
+            Some("thead" | "tbody" | "tfoot") => {
+                self.with_node(parent, |node| node.parent).flatten().and_then(|table| self.table_rows(table))
+            }
+            _ => None,
+        };
+        Some(rows.and_then(|rows| rows.iter().position(|candidate| *candidate == row))
+            .map(|index| index as isize).unwrap_or(-1))
+    }
+
+    pub fn table_cell_index(&self, cell: NodeId) -> Option<isize> {
+        let tag = self.html_element_local_name(cell)?;
+        if !["td", "th"].contains(&tag.as_ref()) { return None; }
+        let cells = self.with_node(cell, |node| node.parent).flatten()
+            .and_then(|row| self.table_row_cells(row));
+        Some(cells.and_then(|cells| cells.iter().position(|candidate| *candidate == cell))
+            .map(|index| index as isize).unwrap_or(-1))
+    }
+
     fn html_element_local_name(&self, id: NodeId) -> Option<LocalName> {
         self.with_node(id, |node| {
             node.as_element().filter(|name| {
@@ -2477,6 +2532,51 @@ mod tests {
         assert_eq!(tree.table_rows(table), Some(vec![expected[1], direct, expected[2], expected[0]]));
         assert_eq!(tree.table_rows(foreign), None);
         assert_eq!(tree.table_rows(NodeId::new(u32::MAX)), None);
+    }
+
+    #[test]
+    fn table_child_collections_and_indices_follow_native_ownership() {
+        let tree = DomTree::new();
+        let table = element(&tree, "table");
+        let mut sections = Vec::new();
+        let mut rows = Vec::new();
+        for tag in ["tfoot", "tbody", "thead"] {
+            let section = element(&tree, tag);
+            let row = element(&tree, "tr");
+            tree.append_child(table, section);
+            tree.append_child(section, row);
+            sections.push(section);
+            rows.push(row);
+        }
+        let first = element(&tree, "th");
+        let second = element(&tree, "td");
+        tree.append_child(rows[1], first);
+        tree.append_child(rows[1], second);
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, Namespace::from("urn:foreign"), LocalName::from("td")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(rows[1], foreign);
+        assert_eq!(tree.table_sections(table, "tbody"), Some(vec![sections[1]]));
+        assert_eq!(tree.table_section_rows(sections[1]), Some(vec![rows[1]]));
+        assert_eq!(tree.table_row_cells(rows[1]), Some(vec![first, second]));
+        assert_eq!(tree.table_interface(first), Some("HTMLTableCellElement"));
+        assert_eq!(tree.table_interface(foreign), None);
+        assert_eq!(tree.table_row_index(rows[0], false), Some(2));
+        assert_eq!(tree.table_row_index(rows[1], false), Some(1));
+        assert_eq!(tree.table_row_index(rows[1], true), Some(0));
+        assert_eq!(tree.table_cell_index(second), Some(1));
+        assert_eq!(tree.table_cell_index(foreign), None);
+        assert_eq!(tree.table_row_cells(table), None);
+        assert_eq!(tree.table_section_rows(NodeId::new(u32::MAX)), None);
+        tree.append_child(sections[2], rows[1]);
+        assert_eq!(tree.table_row_index(rows[1], false), Some(1));
+        assert_eq!(tree.table_row_index(rows[1], true), Some(1));
+        tree.remove_child(rows[1]);
+        assert_eq!(tree.table_row_index(rows[1], false), Some(-1));
+        assert_eq!(tree.table_row_index(rows[1], true), Some(-1));
+        assert_eq!(tree.table_cell_index(second), Some(1));
     }
 
     #[test]
