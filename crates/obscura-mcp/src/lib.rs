@@ -1061,7 +1061,6 @@ async fn resolve_mcp_principal(cp: &obscura_control_plane::ControlPlane) -> Resu
 }
 
 #[cfg(feature = "distributed")]
-#[cfg(feature = "distributed")]
 async fn tool_submit_job(args: &Value) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str).ok_or("Missing url")?;
     let operation = args.get("operation").and_then(Value::as_str).unwrap_or("navigate");
@@ -1082,7 +1081,6 @@ async fn tool_submit_job(args: &Value) -> Result<String, String> {
     }
 }
 
-#[cfg(feature = "distributed")]
 #[cfg(feature = "distributed")]
 async fn tool_get_job(args: &Value) -> Result<String, String> {
     let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
@@ -1105,7 +1103,6 @@ async fn tool_get_job(args: &Value) -> Result<String, String> {
 }
 
 #[cfg(feature = "distributed")]
-#[cfg(feature = "distributed")]
 async fn tool_cancel_job(args: &Value) -> Result<String, String> {
     let job_id_str = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
     let job_id: Uuid = job_id_str.parse().map_err(|_| "Invalid job_id")?;
@@ -1126,7 +1123,6 @@ async fn tool_cancel_job(args: &Value) -> Result<String, String> {
     }
 }
 
-#[cfg(feature = "distributed")]
 #[cfg(feature = "distributed")]
 async fn tool_list_jobs(args: &Value) -> Result<String, String> {
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as i64;
