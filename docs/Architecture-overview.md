@@ -168,6 +168,16 @@ read; prefixed or foreign names include namespace/local-name metadata in that
 same read. Table construction and parser/wrapper workloads are covered by the
 public performance smoke gate.
 
+Select and option wrappers have distinct HTML interfaces. Select `length`,
+`item`, `namedItem`, `remove`, `add`, value lookup, and option `index` use native
+option ownership: nested HTML selects, datalists, and option subtrees do not
+contribute options to the outer select. Numeric insertion targets retain their
+actual optgroup parent. Length assignments above 100,000 are rejected with a
+warning rather than attempting unbounded allocation. These APIs also support
+borrowed methods on child-realm nodes. Select collections still use the existing
+snapshot HTMLCollection implementation; indexed properties on the select itself
+and the remaining table construction APIs are separate work.
+
 `window.origin` (including the bare `origin` identifier) reports the owning
 document's origin, including inherited blank-frame origins. Page assignment
 replaces this property without changing the document's actual origin.

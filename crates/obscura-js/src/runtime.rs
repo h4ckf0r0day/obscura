@@ -4694,6 +4694,196 @@ mod tests {
     }
 
     #[test]
+    fn select_options_use_native_ownership_and_live_option_indexes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.createElement('select');
+            document.body.append(select);
+            const add = (parent, id) => {
+                const option = new Option(id, id);
+                option.id = id;
+                parent.append(option);
+                return option;
+            };
+            const first = add(select, 'first');
+            const div = document.createElement('div');
+            select.append(div);
+            const second = add(div, 'second');
+            const group = document.createElement('optgroup');
+            select.append(group);
+            const third = add(group, 'third');
+            const nested = document.createElement('select');
+            select.append(nested);
+            const hidden = add(nested, 'nested');
+            hidden.selected = true;
+            const datalist = document.createElement('datalist');
+            select.append(datalist);
+            const suggested = add(datalist, 'suggested');
+            const outer = add(select, 'outer');
+            const inner = add(outer, 'inner');
+            const initial = [select.length, Array.from(select.options, o => o.id),
+                [first.index, second.index, third.index, hidden.index, suggested.index, outer.index, inner.index],
+                select.value, select.selectedIndex, select.item(2) === third,
+                select.namedItem('second') === second];
+            select.value = 'third';
+            const chosen = [third.selected, hidden.selected, select.value, select.selectedIndex];
+            second.remove();
+            return {initial, chosen, moved: [third.index, select.length], liveRows:
+                typeof Object.getOwnPropertyDescriptor(HTMLTableElement.prototype, 'rows').get};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[4,["first","second","third","outer"],[0,1,2,0,0,3,0],"first",0,true,true],
+            "chosen":[true,true,"third",2], "moved":[1,3], "liveRows":"function",
+        }));
+    }
+
+    #[test]
+    fn select_add_respects_group_parents_and_union_conversions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const result = [];
+            for (const kind of ['number','string','bigint','symbol','object','group','self','foreign']) {
+                const select = document.createElement('select');
+                select.innerHTML = '<option id="a">A</option><optgroup><option id="b">B</option></optgroup>';
+                const option = new Option('X');
+                const before = {number:1, string:'1', bigint:1n, symbol:Symbol(),
+                    object:{valueOf() { return 1; }}, group:select.querySelector('optgroup'),
+                    self:select, foreign:document.createElementNS('urn:foreign','option')}[kind];
+                try {
+                    select.add(option, before);
+                    result.push([kind, option.parentNode.localName, Array.from(select.options, o => o.text)]);
+                } catch (error) { result.push([kind, error.name]); }
+            }
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            ["number","optgroup",["A","X","B"]], ["string","optgroup",["A","X","B"]],
+            ["bigint","TypeError"], ["symbol","TypeError"], ["object","optgroup",["A","X","B"]],
+            ["group","select",["A","X","B"]], ["self","NotFoundError"], ["foreign","select",["X","A","B"]],
+        ]));
+    }
+
+    #[test]
+    fn select_length_and_remove_overloads_modify_owned_options_only() {
+        let mut rt = setup_runtime("<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option><option id='c'>C</option></optgroup></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const group = select.querySelector('optgroup');
+            select.length = 5;
+            const grown = [select.length, select.item(4).text, select.item(4) instanceof HTMLOptionElement];
+            select.length = 2;
+            const shrunk = [select.length, group.children.length, select.item(1).id];
+            select.remove(-1);
+            select.remove(99);
+            const untouched = [select.length, select.isConnected];
+            select.remove(null);
+            const removedFirst = [select.length, select.item(0).id, select.isConnected];
+            select.length = 0;
+            select.length = 1;
+            const cleared = [select.length, group.children.length, select.item(0).index];
+            select.remove();
+            return {grown, shrunk, untouched, removedFirst, cleared, connected:select.isConnected};
+        })()"#).unwrap(), serde_json::json!({
+            "grown":[5,"",true], "shrunk":[2,1,"b"], "untouched":[2,true],
+            "removedFirst":[1,"b",true], "cleared":[1,0,0], "connected":false,
+        }));
+    }
+
+    #[test]
+    fn select_legacy_methods_enforce_webidl_conversions_and_bounded_lengths() {
+        let mut rt = setup_runtime("<html><body><select><option id='first' name='alias'>A</option><option>B</option></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const throws = f => { try { f(); return false; } catch (e) { return e instanceof TypeError; } };
+            const errors = [throws(() => select.item()), throws(() => select.namedItem()),
+                throws(() => select.item(0n)), throws(() => select.length = 2n),
+                throws(() => select.namedItem(Symbol())), throws(() => select.remove(Symbol())),
+                throws(() => select.length = Symbol())];
+            const reads = [select.item('0').id, select.item(-1), select.item(undefined).id,
+                select.namedItem('alias').id, select.namedItem(''), select.namedItem('missing')];
+            const warnings = [];
+            console.warn = value => warnings.push(value);
+            select.length = 100001;
+            select.length = -1;
+            const bounded = [select.length, warnings.length,
+                warnings.every(value => value.includes('100000'))];
+            select.length = '3';
+            return {errors, reads, bounded, converted:select.length};
+        })()"#).unwrap(), serde_json::json!({
+            "errors":[true,true,true,true,true,true,true], "reads":["first",null,"first","first",null,null],
+            "bounded":[2,2,true], "converted":3,
+        }));
+    }
+
+    #[test]
+    fn select_legacy_methods_read_options_after_argument_coercion() {
+        let mut rt = setup_runtime("<html><body><select><option id='first'>A</option></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const change = id => { select.innerHTML = '<option id="'+id+'">X</option>'; };
+            const item = select.item({valueOf() { change('item'); return 0; }}).id;
+            const named = select.namedItem({toString() { change('named'); return 'named'; }}).id;
+            select.remove({valueOf() { change('removed'); return 0; }});
+            const removed = select.length;
+            select.length = {valueOf() { change('length'); return 0; }};
+            return [item, named, removed, select.length];
+        })()"#).unwrap(), serde_json::json!(["item","named",0,0]));
+    }
+
+    #[test]
+    fn select_and_option_interfaces_preserve_factories_and_validate_receivers() {
+        let mut rt = setup_runtime("<html><body><select><option>A</option></select><div></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const option = select.item(0);
+            const length = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'length');
+            const index = Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, 'index').get;
+            const errors = [];
+            for (const value of [document.querySelector('div'), {}, Object.create(HTMLSelectElement.prototype),
+                document.createElementNS('urn:foreign', 'select'), document.createElementNS('http://www.w3.org/1999/xhtml', 'SELECT')]) {
+                for (const method of [() => length.get.call(value), () => length.set.call(value, 2),
+                    () => HTMLSelectElement.prototype.item.call(value, 0),
+                    () => HTMLSelectElement.prototype.namedItem.call(value, ''),
+                    () => HTMLSelectElement.prototype.remove.call(value)]) {
+                    try { method(); errors.push(false); } catch (e) { errors.push(e instanceof TypeError); }
+                }
+            }
+            for (const value of [select, {}, document.createElementNS('urn:foreign', 'option')]) {
+                try { index.call(value); errors.push(false); } catch (e) { errors.push(e instanceof TypeError); }
+            }
+            const constructors = [HTMLSelectElement, HTMLOptionElement].map(C => {
+                try { new C(); return false; } catch (e) { return e instanceof TypeError; }
+            });
+            return {brands:[select instanceof HTMLSelectElement, option instanceof HTMLOptionElement,
+                select.cloneNode(true) instanceof HTMLSelectElement,
+                option.cloneNode() instanceof HTMLOptionElement, new Option() instanceof HTMLOptionElement,
+                document.createElement('div') instanceof HTMLSelectElement],
+                noGenericLength:!('length' in document.createElement('div')),
+                errors:errors.every(Boolean), constructors, detached:new Option().index,
+                signatures:[HTMLSelectElement.length, HTMLOptionElement.length, index.name,
+                    index.toString(), HTMLSelectElement.prototype.item.length,
+                    HTMLSelectElement.prototype.namedItem.length, HTMLSelectElement.prototype.remove.length]};
+        })()"#).unwrap(), serde_json::json!({
+            "brands":[true,true,true,true,true,false], "noGenericLength":true,
+            "errors":true, "constructors":[true,true], "detached":0,
+            "signatures":[0,0,"get index","function get index() { [native code] }",1,1,0],
+        }));
+    }
+
+    #[test]
+    fn select_legacy_methods_work_in_child_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option></optgroup></select></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            const select = document.querySelector('select');
+            const branded = select instanceof HTMLSelectElement && select.item(1) instanceof HTMLOptionElement;
+            const index = select.namedItem('b').index;
+            select.remove(0);
+            select.length = 3;
+            return [branded, index, select.item(0).id, select.item(2).index, select.length];
+        })()"#).unwrap(), serde_json::json!([true,1,"b",2,3]));
+    }
+
+    #[test]
     fn table_rows_are_live_ordered_readonly_collections() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {
