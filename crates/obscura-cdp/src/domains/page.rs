@@ -15,7 +15,7 @@ const DEFAULT_SCREENSHOT_QUALITY: i64 = 80;
 /// child's protocol id is derived from its page's. It stays stable for the
 /// life of the frame, which is what lets a client match an attach event to the
 /// frame it later sees in the tree.
-fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
+pub(crate) fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
     format!("{page_frame_id}-frame-{frame_id}")
 }
 

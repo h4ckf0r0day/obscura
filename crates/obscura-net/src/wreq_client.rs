@@ -17,11 +17,10 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::client::{
     cors_required, env_allows_private_network, error_chain, fetch_file_url, is_forbidden_ip,
-    redirect_taints_origin, request_fetch_site, request_referrer, response_too_large,
-    proxy_resolves_remotely, same_site_context, serialized_request_origin, validate_cors_response,
-    validate_proxied_host,
-    validate_request_mode, validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError,
-    RequestInfo, RequestMode, ResourceRequest, Response, SsrfGuardResolver,
+    redirect_taints_origin, request_fetch_site, request_origin_header, request_referrer, response_too_large,
+    proxy_resolves_remotely, same_site_context, serialized_request_origin, validate_cors_response, validate_proxied_host, validate_request_mode,
+    validate_url, CallbackRegistry, InFlightGuard, ObscuraNetError, RequestInfo, RequestMode,
+    ResourceRequest, Response, SsrfGuardResolver,
 };
 #[cfg(feature = "stealth")]
 use crate::cookies::{CookieJar, SameSiteContext};
@@ -347,7 +346,18 @@ impl StealthHttpClient {
         &self, url: &Url, method: &str, body: Option<Vec<u8>>,
         headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_request(url, ResourceRequest::navigation(), callbacks, method, body, headers).await
+        self.fetch_navigation_request_from_document(url, method, body, headers, None, callbacks).await
+    }
+
+    /// Fetch a navigation with an optional owning document, retaining it across redirects.
+    pub async fn fetch_navigation_request_from_document(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, initiator: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        let request = initiator.map(ResourceRequest::navigation_from_document)
+            .unwrap_or_else(ResourceRequest::navigation);
+        self.fetch_request(url, request, callbacks, method, body, headers).await
     }
 
     async fn fetch_request(
@@ -380,6 +390,7 @@ impl StealthHttpClient {
 
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
+        let mut referrer = request.referrer.clone().or_else(|| request.initiator.clone());
         let mut request_callback_fired = false;
 
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
@@ -390,7 +401,7 @@ impl StealthHttpClient {
 
             req = req
                 .header("accept", request.accept())
-                .header("sec-fetch-site", request_fetch_site(&request, &current_url))
+                .header("sec-fetch-site", request_fetch_site(&request, &current_url, redirect_tainted))
                 .header("sec-fetch-mode", request.mode.header_value())
                 .header("sec-fetch-dest", request.destination());
             if request.mode == RequestMode::Navigate {
@@ -398,7 +409,8 @@ impl StealthHttpClient {
                     .header("upgrade-insecure-requests", "1")
                     .header("sec-fetch-user", "?1");
             }
-            if let Some(referer) = request_referrer(&request, &current_url) {
+            let referer = request_referrer(referrer.as_ref(), &current_url);
+            if let Some(referer) = &referer {
                 req = req.header("referer", referer);
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
@@ -409,7 +421,7 @@ impl StealthHttpClient {
                     same_site_context(
                         &request,
                         &current_url,
-                        request.mode == crate::RequestMode::Navigate,
+                        matches!(method, wreq::Method::GET | wreq::Method::HEAD),
                     ),
                 )
             } else {
@@ -432,8 +444,8 @@ impl StealthHttpClient {
                 }
                 req = req.header(k.as_str(), v.as_str());
             }
-            if cors_required(&request, &current_url) {
-                req = req.header("origin", &request_origin);
+            if let Some(origin) = request_origin_header(&request, &current_url, &request_origin, matches!(method, wreq::Method::GET | wreq::Method::HEAD)) {
+                req = req.header("origin", origin);
             }
 
             let request_info = RequestInfo {
@@ -506,6 +518,8 @@ impl StealthHttpClient {
                             .map_err(ObscuraNetError::Network)?;
                     }
                     validate_request_mode(&request, &next_url)?;
+                    referrer = referer.as_deref().map(Url::parse).transpose()
+                        .map_err(|error| ObscuraNetError::Network(format!("Invalid redirect referrer: {error}")))?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
                     if next_url.origin() != current_url.origin() {

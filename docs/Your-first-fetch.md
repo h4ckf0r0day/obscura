@@ -53,19 +53,20 @@ obscura fetch https://my-spa.example --wait-until domcontentloaded --eval "docum
 | `networkidle2`     | ≤2 network connections active for 500ms       |
 | `networkidle0`     | 0 network connections active for 500ms        |
 
-(When driving obscura via Puppeteer or Playwright the default is `domcontentloaded` to match client expectations.)
+Puppeteer and Playwright default to `load`. Set `waitUntil` explicitly to choose
+a different readiness condition.
 
 ## Common flags
 
 ```
 --user-agent "..."        Override the User-Agent
 --timeout 30                Navigation timeout in seconds (default 30)
---wait 5                    Extra wait after the page settles, in seconds (default 5)
---selector ".main"          CSS selector to narrow output to
+--wait 5                    Fixed post-load delay in seconds; omitted uses adaptive settling (5s cap)
+--selector ".main"          Wait for a CSS selector; does not filter output
 --proxy http://host:port    Route through a proxy
 --stealth                   Stealth client (TLS fingerprint, tracker blocking)
 -o, --output file.html      Write output to a file
--q, --quiet                 Suppress info logging
+-q, --quiet                 Suppress logs
 ```
 
 Full list: [CLI reference](CLI-reference.md).

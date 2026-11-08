@@ -3501,6 +3501,13 @@ function _setElemHrefPart(el, part, value) {
   if (c) el.setAttribute('href', c.href);
 }
 
+// Unknown input types use the text state and support selection.
+const _INPUT_NO_SELECTION_TYPES = new Set([
+  'hidden', 'email', 'date', 'month', 'week', 'time', 'datetime-local',
+  'number', 'range', 'color', 'checkbox', 'radio', 'file',
+  'submit', 'image', 'reset', 'button',
+]);
+
 // --- <input> number/date conversion (valueAsNumber/valueAsDate/stepUp/Down) ---
 // Applicable types and their step scale factor + default step (HTML spec).
 const _INPUT_NUM_TYPES = { date: 1, month: 1, week: 1, time: 1, 'datetime-local': 1, number: 1, range: 1 };
@@ -4795,7 +4802,7 @@ class Element extends Node {
       // click path in input.rs, which already treats <input type=image> as a
       // submit button.
       if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
+        const form = this.form;
         // A real submit-button click fires the cancelable submit event, so use
         // requestSubmit() (not the plain submit() method, which now bypasses it).
         if (form && typeof form.requestSubmit === 'function') {
@@ -4978,7 +4985,8 @@ class Element extends Node {
     const tag = this.localName;
     if (tag === 'select') {
       // Selected option wins; otherwise first option (HTML default).
-      const opts = this.querySelectorAll('option');
+      const opts = this.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        ? _selectOptions(this) : this.querySelectorAll('option');
       for (let i = 0; i < opts.length; i++) {
         if (opts[i].selected) {
           return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
@@ -5031,7 +5039,8 @@ class Element extends Node {
       // itself. Dispatching here fed pages that assign inside a change
       // handler back into that handler in an infinite loop.
       const wanted = String(v);
-      const opts = this.querySelectorAll('option');
+      const opts = this.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        ? _selectOptions(this) : this.querySelectorAll('option');
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
@@ -5040,10 +5049,32 @@ class Element extends Node {
       return;
     }
     const value = String(v);
+    const type = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
+    const supportsSelection = tag === 'textarea' ||
+      (tag === 'input' && !_INPUT_NO_SELECTION_TYPES.has(type));
+    let changed = false;
+    if (supportsSelection) {
+      if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
+      let previous = _formValues[this._nid];
+      if (previous === undefined) {
+        previous = (tag === 'textarea'
+          ? _domParse('text_content', this._nid)
+          : _domParse('get_attribute', this._nid, 'value')) ?? '';
+      }
+      changed = previous !== value;
+    }
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
       this.textContent = value;
+    }
+    // Assigning the same value preserves selection. Internal updates must not
+    // invoke a page override of setSelectionRange().
+    if (changed || (supportsSelection && !_ns_selectionStart.has(this))) {
+      const position = changed ? value.length : 0;
+      _ns_selectionStart.set(this, position);
+      _ns_selectionEnd.set(this, position);
+      _ns_selectionDir.set(this, 'none');
     }
   }
   get min() { return this.getAttribute('min') || ''; }
@@ -5432,9 +5463,7 @@ class Element extends Node {
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
   get form() {
-    let p = this.parentNode;
-    while (p && p.localName !== 'form') p = p.parentNode;
-    return p;
+    return _formOwner(this);
   }
   // Label association, per the HTML labelable-elements list. Playwright's
   // getByLabel and its follow-label retargeting read these; without them a
@@ -5477,24 +5506,27 @@ class Element extends Node {
   }
   get options() {
     if (this.localName !== 'select') return [];
-    return HTMLCollection._from(this.querySelectorAll('option'));
+    return HTMLCollection._from(this.namespaceURI === 'http://www.w3.org/1999/xhtml'
+      ? _selectOptions(this) : this.querySelectorAll('option'));
   }
   add(item, before = null) {
-    if (this.localName !== 'select') {
-      throw new TypeError("Illegal invocation");
-    }
-    if (!item || item.nodeType !== 1
+    _selectApply(_validateSelect, this, []);
+    if (!_isDomNode(item) || item.nodeType !== 1
+        || item.namespaceURI !== 'http://www.w3.org/1999/xhtml'
         || (item.localName !== 'option' && item.localName !== 'optgroup')) {
       throw new TypeError("Failed to execute 'add' on 'HTMLSelectElement': parameter 1 is not of type 'HTMLOptionElement' or 'HTMLOptGroupElement'.");
     }
-    if (typeof before === 'number') {
-      const reference = this.options[before] || null;
-      this.insertBefore(item, reference);
-    } else if (before == null) {
-      this.appendChild(item);
-    } else {
-      this.insertBefore(item, before);
+    let reference = before;
+    if (before !== null && !(_isDomNode(before) && before.nodeType === 1
+        && before.namespaceURI === 'http://www.w3.org/1999/xhtml')) {
+      const index = +before | 0;
+      reference = _selectOptions(this)[index] || null;
     }
+    if (reference && (reference === this || !this.contains(reference))) {
+      throw new DOMException("The reference node is not a descendant of this select.", "NotFoundError");
+    }
+    const parent = reference ? reference.parentNode : this;
+    parent.insertBefore(item, reference);
   }
   get selectedIndex() {
     const opts = this.options;
@@ -5543,13 +5575,15 @@ class Element extends Node {
   }
   _navigateSubmit(submitter) {
     const pairs = [];
-    const fields = this.querySelectorAll('input, select, textarea');
+    const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
+    const fields = _formControls(this);
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i];
+      const tag = f.localName;
+      if (!['input', 'select', 'textarea', 'button'].includes(tag)) continue;
       const name = f.getAttribute('name');
       if (!name) continue;
-      if (f.getAttribute('disabled') !== null) continue;
-      const tag = f.localName;
+      if (_isActuallyDisabled(f)) continue;
       const type = (f.getAttribute('type') || '').toLowerCase();
       if ((type === 'checkbox' || type === 'radio') && !f.checked) continue;
       if (type === 'file' || type === 'reset') continue;
@@ -5561,14 +5595,36 @@ class Element extends Node {
 
       let val;
       if (tag === 'select') {
-        const opt = f.querySelector('option[selected]') || f.querySelector('option');
-        val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
+        const opts = _selectOptions(f);
+        const multiple = f.hasAttribute('multiple');
+        const chosen = [];
+        let explicit = false;
+        let firstEnabled = null;
+        for (const opt of opts) {
+          explicit ||= opt._selected !== undefined;
+          const parent = opt.parentElement;
+          const disabled = opt.hasAttribute('disabled')
+            || (parent && parent.namespaceURI === 'http://www.w3.org/1999/xhtml'
+                && parent.localName === 'optgroup' && parent.hasAttribute('disabled'));
+          if (!disabled && !firstEnabled) firstEnabled = opt;
+          if (opt.selected) {
+            if (!multiple) chosen.length = 0;
+            chosen.push([opt, disabled]);
+          }
+        }
+        if (!multiple && !chosen.length && !explicit
+            && (parseInt(f.getAttribute('size'), 10) || 0) <= 1 && firstEnabled) {
+          chosen.push([firstEnabled, false]);
+        }
+        for (const [opt, disabled] of chosen) {
+          if (!disabled) pairs.push(enc(name) + '=' + enc(opt.getAttribute('value') ?? opt.textContent));
+        }
+        continue;
       } else if (tag === 'textarea') {
         val = f.value || f.textContent || '';
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
       pairs.push(enc(name) + '=' + enc(val));
     }
 
@@ -7302,6 +7358,7 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+const _nodeCacheGet = Map.prototype.get.bind(_cache);
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -7840,41 +7897,47 @@ globalThis.VTTCue = VTTCue;
 const _htmlInterfaceToken = {};
 const _additionalHtmlElementClasses = Object.create(null);
 const _elementClassFor = (function _elementClassFor(nid) {
-  const tag = _domParse("tag_name", nid);
-  if (tag.includes(":") && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    return _elementClassForKnownName("http://www.w3.org/1999/xhtml", _domParse("local_name", nid));
+  // Canonical HTML names keep the scalar fast path. Other names carry their
+  // namespace/local name in the same native read rather than two more ops.
+  const info = _domParse("tag_name", nid, "interface");
+  const canonicalHTML = typeof info === 'string';
+  const tag = canonicalHTML ? info : info[0];
+  const namespace = canonicalHTML ? "http://www.w3.org/1999/xhtml" : info[1];
+  const localName = canonicalHTML ? null : info[2];
+  if (!canonicalHTML && tag.includes(":") && namespace === "http://www.w3.org/1999/xhtml") {
+    return _elementClassForKnownName(namespace, localName);
   }
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
   // namespace for possible SVG wrappers.
-  if (tag && tag !== tag.toUpperCase()
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
+  if (!canonicalHTML && tag && tag !== tag.toUpperCase()
+      && namespace === "http://www.w3.org/2000/svg") {
     const svgClass = _svgElementClasses[tag];
     if (svgClass) return svgClass;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "INPUT" && globalThis.HTMLInputElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
+      && (canonicalHTML || namespace === "http://www.w3.org/1999/xhtml"
+        && localName === "input")) return globalThis.HTMLInputElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
   if (tag === "META" && globalThis.HTMLMetaElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
+      && (canonicalHTML || namespace === "http://www.w3.org/1999/xhtml"
+        && localName === "meta")) return globalThis.HTMLMetaElement;
   if ((tag === "OL" || tag === "LI")
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    const localName = _domParse("local_name", nid);
-    if (localName === "ol") return HTMLOListElement;
-    if (localName === "li") return HTMLLIElement;
+      && namespace === "http://www.w3.org/1999/xhtml") {
+    const local = canonicalHTML ? tag.toLowerCase() : localName;
+    if (local === "ol") return HTMLOListElement;
+    if (local === "li") return HTMLLIElement;
   }
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+      && namespace === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLSlotElement;
   }
   if (tag === "IFRAME" && globalThis.HTMLIFrameElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+      && namespace === "http://www.w3.org/1999/xhtml") {
     return globalThis.HTMLIFrameElement;
   }
   if (tag === "IMG") return HTMLImageElement;
@@ -7883,8 +7946,8 @@ const _elementClassFor = (function _elementClassFor(nid) {
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
   const additional = _additionalHtmlElementClasses[tag];
-  if (additional && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === tag.toLowerCase()) return additional;
+  if (additional && (canonicalHTML || namespace === "http://www.w3.org/1999/xhtml"
+      && localName === tag.toLowerCase())) return additional;
   return Element;
 });
 const _elementClassForKnownName = (function _elementClassForKnownName(namespace, localName) {
@@ -8036,6 +8099,30 @@ Object.defineProperty(globalThis, 'location', {
   configurable: false,
   enumerable: true,
 });
+
+// Window.origin is replaceable and reads the document origin, including
+// inherited about:blank/srcdoc origins, rather than a pending navigation URL.
+const _windowOriginDescriptor = Object.getOwnPropertyDescriptor({
+  get origin() {
+    if (this === globalThis) return _realmOrigin();
+    const get = _documentRealmMember(this, 'windowOrigin');
+    if (get) return get.call(this);
+    throw new TypeError('Illegal invocation');
+  },
+  set origin(value) {
+    if (this !== globalThis) {
+      const set = _documentRealmMember(this, 'setWindowOrigin');
+      if (set) return set.call(this, value);
+      throw new TypeError('Illegal invocation');
+    }
+    Object.defineProperty(this, 'origin', {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  },
+}, 'origin');
+_markNative(_windowOriginDescriptor.get);
+_markNative(_windowOriginDescriptor.set);
+Object.defineProperty(globalThis, 'origin', _windowOriginDescriptor);
 
 globalThis.window = globalThis;
 globalThis.self = globalThis;
@@ -11902,14 +11989,15 @@ function _emptyFileList() { return _makeFileList([]); }
 // Rust side. Real File objects (backed by the bytes) are created so page code can
 // read them via FileReader or upload them via fetch/FormData, then input+change
 // fire as a genuine selection would (issue #359).
-globalThis.__obscura_setInputFiles = function(el, specs) {
-  const files = (specs || []).map((s) => {
-    let bytes;
-    try {
-      const bin = atob(s.b64 || "");
-      bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    } catch (_e) { bytes = new Uint8Array(0); }
+globalThis.__obscura_setInputFiles = function(el, specs, validateOnly = false) {
+  if (!el || _cache.get(el._nid) !== el || !(el instanceof HTMLInputElement)
+      || (el.getAttribute('type') || '').toLowerCase() !== 'file') return false;
+  if (validateOnly) return true;
+  const selected = el.hasAttribute('multiple') ? (specs || []) : (specs || []).slice(0, 1);
+  const files = selected.map((s) => {
+    const bin = atob(s.b64 || "");
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new File([bytes], s.name || "", { type: s.type || "" });
   });
   el._files = _makeFileList(files);
@@ -11918,8 +12006,9 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   // trusted events; upload flows that gate their change handler on
   // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
   // ones, which would silently break the exact case this feature targets.
-  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
-  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
+  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true })));
+  el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true })));
+  return true;
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
@@ -12639,6 +12728,12 @@ const _checkXmlWellFormed = (html) => {
 // "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
 // flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
 // skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
+// Pages replace String.prototype.startsWith with polyfills that ignore the
+// position argument (`this.substr(0, a.length) === a`; iasWorld county sites
+// ship one). Every `startsWith(x, i)` below then tested the start of the
+// input, so any XML beginning with `<?xml` read as a parse error.
+const _startsWithAt = Function.prototype.call.bind(String.prototype.startsWith);
+
 function _xmlWellFormed(src) {
   const s = String(src);
   const stack = [];
@@ -12649,10 +12744,10 @@ function _xmlWellFormed(src) {
     const lt = s.indexOf('<', i);
     if (lt === -1) break;
     i = lt;
-    if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i + 4); if (e === -1) return false; i = e + 3; continue; }
-    if (s.startsWith('<![CDATA[', i)) { const e = s.indexOf(']]>', i + 9); if (e === -1) return false; i = e + 3; continue; }
-    if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i + 2); if (e === -1) return false; i = e + 2; continue; }
-    if (s.startsWith('<!', i)) { const e = s.indexOf('>', i + 2); if (e === -1) return false; i = e + 1; continue; }
+    if (_startsWithAt(s, '<!--', i)) { const e = s.indexOf('-->', i + 4); if (e === -1) return false; i = e + 3; continue; }
+    if (_startsWithAt(s, '<![CDATA[', i)) { const e = s.indexOf(']]>', i + 9); if (e === -1) return false; i = e + 3; continue; }
+    if (_startsWithAt(s, '<?', i)) { const e = s.indexOf('?>', i + 2); if (e === -1) return false; i = e + 2; continue; }
+    if (_startsWithAt(s, '<!', i)) { const e = s.indexOf('>', i + 2); if (e === -1) return false; i = e + 1; continue; }
     // A start/end/self-closing tag: find its '>' while skipping quoted regions.
     let j = i + 1, quote = null;
     while (j < n) {
@@ -14357,10 +14452,9 @@ Object.defineProperties(HTMLInputElement.prototype, {
 });
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
-  get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
+  get elements() { return _formControls(this); }
   get length() { return this.elements.length; }
-  // Inherit submit() from Element.prototype: it dispatches the cancelable
-  // 'submit' event and (if not prevented) builds form data and navigates.
+  // submit() bypasses the submit event; requestSubmit() dispatches it.
   reset() {
     if (!this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true }))) return;
     for (const f of this.elements) {
@@ -14378,7 +14472,6 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
@@ -14402,7 +14495,6 @@ globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
   Object.defineProperty(proto, 'readOnly', { enumerable: true });
 }
-globalThis.HTMLTableElement = Element;
 // <iframe> needs its own brand: with `HTMLIFrameElement = Element` every
 // element passed `instanceof HTMLIFrameElement`, so style-loader's
 // "insert target is an iframe" branch took `contentDocument.head` of <head>
@@ -14479,7 +14571,6 @@ globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
   assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
   assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
 };
-globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
@@ -14489,6 +14580,14 @@ globalThis.HTMLDialogElement = Element;
 // Identity-only interfaces still need distinct prototypes. Inheriting Element
 // preserves implemented DOM behavior without making unrelated tags pass brand checks.
 for (const [name, tags] of Object.entries({
+  HTMLAnchorElement: ['a'], HTMLBRElement: ['br'], HTMLBodyElement: ['body'],
+  HTMLButtonElement: ['button'], HTMLDataListElement: ['datalist'], HTMLDetailsElement: ['details'],
+  HTMLDialogElement: ['dialog'], HTMLDivElement: ['div'], HTMLFieldSetElement: ['fieldset'],
+  HTMLHRElement: ['hr'], HTMLHeadElement: ['head'], HTMLHeadingElement: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+  HTMLHtmlElement: ['html'], HTMLLabelElement: ['label'], HTMLLegendElement: ['legend'],
+  HTMLLinkElement: ['link'], HTMLParagraphElement: ['p'], HTMLPreElement: ['pre'],
+  HTMLProgressElement: ['progress'], HTMLScriptElement: ['script'], HTMLSpanElement: ['span'],
+  HTMLStyleElement: ['style'], HTMLTemplateElement: ['template'], HTMLUListElement: ['ul'],
   HTMLAreaElement: ['area'], HTMLBaseElement: ['base'], HTMLDListElement: ['dl'],
   HTMLDataElement: ['data'], HTMLDirectoryElement: ['dir'], HTMLEmbedElement: ['embed'],
   HTMLFontElement: ['font'], HTMLFrameElement: ['frame'], HTMLFrameSetElement: ['frameset'],
@@ -14496,11 +14595,12 @@ for (const [name, tags] of Object.entries({
   HTMLMeterElement: ['meter'], HTMLModElement: ['del', 'ins'], HTMLObjectElement: ['object'],
   HTMLOptGroupElement: ['optgroup'], HTMLOutputElement: ['output'], HTMLParamElement: ['param'],
   HTMLPictureElement: ['picture'], HTMLQuoteElement: ['blockquote', 'q'], HTMLSourceElement: ['source'],
-  HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
+  HTMLSelectElement: ['select'], HTMLOptionElement: ['option'],
+  HTMLTableElement: ['table'], HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
   HTMLTableColElement: ['col', 'colgroup'], HTMLTableRowElement: ['tr'],
   HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
 })) {
-  if (globalThis[name] !== undefined) continue;
+  if (globalThis[name] !== undefined && globalThis[name] !== Element) continue;
   const Interface = class extends Element {
     constructor(nid, token) {
       if (token !== _htmlInterfaceToken) {
@@ -14511,6 +14611,7 @@ for (const [name, tags] of Object.entries({
     }
   };
   Object.defineProperty(Interface, 'name', {value: name, configurable: true});
+  Object.defineProperty(Interface, 'length', {value: 0, configurable: true});
   Object.defineProperty(Interface.prototype, Symbol.toStringTag, {value: name, configurable: true});
   Object.defineProperty(globalThis, name, {value: Interface, writable: true, configurable: true});
   for (const tag of tags) {
@@ -14518,6 +14619,249 @@ for (const [name, tags] of Object.entries({
     _additionalHtmlElementClasses[tag.toUpperCase()] = Interface;
   }
 }
+
+let _formOwnerSnapshots = new WeakMap();
+let _formControlSnapshots = new WeakMap();
+let _formCacheEpoch = null;
+function _formEpoch() {
+  if (!_formCacheEpoch) {
+    const buffer = __obscuraCore.ops.op_form_cache_buffer(_realmFrameId);
+    if (buffer === null) throw new TypeError('Illegal invocation');
+    _formCacheEpoch = new Uint32Array(buffer);
+  }
+  return _formCacheEpoch;
+}
+function _readFormOwner(control) {
+  const epoch = _formEpoch();
+  let snapshot = _formOwnerSnapshots.get(control);
+  if (!snapshot || snapshot.low !== epoch[0] || snapshot.high !== epoch[1]) {
+    snapshot = {low:epoch[0], high:epoch[1],
+      owner:_wrapEl(__obscuraCore.ops.op_form_owner(control._nid, _realmFrameId))};
+    _formOwnerSnapshots.set(control, snapshot);
+  }
+  return snapshot.owner;
+}
+function _formOwnerMember() {
+  if (!this || _nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  return _readFormOwner(this);
+}
+function _formOwner(control) {
+  if (control && _nodeCacheGet(control._nid) === control) {
+    return _readFormOwner(control);
+  }
+  const member = control && _documentRealmMember(control, 'formOwner');
+  if (member && member !== _formOwnerMember) return Reflect.apply(member, control, []);
+  throw new TypeError('Illegal invocation');
+}
+function _formControlsMember() {
+  if (!this || _nodeCacheGet(this._nid) !== this) throw new TypeError('Illegal invocation');
+  const epoch = _formEpoch();
+  let snapshot = _formControlSnapshots.get(this);
+  if (!snapshot || snapshot.low !== epoch[0] || snapshot.high !== epoch[1]) {
+    const ids = _domParse('form_controls', this._nid);
+    if (ids === null) throw new TypeError('Illegal invocation');
+    snapshot = {low:epoch[0], high:epoch[1], ids};
+    _formControlSnapshots.set(this, snapshot);
+  }
+  return _formControlsSnapshot(snapshot.ids);
+}
+function _formControls(form) {
+  if (!form || _nodeCacheGet(form._nid) !== form) {
+    const member = form && _documentRealmMember(form, 'formControls');
+    if (member && member !== _formControlsMember) return Reflect.apply(member, form, []);
+    throw new TypeError('Illegal invocation');
+  }
+  return Reflect.apply(_formControlsMember, form, []);
+}
+
+// Keep the existing writable array snapshot, but wrap native IDs only when
+// observed. A length read must not construct every external control wrapper.
+function _formControlsSnapshot(ids) {
+  const target = new HTMLCollection();
+  let hydrated = false;
+  const index = key => typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key)
+    && Number(key) < 4294967295;
+  function materialize(i) {
+    if (!Object.prototype.hasOwnProperty.call(target, i)) target[i] = _wrapEl(ids[i]);
+    return target[i];
+  }
+  function hydrate() {
+    if (hydrated) return;
+    for (let i = 0; i < ids.length; i++) materialize(i);
+    target.length = ids.length;
+    hydrated = true;
+  }
+  return new Proxy(target, {
+    get(t, key, receiver) {
+      if (!hydrated) {
+        if (key === 'length') return ids.length;
+        if (index(key) && Number(key) < ids.length) return materialize(Number(key));
+      }
+      const value = Reflect.get(t, key, receiver);
+      if (value !== undefined || typeof key !== 'string') return value;
+      hydrate();
+      return _htmlCollectionProxy.get(t, key, receiver);
+    },
+    has(t, key) {
+      if (!hydrated && index(key) && Number(key) < ids.length) return true;
+      if (Reflect.has(t, key)) return true;
+      hydrate();
+      return _htmlCollectionProxy.has(t, key);
+    },
+    ownKeys(t) {
+      hydrate();
+      return Reflect.ownKeys(t);
+    },
+    getOwnPropertyDescriptor(t, key) {
+      hydrate();
+      return Reflect.getOwnPropertyDescriptor(t, key);
+    },
+    set(t, key, value, receiver) {
+      hydrate();
+      return Reflect.set(t, key, value, receiver);
+    },
+    defineProperty(t, key, descriptor) {
+      hydrate();
+      return Reflect.defineProperty(t, key, descriptor);
+    },
+    deleteProperty(t, key) {
+      hydrate();
+      return Reflect.deleteProperty(t, key);
+    },
+    preventExtensions(t) {
+      hydrate();
+      return Reflect.preventExtensions(t);
+    },
+  });
+}
+
+const _selectApply = Reflect.apply;
+const _selectElementRemove = Element.prototype.remove;
+function _selectTagIsValid(nid) {
+  const info = _domParse('tag_name', nid, 'interface');
+  return typeof info === 'string' ? info === 'SELECT'
+    : !!info && info[1] === 'http://www.w3.org/1999/xhtml' && info[2] === 'select';
+}
+function _validateSelectMember() {
+  const nid = this && this._nid;
+  return !!this && _nodeCacheGet(nid) === this && _selectTagIsValid(nid);
+}
+function _validateSelect() {
+  const nid = this && this._nid;
+  if (!this || _nodeCacheGet(nid) !== this) {
+    const member = this && _documentRealmMember(this, 'validateSelect');
+    if (member && member !== _validateSelectMember && _selectApply(member, this, [])) return;
+    throw new TypeError('Illegal invocation');
+  }
+  if (!_selectTagIsValid(nid)) throw new TypeError('Illegal invocation');
+}
+function _selectOptionsMember() {
+  const nid = this && this._nid;
+  if (!this || _nodeCacheGet(nid) !== this) return null;
+  const ids = _domParse('select_options', nid);
+  return ids === null ? null : ids.map(_wrapEl);
+}
+function _selectOptions(select) {
+  const nid = select && select._nid;
+  if (!select || _nodeCacheGet(nid) !== select) {
+    const member = select && _documentRealmMember(select, 'selectOptions');
+    if (member && member !== _selectOptionsMember) {
+      const options = _selectApply(member, select, []);
+      if (options !== null) return options;
+    }
+    throw new TypeError('Illegal invocation');
+  }
+  const ids = _domParse('select_options', nid);
+  if (ids === null) throw new TypeError('Illegal invocation');
+  return ids.map(_wrapEl);
+}
+function _optionIndexMember() {
+  const nid = this && this._nid;
+  return this && _nodeCacheGet(nid) === this ? _domParse('option_index', nid) : null;
+}
+function _optionIndexGetter() {
+  const nid = this && this._nid;
+  if (!this || _nodeCacheGet(nid) !== this) {
+    const member = this && _documentRealmMember(this, 'optionIndex');
+    if (member && member !== _optionIndexMember) {
+      const index = _selectApply(member, this, []);
+      if (index !== null) return index;
+    }
+    throw new TypeError('Illegal invocation');
+  }
+  const index = _domParse('option_index', nid);
+  if (index === null) throw new TypeError('Illegal invocation');
+  return index;
+}
+Object.defineProperties(HTMLSelectElement.prototype, {
+  length: {
+    get() { return _selectOptions(this).length; },
+    set(value) {
+      _selectApply(_validateSelect, this, []);
+      const length = +value >>> 0;
+      if (length > 100000) {
+        console.warn("Failed to set the 'length' property on 'HTMLSelectElement': maximum supported length is 100000.");
+        return;
+      }
+      const options = _selectOptions(this);
+      for (let i = options.length - 1; i >= length; i--) {
+        _selectApply(_selectElementRemove, options[i], []);
+      }
+      for (let i = options.length; i < length; i++) {
+        this.appendChild(this.ownerDocument.createElement('option'));
+      }
+    },
+    configurable: true, enumerable: true,
+  },
+  item: {
+    value: function item(index) {
+      _selectApply(_validateSelect, this, []);
+      if (!arguments.length) throw new TypeError("Failed to execute 'item' on 'HTMLSelectElement': 1 argument required.");
+      index = +index >>> 0;
+      return _selectOptions(this)[index] || null;
+    },
+    writable: true, configurable: true, enumerable: true,
+  },
+  namedItem: {
+    value: function namedItem(name) {
+      _selectApply(_validateSelect, this, []);
+      if (!arguments.length) throw new TypeError("Failed to execute 'namedItem' on 'HTMLSelectElement': 1 argument required.");
+      if (typeof name === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+      name = String(name);
+      if (!name) return null;
+      for (const option of _selectOptions(this)) {
+        if (option.id === name || option.getAttribute('name') === name) return option;
+      }
+      return null;
+    },
+    writable: true, configurable: true, enumerable: true,
+  },
+  remove: {
+    value: function remove(index = undefined) {
+      _selectApply(_validateSelect, this, []);
+      if (!arguments.length) {
+        return _selectApply(_selectElementRemove, this, []);
+      }
+      index = +index | 0;
+      const option = _selectOptions(this)[index];
+      if (option) _selectApply(_selectElementRemove, option, []);
+    },
+    writable: true, configurable: true, enumerable: true,
+  },
+});
+Object.defineProperty(HTMLSelectElement, 'length', {value: 0, configurable: true});
+Object.defineProperty(HTMLOptionElement, 'length', {value: 0, configurable: true});
+Object.defineProperty(_optionIndexGetter, 'name', {value: 'get index', configurable: true});
+Object.defineProperty(HTMLOptionElement.prototype, 'index', {
+  get: _optionIndexGetter, configurable: true, enumerable: true,
+});
+for (const name of ['length', 'item', 'namedItem', 'remove']) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, name);
+  for (const method of [descriptor.get, descriptor.set, descriptor.value]) {
+    if (method) _markNative(method);
+  }
+}
+_markNative(_optionIndexGetter);
 
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
@@ -14836,6 +15180,99 @@ const _htmlCollectionProxy = {
     return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
   },
 };
+const _tableRowCollections = new WeakMap();
+function _tableRowsGetter() {
+  if (!this || _cache.get(this._nid) !== this) {
+    const owner = this && this.ownerDocument && this.ownerDocument.defaultView;
+    if (owner && owner !== globalThis) {
+      const getter = Object.getOwnPropertyDescriptor(owner.HTMLTableElement.prototype, 'rows').get;
+      return getter.call(this);
+    }
+    throw new TypeError('Illegal invocation');
+  }
+  if (_tableRowCollections.has(this)) return _tableRowCollections.get(this);
+  const table = this;
+  let epoch = -1;
+  let elements = [];
+  function refresh() {
+    if (epoch !== _domMutationEpoch) {
+      const ids = _domParse('table_rows', table._nid);
+      if (ids === null) throw new TypeError('Illegal invocation');
+      elements = ids.map(_wrapEl);
+      epoch = _domMutationEpoch;
+    }
+    return elements;
+  }
+  const index = key => typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key)
+    && Number(key) < 4294967295;
+  const target = Object.create(HTMLCollection.prototype);
+  const collection = new Proxy(target, {
+    get(t, key, receiver) {
+      const rows = refresh();
+      if (key === 'length') return rows.length;
+      if (key === Symbol.toStringTag && !Reflect.has(t, key)) return 'HTMLCollection';
+      if (index(key)) return rows[Number(key)];
+      const value = Reflect.get(t, key, receiver);
+      if (value !== undefined || typeof key !== 'string') return value;
+      return HTMLCollection.prototype.namedItem.call(receiver, key) || undefined;
+    },
+    has(t, key) {
+      if (index(key)) return Number(key) < refresh().length;
+      return Reflect.has(t, key) || (typeof key === 'string'
+        && !!HTMLCollection.prototype.namedItem.call(collection, key));
+    },
+    ownKeys(t) {
+      const rows = refresh();
+      const keys = new Set();
+      for (let i = 0; i < rows.length; i++) keys.add(String(i));
+      rows.forEach(row => {
+        for (const name of [row.id, row.getAttribute('name')]) {
+          if (name && !Reflect.has(t, name)) keys.add(name);
+        }
+      });
+      for (const key of Reflect.ownKeys(t)) keys.add(key);
+      return [...keys];
+    },
+    getOwnPropertyDescriptor(t, key) {
+      if (index(key)) {
+        const row = refresh()[Number(key)];
+        return row ? {value: row, writable: false, enumerable: true, configurable: true} : undefined;
+      }
+      const descriptor = Reflect.getOwnPropertyDescriptor(t, key);
+      if (descriptor || typeof key !== 'string' || Reflect.has(t, key)) return descriptor;
+      const row = HTMLCollection.prototype.namedItem.call(collection, key);
+      return row ? {value: row, writable: false, enumerable: false, configurable: true} : undefined;
+    },
+    set(t, key, value, receiver) {
+      if (key === 'length' || index(key)
+          || (typeof key === 'string' && !Reflect.has(t, key)
+            && HTMLCollection.prototype.namedItem.call(collection, key))) return false;
+      return Reflect.set(t, key, value, receiver);
+    },
+    defineProperty(t, key, descriptor) {
+      if (key === 'length' || index(key)
+          || (typeof key === 'string' && !Reflect.has(t, key)
+            && HTMLCollection.prototype.namedItem.call(collection, key))) return false;
+      return Reflect.defineProperty(t, key, descriptor);
+    },
+    deleteProperty(t, key) {
+      if (index(key)) return Number(key) >= refresh().length;
+      if (typeof key === 'string' && !Reflect.has(t, key)
+          && HTMLCollection.prototype.namedItem.call(collection, key)) return false;
+      return Reflect.deleteProperty(t, key);
+    },
+    preventExtensions() { return false; },
+  });
+  refresh();
+  _tableRowCollections.set(table, collection);
+  return collection;
+}
+Object.defineProperty(HTMLTableElement, 'length', {value: 0, configurable: true});
+Object.defineProperty(_tableRowsGetter, 'name', {value: 'get rows', configurable: true});
+Object.defineProperty(HTMLTableElement.prototype, 'rows', {
+  get: _tableRowsGetter, enumerable: true, configurable: true,
+});
+_markNative(_tableRowsGetter);
 // True for elements in the HTML namespace (the only ones whose name attribute
 // contributes to an HTMLCollection's supported property names).
 function _isHTMLEl(el) {
@@ -15753,6 +16190,7 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
     delete child.__obscura_core_handoff;
     delete child.Deno;
+    delete child.__bootstrap;
     for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
                        '__obscura_ua_platform_version', '__obscura_stealth',
                        '__obscura_geo_lat', '__obscura_geo_lon']) {
@@ -17051,7 +17489,7 @@ globalThis.focus = function() {}; _markNative(globalThis.focus);
 globalThis.blur = function() {}; _markNative(globalThis.blur);
 globalThis.print = function() {}; _markNative(globalThis.print);
 globalThis.alert = function() {}; _markNative(globalThis.alert);
-globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
+globalThis.confirm = function() { return false; }; _markNative(globalThis.confirm);
 globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
@@ -17466,6 +17904,13 @@ if (!globalThis.crypto.subtle) {
       throw new DOMException(String((e && e.message) || e), "OperationError");
     }
   }
+  async function runOpAsync(fn) {
+    try { return await fn(); }
+    catch (e) {
+      if (e instanceof DOMException) throw e;
+      throw new DOMException(String((e && e.message) || e), "OperationError");
+    }
+  }
 
   // The JWK `alg` of an AES or HMAC key, or undefined for the others.
   function jwkAlg(key, bytes) {
@@ -17591,7 +18036,7 @@ if (!globalThis.crypto.subtle) {
         const hash = normalizeHash(alg.hash);
         const salt = toBytes(alg.salt);
         const iterations = alg.iterations >>> 0;
-        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
+        return bufferOf(await runOpAsync(() => __obscuraCore.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
       }
       if (alg.name === "HKDF") {
         const hash = normalizeHash(alg.hash);
@@ -18744,6 +19189,8 @@ const _installCaretGeometry = (function _installCaretGeometry() {
 
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
+const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
+const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
   ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
@@ -18754,6 +19201,20 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['selectOptions', _selectOptionsMember],
+  ['formOwner', _formOwnerMember],
+  ['formControls', _formControlsMember],
+  ['validateSelect', _validateSelectMember],
+  ['optionIndex', _optionIndexMember],
+  ['domNodeReference', function() {
+    const nid = this._nid;
+    if (_nodeCacheGet(nid) !== this) throw new TypeError('Not a current DOM node');
+    const doc = _nodeDocumentOf(this);
+    const url = doc === document && globalThis.__virtualUrl || _nativeDocumentUrl(doc);
+    return [nid, url, _nativeNodeBaseUri(this)];
+  }],
+  ['windowOrigin', _windowOriginDescriptor.get],
+  ['setWindowOrigin', _windowOriginDescriptor.set],
 ]));
 
 globalThis.__obscura_init_frames = function() {
@@ -18775,6 +19236,9 @@ globalThis.__obscura_init_frames = function() {
 globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _formCacheEpoch = null;
+  _formOwnerSnapshots = new WeakMap();
+  _formControlSnapshots = new WeakMap();
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
   _sandboxOpaqueOrigin = _domParse('sandbox_opaque_origin') === true;
   globalThis.__obscura_update_media_preferences();
@@ -19335,32 +19799,51 @@ if (!Element.prototype.setSelectionRange) {
   _markNative(Element.prototype.setSelectionRange);
 }
 
-// Element.prototype.setRangeText - replace selection with text
+// Element.prototype.setRangeText - replace selected text, preserving the
+// selection around edits as HTMLInputElement/HTMLTextAreaElement do.
 if (!Element.prototype.setRangeText) {
   Element.prototype.setRangeText = function setRangeText(replacement, start, end, selectMode) {
-    const val = this.value;
-    if (!val) return;
-    const strVal = String(val);
-    start = start === undefined ? (this.selectionStart ?? 0) : Math.max(0, parseInt(start, 10) || 0);
-    end = end === undefined ? (this.selectionEnd ?? 0) : Math.max(0, parseInt(end, 10) || 0);
-    const newValue = strVal.slice(0, start) + String(replacement) + strVal.slice(end);
-    this.value = newValue;
-    selectMode = selectMode || 'preserve';
-    if (selectMode === 'select') {
-      const replLen = String(replacement).length;
-      _ns_selectionStart.set(this, start);
-      _ns_selectionEnd.set(this, start + replLen);
-      _ns_selectionDir.set(this, 'none');
-    } else if (selectMode === 'start') {
-      _ns_selectionStart.set(this, start);
-      _ns_selectionEnd.set(this, start);
-      _ns_selectionDir.set(this, 'none');
-    } else if (selectMode === 'end') {
-      const replLen = String(replacement).length;
-      _ns_selectionStart.set(this, start + replLen);
-      _ns_selectionEnd.set(this, start + replLen);
-      _ns_selectionDir.set(this, 'none');
+    const tag = this.localName;
+    const inputType = tag === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
+    if (tag !== 'textarea' && !(tag === 'input' &&
+        !_INPUT_NO_SELECTION_TYPES.has(inputType))) {
+      throw new DOMException('This input element does not support text selection.', 'InvalidStateError');
     }
+    if (arguments.length < 1 || arguments.length === 2)
+      throw new TypeError("Failed to execute 'setRangeText': invalid number of arguments");
+    const mode = selectMode === undefined ? 'preserve' : String(selectMode);
+    if (!['select', 'start', 'end', 'preserve'].includes(mode))
+      throw new TypeError("Failed to execute 'setRangeText': invalid selection mode");
+    const value = String(this.value ?? '');
+    const text = String(replacement);
+    let lo = arguments.length < 3 ? (this.selectionStart ?? 0) : (+start >>> 0);
+    let hi = arguments.length < 3 ? (this.selectionEnd ?? 0) : (+end >>> 0);
+    if (lo > hi) throw new DOMException('Start is greater than end.', 'IndexSizeError');
+    lo = Math.min(lo, value.length);
+    hi = Math.min(hi, value.length);
+    const beforeStart = Math.min(this.selectionStart ?? 0, value.length);
+    const beforeEnd = Math.min(this.selectionEnd ?? 0, value.length);
+    this.value = value.slice(0, lo) + text + value.slice(hi);
+    const afterEnd = lo + text.length;
+    const delta = text.length - (hi - lo);
+    let selectionStart = beforeStart;
+    let selectionEnd = beforeEnd;
+    if (mode === 'select') {
+      selectionStart = lo;
+      selectionEnd = afterEnd;
+    } else if (mode === 'start') {
+      selectionStart = selectionEnd = lo;
+    } else if (mode === 'end') {
+      selectionStart = selectionEnd = afterEnd;
+    } else {
+      // Preserve offsets before the replaced range, shift offsets after it,
+      // and collapse selection endpoints that intersect the replaced text.
+      if (selectionStart > hi) selectionStart += delta;
+      else if (selectionStart > lo) selectionStart = lo;
+      if (selectionEnd > hi) selectionEnd += delta;
+      else if (selectionEnd > lo) selectionEnd = afterEnd;
+    }
+    this.setSelectionRange(selectionStart, selectionEnd, 'forward');
   };
   _markNative(Element.prototype.setRangeText);
 }

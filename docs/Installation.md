@@ -45,10 +45,17 @@ yay -S obscura-browser
 ## Docker
 
 ```bash
-docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+export OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)"
+docker run -d --name obscura -p 127.0.0.1:9222:9222 \
+  -e OBSCURA_CDP_TOKEN \
+  h4ckf0r0day/obscura
 ```
 
 Image: [h4ckf0r0day/obscura](https://hub.docker.com/r/h4ckf0r0day/obscura). Built on `distroless/cc:nonroot`, with no shell or package manager in the runtime image, running as uid 65532. Note the `-p 127.0.0.1:...` above: it publishes the port to host loopback only. A mounted `--storage-dir` must be writable by uid 65532 — see [Run in production at scale](Run-in-production-at-scale.md#the-container-does-not-run-as-root).
+
+The container requires `OBSCURA_CDP_TOKEN` because it binds all container
+interfaces. Send that token in your CDP client's `Authorization: Bearer <token>`
+header. See [CDP authentication](Connect-Puppeteer-or-Playwright.md#authentication).
 
 Official archives and the Docker image include the rendering engine. Source
 builders must pass `--features render`; see [Build from source](Build-from-source.md).

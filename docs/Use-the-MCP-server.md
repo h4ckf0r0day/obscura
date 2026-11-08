@@ -29,7 +29,8 @@ obscura mcp --http --port 3000
 The HTTP transport binds `127.0.0.1` by default. Bind all interfaces with `--host` for a container or sidecar deployment:
 
 ```bash
-obscura mcp --http --host 0.0.0.0 --port 3000
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" \
+  obscura mcp --http --host 0.0.0.0 --port 3000
 ```
 
 With stealth and proxy:
@@ -90,7 +91,10 @@ Interact:
 
 Wait and run JS:
 
-- `browser_wait_for`, `browser_wait_for_text`, `browser_evaluate`
+- `browser_wait_for`, `browser_wait_for_text`, `browser_wait_for_function`, `browser_evaluate`
+
+`browser_wait_for_function` polls the JavaScript expression in `function` until
+it becomes truthy. `timeout` defaults to 30000 ms and `pollIntervalMs` to 100 ms.
 
 `browser_evaluate` accepts JavaScript scripts, executes them once, and waits for
 returned promises. `timeoutMs` defaults to 5000 ms and bounds synchronous
@@ -153,6 +157,31 @@ references return a tool error instead of acting on a different element.
 
 MCP exposes still-image and PDF output. It does not stream video frames; use
 CDP `Page.startScreencast` for activity-driven screencasting.
+
+## Web search (optional)
+
+The browser tools act on pages the agent already has a URL for. To let it find
+pages first, set `OBSCURA_WEB_SEARCH=keenable` in the server's environment.
+This adds a `web_search` tool (`query`, optional `limit`, default 5, max 50)
+that returns one JSON object per line with `title`, `url`, and `snippet`.
+Responses larger than 1 MiB after decompression return a tool error.
+
+The tool is not listed unless the variable is set. Each call sends the query
+to the Keenable search API (`api.keenable.ai`) through the configured proxy.
+No account is needed. The public endpoint is rate limited per IP; set
+`KEENABLE_API_KEY` to raise the limit.
+
+```json
+{
+  "mcpServers": {
+    "obscura": {
+      "command": "/path/to/obscura",
+      "args": ["mcp"],
+      "env": { "OBSCURA_WEB_SEARCH": "keenable" }
+    }
+  }
+}
+```
 
 ## Claude Desktop
 

@@ -47,10 +47,10 @@ pub struct BrowserContext {
 /// One origin's persisted `localStorage`. The origin is inside the file, so the
 /// file name only has to be unique and stable, not reversible.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct StoredOriginStorage {
+struct StoredOriginStorage<T = Vec<(String, String)>> {
     origin: String,
     /// `[key, value]` pairs in insertion order, the order `Storage.key(i)` uses.
-    entries: Vec<(String, String)>,
+    entries: T,
 }
 
 /// Filename-safe stem for an origin: a sanitized prefix for readability plus the
@@ -249,6 +249,15 @@ impl BrowserContext {
         Self::with_options(id, proxy_url, false)
     }
 
+    /// Private CDP state; only the server's persistence context writes the profile.
+    pub fn connection_copy(&self, id: String) -> Self {
+        let mut copy = self.isolated_copy(id, true);
+        copy.local_storage = Arc::new(self.local_storage.isolated_snapshot());
+        copy.indexed_db = Arc::new(obscura_js::indexed_db::IndexedDbStorage::default());
+        copy.storage_dir = None;
+        copy
+    }
+
     /// Create a context with the same browser configuration but independent
     /// mutable network state. Persistent copies start with the template's
     /// current cookies; incognito copies start empty and never write to the
@@ -326,7 +335,7 @@ impl BrowserContext {
                     result => result,
                 }
             } else {
-                let stored = StoredOriginStorage { origin: origin.to_string(), entries: entries.to_vec() };
+                let stored = StoredOriginStorage { origin: origin.to_string(), entries };
                 serde_json::to_vec(&stored).map_err(std::io::Error::other)
                     .and_then(|bytes| write_file_atomically(&path, &bytes))
             };
@@ -589,6 +598,27 @@ mod tests {
             persistent.local_storage.get("https://app.example", "k"),
             Some("v".to_string())
         );
+    }
+
+    #[test]
+    fn connection_copies_isolate_live_storage_and_cannot_write_the_profile() {
+        let dir = temp_storage_dir("connection-copy");
+        let profile = BrowserContext::with_storage("profile".into(), Some(dir.clone()));
+        assert!(profile.local_storage.load("https://app.test", vec![("seed".into(), "initial".into())]));
+        let a = profile.connection_copy("a".into());
+        let b = profile.connection_copy("b".into());
+        assert!(a.storage_dir.is_none());
+        assert!(a.local_storage.set("https://app.test", "secret".into(), "a".into()));
+        assert_eq!(b.local_storage.get("https://app.test", "seed").as_deref(), Some("initial"));
+        assert_eq!(b.local_storage.get("https://app.test", "secret"), None);
+        assert_eq!(profile.local_storage.get("https://app.test", "secret"), None);
+        assert!(!Arc::ptr_eq(&a.indexed_db, &b.indexed_db));
+        assert!(!Arc::ptr_eq(&a.indexed_db, &profile.indexed_db));
+        a.save_local_storage();
+        assert!(!dir.join("localStorage").exists());
+        let persistent = profile.isolated_copy("persistent".into(), true);
+        assert!(Arc::ptr_eq(&persistent.local_storage, &profile.local_storage));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An unchanged store must not touch the disk, or every navigation on a

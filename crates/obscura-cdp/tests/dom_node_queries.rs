@@ -32,6 +32,65 @@ fn object(ctx: &mut CdpContext, session: &str, expression: &str) -> String {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn dom_queries_respect_the_requested_subtree_and_shadow_root() {
+    let (mut ctx, session, _) = fixture().await;
+    let shadow_nid = ctx.get_session_page_mut(&Some(session.clone())).unwrap().evaluate(r#"(() => {
+        document.body.innerHTML =
+            '<section id="left"><button class="hit" id="left-hit">Left</button><div id="host"></div></section>' +
+            '<section id="right"><button class="hit" id="right-hit">Right</button></section>';
+        const shadow = document.querySelector('#host').attachShadow({mode: 'open'});
+        shadow.innerHTML = '<button class="hit" id="shadow-hit">Shadow</button>';
+        return shadow._nid;
+    })()"#).as_f64().unwrap() as u64;
+
+    let left = ok(&mut ctx, &session, "querySelector", json!({"selector":"#left"})).await["nodeId"].clone();
+    let right = ok(&mut ctx, &session, "querySelector", json!({"selector":"#right"})).await["nodeId"].clone();
+    let left_hit = ok(&mut ctx, &session, "querySelector", json!({"selector":"#left-hit"})).await["nodeId"].clone();
+    let right_hit = ok(&mut ctx, &session, "querySelector", json!({"selector":"#right-hit"})).await["nodeId"].clone();
+    let shadow_hit = ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":shadow_nid,"selector":"#shadow-hit"})).await["nodeId"].clone();
+
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":left,"selector":".hit"})).await["nodeId"], left_hit);
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":right,"selector":".hit"})).await["nodeId"], right_hit);
+    assert_eq!(ok(&mut ctx, &session, "querySelectorAll",
+        json!({"nodeId":left,"selector":".hit"})).await["nodeIds"], json!([left_hit]));
+    assert_eq!(ok(&mut ctx, &session, "querySelectorAll",
+        json!({"nodeId":right,"selector":".hit"})).await["nodeIds"], json!([right_hit]));
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":right,"selector":":scope > .hit"})).await["nodeId"], right_hit);
+    assert_eq!(ok(&mut ctx, &session, "querySelectorAll",
+        json!({"nodeId":right,"selector":":scope > .hit"})).await["nodeIds"], json!([right_hit]));
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":left,"selector":"#right-hit"})).await["nodeId"], 0);
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":left,"selector":"#left"})).await["nodeId"], 0);
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":shadow_nid,"selector":".hit"})).await["nodeId"], shadow_hit);
+    assert_eq!(ok(&mut ctx, &session, "querySelectorAll",
+        json!({"nodeId":shadow_nid,"selector":".hit"})).await["nodeIds"], json!([shadow_hit]));
+    assert_eq!(ok(&mut ctx, &session, "querySelector",
+        json!({"nodeId":left,"selector":"#shadow-hit"})).await["nodeId"], 0);
+    assert_eq!(ok(&mut ctx, &session, "querySelectorAll",
+        json!({"nodeId":0,"selector":".hit"})).await["nodeIds"], json!([left_hit, right_hit]));
+
+    for node_id in [json!(999999), json!(4294967297u64), json!("invalid"),
+        json!(-1), json!(1.5), json!(null), json!(true)] {
+        for method in ["querySelector", "querySelectorAll"] {
+            assert!(call(&mut ctx, &session, method,
+                json!({"nodeId":node_id,"selector":".hit"})).await.error.is_some(),
+                "invalid nodeId should be rejected for {method}");
+        }
+    }
+    for method in ["querySelector", "querySelectorAll"] {
+        assert!(call(&mut ctx, &session, method,
+            json!({"nodeId":right,"selector":"["})).await.error.is_some(),
+            "invalid selectors must not become empty results for {method}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn dom_attributes_preserve_qualified_names_and_reject_invalid_nodes() {
     let (mut ctx, session, _) = fixture().await;
     let node = ok(&mut ctx, &session, "querySelector", json!({"selector":"#lab"})).await["nodeId"].clone();

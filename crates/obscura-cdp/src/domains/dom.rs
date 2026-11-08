@@ -32,6 +32,18 @@ fn node_id_param(params: &Value) -> Result<NodeId, String> {
         .map(NodeId::new).ok_or_else(|| "valid nodeId required".into())
 }
 
+// CDP DOM.querySelector* searches descendants of the requested node, not the
+// whole document. Keep the historic omitted/zero nodeId fallback for clients
+// that have not requested a DOM document yet.
+fn query_root(dom: &DomTree, params: &Value) -> Result<NodeId, String> {
+    let Some(raw) = params.get("nodeId") else { return Ok(dom.document()) };
+    if raw.as_u64() == Some(0) { return Ok(dom.document()); }
+    let id = raw.as_u64().and_then(|id| u32::try_from(id).ok())
+        .map(NodeId::new).ok_or("Invalid nodeId")?;
+    if dom.get_node(id).is_none() { return Err("No node with given id found".into()); }
+    Ok(id)
+}
+
 fn push_children(dom: &DomTree, state: &mut DomDocument, node: NodeId, depth: u32,
     session_id: &Option<String>, events: &mut Vec<CdpEvent>) {
     let mut pending = vec![(node, depth.min(MAX_SERIALIZE_DEPTH))];
@@ -104,6 +116,23 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
         return Ok(nid as u64);
     }
     Err("nodeId, backendNodeId, or objectId required".to_string())
+}
+
+async fn run_file_input_command(page: &mut Page, function: &str, object_id: Option<&str>,
+    specs: Value, validate_only: bool) -> Result<(), String> {
+    let specs = serde_json::to_string(&specs).map_err(|error| error.to_string())?;
+    let command = format!("function() {{ return ({function}).call(this, {specs}, {validate_only}); }}");
+    let result = page.call_function_on_for_cdp_with_timeout(&command, object_id,
+        &[], true, false, 30_000).await?;
+    if result.thrown {
+        return Err(format!("Could not set input files: {}", result.description));
+    }
+    match result.value.as_ref().and_then(Value::as_str) {
+        Some("ok") => Ok(()),
+        Some("missing") => Err("Could not find node with given id".into()),
+        Some("invalid") => Err("Node is not a file input element".into()),
+        _ => Err("Could not set files on the input element".into()),
+    }
 }
 
 /// Standard base64 (with padding). Used to ferry file bytes to the JS layer for
@@ -269,19 +298,17 @@ pub async fn handle(
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
             let result = page.with_dom(|dom| {
-                dom.query_selector(selector).ok().flatten().map(|id| id.index()).unwrap_or(0)
-            }).unwrap_or(0);
-            Ok(json!({ "nodeId": result }))
+                dom.query_selector_from(query_root(dom, params)?, selector)
+            }).ok_or("No DOM loaded")??;
+            Ok(json!({ "nodeId": result.map(|id| id.index()).unwrap_or(0) }))
         }
         "querySelectorAll" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
             let ids = page.with_dom(|dom| {
-                dom.query_selector_all(selector).ok()
-                    .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            }).unwrap_or_default();
-            Ok(json!({ "nodeIds": ids }))
+                dom.query_selector_all_from(query_root(dom, params)?, selector)
+            }).ok_or("No DOM loaded")??;
+            Ok(json!({ "nodeIds": ids.iter().map(|id| id.index()).collect::<Vec<_>>() }))
         }
         "getOuterHTML" => {
             // go-rod asks for the HTML of an element handle it already holds and
@@ -289,6 +316,13 @@ pub async fn handle(
             // accepts all three identifiers here; accepting nodeId alone made
             // every rod page.HTML() fail with "nodeId required".
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            if params["nodeId"].as_u64().is_none() && params["backendNodeId"].as_u64().is_none() {
+                if let Some(object_id) = params["objectId"].as_str() {
+                    let html = page.js.as_mut().ok_or("No JS runtime")?
+                        .with_remote_dom_node(object_id, |dom, node_id, _, _, _| dom.outer_html(node_id))?;
+                    return Ok(json!({"outerHTML":html}));
+                }
+            }
             let node_id = resolve_node_id(page, params)?;
             let html = page.with_dom(|dom| {
                 dom.outer_html(NodeId::new(node_id as u32))
@@ -298,6 +332,36 @@ pub async fn handle(
         "describeNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
+            if params["nodeId"].as_u64().is_none() && params["backendNodeId"].as_u64().is_none() {
+                if let Some(object_id) = params["objectId"].as_str() {
+                    let page_frame_id = page.frame_id.clone();
+                    let node = page.js.as_mut().ok_or("No JS runtime")?
+                        .with_remote_dom_node(object_id, |dom, node_id, frame_id, url, base| {
+                            let mut node = serialize_node(dom, node_id, depth as u32, 0);
+                            let document_element = dom.children(dom.document()).into_iter().find(|id| {
+                                dom.with_node(*id, |node| matches!(node.data, NodeData::Element { .. }))
+                                    == Some(true)
+                            }).map(|id| id.index() as u64);
+                            let protocol_frame = if frame_id == 0 { page_frame_id.clone() }
+                                else { super::page::child_frame_id(&page_frame_id, frame_id) };
+                            let mut pending = vec![&mut node];
+                            while let Some(node) = pending.pop() {
+                                if node["nodeType"] == 9 {
+                                    node["documentURL"] = json!(url);
+                                    node["baseURL"] = json!(base);
+                                }
+                                if document_element.is_some() && node["backendNodeId"].as_u64() == document_element {
+                                    node["frameId"] = json!(protocol_frame);
+                                }
+                                if let Some(children) = node["children"].as_array_mut() {
+                                    pending.extend(children.iter_mut());
+                                }
+                            }
+                            node
+                        })?;
+                    return Ok(json!({"node":node}));
+                }
+            }
 
             let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
@@ -429,12 +493,39 @@ pub async fn handle(
             if !page.context.allow_file_access {
                 return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
             }
-            let node_id = resolve_node_id(page, params)?;
-            let paths: Vec<String> = params
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            let files = params.get("files").and_then(Value::as_array)
+                .ok_or("DOM.setFileInputFiles requires a files array")?;
+            let paths: Vec<&str> = files.iter().map(|file| file.as_str()
+                .ok_or_else(|| "DOM.setFileInputFiles requires string file paths".to_string()))
+                .collect::<Result<_, _>>()?;
+            // Keep remote handles intact: a child-frame node's numeric id
+            // belongs to its own DOM, not the page's root DOM.
+            let (object_id, receiver) = if params.get("nodeId").is_some()
+                || params.get("backendNodeId").is_some() {
+                let node_id = params.get("nodeId").or_else(|| params.get("backendNodeId"))
+                    .and_then(Value::as_u64).ok_or("valid nodeId or backendNodeId required")?;
+                let exists = u32::try_from(node_id).ok().and_then(|id| {
+                    page.with_dom(|dom| dom.get_node(NodeId::new(id)).is_some())
+                }).unwrap_or(false);
+                if !exists { return Err("Could not find node with given id".into()); }
+                (None, format!("globalThis._wrap({node_id})"))
+            } else {
+                let object_id = params.get("objectId").and_then(Value::as_str)
+                    .ok_or("nodeId, backendNodeId, or objectId required")?;
+                (Some(object_id), "this".to_string())
+            };
+            let function = format!(
+                "function(specs, validateOnly) {{\
+                    var el = {receiver};\
+                    if (!el || !el.nodeType) return 'missing';\
+                    var owner = el.ownerDocument && el.ownerDocument.defaultView || globalThis;\
+                    if (typeof owner.__obscura_setInputFiles !== 'function')\
+                        throw new Error('File input helper unavailable');\
+                    return owner.__obscura_setInputFiles(el, specs, validateOnly) === true\
+                        ? 'ok' : (validateOnly ? 'invalid' : 'failed');\
+                }}"
+            );
+            run_file_input_command(page, &function, object_id, json!([]), true).await?;
 
             let mut specs = Vec::with_capacity(paths.len());
             for p in &paths {
@@ -448,13 +539,7 @@ pub async fn handle(
                 specs.push(json!({ "name": name, "type": guess_mime(p), "b64": encode_base64(&bytes) }));
             }
 
-            let specs_json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
-            let code = format!(
-                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
-                 if (el && globalThis.__obscura_setInputFiles) {{ globalThis.__obscura_setInputFiles(el, {1}); return true; }} return false; }})()",
-                node_id, specs_json
-            );
-            let _ = page.evaluate(&code);
+            run_file_input_command(page, &function, object_id, json!(specs), false).await?;
             Ok(json!({}))
         }
         "getBoxModel" => {
