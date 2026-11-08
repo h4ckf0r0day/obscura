@@ -120,6 +120,11 @@ standards mode without requiring a doctype and honors script-disabled
 Sandboxed `srcdoc` enforces opaque document access and script disabling,
 including inherited restrictions on nested frames. This does not implement
 every HTML sandbox policy. Frame module scripts remain unsupported.
+CDP `DOM.describeNode` and `DOM.getOuterHTML` resolve remote node handles in
+their native owning document, including handles obtained through the parent.
+The document element carries that document's protocol frame ID, so Playwright
+can discover an element handle's owner frame. Retired frame handles fail
+instead of reading a same-numbered node in the main document.
 Child-frame CDP evaluation routing and iframe content compositing remain
 separate compatibility gaps; loading a document does not establish support
 for Playwright frame locators or iframe screenshot fidelity.

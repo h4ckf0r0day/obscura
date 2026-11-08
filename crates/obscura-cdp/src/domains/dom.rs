@@ -306,6 +306,13 @@ pub async fn handle(
             // accepts all three identifiers here; accepting nodeId alone made
             // every rod page.HTML() fail with "nodeId required".
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            if params["nodeId"].as_u64().is_none() && params["backendNodeId"].as_u64().is_none() {
+                if let Some(object_id) = params["objectId"].as_str() {
+                    let html = page.js.as_mut().ok_or("No JS runtime")?
+                        .with_remote_dom_node(object_id, |dom, node_id, _, _, _| dom.outer_html(node_id))?;
+                    return Ok(json!({"outerHTML":html}));
+                }
+            }
             let node_id = resolve_node_id(page, params)?;
             let html = page.with_dom(|dom| {
                 dom.outer_html(NodeId::new(node_id as u32))
@@ -315,6 +322,36 @@ pub async fn handle(
         "describeNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
+            if params["nodeId"].as_u64().is_none() && params["backendNodeId"].as_u64().is_none() {
+                if let Some(object_id) = params["objectId"].as_str() {
+                    let page_frame_id = page.frame_id.clone();
+                    let node = page.js.as_mut().ok_or("No JS runtime")?
+                        .with_remote_dom_node(object_id, |dom, node_id, frame_id, url, base| {
+                            let mut node = serialize_node(dom, node_id, depth as u32, 0);
+                            let document_element = dom.children(dom.document()).into_iter().find(|id| {
+                                dom.with_node(*id, |node| matches!(node.data, NodeData::Element { .. }))
+                                    == Some(true)
+                            }).map(|id| id.index() as u64);
+                            let protocol_frame = if frame_id == 0 { page_frame_id.clone() }
+                                else { super::page::child_frame_id(&page_frame_id, frame_id) };
+                            let mut pending = vec![&mut node];
+                            while let Some(node) = pending.pop() {
+                                if node["nodeType"] == 9 {
+                                    node["documentURL"] = json!(url);
+                                    node["baseURL"] = json!(base);
+                                }
+                                if document_element.is_some() && node["backendNodeId"].as_u64() == document_element {
+                                    node["frameId"] = json!(protocol_frame);
+                                }
+                                if let Some(children) = node["children"].as_array_mut() {
+                                    pending.extend(children.iter_mut());
+                                }
+                            }
+                            node
+                        })?;
+                    return Ok(json!({"node":node}));
+                }
+            }
 
             let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
