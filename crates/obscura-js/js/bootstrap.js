@@ -4985,7 +4985,8 @@ class Element extends Node {
     const tag = this.localName;
     if (tag === 'select') {
       // Selected option wins; otherwise first option (HTML default).
-      const opts = this.querySelectorAll('option');
+      const opts = this.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        ? _selectOptions(this) : this.querySelectorAll('option');
       for (let i = 0; i < opts.length; i++) {
         if (opts[i].selected) {
           return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
@@ -5038,7 +5039,8 @@ class Element extends Node {
       // itself. Dispatching here fed pages that assign inside a change
       // handler back into that handler in an infinite loop.
       const wanted = String(v);
-      const opts = this.querySelectorAll('option');
+      const opts = this.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        ? _selectOptions(this) : this.querySelectorAll('option');
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
@@ -5506,24 +5508,27 @@ class Element extends Node {
   }
   get options() {
     if (this.localName !== 'select') return [];
-    return HTMLCollection._from(this.querySelectorAll('option'));
+    return HTMLCollection._from(this.namespaceURI === 'http://www.w3.org/1999/xhtml'
+      ? _selectOptions(this) : this.querySelectorAll('option'));
   }
   add(item, before = null) {
-    if (this.localName !== 'select') {
-      throw new TypeError("Illegal invocation");
-    }
-    if (!item || item.nodeType !== 1
+    _selectApply(_validateSelect, this, []);
+    if (!_isDomNode(item) || item.nodeType !== 1
+        || item.namespaceURI !== 'http://www.w3.org/1999/xhtml'
         || (item.localName !== 'option' && item.localName !== 'optgroup')) {
       throw new TypeError("Failed to execute 'add' on 'HTMLSelectElement': parameter 1 is not of type 'HTMLOptionElement' or 'HTMLOptGroupElement'.");
     }
-    if (typeof before === 'number') {
-      const reference = this.options[before] || null;
-      this.insertBefore(item, reference);
-    } else if (before == null) {
-      this.appendChild(item);
-    } else {
-      this.insertBefore(item, before);
+    let reference = before;
+    if (before !== null && !(_isDomNode(before) && before.nodeType === 1
+        && before.namespaceURI === 'http://www.w3.org/1999/xhtml')) {
+      const index = +before | 0;
+      reference = _selectOptions(this)[index] || null;
     }
+    if (reference && (reference === this || !this.contains(reference))) {
+      throw new DOMException("The reference node is not a descendant of this select.", "NotFoundError");
+    }
+    const parent = reference ? reference.parentNode : this;
+    parent.insertBefore(item, reference);
   }
   get selectedIndex() {
     const opts = this.options;
@@ -7331,6 +7336,7 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+const _selectCacheGet = Map.prototype.get.bind(_cache);
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -14445,7 +14451,6 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
@@ -14545,7 +14550,6 @@ globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
   assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
   assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
 };
-globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
@@ -14562,6 +14566,7 @@ for (const [name, tags] of Object.entries({
   HTMLMeterElement: ['meter'], HTMLModElement: ['del', 'ins'], HTMLObjectElement: ['object'],
   HTMLOptGroupElement: ['optgroup'], HTMLOutputElement: ['output'], HTMLParamElement: ['param'],
   HTMLPictureElement: ['picture'], HTMLQuoteElement: ['blockquote', 'q'], HTMLSourceElement: ['source'],
+  HTMLSelectElement: ['select'], HTMLOptionElement: ['option'],
   HTMLTableElement: ['table'], HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
   HTMLTableColElement: ['col', 'colgroup'], HTMLTableRowElement: ['tr'],
   HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
@@ -14584,6 +14589,134 @@ for (const [name, tags] of Object.entries({
     _additionalHtmlElementClasses[tag.toUpperCase()] = Interface;
   }
 }
+
+const _selectApply = Reflect.apply;
+const _selectElementRemove = Element.prototype.remove;
+function _selectTagIsValid(nid) {
+  const info = _domParse('tag_name', nid, 'interface');
+  return typeof info === 'string' ? info === 'SELECT'
+    : !!info && info[1] === 'http://www.w3.org/1999/xhtml' && info[2] === 'select';
+}
+function _validateSelectMember() {
+  const nid = this && this._nid;
+  return !!this && _selectCacheGet(nid) === this && _selectTagIsValid(nid);
+}
+function _validateSelect() {
+  const nid = this && this._nid;
+  if (!this || _selectCacheGet(nid) !== this) {
+    const member = this && _documentRealmMember(this, 'validateSelect');
+    if (member && member !== _validateSelectMember && _selectApply(member, this, [])) return;
+    throw new TypeError('Illegal invocation');
+  }
+  if (!_selectTagIsValid(nid)) throw new TypeError('Illegal invocation');
+}
+function _selectOptionsMember() {
+  const nid = this && this._nid;
+  if (!this || _selectCacheGet(nid) !== this) return null;
+  const ids = _domParse('select_options', nid);
+  return ids === null ? null : ids.map(_wrapEl);
+}
+function _selectOptions(select) {
+  const nid = select && select._nid;
+  if (!select || _selectCacheGet(nid) !== select) {
+    const member = select && _documentRealmMember(select, 'selectOptions');
+    if (member && member !== _selectOptionsMember) {
+      const options = _selectApply(member, select, []);
+      if (options !== null) return options;
+    }
+    throw new TypeError('Illegal invocation');
+  }
+  const ids = _domParse('select_options', nid);
+  if (ids === null) throw new TypeError('Illegal invocation');
+  return ids.map(_wrapEl);
+}
+function _optionIndexMember() {
+  const nid = this && this._nid;
+  return this && _selectCacheGet(nid) === this ? _domParse('option_index', nid) : null;
+}
+function _optionIndexGetter() {
+  const nid = this && this._nid;
+  if (!this || _selectCacheGet(nid) !== this) {
+    const member = this && _documentRealmMember(this, 'optionIndex');
+    if (member && member !== _optionIndexMember) {
+      const index = _selectApply(member, this, []);
+      if (index !== null) return index;
+    }
+    throw new TypeError('Illegal invocation');
+  }
+  const index = _domParse('option_index', nid);
+  if (index === null) throw new TypeError('Illegal invocation');
+  return index;
+}
+Object.defineProperties(HTMLSelectElement.prototype, {
+  length: {
+    get() { return _selectOptions(this).length; },
+    set(value) {
+      _selectApply(_validateSelect, this, []);
+      const length = +value >>> 0;
+      if (length > 100000) {
+        console.warn("Failed to set the 'length' property on 'HTMLSelectElement': maximum supported length is 100000.");
+        return;
+      }
+      const options = _selectOptions(this);
+      for (let i = options.length - 1; i >= length; i--) {
+        _selectApply(_selectElementRemove, options[i], []);
+      }
+      for (let i = options.length; i < length; i++) {
+        this.appendChild(this.ownerDocument.createElement('option'));
+      }
+    },
+    configurable: true, enumerable: true,
+  },
+  item: {
+    value: function item(index) {
+      _selectApply(_validateSelect, this, []);
+      if (!arguments.length) throw new TypeError("Failed to execute 'item' on 'HTMLSelectElement': 1 argument required.");
+      index = +index >>> 0;
+      return _selectOptions(this)[index] || null;
+    },
+    writable: true, configurable: true, enumerable: true,
+  },
+  namedItem: {
+    value: function namedItem(name) {
+      _selectApply(_validateSelect, this, []);
+      if (!arguments.length) throw new TypeError("Failed to execute 'namedItem' on 'HTMLSelectElement': 1 argument required.");
+      if (typeof name === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+      name = String(name);
+      if (!name) return null;
+      for (const option of _selectOptions(this)) {
+        if (option.id === name || option.getAttribute('name') === name) return option;
+      }
+      return null;
+    },
+    writable: true, configurable: true, enumerable: true,
+  },
+  remove: {
+    value: function remove(index = undefined) {
+      _selectApply(_validateSelect, this, []);
+      if (!arguments.length) {
+        return _selectApply(_selectElementRemove, this, []);
+      }
+      index = +index | 0;
+      const option = _selectOptions(this)[index];
+      if (option) _selectApply(_selectElementRemove, option, []);
+    },
+    writable: true, configurable: true, enumerable: true,
+  },
+});
+Object.defineProperty(HTMLSelectElement, 'length', {value: 0, configurable: true});
+Object.defineProperty(HTMLOptionElement, 'length', {value: 0, configurable: true});
+Object.defineProperty(_optionIndexGetter, 'name', {value: 'get index', configurable: true});
+Object.defineProperty(HTMLOptionElement.prototype, 'index', {
+  get: _optionIndexGetter, configurable: true, enumerable: true,
+});
+for (const name of ['length', 'item', 'namedItem', 'remove']) {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, name);
+  for (const method of [descriptor.get, descriptor.set, descriptor.value]) {
+    if (method) _markNative(method);
+  }
+}
+_markNative(_optionIndexGetter);
 
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
@@ -18921,6 +19054,9 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['selectOptions', _selectOptionsMember],
+  ['validateSelect', _validateSelectMember],
+  ['optionIndex', _optionIndexMember],
   ['windowOrigin', _windowOriginDescriptor.get],
   ['setWindowOrigin', _windowOriginDescriptor.set],
 ]));

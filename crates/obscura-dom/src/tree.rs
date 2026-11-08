@@ -1280,11 +1280,7 @@ impl DomTree {
     /// HTML table rows: header sections first, body/direct rows in tree order,
     /// and footer sections last. Nested tables do not contribute rows.
     pub fn table_rows(&self, table: NodeId) -> Option<Vec<NodeId>> {
-        let html_tag = |id| self.with_node(id, |node| {
-            node.as_element().filter(|name| {
-                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-            }).map(|name| name.local.clone())
-        }).flatten();
+        let html_tag = |id| self.html_element_local_name(id);
         if html_tag(table).as_ref().map(|tag| tag.as_ref()) != Some("table") {
             return None;
         }
@@ -1307,6 +1303,60 @@ impl DomTree {
         head.extend(body);
         head.extend(foot);
         Some(head)
+    }
+
+    fn html_element_local_name(&self, id: NodeId) -> Option<LocalName> {
+        self.with_node(id, |node| {
+            node.as_element().filter(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+            }).map(|name| name.local.clone())
+        }).flatten()
+    }
+
+    /// Options owned by this select, excluding nested select, datalist and
+    /// option subtrees rather than treating every descendant as an option.
+    pub fn select_options(&self, select: NodeId) -> Option<Vec<NodeId>> {
+        if self.html_element_local_name(select).as_ref().map(|name| name.as_ref()) != Some("select") {
+            return None;
+        }
+        let mut options = Vec::new();
+        let mut pending: Vec<_> = self.children(select).into_iter().rev().collect();
+        let mut remaining = self.node_slot_count();
+        while let Some(node) = pending.pop() {
+            if remaining == 0 {
+                eprintln!("obscura: select-options traversal cap hit - tree has a cycle");
+                return None;
+            }
+            remaining -= 1;
+            match self.html_element_local_name(node).as_ref().map(|name| name.as_ref()) {
+                Some("option") => options.push(node),
+                Some("select" | "datalist") => {},
+                _ => pending.extend(self.children(node).into_iter().rev()),
+            }
+        }
+        Some(options)
+    }
+
+    pub fn option_index(&self, option: NodeId) -> Option<usize> {
+        if self.html_element_local_name(option).as_ref().map(|name| name.as_ref()) != Some("option") {
+            return None;
+        }
+        let mut parent = self.with_node(option, |node| node.parent).flatten();
+        let mut remaining = self.node_slot_count();
+        while let Some(node) = parent {
+            if remaining == 0 {
+                eprintln!("obscura: option-index traversal cap hit - tree has a cycle");
+                return None;
+            }
+            remaining -= 1;
+            match self.html_element_local_name(node).as_ref().map(|name| name.as_ref()) {
+                Some("select") => return self.select_options(node)
+                    .map(|options| options.iter().position(|id| *id == option).unwrap_or(0)),
+                Some("datalist" | "option") => return Some(0),
+                _ => parent = self.with_node(node, |node| node.parent).flatten(),
+            }
+        }
+        Some(0)
     }
 
     /// Snapshot the direct children of `host`'s shadow root. Ordinary
@@ -2108,6 +2158,63 @@ mod tests {
         assert_eq!(tree.table_rows(table), Some(vec![expected[1], direct, expected[2], expected[0]]));
         assert_eq!(tree.table_rows(foreign), None);
         assert_eq!(tree.table_rows(NodeId::new(u32::MAX)), None);
+    }
+
+    #[test]
+    fn select_options_follow_native_ownership_boundaries() {
+        let tree = DomTree::new();
+        let select = element(&tree, "select");
+        let first = element(&tree, "option");
+        tree.append_child(select, first);
+        let mut included = vec![first];
+        for tag in ["div", "optgroup", "select", "datalist", "option"] {
+            let parent = element(&tree, tag);
+            let option = element(&tree, "option");
+            tree.append_child(select, parent);
+            tree.append_child(parent, option);
+            match tag {
+                "div" | "optgroup" => included.push(option),
+                "option" => included.push(parent),
+                _ => {},
+            }
+            let expected = if tag == "div" { 1 } else if tag == "optgroup" { 2 } else { 0 };
+            assert_eq!(tree.option_index(option), Some(expected));
+            if tag == "select" { assert_eq!(tree.select_options(parent), Some(vec![option])); }
+        }
+        let foreign = tree.new_node(NodeData::Element {
+            name: QualName::new(None, Namespace::from("urn:foreign"), LocalName::from("select")),
+            attrs: vec![], template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        let foreign_child = element(&tree, "option");
+        tree.append_child(select, foreign);
+        tree.append_child(foreign, foreign_child);
+        included.push(foreign_child);
+        assert_eq!(tree.select_options(select), Some(included.clone()));
+        assert_eq!(tree.option_index(foreign_child), Some(4));
+        tree.detach(first);
+        included.remove(0);
+        assert_eq!(tree.select_options(select), Some(included));
+        assert_eq!(tree.option_index(first), Some(0));
+        assert_eq!(tree.option_index(foreign_child), Some(3));
+        assert_eq!(tree.select_options(foreign), None);
+        assert_eq!(tree.option_index(select), None);
+        assert_eq!(tree.select_options(NodeId::new(u32::MAX)), None);
+        assert_eq!(tree.option_index(NodeId::new(u32::MAX)), None);
+    }
+
+    #[test]
+    fn select_options_and_indexes_bound_broken_cycles() {
+        let tree = DomTree::new();
+        let select = element(&tree, "select");
+        let container = element(&tree, "div");
+        let option = element(&tree, "option");
+        tree.append_child(select, container);
+        tree.append_child(container, option);
+        tree.with_node_mut(container, |node| node.first_child = Some(container));
+        assert_eq!(tree.select_options(select), None);
+        tree.with_node_mut(container, |node| node.parent = Some(container));
+        assert_eq!(tree.option_index(option), None);
     }
 
     #[test]

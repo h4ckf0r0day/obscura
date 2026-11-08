@@ -2714,6 +2714,16 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 rows.into_iter().map(|row| row.index()).collect::<Vec<_>>()
             })).to_string()
         }
+        "select_options" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.select_options(nid).map(|options| {
+                options.into_iter().map(|option| option.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "option_index" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.option_index(nid)).to_string()
+        }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom

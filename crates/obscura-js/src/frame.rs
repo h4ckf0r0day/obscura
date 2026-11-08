@@ -551,6 +551,39 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_select_and_option_methods_keep_the_owning_dom() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><select id='parent'><option>Parent</option></select></body></html>");
+        let _frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option></optgroup></select></body></html>").unwrap();
+        assert_eq!(parent.evaluate(r#"(() => {
+            const select = globalThis.__obscura_frameObjects[1].document.querySelector('select');
+            const length = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'length');
+            const index = Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, 'index').get;
+            const item = HTMLSelectElement.prototype.item.call(select, 1);
+            const named = HTMLSelectElement.prototype.namedItem.call(select, 'b');
+            const initial = [length.get.call(select), item.id, named === item, index.call(item)];
+            length.set.call(select, 3);
+            HTMLSelectElement.prototype.remove.call(select, 0);
+            const changed = [select.length, select.item(0).id, index.call(item)];
+            const div = select.ownerDocument.createElement('div');
+            const rejected = [() => length.get.call(div), () => length.set.call(div, 1),
+                () => HTMLSelectElement.prototype.item.call(div, 0),
+                () => HTMLSelectElement.prototype.namedItem.call(div, ''),
+                () => HTMLSelectElement.prototype.remove.call(div), () => index.call(div)].map(call => {
+                    try { call(); return false; } catch (error) { return error instanceof TypeError; }
+                });
+            HTMLSelectElement.prototype.remove.call(select);
+            return {initial, changed, rejected, childConnected:select.isConnected,
+                parent:[document.getElementById('parent').length, document.querySelector('option').textContent]};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[2,"b",true,1], "changed":[2,"b",0], "rejected":[true,true,true,true,true,true],
+            "childConnected":false,
+            "parent":[1,"Parent"],
+        }));
+    }
+
+    #[test]
     fn borrowed_style_getter_keeps_the_elements_declaration() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let _frame = FrameRealm::new(&mut parent, 1, 0,
