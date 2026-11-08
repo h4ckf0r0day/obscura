@@ -161,8 +161,16 @@ continues to resolve the separate beforeunload confirmation from `Page.close`.
 `HTMLTableElement.rows` is a live, read-only HTMLCollection. Native traversal
 orders header rows first, body/direct rows next, and footer rows last, excluding
 nested tables and foreign namespaces. Reads reuse the collection until a DOM
-mutation invalidates its row snapshot. This also supports Playwright's implicit
-table-header role calculation; it does not add the other missing table APIs.
+mutation invalidates its row snapshot. Section `rows`, row `cells`, and table
+`tBodies` share this cached, owning-realm collection implementation. Native
+indices exclude nested tables and foreign namespaces. Table section access,
+row/cell insertion and deletion, and `createTBody` preserve their actual DOM
+parents and invalidate retained collections through ordinary DOM mutations.
+This also supports Playwright's implicit table-header role calculation.
+These collections retain the existing `rows` write-rejection behavior: indexed
+and supported named assignments/redefinitions are rejected without changing
+the collection. Chromium instead reports success for ignored writes, including
+ignored nonconfigurable redefinitions; that reflection difference remains.
 Wrapper classification keeps canonical HTML names on a single scalar native
 read; prefixed or foreign names include namespace/local-name metadata in that
 same read. Table construction and parser/wrapper workloads are covered by the
@@ -175,8 +183,19 @@ contribute options to the outer select. Numeric insertion targets retain their
 actual optgroup parent. Length assignments above 100,000 are rejected with a
 warning rather than attempting unbounded allocation. These APIs also support
 borrowed methods on child-realm nodes. Select collections still use the existing
-snapshot HTMLCollection implementation; indexed properties on the select itself
-and the remaining table construction APIs are separate work.
+snapshot HTMLCollection implementation. Numeric select access uses V8 indexed
+handlers, not a Proxy around ordinary DOM properties. Fresh selects allocate the
+native wrapper directly; custom-element upgrades retain that same wrapper.
+Select-only constructor state is isolated from ordinary HTML interface constructors.
+The private derived constructor initializes the predeclared node slot in JavaScript
+without allocating a discarded JavaScript element or setting each node through V8's C API.
+Indexed reads reuse option
+snapshots keyed by the native form mutation generation. Assignments replace or
+remove the actual option and fill gaps with blank options. Non-null assignments
+past the same 100,000 option limit throw RangeError. Supported indices remain
+configurable and writable in reflection, while deletion is rejected and
+redefinition uses the platform indexed setter. Named getters and existing select
+methods retain their ordinary lookup paths.
 
 CDP `DOM.querySelector` and `DOM.querySelectorAll` search descendants of the
 requested node, including explicit shadow roots, without crossing into sibling

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Interleaved latency, CPU, peak-RSS, and result-correctness comparison."""
+"""Interleaved latency, CPU, peak-RSS, and result-correctness comparison.
+
+Linux wait4 supplies precise CPU and peak RSS for the timeout-guarded process tree.
+"""
 
 from __future__ import annotations
 
@@ -55,6 +58,30 @@ SCENARIOS = {
         "(() => {document.body.innerHTML='<table><tr><td>row</td></tr></table>'.repeat(5000);return document.querySelectorAll('table').length})()",
         5000,
     ),
+    "table-rows-hot": (
+        "(() => {document.body.innerHTML='<table><thead><tr><th>head</th></tr></thead><tbody>'+'<tr><td>body</td></tr>'.repeat(100)+'</tbody></table>';const t=document.querySelector('table'),first=t.rows[0];let n=0;for(let i=0;i<1000000;i++){const rows=t.rows;if(rows[0]===first)n+=rows.length;}return n})()",
+        101000000,
+    ),
+    "table-cells-hot": (
+        "(() => {document.body.innerHTML='<table><tbody>'+'<tr><td>A</td><td>B</td><td>C</td></tr>'.repeat(100)+'</tbody></table>';const row=document.querySelector('tr');let n=0;for(let i=0;i<100000;i++){const cells=row.cells||row.children;n+=cells.length;if(cells[0].textContent==='A')n++;}return n})()",
+        400000,
+    ),
+    "select-create-wrap": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(5000);return document.querySelectorAll('select').length})()",
+        5000,
+    ),
+    "select-create-wrap-50k": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>'.repeat(50000);return document.querySelectorAll('select').length})()",
+        50000,
+    ),
+    "select-item-or-index-hot": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select'),first=s.item(0),indexed='0' in s;let n=0;for(let i=0;i<1000000;i++)if((indexed?s[0]:s.item(0))===first)n++;return n})()",
+        1000000,
+    ),
+    "select-existing-getters-hot": (
+        "(() => {document.body.innerHTML='<select><option>A</option><option>B</option></select>';const s=document.querySelector('select');let n=0;for(let i=0;i<1000000;i++)n+=s.length;return n})()",
+        2000000,
+    ),
     "form-elements-owned": (
         "(() => {document.body.innerHTML='<form id=f>'+'<input name=inside>'.repeat(1000)+'</form>';const f=document.getElementById('f');let n=0;for(let i=0;i<200;i++)n+=f.elements.length;return n})()",
         200000,
@@ -102,8 +129,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[float, int, float]:
-    with tempfile.NamedTemporaryFile(prefix="obscura-rss-", delete=False) as rss_file:
-        rss_path = Path(rss_file.name)
     with tempfile.NamedTemporaryFile(prefix="obscura-stdout-", delete=False) as stdout_file:
         stdout_path = Path(stdout_file.name)
     with tempfile.NamedTemporaryFile(prefix="obscura-stderr-", delete=False) as stderr_file:
@@ -117,11 +142,6 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         "--fsize=2097152",
         "--nofile=256",
         "--",
-        "/usr/bin/time",
-        "-f",
-        "%U %S %M",
-        "-o",
-        str(rss_path),
         str(binary),
         "fetch",
         url,
@@ -144,8 +164,9 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
                 start_new_session=True,
             )
             try:
-                # A Python timeout wait polls exits in steps up to 50 ms.
-                process.wait()
+                # Linux wait4 keeps precise CPU counters for the guarded process tree.
+                _, status, usage = os.wait4(process.pid, 0)
+                process.returncode = os.waitstatus_to_exitcode(status)
             finally:
                 # Remove background descendants left by an untrusted candidate binary.
                 try:
@@ -156,9 +177,9 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
         elapsed_ms = (time.perf_counter() - started) * 1000
         if process.returncode != 0:
             raise RuntimeError(f"{binary} exited with status {process.returncode}")
-        user, system, peak = rss_path.read_text(encoding="ascii").split()
-        cpu_seconds, rss_kib = float(user) + float(system), int(peak)
-        if not math.isfinite(cpu_seconds) or float(user) < 0 or float(system) < 0 or rss_kib <= 0:
+        cpu_seconds = usage.ru_utime + usage.ru_stime
+        rss_kib = usage.ru_maxrss
+        if not math.isfinite(cpu_seconds) or usage.ru_utime < 0 or usage.ru_stime < 0 or rss_kib <= 0:
             raise RuntimeError(f"{binary} produced an invalid CPU/RSS measurement")
         try:
             result = json.loads(stdout_path.read_text(encoding="utf-8"))
@@ -170,7 +191,6 @@ def run_once(binary: Path, url: str, expression: str, expected: int) -> tuple[fl
             )
         return elapsed_ms, rss_kib, cpu_seconds
     finally:
-        rss_path.unlink(missing_ok=True)
         stdout_path.unlink(missing_ok=True)
         stderr_path.unlink(missing_ok=True)
 
@@ -254,7 +274,7 @@ def main() -> None:
         }
         lines.append(
             f"| {scenario} | {base_latency:.1f} ms | {pr_latency:.1f} ms | "
-            f"{(latency_ratio - 1) * 100:+.1f}% | {base_cpu:.2f} s | {pr_cpu:.2f} s | {base_rss / 1024:.1f} MiB | "
+            f"{(latency_ratio - 1) * 100:+.1f}% | {base_cpu:.4f} s | {pr_cpu:.4f} s | {base_rss / 1024:.1f} MiB | "
             f"{pr_rss / 1024:.1f} MiB | {(rss_ratio - 1) * 100:+.1f}% |\n"
         )
         latency_delta = pr_latency - base_latency
@@ -265,7 +285,7 @@ def main() -> None:
         ):
             failures.append(f"{scenario} latency is {latency_ratio:.2f}x the base")
         if pr_cpu > base_cpu * CPU_FAILURE_RATIO and pr_cpu - base_cpu > CPU_FAILURE_DELTA_SECONDS + 1e-9:
-            failures.append(f"{scenario} CPU increased from {base_cpu:.2f} s to {pr_cpu:.2f} s")
+            failures.append(f"{scenario} CPU increased from {base_cpu:.4f} s to {pr_cpu:.4f} s")
         if rss_ratio > RSS_FAILURE_RATIO and rss_delta > RSS_FAILURE_DELTA_KIB:
             failures.append(f"{scenario} RSS is {rss_ratio:.2f}x the base")
 

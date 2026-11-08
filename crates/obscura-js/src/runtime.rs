@@ -5239,6 +5239,68 @@ mod tests {
     }
 
     #[test]
+    fn table_members_preserve_child_realm_collections_and_borrowed_methods() {
+        let mut rt = setup_runtime("<html><body><table><tr><td>Parent</td></tr></table></body></html>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><table><tr><th>Header</th></tr></table></body></html>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const table = child.querySelector('table'), body = table.tBodies[0], row = body.rows[0];
+            const cells = row.cells;
+            const outerGetter = Object.getOwnPropertyDescriptor(HTMLTableRowElement.prototype, 'cells').get;
+            const outerMethod = HTMLTableRowElement.prototype.insertCell;
+            const cell = outerMethod.call(row);
+            const branded = cells instanceof child.defaultView.HTMLCollection
+                && cell instanceof child.defaultView.HTMLTableCellElement;
+            const borrowed = outerGetter !== Object.getOwnPropertyDescriptor(child.defaultView.HTMLTableRowElement.prototype, 'cells').get
+                && outerGetter.call(row) === cells;
+            table.insertRow(0).insertCell();
+            const indices = [row.rowIndex, row.sectionRowIndex, cell.cellIndex];
+            row.deleteCell(0);
+            return [branded, borrowed, cells.length, indices, cell.cellIndex,
+                table.cloneNode(true).rows[1].cells.length, document.querySelector('td').textContent];
+        })()"#).unwrap(), serde_json::json!([true,true,1,[1,1,1],0,1,"Parent"]));
+    }
+
+    #[test]
+    fn native_select_factory_preserves_child_clones_and_custom_upgrade_identity() {
+        let mut rt = setup_runtime("<html><body><select id='custom' is='native-select'><option value='a'>A</option></select></body></html>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><select><option value='a'>A</option><option value='b'>B</option></select></body></html>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const select = child.querySelector('select'), option = child.createElement('option');
+            option.value = 'n'; select[0] = option;
+            const clone = select.cloneNode(true);
+            const childChecks = [select[0] === option,
+                select instanceof child.defaultView.HTMLSelectElement,
+                clone[0].value, clone[0] instanceof child.defaultView.HTMLOptionElement,
+                Object.getOwnPropertyDescriptor(select, '0').value === option,
+                Reflect.deleteProperty(select, '0')];
+            Reflect.defineProperty(select, '1', {value:null});
+            let strictDelete = false;
+            try { (function(){'use strict';delete select[0];})(); }
+            catch(e) { strictDelete = e instanceof TypeError; }
+            const retained = document.getElementById('custom');
+            retained.marker = 'retained';
+            class NativeSelect extends HTMLSelectElement {
+                constructor() { super(); this.upgraded = true; this[0].value = 'upgraded'; }
+            }
+            customElements.define('native-select', NativeSelect, {extends:'select'});
+            // Customized-built-in matching is separate from the existing upgrade mechanism.
+            customElements._upgradeElement(retained, NativeSelect);
+            const created = document.createElement('select');
+            created.appendChild(document.createElement('option'));
+            const foreign = document.createElementNS('urn:foreign', 'select');
+            return [childChecks, select.length, select[1] === undefined, strictDelete,
+                retained === document.getElementById('custom'), retained.marker,
+                retained.upgraded, retained instanceof NativeSelect, retained[0].value,
+                created[0] === created.item(0), '0' in foreign];
+        })()"#).unwrap(), serde_json::json!([[true,true,"n",true,true,false],
+            1,true,true,true,"retained",true,true,"upgraded",true,false]));
+    }
+
+    #[test]
     fn noninteractive_dialogs_do_not_accept_destructive_confirmation() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {

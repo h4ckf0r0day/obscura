@@ -2843,6 +2843,32 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 rows.into_iter().map(|row| row.index()).collect::<Vec<_>>()
             })).to_string()
         }
+        "table_interface" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.table_interface(nid)).to_string()
+        }
+        "table_head" | "table_foot" | "table_bodies" | "table_section_rows" | "table_row_cells" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let elements = match cmd.as_str() {
+                "table_head" => dom.table_sections(nid, "thead"),
+                "table_foot" => dom.table_sections(nid, "tfoot"),
+                "table_bodies" => dom.table_sections(nid, "tbody"),
+                "table_section_rows" => dom.table_section_rows(nid),
+                _ => dom.table_row_cells(nid),
+            };
+            serde_json::json!(elements.map(|elements| {
+                elements.into_iter().map(|element| element.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_row_index" | "table_section_row_index" | "table_cell_index" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let index = match cmd.as_str() {
+                "table_row_index" => dom.table_row_index(nid, false),
+                "table_section_row_index" => dom.table_row_index(nid, true),
+                _ => dom.table_cell_index(nid),
+            };
+            serde_json::json!(index).to_string()
+        }
         "select_options" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
             serde_json::json!(dom.select_options(nid).map(|options| {
@@ -7041,6 +7067,139 @@ pub(crate) fn document_realm<'s, 'i>(
     Some((owner, members))
 }
 
+fn select_index_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    object: v8::Local<'_, v8::Object>,
+    data: v8::Local<'_, v8::Value>,
+    field: u32,
+    args: &[v8::Local<'s, v8::Value>],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let data = v8::Local::new(scope, data);
+    let callback = v8::Local::<v8::Array>::try_from(data).ok()
+        .and_then(|values| values.get_index(scope, field))
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok());
+    let Some(callback) = callback else {
+        if let Some(message) = v8::String::new(scope, "Invalid native select") {
+            let error = v8::Exception::type_error(scope, message);
+            scope.throw_exception(error);
+        }
+        return None;
+    };
+    callback.call(scope, object.into(), args)
+}
+
+fn select_index_values<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    object: v8::Local<'_, v8::Object>,
+    data: v8::Local<'_, v8::Value>,
+) -> Option<v8::Local<'s, v8::Array>> {
+    let value = select_index_callback(scope, object, data, 0, &[])?;
+    if let Ok(values) = v8::Local::<v8::Array>::try_from(value) { return Some(values); }
+    if let Some(message) = v8::String::new(scope, "Invalid native select options") {
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
+    }
+    None
+}
+
+fn select_allocator(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    if args.is_construct_call() { return; }
+    if let Some(message) = v8::String::new(scope, "Illegal constructor") {
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
+    }
+}
+
+#[op2(reentrant)]
+fn op_create_select_allocator<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    prototype: v8::Local<'s, v8::Object>,
+    refresh: v8::Local<'s, v8::Function>,
+    setter: v8::Local<'s, v8::Function>,
+) -> Result<v8::Local<'s, v8::Function>, deno_error::JsErrorBox> {
+    let context = prototype.get_creation_context(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Invalid select creation realm"))?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let key = v8::String::new(scope, "_nid")
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select node key"))?;
+    let data = v8::Array::new_with_elements(scope, &[refresh.into(), setter.into()]);
+    let constructor = v8::FunctionTemplate::builder(select_allocator).build(scope);
+    let template = constructor.instance_template(scope);
+    let empty_nid = v8::Integer::new(scope, 0);
+    template.set(key.into(), empty_nid.into());
+    template.set_indexed_property_handler(v8::IndexedPropertyHandlerConfiguration::new().data(data.into())
+        .getter(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Value>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            if index >= values.length() { return v8::Intercepted::kNo; }
+            if let Some(value) = values.get_index(scope, index) { rv.set(value); }
+            v8::Intercepted::kYes
+        })
+        .setter(|scope: &mut v8::PinScope, index: u32, value: v8::Local<v8::Value>,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<()>| {
+            let value = v8::Local::new(scope, value);
+            let index = v8::Integer::new_from_unsigned(scope, index);
+            if select_index_callback(scope, args.holder(), args.data(), 1, &[index.into(), value]).is_some() {
+                rv.set_bool(true);
+            }
+            v8::Intercepted::kYes
+        })
+        .query(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Integer>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            if index >= values.length() { return v8::Intercepted::kNo; }
+            rv.set_int32(0);
+            v8::Intercepted::kYes
+        })
+        .definer(|scope: &mut v8::PinScope, index: u32, descriptor: &v8::PropertyDescriptor,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<()>| {
+            if descriptor.has_get() || descriptor.has_set() {
+                rv.set_bool(true);
+                return v8::Intercepted::kYes;
+            }
+            let value = if descriptor.has_value() { descriptor.value() } else { v8::undefined(scope).into() };
+            let value = v8::Local::new(scope, value);
+            let index = v8::Integer::new_from_unsigned(scope, index);
+            if select_index_callback(scope, args.holder(), args.data(), 1, &[index.into(), value]).is_some() {
+                rv.set_bool(true);
+            }
+            v8::Intercepted::kYes
+        })
+        .deleter(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Boolean>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            let allowed = index >= values.length();
+            if !allowed && args.should_throw_on_error() {
+                if let Some(message) = v8::String::new(scope, "Cannot delete a supported select index") {
+                    let error = v8::Exception::type_error(scope, message);
+                    scope.throw_exception(error);
+                }
+            }
+            rv.set_bool(allowed);
+            v8::Intercepted::kYes
+        })
+        .enumerator(|scope: &mut v8::PinScope,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Array>| {
+            if let Some(values) = select_index_values(scope, args.holder(), args.data()) {
+                let keys: Vec<v8::Local<v8::Value>> = (0..values.length())
+                    .map(|index| v8::Integer::new_from_unsigned(scope, index).into()).collect();
+                rv.set(v8::Array::new_with_elements(scope, &keys));
+            }
+        }));
+    let constructor = constructor.get_function(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create native select constructor"))?;
+    let key = v8::String::new(scope, "prototype")
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select prototype key"))?;
+    if constructor.set(scope, key.into(), prototype.into()) != Some(true) {
+        return Err(deno_error::JsErrorBox::generic("Could not initialize native select prototype"));
+    }
+    Ok(constructor)
+}
+
 #[op2]
 fn op_document_realm_member<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
@@ -8257,6 +8416,7 @@ pub fn build_extension() -> Extension {
         op_dom(),
         op_form_owner(),
         op_form_cache_buffer(),
+        op_create_select_allocator(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),
