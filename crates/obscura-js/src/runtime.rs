@@ -4666,6 +4666,82 @@ impl Default for ObscuraJsRuntime {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn html_interface_brands_use_distinct_native_prototypes() {
+        let mut rt = setup_runtime("<html><head><style></style><link></head><body><div></div><span></span><a></a><p></p><button></button><h2></h2><template></template></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const pairs = [
+                ['a','HTMLAnchorElement'], ['br','HTMLBRElement'], ['body','HTMLBodyElement'],
+                ['button','HTMLButtonElement'], ['datalist','HTMLDataListElement'], ['details','HTMLDetailsElement'],
+                ['dialog','HTMLDialogElement'], ['div','HTMLDivElement'], ['fieldset','HTMLFieldSetElement'],
+                ['hr','HTMLHRElement'], ['head','HTMLHeadElement'], ['h2','HTMLHeadingElement'],
+                ['html','HTMLHtmlElement'], ['label','HTMLLabelElement'], ['legend','HTMLLegendElement'],
+                ['link','HTMLLinkElement'], ['p','HTMLParagraphElement'], ['pre','HTMLPreElement'],
+                ['progress','HTMLProgressElement'], ['script','HTMLScriptElement'], ['span','HTMLSpanElement'],
+                ['style','HTMLStyleElement'], ['template','HTMLTemplateElement'], ['ul','HTMLUListElement'],
+            ];
+            const xhtml = 'http://www.w3.org/1999/xhtml';
+            const nodes = pairs.map(([tag]) => document.createElement(tag));
+            const correct = pairs.map(([tag,name], index) => {
+                const C = globalThis[name];
+                const node = nodes[index];
+                let rejected = false;
+                try { new C(); } catch (error) { rejected = error instanceof TypeError; }
+                return node instanceof C && node.constructor === C
+                    && Function.prototype[Symbol.hasInstance].call(C, node)
+                    && Object.getPrototypeOf(node) === C.prototype
+                    && Object.prototype.toString.call(node) === '[object '+name+']'
+                    && C.length === 0 && rejected
+                    && node.cloneNode().constructor === C
+                    && document.createElementNS(xhtml, 'x:'+tag).constructor === C
+                    && !(document.createElementNS(xhtml, tag.toUpperCase()) instanceof C)
+                    && !(document.createElementNS('urn:foreign', tag) instanceof C)
+                    && nodes.every((other, otherIndex) => (other instanceof C) === (index === otherIndex));
+            });
+            const parsed = pairs.filter(([tag]) => document.querySelector(tag)).every(([tag,name]) => {
+                const node = document.querySelector(tag);
+                return node.constructor === globalThis[name]
+                    && Object.getPrototypeOf(node) === globalThis[name].prototype;
+            });
+            HTMLDivElement.prototype.__brandProbe = 42;
+            const isolated = document.querySelector('div').__brandProbe === 42
+                && document.createElement('div').__brandProbe === 42
+                && document.querySelector('span').__brandProbe === undefined
+                && document.querySelector('a').__brandProbe === undefined
+                && Element.prototype.__brandProbe === undefined;
+            delete HTMLDivElement.prototype.__brandProbe;
+            return {correct, parsed, isolated};
+        })()"#).unwrap(), serde_json::json!({
+            "correct":vec![true;24], "parsed":true, "isolated":true,
+        }));
+    }
+
+    #[test]
+    fn html_interface_brands_preserve_existing_specialized_behavior() {
+        let mut rt = setup_runtime("<html><head></head><body><input><select><option>one</option></select><textarea></textarea><form></form><iframe></iframe><div></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const input = document.querySelector('input');
+            input.value = 'typed';
+            const select = document.querySelector('select');
+            const textarea = document.querySelector('textarea');
+            textarea.value = 'text';
+            const style = document.createElement('style');
+            style.textContent = 'body {color: red}';
+            let target = document.head;
+            if (target instanceof HTMLIFrameElement) target = target.contentDocument.head;
+            target.appendChild(style);
+            return [input instanceof HTMLInputElement, input.value,
+                select instanceof HTMLSelectElement, select.item(0).index,
+                textarea instanceof HTMLTextAreaElement, textarea.value,
+                document.querySelector('form') instanceof HTMLFormElement,
+                document.querySelector('iframe') instanceof HTMLIFrameElement,
+                !(document.querySelector('div') instanceof HTMLIFrameElement),
+                style.parentNode === document.head, style.constructor === HTMLStyleElement];
+        })()"#).unwrap(), serde_json::json!([
+            true,"typed",true,0,true,"text",true,true,true,true,true,
+        ]));
+    }
+
+    #[test]
     fn file_input_validation_is_nonmutating_and_selection_honors_multiple() {
         let mut rt = setup_runtime("<input id=single type=file><input id=multi type=file multiple><div id=wrong></div>");
         assert_eq!(rt.evaluate(r#"(() => {
@@ -10387,7 +10463,7 @@ mod tests {
                      target.element === element]"
             )
             .unwrap(),
-            serde_json::json!(["[object HTMLElement]", "[object SVGElement]", false, true])
+            serde_json::json!(["[object HTMLDivElement]", "[object SVGElement]", false, true])
         );
     }
 

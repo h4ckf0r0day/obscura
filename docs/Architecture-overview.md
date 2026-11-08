@@ -184,6 +184,13 @@ or nested shadow trees. Native selector scoping also handles `:scope`. Omitted
 or zero node IDs retain the legacy document fallback; invalid node IDs and
 invalid selectors return protocol errors rather than empty successful results.
 
+Previously aliased HTML interfaces now use the same native wrapper factory as
+table/select interfaces. Parsed, created and cloned HTML nodes receive distinct
+interface prototypes and constructors; interface prototype changes do not affect
+unrelated tags. Namespace/local-name checks avoid assigning those interfaces to
+foreign or differently cased names. Existing specialized interfaces retain their
+behavior. The generic `HTMLElement`/`HTMLUnknownElement` hierarchy is separate work.
+
 `window.origin` (including the bare `origin` identifier) reports the owning
 document's origin, including inherited blank-frame origins. Page assignment
 replaces this property without changing the document's actual origin.
