@@ -32,6 +32,18 @@ fn node_id_param(params: &Value) -> Result<NodeId, String> {
         .map(NodeId::new).ok_or_else(|| "valid nodeId required".into())
 }
 
+// CDP DOM.querySelector* searches descendants of the requested node, not the
+// whole document. Keep the historic omitted/zero nodeId fallback for clients
+// that have not requested a DOM document yet.
+fn query_root(dom: &DomTree, params: &Value) -> Result<NodeId, String> {
+    let Some(raw) = params.get("nodeId") else { return Ok(dom.document()) };
+    if raw.as_u64() == Some(0) { return Ok(dom.document()); }
+    let id = raw.as_u64().and_then(|id| u32::try_from(id).ok())
+        .map(NodeId::new).ok_or("Invalid nodeId")?;
+    if dom.get_node(id).is_none() { return Err("No node with given id found".into()); }
+    Ok(id)
+}
+
 fn push_children(dom: &DomTree, state: &mut DomDocument, node: NodeId, depth: u32,
     session_id: &Option<String>, events: &mut Vec<CdpEvent>) {
     let mut pending = vec![(node, depth.min(MAX_SERIALIZE_DEPTH))];
@@ -286,19 +298,17 @@ pub async fn handle(
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
             let result = page.with_dom(|dom| {
-                dom.query_selector(selector).ok().flatten().map(|id| id.index()).unwrap_or(0)
-            }).unwrap_or(0);
-            Ok(json!({ "nodeId": result }))
+                dom.query_selector_from(query_root(dom, params)?, selector)
+            }).ok_or("No DOM loaded")??;
+            Ok(json!({ "nodeId": result.map(|id| id.index()).unwrap_or(0) }))
         }
         "querySelectorAll" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
             let ids = page.with_dom(|dom| {
-                dom.query_selector_all(selector).ok()
-                    .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            }).unwrap_or_default();
-            Ok(json!({ "nodeIds": ids }))
+                dom.query_selector_all_from(query_root(dom, params)?, selector)
+            }).ok_or("No DOM loaded")??;
+            Ok(json!({ "nodeIds": ids.iter().map(|id| id.index()).collect::<Vec<_>>() }))
         }
         "getOuterHTML" => {
             // go-rod asks for the HTML of an element handle it already holds and
