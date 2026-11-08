@@ -18,6 +18,10 @@ All tools validate required/optional fields. Unsupported arguments rejected. Str
 - obscura_submit_job, obscura_get_job, obscura_get_job_result
 - obscura_cancel_job, obscura_list_jobs
 
+## Distributed Tools (feature: distributed)
+- obscura_submit_job, obscura_get_job, obscura_get_job_result
+- obscura_cancel_job, obscura_list_jobs
+
 ## Error Categories
 - Invalid input, Authentication failure, Authorization failure
 - Resource not found, Resource not ready, Invalid job state
