@@ -2831,8 +2831,10 @@ impl ObscuraJsRuntime {
             };
             if let Some(creation_context) = creation_context {
                 if creation_context != context {
-                    frame_id = self.realm_states().borrow().frame_id_for_context(&creation_context);
-                    if frame_id.is_some() { context = creation_context; }
+                    let id = self.realm_states().borrow().frame_id_for_context(&creation_context)
+                        .ok_or("Execution context was destroyed")?;
+                    frame_id = Some(id);
+                    context = creation_context;
                 }
             }
         }

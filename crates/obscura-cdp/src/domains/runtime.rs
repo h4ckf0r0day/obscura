@@ -356,7 +356,7 @@ pub async fn handle(
             // does. CDP names this field `executionContextId` on
             // callFunctionOn (not `contextId`); a request may omit it when
             // `objectId` is supplied — in that case context validation is a
-            // no-op and the default context is used.
+            // no-op and the native call resolves the receiver's owning realm.
             let frame_id = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
 
             // Keep awaitPromise alive for the same command budget as evaluate.

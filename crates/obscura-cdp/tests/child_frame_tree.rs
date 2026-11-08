@@ -150,6 +150,53 @@ async fn child_default_and_isolated_contexts_evaluate_their_own_documents() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn child_object_handles_reject_a_retired_execution_context() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url": url}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0]["frame"];
+    let context_id = ctx.pending_events.iter().find(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == child["id"]
+            && event.params["context"]["auxData"]["isDefault"] == true
+    }).unwrap().params["context"]["id"].as_i64().unwrap();
+    let handle = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression": "({kind:'child'})", "contextId": context_id,
+    }), &session).await;
+    let live = cdp(&mut ctx, 6, "Runtime.callFunctionOn", json!({
+        "functionDeclaration": "function() { return document.URL; }",
+        "objectId": handle["result"]["objectId"], "returnByValue": true,
+    }), &session).await;
+    assert_eq!(live["result"]["value"], child["url"]);
+    cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('iframe').remove()",
+    }), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    cdp(&mut ctx, 8, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 9, "Page.getFrameTree", json!({}), &session).await;
+    assert!(tree["frameTree"]["childFrames"].as_array().is_none_or(Vec::is_empty));
+    let retired = dispatch(&CdpRequest {
+        id: 10, method: "Runtime.callFunctionOn".to_string(),
+        params: json!({
+            "functionDeclaration": "function() { return document.URL; }",
+            "objectId": handle["result"]["objectId"], "returnByValue": true,
+        }),
+        session_id: Some(session.clone()),
+    }, &mut ctx).await;
+    assert_eq!(retired.error.unwrap().message, "Execution context was destroyed");
+    let main = cdp(&mut ctx, 11, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('h1').textContent", "returnByValue": true,
+    }), &session).await;
+    assert_eq!(main["result"]["value"], "Main heading");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn late_runtime_enable_reports_child_default_and_registered_utility_contexts_once() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;

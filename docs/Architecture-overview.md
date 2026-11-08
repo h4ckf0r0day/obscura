@@ -129,8 +129,10 @@ Live child frames advertise their default CDP execution contexts.
 `Runtime.evaluate` and `Runtime.callFunctionOn`, including awaited calls,
 enter the frame's actual V8 realm and use its document. Remote objects remain
 in the page's central handle store, while result metadata is read in the
-owning realm. Pending evaluations reject retired frame contexts instead of
-reading a replacement document. Named utility contexts still alias their
+owning realm. Calls using a child object handle infer its live realm and
+reject retired realms rather than falling back to the main document.
+Pending evaluations reject retired frame contexts instead of reading a
+replacement document. Named utility contexts still alias their
 frame's realm rather than providing separate JavaScript worlds.
 Iframe content compositing remains a separate compatibility gap; evaluating
 a child document does not establish iframe screenshot fidelity.
