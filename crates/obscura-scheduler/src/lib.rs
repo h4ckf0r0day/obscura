@@ -33,6 +33,7 @@ pub struct DispatchMessage {
     pub correlation_id: Option<Uuid>,
 }
 
+#[derive(Clone)]
 pub struct Scheduler {
     control: ControlPlane,
     nats: NatsClient,
@@ -199,6 +200,15 @@ impl Scheduler {
 
         // initial drain of pending
         while self.schedule_one().await? {}
+
+        // Start reconciliation loop in background
+        let sched = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = sched.reconcile_workers().await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
 
         loop {
             match consumer.next_message().await {
