@@ -551,6 +551,28 @@ mod tests {
     }
 
     #[test]
+    fn html_interface_brands_stay_in_the_creation_realm() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><div id='parent'>Parent</div></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body><div id='child'>Child</div><span></span></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            HTMLDivElement.prototype.__brandProbe = 'child';
+            const node = document.getElementById('child');
+            return [node.constructor === HTMLDivElement, node instanceof HTMLDivElement,
+                !(node instanceof HTMLSpanElement), document.createElement('div').__brandProbe,
+                document.querySelector('span').__brandProbe === undefined];
+        })()"#).unwrap(), serde_json::json!([true,true,true,"child",true]));
+        assert_eq!(parent.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document.getElementById('child');
+            const node = document.getElementById('parent');
+            return [child.constructor.name, child.__brandProbe, child instanceof HTMLDivElement,
+                node.constructor === HTMLDivElement, node.__brandProbe === undefined,
+                document.createElement('div').__brandProbe === undefined];
+        })()"#).unwrap(), serde_json::json!(["HTMLDivElement","child",false,true,true,true]));
+    }
+
+    #[test]
     fn borrowed_select_and_option_methods_keep_the_owning_dom() {
         let mut parent = page("https://parent.example/",
             "<html><body><select id='parent'><option>Parent</option></select></body></html>");

@@ -14559,6 +14559,14 @@ globalThis.HTMLDialogElement = Element;
 // Identity-only interfaces still need distinct prototypes. Inheriting Element
 // preserves implemented DOM behavior without making unrelated tags pass brand checks.
 for (const [name, tags] of Object.entries({
+  HTMLAnchorElement: ['a'], HTMLBRElement: ['br'], HTMLBodyElement: ['body'],
+  HTMLButtonElement: ['button'], HTMLDataListElement: ['datalist'], HTMLDetailsElement: ['details'],
+  HTMLDialogElement: ['dialog'], HTMLDivElement: ['div'], HTMLFieldSetElement: ['fieldset'],
+  HTMLHRElement: ['hr'], HTMLHeadElement: ['head'], HTMLHeadingElement: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+  HTMLHtmlElement: ['html'], HTMLLabelElement: ['label'], HTMLLegendElement: ['legend'],
+  HTMLLinkElement: ['link'], HTMLParagraphElement: ['p'], HTMLPreElement: ['pre'],
+  HTMLProgressElement: ['progress'], HTMLScriptElement: ['script'], HTMLSpanElement: ['span'],
+  HTMLStyleElement: ['style'], HTMLTemplateElement: ['template'], HTMLUListElement: ['ul'],
   HTMLAreaElement: ['area'], HTMLBaseElement: ['base'], HTMLDListElement: ['dl'],
   HTMLDataElement: ['data'], HTMLDirectoryElement: ['dir'], HTMLEmbedElement: ['embed'],
   HTMLFontElement: ['font'], HTMLFrameElement: ['frame'], HTMLFrameSetElement: ['frameset'],
@@ -14571,7 +14579,7 @@ for (const [name, tags] of Object.entries({
   HTMLTableColElement: ['col', 'colgroup'], HTMLTableRowElement: ['tr'],
   HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
 })) {
-  if (globalThis[name] !== undefined) continue;
+  if (globalThis[name] !== undefined && globalThis[name] !== Element) continue;
   const Interface = class extends Element {
     constructor(nid, token) {
       if (token !== _htmlInterfaceToken) {
@@ -14582,6 +14590,7 @@ for (const [name, tags] of Object.entries({
     }
   };
   Object.defineProperty(Interface, 'name', {value: name, configurable: true});
+  Object.defineProperty(Interface, 'length', {value: 0, configurable: true});
   Object.defineProperty(Interface.prototype, Symbol.toStringTag, {value: name, configurable: true});
   Object.defineProperty(globalThis, name, {value: Interface, writable: true, configurable: true});
   for (const tag of tags) {
