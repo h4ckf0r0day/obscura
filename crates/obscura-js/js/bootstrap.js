@@ -7331,6 +7331,7 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+const _nodeCacheGet = Map.prototype.get.bind(_cache);
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -18911,6 +18912,8 @@ const _installCaretGeometry = (function _installCaretGeometry() {
 
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
+const _nativeDocumentUrl = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Document.prototype, 'URL').get);
+const _nativeNodeBaseUri = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get);
 const _documentMembers = Object.freeze(Object.fromEntries([
   ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
@@ -18921,6 +18924,13 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['domNodeReference', function() {
+    const nid = this._nid;
+    if (_nodeCacheGet(nid) !== this) throw new TypeError('Not a current DOM node');
+    const doc = _nodeDocumentOf(this);
+    const url = doc === document && globalThis.__virtualUrl || _nativeDocumentUrl(doc);
+    return [nid, url, _nativeNodeBaseUri(this)];
+  }],
   ['windowOrigin', _windowOriginDescriptor.get],
   ['setWindowOrigin', _windowOriginDescriptor.set],
 ]));
