@@ -186,6 +186,9 @@ borrowed methods on child-realm nodes. Select collections still use the existing
 snapshot HTMLCollection implementation. Numeric select access uses V8 indexed
 handlers, not a Proxy around ordinary DOM properties. Fresh selects allocate the
 native wrapper directly; custom-element upgrades retain that same wrapper.
+Select-only constructor state is isolated from ordinary HTML interface constructors.
+The private derived constructor initializes the predeclared node slot in JavaScript
+without allocating a discarded JavaScript element or setting each node through V8's C API.
 Indexed reads reuse option
 snapshots keyed by the native form mutation generation. Assignments replace or
 remove the actual option and fill gaps with blank options. Non-null assignments

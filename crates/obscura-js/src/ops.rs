@@ -7102,28 +7102,20 @@ fn select_index_values<'s, 'i>(
     None
 }
 
-fn select_constructor(
+fn select_allocator(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
-    let nid = args.get(0);
-    if args.is_construct_call() && nid.is_uint32() {
-        if let Ok(key) = v8::Local::<v8::String>::try_from(args.data()) {
-            match args.this().create_data_property(scope, key.into(), nid) {
-                Some(true) | None => return,
-                Some(false) => {}
-            }
-        }
-    }
-    if let Some(message) = v8::String::new(scope, "Could not initialize native select") {
+    if args.is_construct_call() { return; }
+    if let Some(message) = v8::String::new(scope, "Illegal constructor") {
         let error = v8::Exception::type_error(scope, message);
         scope.throw_exception(error);
     }
 }
 
 #[op2(reentrant)]
-fn op_create_select_constructor<'s, 'i>(
+fn op_create_select_allocator<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     prototype: v8::Local<'s, v8::Object>,
     refresh: v8::Local<'s, v8::Function>,
@@ -7135,7 +7127,7 @@ fn op_create_select_constructor<'s, 'i>(
     let key = v8::String::new(scope, "_nid")
         .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select node key"))?;
     let data = v8::Array::new_with_elements(scope, &[refresh.into(), setter.into()]);
-    let constructor = v8::FunctionTemplate::builder(select_constructor).data(key.into()).build(scope);
+    let constructor = v8::FunctionTemplate::builder(select_allocator).build(scope);
     let template = constructor.instance_template(scope);
     let empty_nid = v8::Integer::new(scope, 0);
     template.set(key.into(), empty_nid.into());
@@ -8424,7 +8416,7 @@ pub fn build_extension() -> Extension {
         op_dom(),
         op_form_owner(),
         op_form_cache_buffer(),
-        op_create_select_constructor(),
+        op_create_select_allocator(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),

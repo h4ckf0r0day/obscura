@@ -22,17 +22,21 @@ class ProcessMeasurementTests(unittest.TestCase):
             commands.append(command)
             kwargs["stdout"].write(b"5000\n")
             kwargs["stdout"].flush()
-            Path(command[command.index("-o") + 1]).write_text("0.12 0.03 1024\n")
             self.assertTrue(kwargs["start_new_session"])
             return process
 
         with patch.object(perf_smoke.subprocess, "Popen", side_effect=start), \
+                patch.object(perf_smoke.os, "wait4", return_value=(
+                    process.pid, 0, Mock(ru_utime=0.123456, ru_stime=0.027778, ru_maxrss=1024),
+                )) as wait, \
                 patch.object(perf_smoke.os, "killpg") as cleanup:
             _, rss, cpu = perf_smoke.run_once(Path("/fake/engine"), "http://localhost/", "5000", 5000)
         self.assertEqual(rss, 1024)
-        self.assertAlmostEqual(cpu, 0.15)
-        process.wait.assert_called_once_with()
+        self.assertAlmostEqual(cpu, 0.151234)
+        wait.assert_called_once_with(process.pid, 0)
+        process.wait.assert_not_called()
         self.assertEqual(commands[0][:4], ["timeout", "--signal=KILL", "45", "prlimit"])
+        self.assertNotIn("/usr/bin/time", commands[0])
         self.assertIn("--fsize=2097152", commands[0])
         self.assertIn("--nofile=256", commands[0])
         cleanup.assert_called_once_with(process.pid, signal.SIGKILL)
@@ -57,24 +61,27 @@ class RegressionGateTests(unittest.TestCase):
             baseline.touch()
             candidate.touch()
             clock = [0.0]
+            measured_cpu = [0.0]
 
             def start(command, **kwargs):
                 changed = str(candidate) in command
                 clock[0] += (candidate_latency if changed else base_latency) / 1000
-                cpu = candidate_cpu if changed else base_cpu
-                metrics = f"{cpu:.2f} 0.00 40960\n" if command[command.index("-f") + 1] != "%M" else "40960\n"
-                Path(command[command.index("-o") + 1]).write_text(metrics)
+                measured_cpu[0] = candidate_cpu if changed else base_cpu
                 kwargs["stdout"].write(b"5\n")
                 kwargs["stdout"].flush()
                 process = Mock(pid=12345, returncode=0)
                 process.wait.return_value = 0
                 return process
 
+            def wait(pid, _flags):
+                return pid, 0, Mock(ru_utime=measured_cpu[0], ru_stime=0.0, ru_maxrss=40960)
+
             logs = io.StringIO()
             error = None
             with patch.object(sys, "argv", ["perf_smoke.py", "--base", str(baseline), "--candidate", str(candidate), "--output", str(output)]), \
                     patch.object(perf_smoke, "SCENARIOS", {"probe": ("5", 5)}), \
                     patch.object(perf_smoke.subprocess, "Popen", side_effect=start), \
+                    patch.object(perf_smoke.os, "wait4", side_effect=wait), \
                     patch.object(perf_smoke.time, "perf_counter", side_effect=lambda: clock[0]), \
                     patch.object(perf_smoke.os, "killpg"), \
                     patch.dict(perf_smoke.os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
@@ -99,6 +106,17 @@ class RegressionGateTests(unittest.TestCase):
     def test_absolute_floors_keep_short_timing_and_cpu_quantization_noise(self):
         error, _, _ = self.compare(50, 55, 0.02, 0.04)
         self.assertIsNone(error)
+
+    def test_precise_cpu_is_not_rounded_into_a_false_regression(self):
+        error, report, _ = self.compare(300, 310, 0.2591, 0.2799)
+        self.assertIsNone(error)
+        self.assertEqual(report["scenarios"]["probe"]["base_cpu_seconds"], 0.2591)
+        self.assertEqual(report["scenarios"]["probe"]["candidate_cpu_seconds"], 0.2799)
+
+    def test_small_cpu_regression_still_exceeds_unchanged_relative_and_absolute_gates(self):
+        error, _, logs = self.compare(300, 300, 0.25, 0.276)
+        self.assertIsNotNone(error)
+        self.assertIn("::error::probe CPU", logs)
 
     def test_nonfinite_cpu_measurement_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "invalid CPU"):
