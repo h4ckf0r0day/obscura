@@ -41,9 +41,18 @@ use url::Url;
 
 use crate::client::{env_allows_private_network, is_forbidden_ip};
 
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connecting to the real proxy, its TLS handshake and its CONNECT reply.
+const UPSTREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// A client's request head, and the real proxy's response head for a plain
+/// HTTP request. Generous: it only frees tasks a stalled peer would strand.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_CONNECTIONS: usize = 512;
 const MAX_TUNNEL_RESPONSE_HEAD: usize = 16 * 1024;
 const TOKEN_USER: &str = "obscura";
+/// Used when the pinning proxy cannot start: nothing listens on port 0, so
+/// every request fails instead of reaching the real proxy unpinned.
+const REFUSING_PROXY: &str = "http://127.0.0.1:0";
 
 type Lookup = Arc<
     dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>
@@ -61,6 +70,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 /// loopback proxy that pins every target to its checked address, started
 /// once per distinct proxy and kept for the life of the process. Any other
 /// proxy, or the guard switched off, returns `proxy_url` unchanged.
+///
+/// If the pinning proxy cannot start, the result is a proxy that refuses
+/// every request: the clients fail rather than send names unchecked.
 pub fn pinned_proxy_url(proxy_url: &str, allow_private_network: bool) -> String {
     if allow_private_network || env_allows_private_network() {
         return proxy_url.to_string();
@@ -79,10 +91,8 @@ pub fn pinned_proxy_url(proxy_url: &str, allow_private_network: bool) -> String 
             local
         }
         Err(error) => {
-            // The local pre-check (`validate_proxied_host`) still runs, so the
-            // client keeps the protection it had before pinning existed.
-            tracing::error!(%error, "could not start the address-pinning proxy; using the proxy directly");
-            proxy_url.to_string()
+            tracing::error!(%error, "could not start the address-pinning proxy; proxied requests will fail");
+            REFUSING_PROXY.to_string()
         }
     }
 }
@@ -110,7 +120,11 @@ struct Upstream {
 
 impl Upstream {
     fn parse(proxy_url: &str) -> Option<Self> {
-        let url = Url::parse(proxy_url).ok()?;
+        // reqwest and wreq read a proxy given without a scheme as http://.
+        let url = match Url::parse(proxy_url) {
+            Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("http://{proxy_url}")).ok()?,
+            parsed => parsed.ok()?,
+        };
         let tls = match url.scheme() {
             "http" => false,
             "https" => true,
@@ -122,7 +136,7 @@ impl Upstream {
             url::Host::Ipv6(ip) => ip.to_string(),
         };
         let port = url.port_or_known_default()?;
-        let authorization = (!url.username().is_empty()).then(|| {
+        let authorization = (!url.username().is_empty() || url.password().is_some()).then(|| {
             let decode = |part: &str| percent_encoding::percent_decode_str(part).decode_utf8_lossy().into_owned();
             let credentials = format!("{}:{}", decode(url.username()), decode(url.password().unwrap_or("")));
             basic(&credentials)
@@ -131,9 +145,13 @@ impl Upstream {
     }
 
     async fn connect(&self) -> io::Result<Box<dyn Io>> {
-        let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect((self.host.as_str(), self.port)))
+        tokio::time::timeout(UPSTREAM_SETUP_TIMEOUT, self.connect_unbounded())
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connecting to the proxy timed out"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connecting to the proxy timed out"))?
+    }
+
+    async fn connect_unbounded(&self) -> io::Result<Box<dyn Io>> {
+        let tcp = TcpStream::connect((self.host.as_str(), self.port)).await?;
         tcp.set_nodelay(true)?;
         if !self.tls {
             return Ok(Box::new(tcp));
@@ -146,7 +164,13 @@ impl Upstream {
 
     /// Opens `CONNECT authority` through the real proxy.
     async fn tunnel(&self, authority: &str) -> io::Result<Box<dyn Io>> {
-        let mut stream = self.connect().await?;
+        tokio::time::timeout(UPSTREAM_SETUP_TIMEOUT, self.tunnel_unbounded(authority))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "opening the proxy tunnel timed out"))?
+    }
+
+    async fn tunnel_unbounded(&self, authority: &str) -> io::Result<Box<dyn Io>> {
+        let mut stream = self.connect_unbounded().await?;
         let mut head = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if let Some(authorization) = &self.authorization {
             head.push_str("Proxy-Authorization: ");
@@ -235,14 +259,19 @@ fn start(upstream: Upstream, lookup: Lookup) -> io::Result<String> {
                 Ok(listener) => listener,
                 Err(error) => return tracing::error!(%error, "address-pinning proxy stopped"),
             };
+            let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
             loop {
+                let Ok(slot) = slots.clone().acquire_owned().await else { return };
                 let Ok((stream, _)) = listener.accept().await else { continue };
                 let state = state.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let _ = stream.set_nodelay(true);
                     let service = hyper::service::service_fn(move |request| handle(state.clone(), request));
                     let _ = hyper::server::conn::http1::Builder::new()
                         .preserve_header_case(true)
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(HEAD_TIMEOUT)
                         .serve_connection(TokioIo::new(stream), service)
                         .with_upgrades()
                         .await;
@@ -328,10 +357,13 @@ async fn forward(state: Arc<Pinning>, mut request: Request<Incoming>) -> Result<
         tracing::warn!("{reason}");
         Refused(reason)
     })?;
-    if !request.headers().contains_key(HOST) {
-        let host = HeaderValue::from_str(authority.as_str()).map_err(|e| Refused(e.to_string()))?;
-        request.headers_mut().insert(HOST, host);
-    }
+    // RFC 9112 3.2.2: a proxy uses the request target, not a Host header the
+    // request also carries, so the origin sees the name that was checked.
+    let host = match authority.port() {
+        Some(port) => format!("{}:{port}", authority.host()),
+        None => authority.host().to_string(),
+    };
+    request.headers_mut().insert(HOST, HeaderValue::from_str(&host).map_err(|e| Refused(e.to_string()))?);
     let path = uri.path_and_query().map_or("/", |path| path.as_str());
     *request.uri_mut() = Uri::try_from(format!("http://{pinned}{path}")).map_err(|e| Refused(e.to_string()))?;
     if let Some(authorization) = &state.upstream.authorization {
@@ -339,13 +371,18 @@ async fn forward(state: Arc<Pinning>, mut request: Request<Incoming>) -> Result<
     }
     request.headers_mut().remove("proxy-connection");
     let upstream = state.upstream.connect().await.map_err(|e| Refused(format!("connecting to the proxy: {e}")))?;
-    let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+    let handshake = hyper::client::conn::http1::Builder::new()
         .preserve_header_case(true)
-        .handshake(TokioIo::new(upstream))
+        .handshake(TokioIo::new(upstream));
+    let (mut sender, connection) = tokio::time::timeout(UPSTREAM_SETUP_TIMEOUT, handshake)
         .await
+        .map_err(|_| Refused("the proxy handshake timed out".into()))?
         .map_err(|e| Refused(format!("proxy handshake: {e}")))?;
     tokio::spawn(connection);
-    let response = sender.send_request(request).await.map_err(|e| Refused(format!("proxy request: {e}")))?;
+    let response = tokio::time::timeout(RESPONSE_HEAD_TIMEOUT, sender.send_request(request))
+        .await
+        .map_err(|_| Refused("the proxy did not answer".into()))?
+        .map_err(|e| Refused(format!("proxy request: {e}")))?;
     Ok(response.map(BodyExt::boxed))
 }
 
@@ -567,6 +604,42 @@ pub(crate) mod tests {
         assert_eq!(body, "public");
         let expected = format!("proxy-authorization: basic {}\r\n", base64::engine::general_purpose::STANDARD.encode("user:p@ss").to_ascii_lowercase());
         assert!(proxy.heads()[0].to_ascii_lowercase().contains(&expected), "{}", proxy.heads()[0]);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_given_without_a_scheme_is_pinned_like_reqwest_reads_it() {
+        name("schemeless.test", "93.184.216.34");
+        let (public, _) = origin("public").await;
+        let (internal, internal_hits) = origin("internal").await;
+        let proxy = fake_proxy(vec![("93.184.216.34:80".into(), public), ("schemeless.test:80".into(), internal)], None).await;
+        let bare = proxy.url.trim_start_matches("http://").to_string();
+        let pinned = pinned_proxy_url(&bare, false);
+        assert_ne!(pinned, bare);
+
+        let client = reqwest::Client::builder().proxy(reqwest::Proxy::all(pinned).unwrap()).build().unwrap();
+        let body = client.get("http://schemeless.test/").send().await.unwrap().text().await.unwrap();
+
+        assert_eq!(body, "public");
+        assert_eq!(internal_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_host_header_set_by_the_request_does_not_reach_the_proxy() {
+        name("hosted.test", "93.184.216.34");
+        let (public, _) = origin("public").await;
+        let proxy = fake_proxy(vec![("93.184.216.34:80".into(), public)], None).await;
+
+        client_through(&proxy).get("http://hosted.test/").header("host", "metadata.google.internal").send().await.unwrap();
+
+        let head = proxy.heads()[0].to_ascii_lowercase();
+        assert!(head.contains("host: hosted.test\r\n") && !head.contains("metadata"), "{head}");
+    }
+
+    #[test]
+    fn credentials_with_only_a_password_reach_the_proxy() {
+        let upstream = Upstream::parse("http://:secret@127.0.0.1:3128").unwrap();
+        assert_eq!(upstream.authorization, Some(basic(":secret")));
+        assert!(Upstream::parse("socks5h://127.0.0.1:1080").is_none());
     }
 
     #[test]

@@ -2888,7 +2888,8 @@ mod tests {
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
             socket.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "POST http://search.test/v1/search/public HTTP/1.1\r\n");
+            // The pinning proxy hands the fixture the checked address it resolved.
+            assert_eq!(line, "POST http://93.184.216.34:80/v1/search/public HTTP/1.1\r\n");
             let mut length = None;
             loop {
                 line.clear();
@@ -2943,7 +2944,7 @@ mod tests {
                 };
                 let (state, fixture) = web_search_response_fixture(response, false).await;
                 let request = WebSearchRequest {
-                    url: "http://search.test/v1/search/public",
+                    url: "http://93.184.216.34/v1/search/public",
                     ..web_search_request("obscura", 50, None)
                 };
                 let result = tokio::time::timeout(
@@ -2977,7 +2978,7 @@ mod tests {
         for response in responses {
             let (state, fixture) = web_search_response_fixture(response, true).await;
             let request = WebSearchRequest {
-                url: "http://search.test/v1/search/public",
+                url: "http://93.184.216.34/v1/search/public",
                 ..web_search_request("obscura", 50, None)
             };
             let error = tokio::time::timeout(
