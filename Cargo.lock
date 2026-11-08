@@ -2566,6 +2566,7 @@ dependencies = [
  "anyhow",
  "base64",
  "obscura-browser",
+ "obscura-control-plane",
  "obscura-dom",
  "obscura-net",
  "serde",

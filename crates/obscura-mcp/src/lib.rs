@@ -727,6 +727,50 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                     },
                     "required": ["state"]
                 }
+            },
+            {
+                "name": "obscura_submit_job",
+                "description": "Submit a distributed browser execution job through the control plane",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "URL to navigate to" },
+                        "operation": { "type": "string", "description": "Operation (navigate, snapshot, evaluate)", "default": "navigate" }
+                    },
+                    "required": ["url"]
+                }
+            },
+            {
+                "name": "obscura_get_job",
+                "description": "Get the status of a distributed browser execution job",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": { "type": "string", "description": "Job ID" }
+                    },
+                    "required": ["job_id"]
+                }
+            },
+            {
+                "name": "obscura_cancel_job",
+                "description": "Cancel a distributed browser execution job",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": { "type": "string", "description": "Job ID" }
+                    },
+                    "required": ["job_id"]
+                }
+            },
+            {
+                "name": "obscura_list_jobs",
+                "description": "List distributed browser execution jobs for the authenticated tenant",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "number", "description": "Maximum number of jobs to return (default: 20)" }
+                    }
+                }
             }
     ]).as_array().cloned().expect("MCP tool list must be an array");
 
@@ -834,6 +878,10 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_search" => tool_search(args, state),
         "browser_storage_state" => tool_storage_state(state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
+        "obscura_submit_job" => tool_submit_job(args).await,
+        "obscura_get_job" => tool_get_job(args).await,
+        "obscura_cancel_job" => tool_cancel_job(args).await,
+        "obscura_list_jobs" => tool_list_jobs(args).await,
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -981,6 +1029,43 @@ fn truncate(text: &str, max_chars: usize) -> String {
     let head: String = text.chars().take(max_chars).collect();
     let remaining = text.chars().count() - max_chars;
     format!("{head}\n...(truncated, {remaining} more chars)")
+}
+
+async fn tool_submit_job(args: &Value) -> Result<String, String> {
+    let url = args.get("url").and_then(Value::as_str).ok_or("Missing url")?;
+    let operation = args.get("operation").and_then(Value::as_str).unwrap_or("navigate");
+    let db_url = std::env::var("DATABASE_URL").ok();
+    if db_url.is_none() {
+        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    }
+    Ok(format!("Distributed job submission requested for {} (operation: {}). Control plane integration pending.", url, operation))
+}
+
+async fn tool_get_job(args: &Value) -> Result<String, String> {
+    let job_id = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
+    let db_url = std::env::var("DATABASE_URL").ok();
+    if db_url.is_none() {
+        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    }
+    Ok(format!("Job {} status query requested. Control plane integration pending.", job_id))
+}
+
+async fn tool_cancel_job(args: &Value) -> Result<String, String> {
+    let job_id = args.get("job_id").and_then(Value::as_str).ok_or("Missing job_id")?;
+    let db_url = std::env::var("DATABASE_URL").ok();
+    if db_url.is_none() {
+        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    }
+    Ok(format!("Job {} cancellation requested. Control plane integration pending.", job_id))
+}
+
+async fn tool_list_jobs(args: &Value) -> Result<String, String> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
+    let db_url = std::env::var("DATABASE_URL").ok();
+    if db_url.is_none() {
+        return Err("Distributed execution requires DATABASE_URL to be set".into());
+    }
+    Ok(format!("Job listing requested (limit: {}). Control plane integration pending.", limit))
 }
 
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
