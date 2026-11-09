@@ -23,19 +23,7 @@ permissions:
 jobs:
   audit:
     name: Audit release dependencies
-    runs-on:
-  # Manual/called validation uses Windows only and cannot publish a release.
-  workflow_dispatch:
-    inputs:
-      windows_only:
-        description: Validate only the Windows distribution
-        type: boolean
-        default: true
-  workflow_call:
-    inputs:
-      windows_only:
-        type: boolean
-        default: true ubuntu-22.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -63,19 +51,7 @@ jobs:
           {"target":"x86_64-apple-darwin","os":"macos-15-intel","name":"obscura-x86_64-macos"},
           {"target":"x86_64-pc-windows-msvc","os":"windows-latest","name":"obscura-x86_64-windows"}]') }}
 
-    runs-on:
-  # Manual/called validation uses Windows only and cannot publish a release.
-  workflow_dispatch:
-    inputs:
-      windows_only:
-        description: Validate only the Windows distribution
-        type: boolean
-        default: true
-  workflow_call:
-    inputs:
-      windows_only:
-        type: boolean
-        default: true ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -232,19 +208,7 @@ jobs:
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on:
-  # Manual/called validation uses Windows only and cannot publish a release.
-  workflow_dispatch:
-    inputs:
-      windows_only:
-        description: Validate only the Windows distribution
-        type: boolean
-        default: true
-  workflow_call:
-    inputs:
-      windows_only:
-        type: boolean
-        default: true ubuntu-22.04
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
