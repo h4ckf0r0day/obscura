@@ -12355,108 +12355,122 @@ if (typeof FileList === "undefined") globalThis.FileList = class FileList {
 };
 {
   const secret = Symbol('data-transfer-internal');
+  const itemState = new WeakMap();
+  const itemListState = new WeakMap();
+  const transferState = new WeakMap();
+  const normalizedType = (type) => {
+    const value = String(type).trim().toLowerCase();
+    return value === 'text' ? 'text/plain' : value === 'url' ? 'text/uri-list' : value;
+  };
   class DataTransferItem {
     constructor(token, kind, type, data) {
       if (token !== secret) throw new TypeError('Illegal constructor');
-      this.kind = kind;
-      this.type = type;
-      this._data = data;
+      itemState.set(this, { kind, type, data });
     }
-    getAsFile() { return this.kind === 'file' ? this._data : null; }
+    get kind() { return itemState.get(this).kind; }
+    get type() { return itemState.get(this).type; }
+    getAsFile() { return this.kind === 'file' ? itemState.get(this).data : null; }
     getAsString(callback) {
       if (this.kind !== 'string' || typeof callback !== 'function') return;
-      const value = this._data;
-      queueMicrotask(() => callback(value));
+      const value = itemState.get(this).data;
+      // HTML drag-data callbacks are tasks, not promise microtasks.
+      setTimeout(() => callback(value), 0);
     }
   }
   class DataTransferItemList {
     constructor(token, entries, onChange) {
       if (token !== secret) throw new TypeError('Illegal constructor');
-      this._entries = entries;
-      this._onChange = onChange;
-      this._indexed = 0;
+      itemListState.set(this, { entries, onChange, indexed: 0 });
     }
-    get length() { return this._entries.length; }
-    item(index) { return this._entries[index] || null; }
+    get length() { return itemListState.get(this).entries.length; }
+    item(index) { return itemListState.get(this).entries[index] || null; }
     _sync() {
-      for (let i = 0; i < this._indexed; i++) delete this[i];
-      this._indexed = this._entries.length;
-      for (let i = 0; i < this._indexed; i++) {
+      const state = itemListState.get(this);
+      for (let i = 0; i < state.indexed; i++) delete this[i];
+      state.indexed = state.entries.length;
+      for (let i = 0; i < state.indexed; i++) {
         Object.defineProperty(this, i, {
-          configurable: true, enumerable: true, get: () => this._entries[i]
+          configurable: true, enumerable: true, get: () => state.entries[i]
         });
       }
-      this._onChange();
+      state.onChange();
     }
     add(data, type) {
+      const state = itemListState.get(this);
       let entry;
       if (data instanceof File) {
         entry = new DataTransferItem(secret, 'file', data.type, data);
       } else {
         if (arguments.length < 2) throw new TypeError('A type is required for string items');
-        const mime = String(type).toLowerCase();
-        if (this._entries.some(item => item.kind === 'string' && item.type === mime))
+        const mime = normalizedType(type);
+        if (state.entries.some(item => item.kind === 'string' && item.type === mime))
           throw new DOMException('An item with that type already exists', 'NotSupportedError');
         entry = new DataTransferItem(secret, 'string', mime, String(data));
       }
-      this._entries.push(entry);
+      state.entries.push(entry);
       this._sync();
       return entry;
     }
     remove(index) {
+      const state = itemListState.get(this);
       const i = Number(index);
-      if (Number.isInteger(i) && i >= 0 && i < this._entries.length) {
-        this._entries.splice(i, 1);
+      if (Number.isInteger(i) && i >= 0 && i < state.entries.length) {
+        state.entries.splice(i, 1);
         this._sync();
       }
     }
-    clear() { this._entries.length = 0; this._sync(); }
-    [Symbol.iterator]() { return this._entries[Symbol.iterator](); }
+    clear() { itemListState.get(this).entries.length = 0; this._sync(); }
+    [Symbol.iterator]() { return itemListState.get(this).entries[Symbol.iterator](); }
   }
   class DataTransfer {
     constructor() {
-      this._entries = [];
-      this._files = Object.create(FileList.prototype);
-      this._fileSlots = 0;
-      this.items = new DataTransferItemList(secret, this._entries, () => this._syncFiles());
+      const state = { entries: [], files: Object.create(FileList.prototype), fileSlots: 0, items: null };
+      transferState.set(this, state);
+      state.items = new DataTransferItemList(secret, state.entries, () => this._syncFiles());
       this._syncFiles();
       this.dropEffect = 'none';
-      this.effectAllowed = 'all';
+      this.effectAllowed = 'none';
     }
     _syncFiles() {
-      const files = this._entries.filter(item => item.kind === 'file').map(item => item._data);
-      for (let i = 0; i < this._fileSlots; i++) delete this._files[i];
-      this._fileSlots = files.length;
+      const state = transferState.get(this);
+      const files = state.entries.filter(item => item.kind === 'file').map(item => itemState.get(item).data);
+      for (let i = 0; i < state.fileSlots; i++) delete state.files[i];
+      state.fileSlots = files.length;
       for (let i = 0; i < files.length; i++) {
-        Object.defineProperty(this._files, i, {value: files[i], configurable: true, enumerable: true});
+        Object.defineProperty(state.files, i, {value: files[i], configurable: true, enumerable: true});
       }
-      Object.defineProperty(this._files, 'length', {
+      Object.defineProperty(state.files, 'length', {
         value: files.length, configurable: true, enumerable: false
       });
     }
-    get files() { return this._files; }
+    get items() { return transferState.get(this).items; }
+    get files() { return transferState.get(this).files; }
     get types() {
+      const entries = transferState.get(this).entries;
       const types = [];
-      for (const item of this._entries) {
+      for (const item of entries) {
         if (item.kind === 'string' && !types.includes(item.type)) types.push(item.type);
       }
-      if (this._entries.some(item => item.kind === 'file')) types.push('Files');
+      if (entries.some(item => item.kind === 'file')) types.push('Files');
       return types;
     }
     getData(type) {
-      const key = String(type).toLowerCase();
-      return this._entries.find(item => item.kind === 'string' && item.type === key)?._data || '';
+      const key = normalizedType(type);
+      const item = transferState.get(this).entries.find(item => item.kind === 'string' && item.type === key);
+      return item ? itemState.get(item).data : '';
     }
     setData(type, data) {
-      const key = String(type).toLowerCase();
-      const existing = this._entries.find(item => item.kind === 'string' && item.type === key);
-      if (existing) existing._data = String(data);
+      const key = normalizedType(type);
+      const item = transferState.get(this).entries.find(item => item.kind === 'string' && item.type === key);
+      if (item) itemState.get(item).data = String(data);
       else this.items.add(String(data), key);
     }
     clearData(type) {
-      for (let i = this._entries.length - 1; i >= 0; i--) {
-        if (this._entries[i].kind === 'string' && (type === undefined || this._entries[i].type === String(type).toLowerCase()))
-          this._entries.splice(i, 1);
+      const entries = transferState.get(this).entries;
+      const key = type === undefined ? undefined : normalizedType(type);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        if (entries[i].kind === 'string' && (key === undefined || entries[i].type === key))
+          entries.splice(i, 1);
       }
       this.items._sync();
     }
