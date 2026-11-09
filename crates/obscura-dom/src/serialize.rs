@@ -176,10 +176,14 @@ impl DomTree {
     }
 }
 
+// "Escaping a string" from the HTML Standard. Attribute mode escapes `<` and
+// `>` too: left literal, a value such as `</noscript><img>` ends its raw-text
+// parent when the markup is parsed again.
 fn escape_text(s: &str, buf: &mut String) {
     for c in s.chars() {
         match c {
             '&' => buf.push_str("&amp;"),
+            '\u{a0}' => buf.push_str("&nbsp;"),
             '<' => buf.push_str("&lt;"),
             '>' => buf.push_str("&gt;"),
             _ => buf.push(c),
@@ -191,7 +195,10 @@ fn escape_attr(s: &str, buf: &mut String) {
     for c in s.chars() {
         match c {
             '&' => buf.push_str("&amp;"),
+            '\u{a0}' => buf.push_str("&nbsp;"),
             '"' => buf.push_str("&quot;"),
+            '<' => buf.push_str("&lt;"),
+            '>' => buf.push_str("&gt;"),
             _ => buf.push(c),
         }
     }
@@ -307,6 +314,36 @@ mod tests {
             assert!(out.contains("&lt;img src=x onerror=1&gt;"), "{out}");
             assert!(again.query_selector("img").unwrap().is_none(), "{out}");
         }
+    }
+
+    #[test]
+    fn attribute_values_and_text_are_escaped_as_the_standard_says() {
+        let (out, again) = reparsed("<a title='&quot;&gt;&lt;img src=x&gt; a&nbsp;b &amp;amp;'>c&nbsp;d</a>");
+        let link = "<a title=\"&quot;&gt;&lt;img src=x&gt; a&nbsp;b &amp;amp;\">c&nbsp;d</a>";
+        assert!(out.contains(link), "{out}");
+        assert_eq!(again.outer_html(again.query_selector("a").unwrap().unwrap()), link);
+    }
+
+    #[test]
+    fn an_attribute_value_cannot_end_a_raw_text_parent() {
+        // What a script can build with appendChild: an element inside a
+        // <noscript>, whose text the parser reads as raw text next time.
+        let tree = parse_html("<noscript id=host></noscript>");
+        let host = tree.get_element_by_id("host").unwrap();
+        let child = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), LocalName::from("p")),
+            attrs: vec![crate::tree::Attribute {
+                name: QualName::new(None, ns!(), LocalName::from("title")),
+                value: "</noscript><img src=x onerror=1>".to_string(),
+            }],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(host, child);
+
+        let out = tree.outer_html(host);
+        assert_eq!(out, "<noscript id=\"host\"><p title=\"&lt;/noscript&gt;&lt;img src=x onerror=1&gt;\"></p></noscript>");
+        assert!(parse_html(&out).query_selector("img").unwrap().is_none(), "{out}");
     }
 
     #[test]
