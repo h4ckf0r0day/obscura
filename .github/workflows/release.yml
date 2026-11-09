@@ -183,17 +183,15 @@ jobs:
           tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
           tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
 
-      - name: Package (Windows)
+      - name: Package and verify Windows runtime dependencies
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cd dist/default
-          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
-          cd ../stealth
-          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
-          cd ../no-render
-          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
-          cd ../no-render-stealth
-          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
+          ./scripts/ci/test_package_windows.ps1
+          ./scripts/ci/package_windows.ps1 dist/default '${{ matrix.name }}.zip'
+          ./scripts/ci/package_windows.ps1 dist/stealth '${{ matrix.name }}-stealth.zip'
+          ./scripts/ci/package_windows.ps1 dist/no-render '${{ matrix.name }}-no-render.zip'
+          ./scripts/ci/package_windows.ps1 dist/no-render-stealth '${{ matrix.name }}-no-render-stealth.zip'
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
