@@ -312,6 +312,10 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 
 `--storage-dir` persists cookies to `cookies.json` and `localStorage` to `localStorage/<origin>-<digest>.json`: read on process start, written after each navigation that changed something and on graceful shutdown. `sessionStorage` is origin-keyed in memory only, per tab.
 
+Storage objects use their original prototype to distinguish platform members from
+stored names. Replacing or deleting `window.Storage` does not break either store;
+changes to the original prototype still take effect.
+
 ## Stealth
 
 `--stealth` swaps the default `reqwest` client for `obscura-net/wreq_client.rs`, which presents a real browser's TLS ClientHello, ALPN, and cipher order (a consistent Chrome fingerprint, not a randomized one) so the TLS layer matches the User-Agent and JS surfaces. It also applies the bundled tracker blocklist before any request leaves the process. Scripted `fetch()`/XHR go through the same stealth client, so subresource requests carry the same fingerprint as the navigation. `--stealth` is a global CLI flag that applies to `fetch`, `serve`, `scrape`, and `mcp`.

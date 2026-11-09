@@ -13541,9 +13541,10 @@ Object.defineProperty(Storage.prototype, 'length', {
 });
 
 const _mkStore = (local) => {
-  const target = Object.create(Storage.prototype);
+  const prototype = Storage.prototype;
+  const target = Object.create(prototype);
   const slot = { local: !!local };
-  const isReal = (p) => p === 'constructor' || (p in Storage.prototype);
+  const isReal = (p) => p === 'constructor' || (p in prototype);
   const proxy = new Proxy(target, {
     get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
     set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
