@@ -1,16 +1,11 @@
 name: Release
 
 on:
-  # Manual/called validation uses Windows only and cannot publish a release.
+  # Manual validation uses Windows only and cannot publish a release.
   workflow_dispatch:
     inputs:
       windows_only:
         description: Validate only the Windows distribution
-        type: boolean
-        default: true
-  workflow_call:
-    inputs:
-      windows_only:
         type: boolean
         default: true
   push:
