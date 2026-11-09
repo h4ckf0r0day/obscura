@@ -168,6 +168,11 @@
     {"name": "explicit fractional line height accumulates fractionally", "color": "#c2255c", "x": 600, "y": 215, "width": 100, "height": 20},
     {"name": "explicit line height may be smaller than font size", "color": "#2b8a3e", "x": 750, "y": 100, "width": 100, "height": 20}
   ],
+  "float-em-margin-band": [
+    {"name": "float stays at the inline end beside its em margin", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
+    {"name": "in-flow block beside the float keeps its authored-margin width", "color": "#087f5b", "x": 0, "y": 0, "width": 580, "height": 100},
+    {"name": "clear moves below the float bottom at full width", "color": "#a61e4d", "x": 0, "y": 400, "width": 900, "height": 50}
+  ],
   "float-flow-bands": [
     {"name": "right float occupies its band", "color": "#1971c2", "x": 650, "y": 0, "width": 250, "height": 400},
     {"name": "float-avoiding intro uses available band", "color": "#087f5b", "x": 0, "y": 0, "width": 650, "height": 100},
