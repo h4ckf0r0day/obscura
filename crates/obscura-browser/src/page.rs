@@ -2462,6 +2462,16 @@ impl Page {
                                 }
                                 _ => continue,
                             };
+                            // HTML "prepare the script element": a classic
+                            // script with `nomodule` does not run in a browser
+                            // that supports module scripts. Sites ship a modern
+                            // module build beside a nomodule legacy build;
+                            // running both mixes their webpack runtimes.
+                            if matches!(kind, ScriptKind::Classic)
+                                && node.get_attribute("nomodule").is_some()
+                            {
+                                continue;
+                            }
 
                             let inline_code = if src.is_none() {
                                 dom.text_content(sid)
@@ -8729,6 +8739,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.value, Some(serde_json::json!(2.0)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nomodule_classic_scripts_do_not_run() {
+        let mut page = import_map_test_page(
+            "nomodule",
+            "http://127.0.0.1:9",
+            r#"<html><head>
+                <script>globalThis.__ran = ['classic'];</script>
+                <script nomodule>globalThis.__ran.push('nomodule-inline');</script>
+                <script type="module">globalThis.__ran.push('module');</script>
+                <script nomodule type="text/javascript">globalThis.__ran.push('nomodule-typed');</script>
+                <script>
+                  const dynamic = document.createElement('script');
+                  dynamic.setAttribute('nomodule', '');
+                  dynamic.textContent = "globalThis.__ran.push('nomodule-dynamic')";
+                  document.head.appendChild(dynamic);
+                  const plain = document.createElement('script');
+                  plain.textContent = "globalThis.__ran.push('dynamic')";
+                  document.head.appendChild(plain);
+                </script>
+            </head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(None).await;
+        let ran = page.js.as_mut().unwrap().evaluate("globalThis.__ran").unwrap();
+        assert_eq!(ran, serde_json::json!(["classic", "dynamic", "module"]));
     }
 
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
