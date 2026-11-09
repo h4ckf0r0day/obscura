@@ -1,0 +1,35 @@
+name: Diagnose Windows release dependencies
+on:
+  push:
+    branches: [fix/windows-vcruntime-distribution]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect published v0.2.6 archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          foreach ($suffix in @('', '-stealth', '-no-render', '-no-render-stealth')) {
+            $name = "obscura-x86_64-windows$suffix"
+            Invoke-WebRequest "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.6/$name.zip" -OutFile "$env:RUNNER_TEMP\$name.zip"
+            $dir = "$env:RUNNER_TEMP\$name"
+            Expand-Archive "$env:RUNNER_TEMP\$name.zip" $dir
+            Write-Output "ARCHIVE $name"
+            Get-ChildItem $dir | Select-Object Name,Length | Format-Table
+            foreach ($exe in Get-ChildItem $dir -Filter '*.exe') {
+              Write-Output "DEPENDENTS $($exe.Name)"
+              & $dumpbin /DEPENDENTS $exe.FullName
+              if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed' }
+            }
+          }
+          Write-Output 'MSVC REDIST SOURCES'
+          Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\*.dll" | Select-Object FullName
+          Write-Output 'V8 CRT CONFIGURATION'
+          $source = (Invoke-WebRequest 'https://raw.githubusercontent.com/denoland/rusty_v8/v150.4.0/build.rs').Content
+          $source -split "`n" | Select-String 'crt|static_crt|use_custom_libcxx|GN_ARGS' -Context 3,3
