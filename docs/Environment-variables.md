@@ -73,6 +73,20 @@ bytes. Pass it as `Authorization: Bearer <token>` in the CDP client's headers.
 OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" obscura serve --host 0.0.0.0
 ```
 
+### `OBSCURA_CDP_ALLOWED_ORIGINS`
+
+Comma-separated `Origin` allowlist for CDP clients that send an `Origin`
+header (browser-style WebSocket clients such as Puppeteer, Playwright, and
+chrome-remote-interface all do). Loopback origins and the server's own address
+are always accepted without it, so standard clients work out of the box; a
+non-loopback origin is refused with an actionable 403 unless it is listed
+here. `*` allows every origin, including the `null` origin that sandboxed
+pages send.
+
+```bash
+OBSCURA_CDP_ALLOWED_ORIGINS="https://tunnel.example" obscura serve
+```
+
 ### `OBSCURA_FETCH_TIMEOUT_MS`
 
 Request timeout for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. Without it a request to a server that accepts the connection but never responds (including a CORS preflight) hangs forever and the XHR is stuck with no completion event. Default 30000 (30 seconds).

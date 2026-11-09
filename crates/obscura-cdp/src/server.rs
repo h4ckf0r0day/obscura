@@ -142,12 +142,81 @@ fn host_matches_bind(
         })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ControlRefusal {
-    BrowserOrigin,
+    BrowserOrigin(String),
     ForeignHost,
     Unauthorized,
     OversizedHead,
+}
+
+/// Origin allowlist for CDP callers, read from `OBSCURA_CDP_ALLOWED_ORIGINS`
+/// (comma-separated, `*` allows every origin). Unset means only the
+/// Chrome-default policy in `origin_accepted` applies.
+fn allowed_origins_env() -> Option<String> {
+    std::env::var("OBSCURA_CDP_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Whether a control connection's `Origin` header is accepted (issue #1495).
+///
+/// Chrome's DevTools handler rejects a WebSocket handshake whose `Origin` is
+/// neither the server's own address nor allowlisted, but Puppeteer, Playwright,
+/// and chrome-remote-interface all send a normal loopback `Origin` on every
+/// connect, so refusing every request with an `Origin` header locked those
+/// clients out entirely. The Chrome-compatible policy here:
+///
+/// - an entry in `OBSCURA_CDP_ALLOWED_ORIGINS` (exact, case-insensitive, `*`
+///   wildcard — the `--remote-allow-origins` semantics) overrides everything,
+///   including the `null` origin that sandboxed pages send,
+/// - a loopback origin (any `localhost` / loopback host, any port) is
+///   accepted: such a page is served by a local process, the same trust
+///   domain as the automation client itself,
+/// - an origin equal to the server's own `http://<bind-ip>:<bind-port>`
+///   address is accepted (Chrome's same-origin rule).
+///
+/// Requests without an `Origin` header (native clients) never reach this.
+fn origin_accepted(
+    origin: &str,
+    bind_ip: std::net::IpAddr,
+    bind_port: u16,
+    allowed_origins: Option<&str>,
+) -> bool {
+    let origin = origin.trim();
+    if let Some(list) = allowed_origins {
+        let wanted = origin.to_ascii_lowercase();
+        if list
+            .split(',')
+            .map(str::trim)
+            .any(|entry| entry == "*" || entry.eq_ignore_ascii_case(&wanted))
+        {
+            return true;
+        }
+    }
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let loopback_host = match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if loopback_host {
+        return true;
+    }
+    // Chrome's same-origin rule: the handshake is trusted when the origin is
+    // exactly the server's own http address.
+    let Ok(server) = url::Url::parse(&format!("http://{}", SocketAddr::new(bind_ip, bind_port)))
+    else {
+        return false;
+    };
+    parsed.origin() == server.origin()
 }
 
 fn control_refusal(
@@ -156,9 +225,12 @@ fn control_refusal(
     port: u16,
     forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
+    allowed_origins: Option<&str>,
 ) -> Option<ControlRefusal> {
-    if header_value(head, "origin").is_some() {
-        return Some(ControlRefusal::BrowserOrigin);
+    if let Some(origin) = header_value(head, "origin") {
+        if !origin_accepted(origin, bind_ip, port, allowed_origins) {
+            return Some(ControlRefusal::BrowserOrigin(origin.to_owned()));
+        }
     }
     if !header_value(head, "host")
         .is_some_and(|host| host_matches_bind(host, bind_ip, port, forwarded))
@@ -173,17 +245,30 @@ fn control_refusal(
 
 fn refuse_control_connection(mut stream: std::net::TcpStream, refusal: ControlRefusal) {
     use std::io::Write;
-    let (status, reason) = match refusal {
+    let (status, reason) = match &refusal {
         ControlRefusal::Unauthorized => ("401 Unauthorized", "authentication required"),
         ControlRefusal::OversizedHead => (
             "431 Request Header Fields Too Large",
             "request head too large",
         ),
-        ControlRefusal::BrowserOrigin | ControlRefusal::ForeignHost => {
+        ControlRefusal::BrowserOrigin(_) | ControlRefusal::ForeignHost => {
             ("403 Forbidden", "request refused")
         }
     };
-    let body = format!("{{\"error\":\"{reason}\"}}");
+    let body = match &refusal {
+        // Mirror Chrome's actionable rejection so a failing client can be
+        // fixed by configuration, not by suppressing the header.
+        ControlRefusal::BrowserOrigin(origin) => json!({
+            "error": reason,
+            "detail": format!(
+                "Rejected an incoming WebSocket connection from the '{origin}' origin. \
+                 Set OBSCURA_CDP_ALLOWED_ORIGINS={origin} to allow connections from this \
+                 origin or OBSCURA_CDP_ALLOWED_ORIGINS=* to allow all origins."
+            ),
+        })
+        .to_string(),
+        _ => format!("{{\"error\":\"{reason}\"}}"),
+    };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -439,6 +524,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
     let accept_auth_token = auth_token.clone();
+    let accept_allowed_origins = allowed_origins_env();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -504,6 +590,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
                                 port,
                                 forwarded,
                                 accept_auth_token.as_deref(),
+                                accept_allowed_origins.as_deref(),
                                 &ws_tx,
                                 &head,
                             ) {
@@ -1115,10 +1202,11 @@ fn accept_dispatch(
     port: u16,
     forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
+    allowed_origins: Option<&str>,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
 ) -> anyhow::Result<()> {
-    if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token) {
+    if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token, allowed_origins) {
         refuse_control_connection(stream, refusal);
         return Ok(());
     }
@@ -2605,7 +2693,7 @@ mod tests {
     fn native_loopback_cdp_request_is_allowed() {
         let head = native_head("127.0.0.1:9222");
         assert_eq!(
-            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None, None),
+            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None, None, None),
             None
         );
     }
@@ -2623,14 +2711,16 @@ mod tests {
                 9222,
                 None,
                 None,
+                None,
             ),
-            Some(ControlRefusal::BrowserOrigin)
+            Some(ControlRefusal::BrowserOrigin("https://evil.example".to_owned()))
         );
         assert_eq!(
             control_refusal(
                 &native_head("rebind.example:9222"),
                 "127.0.0.1".parse().unwrap(),
                 9222,
+                None,
                 None,
                 None,
             ),
@@ -2643,7 +2733,7 @@ mod tests {
         let bind = "127.0.0.1".parse().unwrap();
         let forwarded = Some((bind, 9222));
         assert_eq!(
-            control_refusal(&native_head("127.0.0.1:9222"), bind, 9223, forwarded, None),
+            control_refusal(&native_head("127.0.0.1:9222"), bind, 9223, forwarded, None, None),
             None
         );
         assert_eq!(
@@ -2653,11 +2743,12 @@ mod tests {
                 9223,
                 forwarded,
                 None,
+                None,
             ),
             Some(ControlRefusal::ForeignHost)
         );
         assert_eq!(
-            control_refusal(&native_head("127.0.0.1:9444"), bind, 9223, forwarded, None),
+            control_refusal(&native_head("127.0.0.1:9444"), bind, 9223, forwarded, None, None),
             Some(ControlRefusal::ForeignHost)
         );
     }
@@ -2668,9 +2759,59 @@ mod tests {
         let public = Some(("0.0.0.0".parse().unwrap(), 9222));
         let head = native_head("cdp.example.test:9222");
         assert_eq!(
-            control_refusal(&head, bind, 9223, public, Some("secret")),
+            control_refusal(&head, bind, 9223, public, Some("secret"), None),
             Some(ControlRefusal::Unauthorized)
         );
+    }
+
+    #[test]
+    fn loopback_origins_are_accepted_without_configuration() {
+        let bind = "127.0.0.1".parse().unwrap();
+        // What Puppeteer, Playwright, and chrome-remote-interface send on a
+        // standard connect (issue #1495): origin derived from the ws URL.
+        for origin in [
+            "http://127.0.0.1:9222",
+            "http://localhost:9222",
+            "http://localhost:8080",
+            "http://[::1]:9222",
+            "https://localhost:5173",
+        ] {
+            assert!(super::origin_accepted(origin, bind, 9222, None), "{origin}");
+        }
+        // A different port than the bind is still loopback.
+        assert!(super::origin_accepted("http://127.0.0.1:7777", bind, 9222, None));
+    }
+
+    #[test]
+    fn non_loopback_origins_stay_refused_without_configuration() {
+        let bind = "127.0.0.1".parse().unwrap();
+        for origin in [
+            "https://evil.example",
+            "http://evil.example:8080",
+            "http://rebind.example:9222",
+            "null",
+            "",
+        ] {
+            assert!(!super::origin_accepted(origin, bind, 9222, None), "{origin}");
+        }
+        // Chrome's same-origin rule: the exact server address is accepted.
+        assert!(super::origin_accepted("http://192.168.1.10:9333", "192.168.1.10".parse().unwrap(), 9333, None));
+        assert!(!super::origin_accepted("http://192.168.1.10:9333", "192.168.1.10".parse().unwrap(), 9444, None));
+    }
+
+    #[test]
+    fn allowed_origins_list_overrides_the_default_policy() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let list = Some("http://dev.example:4173, https://tunnel.example");
+        assert!(super::origin_accepted("http://dev.example:4173", bind, 9222, list));
+        assert!(super::origin_accepted("https://tunnel.example", bind, 9222, list));
+        assert!(super::origin_accepted("  https://tunnel.example ", bind, 9222, list));
+        assert!(!super::origin_accepted("http://other.example", bind, 9222, list));
+        // `*` allows everything, matching --remote-allow-origins=*
+        assert!(super::origin_accepted("http://anything.example", bind, 9222, Some("*")));
+        assert!(super::origin_accepted("null", bind, 9222, Some("null")));
+        // Matching is case-insensitive like Chrome's lowercased set.
+        assert!(super::origin_accepted("HTTP://DEV.EXAMPLE:4173", bind, 9222, list));
     }
 
     #[test]
