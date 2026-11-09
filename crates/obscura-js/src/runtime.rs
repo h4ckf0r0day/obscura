@@ -257,9 +257,15 @@ pub struct CdpObjectState {
     evaluation_recipes: HashMap<String, String>,
 }
 
+struct CdpObjectRecord {
+    retrieval: String,
+    // The evaluation world can differ from the value's creation realm.
+    frame: Option<(u32, v8::Global<v8::Context>)>,
+}
+
 pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
-    object_store: HashMap<String, String>,
+    object_store: HashMap<String, CdpObjectRecord>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
@@ -1470,18 +1476,58 @@ impl ObscuraJsRuntime {
                     .and_then(|rest| rest.split_once('-'))
                     .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
                     .unwrap_or(0);
-                let object_id_lit = js_string_literal(object_id);
-                let retrieval = if frame_id == 0 {
-                    format!("globalThis.__obscura_objects[{object_id_lit}]")
-                } else {
-                    format!(
-                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}]"
-                    )
-                };
-                self.object_store.insert(object_id.to_string(), retrieval);
+                if let Err(error) = self.retain_console_object(object_id, frame_id) {
+                    tracing::warn!(object_id, %error, "Could not retain console object");
+                }
             }
         }
         events
+    }
+
+    fn retain_console_object(&mut self, object_id: &str, frame_id: u32) -> Result<(), String> {
+        let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
+        let result = self.retain_console_object_in_context(object_id, frame_id);
+        if self.disarm_watchdog(watchdog) {
+            return Err("Console object retention exceeded its deadline".into());
+        }
+        self.finish_heap_checked(result)
+    }
+
+    fn retain_console_object_in_context(&mut self, object_id: &str, frame_id: u32) -> Result<(), String> {
+        let frame = if frame_id == 0 { None } else {
+            Some((frame_id, self.cdp_context(Some(frame_id))?))
+        };
+        if let Some((_, context)) = &frame {
+            let value = {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
+                v8::tc_scope!(let scope, scope);
+                let key = v8::String::new(scope, "__obscura_objects").ok_or("Console store allocation failed")?;
+                let global = scope.get_current_context().global(scope);
+                let objects = global.get(scope, key.into()).and_then(|value| value.to_object(scope))
+                    .ok_or("Console object store unavailable")?;
+                let key = v8::String::new(scope, object_id).ok_or("Console object key allocation failed")?;
+                let value = objects.get(scope, key.into()).ok_or("Console object unavailable")?;
+                let value = v8::Global::new(scope, value);
+                if objects.delete(scope, key.into()) != Some(true) { return Err("Cannot move console object".into()); }
+                value
+            };
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let key = v8::String::new(scope, "__obscura_objects").ok_or("Console store allocation failed")?;
+            let global = scope.get_current_context().global(scope);
+            let objects = global.get(scope, key.into()).and_then(|value| value.to_object(scope))
+                .ok_or("Console object store unavailable")?;
+            let key = v8::String::new(scope, object_id).ok_or("Console object key allocation failed")?;
+            let value = v8::Local::new(scope, value);
+            if objects.set(scope, key.into(), value) != Some(true) { return Err("Cannot retain console object".into()); }
+        }
+        self.object_store.insert(object_id.to_string(), CdpObjectRecord {
+            retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id)), frame,
+        });
+        Ok(())
     }
 
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
@@ -2807,10 +2853,19 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
-        let mut context = self.cdp_context(frame_id)?;
+        if let Some(object_id) = object_id {
+            self.validate_cdp_object_context(object_id)?;
+            let object_frame = self.object_store.get(object_id)
+                .and_then(|record| record.frame.as_ref().map(|(id, _)| *id));
+            if frame_id.is_some() && frame_id != object_frame {
+                return Err("Object belongs to a different execution context".into());
+            }
+            frame_id = object_frame;
+        }
+        let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
         let receiver = if object_id.is_some() {
-            let this_expr = self.resolve_this(object_id);
+            let this_expr = self.resolve_this(object_id)?;
             self.execute_runtime_script("<cdp-receiver>", this_expr)
                 .map_err(|error| format!("JS error: {error}"))?
         } else {
@@ -2820,24 +2875,6 @@ impl ObscuraJsRuntime {
             let value: v8::Local<v8::Value> = global.into();
             v8::Global::new(scope, value)
         };
-        if frame_id.is_none() && object_id.is_some() {
-            let creation_context = {
-                let mut entered = self.runtime();
-                let main = entered.main_context();
-                v8::scope_with_context!(scope, entered.v8_isolate(), main);
-                v8::Local::<v8::Object>::try_from(v8::Local::new(scope, &receiver)).ok()
-                    .and_then(|object| object.get_creation_context(scope))
-                    .map(|context| v8::Global::new(scope, context))
-            };
-            if let Some(creation_context) = creation_context {
-                if creation_context != context {
-                    let id = self.realm_states().borrow().frame_id_for_context(&creation_context)
-                        .ok_or("Execution context was destroyed")?;
-                    frame_id = Some(id);
-                    context = creation_context;
-                }
-            }
-        }
         let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context))
             .collect::<Result<Vec<_>, _>>()?;
         self.object_counter += 1;
@@ -2994,6 +3031,9 @@ impl ObscuraJsRuntime {
         } else { meta };
         let mut info = self.finish_cdp_result(&meta, &oid)?;
         info.thrown = rejected;
+        if info.object_id.is_some() {
+            self.object_store.get_mut(&oid).ok_or("Cannot store evaluation context")?.frame = pending.frame;
+        }
         if !rejected && info.object_id.is_some() {
             if let Some(recipe) = pending.recipe { self.evaluation_recipes.insert(oid, recipe); }
         }
@@ -3050,7 +3090,10 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
+            CdpObjectRecord {
+                retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
+                frame: None,
+            },
         );
         Ok(oid)
     }
@@ -3084,44 +3127,51 @@ impl ObscuraJsRuntime {
         self.finish_cdp_result(&meta_json, &oid)
     }
 
+    #[doc(hidden)]
+    pub fn validate_cdp_object_context(&self, object_id: &str) -> Result<(), String> {
+        let record = self.object_store.get(object_id);
+        if record.is_none() && !self.evaluation_recipes.contains_key(object_id)
+            && !object_id.strip_prefix("node-").is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) && id.parse::<u32>().is_ok()
+            })
+        {
+            return Err("Could not find object with given id".into());
+        }
+        if record.and_then(|record| record.frame.as_ref())
+            .is_some_and(|(id, context)| self.realm_states().borrow().context(*id).as_ref() != Some(context))
+        {
+            return Err("Execution context was destroyed".into());
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn cdp_object_expression(&mut self, object_id: &str) -> Result<String, String> {
+        self.validate_cdp_object_context(object_id)?;
+        self.resolve_this(Some(object_id))
+    }
+
+    #[doc(hidden)]
+    pub fn register_cdp_property_object(&mut self, parent_id: &str, object_id: &str) -> Result<(), String> {
+        self.validate_cdp_object_context(parent_id)?;
+        let frame = self.object_store.get(parent_id).and_then(|record| record.frame.clone());
+        self.object_store.insert(object_id.to_string(), CdpObjectRecord {
+            retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id)),
+            frame,
+        });
+        Ok(())
+    }
+
     pub fn release_object(&mut self, object_id: &str) {
         self.evaluation_recipes.remove(object_id);
-        if self.object_store.remove(object_id).is_some() {
-            let frame_id = object_id
-                .strip_prefix("console-")
-                .and_then(|rest| rest.split_once('-'))
-                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
-                .unwrap_or(0);
-            let object_id_lit = js_string_literal(object_id);
-            let code = if frame_id == 0 {
-                format!("delete globalThis.__obscura_objects[{object_id_lit}];")
-            } else {
-                format!(
-                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}];"
-                )
-            };
+        if let Some(record) = self.object_store.remove(object_id) {
+            let code = format!("delete ({});", record.retrieval);
             let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let mut frame_ids: Vec<u32> = self
-            .object_store
-            .keys()
-            .filter_map(|object_id| object_id.strip_prefix("console-"))
-            .filter_map(|rest| rest.split_once('-'))
-            .filter_map(|(frame_id, _)| frame_id.parse().ok())
-            .filter(|frame_id| *frame_id != 0)
-            .collect();
-        frame_ids.sort_unstable();
-        frame_ids.dedup();
-        let mut code = "globalThis.__obscura_objects = {};".to_string();
-        for frame_id in frame_ids {
-            code.push_str(&format!(
-                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
-            ));
-        }
-        let _ = self.execute_runtime_script("<releaseGroup>", code);
+        let _ = self.execute_runtime_script("<releaseGroup>", "globalThis.__obscura_objects = {};".to_string());
         self.object_store.clear();
         self.evaluation_recipes.clear();
     }
@@ -4261,10 +4311,7 @@ impl ObscuraJsRuntime {
     pub fn with_remote_dom_node<R>(&mut self, object_id: &str,
         inspect: impl FnOnce(&DomTree, NodeId, u32, &str, &str) -> R) -> Result<R, String> {
         self.begin_javascript_task();
-        // getProperties also stores child handles directly in the realm's table.
-        let retrieval = self.resolve_remote_object(object_id).unwrap_or_else(|| {
-            format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id))
-        });
+        let retrieval = self.cdp_object_expression(object_id)?;
         let receiver = self.execute_runtime_script("<cdp-dom-node>", retrieval)
             .map_err(|error| format!("Could not resolve remote node: {error}"))?;
         let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
@@ -4453,7 +4500,7 @@ impl ObscuraJsRuntime {
 
     fn resolve_remote_object(&mut self, object_id: &str) -> Option<String> {
         if let Some(retrieval) = self.object_store.get(object_id) {
-            return Some(retrieval.clone());
+            return Some(retrieval.retrieval.clone());
         }
         let expression = self.evaluation_recipes.get(object_id)?.clone();
         let object_id_literal = js_string_literal(object_id);
@@ -4462,19 +4509,23 @@ impl ObscuraJsRuntime {
         self.execute_runtime_script("<restore-cdp-object>", code)
             .ok()?;
         let retrieval = format!("globalThis.__obscura_objects[{object_id_literal}]");
-        self.object_store
-            .insert(object_id.to_string(), retrieval.clone());
+        self.object_store.insert(object_id.to_string(), CdpObjectRecord {
+            retrieval: retrieval.clone(), frame: None,
+        });
         Some(retrieval)
     }
 
-    fn resolve_this(&mut self, object_id: Option<&str>) -> String {
+    fn resolve_this(&mut self, object_id: Option<&str>) -> Result<String, String> {
         match object_id {
             Some(oid) => {
                 if let Some(retrieval) = self.resolve_remote_object(oid) {
-                    retrieval
+                    Ok(retrieval)
                 } else if oid.starts_with("node-") {
-                    let nid = oid.strip_prefix("node-").unwrap_or("0");
-                    format!(
+                    let nid = oid.strip_prefix("node-").filter(|id| {
+                        !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                    }).and_then(|id| id.parse::<u32>().ok())
+                        .ok_or("Could not find object with given id")?;
+                    Ok(format!(
                         "(function() {{ \
                             var nid = {}; \
                             var cache = globalThis._cache || new Map(); \
@@ -4482,12 +4533,12 @@ impl ObscuraJsRuntime {
                             return null; \
                         }})()",
                         nid
-                    )
+                    ))
                 } else {
-                    "globalThis".to_string()
+                    Err("Could not find object with given id".into())
                 }
             }
-            None => "globalThis".to_string(),
+            None => Ok("globalThis".to_string()),
         }
     }
 
@@ -4498,7 +4549,12 @@ impl ObscuraJsRuntime {
     ) -> Result<v8::Global<v8::Value>, String> {
         // Remote handles take precedence over value, including rod's value:null.
         if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
-            let expression = self.resolve_remote_object(id).unwrap_or_else(|| "undefined".into());
+            let expression = self.cdp_object_expression(id)?;
+            let object_context = self.object_store.get(id).and_then(|record| record.frame.as_ref())
+                .map(|(_, context)| context.clone()).unwrap_or_else(|| self.runtime().main_context());
+            if &object_context != context {
+                return Err("Object belongs to a different execution context".into());
+            }
             return self.execute_runtime_script("<cdp-argument>", expression)
                 .map_err(|error| format!("JS error: {error}"));
         }
@@ -4590,7 +4646,10 @@ impl ObscuraJsRuntime {
         }
         self.object_store.insert(
             oid.to_string(),
-            format!("globalThis.__obscura_objects[{}]", js_string_literal(oid)),
+            CdpObjectRecord {
+                retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(oid)),
+                frame: None,
+            },
         );
         Ok(Self::info_from_meta(meta, Some(oid.to_string())))
     }
@@ -5246,6 +5305,133 @@ mod tests {
             select.length = 3;
             return [branded, index, select.item(0).id, select.item(2).index, select.length];
         })()"#).unwrap(), serde_json::json!([true,1,"b",2,3]));
+    }
+
+    #[test]
+    fn cdp_frame_console_retention_bounds_page_owned_store_getters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://foreign.test/child", "<html><body>child</body></html>").unwrap();
+        frame.execute_script(&mut rt, r#"console.log({answer:42});
+            globalThis.__obscura_objects = new Proxy({}, {get() { while (true) {} }});
+            void 0;
+        "#).unwrap();
+        let events = rt.take_pending_runtime_events();
+        assert!(events.iter().any(|event| matches!(event, RuntimeEvent::Console(_))));
+        assert!(rt.object_store.is_empty());
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+        drop(frame);
+    }
+
+    #[test]
+    fn cdp_frame_console_objects_keep_their_world_without_leaking_child_store_entries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://foreign.test/child", "<html><body>child</body></html>").unwrap();
+        frame.execute_script(&mut rt, "console.log({answer:42})").unwrap();
+        let events = rt.take_pending_runtime_events();
+        let oid = events.iter().find_map(|event| match event {
+            RuntimeEvent::Console(event) => event.args.iter().find_map(|arg| arg["objectId"].as_str()),
+            _ => None,
+        }).expect("missing console object").to_string();
+        let CdpEvaluation::Complete(result) = rt.start_cdp_call(
+            "function() { return [document.URL, this.answer]; }", Some(&oid), &[], true, false,
+        ).unwrap() else { panic!("expected a value"); };
+        assert_eq!(result.value.unwrap(), serde_json::json!(["http://foreign.test/child",42]));
+        assert_eq!(frame.evaluate(&mut rt, "Object.keys(globalThis.__obscura_objects).length").unwrap(),
+            serde_json::json!(0));
+        rt.release_object(&oid);
+        assert_eq!(rt.evaluate("Object.keys(globalThis.__obscura_objects).length").unwrap(), serde_json::json!(0.0));
+        assert!(rt.start_cdp_call("function() { return this; }", Some(&oid), &[], true, false).is_err());
+        drop(frame);
+    }
+
+    #[test]
+    fn cdp_frame_handles_keep_the_wrapping_world_and_reject_reused_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        frame.evaluate(&mut rt, "globalThis.childObject = {nested: {answer:42}}").unwrap();
+        let child = rt.start_cdp_evaluation_in_frame(Some(1), "childObject", false, false).unwrap();
+        let CdpEvaluation::Complete(child) = child else { panic!("expected a handle"); };
+        let child_id = child.object_id.unwrap();
+        let root = rt.start_cdp_evaluation(
+            "globalThis.__obscura_frameObjects[1].window.childObject", false, false,
+        ).unwrap();
+        let CdpEvaluation::Complete(root) = root else { panic!("expected a handle"); };
+        let root_id = root.object_id.unwrap();
+        for (id, expected) in [(&root_id, "http://example.com/test"), (&child_id, "http://example.com/child")] {
+            let result = rt.start_cdp_call("function() { return document.URL; }", Some(id), &[], true, false).unwrap();
+            let CdpEvaluation::Complete(result) = result else { panic!("expected a value"); };
+            assert_eq!(result.value.unwrap(), serde_json::json!(expected));
+        }
+        drop(frame);
+        let _replacement = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/new", "<html><body>new</body></html>").unwrap();
+        assert_eq!(rt.validate_cdp_object_context(&child_id).unwrap_err(), "Execution context was destroyed");
+        assert!(rt.start_cdp_call("function() { return 1; }", Some(&child_id), &[], true, false).is_err());
+        assert!(rt.start_cdp_call("function() { return document.URL; }", Some(&root_id), &[], true, false).is_ok());
+    }
+
+    #[test]
+    fn cdp_calls_reject_unknown_released_cross_world_and_malformed_node_handles() {
+        let mut rt = setup_runtime("<html><body><h1>Main</h1></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        let CdpEvaluation::Complete(child) = rt.start_cdp_evaluation_in_frame(
+            Some(1), "({answer:42})", false, false,
+        ).unwrap() else { panic!("expected a handle"); };
+        let child_id = child.object_id.unwrap();
+        let invalid = ["unknown", "node-", "node--1", "node-+1", "node-1e1", "node-4294967296",
+            "node-1;globalThis.__pwned=1;//", "node-1\n"];
+        for id in invalid {
+            assert!(rt.start_cdp_call("function() { globalThis.__pwned=1; }",
+                Some(id), &[], true, false).is_err(), "{id}");
+            assert!(rt.start_cdp_call("function(value) { globalThis.__pwned=1; }",
+                None, &[serde_json::json!({"objectId":id,"value":null})], true, false).is_err(), "{id}");
+        }
+        assert!(rt.start_cdp_call("function(value) { globalThis.__pwned=1; }", None,
+            &[serde_json::json!({"objectId":child_id})], true, false).is_err());
+        assert!(rt.start_cdp_call_in_frame(Some(1), "function(value) { return value.answer; }", None,
+            &[serde_json::json!({"objectId":child_id,"value":null})], true, false).is_ok());
+        let node_id = rt.with_dom(|dom| dom.query_selector("h1").unwrap().unwrap().raw()).unwrap();
+        assert!(rt.start_cdp_call("function() { return this.textContent; }",
+            Some(&format!("node-{node_id}")), &[], true, false).is_ok());
+        rt.release_object(&child_id);
+        assert!(rt.start_cdp_call("function() { globalThis.__pwned=1; }",
+            Some(&child_id), &[], true, false).is_err());
+        assert_eq!(rt.evaluate("globalThis.__pwned").unwrap(), serde_json::Value::Null);
+        drop(frame);
+    }
+
+    #[test]
+    fn cdp_suspension_recipes_never_restore_child_handles_in_the_main_world() {
+        let mut rt = setup_runtime("<html><body><h1>Main</h1></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        let CdpEvaluation::Complete(child) = rt.start_cdp_evaluation_in_frame(
+            Some(1), "({answer:42})", false, false,
+        ).unwrap() else { panic!("expected a handle"); };
+        let child_id = child.object_id.unwrap();
+        let CdpEvaluation::Complete(root) = rt.start_cdp_evaluation(
+            "document.querySelector('h1')", false, false,
+        ).unwrap() else { panic!("expected a handle"); };
+        let root_id = root.object_id.unwrap();
+        let state = rt.take_cdp_object_state();
+        drop(frame);
+        drop(rt);
+        let mut rt = setup_runtime("<html><body><h1>Main</h1></body></html>");
+        rt.restore_cdp_object_state(state);
+        assert!(rt.start_cdp_call("function() { return document.URL; }",
+            Some(&child_id), &[], true, false).is_err());
+        let CdpEvaluation::Complete(value) = rt.start_cdp_call("function() { return this.textContent; }",
+            Some(&root_id), &[], true, false).unwrap() else { panic!("expected a value"); };
+        assert_eq!(value.value.unwrap(), serde_json::json!("Main"));
+        rt.release_object_group();
+        assert!(rt.start_cdp_call("function() { return this; }",
+            Some(&root_id), &[], true, false).is_err());
     }
 
     #[test]
@@ -20938,7 +21124,7 @@ mod tests {
         // store holds it; simulate a store entry whose id carries source text.
         let hostile = "x'];globalThis.__pwned=1;//";
         rt.object_store
-            .insert(hostile.to_string(), "undefined".to_string());
+            .insert(hostile.to_string(), CdpObjectRecord { retrieval: "undefined".to_string(), frame: None });
         rt.release_object(hostile);
         assert_eq!(
             rt.evaluate("globalThis.__pwned").unwrap(),

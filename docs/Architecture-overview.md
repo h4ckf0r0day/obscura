@@ -129,8 +129,10 @@ Live child frames advertise their default CDP execution contexts.
 `Runtime.evaluate` and `Runtime.callFunctionOn`, including awaited calls,
 enter the frame's actual V8 realm and use its document. Remote objects remain
 in the page's central handle store, while result metadata is read in the
-owning realm. Calls using a child object handle infer its live realm and
-reject retired realms rather than falling back to the main document.
+owning realm. Object handles and their property handles retain the realm
+of the evaluation that produced them, not the object's creation realm.
+Calls reject retired realms and unknown or released handles rather than
+falling back to the main document.
 Pending evaluations reject retired frame contexts instead of reading a
 replacement document. Named utility contexts still alias their
 frame's realm rather than providing separate JavaScript worlds.

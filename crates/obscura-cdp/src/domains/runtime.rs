@@ -356,7 +356,7 @@ pub async fn handle(
             // does. CDP names this field `executionContextId` on
             // callFunctionOn (not `contextId`); a request may omit it when
             // `objectId` is supplied — in that case context validation is a
-            // no-op and the native call resolves the receiver's owning realm.
+            // no-op and the native call uses the handle's recorded evaluation realm.
             let frame_id = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
 
             // Keep awaitPromise alive for the same command budget as evaluate.
@@ -418,6 +418,8 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page")?;
+                let retrieval = page.js.as_mut().ok_or("No runtime")?
+                    .cdp_object_expression(oid)?;
                 // The child ids minted below are `<parent>::<key>` and the key
                 // is a property name off a page object, so the page decides
                 // what ends up inside this literal. A JSON literal covers the
@@ -426,7 +428,7 @@ pub async fn handle(
                 let oid_literal = crate::util::object_id_literal(oid);
                 let code = format!(
                     "(function() {{\
-                        var obj = globalThis.__obscura_objects[{oid}];\
+                        var obj = {retrieval};\
                         if (!obj || typeof obj !== 'object') return [];\
                         var keys = Object.keys(obj);\
                         return keys.map(function(k) {{\
@@ -454,17 +456,21 @@ pub async fn handle(
                         }});\
                     }})()",
                     oid = oid_literal,
+                    retrieval = retrieval,
                 );
                 let result = page.evaluate(&code);
                 if let serde_json::Value::Array(props) = result {
                     let descriptors: Vec<Value> = props
                         .iter()
-                        .map(|p| {
+                        .map(|p| -> Result<Value, String> {
                             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             let prop_type =
                                 p.get("type").and_then(|v| v.as_str()).unwrap_or("undefined");
                             let mut remote = json!({ "type": prop_type });
                             if let Some(child_oid) = p.get("childOid").and_then(|v| v.as_str()) {
+                                if let Some(js) = &mut page.js {
+                                    js.register_cdp_property_object(oid, child_oid)?;
+                                }
                                 remote["type"] = json!("object");
                                 if let Some(sub) = p.get("subtype").and_then(|v| v.as_str()) {
                                     remote["subtype"] = json!(sub);
@@ -500,16 +506,16 @@ pub async fn handle(
                                     }
                                 }
                             }
-                            json!({
+                            Ok(json!({
                                 "name": name,
                                 "value": remote,
                                 "configurable": true,
                                 "enumerable": true,
                                 "writable": true,
                                 "isOwn": true,
-                            })
+                            }))
                         })
-                        .collect();
+                        .collect::<Result<_, _>>()?;
                     Ok(json!({ "result": descriptors, "internalProperties": [] }))
                 } else {
                     Ok(json!({ "result": [], "internalProperties": [] }))
