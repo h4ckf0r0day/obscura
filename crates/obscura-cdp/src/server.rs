@@ -151,45 +151,27 @@ enum ControlRefusal {
 }
 
 /// Origin allowlist for CDP callers, read from `OBSCURA_CDP_ALLOWED_ORIGINS`
-/// (comma-separated, `*` allows every origin). Unset means only the
-/// Chrome-default policy in `origin_accepted` applies.
+/// (comma-separated, `*` allows every origin). Unset accepts only the
+/// endpoint's own HTTP origin.
 fn allowed_origins_env() -> Option<String> {
     std::env::var("OBSCURA_CDP_ALLOWED_ORIGINS")
         .ok()
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Whether a control connection's `Origin` header is accepted (issue #1495).
-///
-/// Chrome's DevTools handler rejects a WebSocket handshake whose `Origin` is
-/// neither the server's own address nor allowlisted, but Puppeteer, Playwright,
-/// and chrome-remote-interface all send a normal loopback `Origin` on every
-/// connect, so refusing every request with an `Origin` header locked those
-/// clients out entirely. The Chrome-compatible policy here:
-///
-/// - an entry in `OBSCURA_CDP_ALLOWED_ORIGINS` (exact, case-insensitive, `*`
-///   wildcard — the `--remote-allow-origins` semantics) overrides everything,
-///   including the `null` origin that sandboxed pages send,
-/// - a loopback origin (any `localhost` / loopback host, any port) is
-///   accepted: such a page is served by a local process, the same trust
-///   domain as the automation client itself,
-/// - an origin equal to the server's own `http://<bind-ip>:<bind-port>`
-///   address is accepted (Chrome's same-origin rule).
-///
-/// Requests without an `Origin` header (native clients) never reach this.
+// The request authority can name the public listener instead of its worker.
+// Host validation and authentication still apply after the origin check.
 fn origin_accepted(
     origin: &str,
-    bind_ip: std::net::IpAddr,
-    bind_port: u16,
+    request_host: Option<&str>,
     allowed_origins: Option<&str>,
 ) -> bool {
     let origin = origin.trim();
     if let Some(list) = allowed_origins {
-        let wanted = origin.to_ascii_lowercase();
         if list
             .split(',')
             .map(str::trim)
-            .any(|entry| entry == "*" || entry.eq_ignore_ascii_case(&wanted))
+            .any(|entry| entry == "*" || entry.eq_ignore_ascii_case(origin))
         {
             return true;
         }
@@ -197,23 +179,20 @@ fn origin_accepted(
     let Ok(parsed) = url::Url::parse(origin) else {
         return false;
     };
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
+    if parsed.scheme() != "http"
+        || !origin.contains("://")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return false;
     }
-    let loopback_host = match parsed.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        None => false,
+    let Some(request_host) = request_host else {
+        return false;
     };
-    if loopback_host {
-        return true;
-    }
-    // Chrome's same-origin rule: the handshake is trusted when the origin is
-    // exactly the server's own http address.
-    let Ok(server) = url::Url::parse(&format!("http://{}", SocketAddr::new(bind_ip, bind_port)))
-    else {
+    let Ok(server) = url::Url::parse(&format!("http://{request_host}/")) else {
         return false;
     };
     parsed.origin() == server.origin()
@@ -228,7 +207,7 @@ fn control_refusal(
     allowed_origins: Option<&str>,
 ) -> Option<ControlRefusal> {
     if let Some(origin) = header_value(head, "origin") {
-        if !origin_accepted(origin, bind_ip, port, allowed_origins) {
+        if !origin_accepted(origin, header_value(head, "host"), allowed_origins) {
             return Some(ControlRefusal::BrowserOrigin(origin.to_owned()));
         }
     }
@@ -256,12 +235,10 @@ fn refuse_control_connection(mut stream: std::net::TcpStream, refusal: ControlRe
         }
     };
     let body = match &refusal {
-        // Mirror Chrome's actionable rejection so a failing client can be
-        // fixed by configuration, not by suppressing the header.
         ControlRefusal::BrowserOrigin(origin) => json!({
             "error": reason,
             "detail": format!(
-                "Rejected an incoming WebSocket connection from the '{origin}' origin. \
+                "Rejected a CDP control request from the '{origin}' origin. \
                  Set OBSCURA_CDP_ALLOWED_ORIGINS={origin} to allow connections from this \
                  origin or OBSCURA_CDP_ALLOWED_ORIGINS=* to allow all origins."
             ),
@@ -2765,53 +2742,81 @@ mod tests {
     }
 
     #[test]
-    fn loopback_origins_are_accepted_without_configuration() {
-        let bind = "127.0.0.1".parse().unwrap();
-        // What Puppeteer, Playwright, and chrome-remote-interface send on a
-        // standard connect (issue #1495): origin derived from the ws URL.
-        for origin in [
-            "http://127.0.0.1:9222",
-            "http://localhost:9222",
-            "http://localhost:8080",
-            "http://[::1]:9222",
-            "https://localhost:5173",
+    fn endpoint_origins_are_accepted_without_configuration() {
+        for (origin, host) in [
+            ("http://127.0.0.1:9222", "127.0.0.1:9222"),
+            ("HTTP://LOCALHOST:9222", "localhost:9222"),
+            ("http://[::1]:9222", "[::1]:9222"),
+            ("http://192.168.1.10:9333", "192.168.1.10:9333"),
+            ("http://localhost", "localhost:80"),
+            ("http://cdp.example.test:9222", "cdp.example.test:9222"),
         ] {
-            assert!(super::origin_accepted(origin, bind, 9222, None), "{origin}");
+            assert!(super::origin_accepted(origin, Some(host), None), "{origin}");
         }
-        // A different port than the bind is still loopback.
-        assert!(super::origin_accepted("http://127.0.0.1:7777", bind, 9222, None));
     }
 
     #[test]
-    fn non_loopback_origins_stay_refused_without_configuration() {
-        let bind = "127.0.0.1".parse().unwrap();
+    fn foreign_and_malformed_origins_stay_refused_without_configuration() {
         for origin in [
             "https://evil.example",
             "http://evil.example:8080",
             "http://rebind.example:9222",
+            "http://127.0.0.1:7777",
+            "http://localhost:9222",
+            "https://127.0.0.1:9222",
+            "http://user@127.0.0.1:9222",
+            "http://user:pass@127.0.0.1:9222",
+            "http://127.0.0.1:9222/path",
+            "http://127.0.0.1:9222/?query",
+            "http://127.0.0.1:9222/#fragment",
+            "http:127.0.0.1:9222",
             "null",
             "",
         ] {
-            assert!(!super::origin_accepted(origin, bind, 9222, None), "{origin}");
+            assert!(!super::origin_accepted(origin, Some("127.0.0.1:9222"), None), "{origin}");
         }
-        // Chrome's same-origin rule: the exact server address is accepted.
-        assert!(super::origin_accepted("http://192.168.1.10:9333", "192.168.1.10".parse().unwrap(), 9333, None));
-        assert!(!super::origin_accepted("http://192.168.1.10:9333", "192.168.1.10".parse().unwrap(), 9444, None));
+        assert!(!super::origin_accepted("http://127.0.0.1:9222", None, None));
     }
 
     #[test]
     fn allowed_origins_list_overrides_the_default_policy() {
-        let bind = "127.0.0.1".parse().unwrap();
+        let host = Some("127.0.0.1:9222");
         let list = Some("http://dev.example:4173, https://tunnel.example");
-        assert!(super::origin_accepted("http://dev.example:4173", bind, 9222, list));
-        assert!(super::origin_accepted("https://tunnel.example", bind, 9222, list));
-        assert!(super::origin_accepted("  https://tunnel.example ", bind, 9222, list));
-        assert!(!super::origin_accepted("http://other.example", bind, 9222, list));
-        // `*` allows everything, matching --remote-allow-origins=*
-        assert!(super::origin_accepted("http://anything.example", bind, 9222, Some("*")));
-        assert!(super::origin_accepted("null", bind, 9222, Some("null")));
-        // Matching is case-insensitive like Chrome's lowercased set.
-        assert!(super::origin_accepted("HTTP://DEV.EXAMPLE:4173", bind, 9222, list));
+        assert!(super::origin_accepted("http://dev.example:4173", host, list));
+        assert!(super::origin_accepted("https://tunnel.example", host, list));
+        assert!(super::origin_accepted("  https://tunnel.example ", host, list));
+        assert!(!super::origin_accepted("http://other.example", host, list));
+        assert!(super::origin_accepted("http://anything.example", host, Some("*")));
+        assert!(super::origin_accepted("null", host, Some("null")));
+        assert!(super::origin_accepted("HTTP://DEV.EXAMPLE:4173", host, list));
+    }
+
+    #[test]
+    fn allowed_origins_preserve_forwarded_host_and_authentication_checks() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let forwarded = Some((bind, 9222));
+        let token = "01234567890123456789012345678901";
+        let with_origin = |host, origin| native_head(host).replace(
+            "Upgrade: websocket", &format!("Origin: {origin}\r\nUpgrade: websocket"),
+        );
+        assert_eq!(control_refusal(
+            &with_origin("127.0.0.1:9222", "http://127.0.0.1:9222"),
+            bind, 9223, forwarded, None, None,
+        ), None);
+        assert_eq!(control_refusal(
+            &with_origin("rebind.example:9222", "http://rebind.example:9222"),
+            bind, 9223, forwarded, None, Some("*"),
+        ), Some(ControlRefusal::ForeignHost));
+        assert_eq!(control_refusal(
+            &with_origin("127.0.0.1:9222", "https://allowed.example"),
+            bind, 9223, forwarded, Some(token), Some("https://allowed.example"),
+        ), Some(ControlRefusal::Unauthorized));
+        let authenticated = with_origin("cdp.example.test:9222", "http://cdp.example.test:9222")
+            .replace("Upgrade: websocket", &format!("Authorization: Bearer {token}\r\nUpgrade: websocket"));
+        assert_eq!(control_refusal(
+            &authenticated, bind, 9223, Some(("0.0.0.0".parse().unwrap(), 9222)),
+            Some(token), None,
+        ), None);
     }
 
     #[test]

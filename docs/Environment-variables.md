@@ -75,13 +75,16 @@ OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" obscura serve --host 0.0.0.0
 
 ### `OBSCURA_CDP_ALLOWED_ORIGINS`
 
-Comma-separated `Origin` allowlist for CDP clients that send an `Origin`
-header (browser-style WebSocket clients such as Puppeteer, Playwright, and
-chrome-remote-interface all do). Loopback origins and the server's own address
-are always accepted without it, so standard clients work out of the box; a
-non-loopback origin is refused with an actionable 403 unless it is listed
-here. `*` allows every origin, including the `null` origin that sandboxed
-pages send.
+Comma-separated `Origin` allowlist for CDP discovery and WebSocket requests.
+Without it, clients that omit `Origin` or send the endpoint's own HTTP origin
+are accepted. Origins with a different scheme, hostname, or port are refused
+with an actionable 403, including other loopback applications. Forwarded
+workers compare against the client-facing request authority.
+
+List another application's exact origin to grant it access. Matching is
+case-insensitive. `*` allows every origin, including `null`, and removes the
+browser-origin boundary; avoid it for untrusted pages. Host validation and
+`OBSCURA_CDP_TOKEN` authentication still apply to allowlisted origins.
 
 ```bash
 OBSCURA_CDP_ALLOWED_ORIGINS="https://tunnel.example" obscura serve
