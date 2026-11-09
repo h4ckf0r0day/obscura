@@ -26,7 +26,11 @@ function Get-WindowsDistributionTools {
 function ConvertFrom-PeDependencies([string[]]$Output) {
     $dependencies = @($Output | ForEach-Object {
         # /DEPENDENTS includes ordinary and delay-load imports.
-        if ("$_" -match '^\s+([\w.-]+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
+        if ("$_" -match '^\s+(.+?\.dll)\s*$') {
+            $name = $Matches[1].ToLowerInvariant()
+            if ($name -notmatch '^[\w.-]+\.dll$') { throw "Invalid DLL import: $name" }
+            $name
+        }
     } | Sort-Object -Unique)
     if (!$dependencies.Count) { throw 'No DLL imports parsed' }
     return $dependencies
@@ -102,12 +106,30 @@ function Test-WindowsPackageStartup([string]$Directory) {
             }
         }
         $process = [Diagnostics.Process]::Start($info)
-        $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if ($name -eq 'obscura-worker.exe') {
             $process.StandardInput.WriteLine('{"cmd":"navigate","url":"data:text/html,<title>runtime</title>"}')
             $process.StandardInput.WriteLine('{"cmd":"evaluate","expression":"1+1"}')
+            $responses = @(foreach ($index in 0..1) {
+                $line = $process.StandardOutput.ReadLineAsync()
+                if (!$line.Wait(60000)) {
+                    $process.Kill($true)
+                    throw 'Worker response timed out'
+                }
+                $line.GetAwaiter().GetResult() | ConvertFrom-Json
+            })
+            # Keep stdin open while checking the live process. A successful
+            # launch alone could have used a CRT already installed on the runner.
+            $modules = @($process.Modules)
+            foreach ($dll in Get-ChildItem -LiteralPath $Directory -Filter '*.dll') {
+                $loaded = @($modules | Where-Object ModuleName -eq $dll.Name)
+                if ($loaded.Count -ne 1 -or $loaded[0].FileName -ne $dll.FullName) {
+                    throw "Worker did not load app-local $($dll.Name)"
+                }
+                Write-Host "LOADED APP-LOCAL $($loaded[0].FileName)"
+            }
         }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
         $process.StandardInput.Close()
         if (!$process.WaitForExit(60000)) {
             $process.Kill($true)
@@ -117,10 +139,9 @@ function Test-WindowsPackageStartup([string]$Directory) {
         $err = $stderr.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "$name exited $($process.ExitCode): $err" }
         if ($name -eq 'obscura-worker.exe') {
-            $responses = @($out -split '\r?\n' | Where-Object { $_ } | ConvertFrom-Json)
             if ($responses.Count -ne 2 -or $responses[0].ok -ne $true -or
                 $responses[1].ok -ne $true -or $responses[1].result -ne 2) {
-                throw "Worker runtime smoke failed: $out $err"
+                throw "Worker runtime smoke failed: $($responses | ConvertTo-Json -Compress) $err"
             }
         } elseif (($out | ConvertFrom-Json) -ne 2) { throw "CLI runtime smoke failed: $out $err" }
         Write-Host "STARTUP PASS $name"

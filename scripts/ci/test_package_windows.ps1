@@ -16,6 +16,7 @@ $parsed = @(ConvertFrom-PeDependencies @(
 ))
 if ($parsed.Count -ne 2 -or $parsed -notcontains 'vcruntime140_1.dll') { throw 'Import parser failed' }
 Assert-Fails { ConvertFrom-PeDependencies @('unrecognized dumpbin output') } 'No DLL imports'
+Assert-Fails { ConvertFrom-PeDependencies @('    ..\outside.dll') } 'Invalid DLL import'
 foreach ($name in @('kernel32.dll', 'ucrtbase.dll', 'api-ms-win-crt-runtime-l1-1-0.dll')) {
     if (!(Test-WindowsSystemDll $name)) { throw "System DLL rejected: $name" }
 }
@@ -44,6 +45,8 @@ $script:imports = @{
 }
 Assert-Fails { Resolve-WindowsDependencies $stage 'unused' } 'Unbundled non-system dependency'
 Resolve-WindowsDependencies $stage 'unused' $redist
+Resolve-WindowsDependencies $stage 'unused'
+$script:imports['vcruntime140.dll'] += 'vcruntime140_1.dll'
 Resolve-WindowsDependencies $stage 'unused'
 foreach ($name in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
     if (!(Test-Path (Join-Path $stage $name))) { throw "Transitive runtime missing: $name" }
