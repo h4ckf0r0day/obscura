@@ -25586,6 +25586,114 @@ mod tests {
     }
 
     #[test]
+    fn web_storage_survives_global_constructor_replacement() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'Storage');
+            const NativeStorage = Storage;
+            let reads = 0;
+            const exercise = store => {
+                store.clear();
+                store.setItem('alpha', 'one');
+                store.beta = 'two';
+                const result = [store.getItem('alpha'), store.beta, Object.keys(store).join(','),
+                    Object.getOwnPropertyDescriptor(store, 'beta').value, 'beta' in store,
+                    store.length, store.key(1), delete store.beta];
+                store.removeItem('alpha');
+                return [...result, store.getItem('beta'), store.getItem('alpha'), store.length,
+                    store.constructor === NativeStorage];
+            };
+            const mutations = [
+                () => { globalThis.Storage = {}; },
+                () => { globalThis.Storage = null; },
+                () => { globalThis.Storage = undefined; },
+                () => { globalThis.Storage = function PageStorage() {}; },
+                () => { delete globalThis.Storage; },
+                () => Object.defineProperty(globalThis, 'Storage', {configurable:true,
+                    get() { reads++; throw new Error('page constructor getter'); }}),
+                () => Object.defineProperty(globalThis, 'Storage', {configurable:true, writable:true,
+                    value:new Proxy(function PageStorage() {}, {
+                        get() { reads++; throw new Error('page constructor proxy'); }
+                    })}),
+            ];
+            try {
+                const runs = mutations.map(mutate => {
+                    mutate();
+                    return [localStorage, sessionStorage].map(exercise);
+                });
+                return {runs, reads};
+            } finally {
+                Object.defineProperty(globalThis, 'Storage', descriptor);
+            }
+        })()"#).unwrap();
+        let store = serde_json::json!([
+            "one", "two", "alpha,beta", "two", true, 2, "beta", true, null, null, 0, true,
+        ]);
+        assert_eq!(result, serde_json::json!({"runs":vec![vec![store; 2]; 7], "reads":0}));
+    }
+
+    #[test]
+    fn web_storage_original_prototype_remains_live_after_constructor_replacement() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const NativeStorage = Storage;
+            const prototype = NativeStorage.prototype;
+            const store = localStorage;
+            globalThis.Storage = {};
+            try {
+                Object.defineProperty(prototype, 'extra', {configurable:true, get() { return 42; }});
+                store.setItem('extra', 'named');
+                const result = [store.extra, store.getItem('extra'), 'extra' in store];
+                delete prototype.extra;
+                return [...result, store.extra];
+            } finally {
+                delete prototype.extra;
+                globalThis.Storage = NativeStorage;
+            }
+        })()"#).unwrap(), serde_json::json!([42, "named", true, "named"]));
+    }
+
+    #[test]
+    fn web_storage_constructor_replacement_keeps_child_origin_buckets() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            globalThis.Storage = null;
+            localStorage.shared = 'child';
+            sessionStorage.shared = 'same-tab';
+            return [localStorage.getItem('shared'), sessionStorage.shared,
+                localStorage.constructor.name, Object.keys(localStorage)];
+        })()"#).unwrap(), serde_json::json!(["child", "same-tab", "Storage", ["shared"]]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            globalThis.Storage = {};
+            return [localStorage.shared, sessionStorage.shared];
+        })()"#).unwrap(), serde_json::json!(["child", "same-tab"]));
+        let foreign = crate::frame::FrameRealm::new(&mut rt, 2, 0,
+            "http://foreign.test/child", "<html><body>foreign</body></html>").unwrap();
+        assert_eq!(foreign.evaluate(&mut rt, r#"(() => {
+            globalThis.Storage = undefined;
+            const before = [localStorage.getItem('shared'), sessionStorage.getItem('shared')];
+            localStorage.shared = 'foreign';
+            return before;
+        })()"#).unwrap(), serde_json::json!([null, null]));
+        assert_eq!(rt.evaluate("[localStorage.shared, sessionStorage.shared]").unwrap(),
+            serde_json::json!(["child", "same-tab"]));
+    }
+
+    #[test]
+    fn web_storage_constructor_replacement_keeps_opaque_origin_checks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("(() => { globalThis.savedStores = [localStorage, sessionStorage]; globalThis.Storage = {}; return true; })()").unwrap();
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(r#"[
+            ...['localStorage', 'sessionStorage'].map(name => () => globalThis[name]),
+            ...savedStores.map(store => () => store.getItem('token')),
+        ].map(read => { try { read(); return 'allowed'; } catch (error) { return error.name; } })"#).unwrap(),
+            serde_json::json!(["SecurityError", "SecurityError", "SecurityError", "SecurityError"]));
+    }
+
+    #[test]
     fn web_storage_preserves_undefined_values_and_rejects_symbol_arguments() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"[localStorage, sessionStorage].map(store => {
