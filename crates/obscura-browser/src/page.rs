@@ -8731,6 +8731,27 @@ mod tests {
         assert_eq!(result.value, Some(serde_json::json!(2.0)));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_xmlns_attribute_has_no_prefix() {
+        let mut page = import_map_test_page(
+            "xmlns",
+            "http://127.0.0.1:9",
+            r#"<html><body><div id=w><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg></div></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(None).await;
+        let result = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const attr = document.querySelector('svg').attributes[0];
+            return [attr.name, attr.localName, attr.prefix, attr.namespaceURI,
+                document.getElementById('w').innerHTML,
+                document.querySelector('svg').getAttribute('xmlns')];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "xmlns", "xmlns", null, "http://www.w3.org/2000/xmlns/",
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>"#,
+            "http://www.w3.org/2000/svg"
+        ]));
+    }
+
     fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
             name.to_string(),
