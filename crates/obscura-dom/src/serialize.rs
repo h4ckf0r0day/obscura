@@ -176,32 +176,41 @@ impl DomTree {
     }
 }
 
-// "Escaping a string" from the HTML Standard. Attribute mode escapes `<` and
-// `>` too: left literal, a value such as `</noscript><img>` ends its raw-text
-// parent when the markup is parsed again.
+// "Escaping a string" from the HTML Standard. Attribute mode escapes `"`, and
+// `<` and `>` too: left literal, a value such as `</noscript><img>` ends its
+// raw-text parent when the markup is parsed again.
 fn escape_text(s: &str, buf: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => buf.push_str("&amp;"),
-            '\u{a0}' => buf.push_str("&nbsp;"),
-            '<' => buf.push_str("&lt;"),
-            '>' => buf.push_str("&gt;"),
-            _ => buf.push(c),
-        }
-    }
+    escape(s, false, buf);
 }
 
 fn escape_attr(s: &str, buf: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => buf.push_str("&amp;"),
-            '\u{a0}' => buf.push_str("&nbsp;"),
-            '"' => buf.push_str("&quot;"),
-            '<' => buf.push_str("&lt;"),
-            '>' => buf.push_str("&gt;"),
-            _ => buf.push(c),
-        }
+    escape(s, true, buf);
+}
+
+/// Copies the runs between escaped characters whole; most text has none.
+fn escape(s: &str, attribute: bool, buf: &mut String) {
+    let bytes = s.as_bytes();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let (entity, len) = match bytes[i] {
+            b'&' => ("&amp;", 1),
+            b'<' => ("&lt;", 1),
+            b'>' => ("&gt;", 1),
+            b'"' if attribute => ("&quot;", 1),
+            // U+00A0 NO-BREAK SPACE in UTF-8.
+            0xC2 if bytes.get(i + 1) == Some(&0xA0) => ("&nbsp;", 2),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        buf.push_str(&s[copied..i]);
+        buf.push_str(entity);
+        i += len;
+        copied = i;
     }
+    buf.push_str(&s[copied..]);
 }
 
 fn is_void_element(tag: &str) -> bool {
@@ -344,6 +353,19 @@ mod tests {
         let out = tree.outer_html(host);
         assert_eq!(out, "<noscript id=\"host\"><p title=\"&lt;/noscript&gt;&lt;img src=x onerror=1&gt;\"></p></noscript>");
         assert!(parse_html(&out).query_selector("img").unwrap().is_none(), "{out}");
+    }
+
+    #[test]
+    fn escaping_keeps_every_other_character_including_multibyte_ones() {
+        let mut out = String::new();
+        super::escape_text("\u{a0}é&\u{a1}<ع>\u{c2}\u{1f600}\"\u{a0}", &mut out);
+        assert_eq!(out, "&nbsp;é&amp;\u{a1}&lt;ع&gt;\u{c2}\u{1f600}\"&nbsp;");
+        out.clear();
+        super::escape_attr("\"a\u{a0}<b>&\"", &mut out);
+        assert_eq!(out, "&quot;a&nbsp;&lt;b&gt;&amp;&quot;");
+        out.clear();
+        super::escape_text("", &mut out);
+        assert_eq!(out, "");
     }
 
     #[test]
