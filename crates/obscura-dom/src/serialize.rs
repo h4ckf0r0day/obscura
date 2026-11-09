@@ -23,6 +23,11 @@ impl DomTree {
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
+        // An element that serializes as void has no markup of its own, even
+        // when script has appended children to it.
+        if self.with_node(node_id, |n| n.as_element().is_some_and(serializes_as_void)).unwrap_or(false) {
+            return buf;
+        }
         self.serialize_worklist(self.child_work(self.content_source(node_id)), &mut buf);
         buf
     }
@@ -113,7 +118,7 @@ impl DomTree {
                         buf.push('>');
                     }
 
-                    if !is_void_element(tag) {
+                    if !serializes_as_void(name) {
                         // Push the closing tag first so it pops after all the
                         // children we push next.
                         if include_self {
@@ -213,12 +218,16 @@ fn escape(s: &str, attribute: bool, buf: &mut String) {
     buf.push_str(&s[copied..]);
 }
 
-fn is_void_element(tag: &str) -> bool {
-    matches!(
-        tag,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
-            | "param" | "source" | "track" | "wbr"
-    )
+/// "Serializes as void": the void elements plus four obsolete ones. Such an
+/// element gets no end tag and its children are not written. HTML elements
+/// only: `<br>` created in another namespace is an ordinary element.
+fn serializes_as_void(name: &QualName) -> bool {
+    name.ns == ns!(html)
+        && matches!(
+            name.local.as_ref(),
+            "area" | "base" | "basefont" | "bgsound" | "br" | "col" | "embed" | "frame" | "hr" | "img"
+                | "input" | "keygen" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+        )
 }
 
 /// Parents whose text children are written without escaping, per "serializing
@@ -366,6 +375,40 @@ mod tests {
         out.clear();
         super::escape_text("", &mut out);
         assert_eq!(out, "");
+    }
+
+    fn element(tree: &crate::tree::DomTree, ns: html5ever::Namespace, local: &str) -> crate::tree::NodeId {
+        tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns, LocalName::from(local)),
+            attrs: Vec::new(),
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        })
+    }
+
+    #[test]
+    fn elements_that_serialize_as_void_write_no_children_and_no_end_tag() {
+        let tree = parse_html("<span id=host></span>");
+        let host = tree.get_element_by_id("host").unwrap();
+        for tag in ["br", "img", "basefont", "bgsound", "frame", "keygen", "param"] {
+            let void = element(&tree, ns!(html), tag);
+            let child = element(&tree, ns!(html), "b");
+            tree.append_child(void, child);
+            tree.append_child(host, void);
+            assert_eq!(tree.inner_html(void), "", "{tag}");
+            assert_eq!(tree.outer_html(void), format!("<{tag}>"), "{tag}");
+        }
+        assert_eq!(tree.inner_html(host), "<br><img><basefont><bgsound><frame><keygen><param>");
+    }
+
+    #[test]
+    fn a_void_name_in_another_namespace_is_an_ordinary_element() {
+        let tree = parse_html("<span id=host></span>");
+        let br = element(&tree, ns!(svg), "br");
+        let child = element(&tree, ns!(svg), "g");
+        tree.append_child(br, child);
+        assert_eq!(tree.outer_html(br), "<br><g></g></br>");
+        assert_eq!(tree.inner_html(br), "<g></g>");
     }
 
     #[test]
