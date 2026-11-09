@@ -4599,10 +4599,27 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        self.evaluate_for_cdp_in_frame_with_timeout(
+            None, expression, return_by_value, await_promise, await_timeout_ms,
+        ).await
+    }
+
+    #[doc(hidden)]
+    pub async fn evaluate_for_cdp_in_frame_with_timeout(
+        &mut self,
+        frame_id: Option<u32>,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         if let Some(js) = &mut self.js {
-            let evaluation = js.start_cdp_evaluation(expression, return_by_value, await_promise)?;
+            let evaluation = js.start_cdp_evaluation_in_frame(
+                frame_id, expression, return_by_value, await_promise,
+            )?;
             self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
         } else {
+            if frame_id.is_some() { return Err("JavaScript runtime unavailable".into()); }
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
                 thrown: false,
@@ -4680,8 +4697,26 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        self.call_function_on_for_cdp_in_frame_with_timeout(
+            None, function_declaration, object_id, args, return_by_value,
+            await_promise, await_timeout_ms,
+        ).await
+    }
+
+    #[doc(hidden)]
+    pub async fn call_function_on_for_cdp_in_frame_with_timeout(
+        &mut self,
+        frame_id: Option<u32>,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        args: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+        await_timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        let evaluation = js.start_cdp_call(
+        let evaluation = js.start_cdp_call_in_frame(
+            frame_id,
             function_declaration,
             object_id,
             args,

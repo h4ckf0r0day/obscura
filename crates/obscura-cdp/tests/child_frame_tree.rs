@@ -21,11 +21,11 @@ async fn serve() -> String {
                 let read = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
                 let body = if request.starts_with("GET /child.html ") {
-                    "<html><body><iframe src=\"/grandchild.html\"></iframe></body></html>"
+                    "<html><body><h2>Child heading</h2><iframe src=\"/grandchild.html\"></iframe></body></html>"
                 } else if request.starts_with("GET /grandchild.html ") {
                     "<html><body><p>deep</p></body></html>"
                 } else {
-                    "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    "<html><body><h1>Main heading</h1><iframe src=\"/child.html\"></iframe></body></html>"
                 };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -88,6 +88,313 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
         .as_str()
         .expect("no sessionId")
         .to_string()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_default_and_isolated_contexts_evaluate_their_own_documents() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url": url}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0];
+    let grandchild = &child["childFrames"][0];
+
+    for frame in [child, grandchild] {
+        let id = frame["frame"]["id"].as_str().unwrap();
+        let context = ctx.pending_events.iter().find(|event| {
+            event.method == "Runtime.executionContextCreated"
+                && event.session_id.as_deref() == Some(session.as_str())
+                && event.params["context"]["auxData"]["frameId"] == id
+                && event.params["context"]["auxData"]["isDefault"] == true
+        }).unwrap_or_else(|| panic!("no default execution context for {id}"));
+        let context_id = context.params["context"]["id"].as_i64().unwrap();
+        let evaluated = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+            "expression": "Promise.resolve(document.URL)",
+            "contextId": context_id, "returnByValue": true, "awaitPromise": true,
+        }), &session).await;
+        assert_eq!(evaluated["result"]["value"], frame["frame"]["url"]);
+
+        let isolated = cdp(&mut ctx, 6, "Page.createIsolatedWorld", json!({
+            "frameId": id, "worldName": "child-utility-probe",
+        }), &session).await;
+        let called = cdp(&mut ctx, 7, "Runtime.callFunctionOn", json!({
+            "functionDeclaration": "async function() { return document.URL; }",
+            "executionContextId": isolated["executionContextId"],
+            "returnByValue": true, "awaitPromise": true,
+        }), &session).await;
+        assert_eq!(called["result"]["value"], frame["frame"]["url"]);
+    }
+
+    let child_id = child["frame"]["id"].as_str().unwrap();
+    let isolated = cdp(&mut ctx, 8, "Page.createIsolatedWorld", json!({
+        "frameId": child_id, "worldName": "child-utility-probe",
+    }), &session).await;
+    let handle = cdp(&mut ctx, 9, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('h2')",
+        "contextId": isolated["executionContextId"], "returnByValue": false,
+    }), &session).await;
+    assert_eq!(handle["result"]["subtype"], "node");
+    let text = cdp(&mut ctx, 10, "Runtime.callFunctionOn", json!({
+        "functionDeclaration": "function() { return this.textContent; }",
+        "objectId": handle["result"]["objectId"], "returnByValue": true,
+    }), &session).await;
+    assert_eq!(text["result"]["value"], "Child heading");
+    let main = cdp(&mut ctx, 11, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('h1').textContent", "returnByValue": true,
+    }), &session).await;
+    assert_eq!(main["result"]["value"], "Main heading");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_and_property_handles_preserve_the_evaluation_world() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url":url}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression":"1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0]["frame"];
+    let child_context = ctx.pending_events.iter().find(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == child["id"]
+            && event.params["context"]["auxData"]["isDefault"] == true
+    }).unwrap().params["context"]["id"].as_i64().unwrap();
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression":"globalThis.childObject = {nested:{answer:42}}", "contextId":child_context,
+    }), &session).await;
+    let cases = [
+        ("document.querySelector('h1')", None, url.as_str()),
+        ("document.querySelector('h2')", Some(child_context), child["url"].as_str().unwrap()),
+        ("document.querySelector('iframe').contentDocument.querySelector('h2')", None, url.as_str()),
+        ("document.querySelector('iframe').contentWindow", None, url.as_str()),
+        ("childObject", Some(child_context), child["url"].as_str().unwrap()),
+        ("document.querySelector('iframe').contentWindow.childObject", None, url.as_str()),
+    ];
+    let mut child_handles = Vec::new();
+    let mut root_handles = Vec::new();
+    for (expression, context, expected_url) in cases {
+        for awaited in [false, true] {
+            let mut params = json!({"expression":expression, "awaitPromise":awaited});
+            if let Some(context) = context { params["contextId"] = json!(context); }
+            let handle = cdp(&mut ctx, 6, "Runtime.evaluate", params, &session).await;
+            let oid = handle["result"]["objectId"].as_str().unwrap().to_string();
+            let called = cdp(&mut ctx, 7, "Runtime.callFunctionOn", json!({
+                "functionDeclaration":"async function(value) { return [document.URL, Array.isArray(value), value instanceof Array]; }",
+                "objectId":oid, "arguments":[{"value":[]}], "awaitPromise":true, "returnByValue":true,
+            }), &session).await;
+            assert_eq!(called["result"]["value"], json!([expected_url,true,true]), "{expression}");
+            if expression.ends_with("childObject") {
+                let props = cdp(&mut ctx, 8, "Runtime.getProperties", json!({"objectId":oid}), &session).await;
+                let nested = props["result"].as_array().unwrap().iter().find(|prop| prop["name"] == "nested")
+                    .unwrap()["value"]["objectId"].as_str().unwrap().to_string();
+                let called = cdp(&mut ctx, 9, "Runtime.callFunctionOn", json!({
+                    "functionDeclaration":"function() { return [document.URL, this.answer]; }",
+                    "objectId":nested, "returnByValue":true,
+                }), &session).await;
+                assert_eq!(called["result"]["value"], json!([expected_url,42]));
+                if context.is_some() { child_handles.push(nested); } else { root_handles.push(nested); }
+            }
+            if context.is_some() { child_handles.push(oid); } else { root_handles.push(oid); }
+        }
+    }
+    cdp(&mut ctx, 10, "Runtime.evaluate", json!({
+        "expression":"document.querySelector('iframe').remove()",
+    }), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    cdp(&mut ctx, 11, "Runtime.evaluate", json!({"expression":"1"}), &session).await;
+    for oid in &child_handles {
+        for method in ["Runtime.callFunctionOn", "Runtime.getProperties"] {
+            let result = dispatch(&CdpRequest {
+                id:12, method:method.to_string(),
+                params:json!({"objectId":oid,"functionDeclaration":"function() { return document.URL; }"}),
+                session_id:Some(session.clone()),
+            }, &mut ctx).await;
+            assert_eq!(result.error.unwrap().message, "Execution context was destroyed", "{method}");
+        }
+    }
+    for oid in &root_handles {
+        let called = cdp(&mut ctx, 13, "Runtime.callFunctionOn", json!({
+            "objectId":oid, "functionDeclaration":"function() { return document.URL; }", "returnByValue":true,
+        }), &session).await;
+        assert_eq!(called["result"]["value"], url);
+    }
+    cdp(&mut ctx, 14, "Runtime.releaseObject", json!({"objectId":root_handles[0]}), &session).await;
+    let released = dispatch(&CdpRequest {
+        id:15, method:"Runtime.getProperties".to_string(),
+        params:json!({"objectId":root_handles[0]}), session_id:Some(session.clone()),
+    }, &mut ctx).await;
+    assert_eq!(released.error.unwrap().message, "Could not find object with given id");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_object_handles_reject_a_retired_execution_context() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url": url}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0]["frame"];
+    let context_id = ctx.pending_events.iter().find(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == child["id"]
+            && event.params["context"]["auxData"]["isDefault"] == true
+    }).unwrap().params["context"]["id"].as_i64().unwrap();
+    let handle = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression": "({kind:'child'})", "contextId": context_id,
+    }), &session).await;
+    let live = cdp(&mut ctx, 6, "Runtime.callFunctionOn", json!({
+        "functionDeclaration": "function() { return document.URL; }",
+        "objectId": handle["result"]["objectId"], "returnByValue": true,
+    }), &session).await;
+    assert_eq!(live["result"]["value"], child["url"]);
+    cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('iframe').remove()",
+    }), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    cdp(&mut ctx, 8, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 9, "Page.getFrameTree", json!({}), &session).await;
+    assert!(tree["frameTree"]["childFrames"].as_array().is_none_or(Vec::is_empty));
+    let retired = dispatch(&CdpRequest {
+        id: 10, method: "Runtime.callFunctionOn".to_string(),
+        params: json!({
+            "functionDeclaration": "function() { return document.URL; }",
+            "objectId": handle["result"]["objectId"], "returnByValue": true,
+        }),
+        session_id: Some(session.clone()),
+    }, &mut ctx).await;
+    assert_eq!(retired.error.unwrap().message, "Execution context was destroyed");
+    let main = cdp(&mut ctx, 11, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('h1').textContent", "returnByValue": true,
+    }), &session).await;
+    assert_eq!(main["result"]["value"], "Main heading");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_runtime_enable_reports_child_default_and_registered_utility_contexts_once() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    let initial = cdp(&mut ctx, 1, "Page.getFrameTree", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.createIsolatedWorld", json!({
+        "frameId": initial["frameTree"]["frame"]["id"], "worldName": "frame-auto-utility",
+    }), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url": url}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child_id = tree["frameTree"]["childFrames"][0]["frame"]["id"].as_str().unwrap();
+    ctx.pending_events.clear();
+    cdp(&mut ctx, 5, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 6, "Runtime.enable", json!({}), &session).await;
+    let contexts = ctx.pending_events.iter().filter(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == child_id
+    }).collect::<Vec<_>>();
+    assert_eq!(contexts.iter().filter(|event| {
+        event.params["context"]["auxData"]["isDefault"] == true
+    }).count(), 1);
+    assert_eq!(contexts.iter().filter(|event| {
+        event.params["context"]["name"] == "frame-auto-utility"
+    }).count(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cross_origin_child_contexts_are_privileged_without_exposing_the_window_to_parent_script() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let html = format!("<!doctype html><h1>Main</h1><iframe src=\"{url}child.html\"></iframe>");
+    let encoded = url::form_urlencoded::byte_serialize(html.as_bytes()).collect::<String>()
+        .replace('+', "%20");
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({
+        "url": format!("data:text/html,{encoded}"),
+    }), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0]["frame"];
+    assert!(child["id"].is_string(), "cross-origin frame was not built: {tree}");
+    let context_id = ctx.pending_events.iter().find(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == child["id"]
+            && event.params["context"]["auxData"]["isDefault"] == true
+    }).unwrap().params["context"]["id"].as_i64().unwrap();
+    let parent_private = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('iframe').contentDocument === null",
+        "returnByValue": true,
+    }), &session).await;
+    assert_eq!(parent_private["result"]["value"], true);
+    let argument_realm = cdp(&mut ctx, 6, "Runtime.callFunctionOn", json!({
+        "functionDeclaration": "function(value) { return this.document.URL === document.URL && Object.getPrototypeOf(value) === Array.prototype; }",
+        "executionContextId": context_id, "arguments": [{"value": [1, 2]}],
+        "returnByValue": true,
+    }), &session).await;
+    assert_eq!(argument_realm["result"]["value"], true);
+    let window = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression": "globalThis", "contextId": context_id,
+    }), &session).await;
+    assert!(window["result"]["objectId"].is_string(), "{window}");
+    let from_window = cdp(&mut ctx, 8, "Runtime.callFunctionOn", json!({
+        "functionDeclaration": "function() { return this.document.URL; }",
+        "objectId": window["result"]["objectId"], "returnByValue": true,
+    }), &session).await;
+    assert_eq!(from_window["result"]["value"], child["url"]);
+    let parent_private = cdp(&mut ctx, 9, "Runtime.evaluate", json!({
+        "expression": "document.querySelector('iframe').contentDocument === null",
+        "returnByValue": true,
+    }), &session).await;
+    assert_eq!(parent_private["result"]["value"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_navigation_reannounces_child_contexts_and_rejects_the_previous_document() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    let mut previous_context = None;
+    for _ in 0..3 {
+        ctx.pending_events.clear();
+        cdp(&mut ctx, 2, "Page.navigate", json!({"url": url}), &session).await;
+        cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression": "1"}), &session).await;
+        let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+        let child = &tree["frameTree"]["childFrames"][0]["frame"];
+        let context = ctx.pending_events.iter().find(|event| {
+            event.method == "Runtime.executionContextCreated"
+                && event.session_id.as_deref() == Some(session.as_str())
+                && event.params["context"]["auxData"]["frameId"] == child["id"]
+                && event.params["context"]["auxData"]["isDefault"] == true
+        }).expect("replacement document did not advertise a child context");
+        let context_id = context.params["context"]["id"].as_i64().unwrap();
+        let reply = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+            "expression": "document.URL", "contextId": context_id, "returnByValue": true,
+        }), &session).await;
+        assert_eq!(reply["result"]["value"], child["url"]);
+        if let Some(previous) = previous_context {
+            let stale = dispatch(&CdpRequest {
+                id: 6, method: "Runtime.evaluate".to_string(),
+                params: json!({"expression": "document.URL", "contextId": previous}),
+                session_id: Some(session.clone()),
+            }, &mut ctx).await;
+            assert!(stale.error.is_some(), "previous document's context still routes");
+        }
+        previous_context = Some(context_id);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
