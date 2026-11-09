@@ -1,6 +1,13 @@
 name: Release
 
 on:
+  # Manual validation uses Windows only and cannot publish a release.
+  workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Validate only the Windows distribution
+        type: boolean
+        default: true
   push:
     tags:
       - 'v*'
@@ -27,33 +34,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            # Build on Ubuntu 22.04 so the Linux release binary works on
-            # common LTS servers with glibc 2.35 instead of requiring the
-            # newer glibc shipped by ubuntu-latest.
-            os: ubuntu-22.04
-            name: obscura-x86_64-linux
-          - target: aarch64-unknown-linux-gnu
-            # Native build on GitHub's ARM runner.
-            os: ubuntu-22.04-arm
-            name: obscura-aarch64-linux
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: obscura-aarch64-macos
-          - target: x86_64-apple-darwin
-            # Must run on a native Intel runner. obscura-js bakes a V8 startup
-            # snapshot at build time, and that snapshot is architecture specific.
-            # macos-latest is Apple Silicon, so building x86_64 there embeds an
-            # arm64 snapshot into the Intel binary and V8 crashes deserializing
-            # it at isolate init (issue #290). macos-15-intel is the last x86_64
-            # image (available until Aug 2027); there is no cross-build that
-            # produces a correct snapshot.
-            os: macos-15-intel
-            name: obscura-x86_64-macos
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: obscura-x86_64-windows
+        # Linux retains glibc 2.35 compatibility. Both macOS architectures must
+        # build natively because V8 snapshots are architecture-specific (#290).
+        # macos-15-intel remains available until August 2027.
+        include: >-
+          ${{ fromJSON(inputs.windows_only &&
+          '[{"target":"x86_64-pc-windows-msvc","os":"windows-latest","name":"obscura-x86_64-windows"}]' ||
+          '[{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22.04","name":"obscura-x86_64-linux"},
+          {"target":"aarch64-unknown-linux-gnu","os":"ubuntu-22.04-arm","name":"obscura-aarch64-linux"},
+          {"target":"aarch64-apple-darwin","os":"macos-latest","name":"obscura-aarch64-macos"},
+          {"target":"x86_64-apple-darwin","os":"macos-15-intel","name":"obscura-x86_64-macos"},
+          {"target":"x86_64-pc-windows-msvc","os":"windows-latest","name":"obscura-x86_64-windows"}]') }}
 
     runs-on: ${{ matrix.os }}
 
@@ -183,17 +174,15 @@ jobs:
           tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
           tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
 
-      - name: Package (Windows)
+      - name: Package and verify Windows runtime dependencies
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cd dist/default
-          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
-          cd ../stealth
-          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
-          cd ../no-render
-          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
-          cd ../no-render-stealth
-          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
+          ./scripts/ci/test_package_windows.ps1
+          ./scripts/ci/package_windows.ps1 dist/default '${{ matrix.name }}.zip'
+          ./scripts/ci/package_windows.ps1 dist/stealth '${{ matrix.name }}-stealth.zip'
+          ./scripts/ci/package_windows.ps1 dist/no-render '${{ matrix.name }}-no-render.zip'
+          ./scripts/ci/package_windows.ps1 dist/no-render-stealth '${{ matrix.name }}-no-render-stealth.zip'
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -212,6 +201,7 @@ jobs:
           retention-days: 1
 
   publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-22.04
     permissions:

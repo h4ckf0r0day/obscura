@@ -140,7 +140,8 @@ x86_64 Windows only (no 32-bit build).
 
 Download `obscura-x86_64-windows.zip` from
 [Releases](https://github.com/h4ckf0r0day/obscura/releases),
-extract it, and add the folder to your PATH. No C++ build tools are required.
+extract it, and add the folder to your PATH. Keep the bundled runtime DLLs beside
+both executables. No C++ build tools are required.
 
 Alternatively, with [Scoop](https://scoop.sh/) installed:
 
