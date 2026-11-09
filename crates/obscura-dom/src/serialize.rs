@@ -1,3 +1,5 @@
+use html5ever::{ns, QualName};
+
 use crate::tree::{DomTree, NodeData, NodeId};
 
 // A unit of pending serialization work. Held on an explicit heap stack instead
@@ -131,9 +133,7 @@ impl DomTree {
                     let parent_is_raw = node.parent
                         .and_then(|pid| {
                             self.with_node(pid, |p| {
-                                p.as_element()
-                                    .map(|name| is_raw_text_element(name.local.as_ref()))
-                                    .unwrap_or(false)
+                                p.as_element().is_some_and(serializes_text_literally)
                             })
                         })
                         .unwrap_or(false);
@@ -205,8 +205,19 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
-fn is_raw_text_element(tag: &str) -> bool {
-    matches!(tag, "script" | "style" | "textarea" | "title")
+/// Parents whose text children are written without escaping, per "serializing
+/// HTML fragments". `textarea` and `title` are not among them: the parser
+/// decodes character references inside them, so their text must be escaped or
+/// `&lt;/textarea&gt;` comes back out as a real end tag. Only HTML elements
+/// qualify: a `style` or `script` in SVG or MathML holds ordinary text, and
+/// tags written literally there would be parsed as markup on the way back in.
+/// `noscript` is literal because scripting is enabled.
+fn serializes_text_literally(name: &QualName) -> bool {
+    name.ns == ns!(html)
+        && matches!(
+            name.local.as_ref(),
+            "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext" | "noscript"
+        )
 }
 
 #[cfg(test)]
@@ -252,6 +263,50 @@ mod tests {
         let html = tree.outer_html(p);
         assert!(html.contains("&amp;"));
         assert!(html.contains("&lt;"));
+    }
+
+    /// Parses `html`, serializes it, and parses the result again.
+    fn reparsed(html: &str) -> (String, crate::tree::DomTree) {
+        let first = parse_html(html);
+        let out = first.inner_html(first.document());
+        let second = parse_html(&out);
+        (out, second)
+    }
+
+    #[test]
+    fn textarea_and_title_text_is_escaped_so_it_cannot_close_its_element() {
+        let (out, again) = reparsed(
+            "<title>a &lt;/title&gt;&lt;script&gt;x&lt;/script&gt;</title>\
+             <textarea>b &lt;/textarea&gt;&lt;script&gt;y&lt;/script&gt; &amp;amp;</textarea>",
+        );
+        assert!(out.contains("<title>a &lt;/title&gt;&lt;script&gt;x&lt;/script&gt;</title>"), "{out}");
+        assert!(
+            out.contains("<textarea>b &lt;/textarea&gt;&lt;script&gt;y&lt;/script&gt; &amp;amp;</textarea>"),
+            "{out}"
+        );
+        assert!(again.query_selector("script").unwrap().is_none(), "{out}");
+    }
+
+    #[test]
+    fn raw_text_elements_keep_their_text_literal() {
+        for tag in ["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript"] {
+            let source = format!("<{tag}>a < b && c > d</{tag}>");
+            let tree = parse_html(&source);
+            let node = tree.query_selector(tag).unwrap().unwrap();
+            assert_eq!(tree.outer_html(node), source, "{tag}");
+        }
+        let tree = parse_html("<plaintext>a < b & c");
+        let node = tree.query_selector("plaintext").unwrap().unwrap();
+        assert_eq!(tree.inner_html(node), "a < b & c");
+    }
+
+    #[test]
+    fn style_and_script_text_in_foreign_content_is_escaped() {
+        for (open, close) in [("<svg><style>", "</style></svg>"), ("<svg><script>", "</script></svg>"), ("<math><style>", "</style></math>")] {
+            let (out, again) = reparsed(&format!("{open}&lt;img src=x onerror=1&gt;{close}"));
+            assert!(out.contains("&lt;img src=x onerror=1&gt;"), "{out}");
+            assert!(again.query_selector("img").unwrap().is_none(), "{out}");
+        }
     }
 
     #[test]
