@@ -1,20 +1,5 @@
-//! The CDP endpoint must accept the handshakes that standard WebSocket
-//! clients actually send (issue #1495).
-//!
-//! RFC 6455 browsers attach an `Origin` header to every cross-site
-//! WebSocket connect, and the mainstream CDP clients (Puppeteer, Playwright's
-//! `connect_over_cdp`, `chrome-remote-interface`, Python `websocket-client`)
-//! send a normal loopback `Origin` on every connect. Before the fix any
-//! request with an `Origin` header was refused with
-//! `403 {"error":"request refused"}`, so every one of those clients failed
-//! while only clients that suppress the header could connect.
-//!
-//! The policy now matches Chrome's DevTools handler: loopback origins and the
-//! server's own address are accepted, native clients without `Origin` are
-//! accepted, and a non-loopback origin is refused with an actionable
-//! `OBSCURA_CDP_ALLOWED_ORIGINS` hint unless the allowlist admits it.
-//!
-//! Run with `cargo nextest run -p obscura-cdp -E 'test(cdp_ws_origin_policy)'`.
+//! Endpoint-derived client origins are accepted without trusting other local
+//! applications. Additional origins require an explicit allowlist.
 
 use std::time::Duration;
 
@@ -29,12 +14,19 @@ async fn pick_port() -> u16 {
 }
 
 /// Send one handshake request with a caller-chosen `Origin` and return the
-/// raw response head. The status line and any JSON body come back together
-/// for refusals; a 101 answer has no body.
+/// response head and any Content-Length body; a 101 answer has no body.
 async fn raw_handshake(port: u16, origin: Option<&str>, path: &str) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .expect("control connection must open");
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(stream) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("control connection failed: {error}"),
+            }
+        }
+    }).await.expect("CDP listener must become ready");
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
          Upgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -47,8 +39,7 @@ async fn raw_handshake(port: u16, origin: Option<&str>, path: &str) -> String {
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await.expect("handshake write");
 
-    // The refusal carries `Connection: close`, the 101 keeps the socket open,
-    // so read until the end of the response head rather than until EOF.
+    // An upgrade keeps the connection open, so do not wait for EOF.
     let mut buf = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut chunk = [0u8; 1024];
@@ -56,8 +47,15 @@ async fn raw_handshake(port: u16, origin: Option<&str>, path: &str) -> String {
             let n = stream.read(&mut chunk).await.expect("handshake read");
             assert!(n > 0, "connection closed before a response head arrived");
             buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&buf[..end]).expect("UTF-8 response head");
+                let length = head.lines().filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().expect("valid content length"))
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + length {
+                    break;
+                }
             }
         }
     })
@@ -68,7 +66,7 @@ async fn raw_handshake(port: u16, origin: Option<&str>, path: &str) -> String {
 
 fn start_server(port: u16) {
     tokio::task::spawn_local(async move {
-        let _ = obscura_cdp::start_with_serve_options_and_limit(
+        obscura_cdp::start_with_serve_options_and_limit(
             port,
             "127.0.0.1",
             None,
@@ -79,7 +77,7 @@ fn start_server(port: u16) {
             true,
             128,
         )
-        .await;
+        .await.expect("CDP server must start");
     });
 }
 
@@ -93,30 +91,12 @@ fn standard_client_origins_complete_the_websocket_handshake() {
     local.block_on(&rt, async move {
         let port = pick_port().await;
         start_server(port);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // What the mainstream CDP clients send: an Origin derived from the
-        // ws://127.0.0.1:<port> endpoint, or from a localhost variant of it.
-        // Before the fix each of these was a 403.
-        for origin in [
-            format!("http://127.0.0.1:{port}"),
-            format!("http://localhost:{port}"),
-            "http://127.0.0.1:5173".to_string(),
-        ] {
-            let response = tokio::time::timeout(
-                Duration::from_secs(5),
-                raw_handshake(port, Some(&origin), "/devtools/browser"),
-            )
-            .await
-            .expect("handshake timed out");
-            assert!(
-                response.starts_with("HTTP/1.1 101"),
-                "origin {origin} must complete the upgrade, got: {:?}",
-                response.lines().next()
-            );
-        }
+        let origin = format!("http://127.0.0.1:{port}");
+        let response = raw_handshake(port, Some(&origin), "/devtools/browser").await;
+        assert!(response.starts_with("HTTP/1.1 101"), "endpoint Origin: {response}");
 
-        // Native clients never send Origin and were never affected.
+        // Clients that omit Origin remain accepted.
         let response = tokio::time::timeout(
             Duration::from_secs(5),
             raw_handshake(port, None, "/devtools/browser"),
@@ -129,13 +109,13 @@ fn standard_client_origins_complete_the_websocket_handshake() {
         // origin policy; a browser tab probing them sends an Origin too.
         let response = tokio::time::timeout(
             Duration::from_secs(5),
-            raw_handshake(port, Some("http://localhost:5173"), "/json/version"),
+            raw_handshake(port, Some(&origin), "/json/version"),
         )
         .await
         .expect("/json/version timed out");
         assert!(
             response.starts_with("HTTP/1.1 200"),
-            "/json/version with loopback Origin must answer, got: {:?}",
+            "/json/version with endpoint Origin must answer, got: {:?}",
             response.lines().next()
         );
     });
@@ -151,31 +131,25 @@ fn cross_origin_handshake_is_refused_with_an_actionable_message() {
     local.block_on(&rt, async move {
         let port = pick_port().await;
         start_server(port);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            raw_handshake(port, Some("http://evil.example:8080"), "/devtools/browser"),
-        )
-        .await
-        .expect("handshake timed out");
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "cross-origin connect must be refused, got: {:?}",
-            response.lines().next()
-        );
-        assert!(response.contains("\"error\":\"request refused\""), "body: {response}");
-        // The refusal names the knob, like Chrome names
-        // --remote-allow-origins in its 403 body.
-        assert!(
-            response.contains("OBSCURA_CDP_ALLOWED_ORIGINS=http://evil.example:8080"),
-            "refusal must be actionable, body: {response}"
-        );
+        for origin in [
+            "http://evil.example:8080".to_string(),
+            format!("http://127.0.0.1:{}", port.wrapping_add(1)),
+            format!("http://localhost:{port}"),
+            format!("https://127.0.0.1:{port}"),
+            "null".to_string(),
+        ] {
+            let response = raw_handshake(port, Some(&origin), "/devtools/browser").await;
+            assert!(response.starts_with("HTTP/1.1 403"), "origin {origin}: {response}");
+            assert!(response.contains("\"error\":\"request refused\""), "body: {response}");
+            assert!(response.contains(&format!("OBSCURA_CDP_ALLOWED_ORIGINS={origin}")),
+                "refusal must be actionable, body: {response}");
+        }
     });
 }
 
 #[test]
-fn allowed_origins_env_var_admits_listed_and_wildcard_origins() {
+fn allowed_origins_env_var_admits_wildcard_origins() {
     // SAFETY: nextest runs every test in its own process, and each server
     // reads the variable once, when its accept thread starts.
     unsafe {
@@ -190,7 +164,6 @@ fn allowed_origins_env_var_admits_listed_and_wildcard_origins() {
         // Wildcard server: even a non-loopback origin now upgrades.
         let wildcard_port = pick_port().await;
         start_server(wildcard_port);
-        tokio::time::sleep(Duration::from_millis(300)).await;
         let response = tokio::time::timeout(
             Duration::from_secs(5),
             raw_handshake(wildcard_port, Some("http://evil.example:8080"), "/devtools/browser"),
@@ -202,14 +175,23 @@ fn allowed_origins_env_var_admits_listed_and_wildcard_origins() {
             "wildcard must admit any origin, got: {:?}",
             response.lines().next()
         );
+    });
+}
 
-        // Explicit-list server on a second port: only listed origins pass.
-        unsafe {
-            std::env::set_var("OBSCURA_CDP_ALLOWED_ORIGINS", "http://tunnel.example:4242");
-        }
+#[test]
+fn allowed_origins_env_var_admits_only_listed_origins() {
+    // SAFETY: set before starting runtime or server threads; nextest isolates tests.
+    unsafe {
+        std::env::set_var("OBSCURA_CDP_ALLOWED_ORIGINS", "http://tunnel.example:4242");
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
         let port = pick_port().await;
         start_server(port);
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let response = tokio::time::timeout(
             Duration::from_secs(5),
@@ -231,8 +213,4 @@ fn allowed_origins_env_var_admits_listed_and_wildcard_origins() {
         .expect("handshake timed out");
         assert!(response.starts_with("HTTP/1.1 403"), "unlisted origin: {response}");
     });
-    // SAFETY: as above; restored so a same-process cargo test run is clean.
-    unsafe {
-        std::env::remove_var("OBSCURA_CDP_ALLOWED_ORIGINS");
-    }
 }
