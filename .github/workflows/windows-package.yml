@@ -7,7 +7,7 @@ on:
       - '.github/workflows/windows-package.yml'
       - 'scripts/ci/*windows*.ps1'
   push:
-    branches: [main, fix/windows-vcruntime-distribution]
+    branches: [main]
     paths:
       - '.github/workflows/release.yml'
       - '.github/workflows/windows-package.yml'
