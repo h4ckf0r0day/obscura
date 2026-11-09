@@ -1,5 +1,9 @@
 `--dump markdown` converts the rendered page to markdown.
 
+Extraction switches to an iterative tree walk for deep subtrees, so deeply
+nested DOMs do not exhaust the JavaScript call stack. Nested table cells are
+converted once and reused when assembling their rows.
+
 ```bash
 obscura fetch https://example.com --dump markdown
 ```
