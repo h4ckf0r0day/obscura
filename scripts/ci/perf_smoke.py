@@ -38,6 +38,32 @@ SCENARIOS = {
         "(function(){for(var i=0;i<2000;i++)localStorage.setItem('k'+i,'value-'+i);var n=0;for(var j=0;j<2000;j++)n+=localStorage.getItem('k'+j).length;return n;})()",
         18890,
     ),
+    "storage-method-read-hot": (
+        "(() => {const s=localStorage;s.setItem('item','value');let n=0;"
+        "for(let i=0;i<200000;i++)n+=s.getItem('item').length;return n})()",
+        1000000,
+    ),
+    "storage-named-read-hot": (
+        "(() => {const s=localStorage;s.item='value';let n=0;"
+        "for(let i=0;i<200000;i++)n+=s.item.length;return n})()",
+        1000000,
+    ),
+    "storage-members-hot": (
+        "(() => {const s=sessionStorage;s.item='value';let n=0;"
+        "for(let i=0;i<200000;i++)n+=s.length+('item' in s)+('getItem' in s);return n})()",
+        600000,
+    ),
+    "storage-named-write-delete-hot": (
+        "(() => {const s=sessionStorage;let n=0;for(let i=0;i<50000;i++){"
+        "s.item='value';n+=delete s.item;}return n+s.length})()",
+        50000,
+    ),
+    "storage-enumeration-hot": (
+        "(() => {const s=localStorage;s.alpha='one';s.beta='two';let n=0;"
+        "for(let i=0;i<20000;i++)n+=Object.keys(s).length+"
+        "(Object.getOwnPropertyDescriptor(s,'beta').value==='two');return n})()",
+        60000,
+    ),
     "dom-lookup": (
         "(() => {let h=document.createElement('div');h.id='probe';document.body.append(h);let n=0;for(let i=0;i<2000000;i++)if(document.getElementById('probe')===h)n++;return n;})()",
         2000000,
