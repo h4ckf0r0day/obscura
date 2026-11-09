@@ -54,3 +54,7 @@ jobs:
             }
             New-WindowsPackage $stage "$env:RUNNER_TEMP\fixed-$name.zip"
           }
+  release-build:
+    uses: ./.github/workflows/release.yml
+    with:
+      windows_only: true

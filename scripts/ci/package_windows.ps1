@@ -122,7 +122,7 @@ function Test-WindowsPackageStartup([string]$Directory) {
                 $responses[1].ok -ne $true -or $responses[1].result -ne 2) {
                 throw "Worker runtime smoke failed: $out $err"
             }
-        } elseif ($out.Trim() -ne '2') { throw "CLI runtime smoke failed: $out $err" }
+        } elseif (($out | ConvertFrom-Json) -ne 2) { throw "CLI runtime smoke failed: $out $err" }
         Write-Host "STARTUP PASS $name"
         $process.Dispose()
     }
