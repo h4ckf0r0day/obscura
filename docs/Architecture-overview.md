@@ -125,6 +125,10 @@ their native owning document, including handles obtained through the parent.
 The document element carries that document's protocol frame ID, so Playwright
 can discover an element handle's owner frame. Retired frame handles fail
 instead of reading a same-numbered node in the main document.
+Serialized iframe owner elements identify their live child frame in
+`DOM.describeNode`, `DOM.getDocument`, and `DOM.setChildNodes`. Native ownership
+records distinguish nested documents and omit retired or detached contexts,
+allowing clients to resolve iframe elements to their child frames.
 Live child frames advertise their default CDP execution contexts.
 `Runtime.evaluate` and `Runtime.callFunctionOn`, including awaited calls,
 enter the frame's actual V8 realm and use its document. Remote objects remain
