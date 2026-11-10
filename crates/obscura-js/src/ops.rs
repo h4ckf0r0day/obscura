@@ -509,6 +509,8 @@ pub struct ObscuraState {
     pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
+    /// Which frame is the parent browsing context; 0 is the page's own realm.
+    pub parent_frame_id: u32,
     // postMessage traffic between realms, waiting to be delivered. A realm
     // cannot reach another realm's context on its own, so the message is queued
     // here and the Page dispatches it, the same way frames themselves are
@@ -792,6 +794,7 @@ impl ObscuraState {
             pending_frame_bytes: 0,
             frame_id_counter: 0,
             frame_id: 0,
+            parent_frame_id: 0,
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -7290,6 +7293,7 @@ fn op_initial_frame(
             child.sandbox_opaque_origin = opaque;
             child.url = frame_url.to_string();
             child.frame_id = frame_id;
+            child.parent_frame_id = parent_frame_id;
             child.about_base_url = document_base_url(&parent);
             child.scripting_enabled = parent.scripting_enabled && sandbox.as_deref().is_none_or(|value|
                 value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("allow-scripts")));
@@ -8421,6 +8425,81 @@ fn op_frame_preload_scripts(state: &OpState) -> String {
     })
 }
 
+#[op2(fast)]
+fn op_frame_parent(state: &OpState, target_frame_id: u32) -> u32 {
+    if target_frame_id == 0 {
+        return 0;
+    }
+    frame_state(state, target_frame_id).borrow().parent_frame_id
+}
+
+#[op2]
+#[string]
+fn op_frame_children(state: &OpState, target_frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        let target_state = frame_state(state, target_frame_id);
+        let target = target_state.borrow();
+        let generation = target.document_generation;
+        let mut children: Vec<(u32, String)> = Vec::new();
+        let reg = registry.borrow();
+
+        let matching_entries: Vec<u32> = reg
+            .entries
+            .iter()
+            .filter(|(_, id, child_state)| {
+                *id != target_frame_id && child_state.borrow().parent_frame_id == target_frame_id
+            })
+            .map(|(_, id, _)| *id)
+            .collect();
+
+        if let Some(dom) = target.dom.as_ref() {
+            let mut frame_index = 0;
+            for node_id in dom.descendants(dom.document()) {
+                let is_frame = dom.with_node(node_id, |node| {
+                    node.as_element().is_some_and(|tag| {
+                        tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                            && (tag.local.as_ref() == "iframe" || tag.local.as_ref() == "frame")
+                    })
+                }).unwrap_or(false);
+                if !is_frame {
+                    continue;
+                }
+                let name = dom.with_node(node_id, |node| {
+                    node.get_attribute("name")
+                        .or_else(|| node.get_attribute_ns("", "name"))
+                        .or_else(|| node.get_attribute("id"))
+                        .or_else(|| node.get_attribute_ns("", "id"))
+                        .map(str::to_owned)
+                }).flatten().unwrap_or_default();
+                let child_id = reg.child_frame_for_node(&target_state, node_id)
+                    .or_else(|| {
+                        reg.frame_timers.iter().find_map(|(&id, timers)| {
+                            let (owner, owner_node, owner_generation) = timers.owner.as_ref()?;
+                            (owner.as_ptr() == std::rc::Rc::as_ptr(&target_state)
+                                && *owner_node == node_id
+                                && *owner_generation == generation)
+                                .then_some(id)
+                        })
+                    })
+                    .or_else(|| matching_entries.get(frame_index).copied());
+                frame_index += 1;
+                if let Some(child_id) = child_id {
+                    children.push((child_id, name));
+                }
+            }
+        }
+
+        if children.is_empty() {
+            for id in matching_entries {
+                children.push((id, String::new()));
+            }
+        }
+
+        serde_json::to_string(&children).unwrap_or_else(|_| "[]".to_string())
+    })).unwrap_or_else(|_| "[]".to_string())
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -8457,6 +8536,8 @@ pub fn build_extension() -> Extension {
         op_history_traverse(),
         op_frame_document_ready(),
         op_initial_frame(),
+        op_frame_parent(),
+        op_frame_children(),
         op_document_realm_member(),
         op_register_document_realm(),
         op_post_frame_message(),

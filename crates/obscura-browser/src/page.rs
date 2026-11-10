@@ -8126,6 +8126,47 @@ mod tests {
         assert_eq!(evaluated.value.unwrap(), serde_json::json!([true, true, true]));
     }
 
+    // Issue #1490: cross-origin child frame sees parent.frames.length,
+    // parent.length, indexed access to self/siblings, and named access to siblings.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_child_frame_sees_parent_frames_and_named_siblings() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page(
+            "cross-origin-frames",
+            &base,
+            "<html><body>\
+                <iframe name=\"a\" src=\"/child.html?a\"></iframe>\
+                <iframe name=\"b\" src=\"/child.html?b\"></iframe>\
+            </body></html>",
+        );
+        let script = "new Promise(resolve => {\
+            const iframes = document.querySelectorAll('iframe');\
+            let loaded = 0;\
+            const onLoaded = () => {\
+                if (++loaded === 2) {\
+                    const a = iframes[0].contentWindow;\
+                    const b = iframes[1].contentWindow;\
+                    resolve([\
+                        a.parent.frames.length,\
+                        a.parent.length,\
+                        a.parent.frames[0] === a,\
+                        a.parent.frames[1] === a,\
+                        typeof a.parent.frames.b,\
+                        b.parent.frames.length,\
+                        b.parent.frames[1] === b,\
+                        b.parent.frames.b === b,\
+                    ]);\
+                }\
+            };\
+            iframes[0].onload = onLoaded;\
+            iframes[1].onload = onLoaded;\
+        })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!([
+            2, 2, true, false, "object", 2, true, true
+        ]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_frame_script_fetch_keeps_all_siblings_resumable() {
         let (mut page, requests, slow_seen) =

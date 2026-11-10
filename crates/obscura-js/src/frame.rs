@@ -107,6 +107,7 @@ impl FrameRealm {
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
+        state.parent_frame_id = parent_frame_id;
         state.scripting_enabled = scripting_enabled;
         state.sandbox_opaque_origin = sandbox_opaque_origin;
         if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
@@ -1931,5 +1932,114 @@ mod tests {
             "sameFile": true,
             "iterableIterator": true
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_child_frame_sees_parent_frames_and_named_siblings() {
+        let mut parent = page(
+            "https://parent.example/",
+            "<html><body>\
+                <iframe name=\"a\" src=\"https://other.example/a\"></iframe>\
+                <iframe name=\"b\" src=\"https://other.example/b\"></iframe>\
+            </body></html>",
+        );
+        let frame_a = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://other.example/a",
+            "<html><body></body></html>",
+        ).unwrap();
+        let frame_b = FrameRealm::new(
+            &mut parent,
+            2,
+            0,
+            "https://other.example/b",
+            "<html><body></body></html>",
+        ).unwrap();
+
+        let result_a = frame_a.evaluate(&mut parent, r#"
+            [
+                parent.frames.length,
+                parent.length,
+                parent.frames[0] === window,
+                parent.frames[1] === window,
+                typeof parent.frames.b,
+                parent.frames.b !== window,
+                parent.parent === parent,
+                parent.top === parent,
+            ]
+        "#).unwrap();
+        assert_eq!(result_a, serde_json::json!([
+            2, 2, true, false, "object", true, true, true
+        ]));
+
+        let result_b = frame_b.evaluate(&mut parent, r#"
+            [
+                parent.frames.length,
+                parent.length,
+                parent.frames[0] === window,
+                parent.frames[1] === window,
+                parent.frames.b === window,
+                typeof parent.frames.a,
+            ]
+        "#).unwrap();
+        assert_eq!(result_b, serde_json::json!([
+            2, 2, false, true, true, "object"
+        ]));
+
+        frame_a.execute_script(&mut parent, r#"
+            parent.frames.b.postMessage('hello from a', '*');
+        "#).unwrap();
+        let mut messages = parent.take_pending_frame_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].target_frame_id, 2);
+        assert_eq!(messages[0].source_frame_id, 1);
+
+        let message = messages.pop().unwrap();
+        frame_b.execute_script(&mut parent, r#"
+            globalThis.received = [];
+            addEventListener('message', event => {
+                received.push({
+                    data: event.data,
+                    sourceIsA: event.source === parent.frames[0],
+                });
+                event.source.postMessage('reply from b', '*');
+            });
+        "#).unwrap();
+        frame_b.deliver_message(
+            &mut parent,
+            &message.data_json,
+            &message.origin,
+            message.source_frame_id,
+            &message.target_origin,
+        ).unwrap();
+
+        let received = frame_b.evaluate(&mut parent, "globalThis.received").unwrap();
+        assert_eq!(received, serde_json::json!([{
+            "data": "hello from a",
+            "sourceIsA": true,
+        }]));
+
+        let replies = parent.take_pending_frame_messages();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].target_frame_id, 1);
+        assert_eq!(replies[0].source_frame_id, 2);
+
+        // Grandchild frame C inside frame A (parent_frame_id: 1)
+        let frame_c = FrameRealm::new(
+            &mut parent,
+            3,
+            1,
+            "https://other.example/c",
+            "<html><body></body></html>",
+        ).unwrap();
+        let result_c = frame_c.evaluate(&mut parent, r#"
+            [
+                parent.parent === top,
+                parent.parent.frames.length,
+            ]
+        "#).unwrap();
+        assert_eq!(result_c, serde_json::json!([true, 2]));
     }
 }

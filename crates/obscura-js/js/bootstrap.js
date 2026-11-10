@@ -16493,7 +16493,7 @@ function _frameWindowFor(frameId) {
   if (!frameId) return null;
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || _remoteWindows.get(frameId) || null;
+  if (!real) return existing || _remoteWindow(frameId);
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
@@ -16547,6 +16547,19 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
   }
 };
 
+function _remoteWindowChildren(frameId) {
+  try {
+    return JSON.parse(__obscuraCore.ops.op_frame_children(frameId >>> 0));
+  } catch (_) {
+    return [];
+  }
+}
+
+function _resolveFrameWindow(frameId) {
+  if (frameId === _realmFrameId) return globalThis;
+  return _frameWindowFor(frameId) || _remoteWindow(frameId);
+}
+
 // A window in another browsing context, as seen from this one.
 //
 // Only the cross-origin surface is exposed: reaching synchronously into another
@@ -16561,22 +16574,97 @@ class _RemoteWindow {
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
-  get parent() { return this; }
-  get top() { return this; }
+  get parent() {
+    if (this._frameId === 0) return this;
+    const pid = __obscuraCore.ops.op_frame_parent(this._frameId);
+    return pid === _realmFrameId ? globalThis : _remoteWindow(pid);
+  }
+  get top() {
+    return this._frameId === 0 ? this : (0 === _realmFrameId ? globalThis : _remoteWindow(0));
+  }
   get opener() { return null; }
   get closed() { return false; }
-  get length() { return 0; }
+  get length() { return _remoteWindowChildren(this._frameId).length; }
   focus() {}
   blur() {}
   close() {}
+  get [Symbol.toStringTag]() { return 'Window'; }
 }
 _markNative(_RemoteWindow.prototype.postMessage);
+
+const _remoteWindowProxyHandler = {
+  get(target, prop, receiver) {
+    if (prop === 'length') {
+      return _remoteWindowChildren(target._frameId).length;
+    }
+    if (typeof prop === 'string') {
+      const index = Number(prop);
+      if (Number.isInteger(index) && index >= 0 && String(index) === prop) {
+        const children = _remoteWindowChildren(target._frameId);
+        if (index < children.length) {
+          return _resolveFrameWindow(children[index][0]);
+        }
+        return undefined;
+      }
+    }
+    if (prop in target) {
+      return Reflect.get(target, prop, receiver);
+    }
+    if (typeof prop === 'string' && prop !== '') {
+      const children = _remoteWindowChildren(target._frameId);
+      for (let i = 0; i < children.length; i++) {
+        if (children[i][1] === prop) {
+          return _resolveFrameWindow(children[i][0]);
+        }
+      }
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+  has(target, prop) {
+    if (Reflect.has(target, prop)) return true;
+    if (typeof prop === 'string') {
+      const index = Number(prop);
+      if (Number.isInteger(index) && index >= 0 && String(index) === prop) {
+        return index < _remoteWindowChildren(target._frameId).length;
+      }
+      const children = _remoteWindowChildren(target._frameId);
+      return children.some(c => c[1] && c[1] === prop);
+    }
+    return false;
+  },
+  ownKeys(target) {
+    const keys = Reflect.ownKeys(target);
+    const count = _remoteWindowChildren(target._frameId).length;
+    for (let i = 0; i < count; i++) {
+      const key = String(i);
+      if (!keys.includes(key)) keys.push(key);
+    }
+    return keys;
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    if (typeof prop === 'string') {
+      const index = Number(prop);
+      if (Number.isInteger(index) && index >= 0 && String(index) === prop) {
+        const children = _remoteWindowChildren(target._frameId);
+        if (index < children.length) {
+          return {
+            value: _resolveFrameWindow(children[index][0]),
+            writable: false,
+            enumerable: true,
+            configurable: true,
+          };
+        }
+      }
+    }
+    return Reflect.getOwnPropertyDescriptor(target, prop);
+  },
+};
 
 const _remoteWindows = new Map();
 function _remoteWindow(frameId) {
   let win = _remoteWindows.get(frameId);
   if (!win) {
-    win = new _RemoteWindow(frameId);
+    win = new Proxy(new _RemoteWindow(frameId), _remoteWindowProxyHandler);
     _remoteWindows.set(frameId, win);
   }
   return win;
