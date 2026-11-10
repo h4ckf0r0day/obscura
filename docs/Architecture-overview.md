@@ -129,6 +129,15 @@ Serialized iframe owner elements identify their live child frame in
 `DOM.describeNode`, `DOM.getDocument`, and `DOM.setChildNodes`. Native ownership
 records distinguish nested documents and omit retired or detached contexts,
 allowing clients to resolve iframe elements to their child frames.
+Native browsing-context records also back `parent`, `top`, indexed and named
+cross-origin sibling access, and `frames.length`. They exist before a fetched
+document arrives, so a pending frame never aliases an unrelated retired realm.
+Navigation preserves the context's position and remote Window identity;
+removal and reinsertion create a new context at the end of connection order.
+Named cross-origin access requires both the owner's current `name` attribute
+and the context's retained name to match. Missing or forbidden cross-origin
+properties throw `SecurityError`. Queued messages retain their source context
+even when its document is retired before delivery.
 Live child frames advertise their default CDP execution contexts.
 `Runtime.evaluate` and `Runtime.callFunctionOn`, including awaited calls,
 enter the frame's actual V8 realm and use its document. Remote objects remain

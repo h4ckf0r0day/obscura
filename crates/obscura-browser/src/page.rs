@@ -1419,8 +1419,9 @@ impl Page {
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin}, {});",
                     message.source_frame_id,
+                    message.source_context_id.map_or(-1i64, i64::from),
                 );
                 if let Err(error) = js.execute_script("<frame-message>", &script) {
                     tracing::debug!("message to the page failed: {error}");
@@ -1438,13 +1439,7 @@ impl Page {
                 continue;
             };
             let Some(js) = self.js.as_mut() else { continue };
-            if let Err(error) = self.frames[index].deliver_message(
-                js,
-                &message.data_json,
-                &message.origin,
-                message.source_frame_id,
-                &message.target_origin,
-            ) {
+            if let Err(error) = self.frames[index].deliver_queued_message(js, &message) {
                 tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
             }
         }
@@ -1462,7 +1457,8 @@ impl Page {
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
                globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
-               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
+               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin &&\
+                   !globalThis.__obscura_frameElements[{frame_id}]._iframeOpaque)\
                  globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
              }}\
              delete globalThis.__obscura_frameObjects[{frame_id}];\
@@ -8124,6 +8120,47 @@ mod tests {
             frame.src = '/child.html'; document.body.appendChild(frame); })";
         let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
         assert_eq!(evaluated.value.unwrap(), serde_json::json!([true, true, true]));
+    }
+
+    // Issue #1490: cross-origin child frame sees parent.frames.length,
+    // parent.length, indexed access to self/siblings, and named access to siblings.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_child_frame_sees_parent_frames_and_named_siblings() {
+        let (base, _, _) = spawn_slow_frame_script_server().await;
+        let mut page = import_map_test_page(
+            "cross-origin-frames",
+            &base,
+            "<html><body>\
+                <iframe name=\"a\" src=\"/child.html?a\"></iframe>\
+                <iframe name=\"b\" src=\"/child.html?b\"></iframe>\
+            </body></html>",
+        );
+        let script = "new Promise(resolve => {\
+            const iframes = document.querySelectorAll('iframe');\
+            let loaded = 0;\
+            const onLoaded = () => {\
+                if (++loaded === 2) {\
+                    const a = iframes[0].contentWindow;\
+                    const b = iframes[1].contentWindow;\
+                    resolve([\
+                        a.parent.frames.length,\
+                        a.parent.length,\
+                        a.parent.frames[0] === a,\
+                        a.parent.frames[1] === a,\
+                        typeof a.parent.frames.b,\
+                        b.parent.frames.length,\
+                        b.parent.frames[1] === b,\
+                        b.parent.frames.b === b,\
+                    ]);\
+                }\
+            };\
+            iframes[0].onload = onLoaded;\
+            iframes[1].onload = onLoaded;\
+        })";
+        let evaluated = page.evaluate_for_cdp_with_timeout(script, true, true, 2_000).await.unwrap();
+        assert_eq!(evaluated.value.unwrap(), serde_json::json!([
+            2, 2, true, false, "object", 2, true, true
+        ]));
     }
 
     #[tokio::test(flavor = "current_thread")]

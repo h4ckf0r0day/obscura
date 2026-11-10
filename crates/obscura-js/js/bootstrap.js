@@ -164,6 +164,7 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 // makes `iframe.contentDocument.title` read the frame's document rather than
 // the caller's. Set by __obscura_init; 0 is the page.
 let _realmFrameId = 0;
+let _realmContextId = 0;
 
 const _dom = (cmd, a1, a2) => {
   let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
@@ -2469,6 +2470,7 @@ function __prepareInsertedSubtree(root) {
     if (_postConnection) _postConnection.cursor = script;
     if (script.localName === 'iframe') {
       if (script.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
+      _connectFrameContext(script);
       if (script.hasAttribute('srcdoc')) script._loadIframeSrcdoc();
       else {
         const src = script.getAttribute('src');
@@ -5327,6 +5329,7 @@ class Element extends Node {
     _resetIframeElement(this);
   }
   _loadIframeSrc(url, submission) {
+    _connectFrameContext(this);
     if (!submission && this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
     if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _ensureInitialFrameRealm(this); return; }
     let fullUrl = url;
@@ -5364,7 +5367,12 @@ class Element extends Node {
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = el._iframeOpaque ? null : new _IframeDocument(html, loadedUrl, el);
-        el._iframeWin = el._iframeOpaque ? _remoteWindow(el._frameId) : new _IframeWindow(el._iframeDoc, loadedUrl);
+        if (el._iframeOpaque) {
+          const contextId = _connectFrameContext(el);
+          el._iframeWin = contextId < 0 ? null : _remoteContextWindow(contextId);
+        } else {
+          el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
+        }
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
@@ -5395,6 +5403,7 @@ class Element extends Node {
   }
   _loadIframeSrcdoc(force = false) {
     if (this.namespaceURI !== 'http://www.w3.org/1999/xhtml' || !this.isConnected) return;
+    _connectFrameContext(this);
     const html = this.getAttribute('srcdoc');
     if (html === null) return;
     if (!force && this._iframeLoadingUrl === 'about:srcdoc' && this._iframeSrcdoc === html) return;
@@ -5442,7 +5451,10 @@ class Element extends Node {
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
     if (_postConnection && _iframeConnectionPending(this)) return null;
-    if (_ensureInitialFrameRealm(this) === false) return null;
+    if (_ensureInitialFrameRealm(this) === false) {
+      const contextId = _connectFrameContext(this);
+      return contextId < 0 ? null : _remoteContextWindow(contextId);
+    }
     if (this._iframeOpaque && this._frameId) return _remoteWindow(this._frameId);
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
@@ -8227,7 +8239,7 @@ Object.defineProperty(globalThis, 'constructor', {
 // Remove the static _iframeRegistry and replace with dynamic getters.
 Object.defineProperty(globalThis, 'length', {
   get() {
-    return document.querySelectorAll('iframe').length;
+    return __obscuraCore.ops.op_frame_relation(_realmContextId, 0, 0, '');
   },
   configurable: true,
   enumerable: true
@@ -8237,11 +8249,8 @@ Object.defineProperty(globalThis, 'length', {
 for (let i = 0; i < 50; i++) {
   Object.defineProperty(globalThis, i, {
     get() {
-      const iframes = document.querySelectorAll('iframe');
-      if (i < iframes.length) {
-        return iframes[i].contentWindow;
-      }
-      return undefined;
+      const id = __obscuraCore.ops.op_frame_relation(_realmContextId, 2, i, '');
+      return id < 0 ? undefined : _windowForContext(id);
     },
     configurable: true,
     enumerable: false
@@ -15546,14 +15555,11 @@ function _windowNamedCandidates(name) {
 }
 
 function _windowNamedValue(name) {
-  const matches = _windowNamedCandidates(name);
+  const contextId = __obscuraCore.ops.op_frame_relation(_realmContextId, 3, 0, name);
+  if (contextId >= 0) return _windowForContext(contextId);
+  const matches = _windowNamedCandidates(name).filter(([nid, namedFrame]) =>
+    !namedFrame || _domParse('get_attribute', nid, 'id') === name);
   if (matches.length === 0) return undefined;
-  for (const [nid, namedFrame] of matches) {
-    if (namedFrame) {
-      const window = _wrapEl(nid).contentWindow;
-      if (window) return window;
-    }
-  }
   if (matches.length > 1) return HTMLCollection._from(matches.map(([nid]) => _wrapEl(nid)));
   return _wrapEl(matches[0][0]);
 }
@@ -16337,7 +16343,6 @@ globalThis.__obscura_liveFrameIds = function () {
 // surviving reference keeps the frame's context and DOM tree alive.
 globalThis.__obscura_forgetFrame = function (frameId) {
   _dom('retire_frame', frameId);
-  _remoteWindows.delete(frameId);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
   delete globalThis.__obscura_frameWindows[frameId];
@@ -16363,7 +16368,7 @@ function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
   return receiverOrigin === expected;
 }
 
-function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+function _serializeFrameMessage(data) {
   let json;
   // Structured clone cannot cross realms here. JSON carries what postMessage is
   // actually used for; anything else throws the same DataCloneError a browser
@@ -16374,6 +16379,18 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
+  return json;
+}
+
+function _sendContextMessage(contextId, data, targetOrigin) {
+  const frameId = __obscuraCore.ops.op_frame_relation(contextId, 5, 0, '');
+  if (frameId >= 0) return _sendRealmMessage(frameId, data, targetOrigin);
+  _serializeFrameMessage(data);
+  if (targetOrigin !== undefined && targetOrigin !== null) String(targetOrigin);
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+  const json = _serializeFrameMessage(data);
   // An unspecified targetOrigin stays permissive (empty string); the receiver
   // enforces a specified one against its own origin in __obscura_deliverMessage.
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
@@ -16416,6 +16433,7 @@ function _connectInsertedFrames(root, html) {
 
 function _ensureInitialFrameRealm(element, srcdoc) {
   if (element._frameId || !element.isConnected) return;
+  _connectFrameContext(element);
   // An opaque sandbox must never receive the creator's security token.
   let opaque = element.hasAttribute('sandbox') &&
       !element.getAttribute('sandbox').toLowerCase().split(/\s+/).includes('allow-same-origin');
@@ -16490,16 +16508,18 @@ function _resetIframeElement(element) {
 // here". Calling the frame's own postMessage would make the frame both sender
 // and receiver, losing the sender's origin and source.
 function _frameWindowFor(frameId) {
-  if (!frameId) return null;
+  if (frameId === _realmFrameId) return globalThis;
+  if (!frameId) return _remoteWindow(0);
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || _remoteWindows.get(frameId) || null;
+  if (!real) return existing || _remoteWindow(frameId);
   if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
   const parentId = Reflect.get(real, '__obscura_parentFrameId') || 0;
+  const contextId = __obscuraCore.ops.op_frame_context(frameId);
   const post = _markNative(function (data, targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data, targetOrigin);
+    _sendContextMessage(contextId, data, targetOrigin);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -16523,7 +16543,7 @@ function _frameWindowFor(frameId) {
 }
 
 // The host calls this inside the target realm.
-globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin, sourceContextId = -1) {
   // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
   // origin, the same check a real browser does at delivery time. A mismatch
   // drops the message silently.
@@ -16531,7 +16551,8 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
   let data = null;
   try { data = JSON.parse(dataJson).v; } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
-  const source = (globalThis.__obscura_frameId !== 0
+  const source = sourceContextId >= 0 ? _windowForContext(sourceContextId)
+    : (globalThis.__obscura_frameId !== 0
                   && sourceFrameId === globalThis.__obscura_parentFrameId)
     ? globalThis.parent
     : _frameWindowFor(sourceFrameId);
@@ -16547,6 +16568,19 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
   }
 };
 
+function _connectFrameContext(element) {
+  if (!element.isConnected || element.namespaceURI !== 'http://www.w3.org/1999/xhtml') return -1;
+  return __obscuraCore.ops.op_connect_frame(_realmFrameId, element._nid);
+}
+
+function _windowForContext(contextId) {
+  if (contextId === _realmContextId) return globalThis;
+  const owner = __obscuraCore.ops.op_frame_relation(contextId, 6, _realmFrameId, '');
+  if (owner >= 0) return _wrapEl(owner).contentWindow;
+  const frameId = __obscuraCore.ops.op_frame_relation(contextId, 5, 0, '');
+  return frameId < 0 ? _remoteContextWindow(contextId) : _frameWindowFor(frameId);
+}
+
 // A window in another browsing context, as seen from this one.
 //
 // Only the cross-origin surface is exposed: reaching synchronously into another
@@ -16554,33 +16588,117 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
 // across origins anyway. Widgets use postMessage regardless, which is what it
 // is for.
 class _RemoteWindow {
-  constructor(frameId) {
-    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
+  postMessage(data, targetOrigin, _transfer) {
+    _sendContextMessage(_remoteContextId(this), data, targetOrigin);
   }
-  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
-  get self() { return this; }
-  get window() { return this; }
-  get frames() { return this; }
-  get parent() { return this; }
-  get top() { return this; }
+  get self() { return this.closed ? null : this; }
+  get window() { return this.closed ? null : this; }
+  get frames() { return this.closed ? null : this; }
+  get parent() {
+    const id = __obscuraCore.ops.op_frame_relation(_remoteContextId(this), 1, 0, '');
+    return id < 0 ? null : _windowForContext(id);
+  }
+  get top() { return this.closed ? null : _windowForContext(0); }
   get opener() { return null; }
-  get closed() { return false; }
-  get length() { return 0; }
+  get closed() { return __obscuraCore.ops.op_frame_relation(_remoteContextId(this), 4, 0, '') !== 1; }
+  get length() { return __obscuraCore.ops.op_frame_relation(_remoteContextId(this), 0, 0, ''); }
   focus() {}
   blur() {}
   close() {}
 }
 _markNative(_RemoteWindow.prototype.postMessage);
 
+const _remoteContextIds = new WeakMap();
+function _remoteContextId(window) {
+  const id = _remoteContextIds.get(window);
+  if (id === undefined) throw new TypeError('Illegal invocation');
+  return id;
+}
+function _remoteIndex(property) {
+  return typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)
+    && Number(property) < 4294967295;
+}
+function _remoteChild(id, property) {
+  if (typeof property !== 'string') return -1;
+  return _remoteIndex(property)
+    ? __obscuraCore.ops.op_frame_relation(id, 2, Number(property), '')
+    : __obscuraCore.ops.op_frame_relation(id, 3, 0, property);
+}
+function _remoteAllowed(property) {
+  return property !== 'constructor' && Object.prototype.hasOwnProperty.call(_RemoteWindow.prototype, property);
+}
+const _remoteFallbacks = ['then', Symbol.toStringTag, Symbol.hasInstance, Symbol.isConcatSpreadable];
+function _remoteAccessError() {
+  return new DOMException('Blocked cross-origin Window access', 'SecurityError');
+}
+const _remoteWindowProxyHandler = {
+  getPrototypeOf() { return null; },
+  setPrototypeOf() { throw _remoteAccessError(); },
+  defineProperty() { throw _remoteAccessError(); },
+  deleteProperty() { throw _remoteAccessError(); },
+  set() { throw _remoteAccessError(); },
+  preventExtensions() { throw _remoteAccessError(); },
+  get(target, prop, receiver) {
+    if (_remoteAllowed(prop)) return Reflect.get(target, prop, receiver);
+    if (prop === '__obscura_wrapsRealm') return false;
+    const child = _remoteChild(_remoteContextId(target), prop);
+    if (child >= 0) return _windowForContext(child);
+    if (_remoteFallbacks.includes(prop)) return undefined;
+    throw _remoteAccessError();
+  },
+  has(target, prop) {
+    if (_remoteAllowed(prop) || (typeof prop === 'symbol' && _remoteFallbacks.includes(prop))) return true;
+    if (_remoteIndex(prop) && _remoteChild(_remoteContextId(target), prop) >= 0) return true;
+    throw _remoteAccessError();
+  },
+  ownKeys(target) {
+    const count = __obscuraCore.ops.op_frame_relation(_remoteContextId(target), 0, 0, '');
+    return [...Array.from({length:count}, (_, index) => String(index)),
+      ...Object.getOwnPropertyNames(_RemoteWindow.prototype).filter(_remoteAllowed), ..._remoteFallbacks];
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const receiver = _remoteContextWindow(_remoteContextId(target));
+    return {value:receiver[prop], writable:false, enumerable:_remoteIndex(prop), configurable:true};
+  },
+};
+
 const _remoteWindows = new Map();
-function _remoteWindow(frameId) {
-  let win = _remoteWindows.get(frameId);
+const _remoteWindowFinalizer = new FinalizationRegistry(({id, reference}) => {
+  if (_remoteWindows.get(id) === reference) _remoteWindows.delete(id);
+});
+function _remoteContextWindow(contextId) {
+  if (contextId === _realmContextId) return globalThis;
+  let win = _remoteWindows.get(contextId)?.deref();
   if (!win) {
-    win = new _RemoteWindow(frameId);
-    _remoteWindows.set(frameId, win);
+    const target = new _RemoteWindow();
+    win = new Proxy(target, _remoteWindowProxyHandler);
+    _remoteContextIds.set(target, contextId);
+    _remoteContextIds.set(win, contextId);
+    const reference = new WeakRef(win);
+    _remoteWindows.set(contextId, reference);
+    _remoteWindowFinalizer.register(win, {id:contextId, reference});
   }
   return win;
 }
+function _remoteWindow(frameId) {
+  const contextId = __obscuraCore.ops.op_frame_context(frameId);
+  return contextId < 0 ? null : _remoteContextWindow(contextId);
+}
+
+Object.defineProperty(globalThis, 'closed', {
+  get() { return __obscuraCore.ops.op_frame_relation(_realmContextId, 4, 0, '') !== 1; },
+  enumerable:true, configurable:true,
+});
+let _windowName = '';
+Object.defineProperty(globalThis, 'name', {
+  get() { return _realmContextId === 0 ? _windowName : __obscuraCore.ops.op_frame_name(_realmContextId, undefined); },
+  set(value) {
+    const name = `${value}`;
+    if (_realmContextId === 0) _windowName = name;
+    else __obscuraCore.ops.op_frame_name(_realmContextId, name);
+  },
+  enumerable:true, configurable:true,
+});
 
 // Installs `parent` and `top` for a framed document. Called from
 // __obscura_init, before any of the document's own scripts run: `parent ===
@@ -19474,6 +19592,7 @@ globalThis.__obscura_init_frames = function() {
 globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _realmContextId = __obscuraCore.ops.op_frame_context(_realmFrameId);
   _formCacheEpoch = null;
   _formOwnerSnapshots = new WeakMap();
   _formControlSnapshots = new WeakMap();
