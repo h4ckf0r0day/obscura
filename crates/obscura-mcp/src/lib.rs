@@ -1164,6 +1164,13 @@ async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String
             var t = {target};
             if (!t) return "error:element not found";
             t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));
+            if ({key} === "Enter") {{
+                var el = t.nodeType === 9 ? document.activeElement : t;
+                if (el && el.localName !== "textarea") {{
+                    var form = el.form || (el.closest ? el.closest("form") : null);
+                    if (form) {{ try {{ if (typeof form.requestSubmit === "function") {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}
+                }}
+            }}
             t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
             return "ok";
         }})()"#,
