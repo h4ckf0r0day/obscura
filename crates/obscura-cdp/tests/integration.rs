@@ -46,6 +46,7 @@ integration_tests!(
     file_upload_integrity,
     form_submission_ownership,
     form_submit_method_bypasses_listener,
+    iframe_blob_src,
     iframe_event_dispatch,
     input_activation_author_accessors,
     input_key_event_escaping,
