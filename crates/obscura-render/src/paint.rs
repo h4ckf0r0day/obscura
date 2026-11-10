@@ -11530,7 +11530,7 @@ fn resolve_svg_presentation_value<'a>(
     properties: &std::collections::HashMap<String, String>,
 ) -> Option<std::borrow::Cow<'a, str>> {
     if !value.contains("var(") {
-        return Some(std::borrow::Cow::Borrowed(value));
+        return Some(normalize_svg_modern_color(name, std::borrow::Cow::Borrowed(value)));
     }
     let resolved = crate::css::substitute_var_value(value, properties, 0)?;
     if resolved.trim().is_empty()
@@ -11538,7 +11538,28 @@ fn resolve_svg_presentation_value<'a>(
     {
         return None;
     }
-    Some(std::borrow::Cow::Owned(resolved))
+    Some(normalize_svg_modern_color(name, std::borrow::Cow::Owned(resolved)))
+}
+
+fn normalize_svg_modern_color<'a>(
+    name: &str,
+    value: std::borrow::Cow<'a, str>,
+) -> std::borrow::Cow<'a, str> {
+    if !matches!(name, "color" | "fill" | "stroke" | "stop-color" | "flood-color" | "lighting-color") {
+        return value;
+    }
+    let prefix = value.trim().get(..6);
+    if !prefix.is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("oklch(") || prefix.eq_ignore_ascii_case("oklab(")
+    }) {
+        return value;
+    }
+    let Some([red, green, blue, alpha]) = crate::style::parse_color(&value) else {
+        return value;
+    };
+    // usvg does not accept OKLab/OKLCH. Resolve at the standalone SVG
+    // boundary while preserving the alpha channel and symbolic SVG paints.
+    std::borrow::Cow::Owned(format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}"))
 }
 
 /// Detect only values whose post-substitution grammar is unambiguously
