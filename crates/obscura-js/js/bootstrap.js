@@ -17301,8 +17301,220 @@ class HTMLCanvasElement extends Element {
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
 
-HTMLCanvasElement.prototype.getContext = function getContext(type) {
+class _WebGLResource {
+  constructor(context, id) { this._context = context; this._id = id; this._deleted = false; }
+}
+for (const name of ['WebGLBuffer', 'WebGLShader', 'WebGLProgram', 'WebGLTexture', 'WebGLFramebuffer', 'WebGLUniformLocation']) {
+  globalThis[name] = class extends _WebGLResource {};
+}
+
+class _WebGL1 extends globalThis.WebGLRenderingContext {
+  constructor(canvas, id, options) {
+    super();
+    this.canvas = canvas;
+    this._id = id;
+    this._isWebGL = true;
+    this._error = 0;
+    this._options = {alpha:options.alpha !== false, depth:false, stencil:false,
+      antialias:false, premultipliedAlpha:options.premultipliedAlpha !== false, preserveDrawingBuffer:true};
+    this._objects = new Map();
+    this._resizeFromCanvas(true);
+  }
+  get drawingBufferWidth() { return this._w; }
+  get drawingBufferHeight() { return this._h; }
+  getContextAttributes() { return {...this._options}; }
+  isContextLost() { return false; }
+  _call(name, args) {
+    const converted = [];
+    for (const value of args) {
+      if (value instanceof _WebGLResource) {
+        if (value._context !== this || value._deleted) { this._error = this.INVALID_OPERATION; return null; }
+        converted.push(value._id);
+      } else converted.push(ArrayBuffer.isView(value) ? Array.from(value) : value);
+    }
+    const result = __obscuraCore.ops.op_webgl_command(this._id, name, converted);
+    if (result && typeof result === 'object' && result.error) { this._error = result.error; return null; }
+    return result;
+  }
+  _create(name, kind, args) {
+    const id = this._call(name, args);
+    if (id == null) return null;
+    const object = new globalThis[kind](this, id);
+    this._objects.set(kind + ':' + id, object);
+    return object;
+  }
+  _resizeFromCanvas(initial = false) {
+    const width = this.canvas.width, height = this.canvas.height;
+    if (!initial && !__obscuraCore.ops.op_webgl_resize(this._id, width, height)) {
+      this._error = this.OUT_OF_MEMORY; return;
+    }
+    this._w = width; this._h = height;
+    this._buf = new Uint8ClampedArray(width * height * 4);
+    this._bytes = new Uint8Array(this._buf.buffer);
+    if (!__obscuraCore.ops.op_canvas_register_surface(this.canvas._nid, width, height, this._bytes)) {
+      this._error = this.OUT_OF_MEMORY;
+    }
+  }
+  _queuePaint() {
+    if (this._paintQueued) return;
+    this._paintQueued = true;
+    queueMicrotask(() => this._flushPixels());
+  }
+  _flushPixels() {
+    this._paintQueued = false;
+    if (__obscuraCore.ops.op_webgl_snapshot(this._id, this._bytes)) {
+      __obscuraCore.ops.op_canvas_paint_damage(this.canvas._nid);
+    }
+  }
+  getError() { const error = this._error; this._error = 0; const native = this._call('getError', []); return error || native; }
+  getSupportedExtensions() { return []; }
+  getExtension() { return null; }
+  createBuffer() { return this._create('createBuffer', 'WebGLBuffer', []); }
+  createProgram() { return this._create('createProgram', 'WebGLProgram', []); }
+  createTexture() { return this._create('createTexture', 'WebGLTexture', []); }
+  createFramebuffer() { return this._create('createFramebuffer', 'WebGLFramebuffer', []); }
+  createShader(type) {
+    const shader = this._create('createShader', 'WebGLShader', [type]);
+    if (shader) shader._type = type;
+    return shader;
+  }
+  getShaderParameter(shader, parameter) {
+    if (parameter === this.SHADER_TYPE && shader?._context === this) return shader._type;
+    return this._call('getShaderParameter', [shader, parameter]);
+  }
+  getUniformLocation(program, name) { return this._create('getUniformLocation', 'WebGLUniformLocation', [program, String(name)]); }
+  getParameter(parameter) {
+    const value = this._call('getParameter', [parameter]);
+    if ([this.VIEWPORT, this.SCISSOR_BOX, this.MAX_VIEWPORT_DIMS].includes(parameter)) return new Int32Array(value || []);
+    if ([this.ALIASED_LINE_WIDTH_RANGE, this.ALIASED_POINT_SIZE_RANGE, this.COLOR_CLEAR_VALUE].includes(parameter)) return new Float32Array(value || []);
+    const kinds = {[this.CURRENT_PROGRAM]:'WebGLProgram', [this.ARRAY_BUFFER_BINDING]:'WebGLBuffer',
+      [this.ELEMENT_ARRAY_BUFFER_BINDING]:'WebGLBuffer', [this.TEXTURE_BINDING_2D]:'WebGLTexture',
+      [this.FRAMEBUFFER_BINDING]:'WebGLFramebuffer'};
+    return kinds[parameter] ? this._objects.get(kinds[parameter] + ':' + value) || null : value;
+  }
+  _view(data) {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return null;
+  }
+  bufferData(target, data, usage) {
+    if (typeof data === 'number') {
+      if (!Number.isInteger(data) || data < 0 || data > 67108864) { this._error = this.INVALID_VALUE; return; }
+      data = new Uint8Array(data);
+    }
+    const bytes = this._view(data);
+    if (!bytes) { this._error = this.INVALID_VALUE; return; }
+    if (!__obscuraCore.ops.op_webgl_upload(this._id, 'bufferData', [target, usage], bytes)) this._error = this.INVALID_OPERATION;
+  }
+  bufferSubData(target, offset, data) {
+    const bytes = this._view(data);
+    if (!bytes || !Number.isInteger(offset) || offset < 0) { this._error = this.INVALID_VALUE; return; }
+    if (!__obscuraCore.ops.op_webgl_upload(this._id, 'bufferSubData', [target, offset], bytes)) this._error = this.INVALID_OPERATION;
+  }
+  texImage2D(...args) {
+    if (args.length === 6) {
+      const [target, level, internal, format, type, source] = args;
+      if (source instanceof ImageBitmap) {
+        if (!source._bitmapPixels || !__obscuraCore.ops.op_webgl_upload(this._id, 'texImage2D',
+          [target, level, internal, source.width, source.height, format, type, true], source._bitmapPixels)) this._error = this.INVALID_OPERATION;
+        return;
+      }
+      if (source?._ctx?._buf) {
+        source._ctx._flushPixels?.();
+        return this.texImage2D(target, level, internal, source.width, source.height, 0, format, type, source._ctx._buf);
+      }
+      if (source?.data && source.width && source.height) {
+        return this.texImage2D(target, level, internal, source.width, source.height, 0, format, type, source.data);
+      }
+      if (!source?._nid || !__obscuraCore.ops.op_webgl_upload_image(this._id, source._nid, [target, level, internal, format, type])) this._error = this.INVALID_OPERATION;
+      return;
+    }
+    if (args.length !== 9) { this._error = this.INVALID_VALUE; return; }
+    const [target, level, internal, width, height, border, format, type, data] = args;
+    const size = width * height * 4;
+    if (border !== 0 || !Number.isInteger(width) || !Number.isInteger(height)
+      || width < 0 || height < 0 || size > 67108864) { this._error = this.INVALID_VALUE; return; }
+    const bytes = data === null ? new Uint8Array(size) : this._view(data);
+    if (!bytes || !__obscuraCore.ops.op_webgl_upload(this._id, 'texImage2D', [target, level, internal, width, height, format, type], bytes)) this._error = this.INVALID_OPERATION;
+  }
+  readPixels(x, y, width, height, format, type, output) {
+    if (format !== this.RGBA || type !== this.UNSIGNED_BYTE || !ArrayBuffer.isView(output)) { this._error = this.INVALID_ENUM; return; }
+    const bytes = this._view(output);
+    if (!__obscuraCore.ops.op_webgl_read_pixels(this._id, [x, y, width, height], bytes)) this._error = this.INVALID_OPERATION;
+  }
+}
+
+for (const name of ['attachShader','detachShader','bindAttribLocation','linkProgram','useProgram','shaderSource',
+  'compileShader','getShaderInfoLog','getProgramInfoLog','getProgramParameter','getAttribLocation','getActiveAttrib',
+  'getActiveUniform','getShaderPrecisionFormat','bindBuffer','enableVertexAttribArray','disableVertexAttribArray',
+  'vertexAttribPointer','bindTexture','activeTexture','texParameteri','texParameterf','generateMipmap','pixelStorei',
+  'bindFramebuffer','framebufferTexture2D','checkFramebufferStatus',
+  'viewport','scissor','clearColor','clearDepth','clearStencil','enable','disable','isEnabled','blendFunc',
+  'blendFuncSeparate','blendEquation','blendEquationSeparate','blendColor','depthFunc','depthMask','depthRange',
+  'cullFace','frontFace','colorMask','lineWidth','polygonOffset','uniform1f','uniform2f','uniform3f','uniform4f',
+  'uniform1i','uniform2i','uniform3i','uniform4i','uniform1fv','uniform2fv','uniform3fv','uniform4fv',
+  'uniformMatrix2fv','uniformMatrix3fv','uniformMatrix4fv']) {
+  _WebGL1.prototype[name] = function(...args) { return this._call(name, args); };
+}
+for (const name of ['drawArrays', 'drawElements', 'clear', 'flush', 'finish']) {
+  _WebGL1.prototype[name] = function(...args) { this._call(name, args); this._queuePaint(); };
+}
+for (const kind of ['Buffer', 'Program', 'Shader', 'Texture', 'Framebuffer']) {
+  _WebGL1.prototype['delete' + kind] = function(object) {
+    this._call('delete' + kind, [object]);
+    if (object?._context === this) object._deleted = true;
+  };
+}
+
+const _webglConstants = {
+  DEPTH_BUFFER_BIT:256, STENCIL_BUFFER_BIT:1024, COLOR_BUFFER_BIT:16384,
+  POINTS:0, LINES:1, LINE_LOOP:2, LINE_STRIP:3, TRIANGLES:4, TRIANGLE_STRIP:5, TRIANGLE_FAN:6,
+  ZERO:0, ONE:1, SRC_COLOR:768, ONE_MINUS_SRC_COLOR:769, SRC_ALPHA:770, ONE_MINUS_SRC_ALPHA:771,
+  DST_ALPHA:772, ONE_MINUS_DST_ALPHA:773, DST_COLOR:774, ONE_MINUS_DST_COLOR:775,
+  FUNC_ADD:32774, FUNC_SUBTRACT:32778, FUNC_REVERSE_SUBTRACT:32779,
+  ARRAY_BUFFER:34962, ELEMENT_ARRAY_BUFFER:34963, ARRAY_BUFFER_BINDING:34964, ELEMENT_ARRAY_BUFFER_BINDING:34965,
+  STREAM_DRAW:35040, STATIC_DRAW:35044, DYNAMIC_DRAW:35048,
+  BYTE:5120, UNSIGNED_BYTE:5121, SHORT:5122, UNSIGNED_SHORT:5123, INT:5124, UNSIGNED_INT:5125, FLOAT:5126,
+  FRAGMENT_SHADER:35632, VERTEX_SHADER:35633, COMPILE_STATUS:35713, LINK_STATUS:35714, VALIDATE_STATUS:35715,
+  SHADER_TYPE:35663, DELETE_STATUS:35712, ATTACHED_SHADERS:35717, ACTIVE_UNIFORMS:35718, ACTIVE_ATTRIBUTES:35721,
+  CURRENT_PROGRAM:35725, LOW_FLOAT:36336, MEDIUM_FLOAT:36337, HIGH_FLOAT:36338,
+  LOW_INT:36339, MEDIUM_INT:36340, HIGH_INT:36341, FLOAT_VEC2:35664, FLOAT_VEC3:35665, FLOAT_VEC4:35666,
+  INT_VEC2:35667, INT_VEC3:35668, INT_VEC4:35669, BOOL:35670, BOOL_VEC2:35671, BOOL_VEC3:35672, BOOL_VEC4:35673,
+  FLOAT_MAT2:35674, FLOAT_MAT3:35675, FLOAT_MAT4:35676, SAMPLER_2D:35678, SAMPLER_CUBE:35680,
+  TEXTURE_2D:3553, TEXTURE_BINDING_2D:32873, TEXTURE0:33984, ACTIVE_TEXTURE:34016,
+  FRAMEBUFFER:36160, FRAMEBUFFER_BINDING:36006, COLOR_ATTACHMENT0:36064, FRAMEBUFFER_COMPLETE:36053,
+  FRAMEBUFFER_INCOMPLETE_ATTACHMENT:36054, FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:36055,
+  RGBA:6408, RGB:6407, ALPHA:6406, LUMINANCE:6409, LUMINANCE_ALPHA:6410,
+  TEXTURE_MAG_FILTER:10240, TEXTURE_MIN_FILTER:10241, TEXTURE_WRAP_S:10242, TEXTURE_WRAP_T:10243,
+  NEAREST:9728, LINEAR:9729, NEAREST_MIPMAP_NEAREST:9984, LINEAR_MIPMAP_NEAREST:9985,
+  NEAREST_MIPMAP_LINEAR:9986, LINEAR_MIPMAP_LINEAR:9987, REPEAT:10497, CLAMP_TO_EDGE:33071, MIRRORED_REPEAT:33648,
+  UNPACK_ALIGNMENT:3317, PACK_ALIGNMENT:3333, UNPACK_FLIP_Y_WEBGL:37440, UNPACK_PREMULTIPLY_ALPHA_WEBGL:37441,
+  UNPACK_COLORSPACE_CONVERSION_WEBGL:37443, BROWSER_DEFAULT_WEBGL:37444,
+  CULL_FACE:2884, BLEND:3042, DITHER:3024, STENCIL_TEST:2960, DEPTH_TEST:2929, SCISSOR_TEST:3089,
+  FRONT:1028, BACK:1029, FRONT_AND_BACK:1032, CW:2304, CCW:2305,
+  NEVER:512, LESS:513, EQUAL:514, LEQUAL:515, GREATER:516, NOTEQUAL:517, GEQUAL:518, ALWAYS:519,
+  VENDOR:7936, RENDERER:7937, VERSION:7938, SHADING_LANGUAGE_VERSION:35724,
+  MAX_TEXTURE_SIZE:3379, MAX_CUBE_MAP_TEXTURE_SIZE:34076, MAX_RENDERBUFFER_SIZE:34024,
+  MAX_VERTEX_ATTRIBS:34921, MAX_VERTEX_UNIFORM_VECTORS:36347, MAX_VARYING_VECTORS:36348,
+  MAX_FRAGMENT_UNIFORM_VECTORS:36349, MAX_TEXTURE_IMAGE_UNITS:34930, MAX_VERTEX_TEXTURE_IMAGE_UNITS:35660,
+  MAX_COMBINED_TEXTURE_IMAGE_UNITS:35661, MAX_VIEWPORT_DIMS:3386, VIEWPORT:2978, SCISSOR_BOX:3088,
+  ALIASED_LINE_WIDTH_RANGE:33902, ALIASED_POINT_SIZE_RANGE:33901, COLOR_CLEAR_VALUE:3106,
+  RED_BITS:3410, GREEN_BITS:3411, BLUE_BITS:3412, ALPHA_BITS:3413, DEPTH_BITS:3414, STENCIL_BITS:3415,
+  NO_ERROR:0, INVALID_ENUM:1280, INVALID_VALUE:1281, INVALID_OPERATION:1282, OUT_OF_MEMORY:1285, CONTEXT_LOST_WEBGL:37442
+};
+for (const [name, value] of Object.entries(_webglConstants)) {
+  Object.defineProperty(_WebGL1.prototype, name, {value});
+  Object.defineProperty(_WebGL1, name, {value});
+}
+for (let unit = 1; unit < 32; unit++) {
+  Object.defineProperty(_WebGL1.prototype, 'TEXTURE' + unit, {value:33984 + unit});
+  Object.defineProperty(_WebGL1, 'TEXTURE' + unit, {value:33984 + unit});
+}
+globalThis.WebGLRenderingContext = _WebGL1;
+
+HTMLCanvasElement.prototype.getContext = function getContext(type, options = {}) {
   if (type === '2d') {
+    if (this._ctx?._isWebGL) return null;
     if (!this._ctx) {
       try { this._ctx = new _Canvas2D(this); }
       catch (_error) { return null; }
@@ -17310,6 +17522,16 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
     return this._ctx;
   }
   if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+    if (type !== 'webgl2' && typeof __obscuraCore.ops.op_webgl_create === 'function') {
+      if (this._ctx) return this._ctx._isWebGL ? this._ctx : null;
+      if (options?.failIfMajorPerformanceCaveat) return null;
+      options = options || {};
+      const id = __obscuraCore.ops.op_webgl_create(this.width, this.height,
+        options.alpha !== false, options.premultipliedAlpha !== false);
+      if (!id) return null;
+      this._ctx = new _WebGL1(this, id, options);
+      return this._ctx;
+    }
     // Context creation is allowed to fail, and that is the only truthful
     // behavior until the renderer has a real WebGL backend. The former shim
     // reported successful shader/program creation while every draw call was a
@@ -17321,6 +17543,7 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
 };
 HTMLCanvasElement.prototype.toDataURL = function(type) {
   const ctx = this._ctx || this.getContext('2d');
+  ctx?._flushPixels?.();
   if (ctx && ctx._buf) {
     if (ctx._w === 0 || ctx._h === 0) return 'data:,';
     return _encodePNG(ctx._w, ctx._h, ctx._buf);
@@ -18919,8 +19142,40 @@ if (typeof Path2D === 'undefined') {
 }
 
 if (typeof ImageBitmap === 'undefined') {
-  globalThis.ImageBitmap = class ImageBitmap { constructor(){this.width=0;this.height=0;} close(){} };
-  globalThis.createImageBitmap = function() { return Promise.resolve(new ImageBitmap()); };
+  globalThis.ImageBitmap = class ImageBitmap {
+    constructor(){this.width=0;this.height=0;}
+    close(){this.width=0;this.height=0;this._bitmapPixels=null;}
+  };
+  globalThis.createImageBitmap = async function(source, options = {}) {
+    const decode = __obscuraCore.ops.op_webgl_decode_image;
+    if (typeof decode !== 'function') return new ImageBitmap();
+    let width, height, pixels;
+    if (source instanceof Blob) {
+      const decoded = decode(new Uint8Array(await source.arrayBuffer()));
+      if (decoded.byteLength < 8) throw new DOMException('Image decoding failed','InvalidStateError');
+      const header = new DataView(decoded.buffer, decoded.byteOffset, 8);
+      width = header.getUint32(0,true); height = header.getUint32(4,true);
+      pixels = decoded.subarray(8);
+    } else if (source?._ctx?._buf || source?.data) {
+      source._ctx?._flushPixels?.();
+      width = source.width; height = source.height;
+      pixels = new Uint8Array(source._ctx?._buf || source.data);
+    } else throw new DOMException('Unsupported image source','InvalidStateError');
+    if (options.imageOrientation === 'flipY') {
+      const flipped = new Uint8Array(pixels.length), stride = width * 4;
+      for (let row = 0; row < height; row++) flipped.set(pixels.subarray(row * stride,(row + 1) * stride),(height - row - 1) * stride);
+      pixels = flipped;
+    }
+    if (options.premultiplyAlpha === 'premultiply') {
+      for (let index = 0; index < pixels.length; index += 4) {
+        const alpha = pixels[index + 3] / 255;
+        for (let channel = 0; channel < 3; channel++) pixels[index + channel] = Math.round(pixels[index + channel] * alpha);
+      }
+    }
+    const bitmap = new ImageBitmap();
+    bitmap.width = width; bitmap.height = height; bitmap._bitmapPixels = pixels;
+    return bitmap;
+  };
 }
 
 if (typeof Selection === 'undefined') {

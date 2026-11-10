@@ -8,6 +8,8 @@ pub mod ops;
 pub mod runtime;
 pub mod v8_flags;
 mod write_stream;
+#[cfg(feature = "webgl")]
+mod webgl;
 
 #[cfg(test)]
 mod indexed_db_tests;
