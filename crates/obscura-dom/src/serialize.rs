@@ -106,11 +106,7 @@ impl DomTree {
                         buf.push_str(tag);
                         for attr in attrs {
                             buf.push(' ');
-                            if let Some(prefix) = &attr.name.prefix {
-                                buf.push_str(prefix);
-                                buf.push(':');
-                            }
-                            buf.push_str(attr.name.local.as_ref());
+                            push_attribute_name(&attr.name, buf);
                             buf.push_str("=\"");
                             escape_attr(&attr.value, buf);
                             buf.push('"');
@@ -216,6 +212,28 @@ fn escape(s: &str, attribute: bool, buf: &mut String) {
         copied = i;
     }
     buf.push_str(&s[copied..]);
+}
+
+/// An attribute's serialized name. The three namespaces HTML knows are
+/// written with their fixed prefix whatever prefix the attribute carries.
+fn push_attribute_name(name: &QualName, buf: &mut String) {
+    let local = name.local.as_ref();
+    let prefix = if name.ns == ns!() {
+        None
+    } else if name.ns == ns!(xml) {
+        Some("xml")
+    } else if name.ns == ns!(xlink) {
+        Some("xlink")
+    } else if name.ns == ns!(xmlns) {
+        (local != "xmlns").then_some("xmlns")
+    } else {
+        name.prefix.as_ref().map(|prefix| prefix.as_ref())
+    };
+    if let Some(prefix) = prefix {
+        buf.push_str(prefix);
+        buf.push(':');
+    }
+    buf.push_str(local);
 }
 
 /// "Serializes as void": the void elements plus four obsolete ones. Such an
@@ -409,6 +427,32 @@ mod tests {
         tree.append_child(br, child);
         assert_eq!(tree.outer_html(br), "<br><g></g></br>");
         assert_eq!(tree.inner_html(br), "<g></g>");
+    }
+
+    #[test]
+    fn namespaced_attributes_are_written_with_their_fixed_prefix() {
+        let tree = parse_html("<span id=host></span>");
+        let attr = |ns, prefix: Option<&str>, local: &str| crate::tree::Attribute {
+            name: QualName::new(prefix.map(html5ever::Prefix::from), ns, LocalName::from(local)),
+            value: "v".to_string(),
+        };
+        let svg = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(svg), LocalName::from("svg")),
+            attrs: vec![
+                attr(ns!(xml), Some("abc"), "lang"),
+                attr(ns!(xlink), None, "href"),
+                attr(ns!(xmlns), None, "xmlns"),
+                attr(ns!(xmlns), Some("x"), "foo"),
+                attr(ns!(), None, "plain"),
+                attr(html5ever::Namespace::from("urn:other"), Some("o"), "k"),
+            ],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        assert_eq!(
+            tree.outer_html(svg),
+            r#"<svg xml:lang="v" xlink:href="v" xmlns="v" xmlns:foo="v" plain="v" o:k="v"></svg>"#
+        );
     }
 
     #[test]
