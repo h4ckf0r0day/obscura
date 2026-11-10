@@ -1376,6 +1376,16 @@ impl RealmStates {
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
     }
+
+    pub(crate) fn child_frame_for_node(&self, parent: &SharedState, node: NodeId) -> Option<u32> {
+        let generation = parent.borrow().document_generation;
+        self.entries.iter().find_map(|(_, id, _)| {
+            let (owner, owner_node, owner_generation) = self.frame_timers.get(id)?.owner.as_ref()?;
+            (owner.as_ptr() == Rc::as_ptr(parent) && *owner_node == node
+                && *owner_generation == generation && self.frame_timers_active(*id) == Some(true))
+                .then_some(*id)
+        })
+    }
 }
 
 /// The document of the realm a DOM call came from, named rather than inferred.

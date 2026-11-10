@@ -4305,6 +4305,15 @@ impl ObscuraJsRuntime {
         state.dom.as_ref().map(f)
     }
 
+    /// The live child browsing context owned by a node in the specified realm.
+    pub fn child_frame_for_node(&self, parent_frame_id: u32, node: NodeId) -> Option<u32> {
+        let realms = self.realm_states();
+        let realms = realms.borrow();
+        let parent = if parent_frame_id == 0 { self.state.clone() }
+            else { realms.by_frame_id(parent_frame_id)? };
+        realms.child_frame_for_node(&parent, node)
+    }
+
     /// Inspect a genuine remote node in its owning document, including foreign
     /// handles returned through the parent realm. Detached frame handles fail
     /// instead of resolving the same numeric node id in the main document.

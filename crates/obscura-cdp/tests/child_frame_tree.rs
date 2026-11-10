@@ -90,6 +90,118 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
         .to_string()
 }
 
+fn iframe_node(root: &Value) -> Option<&Value> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node["localName"] == "iframe" { return Some(node); }
+        if let Some(children) = node["children"].as_array() {
+            pending.extend(children);
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn iframe_owner_metadata_matches_the_frame_tree_across_dom_surfaces() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Runtime.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url":url}), &session).await;
+    cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression":"1"}), &session).await;
+    let tree = cdp(&mut ctx, 4, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0];
+    let child_id = child["frame"]["id"].clone();
+    let grandchild_id = child["childFrames"][0]["frame"]["id"].clone();
+    let child_context = ctx.pending_events.iter().find(|event|
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == child_id
+            && event.params["context"]["auxData"]["isDefault"] == true
+    ).unwrap().params["context"]["id"].clone();
+
+    for (context, expected) in [(None, child_id.clone()), (Some(child_context), grandchild_id)] {
+        let mut params = json!({"expression":"document.querySelector('iframe')"});
+        if let Some(context) = context { params["contextId"] = context; }
+        let handle = cdp(&mut ctx, 5, "Runtime.evaluate", params, &session).await;
+        let node = cdp(&mut ctx, 6, "DOM.describeNode",
+            json!({"objectId":handle["result"]["objectId"]}), &session).await;
+        assert_eq!(node["node"]["frameId"], expected);
+    }
+    let document = cdp(&mut ctx, 7, "DOM.getDocument", json!({"depth":-1}), &session).await;
+    let owner = iframe_node(&document["root"]).unwrap();
+    assert_eq!(owner["frameId"], child_id);
+    let node_id = owner["nodeId"].clone();
+    for key in ["nodeId", "backendNodeId"] {
+        let mut params = json!({});
+        params[key] = node_id.clone();
+        let described = cdp(&mut ctx, 8, "DOM.describeNode", params, &session).await;
+        assert_eq!(described["node"]["frameId"], child_id);
+    }
+    let described = cdp(&mut ctx, 9, "DOM.describeNode",
+        json!({"nodeId":document["root"]["nodeId"],"depth":-1}), &session).await;
+    assert_eq!(iframe_node(&described["node"]).unwrap()["frameId"], child_id);
+
+    let shallow = cdp(&mut ctx, 10, "DOM.getDocument", json!({"depth":0}), &session).await;
+    assert!(shallow["root"].get("children").is_none());
+    ctx.pending_events.clear();
+    cdp(&mut ctx, 11, "DOM.requestChildNodes",
+        json!({"nodeId":shallow["root"]["nodeId"],"depth":-1}), &session).await;
+    let pushed = ctx.pending_events.iter().filter(|event| event.method == "DOM.setChildNodes")
+        .flat_map(|event| event.params["nodes"].as_array().unwrap()).find_map(iframe_node).unwrap();
+    assert_eq!(pushed["frameId"], child_id);
+
+    cdp(&mut ctx, 12, "DOM.getDocument", json!({"depth":0}), &session).await;
+    let handle = cdp(&mut ctx, 13, "Runtime.evaluate",
+        json!({"expression":"document.querySelector('iframe')"}), &session).await;
+    ctx.pending_events.clear();
+    cdp(&mut ctx, 14, "DOM.requestNode",
+        json!({"objectId":handle["result"]["objectId"]}), &session).await;
+    let pushed = ctx.pending_events.iter().filter(|event| event.method == "DOM.setChildNodes")
+        .flat_map(|event| event.params["nodes"].as_array().unwrap()).find_map(iframe_node).unwrap();
+    assert_eq!(pushed["frameId"], child_id);
+    let missing = cdp(&mut ctx, 15, "DOM.describeNode",
+        json!({"backendNodeId":u32::MAX}), &session).await;
+    assert!(missing["node"].is_null());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cross_origin_iframe_owner_metadata_does_not_revive_detached_contexts() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve().await;
+    let foreign = serve().await;
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":url}), &session).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":format!(
+        "document.querySelector('iframe').src = {}",
+        serde_json::to_string(&format!("{foreign}child.html")).unwrap(),
+    )}), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    let tree = cdp(&mut ctx, 3, "Page.getFrameTree", json!({}), &session).await;
+    let child = &tree["frameTree"]["childFrames"][0]["frame"];
+    assert_eq!(child["url"], format!("{foreign}child.html"));
+    let handle = cdp(&mut ctx, 4, "Runtime.evaluate",
+        json!({"expression":"globalThis.owner = document.querySelector('iframe')"}), &session).await;
+    let node = cdp(&mut ctx, 5, "DOM.describeNode",
+        json!({"objectId":handle["result"]["objectId"]}), &session).await;
+    assert_eq!(node["node"]["frameId"], child["id"]);
+    cdp(&mut ctx, 6, "Runtime.evaluate", json!({"expression":"owner.remove()"}), &session).await;
+    let detached = cdp(&mut ctx, 7, "DOM.describeNode",
+        json!({"objectId":handle["result"]["objectId"]}), &session).await;
+    assert!(detached["node"].get("frameId").is_none());
+    cdp(&mut ctx, 8, "Runtime.evaluate",
+        json!({"expression":"document.body.appendChild(owner)"}), &session).await;
+    ctx.get_session_page_mut(&Some(session.clone())).unwrap().settle(1_000).await;
+    let tree = cdp(&mut ctx, 9, "Page.getFrameTree", json!({}), &session).await;
+    let replacement = &tree["frameTree"]["childFrames"][0]["frame"]["id"];
+    assert_ne!(*replacement, child["id"]);
+    let described = cdp(&mut ctx, 10, "DOM.describeNode",
+        json!({"objectId":handle["result"]["objectId"]}), &session).await;
+    assert_eq!(described["node"]["frameId"], *replacement);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn child_default_and_isolated_contexts_evaluate_their_own_documents() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
