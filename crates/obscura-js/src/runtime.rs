@@ -1377,7 +1377,11 @@ impl ObscuraJsRuntime {
             gs.resolved_scroll = None;
         }
         drop(gs);
-        self.realm_states().borrow().cancel_inactive_frame_timers();
+        let realms = self.realm_states();
+        let mut realms = realms.borrow_mut();
+        realms.cancel_inactive_frame_timers();
+        realms.prune_frame_contexts();
+        realms.connect_document_frames(&self.state);
     }
 
     pub fn set_url(&self, url: &str) {
@@ -10713,7 +10717,7 @@ mod tests {
             second.remove();
             results.push(window.namedContext===collision);
             byId.name = 'idOnlyFrame';
-            results.push(window.idOnlyFrame===byId.contentWindow);
+            results.push(window.idOnlyFrame===byId && byId.contentWindow.name==='');
             byId.removeAttribute('name');
             results.push(window.idOnlyFrame===byId);
             const duplicate = document.createElement('div'); duplicate.id = 'idOnlyFrame';

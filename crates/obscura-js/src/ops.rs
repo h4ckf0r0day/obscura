@@ -673,6 +673,8 @@ pub struct PendingFrameMessage {
     pub target_frame_id: u32,
     /// Where it came from, so the receiver can reply through `event.source`.
     pub source_frame_id: u32,
+    /// The sender's browsing context, even if its document retires before delivery.
+    pub source_context_id: Option<u32>,
     /// The sender's origin, for `event.origin`.
     pub origin: String,
     /// The origin the sender restricted delivery to (postMessage's
@@ -1236,12 +1238,24 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
+    frame_contexts: HashMap<u32, FrameContext>,
+    frame_context_owners: HashMap<(*const RefCell<ObscuraState>, NodeId, u64), u32>,
+    frame_context_children: HashMap<u32, Vec<u32>>,
+    last_frame_context: u32,
     pub(crate) frame_preload_scripts: Vec<String>,
 }
 
 struct FrameTimers {
     owner: Option<(std::rc::Weak<RefCell<ObscuraState>>, NodeId, u64)>,
     cancel: Rc<CancelHandle>,
+    context_id: Option<u32>,
+}
+
+struct FrameContext {
+    owner: Option<(std::rc::Weak<RefCell<ObscuraState>>, NodeId, u64)>,
+    parent: Option<u32>,
+    frame_id: Option<u32>,
+    name: String,
 }
 
 impl RealmStates {
@@ -1259,10 +1273,10 @@ impl RealmStates {
     }
 
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
-        self.cancel_frame_timers(frame_id);
+        self.retire_frame(frame_id);
         self.entries.retain(|(_, id, _)| *id != frame_id);
         self.frame_timers.remove(&frame_id);
-        self.cancel_inactive_frame_timers();
+        self.prune_frame_contexts();
     }
     pub fn register(
         &mut self,
@@ -1270,9 +1284,17 @@ impl RealmStates {
         frame_id: u32,
         state: SharedState,
     ) {
+        let context_id = self.frame_timers.get(&frame_id).and_then(|frame| frame.context_id)
+            .or_else(|| {
+                let parent = self.context_for_frame(state.borrow().parent_frame_id);
+                self.allocate_frame_context(FrameContext {
+                    owner: None, parent, frame_id: Some(frame_id), name: String::new(),
+                })
+            });
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
-            owner: None, cancel: CancelHandle::new_rc(),
+            owner: None, cancel: CancelHandle::new_rc(), context_id,
         });
+        self.connect_document_frames(&state);
         self.entries.push((context, frame_id, state));
     }
 
@@ -1284,11 +1306,148 @@ impl RealmStates {
         }
     }
 
-    fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
+    pub(crate) fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
         let generation = parent.borrow().document_generation;
-        self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
-            owner: None, cancel: CancelHandle::new_rc(),
-        }).owner = Some((Rc::downgrade(parent), node, generation));
+        let context_id = self.connect_frame_context(parent, node);
+        if let Some(context_id) = context_id {
+            let context = self.frame_contexts.get_mut(&context_id).unwrap();
+            if let Some(previous) = context.frame_id.replace(frame_id).filter(|id| *id != frame_id) {
+                if let Some(frame) = self.frame_timers.get(&previous) { frame.cancel.cancel(); }
+            }
+        }
+        let previous = self.frame_timers.get(&frame_id).and_then(|frame| frame.context_id);
+        if previous != context_id {
+            if let Some(previous) = previous.filter(|id|
+                self.frame_contexts.get(id).is_some_and(|context| context.owner.is_none()))
+            {
+                self.frame_contexts.remove(&previous);
+            }
+        }
+        let frame = self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
+            owner: None, cancel: CancelHandle::new_rc(), context_id,
+        });
+        frame.owner = Some((Rc::downgrade(parent), node, generation));
+        frame.context_id = context_id;
+    }
+
+    fn allocate_frame_context(&mut self, context: FrameContext) -> Option<u32> {
+        let Some(id) = self.last_frame_context.checked_add(1) else {
+            tracing::error!("frame context id space exhausted");
+            return None;
+        };
+        self.last_frame_context = id;
+        if context.owner.is_some() {
+            if let Some(parent) = context.parent {
+                self.frame_context_children.entry(parent).or_default().push(id);
+            }
+        }
+        self.frame_contexts.insert(id, context);
+        Some(id)
+    }
+
+    fn context_for_frame(&self, frame_id: u32) -> Option<u32> {
+        if frame_id == 0 { return Some(0); }
+        self.frame_timers.get(&frame_id).and_then(|frame| frame.context_id)
+    }
+
+    fn connect_frame_context(&mut self, parent: &SharedState, node: NodeId) -> Option<u32> {
+        let state = parent.borrow();
+        if state.frame_id != 0 && self.frame_timers_active(state.frame_id) != Some(true) {
+            return None;
+        }
+        let dom = state.dom.as_ref()?;
+        if !dom.is_connected(node) || !dom.with_node(node, |node|
+            node.as_element().is_some_and(|tag| tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                && matches!(tag.local.as_ref(), "iframe" | "frame"))).unwrap_or(false)
+        {
+            return None;
+        }
+        let key = (Rc::as_ptr(parent), node, state.document_generation);
+        if let Some(id) = self.frame_context_owners.get(&key) { return Some(*id); }
+        let parent_context = self.context_for_frame(state.frame_id)?;
+        let name = dom.with_node(node, |node|
+            node.get_attribute("name").unwrap_or("").to_owned()).unwrap_or_default();
+        let id = self.allocate_frame_context(FrameContext {
+            owner: Some((Rc::downgrade(parent), node, state.document_generation)),
+            parent: Some(parent_context), frame_id: None, name,
+        })?;
+        self.frame_context_owners.insert(key, id);
+        Some(id)
+    }
+
+    pub(crate) fn connect_document_frames(&mut self, parent: &SharedState) {
+        let nodes = {
+            let parent = parent.borrow();
+            let Some(dom) = &parent.dom else { return };
+            match dom.query_selector_all("iframe,frame") {
+                Ok(nodes) => nodes,
+                Err(error) => {
+                    tracing::error!(%error, "cannot enumerate parsed frame owners");
+                    return;
+                }
+            }
+        };
+        for node in nodes { self.connect_frame_context(parent, node); }
+    }
+
+    fn frame_context_active(&self, mut id: u32) -> Option<bool> {
+        for _ in 0..=self.frame_contexts.len() {
+            if id == 0 { return Some(true); }
+            let Some(context) = self.frame_contexts.get(&id) else { return Some(false) };
+            if let Some((parent, node, generation)) = &context.owner {
+                let Some(parent) = parent.upgrade() else { return Some(false) };
+                let parent = parent.try_borrow().ok()?;
+                if parent.document_generation != *generation
+                    || !parent.dom.as_ref().is_some_and(|dom| dom.is_connected(*node))
+                {
+                    return Some(false);
+                }
+                return if parent.frame_id == 0 { Some(true) }
+                    else { self.frame_timers_active(parent.frame_id) };
+            }
+            match context.frame_id.and_then(|frame| self.frame_timers_active(frame)) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None if context.frame_id.is_some() => return None,
+                None => return Some(false),
+            }
+            let Some(parent) = context.parent else { return Some(false) };
+            id = parent;
+        }
+        Some(false)
+    }
+
+    fn retire_frame(&mut self, frame_id: u32) {
+        self.cancel_frame_timers(frame_id);
+        if let Some(context) = self.context_for_frame(frame_id)
+            .and_then(|id| self.frame_contexts.get_mut(&id))
+        {
+            if context.frame_id == Some(frame_id) { context.frame_id = None; }
+        }
+        self.prune_frame_contexts();
+    }
+
+    fn retire_frame_contexts(&mut self, ids: &std::collections::HashSet<u32>) {
+        for id in ids {
+            if let Some(context) = self.frame_contexts.remove(id) {
+                if let Some(frame) = context.frame_id.and_then(|id| self.frame_timers.get(&id)) {
+                    frame.cancel.cancel();
+                }
+                if let Some((owner, node, generation)) = context.owner {
+                    self.frame_context_owners.remove(&(owner.as_ptr(), node, generation));
+                }
+                self.frame_context_children.remove(id);
+            }
+        }
+        for children in self.frame_context_children.values_mut() {
+            children.retain(|id| !ids.contains(id));
+        }
+    }
+
+    pub(crate) fn prune_frame_contexts(&mut self) {
+        let retired = self.frame_contexts.keys().copied()
+            .filter(|id| self.frame_context_active(*id) == Some(false)).collect();
+        self.retire_frame_contexts(&retired);
     }
 
     pub(crate) fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
@@ -1325,9 +1484,9 @@ impl RealmStates {
     }
 
     fn frames_removed_by(&self, shared: &SharedState, cmd: &str, arg1: &str, arg2: &str)
-        -> Vec<(u32, u32)>
+        -> Vec<(u32, u32, u32)>
     {
-        if self.frame_timers.is_empty() { return Vec::new(); }
+        if self.frame_contexts.is_empty() { return Vec::new(); }
         let (root, inclusive) = match cmd {
             "append_child" => (arg2, true),
             "insert_before" | "remove_child" => (arg1, true),
@@ -1339,13 +1498,13 @@ impl RealmStates {
         let root = NodeId::new(root);
         let state = shared.borrow();
         let Some(dom) = &state.dom else { return Vec::new() };
+        if inclusive && !dom.is_connected(root) { return Vec::new(); }
         let mut removed = Vec::new();
-        // ponytail: scan the bounded live-frame registry only on structural
-        // mutations; index owners by document if frame-heavy profiling warrants it.
-        for (id, timers) in &self.frame_timers {
-            let Some((parent, node, generation)) = &timers.owner else { continue };
+        // Only structural mutations inspect the bounded live-frame registry.
+        for (id, context) in &self.frame_contexts {
+            let Some((parent, node, generation)) = &context.owner else { continue };
             if parent.as_ptr() != Rc::as_ptr(shared) || *generation != state.document_generation
-                || timers.cancel.is_canceled() || !dom.is_connected(*node)
+                || self.frame_context_active(*id) != Some(true)
             {
                 continue;
             }
@@ -1353,7 +1512,7 @@ impl RealmStates {
             for _ in 0..=dom.len() {
                 let Some(current_node) = current else { break };
                 if current_node == root && (inclusive || current_node != *node) {
-                    removed.push((*id, node.index() as u32));
+                    removed.push((*id, context.frame_id.unwrap_or(0), node.index() as u32));
                     break;
                 }
                 current = dom.with_node(current_node, |node| node.parent).flatten()
@@ -2307,20 +2466,20 @@ fn op_dom(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
-            if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            if let Ok(id) = arg1.parse::<u32>() { registry.borrow_mut().retire_frame(id); }
             return "true".into();
         }
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
         let result = op_dom_inner(shared, cmd, arg1, arg2);
         if result == "true" && !removed.is_empty() {
-            let registry = registry.borrow();
-            for (id, _) in &removed {
-                if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
-            }
+            let mut registry = registry.borrow_mut();
+            registry.retire_frame_contexts(&removed.iter().map(|(id, _, _)| *id).collect());
             registry.cancel_inactive_frame_timers();
+            registry.prune_frame_contexts();
             // The bootstrap unwraps this private mutation result before any
             // DOM caller sees it, and resets only the retired iframe identities.
-            serde_json::json!({"__obscuraFrameRetirements":removed,"result":result}).to_string()
+            let retired: Vec<_> = removed.into_iter().map(|(_, frame, node)| (frame, node)).collect();
+            serde_json::json!({"__obscuraFrameRetirements":retired,"result":result}).to_string()
         } else {
             result
         }
@@ -6937,6 +7096,8 @@ fn op_post_frame_message(
             .unwrap_or_else(|_| "null".to_string())
     });
     drop(source);
+    let source_context_id = state.borrow::<Rc<RefCell<RealmStates>>>().borrow()
+        .context_for_frame(source_frame_id);
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     let over_entries = gs.pending_frame_messages.len() >= frame_message_queue_entry_limit();
@@ -6959,6 +7120,7 @@ fn op_post_frame_message(
     gs.pending_frame_messages.push(PendingFrameMessage {
         target_frame_id,
         source_frame_id,
+        source_context_id,
         origin,
         target_origin: target_origin.to_string(),
         data_json: data_json.to_string(),
@@ -7311,8 +7473,8 @@ fn op_initial_frame(
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
-        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
         registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
+        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         let receiver = v8::undefined(scope);
@@ -8426,78 +8588,100 @@ fn op_frame_preload_scripts(state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_frame_parent(state: &OpState, target_frame_id: u32) -> u32 {
-    if target_frame_id == 0 {
-        return 0;
-    }
-    frame_state(state, target_frame_id).borrow().parent_frame_id
+fn op_connect_frame(state: &OpState, parent_frame_id: u32, node_id: u32) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parent = if parent_frame_id == 0 { Some(state.borrow::<SharedState>().clone()) }
+            else { state.borrow::<Rc<RefCell<RealmStates>>>().borrow().by_frame_id(parent_frame_id) };
+        let id = parent.and_then(|parent|
+            state.borrow::<Rc<RefCell<RealmStates>>>().borrow_mut()
+                .connect_frame_context(&parent, NodeId::new(node_id)));
+        if id.is_none() {
+            tracing::warn!(parent_frame_id, node_id, "rejecting inactive frame owner");
+        }
+        id.map_or(-1.0, f64::from)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_connect_frame panicked");
+        -1.0
+    })
+}
+
+#[op2(fast)]
+fn op_frame_context(state: &OpState, frame_id: u32) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.borrow::<Rc<RefCell<RealmStates>>>().borrow()
+            .context_for_frame(frame_id).map_or(-1.0, f64::from)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_context panicked");
+        -1.0
+    })
+}
+
+// Relations: child count, parent, indexed/named child, liveness, realm, local owner.
+#[op2(fast)]
+fn op_frame_relation(
+    state: &OpState, context_id: u32, relation: u32, index: u32, #[string] name: &str,
+) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let active = registry.frame_context_active(context_id) == Some(true);
+        if relation == 4 { return if active { 1.0 } else { 0.0 }; }
+        if !active { return if relation == 0 { 0.0 } else { -1.0 }; }
+        if relation == 1 {
+            return if context_id == 0 { 0.0 } else {
+                registry.frame_contexts.get(&context_id).and_then(|context| context.parent)
+                    .map_or(-1.0, f64::from)
+            };
+        }
+        if relation == 5 {
+            return if context_id == 0 { 0.0 } else {
+                registry.frame_contexts.get(&context_id).and_then(|context| context.frame_id)
+                    .filter(|id| registry.frame_timers_active(*id) == Some(true))
+                    .map_or(-1.0, f64::from)
+            };
+        }
+        if relation == 6 {
+            let Some((owner, node, generation)) = registry.frame_contexts.get(&context_id)
+                .and_then(|context| context.owner.as_ref()) else { return -1.0 };
+            let caller = if index == 0 { Some(state.borrow::<SharedState>().clone()) }
+                else { registry.by_frame_id(index) };
+            return caller.filter(|caller| owner.as_ptr() == Rc::as_ptr(caller)
+                && caller.borrow().document_generation == *generation)
+                .map_or(-1.0, |_| node.index() as f64);
+        }
+        let mut children = registry.frame_context_children.get(&context_id).into_iter().flatten()
+            .copied().filter(|id| registry.frame_context_active(*id) == Some(true));
+        match relation {
+            0 => children.count() as f64,
+            2 => children.skip(index as usize).next().map_or(-1.0, f64::from),
+            3 if !name.is_empty() => children.find(|id| {
+                let context = &registry.frame_contexts[id];
+                if context.name != name { return false; }
+                let Some((owner, node, _)) = &context.owner else { return false };
+                owner.upgrade().is_some_and(|owner|
+                    owner.borrow().dom.as_ref().is_some_and(|dom|
+                        dom.with_node(*node, |node| node.get_attribute("name") == Some(name))
+                            .unwrap_or(false)))
+            }).map_or(-1.0, f64::from),
+            _ => -1.0,
+        }
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_relation panicked");
+        -1.0
+    })
 }
 
 #[op2]
 #[string]
-fn op_frame_children(state: &OpState, target_frame_id: u32) -> String {
+fn op_frame_name(state: &OpState, context_id: u32, #[string] value: Option<String>) -> String {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
-        let target_state = frame_state(state, target_frame_id);
-        let target = target_state.borrow();
-        let generation = target.document_generation;
-        let mut children: Vec<(u32, String)> = Vec::new();
-        let reg = registry.borrow();
-
-        let matching_entries: Vec<u32> = reg
-            .entries
-            .iter()
-            .filter(|(_, id, child_state)| {
-                *id != target_frame_id && child_state.borrow().parent_frame_id == target_frame_id
-            })
-            .map(|(_, id, _)| *id)
-            .collect();
-
-        if let Some(dom) = target.dom.as_ref() {
-            let mut frame_index = 0;
-            for node_id in dom.descendants(dom.document()) {
-                let is_frame = dom.with_node(node_id, |node| {
-                    node.as_element().is_some_and(|tag| {
-                        tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-                            && (tag.local.as_ref() == "iframe" || tag.local.as_ref() == "frame")
-                    })
-                }).unwrap_or(false);
-                if !is_frame {
-                    continue;
-                }
-                let name = dom.with_node(node_id, |node| {
-                    node.get_attribute("name")
-                        .or_else(|| node.get_attribute_ns("", "name"))
-                        .or_else(|| node.get_attribute("id"))
-                        .or_else(|| node.get_attribute_ns("", "id"))
-                        .map(str::to_owned)
-                }).flatten().unwrap_or_default();
-                let child_id = reg.child_frame_for_node(&target_state, node_id)
-                    .or_else(|| {
-                        reg.frame_timers.iter().find_map(|(&id, timers)| {
-                            let (owner, owner_node, owner_generation) = timers.owner.as_ref()?;
-                            (owner.as_ptr() == std::rc::Rc::as_ptr(&target_state)
-                                && *owner_node == node_id
-                                && *owner_generation == generation)
-                                .then_some(id)
-                        })
-                    })
-                    .or_else(|| matching_entries.get(frame_index).copied());
-                frame_index += 1;
-                if let Some(child_id) = child_id {
-                    children.push((child_id, name));
-                }
-            }
-        }
-
-        if children.is_empty() {
-            for id in matching_entries {
-                children.push((id, String::new()));
-            }
-        }
-
-        serde_json::to_string(&children).unwrap_or_else(|_| "[]".to_string())
-    })).unwrap_or_else(|_| "[]".to_string())
+        let mut registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow_mut();
+        let Some(context) = registry.frame_contexts.get_mut(&context_id) else { return String::new() };
+        if let Some(value) = value { context.name = value; }
+        context.name.clone()
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_name panicked");
+        String::new()
+    })
 }
 
 pub fn build_extension() -> Extension {
@@ -8536,8 +8720,10 @@ pub fn build_extension() -> Extension {
         op_history_traverse(),
         op_frame_document_ready(),
         op_initial_frame(),
-        op_frame_parent(),
-        op_frame_children(),
+        op_connect_frame(),
+        op_frame_context(),
+        op_frame_relation(),
+        op_frame_name(),
         op_document_realm_member(),
         op_register_document_realm(),
         op_post_frame_message(),

@@ -1419,8 +1419,9 @@ impl Page {
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
                 let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
+                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin}, {});",
                     message.source_frame_id,
+                    message.source_context_id.map_or(-1i64, i64::from),
                 );
                 if let Err(error) = js.execute_script("<frame-message>", &script) {
                     tracing::debug!("message to the page failed: {error}");
@@ -1438,13 +1439,7 @@ impl Page {
                 continue;
             };
             let Some(js) = self.js.as_mut() else { continue };
-            if let Err(error) = self.frames[index].deliver_message(
-                js,
-                &message.data_json,
-                &message.origin,
-                message.source_frame_id,
-                &message.target_origin,
-            ) {
+            if let Err(error) = self.frames[index].deliver_queued_message(js, &message) {
                 tracing::debug!("message to frame {} failed: {error}", message.target_frame_id);
             }
         }
@@ -1462,7 +1457,8 @@ impl Page {
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
                globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
-               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
+               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin &&\
+                   !globalThis.__obscura_frameElements[{frame_id}]._iframeOpaque)\
                  globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
              }}\
              delete globalThis.__obscura_frameObjects[{frame_id}];\

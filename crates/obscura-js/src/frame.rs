@@ -211,6 +211,22 @@ impl FrameRealm {
         )
     }
 
+    /// Delivers a queued message without losing a retired sender's Window identity.
+    pub fn deliver_queued_message(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        message: &crate::ops::PendingFrameMessage,
+    ) -> Result<(), String> {
+        self.execute_script(parent, &format!(
+            "globalThis.__obscura_deliverMessage({}, {}, {}, {}, {});",
+            encode_json_argument(&message.data_json),
+            encode_json_argument(&message.origin),
+            message.source_frame_id,
+            encode_json_argument(&message.target_origin),
+            message.source_context_id.map_or(-1i64, i64::from),
+        ))
+    }
+
     pub fn frame_id(&self) -> u32 {
         self.frame_id
     }
@@ -807,7 +823,7 @@ mod tests {
             __obscura_deliverMessage('{"v":"grandchild"}', 'https://parent.example', 2, '*');
             sourceParent.postMessage('reply', '*');
         "#).unwrap();
-        assert_eq!(parent.evaluate("[sourceParent !== window, sourceParent.document === undefined]").unwrap(),
+        assert_eq!(parent.evaluate("[sourceParent !== window, (() => { try { sourceParent.document; return false; } catch (e) { return e.name === 'SecurityError'; } })()]").unwrap(),
             serde_json::json!([true, true]));
         let messages = parent.take_pending_frame_messages();
         assert_eq!(messages.iter().map(|message| (
@@ -1935,7 +1951,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cross_origin_child_frame_sees_parent_frames_and_named_siblings() {
+    async fn parsed_frame_metadata_exists_without_eager_realms_or_started_loads() {
+        let mut parent = page("https://parent.example/",
+            "<html><body><iframe name='a' src='https://other.example/a'></iframe>\
+             <iframe name='b' src='https://other.example/b'></iframe></body></html>");
+        assert_eq!(parent.evaluate("frames.length").unwrap().as_f64(), Some(2.0));
+        assert_eq!(parent.realm_states().borrow().live_count(), 0);
+        assert!(parent.take_pending_frames().is_empty());
+        assert_eq!(parent.evaluate(
+            "[frames.a === frames[0], frames.b === frames[1], frames[0] !== frames[1]]"
+        ).unwrap(), serde_json::json!([true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unowned_frame_realms_do_not_alias_connected_frame_owners() {
         let mut parent = page(
             "https://parent.example/",
             "<html><body>\
@@ -1943,6 +1972,7 @@ mod tests {
                 <iframe name=\"b\" src=\"https://other.example/b\"></iframe>\
             </body></html>",
         );
+        parent.evaluate_script("__obscura_init_frames();").unwrap();
         let frame_a = FrameRealm::new(
             &mut parent,
             1,
@@ -1965,13 +1995,14 @@ mod tests {
                 parent.frames[0] === window,
                 parent.frames[1] === window,
                 typeof parent.frames.b,
+                parent.frames.a !== window,
                 parent.frames.b !== window,
                 parent.parent === parent,
                 parent.top === parent,
             ]
         "#).unwrap();
         assert_eq!(result_a, serde_json::json!([
-            2, 2, true, false, "object", true, true, true
+            2, 2, false, false, "object", true, true, true, true
         ]));
 
         let result_b = frame_b.evaluate(&mut parent, r#"
@@ -1985,48 +2016,15 @@ mod tests {
             ]
         "#).unwrap();
         assert_eq!(result_b, serde_json::json!([
-            2, 2, false, true, true, "object"
+            2, 2, false, false, false, "object"
         ]));
 
         frame_a.execute_script(&mut parent, r#"
             parent.frames.b.postMessage('hello from a', '*');
         "#).unwrap();
-        let mut messages = parent.take_pending_frame_messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].target_frame_id, 2);
-        assert_eq!(messages[0].source_frame_id, 1);
+        assert!(parent.take_pending_frame_messages().is_empty(),
+            "an unowned realm must not receive a pending owner's message");
 
-        let message = messages.pop().unwrap();
-        frame_b.execute_script(&mut parent, r#"
-            globalThis.received = [];
-            addEventListener('message', event => {
-                received.push({
-                    data: event.data,
-                    sourceIsA: event.source === parent.frames[0],
-                });
-                event.source.postMessage('reply from b', '*');
-            });
-        "#).unwrap();
-        frame_b.deliver_message(
-            &mut parent,
-            &message.data_json,
-            &message.origin,
-            message.source_frame_id,
-            &message.target_origin,
-        ).unwrap();
-
-        let received = frame_b.evaluate(&mut parent, "globalThis.received").unwrap();
-        assert_eq!(received, serde_json::json!([{
-            "data": "hello from a",
-            "sourceIsA": true,
-        }]));
-
-        let replies = parent.take_pending_frame_messages();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].target_frame_id, 1);
-        assert_eq!(replies[0].source_frame_id, 2);
-
-        // Grandchild frame C inside frame A (parent_frame_id: 1)
         let frame_c = FrameRealm::new(
             &mut parent,
             3,
@@ -2038,8 +2036,9 @@ mod tests {
             [
                 parent.parent === top,
                 parent.parent.frames.length,
+                parent.parent.frames.a === parent,
             ]
         "#).unwrap();
-        assert_eq!(result_c, serde_json::json!([true, 2]));
+        assert_eq!(result_c, serde_json::json!([true, 2, false]));
     }
 }

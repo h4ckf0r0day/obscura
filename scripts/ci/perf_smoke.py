@@ -129,6 +129,18 @@ SCENARIOS = {
         "(() => {document.body.innerHTML='<form id=f></form><input id=input form=f>'+'<div id=extra></div>'.repeat(1000);const input=document.getElementById('input');let n=0;for(let i=0;i<10000;i++){input.className='state'+i;n+=typeof input.form==='object';}return n})()",
         10000,
     ),
+    "frame-content-window-hot": (
+        "(() => {const e=document.createElement('iframe');document.body.appendChild(e);const w=e.contentWindow;let n=0;for(let i=0;i<50000;i++)n+=e.contentWindow===w;return n})()",
+        50000,
+    ),
+    "frame-indexed-root-hot": (
+        "(() => {document.body.innerHTML='<iframe></iframe>'.repeat(3);const w=frames[0];let n=0;for(let i=0;i<10000;i++)n+=frames[0]===w;return n})()",
+        10000,
+    ),
+    "frame-live-owner-dom-build": (
+        "(() => {document.body.innerHTML='<iframe></iframe>'.repeat(16);for(let i=0;i<5000;i++)document.body.appendChild(document.createElement('div'));return document.querySelectorAll('div').length+frames.length})()",
+        5016,
+    ),
 }
 SCENARIOS.update({
     f"html-parse-depth-{depth}": (
@@ -139,6 +151,17 @@ SCENARIOS.update({
         depth * 60,
     )
     for depth in (4, 32, 128, 300)
+})
+SCENARIOS.update({
+    f"frame-length-{count}-dom-{padding}": (
+        "(() => {document.body.innerHTML='<div></div>'.repeat(" + str(padding)
+        + ")+'<iframe></iframe>'.repeat(" + str(count)
+        + ");let n=0;for(let i=0;i<" + str(iterations)
+        + ";i++)n+=frames.length;return n})()",
+        count * iterations,
+    )
+    for count, iterations, padding in ((0, 100000, 0), (3, 10000, 0),
+                                       (32, 10000, 0), (3, 1000, 2500))
 })
 
 
