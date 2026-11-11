@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Obscura live view</title>
+<style>
+  :root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
+  body { margin: 0; background: #151515; color: #eee; }
+  header { display: flex; gap: 16px; align-items: center; padding: 12px 16px; border-bottom: 1px solid #444; }
+  #address { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button { padding: 6px 12px; cursor: pointer; }
+  #status { margin: 12px 16px; color: #ccc; }
+  img { display: block; max-width: 100%; height: auto; margin: auto; }
+  [hidden] { display: none; }
+</style>
+<header>
+  <strong>Obscura</strong>
+  <span id="address">Waiting for the agent</span>
+  <button id="pause" type="button" aria-pressed="false">Pause</button>
+</header>
+<p id="status" role="status">Read-only view of the active MCP tab.</p>
+<img id="frame" alt="Page rendered by Obscura" hidden>
+<script>
+  const address = document.getElementById('address');
+  const status = document.getElementById('status');
+  const frame = document.getElementById('frame');
+  const pause = document.getElementById('pause');
+  const language = navigator.language.toLowerCase().startsWith('es') ? 'es' : 'en';
+  const messages = {
+    en: { waiting: 'Waiting for the agent', pause: 'Pause', resume: 'Resume', readOnly: 'Read-only view of the active MCP tab.', live: 'Read-only · Live', empty: 'No open tabs. Navigate using your agent.', busy: 'Waiting for the current MCP action to finish.', reconnecting: 'Reconnecting…', image: 'Page rendered by Obscura' },
+    es: { waiting: 'Esperando al agente', pause: 'Pausar', resume: 'Reanudar', readOnly: 'Vista de solo lectura de la pestaña MCP activa.', live: 'Solo lectura · En vivo', empty: 'No hay pestañas abiertas. Navega con tu agente.', busy: 'Esperando a que termine la acción MCP actual.', reconnecting: 'Reconectando…', image: 'Página renderizada por Obscura' },
+  }[language];
+  document.documentElement.lang = language;
+  address.textContent = messages.waiting;
+  status.textContent = messages.readOnly;
+  frame.alt = messages.image;
+  pause.textContent = messages.pause;
+  let isPaused = false;
+  pause.addEventListener('click', () => {
+    isPaused = !isPaused;
+    pause.textContent = isPaused ? messages.resume : messages.pause;
+    pause.setAttribute('aria-pressed', String(isPaused));
+  });
+  async function refresh() {
+    if (!isPaused && !document.hidden) {
+      try {
+        const response = await fetch('frame', { cache: 'no-store', signal: AbortSignal.timeout(12000) });
+        if (!response.ok) throw new Error(messages.busy);
+        const current = await response.json();
+        address.textContent = current.url || messages.waiting;
+        address.title = current.url || '';
+        frame.hidden = !current.image;
+        if (current.image) frame.src = 'data:image/png;base64,' + current.image;
+        else frame.removeAttribute('src');
+        status.textContent = current.tabId ? current.tabId + ' · ' + messages.live : messages.empty;
+      } catch (error) {
+        status.textContent = messages.reconnecting;
+      }
+    }
+    setTimeout(refresh, 500);
+  }
+  refresh();
+</script>
+</html>

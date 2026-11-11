@@ -1,5 +1,41 @@
 # Watch agent sessions live
 
+## Watch the active MCP page
+
+With a render-enabled build, start the stdio server with:
+
+```sh
+obscura mcp --headed
+```
+
+Open the `Obscura viewer:` URL printed on stderr, or call `browser_viewer`
+through MCP to retrieve it. It displays PNG frames from the active tab in that
+same MCP process, including navigation, scrolling, and agent interactions.
+This is a read-only browser-based viewer, not a native desktop window. It does
+not launch Chrome or another browser automatically.
+
+Each process chooses its own available loopback port. `--viewer-port 8080`
+selects a fixed port; `--viewer-ready-file /tmp/session.url` creates a file
+containing the URL. The file must not already exist and is removed on graceful
+stdio EOF. After a forced termination, remove a stale ready file before reusing
+that path.
+
+The viewer polls at most twice a second per visible tab. Pause stops polling,
+and hidden tabs stop requesting frames. Captures happen only on request, on
+the MCP page's owning thread; ordinary MCP mode starts no listener or capture
+timer. Long MCP operations may delay a frame until the operation finishes.
+Viewer requests cannot navigate, click, evaluate scripts, or change viewport.
+
+The listener binds to `127.0.0.1`, requires its random per-process URL path,
+checks Host and Origin, disables caching, and bounds connections and queued
+frame requests. The viewer closes when the MCP process exits. `--headed` is
+currently stdio-only, conflicts with `--http`, and requires rendering.
+
+Run the self-contained [counter reproduction](../render-repros/headed/README.md)
+to verify clicks, tab changes, discovery, and shutdown without an external site.
+
+## Watch a CDP session
+
 Capture frames through the same CDP connection that drives the page. Separate
 browser connections have their own targets; opening another connection does
 not let a viewer attach to an existing agent session. CLI `fetch` and stdio MCP
@@ -104,8 +140,8 @@ connection. Handle `Page.screencastFrame`, acknowledge each frame with
 [Playwright](Use-with-Playwright.md#screencasting) examples. Frames are emitted
 when the page changes, rather than at a fixed rate.
 
-MCP offers `browser_screenshot` for individual captures. It does not expose a
-CDP endpoint for a separate viewer to attach to.
+MCP offers `browser_screenshot` for individual captures and `--headed` for its
+own local viewer. It does not expose a CDP endpoint for attaching to that session.
 
 ## Verify the viewer
 

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Headed MCP reproduction</title>
+<style>
+  body { margin: 0; padding: 32px; background: #f3efe7; color: #272520; font: 20px system-ui; }
+  button { font: inherit; padding: 12px 20px; width: 180px; height: 56px; }
+  #color { width: 160px; height: 120px; margin-top: 24px; background: #b83535; }
+</style>
+<h1>Same-session counter</h1>
+<button id="counter" type="button">Count: 0</button>
+<div id="color"></div>
+<script>
+  let count = 0;
+  document.getElementById('counter').onclick = function () {
+    count += 1;
+    this.textContent = 'Count: ' + count;
+    document.getElementById('color').style.background = count % 2 ? '#287e47' : '#b83535';
+  };
+</script>
+</html>

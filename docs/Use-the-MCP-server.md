@@ -20,6 +20,13 @@ Stdio (default, for direct client integration):
 obscura mcp
 ```
 
+To observe this same session, use `obscura mcp --headed` and open the URL printed
+on stderr. The render-only `browser_viewer` tool returns that URL to the agent.
+The viewer is read-only and follows the active tab; see
+[Watch agent sessions live](Watch-agent-sessions-live.md) for port selection,
+ready files, limitations, and a minimal reproduction. Each process chooses an
+available port, so multiple agents can run independent viewers.
+
 HTTP (for remote or shared use):
 
 ```bash
@@ -117,6 +124,8 @@ Visual output (render-enabled builds):
 
 - `browser_screenshot`: current viewport as an MCP `image/png` content block.
 - `browser_pdf`: current page as an embedded `application/pdf` resource.
+- `browser_viewer`: URL of this session's local viewer, or an error if `--headed`
+  was not enabled at startup. This tool does not start a second browser session.
 
 `browser_screenshot` accepts optional positive `width` and `height` values in
 CSS pixels and enforces a bounded capture size. `browser_pdf` accepts
@@ -155,8 +164,9 @@ listing invalidates the previous tokens. A reference targets the original
 native element, not a replacement or clone that copies its attributes; stale
 references return a tool error instead of acting on a different element.
 
-MCP exposes still-image and PDF output. It does not stream video frames; use
-CDP `Page.startScreencast` for activity-driven screencasting.
+MCP tool responses expose still-image and PDF output. The optional `--headed`
+viewer polls the same page outside the MCP transport; use CDP
+`Page.startScreencast` for activity-driven screencasting of CDP-owned pages.
 
 ## Web search (optional)
 
