@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>PDF block break avoidance</title>
+<style>
+  body { margin: 0; font: 16px Arial; }
+  .spacer { height: 1000px; background: #eee; }
+  .summary { break-inside: avoid; page-break-inside: avoid; border: 2px solid #333; padding: 8px; }
+  h4 { margin: 0; }
+</style>
+<div class="spacer">spacer</div>
+<div class="summary">
+  <h4>Keep this box on one page</h4>
+  <div>row 1</div><div>row 2</div><div>row 3</div><div>row 4</div>
+  <div>row 5</div><div>row 6</div><div>row 7</div><div>row 8</div>
+  <div>row 9</div><div>row 10</div><div>row 11</div><div>row 12</div>
+</div>
+</html>

@@ -723,6 +723,7 @@ impl ObscuraState {
         {
             let (reduce, dark) = parent.media_preferences.get();
             self.render_media = self.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+            self.render_resource_limiter = parent.render_resource_limiter.clone();
         }
         self.cookie_jar = parent.cookie_jar.clone();
         // A frame shares its page's Web Storage Arcs. The ops key by the frame
@@ -3426,6 +3427,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             dom.set_quirks(false);
             *gs.write_stream.borrow_mut() = Some(DocumentWriteStream::new(true));
             gs.document_write_inserted_script.set(false);
+            // document.open reuses the global/Document, but its old parser
+            // images no longer delay load or occupy resource permits.
+            drop(gs);
+            #[cfg(feature = "render")]
+            shared.borrow_mut().render_image_in_flight.clear();
             "true".into()
         }
         "set_text_content" => {
@@ -9409,9 +9415,12 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let gs = shared.borrow();
+    if gs.frame_id != frame_id {
+        return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+    }
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
         dom.get_node(node_id).is_some_and(|node| {
@@ -9495,10 +9504,19 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
-    let shared = {
+async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id: u32) -> String {
+    let (shared, frame_cancel) = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        let shared = frame_state(&state, frame_id);
+        if shared.borrow().frame_id != frame_id {
+            return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
+        }
+        let cancel = if frame_id == 0 { None } else {
+            let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+            registry.cancel_inactive_frame_timers();
+            registry.frame_timers.get(&frame_id).map(|timers| timers.cancel.clone())
+        };
+        (shared, cancel)
     };
     let node_id = NodeId::new(nid);
     let (
@@ -9509,6 +9527,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         http_client,
         callbacks,
         page_in_flight,
+        limiter,
         blocked,
     ) = {
         let gs = shared.borrow();
@@ -9534,6 +9553,11 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        if let Some(origin) = gs.inherited_origin.as_deref() {
+            // about:blank/srcdoc inherit an effective origin, independently
+            // of their URL/referrer. An opaque inherited origin stays opaque.
+            request.initiator = url::Url::parse(origin).ok();
+        }
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;
@@ -9556,6 +9580,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             gs.http_client.clone(),
             gs.callbacks.clone(),
             Arc::clone(&gs.page_in_flight),
+            Arc::clone(&gs.render_resource_limiter),
             blocked,
         )
     };
@@ -9585,8 +9610,15 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             (None, Some(cancel_rx))
         }
     };
+    let cancelled = || serde_json::json!({
+        "state": "error", "ok": false, "currentSrc": selected_url,
+    }).to_string();
     if let Some(receiver) = follower {
-        let _ = receiver.await;
+        let finished = match frame_cancel {
+            Some(cancel) => receiver.or_cancel(cancel).await.is_ok_and(|result| result.is_ok()),
+            None => receiver.await.is_ok(),
+        };
+        if !finished { return cancelled(); }
         return finish_async_image_metadata(
             &shared,
             node_id,
@@ -9610,6 +9642,9 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     let fetch = async { if blocked || parsed_url.is_none() {
         None
     } else {
+        // Share the page's existing resource budget. Acquiring inside this
+        // future lets document replacement cancel queued requests as well.
+        let _permit = limiter.acquire_owned().await.ok()?;
         let parsed_url = parsed_url.as_ref().unwrap();
         #[cfg(feature = "stealth")]
         {
@@ -9645,9 +9680,21 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .ok()
         }
     } };
+    let fetch = async {
+        match frame_cancel {
+            Some(cancel) => fetch.or_cancel(cancel).await,
+            None => Ok(fetch.await),
+        }
+    };
     let response = tokio::select! {
-        response = fetch => response,
-        _ = cancel_rx => None,
+        biased;
+        // A replacement may already own this URL key. Cancellation must not
+        // seed its cache or remove its entry, even if the old fetch is ready.
+        _ = cancel_rx => return cancelled(),
+        response = fetch => match response {
+            Ok(response) => response,
+            Err(_) => return cancelled(),
+        },
     };
     let bytes = response.and_then(|response| {
         (200..300)

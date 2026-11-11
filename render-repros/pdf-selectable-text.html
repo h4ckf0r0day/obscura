@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PDF shaped text and raster fallback</title>
+<style>
+  body { margin: 16px; font: 20px Arial; color: #111; }
+  h1 { margin: 0 0 12px; }
+  p { margin: 12px 0; }
+  .shaped { font-family: system-ui; }
+  .wrapped { width: 180px; }
+  .clipped { width: 170px; height: 24px; overflow: hidden; white-space: nowrap; }
+  .fallback { color: blue; text-decoration: underline; }
+  .after { margin-top: -10px; color: red; }
+  .print-only { display: none; }
+  @media print { .print-only { display: block; } }
+</style>
+<h1>Hello</h1>
+<p id="currency">RM 6,000.00</p>
+<p class="shaped">office affinity ffi q̈ é Ελληνικά Кириллица</p>
+<p class="shaped" dir="rtl">مرحبا بالعالم 123.45 שלום</p>
+<p>Latin with fallback: مرحبا Ελληνικά</p>
+<p class="wrapped">Soft wrapping must keep every word once across several visual lines.</p>
+<p class="clipped">Clipped heading stays selectable beyond this rectangle.</p>
+<img width="40" height="40" alt="Raster image" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGO4YKDwH4QZoIAJxiBeAAAOAwRFe7UuagAAAABJRU5ErkJggg==">
+<p>Vector before</p>
+<p class="fallback">Raster underline</p>
+<p class="after">Vector after</p>
+<p class="shaped" style="font-style:italic">Synthetic italic fallback</p>
+<p style="transform:rotate(2deg)">Rotated raster fallback</p>
+<p class="print-only">Print media text</p>
