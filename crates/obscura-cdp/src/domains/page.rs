@@ -874,6 +874,49 @@ fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
                 .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
 }
 
+pub(crate) fn emit_navigation_commit(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    page_url: &str,
+    page_id: &str,
+    mime: &str,
+) {
+    ctx.current_loader_ids.insert(page_id.to_string(), loader_id.to_string());
+    ctx.nav_events_emitted.insert(page_id.to_string());
+    let ts = timestamp();
+    let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
+    let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.lifecycleEvent".into(),
+        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+        session_id: session_id.clone(),
+    });
+    for runtime_session in &runtime_sessions {
+        ctx.pending_events.push(CdpEvent::with_session(
+            "Runtime.executionContextsCleared", json!({}), runtime_session.clone(),
+        ));
+    }
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.frameNavigated".into(),
+        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, mime), "type": "Navigation"}),
+        session_id: session_id.clone(),
+    });
+    for runtime_session in runtime_sessions {
+        for context in &contexts {
+            ctx.pending_events.push(super::runtime::execution_context_created_event(
+                context, Some(runtime_session.clone()),
+            ));
+        }
+    }
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.lifecycleEvent".into(),
+        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}),
+        session_id: session_id.clone(),
+    });
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -888,6 +931,22 @@ pub fn emit_navigation_events(
     network_events: &[obscura_browser::NetworkEvent],
     wait_until: WaitUntil,
     reached_network_idle: bool,
+) {
+    emit_navigation_events_with_commit(ctx, session_id, frame_id, loader_id, page_url,
+        page_id, network_events, wait_until, reached_network_idle, None);
+}
+
+pub(crate) fn emit_navigation_events_with_commit(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    loader_id: &str,
+    page_url: &str,
+    page_id: &str,
+    network_events: &[obscura_browser::NetworkEvent],
+    wait_until: WaitUntil,
+    reached_network_idle: bool,
+    early_commit_loader: Option<&str>,
 ) {
     let event_start = ctx.pending_events.len();
     ctx.current_loader_ids
@@ -956,35 +1015,9 @@ pub fn emit_navigation_events(
         }
     }
 
-    let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
-    let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
-    let mut phase1 = vec![CdpEvent {
-        method: "Page.lifecycleEvent".into(),
-        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-        session_id: es.clone(),
-    }];
-    for runtime_session in &runtime_sessions {
-        phase1.push(CdpEvent::with_session(
-            "Runtime.executionContextsCleared",
-            json!({}),
-            runtime_session.clone(),
-        ));
+    if early_commit_loader != Some(loader_id) {
+        emit_navigation_commit(ctx, session_id, frame_id, loader_id, page_url, page_id, &nav_mime);
     }
-    phase1.push(CdpEvent {
-        method: "Page.frameNavigated".into(),
-        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
-        session_id: es.clone(),
-    });
-    for runtime_session in runtime_sessions {
-        for context in &contexts {
-            phase1.push(super::runtime::execution_context_created_event(
-                context,
-                Some(runtime_session.clone()),
-            ));
-        }
-    }
-    phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
-    ctx.pending_events.extend(phase1);
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {

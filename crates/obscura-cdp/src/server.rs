@@ -1170,9 +1170,9 @@ fn control_endpoint(head: &str) -> Option<&'static str> {
     let mut request = head.lines().next()?.split_ascii_whitespace();
     if request.next()? != "GET" { return None; }
     match request.next()?.split('?').next()? {
-        "/json/version" => Some("version"),
-        "/json" | "/json/list" => Some("list"),
-        "/json/protocol" => Some("protocol"),
+        "/json/version" | "/json/version/" => Some("version"),
+        "/json" | "/json/" | "/json/list" | "/json/list/" => Some("list"),
+        "/json/protocol" | "/json/protocol/" => Some("protocol"),
         _ => None,
     }
 }
@@ -2049,6 +2049,7 @@ async fn process_with_interception(
     page.set_navigation_commit_notifier(reply_on_commit.then_some(commit_tx));
     let mut commit_pending = reply_on_commit;
     let mut response_sent = false;
+    let mut early_commit_loader = None;
 
     let previous_url = page.url.clone();
     let previous_lifecycle = page.lifecycle;
@@ -2117,8 +2118,20 @@ async fn process_with_interception(
         tokio::select! {
             commit = &mut commit_rx, if commit_pending => {
                 commit_pending = false;
-                if let Ok(intercepted_request) = commit {
-                    let committed_loader = intercepted_request.unwrap_or_else(|| initial_loader_id.clone());
+                if let Ok(intercepted_document) = commit {
+                    if let Some(document) = &intercepted_document {
+                        let mime = document.response_headers.get("content-type")
+                            .map(|value| value.split(';').next().unwrap_or(value).trim())
+                            .unwrap_or("text/html");
+                        crate::domains::page::emit_navigation_commit(ctx, &session_for_events,
+                            &frame_id, &document.request_id, &document.url, &page_id, mime);
+                        for event in ctx.pending_events.drain(..) {
+                            if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
+                        }
+                        early_commit_loader = Some(document.request_id.clone());
+                    }
+                    let committed_loader = intercepted_document.map(|event| event.request_id)
+                        .unwrap_or_else(|| initial_loader_id.clone());
                     let response = crate::types::CdpResponse::success(req.id,
                         json!({"frameId": frame_id, "loaderId": committed_loader}), req.session_id.clone());
                     if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
@@ -2291,7 +2304,7 @@ async fn process_with_interception(
         crate::domains::page::emit_aborted_navigation(ctx, &session_for_events, &frame_id,
             &loader_id, &navigation_url, &navigation_method, &page_id_for_events, document_request_started);
     } else {
-        crate::domains::page::emit_navigation_events(
+        crate::domains::page::emit_navigation_events_with_commit(
             ctx,
             &session_for_events,
             &frame_id,
@@ -2301,6 +2314,7 @@ async fn process_with_interception(
             &network_events,
             wait_until,
             reached_network_idle,
+            early_commit_loader.as_deref(),
         );
     }
     for event in ctx.pending_events.drain(..) {
@@ -4084,12 +4098,15 @@ mod tests {
     #[test]
     fn control_endpoint_matches_only_the_request_target() {
         for (path, expected) in [
-            ("/json", "list"), ("/json/list", "list"),
-            ("/json/version", "version"), ("/json/protocol?schema=1", "protocol"),
+            ("/json", "list"), ("/json/", "list"), ("/json/list", "list"),
+            ("/json/list/?targets=1", "list"), ("/json/version", "version"),
+            ("/json/version/", "version"), ("/json/version/?client=playwright", "version"),
+            ("/json/protocol?schema=1", "protocol"), ("/json/protocol/", "protocol"),
         ] {
             assert_eq!(super::control_endpoint(&format!("GET {path} HTTP/1.1\r\n\r\n")), Some(expected));
         }
-        for path in ["/devtools/page/page-1", "/json/versionify", "/json/list/extra", "/?next=/json/list"] {
+        for path in ["/devtools/page/page-1", "/json/versionify", "/json/list/extra",
+            "/json/version//", "/json//", "/?next=/json/list"] {
             assert_eq!(super::control_endpoint(&format!(
                 "GET {path} HTTP/1.1\r\nX-Note: /json/version /json/list /json/protocol\r\n\r\n"
             )), None);
@@ -4290,6 +4307,7 @@ mod tests {
             let page_id = ctx.create_page();
             let session = format!("{page_id}-session");
             ctx.sessions.insert(session.clone(), page_id.clone());
+            ctx.runtime_enabled_sessions.insert(session.clone());
             let mut intercept_rx = Some(ctx.get_page_mut(&page_id).unwrap().enable_interception());
             let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -4307,6 +4325,8 @@ mod tests {
                 use base64::Engine as _;
                 let mut events = Vec::new();
                 let mut pauses = 0;
+                let mut navigation_replied = false;
+                let mut held_resolution = None;
                 loop {
                     tokio::select! {
                         biased;
@@ -4325,13 +4345,24 @@ mod tests {
                                 } else if pauses == 1 && scenario == "repeat" {
                                     "<script>location.reload()</script>"
                                 } else { "<title>Finished</title>" };
-                                server_tx.send(super::ServerMessage::Cdp(super::CdpMessage {
+                                let resolution = super::ServerMessage::Cdp(super::CdpMessage {
                                     text: json!({"id": pauses + 1, "method": method, "sessionId": session,
                                         "params": {"requestId": request_id, "errorReason": "Aborted", "responseCode": 200,
                                             "responseHeaders": [{"name": "Content-Type", "value": "text/html"}],
                                             "body": base64::engine::general_purpose::STANDARD.encode(body)}}).to_string(),
                                     reply_tx: reply_tx.clone(),
-                                })).unwrap();
+                                });
+                                if scenario == "chain" && pauses == 2 && !navigation_replied {
+                                    held_resolution = Some(resolution);
+                                } else {
+                                    server_tx.send(resolution).unwrap();
+                                }
+                            }
+                            if event["id"] == 1 {
+                                navigation_replied = true;
+                                if let Some(resolution) = held_resolution.take() {
+                                    server_tx.send(resolution).unwrap();
+                                }
                             }
                             events.push(event);
                         }
@@ -4377,7 +4408,22 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn routed_document_script_navigation_preserves_both_completions() {
-        assert_routed_completions(&routed_document_events("chain").await, 2, 0);
+        let events = routed_document_events("chain").await;
+        assert_routed_completions(&events, 2, 0);
+        let response = events.iter().position(|event| event["id"] == 1).unwrap();
+        let loader = &events[response]["result"]["loaderId"];
+        let committed = events.iter().position(|event| event["method"] == "Page.frameNavigated"
+            && &event["params"]["frame"]["loaderId"] == loader).unwrap();
+        assert!(committed < response, "publish the acknowledged commit before the redirected document: {events:?}");
+        assert_eq!(events.iter().filter(|event| event["method"] == "Page.frameNavigated").count(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routed_document_commit_is_not_replayed_at_completion() {
+        let events = routed_document_events("fulfill").await;
+        assert_routed_completions(&events, 1, 0);
+        assert_eq!(events.iter().filter(|event| event["method"] == "Page.frameNavigated").count(), 1);
+        assert_eq!(events.iter().filter(|event| event["method"] == "Runtime.executionContextsCleared").count(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

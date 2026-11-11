@@ -314,7 +314,7 @@ pub struct Page {
     /// 50-second navigation is not silently cut off by the process default.
     /// Pages without an override retain the environment-configurable default.
     navigation_timeout: Option<std::time::Duration>,
-    navigation_commit_notifier: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    navigation_commit_notifier: Option<tokio::sync::oneshot::Sender<Option<NetworkEvent>>>,
     /// Optional per-page cap. Pages without a value keep the default.
     navigation_chain_limit: Option<usize>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
@@ -1175,11 +1175,11 @@ impl Page {
     }
 
     /// CDP's one-shot commit notification. Carries the intercepted document
-    /// request ID when present; ordinary navigations retain CDP's loader ID.
+    /// when present; ordinary navigations retain CDP's loader ID.
     #[doc(hidden)]
     pub fn set_navigation_commit_notifier(
         &mut self,
-        notifier: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+        notifier: Option<tokio::sync::oneshot::Sender<Option<NetworkEvent>>>,
     ) {
         self.navigation_commit_notifier = notifier;
     }
@@ -1188,7 +1188,7 @@ impl Page {
         if let Some(notifier) = self.navigation_commit_notifier.take() {
             let intercepted_request = self.network_events.last()
                 .filter(|event| event.resource_type == "Document" && event.intercepted)
-                .map(|event| event.request_id.clone());
+                .cloned();
             let _ = notifier.send(intercepted_request);
         }
     }
