@@ -1333,17 +1333,10 @@ pub fn parse_wait_until(params: &Value) -> WaitUntil {
                 None
             }
         })
-        // Puppeteer and Playwright drive navigation via `Page.navigate`
-        // without a server-side waitUntil — they wait for `Page.lifecycleEvent`
-        // on the client side. Defaulting the server to `Load` means we run
-        // every parser/deferred/async script on JS-heavy pages before
-        // emitting `load`, which on sites like github.com / reddit.com
-        // pushes nav past 25s and clients time out at 15s. Real Chrome
-        // streams `DOMContentLoaded` as soon as the parser is done; we
-        // batch our event emission at the end of navigation, so the
-        // closest we can get is to default to `DomContentLoaded` and skip
-        // the full-load wait. CLI callers that pass `--wait-until load`
-        // (or `networkidle*`) are unaffected; they get the old behaviour.
+        // Raw CDP is acknowledged at commit by the server; clients then wait
+        // for lifecycle events. Keep the internal default at DOMContentLoaded
+        // rather than adding a full-load wait before those events are emitted.
+        // Explicit waitUntil callers retain their requested readiness condition.
         .unwrap_or(WaitUntil::DomContentLoaded)
 }
 
