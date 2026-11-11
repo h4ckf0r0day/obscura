@@ -2,7 +2,23 @@
 
 ### `OBSCURA_ALLOW_PRIVATE_NETWORK`
 
-Allow fetches to loopback (`127.0.0.0/8`), RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and link-local (`169.254.0.0/16`, including the `169.254.169.254` cloud-metadata endpoint) addresses. The deny-set also covers the unspecified address (`0.0.0.0` / `::`), IPv6 unique-local (`fc00::/7`), and any IPv4-mapped form of the above. Off by default to block SSRF.
+Allow fetches to addresses in the SSRF deny-set. Off by default to block SSRF. The deny-set is defined once, in `is_forbidden_ip` (`crates/obscura-ssrf/src/lib.rs`), and covers:
+
+| Kind | Ranges |
+| --- | --- |
+| Loopback and unspecified | `127.0.0.0/8`, `0.0.0.0/8`, `::1`, `::` |
+| Private (RFC 1918) | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
+| Shared address space (RFC 6598, CGNAT) | `100.64.0.0/10`, which includes Tailscale addresses and the `100.100.100.200` cloud-metadata endpoint |
+| Link-local | `169.254.0.0/16` (including the `169.254.169.254` cloud-metadata endpoint), `fe80::/10` |
+| IPv6 unique-local | `fc00::/7` |
+| Multicast and broadcast | `224.0.0.0/4`, `255.255.255.255`, `ff00::/8` |
+| Documentation and benchmarking | `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `198.18.0.0/15`, `2001:db8::/32`, `3fff::/20` |
+| Other special-purpose IPv4 | `192.0.0.0/24` except `192.0.0.9` and `192.0.0.10`, `192.88.99.0/24`, `240.0.0.0/4` |
+| Other special-purpose IPv6 | `100::/64` (discard-only), `64:ff9b:1::/48` (local-use NAT64) |
+
+IPv6 addresses that embed an IPv4 address are unwrapped and the IPv4 address is checked against the rows above: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`), and Teredo (`2001::/32`, server or client address).
+
+A target on a Tailscale or other CGNAT address therefore needs this setting, just like one on a private LAN address.
 
 The guard validates at DNS-resolution time as well as on literal hosts, so a public hostname that resolves to a forbidden address is rejected at connect time (DNS-rebinding safe), not just hosts written as raw IPs.
 
