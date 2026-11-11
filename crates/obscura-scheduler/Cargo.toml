@@ -19,3 +19,7 @@ futures = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+libc = "0.2"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-nats = "0.38"

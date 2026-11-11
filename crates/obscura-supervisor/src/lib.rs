@@ -62,7 +62,12 @@ impl Default for WorkerRecyclePolicy {
 }
 
 impl WorkerRecyclePolicy {
-    pub fn should_recycle(&self, sessions: usize, rss_mb: Option<u64>, age: Duration) -> Option<String> {
+    pub fn should_recycle(
+        &self,
+        sessions: usize,
+        rss_mb: Option<u64>,
+        age: Duration,
+    ) -> Option<String> {
         if let Some(limit) = self.max_sessions {
             if sessions >= limit {
                 return Some(format!("Exceeded session limit: {sessions} >= {limit}"));
@@ -151,30 +156,9 @@ impl SupervisedWorker {
             });
         }
 
-        // On Linux, set parent-death signal so child dies if parent dies
-        #[cfg(target_os = "linux")]
-        {
-            let expected_ppid = unsafe { libc::getppid() };
-            unsafe {
-                cmd.pre_exec(move || {
-                    // PR_SET_PDEATHSIG = 1, SIGKILL = 9
-                    if libc::prctl(1, 9) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // Race check: parent may have died before registration
-                    if libc::getppid() != expected_ppid {
-                        // Parent already died; terminate self
-                        libc::raise(9); // SIGKILL
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        let mut child_proc = cmd
-            .spawn()
-            .map_err(|e| SupervisorError::SpawnFailed(format!("Failed to spawn {resolved:?}: {e}")))?;
-
+        let mut child_proc = cmd.spawn().map_err(|e| {
+            SupervisorError::SpawnFailed(format!("Failed to spawn {resolved:?}: {e}"))
+        })?;
         let pid = child_proc.id();
         let mut child_stdin = child_proc
             .stdin
@@ -184,6 +168,24 @@ impl SupervisedWorker {
             .stdout
             .take()
             .ok_or_else(|| SupervisorError::SpawnFailed("Missing child stdout pipe".into()))?;
+
+        // Wait for explicit readiness signal from the child.
+        let mut stdout_reader = BufReader::new(child_stdout);
+        let mut ready_line = String::new();
+        let ready = tokio::time::timeout(
+            Duration::from_secs(5),
+            stdout_reader.read_line(&mut ready_line),
+        )
+        .await;
+        match ready {
+            Ok(Ok(n)) if n > 0 && ready_line.contains("ready") => {}
+            _ => {
+                let _ = child_proc.kill().await;
+                return Err(SupervisorError::SpawnFailed(
+                    "worker readiness handshake failed".into(),
+                ));
+            }
+        }
         let child_stderr = child_proc
             .stderr
             .take()
@@ -192,8 +194,11 @@ impl SupervisedWorker {
         let is_ready_flag = Arc::new(AtomicBool::new(false));
 
         // Response ID -> pending oneshot (keyed by request id string)
-        let pending_requests: Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<Result<WorkerResponse, SupervisorError>>>>> =
-            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let pending_requests: Arc<
+            parking_lot::Mutex<
+                HashMap<String, oneshot::Sender<Result<WorkerResponse, SupervisorError>>>,
+            >,
+        > = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
         // Dedicated stderr drainer task (prevents child process buffer lockups)
         let worker_id = id;
@@ -208,7 +213,7 @@ impl SupervisedWorker {
         let pending_for_stdout = pending_requests.clone();
         let is_ready_for_stdout = is_ready_flag.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(child_stdout).lines();
+            let mut lines = stdout_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -250,16 +255,23 @@ impl SupervisedWorker {
                 let serialized = match serde_json::to_string(&job.req) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = job.resp_tx.send(Err(SupervisorError::IpcError(e.to_string())));
+                        let _ = job
+                            .resp_tx
+                            .send(Err(SupervisorError::IpcError(e.to_string())));
                         continue;
                     }
                 };
 
                 if !req_id.is_empty() {
-                    pending_for_writer.lock().insert(req_id.clone(), job.resp_tx);
+                    pending_for_writer
+                        .lock()
+                        .insert(req_id.clone(), job.resp_tx);
                 }
 
-                if let Err(e) = child_stdin.write_all(format!("{serialized}\n").as_bytes()).await {
+                if let Err(e) = child_stdin
+                    .write_all(format!("{serialized}\n").as_bytes())
+                    .await
+                {
                     if !req_id.is_empty() {
                         pending_for_writer.lock().remove(&req_id);
                     }
@@ -304,12 +316,19 @@ impl SupervisedWorker {
             command: WorkerCommand::Ping,
         };
 
-        match worker.send_request(handshake_req, Duration::from_secs(5)).await {
+        match worker
+            .send_request(handshake_req, Duration::from_secs(5))
+            .await
+        {
             Ok(resp) if resp.ok => {
                 worker.mark_ready();
                 let metrics = global_metrics();
-                if let Some(c) = metrics.counter("obscura_worker_processes_total") { c.inc(); }
-                if let Some(c) = metrics.counter("obscura_worker_spawn_total") { c.inc(); }
+                if let Some(c) = metrics.counter("obscura_worker_processes_total") {
+                    c.inc();
+                }
+                if let Some(c) = metrics.counter("obscura_worker_spawn_total") {
+                    c.inc();
+                }
                 tracing::info!(worker_id = id, pid = ?pid, "Supervised worker handshake succeeded");
                 Ok(worker)
             }
@@ -335,10 +354,9 @@ impl SupervisedWorker {
         req: WorkerRequest,
         timeout_dur: Duration,
     ) -> Result<WorkerResponse, SupervisorError> {
-        let job_tx = self
-            .job_tx
-            .as_ref()
-            .ok_or_else(|| SupervisorError::IpcError(format!("Worker {} has no active IPC channel", self.id)))?;
+        let job_tx = self.job_tx.as_ref().ok_or_else(|| {
+            SupervisorError::IpcError(format!("Worker {} has no active IPC channel", self.id))
+        })?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
         let job = WorkerJob { req, resp_tx };
@@ -412,7 +430,9 @@ impl SupervisedWorker {
             let lock = self.child.lock().await;
             if let Some(child) = lock.as_ref() {
                 if let Some(pid) = child.id() {
-                    unsafe { libc::kill(-(pid as i32), 15); } // SIGTERM
+                    unsafe {
+                        libc::kill(-(pid as i32), 15);
+                    } // SIGTERM
                 }
             }
         }
@@ -444,7 +464,9 @@ impl SupervisedWorker {
         }
         if was_ready {
             let metrics = global_metrics();
-            if let Some(c) = metrics.counter("obscura_worker_processes_failed") { c.inc(); }
+            if let Some(c) = metrics.counter("obscura_worker_processes_failed") {
+                c.inc();
+            }
         }
         Ok(())
     }
@@ -589,9 +611,16 @@ impl WorkerPoolSupervisor {
         let metrics = global_metrics();
         let workers = self.workers.read();
         let total = workers.len() as i64;
-        let healthy = workers.iter().filter(|w| w.is_ready.load(Ordering::Acquire)).count() as i64;
-        if let Some(g) = metrics.gauge("obscura_worker_processes_count") { g.set(total); }
-        if let Some(g) = metrics.gauge("obscura_worker_processes_healthy") { g.set(healthy); }
+        let healthy = workers
+            .iter()
+            .filter(|w| w.is_ready.load(Ordering::Acquire))
+            .count() as i64;
+        if let Some(g) = metrics.gauge("obscura_worker_processes_count") {
+            g.set(total);
+        }
+        if let Some(g) = metrics.gauge("obscura_worker_processes_healthy") {
+            g.set(healthy);
+        }
     }
 
     /// Selects a ready worker using round-robin distribution.
@@ -626,7 +655,10 @@ impl WorkerPoolSupervisor {
     }
 
     /// Dispatches a WorkerRequest to an appropriate worker based on session affinity or load balancing.
-    pub async fn dispatch(&self, mut req: WorkerRequest) -> Result<WorkerResponse, SupervisorError> {
+    pub async fn dispatch(
+        &self,
+        mut req: WorkerRequest,
+    ) -> Result<WorkerResponse, SupervisorError> {
         // Assign an id if missing
         if req.id.as_ref().map_or(true, |s| s.is_empty()) {
             req.id = Some(format!(
@@ -673,7 +705,12 @@ impl WorkerPoolSupervisor {
                 .cloned();
 
             match found {
-                Some(w) if w.is_ready.load(Ordering::Acquire) || *w.status.read() == WorkerStatus::Draining => w,
+                Some(w)
+                    if w.is_ready.load(Ordering::Acquire)
+                        || *w.status.read() == WorkerStatus::Draining =>
+                {
+                    w
+                }
                 Some(_) => return Err(SupervisorError::WorkerTerminated(target_id)),
                 None => return Err(SupervisorError::WorkerNotFound(target_id)),
             }
@@ -734,7 +771,10 @@ impl WorkerPoolSupervisor {
             version: "1.0".to_string(),
             command: WorkerCommand::Ping,
         };
-        match worker.send_request(req, self.config.heartbeat_timeout).await {
+        match worker
+            .send_request(req, self.config.heartbeat_timeout)
+            .await
+        {
             Ok(resp) => resp.ok,
             Err(_) => false,
         }
@@ -761,7 +801,10 @@ impl WorkerPoolSupervisor {
     }
 
     /// Restarts a terminated worker with bounded exponential backoff.
-    pub async fn restart_worker(&self, worker_id: usize) -> Result<Arc<SupervisedWorker>, SupervisorError> {
+    pub async fn restart_worker(
+        &self,
+        worker_id: usize,
+    ) -> Result<Arc<SupervisedWorker>, SupervisorError> {
         // Check restart limit
         {
             let counts = self.restart_counts.read();
@@ -798,7 +841,9 @@ impl WorkerPoolSupervisor {
         }
 
         let metrics = global_metrics();
-        if let Some(c) = metrics.counter("obscura_worker_restarts_total") { c.inc(); }
+        if let Some(c) = metrics.counter("obscura_worker_restarts_total") {
+            c.inc();
+        }
 
         self.refresh_pool_metrics();
         Ok(new_worker)
@@ -830,18 +875,26 @@ mod tests {
         };
 
         // Under limits
-        assert!(policy.should_recycle(5, Some(200), Duration::from_secs(30)).is_none());
+        assert!(policy
+            .should_recycle(5, Some(200), Duration::from_secs(30))
+            .is_none());
 
         // Session limit exceeded
-        let reason = policy.should_recycle(10, Some(200), Duration::from_secs(30)).unwrap();
+        let reason = policy
+            .should_recycle(10, Some(200), Duration::from_secs(30))
+            .unwrap();
         assert!(reason.contains("session limit"));
 
         // Memory limit exceeded
-        let reason = policy.should_recycle(5, Some(600), Duration::from_secs(30)).unwrap();
+        let reason = policy
+            .should_recycle(5, Some(600), Duration::from_secs(30))
+            .unwrap();
         assert!(reason.contains("RSS memory limit"));
 
         // Age limit exceeded
-        let reason = policy.should_recycle(5, Some(200), Duration::from_secs(65)).unwrap();
+        let reason = policy
+            .should_recycle(5, Some(200), Duration::from_secs(65))
+            .unwrap();
         assert!(reason.contains("max lifetime"));
     }
 
@@ -889,7 +942,10 @@ mod tests {
         // This test requires the worker binary to be built
         let worker_bin = resolve_worker_binary(Path::new("obscura-runtime-worker"));
         if !worker_bin.exists() {
-            eprintln!("Skipping spawn test: worker binary not found at {:?}", worker_bin);
+            eprintln!(
+                "Skipping spawn test: worker binary not found at {:?}",
+                worker_bin
+            );
             return;
         }
 
@@ -1040,8 +1096,14 @@ mod process_harness_tests {
     #[tokio::test]
     async fn test_process_graceful_termination() {
         let worker_bin = resolve_worker_binary(std::path::Path::new("obscura-runtime-worker"));
-        if !worker_bin.exists() { return; }
-        let config = SupervisorConfig { worker_bin, pool_size: 1, ..SupervisorConfig::default() };
+        if !worker_bin.exists() {
+            return;
+        }
+        let config = SupervisorConfig {
+            worker_bin,
+            pool_size: 1,
+            ..SupervisorConfig::default()
+        };
         let supervisor = WorkerPoolSupervisor::new(config);
         supervisor.start().await.expect("start");
         assert_eq!(supervisor.healthy_count(), 1);
@@ -1078,8 +1140,14 @@ mod process_harness_tests {
     #[tokio::test]
     async fn test_shutdown_cleans_multiple() {
         let worker_bin = resolve_worker_binary(std::path::Path::new("obscura-runtime-worker"));
-        if !worker_bin.exists() { return; }
-        let config = SupervisorConfig { worker_bin, pool_size: 3, ..SupervisorConfig::default() };
+        if !worker_bin.exists() {
+            return;
+        }
+        let config = SupervisorConfig {
+            worker_bin,
+            pool_size: 3,
+            ..SupervisorConfig::default()
+        };
         let supervisor = WorkerPoolSupervisor::new(config);
         supervisor.start().await.expect("start");
         assert_eq!(supervisor.pool_size(), 3);
@@ -1095,8 +1163,14 @@ mod process_group_tests {
     #[tokio::test]
     async fn test_process_group_termination() {
         let worker_bin = resolve_worker_binary(std::path::Path::new("obscura-runtime-worker"));
-        if !worker_bin.exists() { return; }
-        let config = SupervisorConfig { worker_bin, pool_size: 1, ..SupervisorConfig::default() };
+        if !worker_bin.exists() {
+            return;
+        }
+        let config = SupervisorConfig {
+            worker_bin,
+            pool_size: 1,
+            ..SupervisorConfig::default()
+        };
         let supervisor = WorkerPoolSupervisor::new(config);
         supervisor.start().await.expect("start");
         assert_eq!(supervisor.healthy_count(), 1);

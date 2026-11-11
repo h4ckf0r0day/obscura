@@ -2628,15 +2628,19 @@ dependencies = [
 name = "obscura-scheduler"
 version = "0.3.0"
 dependencies = [
+ "async-nats",
  "chrono",
  "futures",
+ "libc",
  "obscura-control-plane",
  "obscura-telemetry",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2675,6 +2679,7 @@ dependencies = [
 name = "obscura-worker"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "obscura-agent",
  "obscura-browser",
  "obscura-dom",
@@ -2697,6 +2702,7 @@ dependencies = [
  "async-nats",
  "chrono",
  "futures",
+ "libc",
  "obscura-control-plane",
  "obscura-scheduler",
  "obscura-supervisor",

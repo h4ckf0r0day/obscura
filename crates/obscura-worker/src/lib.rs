@@ -87,9 +87,8 @@ pub struct ManagedSession {
 
 impl ManagedSession {
     pub fn new(id: String, config: SessionConfig) -> Self {
-        let isolation = IsolationPolicy::for_profile(
-            config.profile.unwrap_or(IsolationProfile::Standard),
-        );
+        let isolation =
+            IsolationPolicy::for_profile(config.profile.unwrap_or(IsolationProfile::Standard));
 
         let mut context = BrowserContext::with_full_options(
             format!("ctx-{id}"),
@@ -150,11 +149,7 @@ impl SessionManager {
         self.started_at.elapsed()
     }
 
-    pub fn create_session(
-        &self,
-        id: String,
-        config: SessionConfig,
-    ) -> Result<(), WorkerError> {
+    pub fn create_session(&self, id: String, config: SessionConfig) -> Result<(), WorkerError> {
         let mut guard = self.sessions.write();
         if guard.contains_key(&id) {
             return Err(WorkerError::SessionAlreadyExists(id));
@@ -226,7 +221,10 @@ impl SessionManager {
     pub async fn evict_idle(&self, max_idle: Duration) -> Vec<String> {
         let session_arcs: Vec<(String, Arc<TokioMutex<ManagedSession>>)> = {
             let guard = self.sessions.read();
-            guard.iter().map(|(id, arc)| (id.clone(), arc.clone())).collect()
+            guard
+                .iter()
+                .map(|(id, arc)| (id.clone(), arc.clone()))
+                .collect()
         };
 
         let now = Instant::now();
@@ -964,79 +962,81 @@ pub async fn run_worker_loop() {
 
     let local = tokio::task::LocalSet::new();
 
-    local.run_until(async move {
-        let manager = SessionManager::new();
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
+    local
+        .run_until(async move {
+            let manager = SessionManager::new();
+            let stdin = tokio::io::stdin();
+            let mut reader = BufReader::new(stdin);
+            let mut line = String::new();
 
-        tracing::info!("Obscura Next Isolated Runtime Worker starting up");
+            tracing::info!("Obscura Next Isolated Runtime Worker starting up");
 
-        let (resp_tx, mut resp_rx) = mpsc::channel::<WorkerResponse>(128);
+            let (resp_tx, mut resp_rx) = mpsc::channel::<WorkerResponse>(128);
 
-        let writer_handle = tokio::task::spawn_local(async move {
-            let mut stdout = tokio::io::stdout();
-            while let Some(resp) = resp_rx.recv().await {
-                if let Ok(mut out) = serde_json::to_string(&resp) {
-                    out.push('\n');
-                    let _ = stdout.write_all(out.as_bytes()).await;
-                    let _ = stdout.flush().await;
+            let writer_handle = tokio::task::spawn_local(async move {
+                let mut stdout = tokio::io::stdout();
+                while let Some(resp) = resp_rx.recv().await {
+                    if let Ok(mut out) = serde_json::to_string(&resp) {
+                        out.push('\n');
+                        let _ = stdout.write_all(out.as_bytes()).await;
+                        let _ = stdout.flush().await;
+                    }
                 }
-            }
-        });
+            });
 
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Worker stdin read error: {e}");
-                    break;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Worker stdin read error: {e}");
+                        break;
+                    }
                 }
-            }
 
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let request: WorkerRequest = match serde_json::from_str(trimmed) {
-                Ok(req) => req,
-                Err(e) => {
-                    let err_resp = WorkerResponse::error(
-                        None,
-                        "INVALID_JSON",
-                        format!("Invalid JSON request: {e}"),
-                    );
-                    let _ = resp_tx.send(err_resp).await;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-            };
 
-            let is_shutdown = matches!(request.command, WorkerCommand::Shutdown);
-            if is_shutdown {
-                let resp = dispatch_worker_command(&manager, request).await;
-                let _ = resp_tx.send(resp).await;
-                break;
+                let request: WorkerRequest = match serde_json::from_str(trimmed) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        let err_resp = WorkerResponse::error(
+                            None,
+                            "INVALID_JSON",
+                            format!("Invalid JSON request: {e}"),
+                        );
+                        let _ = resp_tx.send(err_resp).await;
+                        continue;
+                    }
+                };
+
+                let is_shutdown = matches!(request.command, WorkerCommand::Shutdown);
+                if is_shutdown {
+                    let resp = dispatch_worker_command(&manager, request).await;
+                    let _ = resp_tx.send(resp).await;
+                    break;
+                }
+
+                manager.inc_active_requests();
+                let manager_clone = manager.clone();
+                let resp_tx_clone = resp_tx.clone();
+
+                tokio::task::spawn_local(async move {
+                    let resp = dispatch_worker_command(&manager_clone, request).await;
+                    manager_clone.dec_active_requests();
+                    let _ = resp_tx_clone.send(resp).await;
+                });
             }
 
-            manager.inc_active_requests();
-            let manager_clone = manager.clone();
-            let resp_tx_clone = resp_tx.clone();
+            drop(resp_tx);
+            let _ = writer_handle.await;
 
-            tokio::task::spawn_local(async move {
-                let resp = dispatch_worker_command(&manager_clone, request).await;
-                manager_clone.dec_active_requests();
-                let _ = resp_tx_clone.send(resp).await;
-            });
-        }
-
-        drop(resp_tx);
-        let _ = writer_handle.await;
-
-        tracing::info!("Obscura Next Isolated Runtime Worker shutting down cleanly");
-    }).await;
+            tracing::info!("Obscura Next Isolated Runtime Worker shutting down cleanly");
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -1154,8 +1154,12 @@ mod tests {
         let s1 = "s1".to_string();
         let s2 = "s2".to_string();
 
-        manager.create_session(s1.clone(), SessionConfig::default()).unwrap();
-        manager.create_session(s2.clone(), SessionConfig::default()).unwrap();
+        manager
+            .create_session(s1.clone(), SessionConfig::default())
+            .unwrap();
+        manager
+            .create_session(s2.clone(), SessionConfig::default())
+            .unwrap();
 
         assert_eq!(manager.active_count(), 2);
 
