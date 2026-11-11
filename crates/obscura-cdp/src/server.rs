@@ -1166,13 +1166,22 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
     PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
 }
 
+fn control_endpoint(head: &str) -> Option<&'static str> {
+    let mut request = head.lines().next()?.split_ascii_whitespace();
+    if request.next()? != "GET" { return None; }
+    match request.next()?.split('?').next()? {
+        "/json/version" => Some("version"),
+        "/json" | "/json/list" => Some("list"),
+        "/json/protocol" => Some("protocol"),
+        _ => None,
+    }
+}
+
 /// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
 ///
-/// The connection's request head has already been peeked by the accept loop
-/// (`peek_request_head`) and is passed in as `head`:
-/// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
-///   response is never stalled by the LocalSet.
-/// - WebSocket: forward to the LocalSet for CDP processing.
+/// The request head was peeked without consuming it. HTTP discovery endpoints
+/// are served here so a busy LocalSet cannot stall them; WebSockets are handed
+/// to the LocalSet.
 fn accept_dispatch(
     stream: std::net::TcpStream,
     bind_ip: std::net::IpAddr,
@@ -1187,15 +1196,7 @@ fn accept_dispatch(
         refuse_control_connection(stream, refusal);
         return Ok(());
     }
-    let endpoint = if head.contains("/json/version") {
-        Some("version")
-    } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
-        Some("list")
-    } else if head.contains("/json/protocol") {
-        Some("protocol")
-    } else {
-        None
-    };
+    let endpoint = control_endpoint(head);
 
     if let Some(ep) = endpoint {
         // The request head is already sitting in the kernel receive buffer;
@@ -2040,6 +2041,14 @@ async fn process_with_interception(
     let initial_loader_id = format!("loader-{}", uuid::Uuid::new_v4());
     let mut loader_id = initial_loader_id.clone();
     let mut document_request_started = false;
+    // Raw CDP acknowledges the committed document, not its subresources.
+    // Retain Obscura's explicit waitUntil extension for existing callers.
+    let reply_on_commit = send_command_response && req.method == "Page.navigate"
+        && req.params.get("waitUntil").is_none();
+    let (commit_tx, mut commit_rx) = tokio::sync::oneshot::channel();
+    page.set_navigation_commit_notifier(reply_on_commit.then_some(commit_tx));
+    let mut commit_pending = reply_on_commit;
+    let mut response_sent = false;
 
     let previous_url = page.url.clone();
     let previous_lifecycle = page.lifecycle;
@@ -2073,6 +2082,7 @@ async fn process_with_interception(
             } => (result.map_err(|e| e.to_string()), false),
             _ = cancel_rx => (Err("net::ERR_ABORTED".into()), true),
         };
+        page.set_navigation_commit_notifier(None);
         drop(_v8_guard);
         let _ = nav_done_tx.send((page, result, cancelled)).await;
     });
@@ -2105,6 +2115,16 @@ async fn process_with_interception(
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
+            commit = &mut commit_rx, if commit_pending => {
+                commit_pending = false;
+                if let Ok(intercepted_request) = commit {
+                    let committed_loader = intercepted_request.unwrap_or_else(|| initial_loader_id.clone());
+                    let response = crate::types::CdpResponse::success(req.id,
+                        json!({"frameId": frame_id, "loaderId": committed_loader}), req.session_id.clone());
+                    if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
+                    response_sent = true;
+                }
+            }
             Some((returned_page, result, was_cancelled)) = nav_done_rx.recv() => {
                 page_back = Some(returned_page);
                 navigate_result = result;
@@ -2249,7 +2269,7 @@ async fn process_with_interception(
         Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
     }};
 
-    if send_command_response {
+    if send_command_response && !response_sent {
         if let Ok(json) = serde_json::to_string(&response) {
             let _ = reply_tx.send(json);
         }
@@ -4059,6 +4079,107 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn navigation_intercept_continue_has_no_timer_delay() {
         assert_navigation_intercept_reply_without_timer("continueRequest").await;
+    }
+
+    #[test]
+    fn control_endpoint_matches_only_the_request_target() {
+        for (path, expected) in [
+            ("/json", "list"), ("/json/list", "list"),
+            ("/json/version", "version"), ("/json/protocol?schema=1", "protocol"),
+        ] {
+            assert_eq!(super::control_endpoint(&format!("GET {path} HTTP/1.1\r\n\r\n")), Some(expected));
+        }
+        for path in ["/devtools/page/page-1", "/json/versionify", "/json/list/extra", "/?next=/json/list"] {
+            assert_eq!(super::control_endpoint(&format!(
+                "GET {path} HTTP/1.1\r\nX-Note: /json/version /json/list /json/protocol\r\n\r\n"
+            )), None);
+        }
+        assert_eq!(super::control_endpoint("POST /json/version HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(super::control_endpoint(""), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_navigate_replies_at_commit_before_blocking_scripts() {
+        assert_navigation_commit_reply(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_navigation_wait_still_waits_for_blocking_scripts() {
+        assert_navigation_commit_reply(true).await;
+    }
+
+    async fn assert_navigation_commit_reply(explicit_wait: bool) {
+        use super::{process_with_interception, CdpMessage, ServerMessage};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let fixture = tokio::task::spawn_local(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 2048];
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                let body = "<!doctype html><title>Committed</title><script src='/held.js'></script>";
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+                drop(stream);
+                let (mut script, _) = listener.accept().await.unwrap();
+                assert!(script.read(&mut buffer).await.unwrap() > 0);
+                requested_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                script.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 3\r\nConnection: close\r\n\r\n1; ").await.unwrap();
+            });
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "commit-reply-test".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let mut params = json!({"url": format!("http://{address}/")});
+            if explicit_wait { params["waitUntil"] = json!("load"); }
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": params}).to_string();
+            let nav_reply = reply_tx.clone();
+            let navigation = tokio::task::spawn_local(async move {
+                process_with_interception(&command, &mut ctx, &nav_reply, &mut server_rx,
+                    &mut None, &mut HashMap::new(), &mut std::collections::VecDeque::new(), true).await;
+                ctx
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), requested_rx)
+                .await.expect("blocking script request").unwrap();
+            let early = tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx.recv()).await;
+            if explicit_wait {
+                assert!(early.is_err(), "explicit load wait replied before the script");
+            } else {
+                let reply: serde_json::Value = serde_json::from_str(
+                    &early.expect("raw Page.navigate must reply before the blocked script").unwrap()
+                ).unwrap();
+                assert_eq!(reply["id"], 1);
+                assert!(reply.get("error").is_none(), "{reply}");
+                assert_eq!(reply["result"]["frameId"], page_id);
+                assert!(reply["result"]["loaderId"].is_string());
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: json!({"id": 2, "method": "Page.stopLoading", "sessionId": session}).to_string(),
+                    reply_tx: reply_tx.clone(),
+                })).unwrap();
+            }
+            release_tx.send(()).unwrap();
+            let ctx = tokio::time::timeout(std::time::Duration::from_secs(5), navigation)
+                .await.expect("navigation completion").unwrap();
+            fixture.await.unwrap();
+            let replies: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                .map(|text| serde_json::from_str(&text).unwrap()).collect();
+            assert_eq!(replies.iter().filter(|reply| reply["id"] == 1).count(),
+                usize::from(explicit_wait), "navigate must have exactly one reply");
+            assert!(ctx.get_page(&page_id).is_some());
+        }).await;
     }
 
     async fn assert_stop_loading_cancels_navigation(script: bool, method: &str) {

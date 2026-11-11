@@ -93,9 +93,11 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 | `networkidle0`     | 0 network connections active for 500ms  |
 
 The table uses Puppeteer names. Playwright uses `networkidle` for zero active
-connections and also accepts `commit`. Raw CDP `Page.navigate` uses Obscura's
-`domcontentloaded` default when its `waitUntil` parameter is omitted; client
-libraries wait for lifecycle events according to their own options.
+connections and also accepts `commit`. Raw CDP `Page.navigate` acknowledges the
+committed document before stylesheets and blocking scripts finish when its
+`waitUntil` parameter is omitted. Client libraries still wait for lifecycle
+events according to their own options. Obscura's explicit raw-CDP `waitUntil`
+extension continues to delay the reply until that readiness condition is met.
 
 ## Supported
 

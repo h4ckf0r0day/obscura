@@ -314,6 +314,7 @@ pub struct Page {
     /// 50-second navigation is not silently cut off by the process default.
     /// Pages without an override retain the environment-configurable default.
     navigation_timeout: Option<std::time::Duration>,
+    navigation_commit_notifier: Option<tokio::sync::oneshot::Sender<Option<String>>>,
     /// Optional per-page cap. Pages without a value keep the default.
     navigation_chain_limit: Option<usize>,
     /// Navigation history for Page.getNavigationHistory / navigateToHistoryEntry.
@@ -1146,6 +1147,7 @@ impl Page {
             document_timeline_origin: std::time::Instant::now(),
             navigation_timing: NavigationTiming::default(),
             navigation_timeout: None,
+            navigation_commit_notifier: None,
             navigation_chain_limit: None,
             history: Vec::new(),
             history_index: 0,
@@ -1169,6 +1171,25 @@ impl Page {
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
+        }
+    }
+
+    /// CDP's one-shot commit notification. Carries the intercepted document
+    /// request ID when present; ordinary navigations retain CDP's loader ID.
+    #[doc(hidden)]
+    pub fn set_navigation_commit_notifier(
+        &mut self,
+        notifier: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    ) {
+        self.navigation_commit_notifier = notifier;
+    }
+
+    fn notify_navigation_commit(&mut self) {
+        if let Some(notifier) = self.navigation_commit_notifier.take() {
+            let intercepted_request = self.network_events.last()
+                .filter(|event| event.resource_type == "Document" && event.intercepted)
+                .map(|event| event.request_id.clone());
+            let _ = notifier.send(intercepted_request);
         }
     }
 
@@ -3598,6 +3619,7 @@ impl Page {
                         std::time::Duration::from_secs(5));
                 }
             }
+            self.notify_navigation_commit();
             return Ok(());
         }
 
@@ -3689,6 +3711,7 @@ impl Page {
 
         self.dom = Some(dom);
         self.init_js();
+        self.notify_navigation_commit();
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Install fetched CSS in native DOM state. Cross-origin bytes must not
