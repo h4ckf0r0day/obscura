@@ -886,6 +886,7 @@ pub(crate) fn emit_navigation_commit(
     ctx.current_loader_ids.insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
     let ts = timestamp();
+    ctx.lifecycle_timestamps.insert(page_id.to_string(), [Some(ts), None, None, None, None]);
     let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
     let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
     ctx.pending_events.push(CdpEvent {
@@ -953,7 +954,6 @@ pub(crate) fn emit_navigation_events_with_commit(
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
     let es = session_id.clone();
-    let ts = timestamp();
 
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
@@ -1082,8 +1082,10 @@ pub(crate) fn emit_navigation_events_with_commit(
             tracing::warn!("could not produce navigation screencast frame: {error}");
         }
     }
+    let ts = timestamp();
     let failed = ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed);
-    let mut lifecycle_timestamps = [Some(ts), None, None, None, None];
+    let commit_timestamp = ctx.lifecycle_timestamps.get(page_id).and_then(|times| times[0]);
+    let mut lifecycle_timestamps = [commit_timestamp, None, None, None, None];
     if !failed {
         lifecycle_timestamps[1] = Some(ts);
         lifecycle_timestamps[2] = Some(ts);
@@ -2106,6 +2108,19 @@ pub(crate) fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[test]
+    fn navigation_lifecycle_timestamps_are_monotonic() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        emit_navigation_events(&mut ctx, &None, &page_id, "loader-1", "about:blank",
+            &page_id, &[], WaitUntil::Load, true);
+        let times: Vec<_> = ctx.pending_events.iter()
+            .filter(|event| event.method == "Page.lifecycleEvent")
+            .map(|event| event.params["timestamp"].as_f64().unwrap()).collect();
+        assert!(times.len() >= 4);
+        assert!(times.windows(2).all(|pair| pair[0] <= pair[1]), "{times:?}");
+    }
 
     fn observer_fixture() -> (CdpContext, String, Option<String>, Vec<obscura_browser::NetworkEvent>) {
         let mut ctx = CdpContext::new();
