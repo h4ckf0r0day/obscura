@@ -356,10 +356,15 @@ impl BrowserContext {
     /// Called during graceful shutdown.
     pub fn save_cookies(&self) {
         if let Some(ref dir) = self.storage_dir {
-            let _ = std::fs::create_dir_all(dir);
+            // `save_to_file` creates the directory itself, with owner-only
+            // permissions on unix, so any failure to do so is reported below.
             let cookie_path = dir.join("cookies.json");
             if let Err(e) = self.cookie_jar.save_to_file(&cookie_path) {
-                tracing::warn!("Failed to save cookies to {}: {}", cookie_path.display(), e);
+                tracing::error!(
+                    "Could not save cookies to {}: {}. They will not be persisted, so the next run starts without them.",
+                    cookie_path.display(),
+                    e
+                );
             } else {
                 tracing::info!("Saved cookies to {}", cookie_path.display());
             }
