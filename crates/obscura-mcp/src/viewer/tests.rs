@@ -15,7 +15,7 @@ async fn get(viewer_url: &str, method: &str, suffix: &str, extra: &str) -> Strin
 
 #[tokio::test]
 async fn viewer_routes_are_read_only_and_capability_scoped() {
-    let viewer = Viewer::start(HeadedOptions::default()).await.unwrap();
+    let viewer = Viewer::start(WebViewerOptions::default()).await.unwrap();
     let html = get(&viewer.url, "GET", "", "").await;
     assert!(html.starts_with("HTTP/1.1 200"));
     assert!(html.contains("Page rendered by Obscura"));
@@ -29,7 +29,7 @@ async fn viewer_routes_are_read_only_and_capability_scoped() {
 
 #[tokio::test]
 async fn viewer_frames_are_requested_from_the_owner_and_listener_stops_on_drop() {
-    let mut viewer = Viewer::start(HeadedOptions::default()).await.unwrap();
+    let mut viewer = Viewer::start(WebViewerOptions::default()).await.unwrap();
     let url = viewer.url.clone();
     let fetch = tokio::spawn(async move { get(&url, "GET", "frame", "").await });
     let request = viewer.requests.recv().await.unwrap();
@@ -45,7 +45,7 @@ async fn viewer_frames_are_requested_from_the_owner_and_listener_stops_on_drop()
 
 #[tokio::test]
 async fn viewer_bounds_pending_frames_without_blocking_its_listener() {
-    let mut viewer = Viewer::start(HeadedOptions::default()).await.unwrap();
+    let mut viewer = Viewer::start(WebViewerOptions::default()).await.unwrap();
     let mut requests = tokio::task::JoinSet::new();
     for _ in 0..9 {
         let url = viewer.url.clone();
@@ -69,14 +69,14 @@ fn json_frame() -> Value {
 #[tokio::test]
 async fn independent_viewers_have_unique_urls_and_clean_up_only_their_ready_file() {
     let ready_file = std::env::temp_dir().join(format!("obscura-viewer-{}", uuid::Uuid::new_v4()));
-    let viewer = Viewer::start(HeadedOptions { port: 0, ready_file: Some(ready_file.clone()) }).await.unwrap();
-    let second = Viewer::start(HeadedOptions::default()).await.unwrap();
+    let viewer = Viewer::start(WebViewerOptions { port: 0, ready_file: Some(ready_file.clone()) }).await.unwrap();
+    let second = Viewer::start(WebViewerOptions::default()).await.unwrap();
     assert_ne!(viewer.url, second.url);
     assert_eq!(std::fs::read_to_string(&ready_file).unwrap(), viewer.url);
-    assert!(Viewer::start(HeadedOptions { port: 0, ready_file: Some(ready_file.clone()) }).await.is_err());
+    assert!(Viewer::start(WebViewerOptions { port: 0, ready_file: Some(ready_file.clone()) }).await.is_err());
     drop(viewer);
     assert!(!ready_file.exists());
-    let viewer = Viewer::start(HeadedOptions { port: 0, ready_file: Some(ready_file.clone()) }).await.unwrap();
+    let viewer = Viewer::start(WebViewerOptions { port: 0, ready_file: Some(ready_file.clone()) }).await.unwrap();
     std::fs::write(&ready_file, "replacement").unwrap();
     drop(viewer);
     assert_eq!(std::fs::read_to_string(&ready_file).unwrap(), "replacement");
@@ -118,5 +118,10 @@ async fn viewer_tool_reports_only_its_own_session_url() {
     assert_eq!(disabled["isError"], true);
     state.viewer_url = Some("http://127.0.0.1:1234/test/".into());
     let enabled = crate::handle_tool_call(Value::from(2), &params, &mut state).await.result.unwrap();
-    assert_eq!(enabled["content"][0]["text"], state.viewer_url.unwrap());
+    assert_eq!(enabled["content"][0]["text"], state.viewer_url.as_ref().unwrap().as_str());
+    state.native_window = Some(1234);
+    let native = crate::handle_tool_call(Value::from(3), &params, &mut state).await.result.unwrap();
+    let metadata: Value = serde_json::from_str(native["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["mode"], "native");
+    assert_eq!(metadata["pid"], 1234);
 }

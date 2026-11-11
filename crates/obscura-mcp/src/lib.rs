@@ -6,8 +6,9 @@
 pub mod http;
 mod stdio;
 mod viewer;
+pub mod native;
 
-pub use stdio::{run_with_options, HeadedOptions};
+pub use stdio::{run_with_options, RunOptions, WebViewerOptions};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,6 +84,7 @@ pub struct BrowserState {
     interactive_refs: HashMap<String, NodeId>,
     ref_generation: u64,
     viewer_url: Option<String>,
+    native_window: Option<u32>,
 }
 
 impl BrowserState {
@@ -110,6 +112,7 @@ impl BrowserState {
             interactive_refs: HashMap::new(),
             ref_generation: 0,
             viewer_url: None,
+            native_window: None,
         }
     }
 
@@ -257,7 +260,7 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
 }
 
 pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
-    run_with_options(proxy, user_agent, stealth, None).await
+    run_with_options(proxy, user_agent, stealth, RunOptions::default()).await
 }
 
 fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
@@ -673,7 +676,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
         tools.extend([
             json!({
                 "name": "browser_viewer",
-                "description": "Get the local read-only viewer URL for this MCP session. Requires starting the server with --headed.",
+                "description": "Get this session's native window information or local web viewer URL. Requires --headed or --web-viewer.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
             }),
             json!({
@@ -757,7 +760,10 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         #[cfg(feature = "render")]
         "browser_viewer" => {
             validate_tool_options(args, &[]).and_then(|()| {
-                state.viewer_url.clone().ok_or_else(|| "viewer is disabled; start obscura mcp --headed".into())
+                if let Some(process_id) = state.native_window {
+                    return Ok(json!({ "mode": "native", "pid": process_id }).to_string());
+                }
+                state.viewer_url.clone().ok_or_else(|| "viewer is disabled; start obscura mcp --headed or --web-viewer".into())
             })
         }
         "browser_navigate" => tool_navigate(args, state).await,

@@ -15,10 +15,11 @@ import urllib.request
 
 
 class Session:
-    def __init__(self, binary, ready_file):
+    def __init__(self, binary, ready_file=None, is_native=False):
         self.errors = tempfile.TemporaryFile()
+        arguments = ['mcp', '--headed'] if is_native else ['mcp', '--web-viewer', '--viewer-ready-file', str(ready_file)]
         self.process = subprocess.Popen(
-            [binary, 'mcp', '--headed', '--viewer-ready-file', str(ready_file)],
+            [binary, *arguments],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errors,
             start_new_session=True,
         )

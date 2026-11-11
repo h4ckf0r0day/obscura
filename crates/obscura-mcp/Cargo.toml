@@ -9,6 +9,7 @@ repository.workspace = true
 default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 render = ["obscura-browser/render", "dep:base64"]
+headed = ["render", "dep:obscura-cdp", "dep:winit", "dep:softbuffer"]
 
 [dependencies]
 obscura-browser = { workspace = true }
@@ -22,3 +23,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true, optional = true }
 uuid = { workspace = true }
+obscura-cdp = { workspace = true, optional = true }
+winit = { version = "0.30.13", optional = true }
+softbuffer = { version = "0.4.8", optional = true, default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }

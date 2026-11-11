@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::{BrowserState, HeadedOptions};
+use crate::{BrowserState, WebViewerOptions};
 
 pub(crate) type FrameRequest = oneshot::Sender<Result<Value, String>>;
 
@@ -26,7 +26,7 @@ pub(crate) struct Viewer {
 }
 
 impl Viewer {
-    pub async fn start(options: HeadedOptions) -> Result<Self> {
+    pub async fn start(options: WebViewerOptions) -> Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, options.port)).await?;
         let authority = listener.local_addr()?.to_string();
         let route = format!("/{}/", uuid::Uuid::new_v4().simple());
@@ -111,6 +111,6 @@ pub(crate) fn capture(state: &mut BrowserState) -> Result<Value, String> {
     #[cfg(not(feature = "render"))]
     {
         let _ = state;
-        Err("--headed requires a render-enabled Obscura build".into())
+        Err("--web-viewer requires a render-enabled Obscura build".into())
     }
 }

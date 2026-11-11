@@ -3,32 +3,42 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{dispatch, viewer, BrowserState, RpcMessage};
+use crate::{dispatch, native, viewer, BrowserState, RpcMessage};
 
 #[derive(Default)]
-pub struct HeadedOptions {
+pub struct WebViewerOptions {
     /// Zero chooses an available loopback port, allowing independent agents.
     pub port: u16,
     /// Created exclusively and removed on a graceful exit.
     pub ready_file: Option<PathBuf>,
 }
 
+#[derive(Default)]
+pub struct RunOptions {
+    /// Native mode uses the Obscura CLI's private window entry point.
+    pub headed: bool,
+    pub web_viewer: Option<WebViewerOptions>,
+}
+
 pub async fn run_with_options(
     proxy: Option<String>,
     user_agent: Option<String>,
     stealth: bool,
-    headed: Option<HeadedOptions>,
+    options: RunOptions,
 ) -> Result<()> {
-    if headed.is_some() && !cfg!(feature = "render") {
-        anyhow::bail!("--headed requires a render-enabled Obscura build");
+    anyhow::ensure!(!options.headed || options.web_viewer.is_none(), "choose --headed or --web-viewer");
+    if options.web_viewer.is_some() && !cfg!(feature = "render") {
+        anyhow::bail!("--web-viewer requires a render-enabled Obscura build");
     }
-    let mut viewer = match headed {
+    let mut native = if options.headed { Some(native::start().await?) } else { None };
+    let mut viewer = match options.web_viewer {
         Some(options) => Some(viewer::Viewer::start(options).await?),
         None => None,
     };
     let mut state = BrowserState::new(proxy, user_agent, stealth);
     state.operator_network_hints = true;
     state.viewer_url = viewer.as_ref().map(|viewer| viewer.url.clone());
+    state.native_window = native.as_ref().and_then(native::process_id);
     let mut reader = BufReader::new(tokio::io::stdin()).lines();
     let mut writer = tokio::io::stdout();
     let mut runtime_pump_armed = false;
@@ -37,6 +47,7 @@ pub async fn run_with_options(
         enum Wake {
             Line(Option<String>),
             Frame(viewer::FrameRequest),
+            Native(Option<native::Packet>),
             PageTurn(Result<bool, String>),
         }
         let wake = tokio::select! {
@@ -44,6 +55,7 @@ pub async fn run_with_options(
             // next_line retains partial input when a frame or page task wins.
             line = reader.next_line() => Wake::Line(line?),
             request = viewer::next_request(&mut viewer) => Wake::Frame(request),
+            packet = native::next_packet(&mut native) => Wake::Native(packet),
             result = async { state.page_mut().run_autonomous_event_loop_turn().await }, if runtime_pump_armed => {
                 Wake::PageTurn(result)
             }
@@ -53,6 +65,20 @@ pub async fn run_with_options(
             Wake::Line(None) => {
                 state.context.save_storage();
                 return Ok(());
+            }
+            Wake::Native(Some(packet)) => {
+                if let Some(client) = native.as_mut() {
+                    if let Err(error) = native::apply(client, packet, &mut state).await {
+                        eprintln!("Native window action failed: {error}");
+                    }
+                }
+                runtime_pump_armed = state.has_active_page_runtime();
+                continue;
+            }
+            Wake::Native(None) => {
+                native = None;
+                state.native_window = None;
+                continue;
             }
             Wake::Frame(request) => {
                 if !request.is_closed() {
@@ -92,8 +118,17 @@ pub async fn run_with_options(
 #[cfg(all(test, not(feature = "render")))]
 mod tests {
     #[tokio::test]
-    async fn headed_rejects_no_render_before_starting_a_session() {
-        let result = super::run_with_options(None, None, false, Some(super::HeadedOptions::default())).await;
+    async fn web_viewer_rejects_no_render_before_starting_a_session() {
+        let result = super::run_with_options(None, None, false, super::RunOptions { headed: false, web_viewer: Some(super::WebViewerOptions::default()) }).await;
         assert!(result.unwrap_err().to_string().contains("render-enabled"));
+    }
+}
+
+#[cfg(all(test, not(feature = "headed")))]
+mod native_tests {
+    #[tokio::test]
+    async fn native_window_requires_the_opt_in_feature() {
+        let result = super::run_with_options(None, None, false, super::RunOptions { headed: true, web_viewer: None }).await;
+        assert!(result.unwrap_err().to_string().contains("headed feature"));
     }
 }
