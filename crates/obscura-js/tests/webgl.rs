@@ -29,6 +29,32 @@ fn runtime() -> ObscuraJsRuntime {
 }
 
 #[test]
+fn unavailable_egl_backend_returns_null_and_exits_cleanly() {
+    // Nextest isolates this environment override in its own test process.
+    std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", "/nonexistent-obscura-egl-vendor.json");
+    let mut runtime = ObscuraJsRuntime::new();
+    runtime.set_dom(obscura_dom::parse_html("<canvas></canvas>"));
+    runtime.run_page_init();
+    assert_eq!(runtime.evaluate(r#"(() => {
+        const canvas=document.querySelector('canvas');
+        return [canvas.getContext('webgl'),canvas.getContext('webgl')];
+    })()"#).unwrap(), json!([null,null]));
+}
+
+#[test]
+fn context_cleanup_survives_owner_thread_exit_and_reinitialization() {
+    for _ in 0..3 {
+        std::thread::spawn(|| {
+            let mut runtime = runtime();
+            assert_eq!(runtime.evaluate(r#"(() => {
+                gl.clearColor(0.25,0.5,0.75,1); gl.clear(gl.COLOR_BUFFER_BIT);
+                return [pixel(),gl.getError()];
+            })()"#).unwrap(), json!([[64,128,191,255],0]));
+        }).join().expect("WebGL owner thread must exit cleanly");
+    }
+}
+
+#[test]
 fn context_reads_real_clear_pixels_and_preserves_context_mode() {
     let mut runtime = runtime();
     assert_eq!(runtime.evaluate(r#"(() => {

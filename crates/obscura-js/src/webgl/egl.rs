@@ -25,7 +25,25 @@ pub struct Display {
     destroy_surface: Destroy,
     terminate: Terminate,
     get_proc_address: GetProcAddress,
-    libraries: [Library; 2],
+    libraries: Arc<[Library; 2]>,
+}
+
+fn shared_libraries() -> Result<Arc<[Library; 2]>, String> {
+    // EGL can register thread-exit callbacks even if initialization fails.
+    // Keep the libraries mapped after page/display cleanup so those callbacks
+    // remain callable. Only this pair of loader handles is retained globally.
+    static LIBRARIES: OnceLock<Mutex<Option<Arc<[Library; 2]>>>> = OnceLock::new();
+    let mut shared = LIBRARIES.get_or_init(|| Mutex::new(None))
+        .lock().map_err(|_| "EGL library lock poisoned")?;
+    if let Some(libraries) = shared.as_ref() {
+        return Ok(Arc::clone(libraries));
+    }
+    let libraries = Arc::new(unsafe {
+        [Library::new("libEGL.so.1").map_err(|error| error.to_string())?,
+         Library::new("libGLESv2.so.2").map_err(|error| error.to_string())?]
+    });
+    *shared = Some(Arc::clone(&libraries));
+    Ok(libraries)
 }
 
 impl Display {
@@ -42,8 +60,8 @@ impl Display {
     }
 
     unsafe fn load() -> Result<Self, String> {
-        let egl = Library::new("libEGL.so.1").map_err(|error| error.to_string())?;
-        let gles = Library::new("libGLESv2.so.2").map_err(|error| error.to_string())?;
+        let libraries = shared_libraries()?;
+        let egl = &libraries[0];
         macro_rules! symbol {
             ($name:literal, $kind:ty) => {
                 *egl.get::<$kind>(concat!($name, "\0").as_bytes())
@@ -88,7 +106,7 @@ impl Display {
             destroy_surface: symbol!("eglDestroySurface", Destroy),
             terminate,
             get_proc_address,
-            libraries: [egl, gles],
+            libraries,
         })
     }
 }
