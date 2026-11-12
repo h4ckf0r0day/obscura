@@ -14868,7 +14868,11 @@ function _optionIndexGetter() {
 }
 Object.defineProperties(HTMLSelectElement.prototype, {
   length: {
-    get() { return _selectOptions(this).length; },
+    get() {
+      return this && _nodeCacheGet(this._nid) === this
+        ? _selectApply(_selectIndexedSnapshot, this, []).length
+        : _selectOptions(this).length;
+    },
     set(value) {
       _selectApply(_validateSelect, this, []);
       const length = +value >>> 0;

@@ -5174,6 +5174,55 @@ mod tests {
     }
 
     #[test]
+    fn select_length_snapshot_stays_live_and_private() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><optgroup><option>B</option></optgroup></select><select id='other'></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.getElementById('s');
+            const other = document.getElementById('other');
+            const counts = [select.length, select.length];
+            const exposed = select.options;
+            exposed.length = 0;
+            counts.push(select.length);
+            other.append(select.item(0));
+            counts.push(select.length, other.length);
+            const group = select.querySelector('optgroup');
+            group.append(new Option('C'));
+            counts.push(select.length);
+            group.replaceWith(new Option('D'));
+            counts.push(select.length);
+            const nested = document.createElement('select');
+            nested.append(new Option('hidden'));
+            select.append(nested);
+            const datalist = document.createElement('datalist');
+            datalist.append(new Option('suggested'));
+            select.append(datalist);
+            counts.push(select.length);
+            select.innerHTML = '<option>E</option><option>F</option>';
+            counts.push(select.length, select[1].text);
+            select.length = 0;
+            counts.push(select.length, select[0] === undefined);
+            select.remove();
+            select.append(new Option('detached'));
+            counts.push(select.length, select[0].text);
+            return counts;
+        })()"#).unwrap(), serde_json::json!([2,2,2,1,1,2,1,1,2,"F",0,true,1,"detached"]));
+    }
+
+    #[test]
+    fn select_length_snapshot_observes_native_dom_mutations() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><option id='b'>B</option></select></body></html>");
+        assert_eq!(rt.evaluate("(() => { globalThis.savedSelect = document.getElementById('s'); return savedSelect.length; })()")
+            .unwrap(), serde_json::json!(2.0));
+        {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            dom.remove_child(dom.query_selector("#b").unwrap().unwrap());
+        }
+        assert_eq!(rt.evaluate("[savedSelect.length, savedSelect[1] === undefined]").unwrap(),
+            serde_json::json!([1,true]));
+    }
+
+    #[test]
     fn select_add_respects_group_parents_and_union_conversions() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"(() => {
