@@ -137,10 +137,31 @@ fn modifier_flags(modifiers: u64) -> (bool, bool, bool, bool) {
     )
 }
 
-pub async fn handle(
+/// A page source shared by CDP sessions and the native MCP window.
+pub trait InputTarget {
+    fn get_session_page_mut(&mut self, session_id: &Option<String>) -> Option<&mut obscura_browser::Page>;
+    fn same_document_navigation(&mut self, _session_id: &Option<String>, _frame_id: &str, _url: &str) {}
+}
+
+impl InputTarget for CdpContext {
+    fn get_session_page_mut(&mut self, session_id: &Option<String>) -> Option<&mut obscura_browser::Page> {
+        CdpContext::get_session_page_mut(self, session_id)
+    }
+    fn same_document_navigation(&mut self, session_id: &Option<String>, frame_id: &str, url: &str) {
+        crate::domains::page::emit_same_document_navigation(self, session_id, frame_id, url);
+    }
+}
+
+impl InputTarget for obscura_browser::Page {
+    fn get_session_page_mut(&mut self, _session_id: &Option<String>) -> Option<&mut obscura_browser::Page> {
+        Some(self)
+    }
+}
+
+pub async fn handle<T: InputTarget>(
     method: &str,
     params: &Value,
-    ctx: &mut CdpContext,
+    ctx: &mut T,
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
@@ -347,7 +368,7 @@ pub async fn handle(
                     None
                 };
                 if let Some((frame_id, url)) = moved_frame {
-                    crate::domains::page::emit_same_document_navigation(ctx, session_id, &frame_id, &url);
+                    ctx.same_document_navigation(session_id, &frame_id, &url);
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);

@@ -221,6 +221,22 @@ enum Command {
     },
 
     Mcp {
+        /// Open a native application window for the active stdio MCP page.
+        #[arg(long, hide = !cfg!(feature = "headed"), conflicts_with_all = ["http", "web_viewer"])]
+        headed: bool,
+
+        /// Show the same page in a local read-only browser viewer.
+        #[arg(long, conflicts_with = "http")]
+        web_viewer: bool,
+
+        /// Local viewer port (0 selects an available port per process).
+        #[arg(long, default_value_t = 0, requires = "web_viewer")]
+        viewer_port: u16,
+
+        /// Write the viewer URL here until this process exits.
+        #[arg(long, requires = "web_viewer", value_name = "PATH")]
+        viewer_ready_file: Option<std::path::PathBuf>,
+
         /// Recursively load additional font files before the first render.
         #[arg(long = "font-dir", value_name = "DIR")]
         font_dirs: Vec<std::path::PathBuf>,
@@ -377,6 +393,12 @@ fn effective_v8_flags(user: Option<&str>) -> String {
 const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "headed")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__native_window"))
+        && std::env::var_os("OBSCURA_NATIVE_CHILD").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        return obscura_mcp::native::run_window();
+    }
     std::thread::Builder::new()
         .name("obscura-main".to_string())
         // V8 derives its stack guard from the current native thread. Deep but
@@ -648,6 +670,10 @@ async fn run_cli() -> anyhow::Result<()> {
             .await?;
         }
         Some(Command::Mcp {
+            headed,
+            web_viewer,
+            viewer_port,
+            viewer_ready_file,
             font_dirs,
             http,
             host,
@@ -669,7 +695,12 @@ async fn run_cli() -> anyhow::Result<()> {
             if http {
                 obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
             } else {
-                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
+                let viewer = web_viewer.then_some(obscura_mcp::WebViewerOptions {
+                    port: viewer_port,
+                    ready_file: viewer_ready_file,
+                });
+                let options = obscura_mcp::RunOptions { headed, web_viewer: viewer };
+                obscura_mcp::run_with_options(mcp_proxy, user_agent, stealth, options).await?;
             }
         }
         None => {
@@ -2781,6 +2812,16 @@ mod tests {
             ),
             _ => panic!("expected Serve command"),
         }
+    }
+
+    #[test]
+    fn parsed_mcp_headed_requires_stdio_and_scopes_viewer_options() {
+        assert!(Args::try_parse_from(["obscura", "mcp", "--headed"]).is_ok());
+        assert!(Args::try_parse_from(["obscura", "mcp", "--web-viewer", "--viewer-port", "8080"]).is_ok());
+        assert!(Args::try_parse_from(["obscura", "mcp", "--web-viewer", "--headed"]).is_err());
+        assert!(Args::try_parse_from(["obscura", "mcp", "--headed", "--http"]).is_err());
+        assert!(Args::try_parse_from(["obscura", "mcp", "--viewer-port", "8080"]).is_err());
+        assert!(Args::try_parse_from(["obscura", "mcp", "--viewer-ready-file", "/tmp/viewer.url"]).is_err());
     }
 
     #[test]

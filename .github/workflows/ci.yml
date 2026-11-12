@@ -171,6 +171,24 @@ jobs:
       - name: Build render release
         run: cargo build --release -p obscura-cli --bins --features render
 
+      - name: Verify same-session headed MCP viewer
+        env:
+          OBSCURA_BIN: ${{ github.workspace }}/target/release/obscura
+        run: python3 render-repros/headed/repro.py
+
+      - name: Install native window test libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxkbcommon-x11-0 libxcb-xkb1 libxtst6
+
+      - name: Build native headed mode
+        run: cargo build --release -p obscura-cli --bins --features headed
+
+      - name: Verify native OS input and pixels
+        env:
+          OBSCURA_BIN: ${{ github.workspace }}/target/release/obscura
+        run: xvfb-run -a python3 render-repros/headed/native.py
+
       - name: Test render configuration
         run: cargo nextest run --release --features render --no-fail-fast
 

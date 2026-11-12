@@ -4,6 +4,11 @@
 #![recursion_limit = "512"]
 
 pub mod http;
+mod stdio;
+mod viewer;
+pub mod native;
+
+pub use stdio::{run_with_options, RunOptions, WebViewerOptions};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +20,6 @@ use obscura_browser::{BrowserContext, Page};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Cap on text returned to the agent unless the caller passes a larger
 /// `max_chars`. Agents waste context on multi-KB raw page dumps; this
@@ -79,6 +83,8 @@ pub struct BrowserState {
     /// the next snapshot call.
     interactive_refs: HashMap<String, NodeId>,
     ref_generation: u64,
+    viewer_url: Option<String>,
+    native_window: Option<u32>,
 }
 
 impl BrowserState {
@@ -105,6 +111,8 @@ impl BrowserState {
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
             ref_generation: 0,
+            viewer_url: None,
+            native_window: None,
         }
     }
 
@@ -252,74 +260,7 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
 }
 
 pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut writer = stdout;
-
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
-    state.operator_network_hints = true;
-    // Cookies and Web Storage are written on every navigation; this covers the
-    // writes an agent makes after a page has settled, on the way out.
-    let mut runtime_pump_armed = false;
-
-    loop {
-        // MCP stdio transport: newline-delimited JSON (one message per line)
-        let mut line = String::new();
-        let n = if runtime_pump_armed {
-            tokio::select! {
-                biased;
-                read = reader.read_line(&mut line) => Some(read?),
-                pump_result = state.page_mut().run_autonomous_event_loop_turn() => {
-                    let pump_result = match pump_result {
-                        Ok(reached_idle) => state.finish_active_page_turn(reached_idle).await,
-                        Err(error) => Err(error),
-                    };
-                    match pump_result {
-                        Ok(reached_idle) => runtime_pump_armed = !reached_idle,
-                        Err(error) => {
-                            runtime_pump_armed = false;
-                            eprintln!("MCP page task failed: {error}");
-                        }
-                    }
-                    None
-                }
-            }
-        } else {
-            Some(reader.read_line(&mut line).await?)
-        };
-        let Some(n) = n else {
-            continue;
-        };
-        if n == 0 {
-            state.context.save_storage();
-            return Ok(());
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let msg: RpcMessage = match serde_json::from_str(trimmed) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Notifications (no id) need no response
-        if msg.id.is_none() {
-            continue;
-        }
-
-        let id = msg.id.clone().unwrap_or(Value::Null);
-        let response = dispatch(&msg.method, id, &msg.params, &mut state).await;
-        runtime_pump_armed = state.has_active_page_runtime();
-
-        let mut body = serde_json::to_string(&response)?;
-        body.push('\n');
-        writer.write_all(body.as_bytes()).await?;
-        writer.flush().await?;
-    }
+    run_with_options(proxy, user_agent, stealth, RunOptions::default()).await
 }
 
 fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
@@ -734,6 +675,11 @@ fn handle_tools_list(id: Value) -> RpcResponse {
     {
         tools.extend([
             json!({
+                "name": "browser_viewer",
+                "description": "Get this session's native window information or local web viewer URL. Requires --headed or --web-viewer.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            }),
+            json!({
                 "name": "browser_screenshot",
                 "description": "Capture the current rendered viewport as a PNG image. Width and height default to the page's current CSS viewport.",
                 "inputSchema": {
@@ -811,6 +757,15 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
     }
 
     let result = match name {
+        #[cfg(feature = "render")]
+        "browser_viewer" => {
+            validate_tool_options(args, &[]).and_then(|()| {
+                if let Some(process_id) = state.native_window {
+                    return Ok(json!({ "mode": "native", "pid": process_id }).to_string());
+                }
+                state.viewer_url.clone().ok_or_else(|| "viewer is disabled; start obscura mcp --headed or --web-viewer".into())
+            })
+        }
         "browser_navigate" => tool_navigate(args, state).await,
         "browser_snapshot" => tool_snapshot(args, state),
         "browser_click" => tool_click(args, state).await,
@@ -2438,6 +2393,7 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[tokio::test(flavor = "current_thread")]
     async fn tab_switch_preserves_globals_listeners_and_pending_promises() {

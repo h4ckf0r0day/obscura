@@ -20,6 +20,13 @@ Stdio (default, for direct client integration):
 obscura mcp
 ```
 
+With a desktop-enabled build (`--features headed`), `obscura mcp --headed`
+opens a native application window for the same page. Mouse, keyboard, scroll,
+and resize act on the MCP-owned page. `obscura mcp --web-viewer` instead starts
+a read-only local web viewer. The `browser_viewer` tool returns native window
+metadata or the web viewer URL. See [Watch agent sessions live](Watch-agent-sessions-live.md)
+for build requirements, display support, lifecycle, and minimal reproductions.
+
 HTTP (for remote or shared use):
 
 ```bash
@@ -117,6 +124,9 @@ Visual output (render-enabled builds):
 
 - `browser_screenshot`: current viewport as an MCP `image/png` content block.
 - `browser_pdf`: current page as an embedded `application/pdf` resource.
+- `browser_viewer`: native window metadata (`mode`, `pid`) with `--headed`, or
+  the local viewer URL with `--web-viewer`. It reports an error if no display
+  mode is active and does not start a second browser session.
 
 `browser_screenshot` accepts optional positive `width` and `height` values in
 CSS pixels and enforces a bounded capture size. `browser_pdf` accepts
@@ -155,8 +165,9 @@ listing invalidates the previous tokens. A reference targets the original
 native element, not a replacement or clone that copies its attributes; stale
 references return a tool error instead of acting on a different element.
 
-MCP exposes still-image and PDF output. It does not stream video frames; use
-CDP `Page.startScreencast` for activity-driven screencasting.
+MCP tool responses expose still-image and PDF output. The optional native
+window and web viewer display the same page outside the MCP transport; use CDP
+`Page.startScreencast` for activity-driven screencasting of CDP-owned pages.
 
 ## Web search (optional)
 
