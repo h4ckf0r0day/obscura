@@ -12,6 +12,7 @@ default = ["api"]
 api = ["obscura-browser", "obscura-net", "tokio"]
 stealth = ["api", "obscura-browser/stealth"]
 render = ["api", "obscura-browser/render"]
+webgl = ["render", "obscura-browser/webgl"]
 
 [dependencies]
 obscura-browser = { path = "../obscura-browser", optional = true }

@@ -311,6 +311,19 @@ impl RenderResourceCache {
         self.has_live_outcome(&image_resource_key(url, profile))
     }
 
+    /// Return only image bytes already loaded under the requested CORS and
+    /// credential identity. Texture uploads must never open another request.
+    pub fn cached_image_bytes(&self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
+        if url.starts_with("data:") {
+            let mut scratch = RenderResourceCache::with_loader_and_limits(|_url: &str| None, 0, 0);
+            return fetch_bytes(url, None, &mut scratch);
+        }
+        match self.entries.get(&image_resource_key(url, profile)) {
+            Some(CachedResource::Bytes { bytes, .. }) => Some(Arc::clone(bytes)),
+            _ => None,
+        }
+    }
+
     pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
         self.seed_shared(image_resource_key(&url, profile), Arc::from(bytes));
     }

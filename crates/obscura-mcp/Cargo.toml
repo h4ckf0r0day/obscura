@@ -9,6 +9,7 @@ repository.workspace = true
 default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 render = ["obscura-browser/render", "dep:base64"]
+webgl = ["render", "obscura-browser/webgl"]
 
 [dependencies]
 obscura-browser = { workspace = true }

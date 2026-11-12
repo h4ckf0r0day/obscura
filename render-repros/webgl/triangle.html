@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>body { margin: 0; background: white; }</style>
+<canvas width="160" height="160"></canvas>
+<script>
+const canvas = document.querySelector('canvas');
+const gl = canvas.getContext('webgl', {premultipliedAlpha: false});
+if (!gl) throw new Error('WebGL backend unavailable');
+const program = gl.createProgram();
+for (const [kind, source] of [
+  [gl.VERTEX_SHADER, 'attribute vec2 position;void main(){gl_Position=vec4(position,0.,1.);}'],
+  [gl.FRAGMENT_SHADER, 'precision mediump float;void main(){gl_FragColor=vec4(1.,0.,0.,1.);}']
+]) {
+  const shader = gl.createShader(kind);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+  gl.attachShader(program, shader);
+}
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+gl.useProgram(program);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const position = gl.getAttribLocation(program, 'position');
+gl.enableVertexAttribArray(position);
+gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+gl.drawArrays(gl.TRIANGLES, 0, 3);
+canvas.dataset.status = 'rendered';
+canvas.dataset.renderer = gl.getParameter(gl.RENDERER);
+</script>

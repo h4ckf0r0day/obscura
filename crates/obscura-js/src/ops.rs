@@ -625,6 +625,8 @@ pub struct ObscuraState {
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
+    #[cfg(feature = "webgl")]
+    pub(crate) webgl: crate::webgl::Registry,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
@@ -850,6 +852,8 @@ impl ObscuraState {
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
+            #[cfg(feature = "webgl")]
+            webgl: crate::webgl::Registry::default(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
@@ -8781,6 +8785,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    #[cfg(feature = "webgl")]
+    ops.extend(crate::webgl::ops::declarations());
     ops.push(op_frame_preload_scripts());
     Extension {
         name: "obscura_dom",
@@ -9365,7 +9371,7 @@ fn image_metadata_json(
 }
 
 #[cfg(feature = "render")]
-fn image_request_profile(dom: &DomTree, node_id: NodeId) -> ImageRequestProfile {
+pub(crate) fn image_request_profile(dom: &DomTree, node_id: NodeId) -> ImageRequestProfile {
     match dom
         .get_node(node_id)
         .and_then(|node| node.get_attribute("crossorigin").map(str::to_owned))

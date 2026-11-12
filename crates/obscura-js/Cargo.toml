@@ -15,6 +15,7 @@ stealth = ["obscura-net/stealth"]
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
 render = ["dep:obscura-render", "obscura-render/paint"]
+webgl = ["render", "dep:glow", "dep:libloading", "dep:image"]
 
 [build-dependencies]
 deno_core = "0.412"
@@ -53,3 +54,6 @@ hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
+glow = { version = "0.16", optional = true }
+libloading = { version = "0.8", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"], optional = true }

@@ -1371,6 +1371,8 @@ impl ObscuraJsRuntime {
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
+            #[cfg(feature = "webgl")]
+            gs.webgl.clear();
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -18623,6 +18625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "webgl"))]
     fn unavailable_webgl_context_does_not_claim_success() {
         let mut rt = setup_runtime("<html><body><canvas></canvas></body></html>");
         let result = rt
