@@ -9,6 +9,10 @@ use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
+pub(crate) const LIFECYCLE_PHASES: [&str; 5] = [
+    "commit", "DOMContentLoaded", "load", "networkAlmostIdle", "networkIdle",
+];
+
 #[cfg(feature = "render")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScreencastFormat {
@@ -89,6 +93,9 @@ pub struct CdpContext {
     pub runtime_enabled_sessions: HashSet<String>,
     /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
     pub(crate) lifecycle_enabled_sessions: HashSet<String>,
+    /// Reached phases of the current main-frame document, retained for late
+    /// subscribers even when no session was listening at completion time.
+    pub(crate) lifecycle_timestamps: HashMap<String, [Option<f64>; 5]>,
     // Legacy direct-embedder configuration. Protocol-created worlds live only
     // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
@@ -197,6 +204,7 @@ impl CdpContext {
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
+            lifecycle_timestamps: HashMap::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
@@ -268,6 +276,7 @@ impl CdpContext {
         self.pages.push(page);
         self.current_loader_ids
             .insert(page_id.clone(), format!("loader-blank-{page_id}"));
+        self.lifecycle_timestamps.insert(page_id.clone(), [Some(domains::page::timestamp()); 5]);
         Ok(page_id)
     }
 
@@ -357,6 +366,7 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.lifecycle_timestamps.remove(id);
         self.nav_events_emitted.remove(id);
         self.announced_frames.remove(id);
         self.binding_sessions.retain(|_, owners| {
@@ -416,13 +426,21 @@ impl CdpContext {
     }
 
     pub(crate) fn ensure_default_context(&mut self, page_id: &str) -> Option<ExecutionContextRecord> {
-        if let Some(context) = self.contexts_for_page(page_id).into_iter().find(|context| context.is_default) {
-            return Some(context.clone());
-        }
         let page = self.get_page(page_id)?;
         let frame_id = page.frame_id.clone();
         let origin = page.url_string();
-        Some(self.allocate_context(page_id, &frame_id, &origin, "", true))
+        Some(self.ensure_frame_default_context(page_id, &frame_id, &origin).0)
+    }
+
+    fn ensure_frame_default_context(
+        &mut self, page_id: &str, frame_id: &str, origin: &str,
+    ) -> (ExecutionContextRecord, bool) {
+        if let Some(context) = self.contexts_for_page(page_id)
+            .find(|context| context.is_default && context.frame_id == frame_id)
+        {
+            return (context.clone(), false);
+        }
+        (self.allocate_context(page_id, frame_id, origin, "", true), true)
     }
 
     /// The single hook for an installed replacement Document.
@@ -432,6 +450,7 @@ impl CdpContext {
         frame_id: &str,
         origin: &str,
     ) -> Vec<ExecutionContextRecord> {
+        self.announced_frames.remove(page_id);
         self.dom_documents.retain(|session, document| {
             if document.page_id != page_id { return true; }
             self.pending_events.push(CdpEvent {
@@ -504,8 +523,10 @@ impl CdpContext {
     }
 
     pub(crate) fn default_context_id(&self, page_id: &str) -> Option<i64> {
+        let frame_id = &self.get_page(page_id)?.frame_id;
         self.contexts_for_page(page_id)
-            .find(|context| context.is_default).map(|context| context.id)
+            .find(|context| context.is_default && &context.frame_id == frame_id)
+            .map(|context| context.id)
     }
 
     fn remove_frame_contexts(
@@ -916,6 +937,19 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
     let mut drained = Vec::new();
     for page in &mut ctx.pages {
         let runtime_events = page.take_pending_runtime_events();
+        for event in &runtime_events {
+            if let obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } = event {
+                if let Some(timings) = ctx.lifecycle_timestamps.get_mut(&page.id) {
+                    if name == "init" {
+                        // document.open() retains its loader but starts a new
+                        // document; its predecessor's completion is not replayable.
+                        timings[1..].fill(None);
+                    } else if let Some(index) = LIFECYCLE_PHASES.iter().position(|phase| phase == name) {
+                        timings[index] = Some(*timestamp);
+                    }
+                }
+            }
+        }
         if !runtime_events.is_empty() {
             drained.push((page.id.clone(), runtime_events));
         }
@@ -1109,6 +1143,7 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
     let mut events: Vec<CdpEvent> = Vec::new();
     let mut announced: HashMap<String, Vec<String>> = HashMap::new();
     let mut detached = Vec::new();
+    let mut frame_contexts = Vec::new();
     for page in &ctx.pages {
         let Some(session_ids) = page_to_sessions.get(&page.id) else {
             continue;
@@ -1125,6 +1160,10 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
                 continue;
             }
+            frame_contexts.push((
+                page.id.clone(), id.to_string(),
+                frame["url"].as_str().unwrap_or_default().to_string(),
+            ));
             for session_id in session_ids {
                 // Attach before navigate: a client builds its frame from the
                 // attach event and treats a navigation of a frame it has never
@@ -1160,6 +1199,33 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             }
         }
         announced.insert(page.id.clone(), live_ids);
+    }
+    for (page_id, frame_id, origin) in frame_contexts {
+        let (context, created) = ctx.ensure_frame_default_context(&page_id, &frame_id, &origin);
+        if created {
+            let mut contexts = vec![context];
+            let mut worlds = ctx.isolated_worlds.clone();
+            if let Some(page_worlds) = ctx.page_isolated_worlds.get(&page_id) {
+                for world in page_worlds {
+                    if !worlds.contains(world) { worlds.push(world.clone()); }
+                }
+            }
+            for world in worlds {
+                if world.is_empty() { continue; }
+                let (context, _) = ctx.create_isolated_context(
+                    &page_id, &frame_id, &origin, &world, false,
+                );
+                contexts.push(context);
+            }
+            let sessions = ctx.runtime_sessions_for_page(&page_id);
+            for context in contexts {
+                for session_id in &sessions {
+                    events.push(crate::domains::runtime::execution_context_created_event(
+                        &context, Some(session_id.clone()),
+                    ));
+                }
+            }
+        }
     }
     for (page_id, frame_id, page_sessions) in detached {
         let removed = ctx.remove_frame_contexts(&page_id, &frame_id);
@@ -1269,6 +1335,7 @@ mod tests {
         ctx.binding_sessions.insert("shared".into(), vec!["s1".into(), "other".into()]);
         ctx.remove_page(&page_id);
         assert!(ctx.nav_events_emitted.is_empty());
+        assert!(ctx.lifecycle_timestamps.is_empty());
         assert!(!ctx.binding_sessions.contains_key("only"));
         assert_eq!(ctx.binding_sessions["shared"], vec!["other".to_string()]);
     }

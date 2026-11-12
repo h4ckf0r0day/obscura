@@ -1,5 +1,9 @@
 `--dump markdown` converts the rendered page to markdown.
 
+Extraction switches to an iterative tree walk for deep subtrees, so deeply
+nested DOMs do not exhaust the JavaScript call stack. Nested table cells are
+converted once and reused when assembling their rows.
+
 ```bash
 obscura fetch https://example.com --dump markdown
 ```
@@ -21,7 +25,9 @@ obscura fetch https://example.com --dump markdown
 - `<script>`, `<style>`, `<noscript>`
 - Inline styles
 - ARIA attributes
-- Tracking pixels and beacons
+
+Images are converted without checking their dimensions or purpose. Tracking
+pixel URLs can remain in the output.
 
 ## Save to file
 
@@ -35,7 +41,8 @@ obscura fetch https://docs.example.com/page --dump markdown -o page.md
 obscura fetch https://docs.example.com/page --dump markdown --quiet
 ```
 
-`--quiet` strips info logging so the output is just markdown.
+`--quiet` suppresses logs. Progress messages and logs use stderr; Markdown uses
+stdout. `--verbose` or `RUST_LOG` can override the log filter.
 
 ## Wait for SPA content
 
@@ -45,13 +52,15 @@ For pages that render content client-side:
 obscura fetch https://my-spa.example --wait-until load --dump markdown
 ```
 
-## Narrow to a region
+## Wait for an element
 
-`--selector` restricts the conversion to a CSS selector:
+`--selector` waits for an element before reading the page. It does not restrict
+Markdown conversion to that element:
 
 ```bash
 obscura fetch https://example.com --selector "main" --dump markdown
 obscura fetch https://example.com --selector "article.post" --dump markdown
 ```
 
-Useful for skipping nav, sidebars, and footers.
+To extract a single region, use `--eval` to read its text or HTML, or use the
+[structured extraction tools](Use-the-MCP-server.md#tools-exposed) in MCP.

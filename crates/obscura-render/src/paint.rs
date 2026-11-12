@@ -2945,6 +2945,20 @@ pub fn prepare_dom_with_retained_styles_at_animation_time(
     )
 }
 
+fn cached_custom_properties_ignore_attributes(
+    previous: &PreparedRender,
+    mutations: &[crate::dom::RetainedStyleMutation],
+) -> bool {
+    mutations.iter().all(|mutation| {
+        let crate::dom::RetainedStyleMutation::Attribute(attribute) = mutation else { return true; };
+        previous.layout.custom_properties.get(&attribute.node).is_none_or(|properties| {
+            properties.values().all(|value| {
+                !crate::css::declaration_value_reads_attribute(value, &attribute.name)
+            })
+        })
+    })
+}
+
 pub fn prepare_dom_with_retained_styles_with_animation_state(
     tree: &DomTree,
     viewport: (f32, f32),
@@ -2962,7 +2976,9 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         && previous.animation_sample.mode == crate::AnimationSampleMode::DocumentTime
         && animation_sample.mode == crate::AnimationSampleMode::DocumentTime
         && animation_sample.time.milliseconds >= previous.animation_sample.time.milliseconds;
-    if sample_changed && !forward_document_sample {
+    if (sample_changed && !forward_document_sample)
+        || !cached_custom_properties_ignore_attributes(&previous, mutations)
+    {
         drop(previous);
         return prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
             tree,
@@ -10748,7 +10764,7 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
             && values[3].is_finite()
             && values[2] > 0.0
             && values[3] > 0.0)
-            .then_some(values[2] / values[3])
+            .then(|| values[2] / values[3])
     });
     let ratio = match (width, height) {
         (Some(width), Some(height)) => Some(width / height),
@@ -12563,6 +12579,24 @@ mod tests {
     }
 
     #[test]
+    fn svg_image_metadata_ignores_short_view_box() {
+        // A viewBox with fewer than four numbers is invalid and gives no ratio;
+        // reading it must not index past the parsed values.
+        for view_box in ["0 0", "0 0 24", "24", ""] {
+            let svg = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='20' viewBox='{view_box}'/>"
+            );
+            if let Some(meta) = svg_image_intrinsic_metadata(svg.as_bytes()) {
+                assert_eq!(meta.ratio, Some(0.5), "viewBox {view_box:?}");
+            }
+            let svg = format!("<svg xmlns='http://www.w3.org/2000/svg' viewBox='{view_box}'/>");
+            if let Some(meta) = svg_image_intrinsic_metadata(svg.as_bytes()) {
+                assert_eq!(meta.ratio, None, "viewBox {view_box:?}");
+            }
+        }
+    }
+
+    #[test]
     fn view_box_only_svg_transfers_definite_css_width_without_using_view_box_units() {
         let square = br#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'/>"#;
         assert_eq!(
@@ -13105,6 +13139,67 @@ mod tests {
                 assert_eq!((rect.width, rect.height), expected, "{display} {sizing}");
             }
         }
+    }
+
+    #[test]
+    fn retained_content_tracks_attributes_read_through_inline_custom_properties() {
+        let mut failures = Vec::new();
+        for (binding, content_value, inline) in [
+            ("inline", "var(--label)", "--label:attr(data-label)"),
+            ("dynamic-inline", "var(--label)", "--key:data-label;--label:attr(var(--key))"),
+            ("dynamic-sheet", "attr(var(--key))", "--key:data-label"),
+        ] {
+            for shadow in [true, false] {
+                let content = format!(r#"<style>
+                    span {{ display:inline-block; font-size:24px }}
+                    span::before {{ content:{content_value} }}
+                    i {{ display:inline-block; width:12px; height:12px; background:red }}
+                    </style><span data-label="A" style="{inline}"></span><i></i>"#);
+                let html = if shadow {
+                    format!("<x-host id=host><template shadowrootmode=open>{content}</template></x-host>")
+                } else { content.to_string() };
+                let tree = parse_html(&html);
+                let root = if shadow {
+                    tree.shadow_root(tree.get_element_by_id("host").unwrap()).unwrap()
+                } else { tree.document() };
+                let target = tree.descendants(root).into_iter().find(|id| {
+                    tree.with_node(*id, |node| node.get_attribute("data-label").is_some()).unwrap_or(false)
+                }).unwrap();
+                let viewport = (400.0, 160.0);
+                let mut resources = RenderResourceCache::with_loader(|_: &str| None);
+                let mut cache = crate::css::StylesheetCache::default();
+                let mut previous = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+                    &tree, viewport, None, &mut resources, &[], &mut cache,
+                ).unwrap();
+                let before = paint_prepared(&tree, &mut previous, &mut resources, (0.0, 0.0)).unwrap();
+                tree.with_node_mut(target, |node| node.set_attribute("data-label", "Longer label".into()));
+                let mut retained = prepare_dom_with_retained_attribute_styles(
+                    &tree, viewport, None, &mut resources, &[], &mut cache, previous,
+                    &[crate::dom::AttributeStyleMutation {
+                        node: target, name: "data-label".into(), old_value: Some("A".into()),
+                        new_value: Some("Longer label".into()),
+                    }],
+                ).unwrap();
+                let mut oracle = prepare_dom(&tree, viewport, None, &mut resources).unwrap();
+                let expected = paint_prepared(&tree, &mut oracle, &mut resources, (0.0, 0.0)).unwrap();
+                let actual = paint_prepared(&tree, &mut retained, &mut resources, (0.0, 0.0)).unwrap();
+                if let Some(directory) = std::env::var_os("OBSCURA_RENDER_EVIDENCE_DIR") {
+                    let directory = std::path::PathBuf::from(directory);
+                    std::fs::create_dir_all(&directory).unwrap();
+                    let scope = format!("{}-{binding}", if shadow { "shadow" } else { "light" });
+                    before.save_png(directory.join(format!("initial-{scope}.png"))).unwrap();
+                    actual.save_png(directory.join(format!("actual-{scope}.png"))).unwrap();
+                    expected.save_png(directory.join(format!("oracle-{scope}.png"))).unwrap();
+                }
+                if binding == "inline" {
+                    assert!(before.data() != expected.data(), "fixture must change generated content: shadow={shadow}");
+                }
+                if retained.layout.rects != oracle.layout.rects || actual.data() != expected.data() {
+                    failures.push(format!("{binding}, shadow={shadow}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "stale generated content: {failures:?}");
     }
 
     #[test]

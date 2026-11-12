@@ -1,20 +1,45 @@
 //! Shared markdown extraction script used by the LP.getMarkdown CDP method
-//! and the CLI `--dump markdown` mode. Lives in obscura-browser so both
+//! and the CLI `--dump markdown` mode. Lives in obscura-js so both
 //! obscura-cdp and obscura-cli can call it without depending on each other.
 
 /// JS expression that walks `document.body` and returns a markdown string.
 /// Must be evaluated against a Page that has a fully-bootstrapped JS runtime.
 pub const HTML_TO_MARKDOWN_JS: &str = r#"
 (function() {
-    function toMd(el, depth) {
+    function toMd(el, depth, children, cells) {
         if (!el) return '';
-        var out = '';
         if (el.nodeType === 3) return el.textContent || '';
         if (el.nodeType !== 1) return '';
+        // Keep ordinary pages on the recursive fast path, with a bounded stack.
+        if (depth === 128) {
+            var stack = [{ node: el, kids: el.childNodes || [], index: 0, children: '', cells: [] }];
+            while (stack.length) {
+                var frame = stack[stack.length - 1];
+                if (frame.index < frame.kids.length) {
+                    var child = frame.kids[frame.index++];
+                    if (child.nodeType === 3) frame.children += child.textContent || '';
+                    else if (child.nodeType === 1) stack.push({ node: child, kids: child.childNodes || [], index: 0, children: '', cells: [] });
+                    continue;
+                }
+                var out = toMd(frame.node, -1, frame.children, frame.cells);
+                stack.pop();
+                if (!stack.length) return out;
+                var parent = stack[stack.length - 1];
+                parent.children += out;
+                parent.cells.push(out);
+            }
+        }
         var tag = (el.tagName || '').toLowerCase();
-        var children = '';
-        var cn = el.childNodes || [];
-        for (var i = 0; i < cn.length; i++) children += toMd(cn[i], depth);
+        if (depth !== -1) {
+            children = '';
+            cells = tag === 'tr' ? [] : null;
+            var cn = el.childNodes || [];
+            for (var i = 0; i < cn.length; i++) {
+                var converted = toMd(cn[i], depth + 1);
+                children += converted;
+                if (cells && cn[i].nodeType === 1) cells.push(converted);
+            }
+        }
         children = children.replace(/\n{3,}/g, '\n\n');
         switch(tag) {
             case 'h1': return '\n# ' + children.trim() + '\n\n';
@@ -42,18 +67,14 @@ pub const HTML_TO_MARKDOWN_JS: &str = r#"
             case 'ul': case 'ol':
                 return '\n' + children + '\n';
             case 'li':
-                var parent = el.parentNode;
-                var isOrdered = parent && parent.tagName && parent.tagName.toLowerCase() === 'ol';
+                var listParent = el.parentNode;
+                var isOrdered = listParent && listParent.tagName && listParent.tagName.toLowerCase() === 'ol';
                 var bullet = isOrdered ? '1. ' : '- ';
                 return bullet + children.trim() + '\n';
             case 'table': return '\n' + children + '\n';
             case 'thead': case 'tbody': case 'tfoot': return children;
             case 'tr':
-                var cells = [];
-                var tds = el.childNodes || [];
-                for (var j = 0; j < tds.length; j++) {
-                    if (tds[j].nodeType === 1) cells.push(toMd(tds[j], depth).trim());
-                }
+                for (var j = 0; j < cells.length; j++) cells[j] = cells[j].trim();
                 return '| ' + cells.join(' | ') + ' |\n';
             case 'th': case 'td': return children;
             case 'script': case 'style': case 'noscript': case 'link': case 'meta': return '';

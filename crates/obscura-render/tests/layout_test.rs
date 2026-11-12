@@ -2041,6 +2041,50 @@ fn absolute_inline_svg_keeps_percentage_width_and_view_box_ratio() {
     assert!((art.height - 160.0).abs() < 0.01, "viewBox ratio: {art:?}");
 }
 
+/// `span 0` is an invalid grid line (CSS Grid 1 section 8.3), so the
+/// declaration is ignored: the earlier placement wins, or the item stays
+/// auto-placed. Shopify themes reach it through
+/// `grid-column: span var(--menu-content-columns-desktop) / -1` with the
+/// variable at 0; that once gave taffy a zero-track grid area and aborted the
+/// whole page ("slice index starts at 13 but ends at 12").
+#[test]
+fn grid_placement_with_zero_span_is_ignored() {
+    let tree = parse_html(
+        r#"<html><head><style>
+             html,body{margin:0}
+             .grid{--n:0;display:grid;grid-template-columns:repeat(6,1fr);width:600px}
+             #literal{grid-column:span 0 / -1}
+             #variable{grid-column:span var(--n) / -1}
+             #kept{grid-column:2 / 4;grid-column:span 0 / -1}
+             #side{grid-column-start:3;grid-column-start:span 0}
+           </style></head><body>
+             <div class="grid"><div id="literal">x</div></div>
+             <div class="grid"><div id="variable">x</div></div>
+             <div class="grid"><div id="kept">x</div></div>
+             <div class="grid"><div id="side">x</div></div>
+           </body></html>"#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for id in ["literal", "variable"] {
+        let r = rect(id);
+        assert!(
+            r.x.abs() < 0.01 && (r.width - 100.0).abs() < 0.01,
+            "{id}: an ignored declaration leaves the item auto-placed in the first track: {r:?}"
+        );
+    }
+    let kept = rect("kept");
+    assert!(
+        (kept.x - 100.0).abs() < 0.01 && (kept.width - 200.0).abs() < 0.01,
+        "the earlier valid grid-column must win: {kept:?}"
+    );
+    let side = rect("side");
+    assert!(
+        (side.x - 200.0).abs() < 0.01 && (side.width - 100.0).abs() < 0.01,
+        "the earlier valid grid-column-start must win: {side:?}"
+    );
+}
+
 /// Chromium 150 includes collapsed descendant margins in a grid item's
 /// intrinsic block-size. The nested 64px margin reaches through `section`,
 /// making the first item 200px tall; the second row therefore begins after

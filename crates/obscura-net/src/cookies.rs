@@ -591,11 +591,19 @@ impl CookieJar {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
         let mut tmp = tempfile::NamedTempFile::new_in(
             path.parent().unwrap_or(std::path::Path::new(".")),
         )?;
+        // Cookie values are live session tokens. Do not depend on the tempfile
+        // crate's default mode for keeping them private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         tmp.write_all(json.as_bytes())?;
         tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
@@ -619,6 +627,21 @@ impl CookieJar {
         );
         Ok(count)
     }
+}
+
+/// Create `dir` and any missing parents. On unix, directories created here
+/// are owner-only (0700) because the cookie file inside holds session tokens.
+/// A directory that already exists keeps the mode its owner gave it. On
+/// Windows a new directory inherits the ACL of its parent.
+fn create_private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 impl Default for CookieJar {
@@ -653,7 +676,7 @@ struct PersistedCookie {
     host_only: Option<bool>,
 }
 
-fn parse_http_date(s: &str) -> Result<u64, ()> {
+pub(crate) fn parse_http_date(s: &str) -> Result<u64, ()> {
     let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
     let s = s.replace('-', " ");
@@ -1488,6 +1511,77 @@ mod tests {
         let header = jar2.get_cookie_header_same_site(&url);
         assert!(header.contains("session=abc123"));
         assert!(header.contains("token=xyz"));
+    }
+
+    #[test]
+    fn save_to_file_reports_an_uncreatable_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("session=abc123; Path=/", &url);
+
+        let result = jar.save_to_file(&blocker.join("profile").join("cookies.json"));
+        assert!(result.is_err(), "a save that cannot create its directory must fail");
+        assert!(!blocker.join("profile").exists());
+    }
+
+    #[cfg(unix)]
+    mod private_storage {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        fn jar_with_session() -> CookieJar {
+            let jar = CookieJar::new();
+            let url = Url::parse("https://example.com/").unwrap();
+            jar.set_cookie("session=abc123; Path=/", &url);
+            jar
+        }
+
+        #[test]
+        fn creates_directories_0700_and_file_0600() {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = tmp.path().join("profile");
+            let path = profile.join("nested").join("cookies.json");
+
+            jar_with_session().save_to_file(&path).unwrap();
+
+            assert_eq!(mode(&profile), 0o700);
+            assert_eq!(mode(&profile.join("nested")), 0o700);
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        #[test]
+        fn leaves_an_existing_directory_mode_alone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = tmp.path().join("profile");
+            std::fs::create_dir(&profile).unwrap();
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+            jar_with_session()
+                .save_to_file(&profile.join("cookies.json"))
+                .unwrap();
+
+            assert_eq!(mode(&profile), 0o750);
+        }
+
+        #[test]
+        fn tightens_a_cookie_file_left_world_readable() {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("cookies.json");
+            std::fs::write(&path, "[]").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            jar_with_session().save_to_file(&path).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+        }
     }
 
     #[test]

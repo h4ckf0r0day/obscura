@@ -43,8 +43,8 @@ Omit rendering with `cargo build --release -p obscura-cli --bins --no-default-fe
   (`tcp_options: "M1460,S,T,N,W10"`, window 64240) and macOS
   (`tcp_options: "M1460,N,W6,N,N,T,S,E,E"`, window 65535) produces a different
   passive fingerprint. Obscura operates in userspace and cannot override these
-  kernel defaults. If TCP/IP passive detection is a concern, run Obscura inside
-  a container or VM whose kernel matches the target fingerprint, or route
+  kernel defaults. If TCP/IP passive detection is a concern, run Obscura on a host or VM
+  with the required kernel, or route
   connections through a proxy whose TCP stack presents the desired profile.
 
 ## Proxies
@@ -75,7 +75,8 @@ obscura fetch https://example.com --user-agent "Mozilla/5.0 (...) ..."
 obscura serve --user-agent "Mozilla/5.0 (...) ..."
 ```
 
-Default UA matches a recent Chrome on the build platform.
+The default profile uses a Windows Chrome identity. `--user-agent` overrides
+the User-Agent; it does not change the host operating system or TLS profile.
 
 ## Browser profile, timezone, and geolocation
 

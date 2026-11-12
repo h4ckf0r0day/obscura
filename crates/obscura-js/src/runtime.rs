@@ -239,6 +239,8 @@ pub enum CdpEvaluation {
 pub struct PendingCdpEvaluation {
     object_id: String,
     recipe: Option<String>,
+    // A numeric frame id can be reused after its realm is retired.
+    frame: Option<(u32, v8::Global<v8::Context>)>,
 }
 
 /// CDP remote objects that can be rebuilt when a page's V8 runtime is
@@ -255,9 +257,15 @@ pub struct CdpObjectState {
     evaluation_recipes: HashMap<String, String>,
 }
 
+struct CdpObjectRecord {
+    retrieval: String,
+    // The evaluation world can differ from the value's creation realm.
+    frame: Option<(u32, v8::Global<v8::Context>)>,
+}
+
 pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
-    object_store: HashMap<String, String>,
+    object_store: HashMap<String, CdpObjectRecord>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
     import_map: Rc<RefCell<ImportMap>>,
@@ -797,8 +805,9 @@ impl ObscuraJsRuntime {
     /// the global so page script can never reach `Deno.core.ops`.
     ///
     /// Bootstrap keeps the core reference in a private const. Once deno_core
-    /// has bound the ops, this removes both public globals before page code can
-    /// run, leaving the handoff as the host's only route to child realms.
+    /// has bound the ops, this removes the public globals (`Deno`, the handoff
+    /// and deno_core's `__bootstrap`) before page code can run, leaving the
+    /// handoff as the host's only route to child realms.
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
 
@@ -811,6 +820,10 @@ impl ObscuraJsRuntime {
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
         let deno_key = v8::String::new(scope, "Deno")?;
+        // deno_core's own alias of the same core object (`__bootstrap.core`).
+        // Deno's runtime deletes it after bootstrap (99_main.js); left here it
+        // handed every page the raw op table.
+        let bootstrap_key = v8::String::new(scope, "__bootstrap")?;
         let ops_key = v8::String::new(scope, "ops")?;
         let global = context.global(scope);
 
@@ -823,6 +836,7 @@ impl ObscuraJsRuntime {
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
+        global.delete(scope, bootstrap_key.into());
         Some(ops)
     }
 
@@ -920,6 +934,9 @@ impl ObscuraJsRuntime {
         let Some(deno_key) = v8::String::new(scope, "Deno") else {
             return false;
         };
+        let Some(bootstrap_key) = v8::String::new(scope, "__bootstrap") else {
+            return false;
+        };
         let global = context.global(scope);
         let Some(core) = global.get(scope, handoff_key.into()) else {
             return false;
@@ -958,6 +975,7 @@ impl ObscuraJsRuntime {
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
         global.delete(scope, deno_key.into());
+        global.delete(scope, bootstrap_key.into());
         copied > 0
     }
 
@@ -1196,6 +1214,12 @@ impl ObscuraJsRuntime {
     pub fn has_pending_frame_tasks(&self) -> bool {
         let state = self.state.borrow();
         !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
+            || self.realm_states().borrow().has_pending_navigation()
+    }
+
+    #[doc(hidden)]
+    pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.realm_states().borrow().take_pending_navigations()
     }
 
     /// postMessage traffic waiting to be delivered to another realm.
@@ -1313,7 +1337,7 @@ impl ObscuraJsRuntime {
 
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
-        gs.dom = Some(dom);
+        gs.replace_dom(dom);
         gs.document_generation = gs.document_generation.wrapping_add(1);
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1353,7 +1377,11 @@ impl ObscuraJsRuntime {
             gs.resolved_scroll = None;
         }
         drop(gs);
-        self.realm_states().borrow().cancel_inactive_frame_timers();
+        let realms = self.realm_states();
+        let mut realms = realms.borrow_mut();
+        realms.cancel_inactive_frame_timers();
+        realms.prune_frame_contexts();
+        realms.connect_document_frames(&self.state);
     }
 
     pub fn set_url(&self, url: &str) {
@@ -1452,18 +1480,58 @@ impl ObscuraJsRuntime {
                     .and_then(|rest| rest.split_once('-'))
                     .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
                     .unwrap_or(0);
-                let object_id_lit = js_string_literal(object_id);
-                let retrieval = if frame_id == 0 {
-                    format!("globalThis.__obscura_objects[{object_id_lit}]")
-                } else {
-                    format!(
-                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}]"
-                    )
-                };
-                self.object_store.insert(object_id.to_string(), retrieval);
+                if let Err(error) = self.retain_console_object(object_id, frame_id) {
+                    tracing::warn!(object_id, %error, "Could not retain console object");
+                }
             }
         }
         events
+    }
+
+    fn retain_console_object(&mut self, object_id: &str, frame_id: u32) -> Result<(), String> {
+        let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
+        let result = self.retain_console_object_in_context(object_id, frame_id);
+        if self.disarm_watchdog(watchdog) {
+            return Err("Console object retention exceeded its deadline".into());
+        }
+        self.finish_heap_checked(result)
+    }
+
+    fn retain_console_object_in_context(&mut self, object_id: &str, frame_id: u32) -> Result<(), String> {
+        let frame = if frame_id == 0 { None } else {
+            Some((frame_id, self.cdp_context(Some(frame_id))?))
+        };
+        if let Some((_, context)) = &frame {
+            let value = {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
+                v8::tc_scope!(let scope, scope);
+                let key = v8::String::new(scope, "__obscura_objects").ok_or("Console store allocation failed")?;
+                let global = scope.get_current_context().global(scope);
+                let objects = global.get(scope, key.into()).and_then(|value| value.to_object(scope))
+                    .ok_or("Console object store unavailable")?;
+                let key = v8::String::new(scope, object_id).ok_or("Console object key allocation failed")?;
+                let value = objects.get(scope, key.into()).ok_or("Console object unavailable")?;
+                let value = v8::Global::new(scope, value);
+                if objects.delete(scope, key.into()) != Some(true) { return Err("Cannot move console object".into()); }
+                value
+            };
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let key = v8::String::new(scope, "__obscura_objects").ok_or("Console store allocation failed")?;
+            let global = scope.get_current_context().global(scope);
+            let objects = global.get(scope, key.into()).and_then(|value| value.to_object(scope))
+                .ok_or("Console object store unavailable")?;
+            let key = v8::String::new(scope, object_id).ok_or("Console object key allocation failed")?;
+            let value = v8::Local::new(scope, value);
+            if objects.set(scope, key.into(), value) != Some(true) { return Err("Cannot retain console object".into()); }
+        }
+        self.object_store.insert(object_id.to_string(), CdpObjectRecord {
+            retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id)), frame,
+        });
+        Ok(())
     }
 
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
@@ -2580,13 +2648,19 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
+    #[doc(hidden)]
+    pub fn set_frame_preload_scripts(&self, scripts: &[String]) {
+        self.realm_states().borrow_mut().frame_preload_scripts = scripts.to_vec();
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
         self.state.borrow_mut().navigation_timing.record("domLoading");
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_script_with_timeout(
             "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
+            "globalThis.__obscura_init();",
+            std::time::Duration::from_secs(5),
         );
     }
 
@@ -2668,14 +2742,33 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
+        self.start_cdp_evaluation_in_frame(None, expression, return_by_value, await_promise)
+    }
+
+    fn cdp_context(&mut self, frame_id: Option<u32>) -> Result<v8::Global<v8::Context>, String> {
+        match frame_id {
+            Some(id) => self.realm_states().borrow().context(id)
+                .ok_or_else(|| "Execution context was destroyed".to_string()),
+            None => Ok(self.runtime().main_context()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_evaluation_in_frame(
+        &mut self,
+        frame_id: Option<u32>,
+        expression: &str,
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
+        let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         // Compile the script itself, not a string passed through the page's eval.
         let record = (|| {
             let mut entered = self.runtime();
-            let context = entered.main_context();
-            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
             v8::tc_scope!(let scope, scope);
             let source = v8::String::new(scope, expression).ok_or("CDP source allocation failed")?;
             let name = v8::String::new(scope, "<eval-remote>").ok_or("CDP origin allocation failed")?;
@@ -2698,7 +2791,8 @@ impl ObscuraJsRuntime {
         self.pending_cdp_evaluations.insert(oid.clone(), record);
         let pending = PendingCdpEvaluation {
             object_id: oid,
-            recipe: if return_by_value { None } else { Some(expression.to_string()) },
+            recipe: if return_by_value || frame_id.is_some() { None } else { Some(expression.to_string()) },
+            frame: frame_id.map(|id| (id, context)),
         };
         if await_promise {
             Ok(CdpEvaluation::Pending(pending))
@@ -2748,18 +2842,50 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
+        self.start_cdp_call_in_frame(
+            None, function_declaration, object_id, arguments, return_by_value, await_promise,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn start_cdp_call_in_frame(
+        &mut self,
+        mut frame_id: Option<u32>,
+        function_declaration: &str,
+        object_id: Option<&str>,
+        arguments: &[serde_json::Value],
+        return_by_value: bool,
+        await_promise: bool,
+    ) -> Result<CdpEvaluation, String> {
+        if let Some(object_id) = object_id {
+            self.validate_cdp_object_context(object_id)?;
+            let object_frame = self.object_store.get(object_id)
+                .and_then(|record| record.frame.as_ref().map(|(id, _)| *id));
+            if frame_id.is_some() && frame_id != object_frame {
+                return Err("Object belongs to a different execution context".into());
+            }
+            frame_id = object_frame;
+        }
+        let context = self.cdp_context(frame_id)?;
         self.begin_javascript_task();
-        let this_expr = self.resolve_this(object_id);
-        let receiver = self.execute_runtime_script("<cdp-receiver>", this_expr)
-            .map_err(|error| format!("JS error: {error}"))?;
-        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument))
+        let receiver = if object_id.is_some() {
+            let this_expr = self.resolve_this(object_id)?;
+            self.execute_runtime_script("<cdp-receiver>", this_expr)
+                .map_err(|error| format!("JS error: {error}"))?
+        } else {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
+            let global = scope.get_current_context().global(scope);
+            let value: v8::Local<v8::Value> = global.into();
+            v8::Global::new(scope, value)
+        };
+        let arguments = arguments.iter().map(|argument| self.cdp_call_argument(argument, &context))
             .collect::<Result<Vec<_>, _>>()?;
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let record = (|| {
             let mut entered = self.runtime();
-            let context = entered.main_context();
-            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
             v8::tc_scope!(let scope, scope);
             let receiver = v8::Local::new(scope, &receiver);
             let arguments = arguments.iter().map(|argument| v8::Local::new(scope, argument))
@@ -2791,7 +2917,9 @@ impl ObscuraJsRuntime {
         })();
         let record = self.finish_heap_checked(record)?;
         self.pending_cdp_evaluations.insert(oid.clone(), record);
-        let pending = PendingCdpEvaluation { object_id: oid, recipe: None };
+        let pending = PendingCdpEvaluation {
+            object_id: oid, recipe: None, frame: frame_id.map(|id| (id, context)),
+        };
         if await_promise {
             Ok(CdpEvaluation::Pending(pending))
         } else {
@@ -2802,6 +2930,9 @@ impl ObscuraJsRuntime {
     #[doc(hidden)]
     pub fn has_cdp_evaluation(&self, pending: &PendingCdpEvaluation) -> bool {
         self.pending_cdp_evaluations.contains_key(&pending.object_id)
+            && pending.frame.as_ref().is_none_or(|(id, context)| {
+                self.realm_states().borrow().context(*id).as_ref() == Some(context)
+            })
     }
 
     fn has_ready_cdp_evaluations(&mut self) -> bool {
@@ -2819,6 +2950,7 @@ impl ObscuraJsRuntime {
 
     #[doc(hidden)]
     pub fn cdp_evaluation_ready(&mut self, pending: &PendingCdpEvaluation) -> bool {
+        if !self.has_cdp_evaluation(pending) { return false; }
         let Some(record) = self.pending_cdp_evaluations.get(&pending.object_id).cloned() else {
             return false;
         };
@@ -2841,6 +2973,11 @@ impl ObscuraJsRuntime {
         let oid = pending.object_id;
         let record = self.pending_cdp_evaluations.remove(&oid)
             .ok_or("Evaluation result unavailable")?;
+        if pending.frame.as_ref().is_some_and(|(id, context)| {
+            self.realm_states().borrow().context(*id).as_ref() != Some(context)
+        }) {
+            return Err("Execution context was destroyed".into());
+        }
         let (value, rejected) = {
             let mut entered = self.runtime();
             let context = entered.main_context();
@@ -2869,15 +3006,38 @@ impl ObscuraJsRuntime {
             (v8::Global::new(scope, value), rejected)
         };
         if return_by_value && !rejected { return self.v8_to_cdp_value(value); }
-        let meta = self.execute_runtime_script(
-            "<readMeta>", Self::meta_extract_js(&format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid))),
-        ).map_err(|e| format!("JS error: {e}"))?;
+        let meta = if let Some((_, context)) = &pending.frame {
+            let result = (|| {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
+                v8::tc_scope!(let scope, scope);
+                let source = format!("(function(value) {{ return {}; }})", Self::meta_extract_js("value"));
+                let source = v8::String::new(scope, &source).ok_or("CDP metadata allocation failed")?;
+                let function = v8::Script::compile(scope, source, None)
+                    .and_then(|script| script.run(scope))
+                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    .ok_or_else(|| exception_text(scope))?;
+                let value = v8::Local::new(scope, &value);
+                let receiver = v8::undefined(scope).into();
+                let result = function.call(scope, receiver, &[value])
+                    .ok_or_else(|| exception_text(scope))?;
+                Ok(v8::Global::new(scope, result))
+            })();
+            self.finish_heap_checked(result)?
+        } else {
+            self.execute_runtime_script(
+                "<readMeta>", Self::meta_extract_js(&format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid))),
+            ).map_err(|e| format!("JS error: {e}"))?
+        };
         let meta = self.v8_to_json(meta)?;
         let meta = if let serde_json::Value::String(value) = &meta {
             serde_json::from_str(value).unwrap_or(meta)
         } else { meta };
         let mut info = self.finish_cdp_result(&meta, &oid)?;
         info.thrown = rejected;
+        if info.object_id.is_some() {
+            self.object_store.get_mut(&oid).ok_or("Cannot store evaluation context")?.frame = pending.frame;
+        }
         if !rejected && info.object_id.is_some() {
             if let Some(recipe) = pending.recipe { self.evaluation_recipes.insert(oid, recipe); }
         }
@@ -2934,7 +3094,10 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
+            CdpObjectRecord {
+                retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)),
+                frame: None,
+            },
         );
         Ok(oid)
     }
@@ -2968,44 +3131,51 @@ impl ObscuraJsRuntime {
         self.finish_cdp_result(&meta_json, &oid)
     }
 
+    #[doc(hidden)]
+    pub fn validate_cdp_object_context(&self, object_id: &str) -> Result<(), String> {
+        let record = self.object_store.get(object_id);
+        if record.is_none() && !self.evaluation_recipes.contains_key(object_id)
+            && !object_id.strip_prefix("node-").is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) && id.parse::<u32>().is_ok()
+            })
+        {
+            return Err("Could not find object with given id".into());
+        }
+        if record.and_then(|record| record.frame.as_ref())
+            .is_some_and(|(id, context)| self.realm_states().borrow().context(*id).as_ref() != Some(context))
+        {
+            return Err("Execution context was destroyed".into());
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn cdp_object_expression(&mut self, object_id: &str) -> Result<String, String> {
+        self.validate_cdp_object_context(object_id)?;
+        self.resolve_this(Some(object_id))
+    }
+
+    #[doc(hidden)]
+    pub fn register_cdp_property_object(&mut self, parent_id: &str, object_id: &str) -> Result<(), String> {
+        self.validate_cdp_object_context(parent_id)?;
+        let frame = self.object_store.get(parent_id).and_then(|record| record.frame.clone());
+        self.object_store.insert(object_id.to_string(), CdpObjectRecord {
+            retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id)),
+            frame,
+        });
+        Ok(())
+    }
+
     pub fn release_object(&mut self, object_id: &str) {
         self.evaluation_recipes.remove(object_id);
-        if self.object_store.remove(object_id).is_some() {
-            let frame_id = object_id
-                .strip_prefix("console-")
-                .and_then(|rest| rest.split_once('-'))
-                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
-                .unwrap_or(0);
-            let object_id_lit = js_string_literal(object_id);
-            let code = if frame_id == 0 {
-                format!("delete globalThis.__obscura_objects[{object_id_lit}];")
-            } else {
-                format!(
-                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}];"
-                )
-            };
+        if let Some(record) = self.object_store.remove(object_id) {
+            let code = format!("delete ({});", record.retrieval);
             let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let mut frame_ids: Vec<u32> = self
-            .object_store
-            .keys()
-            .filter_map(|object_id| object_id.strip_prefix("console-"))
-            .filter_map(|rest| rest.split_once('-'))
-            .filter_map(|(frame_id, _)| frame_id.parse().ok())
-            .filter(|frame_id| *frame_id != 0)
-            .collect();
-        frame_ids.sort_unstable();
-        frame_ids.dedup();
-        let mut code = "globalThis.__obscura_objects = {};".to_string();
-        for frame_id in frame_ids {
-            code.push_str(&format!(
-                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
-            ));
-        }
-        let _ = self.execute_runtime_script("<releaseGroup>", code);
+        let _ = self.execute_runtime_script("<releaseGroup>", "globalThis.__obscura_objects = {};".to_string());
         self.object_store.clear();
         self.evaluation_recipes.clear();
     }
@@ -3766,8 +3936,8 @@ impl ObscuraJsRuntime {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
 
-        // Publish settled protocol replies before parking on unrelated page work.
-        if self.has_ready_cdp_evaluations() { return Ok(false); }
+        // Let the page adopt frame documents and deliver messages before parking.
+        if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() { return Ok(false); }
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
@@ -3787,7 +3957,7 @@ impl ObscuraJsRuntime {
                     "autonomous browser task exceeded its task budget".into(),
                 ));
             }
-            if self.has_ready_cdp_evaluations() {
+            if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
                 return std::task::Poll::Ready(Ok(false));
             }
             match tick {
@@ -4093,7 +4263,7 @@ impl ObscuraJsRuntime {
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
         }
-        state.dom.take()
+        state.take_dom()
     }
 
     /// Export document-owned script preparation state before the runtime realm
@@ -4137,6 +4307,71 @@ impl ObscuraJsRuntime {
         #[cfg(feature = "render")]
         state.base_url_cache.borrow_mut().take();
         state.dom.as_ref().map(f)
+    }
+
+    /// The live child browsing context owned by a node in the specified realm.
+    pub fn child_frame_for_node(&self, parent_frame_id: u32, node: NodeId) -> Option<u32> {
+        let realms = self.realm_states();
+        let realms = realms.borrow();
+        let parent = if parent_frame_id == 0 { self.state.clone() }
+            else { realms.by_frame_id(parent_frame_id)? };
+        realms.child_frame_for_node(&parent, node)
+    }
+
+    /// Inspect a genuine remote node in its owning document, including foreign
+    /// handles returned through the parent realm. Detached frame handles fail
+    /// instead of resolving the same numeric node id in the main document.
+    pub fn with_remote_dom_node<R>(&mut self, object_id: &str,
+        inspect: impl FnOnce(&DomTree, NodeId, u32, &str, &str) -> R) -> Result<R, String> {
+        self.begin_javascript_task();
+        let retrieval = self.cdp_object_expression(object_id)?;
+        let receiver = self.execute_runtime_script("<cdp-dom-node>", retrieval)
+            .map_err(|error| format!("Could not resolve remote node: {error}"))?;
+        let watchdog = self.arm_watchdog(std::time::Duration::from_secs(5));
+        let reference = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let receiver = v8::Local::new(scope, &receiver);
+            let object = v8::Local::<v8::Object>::try_from(receiver)
+                .map_err(|_| "Remote object is not a DOM node".to_string())?;
+            let (frame_id, members) = crate::ops::document_realm(scope, object)
+                .ok_or("Remote node has no owning document")?;
+            let key = v8::String::new(scope, "domNodeReference").ok_or("DOM member allocation failed")?;
+            let member = members.get(scope, key.into()).ok_or("DOM node member unavailable")?;
+            let function = v8::Local::<v8::Function>::try_from(member)
+                .map_err(|_| "DOM node member is not a function".to_string())?;
+            let value = function.call(scope, receiver, &[])
+                .ok_or_else(|| format!("Could not inspect remote node: {}", exception_text(scope)))?;
+            let metadata = v8::Local::<v8::Array>::try_from(value)
+                .map_err(|_| "Remote node metadata is unavailable".to_string())?;
+            let node_id = metadata.get_index(scope, 0).and_then(|value| value.integer_value(scope))
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or("Remote object is not a current DOM node")?;
+            let url = metadata.get_index(scope, 1).filter(|value| value.is_string())
+                .ok_or("Remote document URL is unavailable")?.to_rust_string_lossy(scope);
+            let base = metadata.get_index(scope, 2).filter(|value| value.is_string())
+                .ok_or("Remote document base URL is unavailable")?.to_rust_string_lossy(scope);
+            Ok::<_, String>((frame_id, NodeId::new(node_id), url, base))
+        })();
+        let fired = self.disarm_watchdog(watchdog);
+        if fired { return Err("Remote node inspection exceeded its deadline".into()); }
+        let (frame_id, node_id, url, base) = reference?;
+        let state = if frame_id == 0 {
+            self.state.clone()
+        } else {
+            let realms = self.realm_states();
+            let realms = realms.borrow();
+            if realms.frame_timers_active(frame_id) != Some(true) {
+                return Err("Remote node belongs to a detached frame".into());
+            }
+            realms.by_frame_id(frame_id).ok_or("Remote node document is unavailable")?
+        };
+        let state = state.borrow();
+        let dom = state.dom.as_ref().ok_or("Remote node document has no DOM")?;
+        if dom.get_node(node_id).is_none() { return Err("Remote node is no longer available".into()); }
+        Ok(inspect(dom, node_id, frame_id, &url, &base))
     }
 
     #[cfg(feature = "render")]
@@ -4278,7 +4513,7 @@ impl ObscuraJsRuntime {
 
     fn resolve_remote_object(&mut self, object_id: &str) -> Option<String> {
         if let Some(retrieval) = self.object_store.get(object_id) {
-            return Some(retrieval.clone());
+            return Some(retrieval.retrieval.clone());
         }
         let expression = self.evaluation_recipes.get(object_id)?.clone();
         let object_id_literal = js_string_literal(object_id);
@@ -4287,19 +4522,23 @@ impl ObscuraJsRuntime {
         self.execute_runtime_script("<restore-cdp-object>", code)
             .ok()?;
         let retrieval = format!("globalThis.__obscura_objects[{object_id_literal}]");
-        self.object_store
-            .insert(object_id.to_string(), retrieval.clone());
+        self.object_store.insert(object_id.to_string(), CdpObjectRecord {
+            retrieval: retrieval.clone(), frame: None,
+        });
         Some(retrieval)
     }
 
-    fn resolve_this(&mut self, object_id: Option<&str>) -> String {
+    fn resolve_this(&mut self, object_id: Option<&str>) -> Result<String, String> {
         match object_id {
             Some(oid) => {
                 if let Some(retrieval) = self.resolve_remote_object(oid) {
-                    retrieval
+                    Ok(retrieval)
                 } else if oid.starts_with("node-") {
-                    let nid = oid.strip_prefix("node-").unwrap_or("0");
-                    format!(
+                    let nid = oid.strip_prefix("node-").filter(|id| {
+                        !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                    }).and_then(|id| id.parse::<u32>().ok())
+                        .ok_or("Could not find object with given id")?;
+                    Ok(format!(
                         "(function() {{ \
                             var nid = {}; \
                             var cache = globalThis._cache || new Map(); \
@@ -4307,19 +4546,28 @@ impl ObscuraJsRuntime {
                             return null; \
                         }})()",
                         nid
-                    )
+                    ))
                 } else {
-                    "globalThis".to_string()
+                    Err("Could not find object with given id".into())
                 }
             }
-            None => "globalThis".to_string(),
+            None => Ok("globalThis".to_string()),
         }
     }
 
-    fn cdp_call_argument(&mut self, argument: &serde_json::Value) -> Result<v8::Global<v8::Value>, String> {
+    fn cdp_call_argument(
+        &mut self,
+        argument: &serde_json::Value,
+        context: &v8::Global<v8::Context>,
+    ) -> Result<v8::Global<v8::Value>, String> {
         // Remote handles take precedence over value, including rod's value:null.
         if let Some(id) = argument.get("objectId").and_then(|value| value.as_str()) {
-            let expression = self.resolve_remote_object(id).unwrap_or_else(|| "undefined".into());
+            let expression = self.cdp_object_expression(id)?;
+            let object_context = self.object_store.get(id).and_then(|record| record.frame.as_ref())
+                .map(|(_, context)| context.clone()).unwrap_or_else(|| self.runtime().main_context());
+            if &object_context != context {
+                return Err("Object belongs to a different execution context".into());
+            }
             return self.execute_runtime_script("<cdp-argument>", expression)
                 .map_err(|error| format!("JS error: {error}"));
         }
@@ -4333,8 +4581,7 @@ impl ObscuraJsRuntime {
         }
         let result = (|| {
             let mut entered = self.runtime();
-            let context = entered.main_context();
-            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::scope_with_context!(scope, entered.v8_isolate(), context.clone());
             v8::tc_scope!(let scope, scope);
             let value = if let Some(value) = argument.get("value") {
                 // JSON data is not an object literal: __proto__ must be an own property.
@@ -4412,7 +4659,10 @@ impl ObscuraJsRuntime {
         }
         self.object_store.insert(
             oid.to_string(),
-            format!("globalThis.__obscura_objects[{}]", js_string_literal(oid)),
+            CdpObjectRecord {
+                retrieval: format!("globalThis.__obscura_objects[{}]", js_string_literal(oid)),
+                frame: None,
+            },
         );
         Ok(Self::info_from_meta(meta, Some(oid.to_string())))
     }
@@ -4584,6 +4834,863 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn form_ownership_tracks_explicit_ids_and_tree_order() {
+        let mut rt = setup_runtime("<form id='f'><input id='a'><input id='b' form='g'><input id='empty' form=''></form><form id='g'></form><input id='c' form='f'><div id='block'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), g = document.getElementById('g');
+            const a = document.getElementById('a'), b = document.getElementById('b');
+            const c = document.getElementById('c'), block = document.getElementById('block');
+            const ids = form => Array.from(form.elements, node => node.id).join(',');
+            const initial = [a.form === f, b.form === g, c.form === f,
+                document.getElementById('empty').form === null, ids(f), ids(g)];
+            block.id = 'f'; f.before(block);
+            const blocked = [c.form === null, ids(f)];
+            f.before(c); block.remove();
+            const reordered = [c.form === f, ids(f)];
+            f.id = 'new';
+            const renamed = [c.form === null, ids(f)];
+            c.setAttribute('form', 'new');
+            return {initial, blocked, reordered, renamed, restored:ids(f)};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[true,true,true,true,"a,c","b"], "blocked":[true,"a"],
+            "reordered":[true,"c,a"], "renamed":[true,"a"], "restored":"c,a"
+        }));
+    }
+
+    #[test]
+    fn form_ownership_lazy_snapshots_preserve_observation_and_array_mutation() {
+        let mut rt = setup_runtime("<form id=f><input id=a name=first><input id=b name=NaN></form><input id=c form=f name=outside>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), a = document.getElementById('a');
+            const b = document.getElementById('b'), c = document.getElementById('c');
+            const fresh = () => f.elements;
+            const collection = fresh();
+            const descriptor = Object.getOwnPropertyDescriptor(collection, '1');
+            const observed = [Array.isArray(collection), collection instanceof HTMLCollection,
+                collection.length === 3, collection.item(0) === a, collection.NaN === b,
+                collection.namedItem('outside') === c, 'outside' in collection,
+                descriptor.value === b && descriptor.writable && descriptor.enumerable && descriptor.configurable,
+                Array.from(collection).every((node, i) => node === [a,b,c][i]),
+                Object.assign({}, collection)[2] === c, c.form === f];
+            const shortened = fresh(); shortened.length = 0; shortened.length = 3;
+            const deleted = fresh(); delete deleted[0];
+            const written = fresh(); written[0] = 'changed';
+            const defined = fresh(); Object.defineProperty(defined, '1', {value:'defined'});
+            const frozen = Object.freeze(fresh());
+            return {observed, mutations:[shortened[0] === undefined, deleted[0] === undefined,
+                written[0] === 'changed', defined[1] === 'defined', frozen[2] === c,
+                fresh()[0] === a && fresh()[1] === b]};
+        })()"#).unwrap(), serde_json::json!({
+            "observed":vec![true;11], "mutations":vec![true;6]
+        }));
+        rt.with_dom(|dom| {
+            let c = dom.get_element_by_id("c").unwrap();
+            dom.form_cache_generation_handle().store(u32::MAX as u64, std::sync::atomic::Ordering::Relaxed);
+            dom.with_node_mut(c, |node| node.set_attribute("form", "missing".into()));
+        });
+        assert_eq!(rt.evaluate("document.getElementById('f').elements.length === 2 && document.getElementById('c').form === null").unwrap(),
+            serde_json::json!(true));
+        rt.with_dom(|dom| {
+            let c = dom.get_element_by_id("c").unwrap();
+            dom.form_cache_generation_handle().store((2u64 << 32) - 1, std::sync::atomic::Ordering::Relaxed);
+            dom.with_node_mut(c, |node| node.set_attribute("form", "f".into()));
+        });
+        assert_eq!(rt.evaluate("document.getElementById('f').elements.length === 3 && document.getElementById('c').form === document.getElementById('f')").unwrap(),
+            serde_json::json!(true));
+        let dom = rt.state.borrow_mut().dom.take().unwrap();
+        let dom = std::thread::spawn(move || {
+            let c = dom.get_element_by_id("c").unwrap();
+            dom.with_node_mut(c, |node| node.set_attribute("form", "missing".into()));
+            dom
+        }).join().unwrap();
+        rt.state.borrow_mut().dom = Some(dom);
+        assert_eq!(rt.evaluate("document.getElementById('f').elements.length === 2 && document.getElementById('c').form === null").unwrap(),
+            serde_json::json!(true));
+        rt.set_dom(parse_html("<form id=f><input></form>"));
+        assert_eq!(rt.evaluate("(() => {const f=document.getElementById('f'); return {length:f.elements.length, ids:Array.from(f.elements,n=>n.id)}})()").unwrap(),
+            serde_json::json!({"length":1,"ids":[""]}));
+    }
+
+    #[test]
+    fn form_ownership_dom_export_invalidates_and_rebinds_cached_getters() {
+        let mut rt = setup_runtime("<form id=f></form><input id=input form=f>");
+        assert_eq!(rt.evaluate("(() => {globalThis.savedInput=document.getElementById('input');globalThis.savedForm=document.getElementById('f');return savedInput.form===savedForm && savedForm.elements.length===1})()").unwrap(),
+            serde_json::json!(true));
+        let dom = rt.take_dom().unwrap();
+        assert_eq!(rt.evaluate_script("savedInput.form===null").unwrap(),
+            serde_json::json!(true));
+        assert!(rt.evaluate_script("savedForm.elements").unwrap_err().contains("TypeError: Illegal invocation"));
+        let dom = std::thread::spawn(move || {
+            let form = dom.get_element_by_id("f").unwrap();
+            dom.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+            dom
+        }).join().unwrap();
+        rt.set_dom(dom);
+        assert_eq!(rt.evaluate_script("savedInput.form===null && savedForm.elements.length===0").unwrap(),
+            serde_json::json!(true));
+        rt.with_dom(|dom| {
+            let input = dom.get_element_by_id("input").unwrap();
+            dom.with_node_mut(input, |node| node.set_attribute("form", "changed".into()));
+        });
+        assert_eq!(rt.evaluate("savedInput.form===savedForm && savedForm.elements.length===1").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn form_ownership_retired_documents_cannot_publish_into_replacement_caches() {
+        let mut rt = setup_runtime("<form id=old><input></form>");
+        rt.evaluate("document.getElementById('old').elements.length").unwrap();
+        let retired = rt.state.borrow_mut().dom.take().unwrap();
+        rt.set_dom(parse_html("<form id=f></form><input id=input form=f>"));
+        let epoch = rt.with_dom(|dom| dom.form_cache_generation_handle().load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        retired.form_cache_generation_handle().store(epoch, std::sync::atomic::Ordering::Relaxed);
+        let old_form = retired.get_element_by_id("old").unwrap();
+        std::thread::spawn(move || {
+            retired.with_node_mut(old_form, |node| node.set_attribute("id", "retired".into()));
+        }).join().unwrap();
+        assert_eq!(rt.evaluate("document.getElementById('input').form === document.getElementById('f')").unwrap(),
+            serde_json::json!(true));
+        rt.with_dom(|dom| {
+            let form = dom.get_element_by_id("f").unwrap();
+            dom.with_node_mut(form, |node| node.set_attribute("id", "changed".into()));
+        });
+        assert_eq!(rt.evaluate("document.getElementById('input').form === null").unwrap(),
+            serde_json::json!(true));
+    }
+
+    #[test]
+    fn form_ownership_updates_cached_lists_on_reset_and_reparenting() {
+        let mut rt = setup_runtime("<form id='f'><input id='a' value='initial'><input id='b' form='g' value='other'></form><form id='g'></form><input id='c' form='f' value='outside'>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), g = document.getElementById('g');
+            const a = document.getElementById('a'), b = document.getElementById('b');
+            const c = document.getElementById('c'), old = f.elements;
+            a.value='changed'; b.value='kept'; c.value='changed'; f.reset();
+            const reset = [a.value,b.value,c.value];
+            g.appendChild(a);
+            const moved = [a.form === g, Array.from(f.elements,n=>n.id).join(','),
+                Array.from(g.elements,n=>n.id).join(',')];
+            c.removeAttribute('form');
+            return {reset,moved,removed:f.elements.length,oldSnapshot:old.length};
+        })()"#).unwrap(), serde_json::json!({
+            "reset":["initial","kept","outside"], "moved":[true,"c","b,a"],
+            "removed":0,"oldSnapshot":2
+        }));
+    }
+
+    #[test]
+    fn form_ownership_preserves_parser_association_until_reset() {
+        let mut rt = setup_runtime("<table><form id='f'><tr><td><span id='box'><input id='a'><button id='b'>Go</button></span></td></tr></form></table><form id='g'></form>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const f = document.getElementById('f'), a = document.getElementById('a');
+            const b = document.getElementById('b'), box = document.getElementById('box');
+            const ids = () => Array.from(f.elements, node => node.id).join(',');
+            const initial = [f.children.length, a.form === f, b.form === f, ids()];
+            a.className = 'kept';
+            const unchanged = a.form === f;
+            a.setAttribute('form', 'missing'); a.removeAttribute('form');
+            const resetAttribute = [a.form === null, ids()];
+            document.body.appendChild(box);
+            return {initial, unchanged, resetAttribute, moved:[b.form === null, ids()]};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[0,true,true,"a,b"], "unchanged":true,
+            "resetAttribute":[true,"b"], "moved":[true,""]
+        }));
+    }
+
+    #[test]
+    fn form_ownership_stays_inside_detached_and_shadow_trees() {
+        let mut rt = setup_runtime("<form id='same'><input id='outer'></form><div id='host'></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const host = document.getElementById('host'), root = host.attachShadow({mode:'open'});
+            root.innerHTML = '<form id="same"><input id="a"></form><input id="b" form="same">';
+            const form = root.querySelector('form'), b = root.querySelector('#b');
+            const initial = [b.form === form, Array.from(form.elements, n => n.id).join(','),
+                document.getElementById('same').elements.length];
+            host.remove();
+            const disconnected = [b.form === null, Array.from(form.elements, n => n.id).join(',')];
+            document.body.appendChild(host);
+            const restored = b.form === form;
+            const detached = document.createElement('div');
+            detached.innerHTML = '<form id="same"><input id="ancestor" form="missing"></form><input id="explicit" form="same">';
+            const input = detached.querySelector('#explicit'), owned = detached.querySelector('form');
+            const separate = [input.form === owned, owned.elements[0] === input];
+            const detachedAncestor = detached.querySelector('#ancestor').form === owned;
+            document.body.appendChild(input);
+            return {initial, disconnected, restored, separate, detachedAncestor,
+                moved:input.form === document.getElementById('same')};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[true,"a,b",1], "disconnected":[true,"a"], "restored":true,
+            "separate":[false,false], "detachedAncestor":true, "moved":true
+        }));
+    }
+
+    #[test]
+    fn html_interface_brands_use_distinct_native_prototypes() {
+        let mut rt = setup_runtime("<html><head><style></style><link></head><body><div></div><span></span><a></a><p></p><button></button><h2></h2><template></template></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const pairs = [
+                ['a','HTMLAnchorElement'], ['br','HTMLBRElement'], ['body','HTMLBodyElement'],
+                ['button','HTMLButtonElement'], ['datalist','HTMLDataListElement'], ['details','HTMLDetailsElement'],
+                ['dialog','HTMLDialogElement'], ['div','HTMLDivElement'], ['fieldset','HTMLFieldSetElement'],
+                ['hr','HTMLHRElement'], ['head','HTMLHeadElement'], ['h2','HTMLHeadingElement'],
+                ['html','HTMLHtmlElement'], ['label','HTMLLabelElement'], ['legend','HTMLLegendElement'],
+                ['link','HTMLLinkElement'], ['p','HTMLParagraphElement'], ['pre','HTMLPreElement'],
+                ['progress','HTMLProgressElement'], ['script','HTMLScriptElement'], ['span','HTMLSpanElement'],
+                ['style','HTMLStyleElement'], ['template','HTMLTemplateElement'], ['ul','HTMLUListElement'],
+            ];
+            const xhtml = 'http://www.w3.org/1999/xhtml';
+            const nodes = pairs.map(([tag]) => document.createElement(tag));
+            const correct = pairs.map(([tag,name], index) => {
+                const C = globalThis[name];
+                const node = nodes[index];
+                let rejected = false;
+                try { new C(); } catch (error) { rejected = error instanceof TypeError; }
+                return node instanceof C && node.constructor === C
+                    && Function.prototype[Symbol.hasInstance].call(C, node)
+                    && Object.getPrototypeOf(node) === C.prototype
+                    && Object.prototype.toString.call(node) === '[object '+name+']'
+                    && C.length === 0 && rejected
+                    && node.cloneNode().constructor === C
+                    && document.createElementNS(xhtml, 'x:'+tag).constructor === C
+                    && !(document.createElementNS(xhtml, tag.toUpperCase()) instanceof C)
+                    && !(document.createElementNS('urn:foreign', tag) instanceof C)
+                    && nodes.every((other, otherIndex) => (other instanceof C) === (index === otherIndex));
+            });
+            const parsed = pairs.filter(([tag]) => document.querySelector(tag)).every(([tag,name]) => {
+                const node = document.querySelector(tag);
+                return node.constructor === globalThis[name]
+                    && Object.getPrototypeOf(node) === globalThis[name].prototype;
+            });
+            HTMLDivElement.prototype.__brandProbe = 42;
+            const isolated = document.querySelector('div').__brandProbe === 42
+                && document.createElement('div').__brandProbe === 42
+                && document.querySelector('span').__brandProbe === undefined
+                && document.querySelector('a').__brandProbe === undefined
+                && Element.prototype.__brandProbe === undefined;
+            delete HTMLDivElement.prototype.__brandProbe;
+            return {correct, parsed, isolated};
+        })()"#).unwrap(), serde_json::json!({
+            "correct":vec![true;24], "parsed":true, "isolated":true,
+        }));
+    }
+
+    #[test]
+    fn html_interface_brands_preserve_existing_specialized_behavior() {
+        let mut rt = setup_runtime("<html><head></head><body><input><select><option>one</option></select><textarea></textarea><form></form><iframe></iframe><div></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const input = document.querySelector('input');
+            input.value = 'typed';
+            const select = document.querySelector('select');
+            const textarea = document.querySelector('textarea');
+            textarea.value = 'text';
+            const style = document.createElement('style');
+            style.textContent = 'body {color: red}';
+            let target = document.head;
+            if (target instanceof HTMLIFrameElement) target = target.contentDocument.head;
+            target.appendChild(style);
+            return [input instanceof HTMLInputElement, input.value,
+                select instanceof HTMLSelectElement, select.item(0).index,
+                textarea instanceof HTMLTextAreaElement, textarea.value,
+                document.querySelector('form') instanceof HTMLFormElement,
+                document.querySelector('iframe') instanceof HTMLIFrameElement,
+                !(document.querySelector('div') instanceof HTMLIFrameElement),
+                style.parentNode === document.head, style.constructor === HTMLStyleElement];
+        })()"#).unwrap(), serde_json::json!([
+            true,"typed",true,0,true,"text",true,true,true,true,true,
+        ]));
+    }
+
+    #[test]
+    fn file_input_validation_is_nonmutating_and_selection_honors_multiple() {
+        let mut rt = setup_runtime("<input id=single type=file><input id=multi type=file multiple><div id=wrong></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const single = document.getElementById('single');
+            const multi = document.getElementById('multi');
+            const specs = [{name:'one',b64:'AID/'},{name:'two',b64:'BAU='}];
+            const events = [];
+            for (const type of ['input','change']) {
+                single.addEventListener(type, event => events.push([type,event.isTrusted]));
+            }
+            const selected = __obscura_setInputFiles(single, specs);
+            const previous = single.files;
+            const validation = __obscura_setInputFiles(single, [], true);
+            const preserved = single.files === previous;
+            __obscura_setInputFiles(multi, specs);
+            const counts = [single.files.length, multi.files.length];
+            const invalid = __obscura_setInputFiles(document.getElementById('wrong'), specs);
+            const forged = __obscura_setInputFiles(Object.create(HTMLInputElement.prototype), specs);
+            __obscura_setInputFiles(single, []);
+            return {selected,validation,preserved,counts,invalid,forged,events,empty:single.files.length};
+        })()"#).unwrap(), serde_json::json!({
+            "selected":true, "validation":true, "preserved":true, "counts":[1,2],
+            "invalid":false, "forged":false,
+            "events":[["input",true],["change",true],["input",true],["change",true]], "empty":0,
+        }));
+    }
+
+    #[test]
+    fn select_options_use_native_ownership_and_live_option_indexes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.createElement('select');
+            document.body.append(select);
+            const add = (parent, id) => {
+                const option = new Option(id, id);
+                option.id = id;
+                parent.append(option);
+                return option;
+            };
+            const first = add(select, 'first');
+            const div = document.createElement('div');
+            select.append(div);
+            const second = add(div, 'second');
+            const group = document.createElement('optgroup');
+            select.append(group);
+            const third = add(group, 'third');
+            const nested = document.createElement('select');
+            select.append(nested);
+            const hidden = add(nested, 'nested');
+            hidden.selected = true;
+            const datalist = document.createElement('datalist');
+            select.append(datalist);
+            const suggested = add(datalist, 'suggested');
+            const outer = add(select, 'outer');
+            const inner = add(outer, 'inner');
+            const initial = [select.length, Array.from(select.options, o => o.id),
+                [first.index, second.index, third.index, hidden.index, suggested.index, outer.index, inner.index],
+                select.value, select.selectedIndex, select.item(2) === third,
+                select.namedItem('second') === second];
+            select.value = 'third';
+            const chosen = [third.selected, hidden.selected, select.value, select.selectedIndex];
+            second.remove();
+            return {initial, chosen, moved: [third.index, select.length], liveRows:
+                typeof Object.getOwnPropertyDescriptor(HTMLTableElement.prototype, 'rows').get};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":[4,["first","second","third","outer"],[0,1,2,0,0,3,0],"first",0,true,true],
+            "chosen":[true,true,"third",2], "moved":[1,3], "liveRows":"function",
+        }));
+    }
+
+    #[test]
+    fn select_length_snapshot_stays_live_and_private() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><optgroup><option>B</option></optgroup></select><select id='other'></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.getElementById('s');
+            const other = document.getElementById('other');
+            const counts = [select.length, select.length];
+            const exposed = select.options;
+            exposed.length = 0;
+            counts.push(select.length);
+            other.append(select.item(0));
+            counts.push(select.length, other.length);
+            const group = select.querySelector('optgroup');
+            group.append(new Option('C'));
+            counts.push(select.length);
+            group.replaceWith(new Option('D'));
+            counts.push(select.length);
+            const nested = document.createElement('select');
+            nested.append(new Option('hidden'));
+            select.append(nested);
+            const datalist = document.createElement('datalist');
+            datalist.append(new Option('suggested'));
+            select.append(datalist);
+            counts.push(select.length);
+            select.innerHTML = '<option>E</option><option>F</option>';
+            counts.push(select.length, select[1].text);
+            select.length = 0;
+            counts.push(select.length, select[0] === undefined);
+            select.remove();
+            select.append(new Option('detached'));
+            counts.push(select.length, select[0].text);
+            return counts;
+        })()"#).unwrap(), serde_json::json!([2,2,2,1,1,2,1,1,2,"F",0,true,1,"detached"]));
+    }
+
+    #[test]
+    fn select_length_snapshot_observes_native_dom_mutations() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><option id='b'>B</option></select></body></html>");
+        assert_eq!(rt.evaluate("(() => { globalThis.savedSelect = document.getElementById('s'); return savedSelect.length; })()")
+            .unwrap(), serde_json::json!(2.0));
+        {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            dom.remove_child(dom.query_selector("#b").unwrap().unwrap());
+        }
+        assert_eq!(rt.evaluate("[savedSelect.length, savedSelect[1] === undefined]").unwrap(),
+            serde_json::json!([1,true]));
+    }
+
+    #[test]
+    fn select_add_respects_group_parents_and_union_conversions() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const result = [];
+            for (const kind of ['number','string','bigint','symbol','object','group','self','foreign']) {
+                const select = document.createElement('select');
+                select.innerHTML = '<option id="a">A</option><optgroup><option id="b">B</option></optgroup>';
+                const option = new Option('X');
+                const before = {number:1, string:'1', bigint:1n, symbol:Symbol(),
+                    object:{valueOf() { return 1; }}, group:select.querySelector('optgroup'),
+                    self:select, foreign:document.createElementNS('urn:foreign','option')}[kind];
+                try {
+                    select.add(option, before);
+                    result.push([kind, option.parentNode.localName, Array.from(select.options, o => o.text)]);
+                } catch (error) { result.push([kind, error.name]); }
+            }
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            ["number","optgroup",["A","X","B"]], ["string","optgroup",["A","X","B"]],
+            ["bigint","TypeError"], ["symbol","TypeError"], ["object","optgroup",["A","X","B"]],
+            ["group","select",["A","X","B"]], ["self","NotFoundError"], ["foreign","select",["X","A","B"]],
+        ]));
+    }
+
+    #[test]
+    fn select_length_and_remove_overloads_modify_owned_options_only() {
+        let mut rt = setup_runtime("<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option><option id='c'>C</option></optgroup></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const group = select.querySelector('optgroup');
+            select.length = 5;
+            const grown = [select.length, select.item(4).text, select.item(4) instanceof HTMLOptionElement];
+            select.length = 2;
+            const shrunk = [select.length, group.children.length, select.item(1).id];
+            select.remove(-1);
+            select.remove(99);
+            const untouched = [select.length, select.isConnected];
+            select.remove(null);
+            const removedFirst = [select.length, select.item(0).id, select.isConnected];
+            select.length = 0;
+            select.length = 1;
+            const cleared = [select.length, group.children.length, select.item(0).index];
+            select.remove();
+            return {grown, shrunk, untouched, removedFirst, cleared, connected:select.isConnected};
+        })()"#).unwrap(), serde_json::json!({
+            "grown":[5,"",true], "shrunk":[2,1,"b"], "untouched":[2,true],
+            "removedFirst":[1,"b",true], "cleared":[1,0,0], "connected":false,
+        }));
+    }
+
+    #[test]
+    fn select_legacy_methods_enforce_webidl_conversions_and_bounded_lengths() {
+        let mut rt = setup_runtime("<html><body><select><option id='first' name='alias'>A</option><option>B</option></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const throws = f => { try { f(); return false; } catch (e) { return e instanceof TypeError; } };
+            const errors = [throws(() => select.item()), throws(() => select.namedItem()),
+                throws(() => select.item(0n)), throws(() => select.length = 2n),
+                throws(() => select.namedItem(Symbol())), throws(() => select.remove(Symbol())),
+                throws(() => select.length = Symbol())];
+            const reads = [select.item('0').id, select.item(-1), select.item(undefined).id,
+                select.namedItem('alias').id, select.namedItem(''), select.namedItem('missing')];
+            const warnings = [];
+            console.warn = value => warnings.push(value);
+            select.length = 100001;
+            select.length = -1;
+            const bounded = [select.length, warnings.length,
+                warnings.every(value => value.includes('100000'))];
+            select.length = '3';
+            return {errors, reads, bounded, converted:select.length};
+        })()"#).unwrap(), serde_json::json!({
+            "errors":[true,true,true,true,true,true,true], "reads":["first",null,"first","first",null,null],
+            "bounded":[2,2,true], "converted":3,
+        }));
+    }
+
+    #[test]
+    fn select_legacy_methods_read_options_after_argument_coercion() {
+        let mut rt = setup_runtime("<html><body><select><option id='first'>A</option></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const change = id => { select.innerHTML = '<option id="'+id+'">X</option>'; };
+            const item = select.item({valueOf() { change('item'); return 0; }}).id;
+            const named = select.namedItem({toString() { change('named'); return 'named'; }}).id;
+            select.remove({valueOf() { change('removed'); return 0; }});
+            const removed = select.length;
+            select.length = {valueOf() { change('length'); return 0; }};
+            return [item, named, removed, select.length];
+        })()"#).unwrap(), serde_json::json!(["item","named",0,0]));
+    }
+
+    #[test]
+    fn select_and_option_interfaces_preserve_factories_and_validate_receivers() {
+        let mut rt = setup_runtime("<html><body><select><option>A</option></select><div></div></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.querySelector('select');
+            const option = select.item(0);
+            const length = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'length');
+            const index = Object.getOwnPropertyDescriptor(HTMLOptionElement.prototype, 'index').get;
+            const errors = [];
+            for (const value of [document.querySelector('div'), {}, Object.create(HTMLSelectElement.prototype),
+                document.createElementNS('urn:foreign', 'select'), document.createElementNS('http://www.w3.org/1999/xhtml', 'SELECT')]) {
+                for (const method of [() => length.get.call(value), () => length.set.call(value, 2),
+                    () => HTMLSelectElement.prototype.item.call(value, 0),
+                    () => HTMLSelectElement.prototype.namedItem.call(value, ''),
+                    () => HTMLSelectElement.prototype.remove.call(value)]) {
+                    try { method(); errors.push(false); } catch (e) { errors.push(e instanceof TypeError); }
+                }
+            }
+            for (const value of [select, {}, document.createElementNS('urn:foreign', 'option')]) {
+                try { index.call(value); errors.push(false); } catch (e) { errors.push(e instanceof TypeError); }
+            }
+            const constructors = [HTMLSelectElement, HTMLOptionElement].map(C => {
+                try { new C(); return false; } catch (e) { return e instanceof TypeError; }
+            });
+            return {brands:[select instanceof HTMLSelectElement, option instanceof HTMLOptionElement,
+                select.cloneNode(true) instanceof HTMLSelectElement,
+                option.cloneNode() instanceof HTMLOptionElement, new Option() instanceof HTMLOptionElement,
+                document.createElement('div') instanceof HTMLSelectElement],
+                noGenericLength:!('length' in document.createElement('div')),
+                errors:errors.every(Boolean), constructors, detached:new Option().index,
+                signatures:[HTMLSelectElement.length, HTMLOptionElement.length, index.name,
+                    index.toString(), HTMLSelectElement.prototype.item.length,
+                    HTMLSelectElement.prototype.namedItem.length, HTMLSelectElement.prototype.remove.length]};
+        })()"#).unwrap(), serde_json::json!({
+            "brands":[true,true,true,true,true,false], "noGenericLength":true,
+            "errors":true, "constructors":[true,true], "detached":0,
+            "signatures":[0,0,"get index","function get index() { [native code] }",1,1,0],
+        }));
+    }
+
+    #[test]
+    fn select_legacy_methods_work_in_child_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><select><option id='a'>A</option><optgroup><option id='b'>B</option></optgroup></select></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            const select = document.querySelector('select');
+            const branded = select instanceof HTMLSelectElement && select.item(1) instanceof HTMLOptionElement;
+            const index = select.namedItem('b').index;
+            select.remove(0);
+            select.length = 3;
+            return [branded, index, select.item(0).id, select.item(2).index, select.length];
+        })()"#).unwrap(), serde_json::json!([true,1,"b",2,3]));
+    }
+
+    #[test]
+    fn cdp_frame_console_retention_bounds_page_owned_store_getters() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://foreign.test/child", "<html><body>child</body></html>").unwrap();
+        frame.execute_script(&mut rt, r#"console.log({answer:42});
+            globalThis.__obscura_objects = new Proxy({}, {get() { while (true) {} }});
+            void 0;
+        "#).unwrap();
+        let events = rt.take_pending_runtime_events();
+        assert!(events.iter().any(|event| matches!(event, RuntimeEvent::Console(_))));
+        assert!(rt.object_store.is_empty());
+        assert_eq!(rt.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+        drop(frame);
+    }
+
+    #[test]
+    fn cdp_frame_console_objects_keep_their_world_without_leaking_child_store_entries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://foreign.test/child", "<html><body>child</body></html>").unwrap();
+        frame.execute_script(&mut rt, "console.log({answer:42})").unwrap();
+        let events = rt.take_pending_runtime_events();
+        let oid = events.iter().find_map(|event| match event {
+            RuntimeEvent::Console(event) => event.args.iter().find_map(|arg| arg["objectId"].as_str()),
+            _ => None,
+        }).expect("missing console object").to_string();
+        let CdpEvaluation::Complete(result) = rt.start_cdp_call(
+            "function() { return [document.URL, this.answer]; }", Some(&oid), &[], true, false,
+        ).unwrap() else { panic!("expected a value"); };
+        assert_eq!(result.value.unwrap(), serde_json::json!(["http://foreign.test/child",42]));
+        assert_eq!(frame.evaluate(&mut rt, "Object.keys(globalThis.__obscura_objects).length").unwrap(),
+            serde_json::json!(0));
+        rt.release_object(&oid);
+        assert_eq!(rt.evaluate("Object.keys(globalThis.__obscura_objects).length").unwrap(), serde_json::json!(0.0));
+        assert!(rt.start_cdp_call("function() { return this; }", Some(&oid), &[], true, false).is_err());
+        drop(frame);
+    }
+
+    #[test]
+    fn cdp_frame_handles_keep_the_wrapping_world_and_reject_reused_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        frame.evaluate(&mut rt, "globalThis.childObject = {nested: {answer:42}}").unwrap();
+        let child = rt.start_cdp_evaluation_in_frame(Some(1), "childObject", false, false).unwrap();
+        let CdpEvaluation::Complete(child) = child else { panic!("expected a handle"); };
+        let child_id = child.object_id.unwrap();
+        let root = rt.start_cdp_evaluation(
+            "globalThis.__obscura_frameObjects[1].window.childObject", false, false,
+        ).unwrap();
+        let CdpEvaluation::Complete(root) = root else { panic!("expected a handle"); };
+        let root_id = root.object_id.unwrap();
+        for (id, expected) in [(&root_id, "http://example.com/test"), (&child_id, "http://example.com/child")] {
+            let result = rt.start_cdp_call("function() { return document.URL; }", Some(id), &[], true, false).unwrap();
+            let CdpEvaluation::Complete(result) = result else { panic!("expected a value"); };
+            assert_eq!(result.value.unwrap(), serde_json::json!(expected));
+        }
+        drop(frame);
+        let _replacement = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/new", "<html><body>new</body></html>").unwrap();
+        assert_eq!(rt.validate_cdp_object_context(&child_id).unwrap_err(), "Execution context was destroyed");
+        assert!(rt.start_cdp_call("function() { return 1; }", Some(&child_id), &[], true, false).is_err());
+        assert!(rt.start_cdp_call("function() { return document.URL; }", Some(&root_id), &[], true, false).is_ok());
+    }
+
+    #[test]
+    fn cdp_calls_reject_unknown_released_cross_world_and_malformed_node_handles() {
+        let mut rt = setup_runtime("<html><body><h1>Main</h1></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        let CdpEvaluation::Complete(child) = rt.start_cdp_evaluation_in_frame(
+            Some(1), "({answer:42})", false, false,
+        ).unwrap() else { panic!("expected a handle"); };
+        let child_id = child.object_id.unwrap();
+        let invalid = ["unknown", "node-", "node--1", "node-+1", "node-1e1", "node-4294967296",
+            "node-1;globalThis.__pwned=1;//", "node-1\n"];
+        for id in invalid {
+            assert!(rt.start_cdp_call("function() { globalThis.__pwned=1; }",
+                Some(id), &[], true, false).is_err(), "{id}");
+            assert!(rt.start_cdp_call("function(value) { globalThis.__pwned=1; }",
+                None, &[serde_json::json!({"objectId":id,"value":null})], true, false).is_err(), "{id}");
+        }
+        assert!(rt.start_cdp_call("function(value) { globalThis.__pwned=1; }", None,
+            &[serde_json::json!({"objectId":child_id})], true, false).is_err());
+        assert!(rt.start_cdp_call_in_frame(Some(1), "function(value) { return value.answer; }", None,
+            &[serde_json::json!({"objectId":child_id,"value":null})], true, false).is_ok());
+        let node_id = rt.with_dom(|dom| dom.query_selector("h1").unwrap().unwrap().raw()).unwrap();
+        assert!(rt.start_cdp_call("function() { return this.textContent; }",
+            Some(&format!("node-{node_id}")), &[], true, false).is_ok());
+        rt.release_object(&child_id);
+        assert!(rt.start_cdp_call("function() { globalThis.__pwned=1; }",
+            Some(&child_id), &[], true, false).is_err());
+        assert_eq!(rt.evaluate("globalThis.__pwned").unwrap(), serde_json::Value::Null);
+        drop(frame);
+    }
+
+    #[test]
+    fn cdp_suspension_recipes_never_restore_child_handles_in_the_main_world() {
+        let mut rt = setup_runtime("<html><body><h1>Main</h1></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        let CdpEvaluation::Complete(child) = rt.start_cdp_evaluation_in_frame(
+            Some(1), "({answer:42})", false, false,
+        ).unwrap() else { panic!("expected a handle"); };
+        let child_id = child.object_id.unwrap();
+        let CdpEvaluation::Complete(root) = rt.start_cdp_evaluation(
+            "document.querySelector('h1')", false, false,
+        ).unwrap() else { panic!("expected a handle"); };
+        let root_id = root.object_id.unwrap();
+        let state = rt.take_cdp_object_state();
+        drop(frame);
+        drop(rt);
+        let mut rt = setup_runtime("<html><body><h1>Main</h1></body></html>");
+        rt.restore_cdp_object_state(state);
+        assert!(rt.start_cdp_call("function() { return document.URL; }",
+            Some(&child_id), &[], true, false).is_err());
+        let CdpEvaluation::Complete(value) = rt.start_cdp_call("function() { return this.textContent; }",
+            Some(&root_id), &[], true, false).unwrap() else { panic!("expected a value"); };
+        assert_eq!(value.value.unwrap(), serde_json::json!("Main"));
+        rt.release_object_group();
+        assert!(rt.start_cdp_call("function() { return this; }",
+            Some(&root_id), &[], true, false).is_err());
+    }
+
+    #[test]
+    fn pending_cdp_frame_evaluation_rejects_a_retired_realm_with_a_reused_id() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>old</body></html>").unwrap();
+        let evaluation = rt.start_cdp_evaluation_in_frame(
+            Some(1), "new Promise(() => {})", true, true,
+        ).unwrap();
+        let CdpEvaluation::Pending(pending) = evaluation else {
+            panic!("expected a pending child evaluation");
+        };
+        assert!(rt.has_cdp_evaluation(&pending));
+        drop(frame);
+        let _replacement = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>new</body></html>").unwrap();
+        assert!(!rt.has_cdp_evaluation(&pending));
+        assert!(!rt.cdp_evaluation_ready(&pending));
+        assert_eq!(rt.finish_cdp_evaluation(pending, true).unwrap_err(),
+            "Execution context was destroyed");
+        assert!(rt.pending_cdp_evaluations.is_empty());
+    }
+
+    #[test]
+    fn table_rows_are_live_ordered_readonly_collections() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const table = document.createElement('table');
+            document.body.append(table);
+            for (const [section, id] of [['tfoot','foot'],['tbody','body'],['thead','head']]) {
+                const group = document.createElement(section);
+                group.innerHTML = '<tr id="'+id+'"><td></td></tr>';
+                table.append(group);
+            }
+            const direct = document.createElement('tr');
+            direct.id = 'direct';
+            table.append(direct);
+            table.querySelector('td').innerHTML = '<table><tr id="nested"><td></td></tr></table>';
+            table.querySelector('thead').append(document.createElementNS('urn:foreign', 'tr'));
+            const rows = table.rows;
+            const initial = Array.from(rows, row => row.id);
+            const collection = [rows === table.rows, rows instanceof HTMLCollection,
+                Array.isArray(rows), Object.prototype.toString.call(rows),
+                rows.item(1).id, rows.namedItem('head').id, rows.head.id,
+                Object.keys(rows), 'head' in rows, rows.item(99)];
+            const writes = [Reflect.set(rows, '0', null), Reflect.set(rows, 'length', 0),
+                Reflect.defineProperty(rows, '1', {value:null}), Reflect.deleteProperty(rows, '0')];
+            rows.custom = 'expando';
+            const reflection = [Object.keys(rows), Object.getOwnPropertyNames(rows),
+                Reflect.deleteProperty(rows, '99')];
+            Object.defineProperty(rows, Symbol.toStringTag, {value:'CustomCollection', configurable:false});
+            reflection.push(Object.prototype.toString.call(rows));
+            table.querySelector('thead').textContent = '';
+            direct.id = 'renamed';
+            direct.setAttribute('name', 'alias');
+            const changed = [rows.length, rows[0].id, rows.renamed === direct,
+                rows.alias === direct, 'head' in rows, rows.head === undefined];
+            direct.id = '99';
+            const numericName = [Object.getOwnPropertyNames(rows).includes('99'),
+                rows[99] === undefined, rows.namedItem('99') === direct,
+                Reflect.deleteProperty(rows, '99')];
+            table.textContent = '';
+            return {initial, collection, writes, reflection, changed, numericName, empty:rows.length};
+        })()"#).unwrap(), serde_json::json!({
+            "initial":["head","body","direct","foot"],
+            "collection":[true,true,false,"[object HTMLCollection]","body","head","head",
+                ["0","1","2","3"],true,null],
+            "writes":[false,false,false,false],
+            "reflection":[["0","1","2","3","custom"],
+                ["0","1","2","3","head","body","direct","foot","custom"],true,"[object CustomCollection]"],
+            "changed":[3,"body",true,true,false,true], "numericName":[true,true,true,true], "empty":0,
+        }));
+    }
+
+    #[test]
+    fn table_rows_preserve_factory_brands_and_reject_non_table_receivers() {
+        let mut rt = setup_runtime("<html><body><table><tr><th>Header</th></tr></table><h1>Heading</h1></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const parsed = document.querySelector('table');
+            const created = document.createElement('table');
+            const cloned = parsed.cloneNode(true);
+            const getter = Object.getOwnPropertyDescriptor(HTMLTableElement.prototype, 'rows').get;
+            const invalid = [document.createElement('div'), {},
+                document.createElementNS('urn:foreign', 'table')].map(value => {
+                try { getter.call(value); return false; } catch (error) { return error instanceof TypeError; }
+            });
+            let illegalConstructor = false;
+            try { new HTMLTableElement(); } catch (error) { illegalConstructor = error instanceof TypeError; }
+            return [parsed instanceof HTMLTableElement, created instanceof HTMLTableElement,
+                cloned instanceof HTMLTableElement, cloned.rows.length, parsed.rows.length,
+                document.querySelector('h1') instanceof HTMLTableElement, invalid, illegalConstructor,
+                HTMLTableElement.length, getter.name, getter.toString()];
+        })()"#).unwrap(), serde_json::json!([true,true,true,1,1,false,[true,true,true],true,
+            0,"get rows","function get rows() { [native code] }"]));
+    }
+
+    #[test]
+    fn table_rows_are_live_in_child_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><table><tr><th>Header</th></tr></table></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            const table = document.querySelector('table');
+            const rows = table.rows;
+            const branded = table instanceof HTMLTableElement && rows instanceof HTMLCollection;
+            table.querySelector('tbody').append(document.createElement('tr'));
+            return [branded, rows.length, table.cloneNode(true).rows.length];
+        })()"#).unwrap(), serde_json::json!([true,2,2]));
+    }
+
+    #[test]
+    fn table_members_preserve_child_realm_collections_and_borrowed_methods() {
+        let mut rt = setup_runtime("<html><body><table><tr><td>Parent</td></tr></table></body></html>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><table><tr><th>Header</th></tr></table></body></html>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const table = child.querySelector('table'), body = table.tBodies[0], row = body.rows[0];
+            const cells = row.cells;
+            const outerGetter = Object.getOwnPropertyDescriptor(HTMLTableRowElement.prototype, 'cells').get;
+            const outerMethod = HTMLTableRowElement.prototype.insertCell;
+            const cell = outerMethod.call(row);
+            const branded = cells instanceof child.defaultView.HTMLCollection
+                && cell instanceof child.defaultView.HTMLTableCellElement;
+            const borrowed = outerGetter !== Object.getOwnPropertyDescriptor(child.defaultView.HTMLTableRowElement.prototype, 'cells').get
+                && outerGetter.call(row) === cells;
+            table.insertRow(0).insertCell();
+            const indices = [row.rowIndex, row.sectionRowIndex, cell.cellIndex];
+            row.deleteCell(0);
+            return [branded, borrowed, cells.length, indices, cell.cellIndex,
+                table.cloneNode(true).rows[1].cells.length, document.querySelector('td').textContent];
+        })()"#).unwrap(), serde_json::json!([true,true,1,[1,1,1],0,1,"Parent"]));
+    }
+
+    #[test]
+    fn native_select_factory_preserves_child_clones_and_custom_upgrade_identity() {
+        let mut rt = setup_runtime("<html><body><select id='custom' is='native-select'><option value='a'>A</option></select></body></html>");
+        let _frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body><select><option value='a'>A</option><option value='b'>B</option></select></body></html>").unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const select = child.querySelector('select'), option = child.createElement('option');
+            option.value = 'n'; select[0] = option;
+            const clone = select.cloneNode(true);
+            const childChecks = [select[0] === option,
+                select instanceof child.defaultView.HTMLSelectElement,
+                clone[0].value, clone[0] instanceof child.defaultView.HTMLOptionElement,
+                Object.getOwnPropertyDescriptor(select, '0').value === option,
+                Reflect.deleteProperty(select, '0')];
+            Reflect.defineProperty(select, '1', {value:null});
+            let strictDelete = false;
+            try { (function(){'use strict';delete select[0];})(); }
+            catch(e) { strictDelete = e instanceof TypeError; }
+            const retained = document.getElementById('custom');
+            retained.marker = 'retained';
+            class NativeSelect extends HTMLSelectElement {
+                constructor() { super(); this.upgraded = true; this[0].value = 'upgraded'; }
+            }
+            customElements.define('native-select', NativeSelect, {extends:'select'});
+            // Customized-built-in matching is separate from the existing upgrade mechanism.
+            customElements._upgradeElement(retained, NativeSelect);
+            const created = document.createElement('select');
+            created.appendChild(document.createElement('option'));
+            const foreign = document.createElementNS('urn:foreign', 'select');
+            return [childChecks, select.length, select[1] === undefined, strictDelete,
+                retained === document.getElementById('custom'), retained.marker,
+                retained.upgraded, retained instanceof NativeSelect, retained[0].value,
+                created[0] === created.item(0), '0' in foreign];
+        })()"#).unwrap(), serde_json::json!([[true,true,"n",true,true,false],
+            1,true,true,true,"retained",true,true,"upgraded",true,false]));
+    }
+
+    #[test]
+    fn noninteractive_dialogs_do_not_accept_destructive_confirmation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const records = ["keep"];
+            const accepted = confirm("Delete this record?");
+            if (accepted) records.pop();
+            return {accepted, records, prompt: prompt("Edit", "draft"),
+                alertResult: typeof alert("Notice")};
+        })()"#).unwrap(), serde_json::json!({
+            "accepted": false, "records": ["keep"], "prompt": null,
+            "alertResult": "undefined",
+        }));
+    }
+
+    #[test]
+    fn noninteractive_dialog_defaults_apply_to_child_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body></body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, "confirm('Delete?')").unwrap(),
+            serde_json::json!(false));
+    }
+
     #[cfg(obscura_external_bootstrap)]
     #[test]
     fn snapshot_core_methods_have_bytecode_before_first_use() {
@@ -4823,9 +5930,26 @@ mod tests {
         rt.evaluate("delete globalThis.__obscura_test_ops").unwrap();
 
         assert_eq!(
-            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff]")
+            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff, typeof __bootstrap]")
                 .unwrap(),
-            serde_json::json!(["undefined", "undefined", "undefined"])
+            serde_json::json!(["undefined", "undefined", "undefined", "undefined"])
+        );
+        // A list of names missed deno_core's `__bootstrap.core` alias, which
+        // handed every page the raw ops. Check what any global leads to.
+        assert_eq!(
+            rt.evaluate(r#"(() => {
+                const names = new Set([...Reflect.ownKeys(globalThis), ...(globalThis.__obscura_hide_list || [])]);
+                const reaches = (value) => {
+                    try {
+                        return !!value && (typeof value === 'object' || typeof value === 'function')
+                            && [value, value.core, value.ops && value, value.core && value.core.ops && value.core]
+                                .some((v) => v && v.ops && typeof v.ops.op_dom === 'function');
+                    } catch (e) { return false; }
+                };
+                return [...names].filter((name) => { try { return reaches(globalThis[name]); } catch (e) { return false; } }).map(String);
+            })()"#).unwrap(),
+            serde_json::json!([]),
+            "no page-visible global may lead to the op table"
         );
         assert_eq!(
             rt.evaluate("document.getElementById('value').textContent")
@@ -6310,6 +7434,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_exposes_builtins_as_properties() {
+        // Go's wasm_exec uses `self` as its global object and reads
+        // self.Object / self.Promise / self.JSON; an undefined one makes the
+        // wasm panic with "call of Value.Invoke on undefined".
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-scope-builtins",
+            r#"
+            globalThis.__workerReplies = [];
+            const source = `
+                const names = ['Object', 'Array', 'Promise', 'JSON', 'Uint8Array', 'Date', 'Reflect', 'WebAssembly', 'Headers', 'AbortController'];
+                postMessage({
+                    missing: names.filter(n => typeof self[n] === 'undefined'),
+                    viaGlobalThis: names.filter(n => typeof globalThis[n] === 'undefined'),
+                    sameObject: self.Object === Object && self.Promise === Promise,
+                    globalThisIsSelf: globalThis === self,
+                    noDocument: typeof self.document === 'undefined' && typeof self.window === 'undefined',
+                    callable: self.JSON.stringify(new self.Promise(() => {}) instanceof self.Promise),
+                });
+            `;
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                __workerReplies.push(event.data);
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            };
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!([{
+                "missing": [], "viaGlobalThis": [], "sameObject": true,
+                "globalThisIsSelf": true, "noDocument": true, "callable": "true",
+            }])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_initialization_error_does_not_rerun_source() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
@@ -7631,6 +8796,23 @@ mod tests {
             .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror') ? true : false;})()")
             .unwrap();
         assert_eq!(has_err, serde_json::json!(true));
+    }
+
+    #[test]
+    fn dom_parser_ignores_page_startswith_polyfill() {
+        // iasWorld county sites replace startsWith with a polyfill that ignores
+        // the position argument; their SOAP responses start with `<?xml`.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(r#"(function(){
+                String.prototype.startsWith = function(a){ return this.substr(0, a.length) === a; };
+                var xml = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><R xmlns="http://tempuri.org/"><GetSearchExistsResult>true</GetSearchExistsResult></R></soap:Body></soap:Envelope>';
+                var d = new DOMParser().parseFromString(xml, 'text/xml');
+                if (d.querySelector('parsererror')) return 'ERR';
+                return d.getElementsByTagName('GetSearchExistsResult')[0].textContent;
+            })()"#)
+            .unwrap();
+        assert_eq!(result, serde_json::json!("true"));
     }
 
     #[test]
@@ -8979,6 +10161,197 @@ mod tests {
     }
 
     #[test]
+    fn custom_element_attribute_reactions_observe_removal_and_can_restore_the_attribute() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const log = [];
+            class RestoreEl extends HTMLElement {
+                static get observedAttributes() { return ['mode']; }
+                attributeChangedCallback(name, oldValue, newValue) {
+                    log.push([oldValue, newValue, this.getAttribute(name)]);
+                    if (newValue === null) this.setAttribute(name, 'restored');
+                }
+            }
+            customElements.define('restore-el', RestoreEl);
+            const results = [];
+            for (const remove of [
+                el => el.removeAttribute('mode'),
+                el => el.toggleAttribute('mode', false),
+                el => el.removeAttributeNS(null, 'mode'),
+            ]) {
+                const el = document.createElement('restore-el');
+                el.setAttribute('mode', 'before');
+                log.length = 0;
+                remove(el);
+                results.push([log.slice(), el.getAttribute('mode'), el.getAttributeNS(null, 'mode')]);
+            }
+            return results;
+        "#).unwrap();
+        let expected = serde_json::json!([
+            [["before", null, null], [null, "restored", "restored"]], "restored", "restored"
+        ]);
+        assert_eq!(result, serde_json::json!([expected, expected, expected]));
+    }
+
+    #[test]
+    fn custom_element_namespace_reactions_observe_updated_attributes_and_style() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const log = [];
+            class StyledEl extends HTMLElement {
+                static get observedAttributes() { return ['style']; }
+                attributeChangedCallback(name, oldValue, newValue) {
+                    log.push([newValue, this.getAttribute(name), this.style.color]);
+                    if (newValue === null) this.setAttribute('style', 'color: red');
+                }
+            }
+            customElements.define('styled-el', StyledEl);
+            const el = document.createElement('styled-el');
+            el.setAttribute('style', 'color: blue');
+            log.length = 0;
+            el.setAttributeNS(null, 'style', 'color: green');
+            el.removeAttributeNS(null, 'style');
+            return [log, el.getAttribute('style'), el.style.color];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [["color: green", "color: green", "green"], [null, null, ""],
+                ["color: red", "color: red", "red"]],
+            "color: red", "red"
+        ]));
+    }
+
+    #[test]
+    fn custom_elements_connect_and_upgrade_on_insertion() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class XEl extends HTMLElement {
+                    constructor() { super(); log.push('ctor'); }
+                    connectedCallback() {
+                        log.push('connected');
+                        if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+                    }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('x-el', XEl);
+                const created = document.createElement('x-el');
+                log.push('created');
+                document.body.appendChild(created);
+                log.push('appended:' + (created.shadowRoot !== null));
+                const holder = document.createElement('div');
+                holder.innerHTML = '<x-el></x-el>';
+                log.push('parsed:' + (holder.firstChild instanceof XEl));
+                document.body.appendChild(holder);
+                log.push('inner:' + (holder.firstChild.shadowRoot !== null));
+                document.body.innerHTML = '<x-el></x-el>';
+                log.push('set:' + (document.body.firstChild instanceof XEl));
+                document.body.firstChild.remove();
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "ctor", "created", "connected", "appended:true",
+                "parsed:false", "ctor", "connected", "inner:true",
+                "disconnected", "disconnected", "ctor", "connected", "set:true",
+                "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_get_reactions_for_moves_and_observed_attributes() {
+        let mut rt = setup_runtime(r#"<html><body><a-el id="a" mode="x" other="y"></a-el><p id="p"></p></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class AEl extends HTMLElement {
+                    static get observedAttributes() { return ['mode']; }
+                    attributeChangedCallback(name, oldValue, newValue) {
+                        log.push(name + ':' + oldValue + '>' + newValue);
+                    }
+                    connectedCallback() { log.push('connected'); }
+                    disconnectedCallback() { log.push('disconnected'); }
+                }
+                customElements.define('a-el', AEl);
+                const a = document.getElementById('a');
+                a.setAttribute('mode', 'y');
+                a.setAttribute('other', 'z');
+                a.removeAttribute('mode');
+                a.removeAttribute('mode');
+                document.getElementById('p').appendChild(a);
+                const detached = document.createElement('div');
+                detached.appendChild(a);
+                detached.removeChild(a);
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "mode:null>x", "connected", "mode:x>y", "mode:y>null",
+                "disconnected", "connected", "disconnected"
+            ])
+        );
+    }
+
+    #[test]
+    fn custom_elements_in_a_connected_shadow_tree_connect() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class InEl extends HTMLElement {
+                    connectedCallback() { log.push('inner'); }
+                }
+                class OutEl extends HTMLElement {
+                    connectedCallback() {
+                        const root = this.attachShadow({ mode: 'open' });
+                        root.innerHTML = '<in-el></in-el>';
+                        log.push('outer');
+                    }
+                }
+                customElements.define('in-el', InEl);
+                customElements.define('out-el', OutEl);
+                const host = document.createElement('out-el');
+                document.body.appendChild(host);
+                host.shadowRoot.appendChild(document.createElement('in-el'));
+                return [log, host.shadowRoot.firstChild instanceof InEl];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([["inner", "outer", "inner"], true]));
+    }
+
+    #[test]
+    fn throwing_connected_callback_is_reported_not_thrown() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const reported = [];
+                globalThis.reportError = (e) => reported.push(e.message);
+                class BadEl extends HTMLElement {
+                    connectedCallback() { throw new Error('connect failed'); }
+                }
+                customElements.define('bad-el', BadEl);
+                const el = document.createElement('bad-el');
+                document.body.appendChild(el);
+                return [el.isConnected, reported];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, ["connect failed"]]));
+    }
+
+    #[test]
     fn editing_command_detection_reports_unsupported_commands_without_mutation() {
         let mut rt = setup_runtime("<body><p>unchanged</p><iframe></iframe></body>");
         assert_eq!(rt.evaluate(r#"(() => {
@@ -9393,7 +10766,7 @@ mod tests {
             second.remove();
             results.push(window.namedContext===collision);
             byId.name = 'idOnlyFrame';
-            results.push(window.idOnlyFrame===byId.contentWindow);
+            results.push(window.idOnlyFrame===byId && byId.contentWindow.name==='');
             byId.removeAttribute('name');
             results.push(window.idOnlyFrame===byId);
             const duplicate = document.createElement('div'); duplicate.id = 'idOnlyFrame';
@@ -9711,7 +11084,7 @@ mod tests {
                      target.element === element]"
             )
             .unwrap(),
-            serde_json::json!(["[object HTMLElement]", "[object SVGElement]", false, true])
+            serde_json::json!(["[object HTMLDivElement]", "[object SVGElement]", false, true])
         );
     }
 
@@ -18947,6 +20320,107 @@ mod tests {
     }
 
     #[test]
+    fn window_origin_is_replaceable_without_changing_the_document_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const descriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+            const initial = origin;
+            const value = { replaced: true };
+            origin = value;
+            const replaced = Object.getOwnPropertyDescriptor(window, 'origin');
+            const errors = [];
+            for (const member of [descriptor.get, descriptor.set]) {
+                try { member.call({}, 'fake'); errors.push('allowed'); }
+                catch (error) { errors.push(error.name); }
+            }
+            location.href = 'https://destination.example/next';
+            return [initial, descriptor.configurable, descriptor.enumerable,
+                descriptor.get.name, descriptor.set.name,
+                descriptor.get.length, descriptor.set.length,
+                origin === value, replaced.writable, replaced.configurable,
+                replaced.enumerable, descriptor.get.call(window), location.origin, errors];
+        })()"#).unwrap(), serde_json::json!([
+            "http://example.com", true, true, "get origin", "set origin", 0, 1,
+            true, true, true, true, "http://example.com", "https://destination.example",
+            ["TypeError", "TypeError"]
+        ]));
+    }
+
+    #[test]
+    fn window_origin_uses_the_receiver_realm_and_inherits_blank_frame_origins() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            const child = frame.contentWindow;
+            const descriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+            const initial = [origin, child.origin, child.location.origin,
+                descriptor.get.call(child)];
+            const value = { child: true };
+            descriptor.set.call(child, value);
+            const replaced = child.origin === value;
+            const parentUnchanged = origin === 'http://example.com';
+            const deleted = delete child.origin;
+            return [initial, replaced, parentUnchanged, deleted,
+                descriptor.get.call(child), Object.hasOwn(child, 'origin')];
+        })()"#).unwrap(), serde_json::json!([
+            ["http://example.com", "http://example.com", "null", "http://example.com"],
+            true, true, true, "http://example.com", false
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pbkdf2_derivation_does_not_block_page_timers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const key = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('password'), 'PBKDF2', false, ['deriveBits']);
+            const derivation = crypto.subtle.deriveBits({
+                name: 'PBKDF2', hash: 'SHA-256',
+                salt: new TextEncoder().encode('salt'), iterations: 1000000,
+            }, key, 256);
+            const first = await Promise.race([
+                derivation.then(() => 'derivation'),
+                new Promise(resolve => setTimeout(() => resolve('timer'), 0)),
+            ]);
+            return [first, (await derivation).byteLength];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(["timer", 32])));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pbkdf2_async_derivation_snapshots_buffers_and_reports_operation_errors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const key = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode('password'), 'PBKDF2', false, ['deriveBits']);
+            const salt = new TextEncoder().encode('salt');
+            const derivation = crypto.subtle.deriveBits({
+                name: 'PBKDF2', hash: 'SHA-1', salt, iterations: 4096,
+            }, key, 160);
+            salt.fill(0);
+            const hex = Array.from(new Uint8Array(await derivation),
+                byte => byte.toString(16).padStart(2, '0')).join('');
+            const errors = [];
+            for (const [iterations, bits] of [[0, 256], [10000001, 256], [10000000, 8388608]]) {
+                try {
+                    await crypto.subtle.deriveBits({
+                        name: 'PBKDF2', hash: 'SHA-1', salt, iterations,
+                    }, key, bits);
+                    errors.push('allowed');
+                } catch (error) {
+                    errors.push([error instanceof DOMException, error.name]);
+                }
+            }
+            return [hex, errors];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([
+            "4b007901b765489abead49d926f721d065a429c1",
+            [[true, "OperationError"], [true, "OperationError"], [true, "OperationError"]]
+        ])));
+    }
+
+    #[test]
     fn test_button_click_dispatches_listener() {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt
@@ -19712,7 +21186,7 @@ mod tests {
         // store holds it; simulate a store entry whose id carries source text.
         let hostile = "x'];globalThis.__pwned=1;//";
         rt.object_store
-            .insert(hostile.to_string(), "undefined".to_string());
+            .insert(hostile.to_string(), CdpObjectRecord { retrieval: "undefined".to_string(), frame: None });
         rt.release_object(hostile);
         assert_eq!(
             rt.evaluate("globalThis.__pwned").unwrap(),
@@ -23931,6 +25405,41 @@ mod tests {
     }
 
     #[test]
+    fn document_implementation_is_a_dom_implementation_interface() {
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const impl = document.implementation;
+            let illegal = false;
+            try { new DOMImplementation(); } catch (e) { illegal = e instanceof TypeError; }
+            const doc = impl.createHTMLDocument("t");
+            return [typeof DOMImplementation, impl instanceof DOMImplementation,
+                impl === document.implementation, illegal,
+                Object.prototype.toString.call(impl),
+                Object.getOwnPropertyDescriptor(globalThis, "DOMImplementation").enumerable,
+                doc.implementation instanceof DOMImplementation,
+                doc.implementation !== impl,
+                impl.createDocumentType("html", "", "").ownerDocument === document];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "function", true, true, true, "[object DOMImplementation]",
+            false, true, true, true
+        ]));
+    }
+
+    #[test]
+    fn document_adopted_stylesheets_is_configurable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const desc = Object.getOwnPropertyDescriptor(Document.prototype, "adoptedStyleSheets");
+            Object.defineProperty(Document.prototype, "adoptedStyleSheets", {
+                get: desc.get, set: desc.set, configurable: true,
+            });
+            return [desc.configurable, Array.isArray(document.adoptedStyleSheets)];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    #[test]
     fn test_xml_serializer_doctype() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
         let result = rt
@@ -24139,6 +25648,114 @@ mod tests {
     }
 
     #[test]
+    fn web_storage_survives_global_constructor_replacement() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'Storage');
+            const NativeStorage = Storage;
+            let reads = 0;
+            const exercise = store => {
+                store.clear();
+                store.setItem('alpha', 'one');
+                store.beta = 'two';
+                const result = [store.getItem('alpha'), store.beta, Object.keys(store).join(','),
+                    Object.getOwnPropertyDescriptor(store, 'beta').value, 'beta' in store,
+                    store.length, store.key(1), delete store.beta];
+                store.removeItem('alpha');
+                return [...result, store.getItem('beta'), store.getItem('alpha'), store.length,
+                    store.constructor === NativeStorage];
+            };
+            const mutations = [
+                () => { globalThis.Storage = {}; },
+                () => { globalThis.Storage = null; },
+                () => { globalThis.Storage = undefined; },
+                () => { globalThis.Storage = function PageStorage() {}; },
+                () => { delete globalThis.Storage; },
+                () => Object.defineProperty(globalThis, 'Storage', {configurable:true,
+                    get() { reads++; throw new Error('page constructor getter'); }}),
+                () => Object.defineProperty(globalThis, 'Storage', {configurable:true, writable:true,
+                    value:new Proxy(function PageStorage() {}, {
+                        get() { reads++; throw new Error('page constructor proxy'); }
+                    })}),
+            ];
+            try {
+                const runs = mutations.map(mutate => {
+                    mutate();
+                    return [localStorage, sessionStorage].map(exercise);
+                });
+                return {runs, reads};
+            } finally {
+                Object.defineProperty(globalThis, 'Storage', descriptor);
+            }
+        })()"#).unwrap();
+        let store = serde_json::json!([
+            "one", "two", "alpha,beta", "two", true, 2, "beta", true, null, null, 0, true,
+        ]);
+        assert_eq!(result, serde_json::json!({"runs":vec![vec![store; 2]; 7], "reads":0}));
+    }
+
+    #[test]
+    fn web_storage_original_prototype_remains_live_after_constructor_replacement() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const NativeStorage = Storage;
+            const prototype = NativeStorage.prototype;
+            const store = localStorage;
+            globalThis.Storage = {};
+            try {
+                Object.defineProperty(prototype, 'extra', {configurable:true, get() { return 42; }});
+                store.setItem('extra', 'named');
+                const result = [store.extra, store.getItem('extra'), 'extra' in store];
+                delete prototype.extra;
+                return [...result, store.extra];
+            } finally {
+                delete prototype.extra;
+                globalThis.Storage = NativeStorage;
+            }
+        })()"#).unwrap(), serde_json::json!([42, "named", true, "named"]));
+    }
+
+    #[test]
+    fn web_storage_constructor_replacement_keeps_child_origin_buckets() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame = crate::frame::FrameRealm::new(&mut rt, 1, 0,
+            "http://example.com/child", "<html><body>child</body></html>").unwrap();
+        assert_eq!(frame.evaluate(&mut rt, r#"(() => {
+            globalThis.Storage = null;
+            localStorage.shared = 'child';
+            sessionStorage.shared = 'same-tab';
+            return [localStorage.getItem('shared'), sessionStorage.shared,
+                localStorage.constructor.name, Object.keys(localStorage)];
+        })()"#).unwrap(), serde_json::json!(["child", "same-tab", "Storage", ["shared"]]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            globalThis.Storage = {};
+            return [localStorage.shared, sessionStorage.shared];
+        })()"#).unwrap(), serde_json::json!(["child", "same-tab"]));
+        let foreign = crate::frame::FrameRealm::new(&mut rt, 2, 0,
+            "http://foreign.test/child", "<html><body>foreign</body></html>").unwrap();
+        assert_eq!(foreign.evaluate(&mut rt, r#"(() => {
+            globalThis.Storage = undefined;
+            const before = [localStorage.getItem('shared'), sessionStorage.getItem('shared')];
+            localStorage.shared = 'foreign';
+            return before;
+        })()"#).unwrap(), serde_json::json!([null, null]));
+        assert_eq!(rt.evaluate("[localStorage.shared, sessionStorage.shared]").unwrap(),
+            serde_json::json!(["child", "same-tab"]));
+    }
+
+    #[test]
+    fn web_storage_constructor_replacement_keeps_opaque_origin_checks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("(() => { globalThis.savedStores = [localStorage, sessionStorage]; globalThis.Storage = {}; return true; })()").unwrap();
+        rt.set_url("data:text/html,opaque");
+        assert_eq!(rt.evaluate(r#"[
+            ...['localStorage', 'sessionStorage'].map(name => () => globalThis[name]),
+            ...savedStores.map(store => () => store.getItem('token')),
+        ].map(read => { try { read(); return 'allowed'; } catch (error) { return error.name; } })"#).unwrap(),
+            serde_json::json!(["SecurityError", "SecurityError", "SecurityError", "SecurityError"]));
+    }
+
+    #[test]
     fn web_storage_preserves_undefined_values_and_rejects_symbol_arguments() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate(r#"[localStorage, sessionStorage].map(store => {
@@ -24270,6 +25887,122 @@ mod tests {
                 "2"
             ])
         );
+    }
+
+    #[test]
+    fn test_html_to_markdown_deep_dom() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"(() => {
+            let child = document.createTextNode('deep leaf');
+            for (let i = 0; i < 12000; i++) {
+                const parent = document.createElement('span');
+                parent.appendChild(child);
+                child = parent;
+            }
+            document.body.appendChild(child);
+        })()"#).unwrap();
+        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(), serde_json::json!("deep leaf"));
+    }
+
+    #[test]
+    fn test_html_to_markdown_deep_tables() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"(() => {
+            let child = document.createTextNode('leaf');
+            for (let i = 0; i < 180; i++) {
+                const table = document.createElement('table');
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.appendChild(child);
+                row.appendChild(cell);
+                table.appendChild(row);
+                child = table;
+            }
+            document.body.appendChild(child);
+        })()"#).unwrap();
+        let expected = format!("{}leaf{}", "| ".repeat(180), " |".repeat(180));
+        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(), serde_json::json!(expected));
+    }
+
+    #[test]
+    fn test_html_to_markdown_deep_subtree_formatting() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        for depth in [127, 128, 129, 130] {
+            rt.evaluate(&format!(r#"(() => {{
+                document.body.innerHTML = '';
+                let child = document.createElement('span');
+                child.innerHTML = '<h1>Title</h1><p>Hello <strong>world</strong></p><table><tr><td>A</td><td>B</td></tr></table>';
+                for (let i = 0; i < {depth}; i++) {{
+                    const parent = document.createElement('span');
+                    parent.appendChild(child);
+                    child = parent;
+                }}
+                document.body.appendChild(child);
+            }})()"#)).unwrap();
+            assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(),
+                serde_json::json!("# Title\n\nHello **world**\n\n| A | B |"), "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn test_html_to_markdown_row_ignores_non_element_children() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"(() => {
+            const table = document.createElement('table');
+            const row = document.createElement('tr');
+            row.appendChild(document.createTextNode('ignored'));
+            row.appendChild(document.createComment('ignored'));
+            const cell = document.createElement('td');
+            cell.textContent = 'A';
+            row.appendChild(cell);
+            const span = document.createElement('span');
+            span.textContent = 'B';
+            row.appendChild(span);
+            table.appendChild(row);
+            document.body.appendChild(table);
+        })()"#).unwrap();
+        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(), serde_json::json!("| A | B |"));
+    }
+
+    #[test]
+    fn test_html_to_markdown_visits_nested_table_elements_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let expected_reads = rt.evaluate(r#"(() => {
+            let child = document.createTextNode('leaf');
+            for (let i = 0; i < 12; i++) {
+                const table = document.createElement('table');
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.appendChild(child);
+                row.appendChild(cell);
+                table.appendChild(row);
+                child = table;
+            }
+            document.body.appendChild(child);
+            const expected = document.body.querySelectorAll('*').length + 1;
+            const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'childNodes');
+            globalThis.markdownChildReads = 0;
+            Object.defineProperty(Node.prototype, 'childNodes', {
+                configurable: true,
+                get() {
+                    markdownChildReads++;
+                    return descriptor.get.call(this);
+                }
+            });
+            return expected;
+        })()"#).unwrap();
+        let md = rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap();
+        assert!(md.as_str().unwrap().contains("leaf"));
+        assert_eq!(rt.evaluate("markdownChildReads").unwrap(), expected_reads);
+    }
+
+    #[test]
+    fn test_html_to_markdown_table_output() {
+        let mut rt = setup_runtime(
+            "<html><body><table><tr><th>A</th><th>B</th></tr><tr><td>one <strong>bold</strong></td><td><a href='/two'>two</a></td></tr></table><p>tail</p></body></html>",
+        );
+        assert_eq!(rt.evaluate(crate::HTML_TO_MARKDOWN_JS).unwrap(),
+            serde_json::json!("| A | B |\n| one **bold** | [two](/two) |\n\ntail"));
     }
 
     #[test]
