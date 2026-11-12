@@ -390,7 +390,7 @@ function _decodeDataScriptUrl(url) {
 // native per-document state so it survives wrapper churn, fragment parsing,
 // moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid);
+  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid, _realmFrameId);
 };
 async function __fetchDynClassicScript(task) {
   let body;
@@ -2208,7 +2208,7 @@ let _scriptingEnabled = true;
 let _sandboxOpaqueOrigin = false;
 function __prepareInsertedScript(script) {
   if (!_scriptingEnabled) return;
-  if (!__obscuraCore.ops.op_script_try_start(script._nid)) return;
+  if (!__obscuraCore.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
   const isImportMap = scriptType === 'importmap';
@@ -7656,7 +7656,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(this._nid >>> 0, _realmFrameId)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -7680,7 +7680,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -16931,7 +16931,7 @@ class _Canvas2D {
         this._buf.byteOffset,
         this._buf.byteLength,
       );
-      if (!register(this.canvas._nid, this._w, this._h, bytes)) {
+      if (!register(this.canvas._nid, this._w, this._h, bytes, _realmFrameId)) {
         throw new RangeError('Canvas backing store allocation failed');
       }
     }
@@ -16942,7 +16942,7 @@ class _Canvas2D {
     queueMicrotask(() => {
       this._damageQueued = false;
       const damage = __obscuraCore.ops.op_canvas_paint_damage;
-      if (typeof damage === 'function') damage(this.canvas._nid);
+      if (typeof damage === 'function') damage(this.canvas._nid, _realmFrameId);
     });
   }
   _parseColor(css) {
