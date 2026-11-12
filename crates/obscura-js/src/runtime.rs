@@ -9388,6 +9388,39 @@ mod tests {
     }
 
     #[test]
+    fn constructed_document_fragment_keeps_its_identity_as_parent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const check = (fragment) => {
+                    const child = document.createElement("div");
+                    fragment.appendChild(child);
+                    const scratch = document.createElement("span");
+                    document.body.appendChild(scratch);
+                    scratch.remove();
+                    const parent = child.parentNode;
+                    let removed;
+                    try { fragment.removeChild(child); removed = "ok"; } catch (error) { removed = error.name; }
+                    return [parent === fragment, parent && parent.nodeType, removed, child.parentNode];
+                };
+                return {
+                    constructed: check(new DocumentFragment()),
+                    created: check(document.createDocumentFragment())
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "constructed": [true, 11, "ok", null],
+                "created": [true, 11, "ok", null]
+            })
+        );
+    }
+
+    #[test]
     fn parent_node_insertion_of_several_nodes_is_one_mutation() {
         let mut rt = setup_runtime("<html><body><div id='p'><i id='first'></i></div><div id='q'><u></u></div></body></html>");
         let result = rt
