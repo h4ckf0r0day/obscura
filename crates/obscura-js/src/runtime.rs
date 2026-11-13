@@ -10160,6 +10160,196 @@ mod tests {
     }
 
     #[test]
+    fn svg_owner_and_viewport_elements_follow_the_parsed_tree() {
+        // #1551. Expected values are Chromium 158's.
+        let mut rt = setup_runtime(
+            r#"<html><body><svg id="root"><rect id="direct"></rect><g><rect id="inG"></rect></g><svg id="inner"><circle id="inInner"></circle><g><rect id="deepInInner"></rect></g></svg><symbol id="sym"><g><rect id="inSymbol"></rect></g><svg id="svgInSymbol"></svg></symbol><defs id="defs"><rect id="inDefs"></rect></defs><image id="img"><rect id="inImage"></rect></image><marker><rect id="inMarker"></rect></marker><pattern><rect id="inPattern"></rect></pattern><foreignObject id="fo"><div id="foDiv"><svg id="foSvg"><rect id="inFoSvg"></rect></svg></div><svg id="foSvgDirect"></svg></foreignObject></svg></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const ns = "http://www.w3.org/2000/svg";
+                const name = (n) => n === null ? null : n.id || n.localName;
+                const both = (el) => name(el.ownerSVGElement) + "|" + name(el.viewportElement);
+                const $ = (id) => document.getElementById(id);
+                const foRect = document.createElementNS(ns, "rect");
+                $("fo").appendChild(foRect);
+                const foDivRect = document.createElementNS(ns, "rect");
+                $("foDiv").appendChild(foDivRect);
+                const plainRect = document.createElementNS(ns, "rect");
+                document.body.appendChild(plainRect);
+                const ids = ["root", "direct", "inG", "inner", "inInner", "deepInInner",
+                    "sym", "inSymbol", "svgInSymbol", "defs", "inDefs", "img", "inImage",
+                    "inMarker", "inPattern", "fo", "foSvg", "inFoSvg", "foSvgDirect"];
+                return ids.map((id) => id + ":" + both($(id))).concat([
+                    "foRect:" + both(foRect),
+                    "foDivRect:" + both(foDivRect),
+                    "plainRect:" + both(plainRect),
+                    $("direct").ownerSVGElement === $("root"),
+                    $("inInner").viewportElement === $("inner"),
+                    "ownerSVGElement" in $("foDiv"),
+                ]);
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "root:null|null",
+                "direct:root|root",
+                "inG:root|root",
+                "inner:root|root",
+                "inInner:inner|inner",
+                "deepInInner:inner|inner",
+                "sym:root|root",
+                "inSymbol:root|sym",
+                "svgInSymbol:root|sym",
+                "defs:root|root",
+                "inDefs:root|root",
+                "img:root|root",
+                "inImage:root|img",
+                "inMarker:root|root",
+                "inPattern:root|root",
+                "fo:root|root",
+                "foSvg:null|root",
+                "inFoSvg:foSvg|foSvg",
+                "foSvgDirect:null|root",
+                "foRect:root|root",
+                "foDivRect:root|root",
+                "plainRect:null|null",
+                true,
+                true,
+                false
+            ])
+        );
+    }
+
+    #[test]
+    fn svg_owner_and_viewport_elements_outside_the_document_and_in_shadow_roots() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="host"></div><svg id="root2"><foreignObject><div id="host2"></div></foreignObject></svg><svg id="a"><svg id="b"></svg></svg></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const ns = "http://www.w3.org/2000/svg";
+                const name = (n) => n === null ? null : n.id || n.localName;
+                const both = (el) => name(el.ownerSVGElement) + "|" + name(el.viewportElement);
+                const make = (tag, id) => {
+                    const el = document.createElementNS(ns, tag);
+                    if (id) el.id = id;
+                    return el;
+                };
+                const out = [];
+                out.push("detachedRect:" + both(make("rect")));
+                const dSvg = make("svg", "dSvg"), dG = make("g"), dRect = make("rect");
+                const dInner = make("svg", "dInner");
+                dSvg.appendChild(dG); dG.appendChild(dRect); dG.appendChild(dInner);
+                out.push("dSvg:" + both(dSvg), "dRect:" + both(dRect), "dInner:" + both(dInner));
+                const removed = make("rect");
+                document.getElementById("a").appendChild(removed);
+                const whileIn = both(removed);
+                removed.remove();
+                out.push("removed:" + whileIn + ">" + both(removed));
+                const moved = make("rect");
+                document.getElementById("b").appendChild(moved);
+                const before = both(moved);
+                document.getElementById("a").appendChild(moved);
+                out.push("moved:" + before + ">" + both(moved));
+                const frag = document.createDocumentFragment();
+                const fSvg = make("svg", "fSvg"), fRect = make("rect");
+                fSvg.appendChild(fRect); frag.appendChild(fSvg);
+                const looseInFrag = make("rect"); frag.appendChild(looseInFrag);
+                out.push("fSvg:" + both(fSvg), "fRect:" + both(fRect), "looseInFrag:" + both(looseInFrag));
+                const tpl = document.createElement("template");
+                tpl.innerHTML = '<svg id="tSvg"><rect id="tRect"></rect></svg>';
+                out.push("tSvg:" + both(tpl.content.firstChild),
+                    "tRect:" + both(tpl.content.firstChild.firstChild));
+                const sr = document.getElementById("host").attachShadow({ mode: "open" });
+                sr.innerHTML = '<svg id="sSvg"><g><rect id="sRect"></rect></g></svg>';
+                const sLoose = make("rect"); sr.appendChild(sLoose);
+                out.push("sSvg:" + both(sr.getElementById("sSvg")),
+                    "sRect:" + both(sr.getElementById("sRect")), "sLoose:" + both(sLoose));
+                const sr2 = document.getElementById("host2").attachShadow({ mode: "closed" });
+                const s2Svg = make("svg", "s2Svg"), s2Rect = make("rect"), s2Loose = make("rect");
+                s2Svg.appendChild(s2Rect); sr2.appendChild(s2Svg); sr2.appendChild(s2Loose);
+                out.push("s2Svg:" + both(s2Svg), "s2Rect:" + both(s2Rect), "s2Loose:" + both(s2Loose));
+                return out;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "detachedRect:null|null",
+                "dSvg:null|null",
+                "dRect:dSvg|dSvg",
+                "dInner:dSvg|dSvg",
+                "removed:a|a>null|null",
+                "moved:b|b>a|a",
+                "fSvg:null|null",
+                "fRect:fSvg|fSvg",
+                "looseInFrag:null|null",
+                "tSvg:null|null",
+                "tRect:tSvg|tSvg",
+                "sSvg:null|null",
+                "sRect:sSvg|sSvg",
+                "sLoose:null|null",
+                "s2Svg:null|root2",
+                "s2Rect:s2Svg|s2Svg",
+                "s2Loose:root2|root2"
+            ])
+        );
+    }
+
+    #[test]
+    fn svg_owner_and_viewport_elements_are_read_only_prototype_accessors() {
+        let mut rt = setup_runtime(r#"<html><body><svg id="root"><rect id="r"></rect></svg></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const r = document.getElementById("r");
+                const out = [];
+                for (const key of ["ownerSVGElement", "viewportElement"]) {
+                    const d = Object.getOwnPropertyDescriptor(SVGElement.prototype, key);
+                    out.push([key, typeof d.get, typeof d.set, d.enumerable, d.configurable,
+                        d.get.name, d.get.length, Function.prototype.toString.call(d.get),
+                        Object.prototype.hasOwnProperty.call(r, key),
+                        key in Element.prototype,
+                        !!Object.getOwnPropertyDescriptor(SVGSVGElement.prototype, key)].join("|"));
+                    r[key] = 5;
+                    try { (function () { "use strict"; r[key] = 5; })(); out.push("assigned"); }
+                    catch (e) { out.push(e.constructor.name); }
+                    out.push(r[key] === document.getElementById("root"));
+                    for (const receiver of [document.body, {}, SVGElement.prototype]) {
+                        try { d.get.call(receiver); out.push("no throw"); }
+                        catch (e) { out.push(e.constructor.name + ": " + e.message); }
+                    }
+                }
+                return out;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "ownerSVGElement|function|undefined|true|true|get ownerSVGElement|0|function get ownerSVGElement() { [native code] }|false|false|false",
+                "TypeError",
+                true,
+                "TypeError: Illegal invocation",
+                "TypeError: Illegal invocation",
+                "TypeError: Illegal invocation",
+                "viewportElement|function|undefined|true|true|get viewportElement|0|function get viewportElement() { [native code] }|false|false|false",
+                "TypeError",
+                true,
+                "TypeError: Illegal invocation",
+                "TypeError: Illegal invocation",
+                "TypeError: Illegal invocation"
+            ])
+        );
+    }
+
+    #[test]
     fn throwing_custom_element_constructor_marks_upgrade_failed_without_connecting() {
         let mut rt = setup_runtime(
             r#"<html><body><throws-during-upgrade id="target"></throws-during-upgrade></body></html>"#,

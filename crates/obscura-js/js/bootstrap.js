@@ -14974,6 +14974,48 @@ _markNative(SVGAnimatedString);
 class SVGElement extends Element {
   get [Symbol.toStringTag]() { return "SVGElement"; }
 }
+// ownerSVGElement and viewportElement walk the parent chain the way Chromium
+// does: they step from a shadow root to its host and pass through HTML
+// ancestors and <foreignObject>. ownerSVGElement stops at the nearest <svg>,
+// but an outermost <svg> (no parent, or a parent that is not an SVG element
+// or is a <foreignObject>) reports null. viewportElement stops at the nearest
+// <svg>, <symbol> or <image> and has no outermost case.
+function _svgElementReceiver(receiver) {
+  if (!receiver || _nodeCacheGet(receiver._nid) !== receiver
+      || receiver.namespaceURI !== "http://www.w3.org/2000/svg") {
+    throw new TypeError('Illegal invocation');
+  }
+  return receiver;
+}
+function _svgParentOrHost(node) {
+  const parent = node.parentNode;
+  return parent && parent.nodeType === 11 ? parent._host || null : parent;
+}
+function _svgAncestorNamed(node, names) {
+  for (let n = _svgParentOrHost(node); n; n = _svgParentOrHost(n)) {
+    if (n.nodeType === 1 && n.namespaceURI === "http://www.w3.org/2000/svg"
+        && names.includes(n.localName)) return n;
+  }
+  return null;
+}
+const _svgElementAccessors = Object.getOwnPropertyDescriptors({
+  get ownerSVGElement() {
+    const el = _svgElementReceiver(this);
+    if (el.localName === "svg") {
+      const parent = el.parentNode;
+      if (!parent || parent.nodeType !== 1
+          || parent.namespaceURI !== "http://www.w3.org/2000/svg"
+          || parent.localName === "foreignObject") return null;
+    }
+    return _svgAncestorNamed(el, ["svg"]);
+  },
+  get viewportElement() {
+    return _svgAncestorNamed(_svgElementReceiver(this), ["svg", "symbol", "image"]);
+  },
+});
+Object.defineProperties(SVGElement.prototype, _svgElementAccessors);
+_markNative(_svgElementAccessors.ownerSVGElement.get);
+_markNative(_svgElementAccessors.viewportElement.get);
 class SVGGraphicsElement extends SVGElement {}
 class SVGGeometryElement extends SVGGraphicsElement {}
 class SVGTextContentElement extends SVGGraphicsElement {}
