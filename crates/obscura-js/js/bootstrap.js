@@ -9379,11 +9379,11 @@ if (typeof Request === 'undefined') {
   globalThis.Request = class Request {
     constructor(input, init = {}) {
       const inputRequest = input instanceof Request ? input : null;
-      let inheritedBody = null;
+      let inheritsBody = false;
       if (typeof input === 'string') { this.url = input; }
       else if (inputRequest) {
         this.url = inputRequest.url;
-        if (init == null || init.body === undefined) inheritedBody = inputRequest._bodyBytes;
+        inheritsBody = init == null || init.body === undefined;
         init = { ...inputRequest, ...init };
       }
       else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
@@ -9392,23 +9392,25 @@ if (typeof Request === 'undefined') {
       this.headers = new Headers(_filterRequestHeaders(init.headers));
       _requestHeaderGuards.add(this.headers);
       this.body = init.body || null;
-      // Extract the body once, as the Fetch spec does at construction: the
-      // bytes read back by text()/arrayBuffer()/formData() are the bytes
-      // fetch() sends, and the Content-Type the body implies (a multipart
-      // boundary in particular) is visible on request.headers.
+      // The Content-Type a body implies is visible on request.headers. A
+      // FormData body is serialized here, because its boundary is part of
+      // that header and the bytes fetch() sends must use the same one. Every
+      // other body is serialized on first use to keep construction cheap.
       this._bodyBytes = null;
-      if (this.body !== null) {
-        if (inheritedBody) {
-          this._bodyBytes = inheritedBody;
-        } else {
-          const implied = {};
-          const bytes = _serializeBody(this.body, implied);
-          const shared = this.body instanceof ArrayBuffer || ArrayBuffer.isView(this.body);
-          this._bodyBytes = shared ? bytes.slice() : bytes;
-          if (implied['Content-Type'] && !this.headers.has('content-type')) {
-            this.headers.set('content-type', implied['Content-Type']);
-          }
+      if (inheritsBody) {
+        this._bodyBytes = inputRequest._bodyBytes;
+      } else if (this.body !== null && typeof this.body !== 'string') {
+        let implied = null;
+        if (this.body instanceof FormData) {
+          const multipart = _formDataToMultipart(this.body);
+          this._bodyBytes = multipart.body;
+          implied = 'multipart/form-data; boundary=' + multipart.boundary;
+        } else if (this.body instanceof URLSearchParams) {
+          implied = 'application/x-www-form-urlencoded;charset=UTF-8';
+        } else if (typeof Blob !== 'undefined' && this.body instanceof Blob && this.body.type) {
+          implied = this.body.type;
         }
+        if (implied !== null && !this.headers.has('content-type')) this.headers.set('content-type', implied);
       }
       this.mode = init.mode || 'cors';
       this.credentials = init.credentials !== undefined
@@ -9431,15 +9433,19 @@ if (typeof Request === 'undefined') {
       // so a FormData clone keeps the boundary its Content-Type names.
       return new Request(this);
     }
-    async text() { return this._bodyBytes ? new TextDecoder().decode(this._bodyBytes) : ''; }
+    _extractBody() {
+      if (this._bodyBytes === null) this._bodyBytes = _serializeBody(this.body, {}, false);
+      return this._bodyBytes;
+    }
+    async text() { return typeof this.body === 'string' ? this.body : new TextDecoder().decode(this._extractBody()); }
     async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes || new Uint8Array(0)); }
+    async arrayBuffer() { return _arrayBufferFromBytes(this._extractBody()); }
     async blob() {
       const ct = this.headers && this.headers.get ? (this.headers.get('content-type') || '') : '';
-      return new Blob(this._bodyBytes ? [this._bodyBytes] : [], { type: ct });
+      return new Blob(this.body != null ? [this._extractBody()] : [], { type: ct });
     }
     async formData() {
-      return _parseFormDataBody(this._bodyBytes || new Uint8Array(0), this.headers.get('content-type'), 'Request');
+      return _parseFormDataBody(this._extractBody(), this.headers.get('content-type'), 'Request');
     }
   };
 }

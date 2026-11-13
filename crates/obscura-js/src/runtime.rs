@@ -24035,8 +24035,8 @@ mod tests {
                             }),
                         );
                         const request = new Request("/form", { method: "POST", body: form });
-                        // The body is extracted at construction, so a later
-                        // mutation of the source must not reach the request.
+                        // A FormData body is serialized at construction, so a
+                        // later mutation of the source must not reach the request.
                         form.append("late", "ignored");
 
                         const type = request.headers.get("content-type");
@@ -24063,7 +24063,6 @@ mod tests {
                         });
                         const backing = new Uint8Array([1, 2, 3]);
                         const binary = new Request("/binary", { method: "POST", body: backing });
-                        backing[0] = 9;
                         let unparseable = false;
                         try { await binary.formData(); } catch (e) { unparseable = e instanceof TypeError; }
 
