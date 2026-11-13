@@ -6756,6 +6756,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_keeps_native_document_position_when_authors_patch_array_map() {
+        let one = "data:text/html,<title>one</title>";
+        let two = "data:text/html,<title>two</title>";
+        let mut page = page_without_chain_limit("history-native-position");
+        page.navigate(one).await.unwrap();
+        page.navigate(two).await.unwrap();
+        page.evaluate("(() => { const map=Array.prototype.map; Array.prototype.map=function(...args){if(this.length===3 && this.every(v=>typeof v==='string' && /^\\d+$/.test(v)))throw new Error('authored map');return Reflect.apply(map,this,args);}; history.pushState(1,'','#one'); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![one.to_string(), two.to_string(), format!("{two}#one")]);
+        assert_eq!(page.history_index, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn history_sync_metadata_is_bounded_by_entries() {
         let url = "data:text/html,<title>history</title>";
         let mut page = page_without_chain_limit("history-metadata");

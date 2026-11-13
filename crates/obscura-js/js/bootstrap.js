@@ -13805,7 +13805,7 @@ globalThis.atob = globalThis.atob || ((s) => {
         const first = changedEnd ? changedStart : syncedLength;
         for (let i = first; i < changedEnd; i++) urls[i - first] = stack[i].url ?? _domParse('document_url');
         const url = stack[idx].url ?? _domParse('document_url');
-        const result = [url, session().start, idx, syncedLength, truncateForward, first, urls];
+        const result = [url, idx, syncedLength, truncateForward, first, urls];
         syncedLength = stack.length;
         dirty = false; truncateForward = false;
         changedStart = Infinity; changedEnd = 0;

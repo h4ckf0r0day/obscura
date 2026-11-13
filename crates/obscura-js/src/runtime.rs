@@ -2716,6 +2716,7 @@ impl ObscuraJsRuntime {
         self.begin_javascript_task();
         let result = self.execute_runtime_script("<history-update>",
             "(() => { const update = globalThis.__obscuraHistory.take(); if (update) return update; const url = globalThis.__virtualUrl; return typeof url === 'string' ? url : ''; })()".to_owned())?;
+        let document_start = self.state.borrow().session_history.document_start;
         let mut entered = self.runtime();
         let context = entered.main_context();
         v8::scope_with_context!(scope, entered.v8_isolate(), context);
@@ -2723,9 +2724,10 @@ impl ObscuraJsRuntime {
         if value.is_string() {
             return Ok(serde_json::Value::String(value.to_rust_string_lossy(scope)));
         }
-        let update: (String, usize, usize, usize, bool, usize, Vec<String>) =
+        let update: (String, usize, usize, bool, usize, Vec<String>) =
             deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string())?;
-        serde_json::to_value(update).map_err(|error| error.to_string())
+        serde_json::to_value((update.0, document_start, update.1, update.2, update.3, update.4, update.5))
+            .map_err(|error| error.to_string())
     }
 
     pub async fn evaluate_for_cdp(
