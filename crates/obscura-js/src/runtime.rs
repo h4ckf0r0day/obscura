@@ -25611,6 +25611,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn closed_dialog_ua_visibility_tracks_open_mutations_in_retained_styles() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>dialog{width:80px;height:30px}</style>
+            <dialog id=target><div>hidden content</div></dialog>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const dialog = document.getElementById('target');
+            const style = getComputedStyle(dialog);
+            const read = () => [style.display, dialog.getBoundingClientRect().height];
+            const result = [read()];
+            dialog.show(); result.push(read());
+            dialog.close(); result.push(read());
+            dialog.open = true; result.push(read());
+            dialog.removeAttribute('open'); result.push(read());
+            dialog.style.display = 'block'; result.push(read());
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            ["none",0],["block",30],["none",0],["block",30],["none",0],["block",30]
+        ]));
+    }
+
     #[test]
     fn test_promise_rejection_event_requires_promise() {
         let mut rt = setup_runtime("<html><body></body></html>");
