@@ -3381,6 +3381,38 @@ impl Page {
         self.push_history_entry(url, false);
     }
 
+    pub(crate) fn apply_history_update(&mut self, fields: &[serde_json::Value]) {
+        let Some(start) = fields.get(1).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
+        let Some(index) = fields.get(2).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
+        let Some(old_length) = fields.get(3).and_then(|value| value.as_u64()).map(|n| n as usize) else { return; };
+        let Some(truncate_forward) = fields.get(4).and_then(|value| value.as_bool()) else { return; };
+        let Some(urls) = fields.get(5).and_then(|value| value.as_array()) else { return; };
+        let Some(urls) = urls.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>() else { return; };
+        if index >= urls.len() || urls.iter().any(|url| cross_scheme_to_file(&self.url_string(), url)) { return; }
+        if self.history.is_empty() && start == 0 {
+            self.history.push(self.url_string());
+        }
+        let Some(end) = start.checked_add(old_length).filter(|&end| end <= self.history.len()) else { return; };
+        let length = urls.len();
+        self.history.splice(start..end, urls);
+        self.document_history_start = start;
+        self.history_index = start + index;
+        if truncate_forward {
+            self.history.truncate(start + length);
+        }
+    }
+
+    /// Traverse an entry belonging to the live document without replacing its runtime.
+    pub fn traverse_same_document_history(&mut self, index: usize) -> bool {
+        self.sync_history_updates();
+        let Some(url) = self.history.get(index) else { return false; };
+        let expression = format!("globalThis.__obscuraHistory.traverse({}, {})", index,
+            serde_json::to_string(url).unwrap_or_default());
+        if self.evaluate(&expression) != serde_json::json!(true) { return false; }
+        self.sync_virtual_url();
+        true
+    }
+
     fn push_history_entry(&mut self, url: String, new_document: bool) {
         if url.is_empty() {
             return;
@@ -3413,6 +3445,13 @@ impl Page {
         self.history = history;
         self.history_index = index;
         self.document_history_start = index;
+        if self.history.is_empty() {
+            let url = self.url_string();
+            if let Some(js) = self.js.as_mut() {
+                let _ = js.execute_script("<reset-history>", &format!(
+                    "globalThis.__obscuraHistory.reset({})", serde_json::to_string(&url).unwrap_or_default()));
+            }
+        }
         self.sync_js_session_history();
     }
 
@@ -3464,6 +3503,7 @@ impl Page {
         initial_referrer: &str,
         initial_initiator: Option<&Url>,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         // file:// is a local file read. Every client route (CLI, CDP's
         // Page.navigate/reload/history and Target.createTarget, the MCP
         // tools) ends up here, so the context's opt-in is enforced once
@@ -5228,6 +5268,7 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        self.sync_history_updates();
         let initiator = self.url.clone();
         let source_url = initiator.as_ref().and_then(|source| {
             Url::parse(url).ok().map(|target| navigation_referrer(source, &target))
@@ -6657,6 +6698,91 @@ mod tests {
         assert_eq!(page.url_string(), two);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_entries_when_the_cursor_moves() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-cursor");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { globalThis.marker=42; history.pushState({n:1}, '', '#one'); history.pushState({n:2}, '', '#two'); })()");
+        page.sync_virtual_url();
+        let entries = vec![url.to_string(), format!("{url}#one"), format!("{url}#two")];
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, entries);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("[marker, history.state.n, history.length]"), serde_json::json!([42, 1, 3]));
+        page.evaluate("history.replaceState({n:3}, '', '#replaced')");
+        page.sync_virtual_url();
+        assert_eq!(page.history.len(), 3);
+        assert_eq!(page.history[1], format!("{url}#replaced"));
+        page.evaluate("history.forward()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 2);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_keeps_distinct_entries_with_the_same_url() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-same-url");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, ''); history.pushState({n:2}, ''); })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(); 3]);
+        assert_eq!(page.history_index, 2);
+        page.evaluate("history.back()");
+        page.sync_virtual_url();
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.evaluate("history.state.n"), serde_json::json!(1.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_document_history_sync_ignores_authored_json_serialization() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-json-override");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState({n:1}, '', '#one'); JSON.stringify=()=> '\"forged\"'; Array.prototype.toJSON=()=> 'forged'; })()");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+        assert_eq!(page.history_index, 1);
+        assert_eq!(page.url_string(), format!("{url}#one"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_metadata_is_bounded_by_entries() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-metadata");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { for(let i=0;i<10000;i++) history.replaceState(i, '', '#'+i); })()");
+        let update = page.js.as_mut().unwrap().take_history_update().unwrap();
+        assert!(update.to_string().len() < 512, "one entry must not retain a mutation log");
+        page.evaluate("history.replaceState(null, '', '#last')");
+        page.sync_virtual_url();
+        assert_eq!(page.history, vec![format!("{url}#last")]);
+        assert_eq!(page.history_index, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_does_not_commit_a_pending_location_navigation() {
+        let url = "data:text/html,<title>history</title>";
+        let mut page = page_without_chain_limit("history-location-preview");
+        page.navigate(url).await.unwrap();
+        page.evaluate("(() => { history.pushState(1, '', '#one'); location.href='https://example.org/next'; })()");
+        page.sync_history_updates();
+        assert_eq!(page.url_string(), format!("{url}#one"));
+        assert_eq!(page.history, vec![url.to_string(), format!("{url}#one")]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_rejects_non_url_page_values() {
+        let mut page = page_without_chain_limit("history-url-type");
+        page.navigate("data:text/html,<title>history</title>").await.unwrap();
+        page.evaluate("globalThis.__virtualUrl = new Array(100000)");
+        assert_eq!(page.js.as_mut().unwrap().take_history_update().unwrap(), serde_json::json!(""));
+    }
+
     /// Same-document entries sit between the documents: a push drops the
     /// forward documents, and back() past the document's own entries loads
     /// the previous document.
@@ -6680,7 +6806,8 @@ mod tests {
         page.evaluate("history.go(-2)");
         assert!(!page.process_pending_navigation().await.unwrap());
         page.evaluate("history.back()");
-        assert!(!page.process_pending_navigation().await.unwrap());
+        assert!(page.process_pending_navigation().await.unwrap());
+        assert_eq!(page.url_string(), one);
         assert_eq!(page.evaluate("location.hash"), serde_json::json!(""));
     }
 

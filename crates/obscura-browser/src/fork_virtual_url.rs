@@ -24,25 +24,43 @@ impl Page {
         let Some(js) = self.js.as_mut() else {
             return false;
         };
-        let Ok(virtual_url) = js.evaluate("globalThis.__virtualUrl || ''") else {
+        let Ok(value) = js.take_history_update() else {
             return false;
         };
+        self.adopt_virtual_url(value)
+    }
+
+    /// Flush history mutations before replacing a document, without adopting
+    /// a Location setter's uncommitted navigation preview.
+    pub fn sync_history_updates(&mut self) -> bool {
+        let Some(js) = self.js.as_mut() else { return false; };
+        let Ok(value) = js.take_history_update() else { return false; };
+        if !value.is_array() { return false; }
+        self.adopt_virtual_url(value)
+    }
+
+    fn adopt_virtual_url(&mut self, value: serde_json::Value) -> bool {
+        let updates = value.as_array();
+        let virtual_url = updates.and_then(|fields| fields.first()).unwrap_or(&value);
         let Some(virtual_url) = virtual_url.as_str().filter(|url| !url.is_empty()) else {
             return false;
         };
         let Ok(parsed) = Url::parse(virtual_url) else {
             return false;
         };
-        if self.url.as_ref() == Some(&parsed) {
-            return false;
-        }
-        // A web document must not become a file:// page without loading one:
         // page.url keys the file:// sub-resource gate (#1069).
         if crate::page::cross_scheme_to_file(&self.url_string(), virtual_url) {
             return false;
         }
-        self.url = Some(parsed);
-        self.push_same_document_history(self.url_string());
-        true
+        let changed = self.url.as_ref() != Some(&parsed);
+        if let Some(fields) = updates {
+            self.apply_history_update(fields);
+            self.url = Some(parsed);
+            self.sync_js_session_history();
+        } else if changed {
+            self.url = Some(parsed);
+            self.push_same_document_history(self.url_string());
+        }
+        changed
     }
 }
