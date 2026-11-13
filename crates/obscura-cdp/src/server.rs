@@ -678,11 +678,13 @@ pub async fn start_with_serve_options_limit_and_ready_file(
             .set_nodelay(true)
             .map_err(|e| error!("set_nodelay on WS stream: {}", e))
             .ok();
-        // Reserve a slot before spawning. `try_update` (rather than a load
+        // Reserve a slot before spawning. `fetch_update` (rather than a load
         // then a store) keeps the check atomic against the accept thread
         // handing off the next stream concurrently.
+        // Retain the established API for compiler compatibility.
+        #[allow(deprecated)]
         let reserved = live_connections
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max_connections).then_some(n + 1)
             })
             .is_ok();
@@ -852,10 +854,11 @@ fn release_connection_memory(idle: bool) {
     }
 }
 
+#[allow(deprecated)]
 fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> bool {
     const BUSY_TRIM_INTERVAL_MS: u64 = 5_000;
     // Claim the interval atomically; a delayed closer cannot roll its timestamp back.
-    last_trim.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+    last_trim.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
         if idle || last == 0 || now.saturating_sub(last) >= BUSY_TRIM_INTERVAL_MS {
             Some(now.max(last))
         } else {
