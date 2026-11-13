@@ -1,13 +1,17 @@
 name: Release
 
 on:
-  # Manual validation uses Windows only and cannot publish a release.
+  # Manual validation cannot publish a release.
   workflow_dispatch:
     inputs:
       windows_only:
         description: Validate only the Windows distribution
         type: boolean
         default: true
+      arm64_capture:
+        description: Validate capture and disconnect cleanup in a native ARM64 container
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -30,6 +34,7 @@ jobs:
           command: check advisories bans licenses sources
 
   build:
+    if: github.event_name != 'workflow_dispatch' || !inputs.arm64_capture
     needs: audit
     strategy:
       fail-fast: false
@@ -199,6 +204,117 @@ jobs:
             ${{ matrix.name }}-no-render-stealth.zip
           if-no-files-found: error
           retention-days: 1
+
+  capture-arm64:
+    name: Native ARM64 capture lifecycle
+    if: github.event_name == 'workflow_dispatch' && inputs.arm64_capture
+    needs: audit
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
+        with:
+          tool: nextest
+          fallback: none
+      - name: Check native architecture
+        run: |
+          test "$(uname -m)" = aarch64
+          node -e 'if (process.arch !== "arm64") process.exit(1)'
+          rustc -Vv
+      - name: Install build and diagnostic tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev gdb
+      - name: Build render release
+        run: cargo build --release -p obscura-cli --bins --features render
+      - name: Check native grid redistribution progress
+        run: |
+          cargo nextest run --manifest-path vendor/taffy/Cargo.toml \
+            --target-dir target/taffy-regressions --release --lib \
+            -E 'test(track_distribution_)'
+      - name: Check fontless capture and disconnect cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          results_root="$RUNNER_TEMP/native-capture"
+          mkdir -p "$results_root"
+          git rev-parse HEAD > "$results_root/source.txt"
+          sha256sum target/release/obscura target/release/obscura-worker > "$results_root/binaries.sha256"
+          baseline_image=h4ckf0r0day/obscura:0.2.6
+          runtime_image=gcr.io/distroless/cc-debian12:nonroot
+          docker pull --platform linux/arm64 "$baseline_image"
+          docker pull --platform linux/arm64 "$runtime_image"
+          docker image inspect "$baseline_image" "$runtime_image" > "$results_root/images.json"
+          test "$(docker image inspect --format '{{.Architecture}}' "$baseline_image")" = arm64
+          test "$(docker image inspect --format '{{.Architecture}}' "$runtime_image")" = arm64
+          container=''
+          trap 'if [[ -n "$container" ]]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi' EXIT
+          capture_status=0
+          probe() {
+            local label="$1" image="$2" mode="$3"
+            local output="$results_root/$label"
+            mkdir -p "$output/ready"
+            chmod 0777 "$output/ready"
+            local mounts=(--volume "$output/ready:/capture")
+            if [[ "$mode" == current ]]; then
+              mounts+=(--volume "$PWD/target/release/obscura:/obscura:ro")
+              mounts+=(--volume "$PWD/target/release/obscura-worker:/obscura-worker:ro")
+            fi
+            container="obscura-capture-$label"
+            docker run --detach --name "$container" --network host \
+              --read-only --tmpfs /tmp:rw,size=128m --memory 1g --cpus 3 --pids-limit 256 \
+              --env TZ=UTC --entrypoint /obscura "${mounts[@]}" "$image" \
+              serve --host 127.0.0.1 --port 0 --workers 1 \
+              --ready-file /capture/ready.json --allow-private-network --quiet
+            for _ in $(seq 1 300); do
+              if [[ -s "$output/ready/ready.json" ]]; then break; fi
+              if [[ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]]; then
+                docker logs "$container"
+                return 1
+              fi
+              sleep 0.1
+            done
+            test -s "$output/ready/ready.json"
+            local endpoint engine_pid
+            endpoint="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("http://"+d["host"]+":"+str(d["port"]))' "$output/ready/ready.json")"
+            engine_pid="$(docker inspect --format '{{.State.Pid}}' "$container")"
+            docker inspect "$container" > "$output/container.json"
+            set +e
+            sudo "$(command -v node)" scripts/ci/capture_lifecycle.mjs \
+              "$endpoint" "$engine_pid" "$output/observations"
+            capture_status=$?
+            set -e
+            docker logs "$container" > "$output/server.log" 2>&1
+            if [[ "$capture_status" != 0 ]]; then
+              sudo timeout 20s gdb --batch -ex 'thread apply all bt 12' \
+                -p "$engine_pid" > "$output/native-stacks.txt" 2>&1 || true
+            fi
+            docker rm -f "$container"
+            container=''
+          }
+          probe baseline "$baseline_image" baseline
+          printf '%s\n' "$capture_status" > "$results_root/baseline-exit.txt"
+          probe current "$runtime_image" current
+          printf '%s\n' "$capture_status" > "$results_root/current-exit.txt"
+          test "$capture_status" = 0
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-capture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-capture
+          if-no-files-found: warn
+          retention-days: 7
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
