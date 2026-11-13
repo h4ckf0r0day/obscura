@@ -285,6 +285,7 @@ jobs:
               sleep 0.1
             done
             test -s "$output/ready/ready.json"
+            sudo chown "$(id -u):$(id -g)" "$output/ready/ready.json"
             local endpoint engine_pid
             endpoint="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("http://"+d["host"]+":"+str(d["port"]))' "$output/ready/ready.json")"
             engine_pid="$(docker inspect --format '{{.State.Pid}}' "$container")"
