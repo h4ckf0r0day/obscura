@@ -1333,6 +1333,7 @@ async fn run_fetch(
     // pages stay fast.
     settle_page(&mut page, wait_secs, wait_is_fixed).await;
 
+    #[cfg(feature = "render")]
     let mut deferred_eval_output = None;
     let initial_controlled_scroll = if eval_at_capture_boundary {
         controlled_scroll_request.as_ref().map(|(x, requested_y)| {
@@ -1377,6 +1378,7 @@ async fn run_fetch(
                 context.save_storage();
                 return Ok(());
             }
+            #[cfg(feature = "render")]
             if screenshot.is_some() {
                 deferred_eval_output = Some(result);
             }
